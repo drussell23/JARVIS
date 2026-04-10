@@ -32,6 +32,18 @@ _STRATEGIC_DOCS = [
 # Max chars to read from each doc (avoid blowing up prompt budget)
 _MAX_DOC_CHARS = 20_000
 
+# Git-history direction inference (Manifesto §4 — synthetic soul).
+_GIT_HISTORY_ENABLED = os.environ.get(
+    "JARVIS_STRATEGIC_GIT_HISTORY_ENABLED", "true"
+).lower() not in ("false", "0", "no", "off")
+_GIT_HISTORY_MAX_COMMITS = int(
+    os.environ.get("JARVIS_STRATEGIC_GIT_MAX_COMMITS", "50")
+)
+# Regex for Conventional Commits: `type(scope): subject`. Scope is optional.
+_CONVENTIONAL_COMMIT_RE = re.compile(
+    r"^(?P<type>[a-zA-Z]+)(?:\((?P<scope>[^)]+)\))?:\s*(?P<subject>.+)$"
+)
+
 
 class StrategicDirectionService:
     """Reads the developer's strategic vision and injects it into operations.
@@ -50,6 +62,7 @@ class StrategicDirectionService:
         self._root = project_root.resolve()
         self._principles: List[str] = []
         self._digest: str = ""
+        self._git_themes: List[str] = []
         self._loaded: bool = False
 
     async def load(self) -> None:
@@ -80,12 +93,23 @@ class StrategicDirectionService:
                 except Exception:
                     logger.debug("[Strategic] Failed to read %s", rel_path, exc_info=True)
 
+        # Infer recent development momentum from git history (Manifesto §4
+        # — synthetic soul: the organism remembers what it has been working
+        # on). Conventional-commit parsing, zero model inference.
+        if _GIT_HISTORY_ENABLED:
+            self._git_themes = self._extract_git_themes(
+                self._root, max_commits=_GIT_HISTORY_MAX_COMMITS,
+            )
+            momentum_section = self._format_git_themes(self._git_themes)
+            if momentum_section:
+                sections.append(momentum_section)
+
         # Build the digest
         self._digest = self._build_digest(sections)
         self._loaded = True
         logger.info(
-            "[Strategic] Loaded: %d principles, %d char digest from %d sources",
-            len(self._principles), len(self._digest), len(sections),
+            "[Strategic] Loaded: %d principles, %d git themes, %d char digest from %d sources",
+            len(self._principles), len(self._git_themes), len(self._digest), len(sections),
         )
 
     @property
@@ -173,6 +197,107 @@ class StrategicDirectionService:
         if len(section) > 4000:
             section = section[:4000] + "\n\n[... truncated for prompt budget]"
         return section
+
+    @staticmethod
+    def _extract_git_themes(
+        project_root: Path,
+        max_commits: int = 50,
+    ) -> List[str]:
+        """Infer active development themes from recent git history.
+
+        Runs ``git log`` for the last ``max_commits`` commits and parses
+        Conventional Commit subjects to build:
+          • a histogram of the most touched scopes (the "(governance)"
+            / "(sensors)" tags — reveal where the momentum is)
+          • a histogram of commit types (``feat`` / ``fix`` / ``refactor``
+            — reveal whether we're building or hardening)
+          • the three most recent subject lines (reveal freshest work)
+
+        Returns a list of short theme strings. Empty list on any failure
+        (no git, shallow clone, subprocess timeout). Zero model inference.
+
+        Manifesto §4 rationale: the synthetic soul remembers what it has
+        been working on — this turns raw git history into explicit context
+        the organism can reason over during GENERATE.
+        """
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "log", f"-{int(max_commits)}", "--pretty=format:%s"],
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return []
+        if result.returncode != 0:
+            return []
+
+        lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+        if not lines:
+            return []
+
+        scope_counts: Dict[str, int] = {}
+        type_counts: Dict[str, int] = {}
+        subjects: List[str] = []
+        for line in lines:
+            m = _CONVENTIONAL_COMMIT_RE.match(line)
+            if not m:
+                # Non-conventional commit (e.g., "Merge branch ..."): still
+                # record the first ~60 chars as a raw subject so we never
+                # drop information completely.
+                subjects.append(line[:60])
+                continue
+            t = (m.group("type") or "").lower()
+            s = (m.group("scope") or "").lower()
+            sub = (m.group("subject") or "").strip()
+            if t:
+                type_counts[t] = type_counts.get(t, 0) + 1
+            if s:
+                scope_counts[s] = scope_counts.get(s, 0) + 1
+            if sub:
+                subjects.append(sub[:60])
+
+        themes: List[str] = []
+
+        if scope_counts:
+            top_scopes = sorted(
+                scope_counts.items(), key=lambda kv: (-kv[1], kv[0])
+            )[:5]
+            themes.append(
+                "Active scopes: "
+                + ", ".join(f"{name} ({count})" for name, count in top_scopes)
+            )
+
+        if type_counts:
+            top_types = sorted(
+                type_counts.items(), key=lambda kv: (-kv[1], kv[0])
+            )[:4]
+            themes.append(
+                "Commit mix: "
+                + ", ".join(f"{name}={count}" for name, count in top_types)
+            )
+
+        if subjects:
+            themes.append("Latest work: " + " | ".join(subjects[:3]))
+
+        return themes
+
+    @staticmethod
+    def _format_git_themes(themes: List[str]) -> str:
+        """Render git-derived themes as a digest section. Empty → empty."""
+        if not themes:
+            return ""
+        body = "\n".join(f"- {t}" for t in themes)
+        return (
+            "## Recent Development Momentum\n\n"
+            "Derived deterministically from the last commits via Conventional "
+            "Commit parsing. Treat this as *where the organism has been focused* "
+            "— a hint about current themes, not a mandate to repeat past work.\n\n"
+            f"{body}"
+        )
 
     @staticmethod
     def _extract_overview(content: str, max_chars: int = 3000) -> str:
