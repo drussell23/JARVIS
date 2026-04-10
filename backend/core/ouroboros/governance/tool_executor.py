@@ -507,6 +507,23 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"write"}),
     ),
+    "delete_file": ToolManifest(
+        name="delete_file", version="1.0",
+        description=(
+            "Delete a file from the repository. You MUST call read_file on "
+            "the target first — deletion of un-read files is rejected so "
+            "the model is forced to consider the content before destroying "
+            "it. Protected paths (.git, .env, credentials, secrets, .ssh, "
+            "node_modules, .venv, .aws, .jarvis, .ouroboros) and directories "
+            "cannot be deleted. The deleted content is captured in memory "
+            "so the orchestrator can reconstruct it from the audit trail if "
+            "needed."
+        ),
+        arg_schema={
+            "path": {"type": "string", "description": "Repo-relative path to delete"},
+        },
+        capabilities=frozenset({"write"}),
+    ),
     "ask_human": ToolManifest(
         name="ask_human", version="1.0",
         description=(
@@ -580,6 +597,7 @@ class ToolExecutor:
             "bash": self._bash,
             "edit_file": self._edit_file,
             "write_file": self._write_file,
+            "delete_file": self._delete_file,
             "type_check": self._type_check,
         }
 
@@ -1411,6 +1429,91 @@ class ToolExecutor:
                 "Venom rollback failed for %s: %s", resolved, exc
             )
 
+    def _delete_file(self, args: Dict[str, Any]) -> str:
+        """Delete a file — hardened edition.
+
+        Contract:
+          * Requires a prior ``read_file`` of the same path (must-have-read).
+          * Rejects protected paths.
+          * Only regular files can be deleted — directories and symlinks
+            are rejected.
+          * The deleted content is captured in the audit trail
+            (``bytes_before`` + ``sha256_before``) so the orchestrator
+            can reconstruct the file if needed.
+          * Post-delete verification confirms the file actually went
+            away; if not, returns an error (no automatic "rollback" —
+            there's nothing to roll back, the file either exists or
+            doesn't).
+        """
+        path_str: str = args["path"]
+        if not path_str:
+            return "(delete_file: 'path' is required)"
+
+        # --- Layer 1: path safety ------------------------------------
+        try:
+            resolved = self._safe_resolve(path_str)
+        except BlockedPathError as exc:
+            return f"(delete_file: blocked path — {exc})"
+
+        rel_path = self._rel_posix(resolved)
+        reason = _is_protected_path(rel_path)
+        if reason is not None:
+            return f"(delete_file: protected path rejected — {reason}: {rel_path})"
+
+        if not resolved.exists():
+            return f"(delete_file: file not found: {rel_path})"
+        if resolved.is_dir():
+            return (
+                f"(delete_file: {rel_path} is a directory — "
+                "delete_file only removes regular files)"
+            )
+
+        # --- Layer 2: must-have-read ---------------------------------
+        if not self._has_read(resolved, path_str):
+            return (
+                f"(delete_file: must-have-read violation — call "
+                f"read_file({rel_path!r}) before deleting. Venom requires "
+                f"you to inspect a file before destroying it.)"
+            )
+
+        # --- Layer 3: capture content for the audit trail -----------
+        try:
+            prior_content = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"(delete_file: cannot read {rel_path} for audit: {exc})"
+
+        # --- Layer 4: delete -----------------------------------------
+        try:
+            resolved.unlink()
+        except OSError as exc:
+            return f"(delete_file: unlink failed for {rel_path}: {exc})"
+
+        # --- Layer 5: post-delete verification -----------------------
+        if resolved.exists():
+            return (
+                f"(delete_file: post-delete verification failed — "
+                f"{rel_path} still exists on disk)"
+            )
+
+        # --- Success — audit + remove from _files_read --------------
+        self._record_edit(
+            tool="delete_file",
+            rel_path=rel_path,
+            action="deleted",
+            before=prior_content,
+            after="",  # deleted files have no "after" content
+        )
+        # Remove from read set so a future create-via-write_file behaves
+        # as a NEW-file creation (not overwrite) and doesn't short-circuit
+        # must-have-read.
+        self._files_read.discard(rel_path)
+
+        prior_hash = hashlib.sha256(prior_content.encode("utf-8")).hexdigest()
+        n_lines = prior_content.count("\n") + 1
+        return (
+            f"OK: deleted {rel_path} ({n_lines} lines, sha256 {prior_hash[:12]})"
+        )
+
     def _type_check(self, args: Dict[str, Any]) -> str:
         """Run pyright/mypy on specific files — returns diagnostics.
 
@@ -1681,12 +1784,12 @@ class GoverningToolPolicy:
                     detail="JARVIS_TOOL_BASH_ALLOWED is not 'true'",
                 )
 
-        # Rule 12: edit_file / write_file — enabled by default under governance
-        # (Manifesto §6: risk engine + approval gates protect against bad writes).
-        # Defence-in-depth: we check protected paths at the policy layer as
-        # well as inside the handlers, so even a bypassed handler can't
-        # touch .git/ / .env / credentials etc.
-        elif name in ("edit_file", "write_file"):
+        # Rule 12: edit_file / write_file / delete_file — enabled by default
+        # under governance. (Manifesto §6: risk engine + approval gates
+        # protect against bad writes.) Defence-in-depth: we check protected
+        # paths at the policy layer as well as inside the handlers, so even
+        # a bypassed handler can't touch .git/ / .env / credentials etc.
+        elif name in ("edit_file", "write_file", "delete_file"):
             allowed = (
                 os.environ.get("JARVIS_TOOL_EDIT_ALLOWED", "true").lower() == "true"
             )

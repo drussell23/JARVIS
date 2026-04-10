@@ -593,6 +593,101 @@ class TestEdgeCases:
         # Internal state unchanged by external mutation
         assert executor._edit_history[0]["path"] == "backend/main.py"
 
+    def test_delete_file_requires_prior_read(self, tmp_path: Path) -> None:
+        repo = _make_repo(tmp_path)
+        (repo / "scratch.txt").write_text("delete me\n", encoding="utf-8")
+        executor = ToolExecutor(repo_root=repo)
+
+        result = executor._delete_file({"path": "scratch.txt"})
+        assert "must-have-read violation" in result
+        assert (repo / "scratch.txt").exists()
+
+    def test_delete_file_after_read(self, tmp_path: Path) -> None:
+        repo = _make_repo(tmp_path)
+        (repo / "scratch.txt").write_text("delete me\n", encoding="utf-8")
+        executor = ToolExecutor(repo_root=repo)
+        _read(executor, "scratch.txt")
+
+        result = executor._delete_file({"path": "scratch.txt"})
+        assert result.startswith("OK: deleted")
+        assert not (repo / "scratch.txt").exists()
+        # Audit trail captured the content
+        assert len(executor._edit_history) == 1
+        entry = executor._edit_history[0]
+        assert entry["tool"] == "delete_file"
+        assert entry["action"] == "deleted"
+        assert entry["bytes_before"] == len("delete me\n")
+        assert entry["bytes_after"] == 0
+        assert entry["sha256_before"] is not None
+        # _files_read was cleared so a re-create via write_file works as new
+        assert "scratch.txt" not in executor._files_read
+
+    def test_delete_file_rejects_protected_path(self, tmp_path: Path) -> None:
+        repo = _make_repo(tmp_path)
+        (repo / ".env").write_text("SECRET=x\n", encoding="utf-8")
+        executor = ToolExecutor(repo_root=repo)
+        executor._files_read.add(".env")
+
+        result = executor._delete_file({"path": ".env"})
+        assert "protected path rejected" in result
+        assert (repo / ".env").exists()
+
+    def test_delete_file_rejects_directory(self, tmp_path: Path) -> None:
+        repo = _make_repo(tmp_path)
+        executor = ToolExecutor(repo_root=repo)
+        executor._files_read.add("backend")
+
+        result = executor._delete_file({"path": "backend"})
+        assert "is a directory" in result
+        assert (repo / "backend").exists()
+
+    def test_delete_file_missing(self, tmp_path: Path) -> None:
+        repo = _make_repo(tmp_path)
+        executor = ToolExecutor(repo_root=repo)
+        executor._files_read.add("nothing.txt")
+
+        result = executor._delete_file({"path": "nothing.txt"})
+        assert "file not found" in result
+
+    def test_delete_then_recreate_new_file(self, tmp_path: Path) -> None:
+        """After deletion, recreating via write_file should succeed as a
+        new-file creation (must-have-read exempt)."""
+        repo = _make_repo(tmp_path)
+        (repo / "scratch.txt").write_text("old\n", encoding="utf-8")
+        executor = ToolExecutor(repo_root=repo)
+        _read(executor, "scratch.txt")
+
+        del_result = executor._delete_file({"path": "scratch.txt"})
+        assert del_result.startswith("OK: deleted")
+
+        # No prior read for the NEW file — should still succeed
+        create_result = executor._write_file({
+            "path": "scratch.txt",
+            "content": "fresh\n",
+        })
+        assert create_result.startswith("OK: created")
+        assert (repo / "scratch.txt").read_text() == "fresh\n"
+
+    def test_delete_file_policy_layer_protects_git(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        policy = GoverningToolPolicy(repo_roots={"jarvis": repo})
+        ctx = PolicyContext(
+            repo="jarvis",
+            repo_root=repo,
+            op_id="op-test",
+            call_id="op-test:r0:delete_file",
+            round_index=0,
+        )
+        call = ToolCall(
+            name="delete_file",
+            arguments={"path": ".git/HEAD"},
+        )
+        result = policy.evaluate(call, ctx)
+        assert result.decision == PolicyDecision.DENY
+        assert result.reason_code == "tool.denied.protected_path"
+
     def test_env_extensible_protected_paths(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
