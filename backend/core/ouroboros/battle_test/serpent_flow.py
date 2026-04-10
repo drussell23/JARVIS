@@ -1526,6 +1526,116 @@ class SerpentFlow:
         return approved
 
     # ══════════════════════════════════════════════════════════
+    # Plan Approval Hard Gate (Phase 1b)
+    # ══════════════════════════════════════════════════════════
+
+    async def request_plan_permission(
+        self,
+        op_id: str,
+        description: str,
+        target_files: List[str],
+        plan_text: str,
+        complexity: str = "",
+    ) -> bool:
+        """Interactive [Y/n] gate for *implementation plans* (pre-GENERATE).
+
+        Identical interaction model to :meth:`request_execution_permission`,
+        but renders the model-generated plan as markdown instead of a code
+        diff. Used by the Plan Approval Hard Gate (Manifesto §6) for
+        COMPLEX/ARCHITECTURAL ops — the human sees the approach before
+        any tokens are burned on code generation.
+
+        Returns ``True`` for approval, ``False`` for rejection.
+        """
+        short = _short_id(op_id) if op_id else ""
+        c = self.console
+
+        # Step 1: Render plan as markdown
+        try:
+            from rich.markdown import Markdown
+            from rich.panel import Panel as _Panel
+
+            plan_panel = _Panel(
+                Markdown(plan_text or "_(no plan content)_"),
+                title=(
+                    f"📝 Implementation Plan │ "
+                    f"{complexity or 'unclassified'} │ op:{short}"
+                ),
+                border_style=_C["mind"],
+                expand=False,
+                width=min(c.width, 90),
+                padding=(0, 1),
+            )
+            c.print()
+            c.print(plan_panel)
+        except Exception:
+            # Markdown rendering failed — fall back to plain text
+            c.print()
+            c.print(
+                f"[{_C['mind']}]📝 Implementation Plan │ op:{short}[/{_C['mind']}]"
+            )
+            c.print(plan_text or "(no plan content)")
+
+        # Step 2: Plan Gate panel
+        body_lines = [f"[bold]{description}[/bold]"]
+        if target_files:
+            files_display = ", ".join(
+                f.split("/")[-1] if "/" in f else f for f in target_files[:5]
+            )
+            body_lines.append(f"📂 {files_display}")
+        body_lines.append(
+            f"[{_C['dim']}]Approve the APPROACH before code is generated. "
+            f"Rejection prevents wasted tokens on a wrong strategy.[/{_C['dim']}]"
+        )
+
+        panel = Panel(
+            "\n".join(body_lines),
+            title=f"🔒 Plan Gate │ op:{short}",
+            border_style=_C["heal"],
+            expand=False,
+            width=min(c.width, 68),
+            padding=(0, 1),
+        )
+        c.print()
+        c.print(panel)
+
+        # Step 3: Async [Y/n] prompt
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.formatted_text import HTML
+            from prompt_toolkit.patch_stdout import patch_stdout
+
+            session = PromptSession()
+            with patch_stdout(raw=True):
+                answer = await session.prompt_async(
+                    HTML("<b>  Approve this plan and proceed to GENERATE? [Y/n] </b>"),
+                )
+            answer = answer.strip().lower()
+            approved = answer in ("", "y", "yes")
+        except ImportError:
+            c.print(
+                f"  [{_C['heal']}](prompt_toolkit unavailable — auto-approving plan)[/{_C['heal']}]",
+                highlight=False,
+            )
+            approved = True
+        except (EOFError, KeyboardInterrupt):
+            approved = False
+
+        # Step 4: Decision artifact
+        if approved:
+            c.print(
+                f"  [{_C['life']}]✅ plan approved[/{_C['life']}]  [{_C['dim']}]op:{short}[/{_C['dim']}]",
+                highlight=False,
+            )
+        else:
+            c.print(
+                f"  [{_C['death']}]❌ plan rejected[/{_C['death']}]  [{_C['dim']}]op:{short}[/{_C['dim']}]",
+                highlight=False,
+            )
+        c.print()
+        return approved
+
+    # ══════════════════════════════════════════════════════════
     # Helpers
     # ══════════════════════════════════════════════════════════
 
@@ -1890,10 +2000,26 @@ class SerpentApprovalProvider:
         """Delegate request registration to the inner provider."""
         return await self._inner.request(context)
 
+    async def request_plan(self, context: Any, plan_text: str) -> str:
+        """Delegate plan-variant request registration to the inner provider.
+
+        Part of the Plan Approval Hard Gate (Phase 1b). The inner provider
+        stores ``plan_text`` on the pending request; :meth:`await_decision`
+        detects it and renders the plan markdown instead of a diff.
+        """
+        if not hasattr(self._inner, "request_plan"):
+            # Duck-type fallback: inner provider doesn't support plan
+            # approval. The caller must handle this gracefully — typically
+            # by skipping the plan gate entirely.
+            raise NotImplementedError(
+                "inner approval provider does not support request_plan"
+            )
+        return await self._inner.request_plan(context, plan_text)
+
     async def await_decision(
         self, request_id: str, timeout_s: float,
     ) -> Any:
-        """Show diff + Iron Gate prompt, then route decision to inner provider."""
+        """Show diff/plan + Iron Gate prompt, then route decision to inner provider."""
         pending = self._inner._requests.get(request_id)
         if pending is None or pending.result is not None:
             return await self._inner.await_decision(request_id, timeout_s)
@@ -1902,6 +2028,26 @@ class SerpentApprovalProvider:
         op_id = ctx.op_id
         description = ctx.description or ""
         target_files = list(ctx.target_files) if ctx.target_files else []
+
+        # ── Plan Approval Hard Gate branch ──
+        # If plan_text is set, this is a pre-GENERATE plan approval request.
+        # Render the plan markdown via request_plan_permission instead of
+        # the code-diff flow below.
+        _plan_text = getattr(pending, "plan_text", None)
+        if _plan_text is not None:
+            _complexity = getattr(ctx, "task_complexity", "") or ""
+            approved = await self._flow.request_plan_permission(
+                op_id=op_id,
+                description=description,
+                target_files=target_files,
+                plan_text=_plan_text,
+                complexity=_complexity,
+            )
+            if approved:
+                return await self._inner.approve(request_id, "operator")
+            return await self._inner.reject(
+                request_id, "operator", "plan rejected via Plan Gate"
+            )
 
         # Generate proposed diff from candidate
         diff_text = ""

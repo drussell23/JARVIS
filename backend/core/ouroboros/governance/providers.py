@@ -3214,6 +3214,129 @@ def _is_retryable_transient_error(exc: BaseException) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Route-aware extended thinking profile
+# ---------------------------------------------------------------------------
+#
+# Claude's ``extended_thinking`` API parameter lets the model burn an invisible
+# reasoning budget before emitting output. For complex/architectural ops this
+# is cheap (thinking tokens are billed at input rate) and massively improves
+# patch quality — the model writes after reasoning instead of mid-inference.
+# For trivial ops the overhead (~10s first-token latency) is net-negative.
+#
+# Rather than a single global ``JARVIS_THINKING_BUDGET`` sized for the worst
+# case, we compute a per-op profile driven by both ``task_complexity`` (from
+# ComplexityClassifier) and ``provider_route`` (from UrgencyRouter). Defaults
+# cover most cases; every knob is env-overridable for zero hardcoding.
+#
+# Defaults reflect the Manifesto §5 cost curve:
+#   - trivial    →    0 tokens  (skip thinking entirely)
+#   - simple     → 4000 tokens  (~$0.012 @ input rate)
+#   - moderate   → 8000 tokens  (~$0.024)
+#   - complex    →16000 tokens  (~$0.048)
+#   - architectural→24000 tokens(~$0.072)
+#
+# Force-on: when the task is complex/architectural, we override any global
+# "thinking disabled" setting — the user's directive ("O+V must use its
+# token budget to reason deeply before executing complex edits") takes
+# precedence over the legacy flag. Disable via JARVIS_THINKING_FORCE_ON_COMPLEX=false.
+
+_COMPLEX_TASK_COMPLEXITIES = frozenset({"complex", "heavy_code", "architectural"})
+_COMPLEX_PROVIDER_ROUTES = frozenset({"complex"})
+_ARCHITECTURAL_COMPLEXITIES = frozenset({"architectural"})
+
+
+def _compute_thinking_profile(
+    context: Any,
+    extended_thinking_default: bool,
+    base_budget: int,
+) -> Tuple[bool, int, str]:
+    """Compute route-aware extended thinking enablement and budget.
+
+    Returns ``(enabled, budget_tokens, reason)``. ``reason`` is a short
+    human-readable tag used in log messages so the decision trail is
+    visible in SerpentFlow and debug.log.
+
+    Resolution order (first hit wins):
+      1. ``task_complexity == "trivial"`` → disable (reason="trivial-skip")
+      2. ``task_complexity == "architectural"`` → force-on, architectural budget
+      3. ``task_complexity in _COMPLEX_TASK_COMPLEXITIES`` or
+         ``provider_route in _COMPLEX_PROVIDER_ROUTES`` → force-on, complex budget
+      4. ``task_complexity == "simple"`` → simple budget (if globally enabled)
+      5. ``task_complexity == "moderate"`` → moderate budget (if globally enabled)
+      6. Fallback → global default (``extended_thinking_default``, ``base_budget``)
+
+    Force-on (steps 2-3) overrides ``extended_thinking_default`` unless
+    ``JARVIS_THINKING_FORCE_ON_COMPLEX`` is explicitly set to a falsey
+    value — matching the user directive that complex ops MUST reason.
+
+    All budgets are env-overridable:
+      JARVIS_THINKING_BUDGET_TRIVIAL       (default 0 — effectively disabled)
+      JARVIS_THINKING_BUDGET_SIMPLE        (default 4000)
+      JARVIS_THINKING_BUDGET_MODERATE      (default 8000)
+      JARVIS_THINKING_BUDGET_COMPLEX       (default 16000)
+      JARVIS_THINKING_BUDGET_ARCHITECTURAL (default 24000)
+      JARVIS_THINKING_FORCE_ON_COMPLEX     (default true)
+    """
+    task_complexity = (getattr(context, "task_complexity", "") or "").lower()
+    provider_route = (getattr(context, "provider_route", "") or "").lower()
+
+    # Env-driven budgets (read every call — cheap, supports live tuning).
+    _budget_trivial = int(os.environ.get("JARVIS_THINKING_BUDGET_TRIVIAL", "0"))
+    _budget_simple = int(os.environ.get("JARVIS_THINKING_BUDGET_SIMPLE", "4000"))
+    _budget_moderate = int(os.environ.get("JARVIS_THINKING_BUDGET_MODERATE", "8000"))
+    _budget_complex = int(os.environ.get("JARVIS_THINKING_BUDGET_COMPLEX", "16000"))
+    _budget_architectural = int(
+        os.environ.get("JARVIS_THINKING_BUDGET_ARCHITECTURAL", "24000")
+    )
+    _force_on_complex = os.environ.get(
+        "JARVIS_THINKING_FORCE_ON_COMPLEX", "true"
+    ).lower() not in ("false", "0", "no", "off")
+
+    # 1. Trivial: default 0 (skip). If a user explicitly sets a
+    # JARVIS_THINKING_BUDGET_TRIVIAL > 0, honor it — some power users may
+    # want a tiny thinking budget even on trivial ops for consistency.
+    if task_complexity == "trivial":
+        if _budget_trivial > 0 and extended_thinking_default:
+            return (True, max(_budget_trivial, 1024), "trivial-explicit")
+        return (False, 0, "trivial-skip")
+
+    # 2. Architectural: highest tier, force-on.
+    if task_complexity in _ARCHITECTURAL_COMPLEXITIES:
+        if _force_on_complex or extended_thinking_default:
+            return (True, max(_budget_architectural, 1024), "architectural-force")
+        return (False, 0, "architectural-but-disabled")
+
+    # 3. Complex (complexity or route): force-on.
+    is_complex = (
+        task_complexity in _COMPLEX_TASK_COMPLEXITIES
+        or provider_route in _COMPLEX_PROVIDER_ROUTES
+    )
+    if is_complex:
+        if _force_on_complex or extended_thinking_default:
+            return (True, max(_budget_complex, 1024), "complex-force")
+        return (False, 0, "complex-but-disabled")
+
+    # Below here we respect the global default. If extended thinking is
+    # globally disabled AND the task isn't complex/architectural, we honor
+    # the off-switch.
+    if not extended_thinking_default:
+        return (False, 0, "global-disabled")
+
+    # 4. Simple: reduced budget.
+    if task_complexity == "simple":
+        return (True, max(_budget_simple, 1024), "simple")
+
+    # 5. Moderate: mid-tier budget.
+    if task_complexity == "moderate":
+        return (True, max(_budget_moderate, 1024), "moderate")
+
+    # 6. Unknown/empty task_complexity: fall back to the provider's
+    # configured base budget. This preserves pre-existing behavior for
+    # contexts that haven't been stamped by ComplexityClassifier yet.
+    return (True, max(base_budget, 1024), "default")
+
+
 class ClaudeProvider:
     """CandidateProvider adapter wrapping the Anthropic Claude API.
 
@@ -3629,15 +3752,28 @@ class ClaudeProvider:
                 context, is_tool_round=_is_tool_round,
             )
 
-            # Extended thinking: enable deep reasoning for non-tool-round calls.
-            # Tool rounds are fast JSON responses — no thinking needed.
+            # Extended thinking: route-aware deep reasoning. The profile is
+            # computed by _compute_thinking_profile() which reads both
+            # task_complexity (from ComplexityClassifier) and provider_route
+            # (from UrgencyRouter), and force-enables for complex/architectural
+            # ops regardless of the global flag — per user directive, O+V
+            # MUST reason deeply before executing complex edits.
+            #
+            # Tool rounds always skip thinking: they emit small JSON tool
+            # calls where thinking overhead (~10s) dwarfs the actual work.
             # Anthropic requires temperature=1.0 when thinking is enabled.
-            # Trivial tasks skip thinking entirely (saves 30-40s of 60s budget).
-            # Simple tasks use reduced budget (4K tokens instead of 10K).
-            _use_thinking = self._extended_thinking and not _is_tool_round
-            _task_complexity = getattr(context, "task_complexity", "")
-            if _task_complexity == "trivial":
-                _use_thinking = False
+            _use_thinking = False
+            _thinking_tokens = 0
+            _thinking_reason = "tool-round" if _is_tool_round else "no-profile"
+            if not _is_tool_round:
+                _use_thinking, _thinking_tokens, _thinking_reason = (
+                    _compute_thinking_profile(
+                        context,
+                        extended_thinking_default=self._extended_thinking,
+                        base_budget=self._thinking_budget,
+                    )
+                )
+
             # Starved-budget guard: extended thinking burns ~10s of latency
             # before the first output token. When this is a fallback call
             # after Tier 0 DW exhausted its budget, timeout_s can be ~15-20s
@@ -3651,16 +3787,19 @@ class ClaudeProvider:
             if _use_thinking and timeout_s < _THINKING_BREAKEVEN_S:
                 logger.info(
                     "[ClaudeProvider] budget %.1fs < breakeven %.1fs — "
-                    "disabling extended thinking for this call",
-                    timeout_s, _THINKING_BREAKEVEN_S,
+                    "disabling extended thinking (was %s, %d tok) for this call",
+                    timeout_s,
+                    _THINKING_BREAKEVEN_S,
+                    _thinking_reason,
+                    _thinking_tokens,
                 )
                 _use_thinking = False
+                _thinking_tokens = 0
+                _thinking_reason = "budget-starved"
+
             _temperature = 1.0 if _use_thinking else 0.2
             _thinking_param: Optional[Dict[str, Any]] = None
-            if _use_thinking:
-                _thinking_tokens = self._thinking_budget
-                if _task_complexity == "simple":
-                    _thinking_tokens = min(_thinking_tokens, 4000)
+            if _use_thinking and _thinking_tokens > 0:
                 _thinking_param = {
                     "type": "enabled",
                     "budget_tokens": _thinking_tokens,
@@ -3670,6 +3809,15 @@ class ClaudeProvider:
                 _effective_max_tokens = min(
                     max(_effective_max_tokens, _thinking_tokens + 4096),
                     self._output_ceiling,
+                )
+                logger.info(
+                    "[ClaudeProvider] extended thinking ENABLED: "
+                    "reason=%s budget=%d tok max_tokens=%d complexity=%r route=%r",
+                    _thinking_reason,
+                    _thinking_tokens,
+                    _effective_max_tokens,
+                    getattr(context, "task_complexity", ""),
+                    getattr(context, "provider_route", ""),
                 )
 
             # Prompt caching: mark the system prompt as cacheable.

@@ -124,6 +124,11 @@ class _PendingRequest:
     elicitation_options: Optional[List[str]] = None
     elicitation_answer: Optional[str] = None
     elicitation_event: Optional[asyncio.Event] = None
+    # Plan Approval Hard Gate (Phase 1b): when set, this request is for
+    # approval of a pre-GENERATE implementation plan (not a finished code
+    # candidate). Renderers should show the plan markdown instead of a
+    # unified diff. Request ID is namespaced via ``_plan_request_id``.
+    plan_text: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +320,70 @@ class CLIApprovalProvider:
             logger.info(
                 "[Approval] Pending: op_id=%s desc=%s files=%s",
                 context.op_id, context.description, context.target_files,
+            )
+        return request_id
+
+    # -- request_plan (Phase 1b: Plan Approval Hard Gate) --
+
+    @staticmethod
+    def _plan_request_id(op_id: str) -> str:
+        """Return the namespaced request id used for plan approval.
+
+        Plan approval shares the same _requests dict as code approval but
+        uses a distinct key so both can coexist for the same op. The
+        ``::plan`` suffix is a sentinel renderers check via
+        :meth:`is_plan_request`.
+        """
+        return f"{op_id}::plan"
+
+    @staticmethod
+    def is_plan_request(request_id: str) -> bool:
+        """Return True if *request_id* is a plan-variant request."""
+        return request_id.endswith("::plan")
+
+    async def request_plan(
+        self, context: OperationContext, plan_text: str
+    ) -> str:
+        """Submit an operation's implementation plan for pre-GENERATE approval.
+
+        Unlike :meth:`request` (which approves finished code), this submits
+        a model-generated plan (schema plan.1 markdown) and blocks the
+        pipeline before any tokens are burned on generation. The use case
+        is COMPLEX/ARCHITECTURAL ops where the cost of a wrong patch is
+        high — we want the human to sign off on the approach first.
+
+        Idempotent on the same ``context.op_id``: repeated calls return
+        the same plan-variant request id without overwriting ``plan_text``.
+
+        Parameters
+        ----------
+        context:
+            The operation context whose plan is being submitted.
+        plan_text:
+            The rendered plan (markdown preferred, JSON also acceptable).
+            Renderers will display this verbatim.
+
+        Returns
+        -------
+        str
+            The plan-variant request id (``<op_id>::plan``).
+        """
+        request_id = self._plan_request_id(context.op_id)
+        if request_id not in self._requests:
+            self._requests[request_id] = _PendingRequest(
+                context=context,
+                result=None,
+                event=asyncio.Event(),
+                created_at=datetime.now(tz=timezone.utc),
+                plan_text=plan_text,
+            )
+            logger.info(
+                "[Approval] Plan pending: op_id=%s desc=%s files=%s "
+                "plan_len=%d",
+                context.op_id,
+                context.description,
+                context.target_files,
+                len(plan_text),
             )
         return request_id
 
