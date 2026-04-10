@@ -962,6 +962,7 @@ class GovernedOrchestrator:
         except Exception:
             pass
 
+        _plan_result: Optional[Any] = None
         try:
             from backend.core.ouroboros.governance.plan_generator import (
                 PlanGenerator, PLAN_TIMEOUT_S,
@@ -1013,6 +1014,204 @@ class GovernedOrchestrator:
                 "[Orchestrator] PLAN phase failed for op=%s: %s; "
                 "continuing to GENERATE without plan",
                 ctx.op_id, exc,
+            )
+
+        # ---- Phase 2d: Plan Approval Hard Gate (Phase 1b) ----
+        # For COMPLEX / ARCHITECTURAL ops, pause BEFORE burning generation
+        # tokens and get human sign-off on the approach. Rejection aborts
+        # the op; approval proceeds to GENERATE. Manifesto §6 (Iron Gate):
+        # "every autonomous decision is visible" + cost protection.
+        #
+        # Env-gated, fully override-able for battle tests and CI:
+        #   JARVIS_PLAN_APPROVAL_ENABLED         (default true)
+        #   JARVIS_PLAN_APPROVAL_ROUTES          (default "complex")
+        #   JARVIS_PLAN_APPROVAL_COMPLEXITIES    (default "complex,heavy_code,architectural")
+        #   JARVIS_PLAN_APPROVAL_TIMEOUT_S       (default 600.0)
+        #   JARVIS_PLAN_APPROVAL_EXPIRE_GRACE    (default false — strict)
+        _plan_gate_enabled = os.environ.get(
+            "JARVIS_PLAN_APPROVAL_ENABLED", "true"
+        ).lower() not in ("false", "0", "no", "off")
+        _plan_gate_applied = False
+        if (
+            _plan_gate_enabled
+            and _plan_result is not None
+            and not getattr(_plan_result, "skipped", True)
+            and self._approval_provider is not None
+            and hasattr(self._approval_provider, "request_plan")
+        ):
+            _gate_routes = {
+                r.strip().lower()
+                for r in os.environ.get(
+                    "JARVIS_PLAN_APPROVAL_ROUTES", "complex"
+                ).split(",")
+                if r.strip()
+            }
+            _gate_complexities = {
+                c.strip().lower()
+                for c in os.environ.get(
+                    "JARVIS_PLAN_APPROVAL_COMPLEXITIES",
+                    "complex,heavy_code,architectural",
+                ).split(",")
+                if c.strip()
+            }
+            _route = (getattr(ctx, "provider_route", "") or "").lower()
+            _task_cx = (getattr(ctx, "task_complexity", "") or "").lower()
+            _plan_cx = (getattr(_plan_result, "complexity", "") or "").lower()
+            # OR-predicate: gate trips if ANY of (provider_route,
+            # task_complexity, plan_result.complexity) matches the filters.
+            # plan_result.complexity takes precedence because the model
+            # has just reasoned about the actual scope during PLAN phase.
+            if (
+                _route in _gate_routes
+                or _task_cx in _gate_complexities
+                or _plan_cx in _gate_complexities
+            ):
+                _plan_gate_applied = True
+                _plan_gate_timeout = float(os.environ.get(
+                    "JARVIS_PLAN_APPROVAL_TIMEOUT_S", "600.0"
+                ))
+                _expire_grace = os.environ.get(
+                    "JARVIS_PLAN_APPROVAL_EXPIRE_GRACE", "false"
+                ).lower() in ("true", "1", "yes", "on")
+
+                # Render plan as markdown for human review. Fall back to
+                # raw JSON if to_prompt_section() is unavailable.
+                try:
+                    _plan_markdown = _plan_result.to_prompt_section()
+                except Exception:
+                    _plan_markdown = _plan_result.plan_json or "(no plan)"
+
+                logger.info(
+                    "[Orchestrator] Plan Gate engaged for op=%s "
+                    "(route=%r task_cx=%r plan_cx=%r) — awaiting human",
+                    ctx.op_id, _route, _task_cx, _plan_cx,
+                )
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="plan", progress_pct=30.0,
+                        plan_gate_engaged=True,
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    _plan_req_id = await self._approval_provider.request_plan(
+                        ctx, _plan_markdown,
+                    )
+                    _plan_decision: ApprovalResult = await (
+                        self._approval_provider.await_decision(
+                            _plan_req_id, _plan_gate_timeout,
+                        )
+                    )
+                except Exception as _gate_exc:
+                    # Gate infrastructure failure — log and continue without
+                    # gating rather than blocking the pipeline forever.
+                    logger.warning(
+                        "[Orchestrator] Plan Gate infra failure for op=%s: %s; "
+                        "continuing to GENERATE without approval",
+                        ctx.op_id, _gate_exc,
+                    )
+                    _plan_decision = None  # type: ignore[assignment]
+
+                if _plan_decision is not None:
+                    if _plan_decision.status is ApprovalStatus.REJECTED:
+                        _reject_reason = (
+                            getattr(_plan_decision, "reason", "") or ""
+                        )
+                        logger.info(
+                            "[Orchestrator] Plan REJECTED for op=%s: %s",
+                            ctx.op_id, _reject_reason,
+                        )
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="plan_rejected",
+                        )
+                        await self._record_ledger(
+                            ctx,
+                            OperationState.FAILED,
+                            {
+                                "reason": "plan_rejected",
+                                "approver": _plan_decision.approver,
+                                "rejection_reason": _reject_reason,
+                                "plan_complexity": _plan_cx,
+                            },
+                        )
+                        # Persist rejection so future similar plans learn from it.
+                        if _reject_reason:
+                            try:
+                                from backend.core.ouroboros.governance.user_preference_memory import (
+                                    get_default_store,
+                                )
+                                get_default_store().record_approval_rejection(
+                                    op_id=ctx.op_id,
+                                    description=f"[PLAN] {ctx.description}",
+                                    target_files=list(ctx.target_files),
+                                    reason=_reject_reason,
+                                    approver=(
+                                        getattr(_plan_decision, "approver", "human")
+                                        or "human"
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                        # Session lesson for intra-session learning.
+                        _files_short = ", ".join(
+                            p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
+                        )
+                        self._session_lessons.append((
+                            "code",
+                            f"[PLAN REJECTED] {ctx.description[:60]} "
+                            f"({_files_short}) — human rejected the approach: "
+                            f"{_reject_reason[:80] or 'no reason given'}. "
+                            f"Reconsider strategy before retry.",
+                        ))
+                        if len(self._session_lessons) > self._session_lessons_max:
+                            self._session_lessons = (
+                                self._session_lessons[-self._session_lessons_max:]
+                            )
+                        return ctx
+
+                    if _plan_decision.status is ApprovalStatus.EXPIRED:
+                        if _expire_grace:
+                            logger.warning(
+                                "[Orchestrator] Plan Gate expired for op=%s; "
+                                "grace mode — continuing to GENERATE",
+                                ctx.op_id,
+                            )
+                        else:
+                            logger.info(
+                                "[Orchestrator] Plan Gate EXPIRED for op=%s — "
+                                "aborting (strict mode)",
+                                ctx.op_id,
+                            )
+                            ctx = ctx.advance(
+                                OperationPhase.EXPIRED,
+                                terminal_reason_code="plan_approval_expired",
+                            )
+                            await self._record_ledger(
+                                ctx,
+                                OperationState.FAILED,
+                                {"reason": "plan_approval_expired"},
+                            )
+                            return ctx
+
+                    # APPROVED (or grace on EXPIRED) — continue to GENERATE
+                    if _plan_decision.status is ApprovalStatus.APPROVED:
+                        logger.info(
+                            "[Orchestrator] Plan APPROVED for op=%s by %s",
+                            ctx.op_id, _plan_decision.approver,
+                        )
+        elif _plan_gate_enabled and _plan_result is not None and not getattr(
+            _plan_result, "skipped", True
+        ):
+            logger.debug(
+                "[Orchestrator] Plan Gate skipped for op=%s: "
+                "provider=%s has_request_plan=%s",
+                ctx.op_id,
+                type(self._approval_provider).__name__
+                if self._approval_provider
+                else "None",
+                hasattr(self._approval_provider, "request_plan"),
             )
 
         ctx = ctx.advance(OperationPhase.GENERATE)

@@ -329,3 +329,131 @@ class TestCLIApprovalProvider:
             request_id, approver="derek", reason="Changed mind"
         )
         assert result.status is ApprovalStatus.SUPERSEDED
+
+
+# ---------------------------------------------------------------------------
+# TestRequestPlan (Phase 1b: Plan Approval Hard Gate)
+# ---------------------------------------------------------------------------
+
+
+class TestRequestPlan:
+    """Plan-variant approval flow — the gate that blocks pre-GENERATE.
+
+    Plan approval uses a composite key ``{op_id}::plan`` so it can coexist
+    with code approval for the same op. SerpentApprovalProvider checks the
+    ``plan_text`` field on the pending request to decide whether to render
+    a code diff or plan markdown.
+    """
+
+    @pytest.fixture
+    def provider(self) -> CLIApprovalProvider:
+        return CLIApprovalProvider()
+
+    @pytest.fixture
+    def ctx(self) -> OperationContext:
+        return _make_context()
+
+    def test_plan_request_id_helper(self) -> None:
+        assert (
+            CLIApprovalProvider._plan_request_id("op-abc")
+            == "op-abc::plan"
+        )
+
+    def test_is_plan_request_positive(self) -> None:
+        assert CLIApprovalProvider.is_plan_request("op-abc::plan") is True
+
+    def test_is_plan_request_negative(self) -> None:
+        assert CLIApprovalProvider.is_plan_request("op-abc") is False
+
+    @pytest.mark.asyncio
+    async def test_request_plan_returns_namespaced_id(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        plan_id = await provider.request_plan(ctx, "# Plan\n- Step 1")
+        assert plan_id == f"{ctx.op_id}::plan"
+        assert plan_id != ctx.op_id
+
+    @pytest.mark.asyncio
+    async def test_request_plan_stores_plan_text(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        plan_text = "## Approach\n- Refactor auth middleware"
+        plan_id = await provider.request_plan(ctx, plan_text)
+        pending = provider._requests[plan_id]
+        assert pending.plan_text == plan_text
+
+    @pytest.mark.asyncio
+    async def test_code_request_has_no_plan_text(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        """Regular request() must NOT set plan_text (distinguishability)."""
+        code_id = await provider.request(ctx)
+        assert provider._requests[code_id].plan_text is None
+
+    @pytest.mark.asyncio
+    async def test_request_plan_and_request_coexist(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        """Same op can have both a plan request and a code request pending."""
+        code_id = await provider.request(ctx)
+        plan_id = await provider.request_plan(ctx, "# Plan")
+        assert code_id != plan_id
+        assert code_id in provider._requests
+        assert plan_id in provider._requests
+        # They are independent pending requests
+        assert provider._requests[code_id].plan_text is None
+        assert provider._requests[plan_id].plan_text == "# Plan"
+
+    @pytest.mark.asyncio
+    async def test_request_plan_idempotent(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        first = await provider.request_plan(ctx, "# First plan")
+        second = await provider.request_plan(ctx, "# Second plan (ignored)")
+        assert first == second
+        # First plan text is preserved (idempotent)
+        assert provider._requests[first].plan_text == "# First plan"
+
+    @pytest.mark.asyncio
+    async def test_plan_approve_via_standard_approve(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        """Plan requests approve via the standard approve() method,
+        using the composite key."""
+        plan_id = await provider.request_plan(ctx, "# Plan")
+        result = await provider.approve(plan_id, approver="derek")
+        assert result.status is ApprovalStatus.APPROVED
+        assert result.request_id == plan_id
+
+    @pytest.mark.asyncio
+    async def test_plan_reject_via_standard_reject(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        plan_id = await provider.request_plan(ctx, "# Plan")
+        result = await provider.reject(
+            plan_id, approver="derek", reason="Wrong approach"
+        )
+        assert result.status is ApprovalStatus.REJECTED
+        assert result.reason == "Wrong approach"
+
+    @pytest.mark.asyncio
+    async def test_plan_await_decision_blocks_until_approved(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        plan_id = await provider.request_plan(ctx, "# Plan")
+
+        async def _approve_after_delay() -> None:
+            await asyncio.sleep(0.05)
+            await provider.approve(plan_id, approver="derek")
+
+        asyncio.create_task(_approve_after_delay())
+        result = await provider.await_decision(plan_id, timeout_s=2.0)
+        assert result.status is ApprovalStatus.APPROVED
+
+    @pytest.mark.asyncio
+    async def test_plan_await_decision_timeout_expired(
+        self, provider: CLIApprovalProvider, ctx: OperationContext
+    ) -> None:
+        plan_id = await provider.request_plan(ctx, "# Plan")
+        result = await provider.await_decision(plan_id, timeout_s=0.05)
+        assert result.status is ApprovalStatus.EXPIRED
