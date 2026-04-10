@@ -92,7 +92,7 @@ import logging
 import os
 import re
 import threading
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -104,7 +104,6 @@ from typing import (
     List,
     Optional,
     Sequence,
-    Set,
     Tuple,
 )
 
@@ -682,7 +681,7 @@ class UserPreferenceStore:
                 ),
                 why=cleaned_reason[:400],
                 how_to_apply=how,
-                source=f"approval_reject:{op_id}",
+                source=f"approval_reject:{op_id}:{approver or 'human'}",
                 tags=("rejection", "approval"),
                 paths=paths,
             )
@@ -872,9 +871,7 @@ def _yaml_escape(value: str) -> str:
     the value contains a colon, a leading dash, or a newline. Everything
     else passes through.
     """
-    if value is None:
-        return "\"\""
-    s = str(value)
+    s = str(value) if value else ""
     needs_quote = (
         ":" in s
         or s.startswith("-")

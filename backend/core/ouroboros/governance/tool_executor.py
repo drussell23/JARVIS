@@ -260,12 +260,43 @@ def _extra_protected_paths() -> Tuple[str, ...]:
     return tuple(s.strip() for s in raw.split(",") if s.strip())
 
 
+def _user_pref_protected_paths() -> Tuple[str, ...]:
+    """Extra protected path substrings from the UserPreferenceStore hook.
+
+    The store registers ``_provide_protected_paths`` as a module-level
+    callback (``user_preference_memory.register_protected_path_provider``)
+    so every mutating tool call picks up the live set of FORBIDDEN_PATH
+    memories without an import-time dependency. A misbehaving provider is
+    swallowed — we prefer silent degradation to aborting an edit over a
+    buggy hook.
+    """
+    try:
+        from backend.core.ouroboros.governance.user_preference_memory import (
+            get_protected_path_provider,
+        )
+    except Exception:  # pragma: no cover — only on import breakage
+        return ()
+    provider = get_protected_path_provider()
+    if provider is None:
+        return ()
+    try:
+        raw = provider()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("user_pref protected path provider raised: %s", exc)
+        return ()
+    if not raw:
+        return ()
+    return tuple(str(p).strip() for p in raw if p and str(p).strip())
+
+
 def _is_protected_path(rel_path: str) -> Optional[str]:
     """Return a human-readable reason if ``rel_path`` is a protected path.
 
     The match is substring-based against the POSIX-form repo-relative
-    path. Returns ``None`` when the path is safe to write. The hardcoded
-    list is augmented at call time by ``JARVIS_VENOM_PROTECTED_PATHS``.
+    path. Returns ``None`` when the path is safe to write. Three layers
+    are consulted: the hardcoded list, ``JARVIS_VENOM_PROTECTED_PATHS``,
+    and any FORBIDDEN_PATH memories registered via
+    ``user_preference_memory.register_protected_path_provider``.
     """
     if not rel_path:
         return "empty path"
@@ -276,6 +307,9 @@ def _is_protected_path(rel_path: str) -> Optional[str]:
     for pat in _extra_protected_paths():
         if pat in norm:
             return f"protected path pattern {pat!r} matched (env)"
+    for pat in _user_pref_protected_paths():
+        if pat in norm:
+            return f"protected path pattern {pat!r} matched (user_pref memory)"
     return None
 
 
