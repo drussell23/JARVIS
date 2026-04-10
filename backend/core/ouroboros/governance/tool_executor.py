@@ -169,6 +169,11 @@ class ToolBackend(Protocol):
         self, call: "ToolCall", policy_ctx: PolicyContext, deadline: float,
     ) -> "ToolResult": ...
 
+    # NOTE: release_op(op_id) is optional. Backends that maintain per-op
+    # state (e.g. AsyncProcessToolBackend's executor cache for Venom edit
+    # history) should expose it; lightweight test backends may omit it.
+    # ToolLoopCoordinator accesses it via getattr with a None fallback.
+
 
 def _format_denial(tool_name: str, policy_result: PolicyResult) -> str:
     safe_name = tool_name.replace("\n", "\\n").replace("\r", "\\r")
@@ -1929,9 +1934,63 @@ class AsyncProcessToolBackend:
         self._executor_instance = _executor_instance
         self._approval_provider = approval_provider  # For ask_human tool
         self._mcp_client = mcp_client  # For MCP tool dispatch (Gap #7)
+        # Per-op ToolExecutor cache so instance-scoped state (``_files_read``,
+        # ``_edit_history``) persists across calls *within* one op. Without
+        # this, every execute_async() would create a fresh executor and the
+        # must-have-read guard on edit_file/write_file/delete_file would be
+        # reset between calls — turning #193's safety layer into a no-op.
+        # Explicit release_op() at the end of ToolLoopCoordinator.run() frees
+        # the entry; a defensive size cap prevents unbounded growth if a
+        # release call is ever missed.
+        self._executors_by_op: Dict[str, "ToolExecutor"] = {}
+        self._executor_cache_max: int = int(
+            os.environ.get("JARVIS_TOOL_EXECUTOR_CACHE_MAX", "64")
+        )
 
-    def _get_executor(self, repo_root: Path) -> "ToolExecutor":
-        return self._executor_instance or ToolExecutor(repo_root=repo_root)
+    def _get_executor(
+        self,
+        repo_root: Path,
+        op_id: Optional[str] = None,
+    ) -> "ToolExecutor":
+        """Return a ToolExecutor with per-op state persistence.
+
+        Order of precedence:
+          1. Test-path: if ``_executor_instance`` was injected, return it
+             unchanged (preserves existing test fixtures).
+          2. Production-path: if ``op_id`` is provided, return (and cache)
+             a per-op instance so state accumulates within a single op.
+          3. Fallback: return a fresh ToolExecutor (used by code paths that
+             don't supply an op_id — should be rare).
+        """
+        if self._executor_instance is not None:
+            return self._executor_instance
+        if not op_id:
+            return ToolExecutor(repo_root=repo_root)
+        cached = self._executors_by_op.get(op_id)
+        if cached is not None:
+            return cached
+        # LRU-ish safety: if cache is full, evict the oldest insertion.
+        if len(self._executors_by_op) >= self._executor_cache_max:
+            try:
+                _oldest = next(iter(self._executors_by_op))
+                self._executors_by_op.pop(_oldest, None)
+            except StopIteration:
+                pass
+        fresh = ToolExecutor(repo_root=repo_root)
+        self._executors_by_op[op_id] = fresh
+        return fresh
+
+    def release_op(self, op_id: str) -> Optional["ToolExecutor"]:
+        """Release the per-op ToolExecutor, returning it for inspection.
+
+        Callers (typically ToolLoopCoordinator.run()) use the returned
+        executor to capture ``get_edit_history()`` for ledger / postmortem
+        before the instance is dropped. Returns ``None`` if no cached
+        entry exists.
+        """
+        if not op_id:
+            return None
+        return self._executors_by_op.pop(op_id, None)
 
     async def execute_async(
         self, call: ToolCall, policy_ctx: PolicyContext, deadline: float,
@@ -1953,12 +2012,15 @@ class AsyncProcessToolBackend:
             # Async-native tools (web search, code exploration, ask_human)
             if call.name in ("web_search", "web_fetch", "code_explore", "ask_human"):
                 return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
-            return await self._run_sync_tool_async(call, policy_ctx.repo_root, timeout, cap)
+            return await self._run_sync_tool_async(
+                call, policy_ctx.repo_root, timeout, cap, op_id=policy_ctx.op_id,
+            )
 
     async def _run_sync_tool_async(
         self, call: ToolCall, repo_root: Path, timeout: float, cap: int,
+        op_id: Optional[str] = None,
     ) -> ToolResult:
-        executor = self._get_executor(repo_root)
+        executor = self._get_executor(repo_root, op_id=op_id)
         loop = asyncio.get_running_loop()
         try:
             # NOTE: wait_for cancels the Future but the thread continues running to completion.
@@ -2364,6 +2426,9 @@ class ToolLoopCoordinator:
         self._final_write_reserve_s = final_write_reserve_s
         self._last_records: List[ToolExecutionRecord] = []
         self._last_budget_plan: Optional[BudgetPlan] = None  # for telemetry/tests
+        # Edit history captured from the per-op ToolExecutor at run() exit.
+        # Populated by _finalize_run(); reset at the start of each run().
+        self._last_edit_history: List[Dict[str, Any]] = []
         self._on_tool_call = on_tool_call  # Optional callback for real-time display
         self.on_token: Optional[Callable[[str], None]] = None  # Streaming token callback
         # Cost optimization: providers can check this flag to use lower max_tokens
@@ -2379,6 +2444,42 @@ class ToolLoopCoordinator:
             os.environ.get("JARVIS_MAX_EXPLORATION_ROUNDS", "5")
         )
         self._EXPLORATION_TOOLS: frozenset = frozenset({"read_file", "search_code", "get_callers"})
+
+    def _finalize_run(self, op_id: str) -> None:
+        """Release the per-op ToolExecutor and capture its edit history.
+
+        Called at every exit path of ``run()`` (normal return, all raise
+        sites, and CancelledError re-raise). Safe to call more than once
+        per run — subsequent calls are no-ops because ``release_op`` has
+        already popped the entry.
+        """
+        released: Any = None
+        try:
+            _release = getattr(self._backend, "release_op", None)
+            if callable(_release):
+                released = _release(op_id)
+        except Exception:
+            released = None
+        if released is None:
+            return
+        try:
+            get_hist = getattr(released, "get_edit_history", None)
+            if callable(get_hist):
+                history = get_hist()
+                if isinstance(history, list):
+                    self._last_edit_history = list(history)
+        except Exception:
+            pass
+
+    def get_last_edit_history(self) -> List[Dict[str, Any]]:
+        """Return the edit history captured from the most recent run().
+
+        Each entry is a dict with keys ``tool``, ``path``, ``action``,
+        ``before_hash``, ``after_hash``, ``timestamp``. Empty list when
+        no mutations were performed or when the backend doesn't track
+        per-op state (e.g. injected ``_executor_instance`` in tests).
+        """
+        return list(self._last_edit_history)
 
     def _build_budget_plan(self, deadline: float) -> BudgetPlan:
         """Construct a ``BudgetPlan`` for this ``run()`` invocation.
@@ -2450,6 +2551,9 @@ class ToolLoopCoordinator:
             )
 
         self._last_records = []
+        # Reset per-run edit history capture. Populated in the finally
+        # block below from the per-op ToolExecutor before it's released.
+        self._last_edit_history: List[Dict[str, Any]] = []
         records: List[ToolExecutionRecord] = []
         current_prompt = prompt
         repo_root = self._policy.repo_root_for(repo)
@@ -2483,6 +2587,7 @@ class ToolLoopCoordinator:
                     plan.total_budget_s,
                 )
                 self._last_records = list(records)
+                self._finalize_run(op_id)
                 raise RuntimeError("tool_loop_max_rounds_exceeded")
 
             # Signal to provider: use lower max_tokens for tool rounds
@@ -2490,10 +2595,12 @@ class ToolLoopCoordinator:
             raw = await generate_fn(current_prompt)
             tool_calls = parse_fn(raw)
             if tool_calls is None:
+                self._finalize_run(op_id)
                 return raw, records   # Final non-tool response
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self._finalize_run(op_id)
                 raise RuntimeError("tool_loop_deadline_exceeded")
 
             # ── Final-write reserve enforcement ──
