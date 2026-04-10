@@ -1356,8 +1356,10 @@ class TheOracle:
         # Ensure cache directory exists
         OracleConfig.ORACLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Semantic index — fault isolated, never raises in __init__
-        self._semantic_index: "OracleSemanticIndex" = OracleSemanticIndex()
+        # Semantic index — DEFERRED until after graph loading to prevent
+        # concurrent C-extension heap allocation (ChromaDB + pickle).
+        # This avoids libmalloc memory corruption on macOS ARM64.
+        self._semantic_index: "OracleSemanticIndex" = None  # type: ignore[assignment]
 
         logger.info("The Oracle initialized")
 
@@ -1365,17 +1367,19 @@ class TheOracle:
         """Initialize the Oracle, loading cached data if available."""
         logger.info("Initializing The Oracle...")
 
-        # Try to load cached graph
+        # Try to load cached graph (synchronous to avoid libmalloc crash)
         if await self._load_cache():
             logger.info(f"Loaded cached graph: {self._graph._metrics['total_nodes']} nodes, "
                        f"{self._graph._metrics['total_edges']} edges")
-            self._running = True
-            self._last_indexed_monotonic_ns = time.monotonic_ns()
-            return True
+        else:
+            # No cache, do full index
+            logger.info("No cache found, performing full index...")
+            await self.full_index()
 
-        # No cache, do full index
-        logger.info("No cache found, performing full index...")
-        await self.full_index()
+        # Initialize semantic index AFTER graph loading to prevent
+        # concurrent C-extension heap allocation (ChromaDB + pickle).
+        if self._semantic_index is None:
+            self._semantic_index = OracleSemanticIndex()
 
         self._running = True
         self._last_indexed_monotonic_ns = time.monotonic_ns()
@@ -1579,13 +1583,21 @@ class TheOracle:
                 logger.warning(f"Error scanning {file_path}: {e}")
 
     async def _load_cache(self) -> bool:
-        """Load cached graph from disk."""
+        """Load cached graph from disk.
+
+        Loads synchronously (not asyncio.to_thread) to prevent concurrent
+        C-extension heap allocation with ChromaDB/torch/numpy.  At boot
+        time nothing else needs the event loop — blocking for 2-5s is
+        acceptable to avoid libmalloc memory corruption on macOS ARM64.
+
+        Note: pickle is used here for internal cache only (never untrusted
+        data) — the cache file is written by this same process.
+        """
         try:
             if OracleConfig.GRAPH_CACHE_FILE.exists():
-                data = await asyncio.to_thread(
-                    pickle.loads,
-                    OracleConfig.GRAPH_CACHE_FILE.read_bytes(),
-                )
+                _raw = OracleConfig.GRAPH_CACHE_FILE.read_bytes()
+                data = pickle.loads(_raw)  # noqa: S301 — trusted internal cache
+                del _raw  # free the raw bytes immediately
 
                 self._graph._graph = data["graph"]
                 self._graph._node_index = data["node_index"]
@@ -1602,7 +1614,15 @@ class TheOracle:
         return False
 
     async def _save_cache(self) -> None:
-        """Save graph to cache on disk."""
+        """Save graph to cache on disk.
+
+        Serializes synchronously to avoid concurrent heap allocation
+        with C extensions (same rationale as _load_cache).
+        Uses highest available protocol for better ARM64 alignment.
+
+        Note: pickle is used here for internal cache only — the graph
+        contains only our own dataclasses, not untrusted data.
+        """
         try:
             data = {
                 "graph": self._graph._graph,
@@ -1614,9 +1634,8 @@ class TheOracle:
                 "file_hashes": self._file_hashes,
             }
 
-            await asyncio.to_thread(
-                OracleConfig.GRAPH_CACHE_FILE.write_bytes,
-                pickle.dumps(data),
+            OracleConfig.GRAPH_CACHE_FILE.write_bytes(
+                pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),  # noqa: S301
             )
 
             logger.info(f"Saved cache to {OracleConfig.GRAPH_CACHE_FILE}")
