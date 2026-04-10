@@ -1789,6 +1789,75 @@ def _log_parse_failure(
         return None
 
 
+def _find_all_top_level_json(text: str) -> List[str]:
+    """Find every balanced top-level ``{...}`` JSON object in *text*, in order.
+
+    Handles the self-correction pattern where a model emits two (or more)
+    JSON objects back-to-back separated by natural-language text or
+    markdown fences (e.g. "``` Wait, I need to reconsider... ``` {...}").
+    Each returned substring is a syntactically balanced brace-matched
+    block — it may still fail ``json.loads`` if the content itself is
+    malformed, but the braces balance.
+    """
+    objects: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Skip forward to the next opening brace.
+        while i < n and text[i] != "{":
+            i += 1
+        if i >= n:
+            break
+        # Scan forward from i for the matching closing brace.
+        depth = 0
+        in_string = False
+        escape = False
+        end = -1
+        for j in range(i, n):
+            c = text[j]
+            if escape:
+                escape = False
+                continue
+            if c == "\\":
+                escape = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end < 0:
+            break  # Unbalanced — bail.
+        objects.append(text[i:end + 1])
+        i = end + 1
+    return objects
+
+
+def _pick_preferred_json_object(objects: List[str]) -> Optional[str]:
+    """Choose the "intended" JSON object from a list of candidates.
+
+    Preference order (highest first):
+    1. The LAST object containing ``"schema_version"`` — matches the
+       self-correction pattern where the model writes an initial
+       attempt, notices a mistake, then emits a corrected version.
+    2. The last object overall.
+    3. ``None`` if the list is empty.
+    """
+    if not objects:
+        return None
+    for obj in reversed(objects):
+        if '"schema_version"' in obj:
+            return obj
+    return objects[-1]
+
+
 def _extract_json_block(raw: str) -> str:
     """Extract JSON from raw model output, handling common wrapping formats.
 
@@ -1796,10 +1865,13 @@ def _extract_json_block(raw: str) -> str:
     - <think>...</think> reasoning blocks before the actual JSON
     - ```json ... ``` markdown fences
     - Leading/trailing text, explanations, or newlines
-    - Multiple JSON objects (picks the one with schema_version)
+    - Multiple JSON objects (picks the LAST with schema_version to
+      honour the model's self-correction)
 
     Extraction priority:
-    1. Direct JSON parse (raw starts with {)
+    1. Direct JSON parse (raw starts with {). When multiple top-level
+       objects are present (self-correction), prefer the last one with
+       ``schema_version``.
     2. Strip <think>...</think> blocks, then try again
     3. Markdown ```json ... ``` fences
     4. Find the outermost { ... } containing "schema_version"
@@ -1808,19 +1880,60 @@ def _extract_json_block(raw: str) -> str:
     """
     stripped = raw.strip()
 
-    # 1. Direct parse — raw is already clean JSON
+    # 1. Direct parse — raw is already (mostly) clean JSON. We still
+    # walk the text to catch the self-correction pattern (two JSON
+    # objects back-to-back), in which case we pick the last schema
+    # block so the model's corrected answer wins.
     if stripped.startswith("{"):
-        return stripped
+        objects = _find_all_top_level_json(stripped)
+        if len(objects) == 1:
+            return objects[0]
+        if len(objects) > 1:
+            logger.warning(
+                "[parse] Multi-object response detected (%d top-level "
+                "blocks) — using last schema_version block (model "
+                "self-correction pattern)",
+                len(objects),
+            )
+            picked = _pick_preferred_json_object(objects)
+            if picked is not None:
+                return picked
+        # Zero balanced objects even though the text starts with '{'
+        # (truncated response?) — fall through to heuristic paths.
 
     # 2. Strip <think>...</think> blocks (Qwen3.5 reasoning format)
     cleaned = re.sub(r"<think>.*?</think>", "", stripped, flags=re.DOTALL).strip()
     if cleaned.startswith("{"):
-        return cleaned
+        objects = _find_all_top_level_json(cleaned)
+        if len(objects) >= 1:
+            if len(objects) > 1:
+                logger.warning(
+                    "[parse] Multi-object response detected after "
+                    "<think> strip (%d blocks) — using last "
+                    "schema_version block",
+                    len(objects),
+                )
+            picked = _pick_preferred_json_object(objects)
+            if picked is not None:
+                return picked
 
-    # 3. Markdown JSON fences (greedy to capture full JSON)
-    match = re.search(r"```(?:json)?\s*\n?(\{.*\})\s*\n?```", cleaned, re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    # 3. Markdown JSON fences (greedy to capture full JSON).
+    # When multiple fences exist, honour the self-correction pattern
+    # and pick the last one that contains ``schema_version``.
+    fence_matches = re.findall(
+        r"```(?:json)?\s*\n?(\{.*?\})\s*\n?```", cleaned, re.DOTALL,
+    )
+    if fence_matches:
+        if len(fence_matches) > 1:
+            logger.warning(
+                "[parse] Multiple ```json fences detected (%d) — "
+                "using last schema_version fence",
+                len(fence_matches),
+            )
+        for fence in reversed(fence_matches):
+            if '"schema_version"' in fence:
+                return fence.strip()
+        return fence_matches[-1].strip()
 
     # 4. Find { ... } block containing "schema_version" (most likely the right one)
     schema_match = re.search(r'(\{[^{}]*"schema_version".*\})', cleaned, re.DOTALL)
