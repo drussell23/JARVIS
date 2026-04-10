@@ -46,10 +46,20 @@ _DW_MAX_TOKENS = int(os.environ.get("DOUBLEWORD_MAX_TOKENS", "16384"))
 # Complexity-aware max_tokens: lower ceilings for simpler tasks make DW
 # respond faster (fewer tokens to generate) without sacrificing quality.
 # Trivial one-liner fixes don't need 16K output tokens.
+#
+# Why 8192 for trivial (not 4096):
+# bt-2026-04-10-091829/debug.log:677 showed DW's STANDARD-demotion path
+# emitting a 7401-char JSON response that truncated mid-string for a
+# "trivial" requirements.txt op (Python 3.9→3.11 upgrade). The response
+# exceeded the 4096-token cap because the generated content was larger
+# than the 3518-byte source file (adding packages). A 4096 ceiling gives
+# roughly ~7400 chars of JSON-escaped output — exactly where it broke.
+# 8192 gives ~14.5KB headroom at ~+$0.002/op — strictly better than
+# truncated responses that cost the full op + retry.
 _DW_COMPLEXITY_MAX_TOKENS: Dict[str, int] = {
-    "trivial": 4096,
+    "trivial": 8192,
     "moderate": 8192,
-    "standard": 8192,
+    "standard": 12288,
     "complex": 16384,
     "heavy_code": 16384,
 }
@@ -928,13 +938,24 @@ class DoublewordProvider:
         # DW 397B tool loop adds 80-100s for simple tasks where one-shot suffices.
         # Claude keeps tools for simple tasks (it's the fallback and has thinking).
         _complexity = getattr(context, "task_complexity", "")
-        _eff_mt = _DW_COMPLEXITY_MAX_TOKENS.get(_complexity, self._max_tokens)
+        _ceiling = _DW_COMPLEXITY_MAX_TOKENS.get(_complexity, self._max_tokens)
+        # Dynamic budget: complexity ceiling is the floor, scale up by
+        # actual target file bytes. Matches what _generate_raw will
+        # actually pass to the API (kept in sync so the log is truthful).
+        _eff_mt = self._compute_dynamic_max_tokens(context, is_tool_round=False)
         _skip_tools = _complexity in ("trivial", "simple")
         if _skip_tools:
-            logger.info(
-                "[DoublewordProvider] \u26a1 %s task — skipping Venom tool loop "
-                "(one-shot, max_tokens=%d)", _complexity or "trivial", _eff_mt,
-            )
+            if _eff_mt > _ceiling:
+                logger.info(
+                    "[DoublewordProvider] \u26a1 %s task — skipping Venom tool loop "
+                    "(one-shot, max_tokens=%d, dynamic: +%d above %s ceiling)",
+                    _complexity or "trivial", _eff_mt, _eff_mt - _ceiling, _complexity or "trivial",
+                )
+            else:
+                logger.info(
+                    "[DoublewordProvider] \u26a1 %s task — skipping Venom tool loop "
+                    "(one-shot, max_tokens=%d)", _complexity or "trivial", _eff_mt,
+                )
         elif _eff_mt != self._max_tokens:
             logger.info(
                 "[DoublewordProvider] Complexity=%s → max_tokens=%d (default=%d)",
