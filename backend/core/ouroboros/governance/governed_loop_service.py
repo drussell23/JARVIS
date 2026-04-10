@@ -615,6 +615,13 @@ class GovernedLoopConfig:
     max_tool_rounds: int = 15
     tool_timeout_s: float = 30.0
     max_concurrent_tools: int = 2
+    # Budget-derived tool-loop timing (fixes bt-2026-04-10-045911 where
+    # max_tool_rounds × tool_timeout_s could exceed the generation budget
+    # and every IMMEDIATE op died with tool_loop_deadline_exceeded).
+    # ``None`` means "use BudgetPlan.build defaults" which derive from
+    # the actual generation budget at run() time.
+    tool_min_per_round_s: Optional[float] = None
+    tool_final_write_reserve_s: Optional[float] = None
 
     # L2 self-repair settings (RepairBudget drives the repair loop)
     repair_budget: Any = field(default_factory=_lazy_repair_budget_from_env)
@@ -692,6 +699,14 @@ class GovernedLoopConfig:
             max_tool_rounds=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "15")),
             tool_timeout_s=float(os.environ.get("JARVIS_GOVERNED_TOOL_TIMEOUT_S", "30")),
             max_concurrent_tools=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_CONCURRENT", "2")),
+            tool_min_per_round_s=(
+                float(os.environ["JARVIS_TOOL_LOOP_MIN_PER_ROUND_S"])
+                if "JARVIS_TOOL_LOOP_MIN_PER_ROUND_S" in os.environ else None
+            ),
+            tool_final_write_reserve_s=(
+                float(os.environ["JARVIS_TOOL_LOOP_FINAL_WRITE_RESERVE_S"])
+                if "JARVIS_TOOL_LOOP_FINAL_WRITE_RESERVE_S" in os.environ else None
+            ),
             repair_budget=_lazy_repair_budget_from_env(),
             l3_enabled=os.environ.get("JARVIS_GOVERNED_L3_ENABLED", "true").lower() == "true",
             max_concurrent_execution_graphs=int(
@@ -2380,6 +2395,8 @@ class GovernedLoopService:
                 max_rounds=self._config.max_tool_rounds,
                 tool_timeout_s=self._config.tool_timeout_s,
                 on_tool_call=_on_tool_call_display,
+                min_per_round_s=self._config.tool_min_per_round_s,
+                final_write_reserve_s=self._config.tool_final_write_reserve_s,
             )
 
             # Streaming token callback — pipes tokens through CommProtocol

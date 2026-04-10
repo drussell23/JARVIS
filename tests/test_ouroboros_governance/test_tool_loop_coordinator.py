@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, json, time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 import pytest
 from backend.core.ouroboros.governance.tool_executor import (
     AsyncProcessToolBackend, GoverningToolPolicy, PolicyContext, PolicyDecision,
@@ -19,7 +19,14 @@ def _patch_resp():
         "candidates": [{"candidate_id": "c1", "file_path": "src/foo.py",
                          "full_content": "x = 1\n", "rationale": "t"}]})
 
-def _parse_fn(raw: str) -> Optional[ToolCall]:
+def _parse_fn(raw: str) -> Optional[List[ToolCall]]:
+    """Parse a provider response into a list of tool calls or None.
+
+    Contract update: ``ToolLoopCoordinator.run`` passes ``parse_fn`` a
+    ``List[ToolCall]`` now (parallel-execution aware), not a single
+    ``ToolCall``. Returning a single-element list keeps these tests
+    exercising the sequential path while matching the new signature.
+    """
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
@@ -28,7 +35,9 @@ def _parse_fn(raw: str) -> Optional[ToolCall]:
         return None
     tc = data.get("tool_call", {})
     name = tc.get("name")
-    return ToolCall(name=name, arguments=tc.get("arguments", {})) if name else None
+    if not name:
+        return None
+    return [ToolCall(name=name, arguments=tc.get("arguments", {}))]
 
 def _allow_policy(repo_root):
     return GoverningToolPolicy(repo_roots={"jarvis": repo_root})
@@ -52,15 +61,18 @@ async def test_max_rounds_exceeded(tmp_path):
 
 @pytest.mark.asyncio
 async def test_budget_exceeded(tmp_path):
+    # _MAX_PROMPT_CHARS was raised from 32_768 → 131_072 for CC parity;
+    # numbers below sized so the appended tool result definitely blows the
+    # new ceiling on the first round (no auto-compaction before round 2).
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "foo.py").write_text("x" * 50_000)
+    (tmp_path / "src" / "foo.py").write_text("x" * 80_000)
     coordinator = _coordinator(tmp_path)
     responses = [_tool_resp(), _patch_resp()]
     idx = [0]
     async def generate_fn(prompt):
         i = min(idx[0], len(responses)-1); idx[0] += 1; return responses[i]
     with pytest.raises(RuntimeError, match="tool_loop_budget_exceeded"):
-        await coordinator.run(prompt="x" * 31_000, generate_fn=generate_fn,
+        await coordinator.run(prompt="x" * 120_000, generate_fn=generate_fn,
             parse_fn=_parse_fn, repo="jarvis", op_id="op-budget", deadline=time.monotonic()+30)
 
 @pytest.mark.asyncio

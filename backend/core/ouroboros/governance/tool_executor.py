@@ -1487,6 +1487,187 @@ _COMPACT_THRESHOLD_CHARS = int(
 )  # Trigger compaction at 75% of max to avoid hard crash
 
 
+# ---------------------------------------------------------------------------
+# BudgetPlan — structural per-round timeout derivation
+# ---------------------------------------------------------------------------
+#
+# Problem this solves (reference: battle test session bt-2026-04-10-045911):
+#   ToolLoopCoordinator was constructed with ``max_rounds=15`` and a hardcoded
+#   ``tool_timeout_s=30s``. Those two numbers multiply to a 450s worst-case
+#   tool-loop duration, but the IMMEDIATE generation budget is only 60s.
+#   Every op burning a single ``read_file`` round would then blow past the
+#   orchestrator's ``asyncio.wait_for`` and die with
+#   ``tool_loop_deadline_exceeded`` / ``CancelledError``, without ever
+#   returning a candidate.  **Every IMMEDIATE op in that run failed this way.**
+#
+# Fix (Manifesto §6 — the Iron Gate refuses to run a tool loop whose budget
+# contract is structurally impossible):
+#   Per-round timeouts are derived from the total generation deadline at the
+#   start of every ``run()`` call.  The rule is simple — the per-round timeout
+#   is the **fair share** of the remaining budget (minus a reserve for the
+#   final model write), clamped to [min_per_round_s, max_per_round_s], and the
+#   effective max-rounds is capped so ``min_per_round_s * rounds`` fits inside
+#   the usable budget.  Fast rounds give their unused time back to future
+#   rounds automatically because the next call re-reads ``remaining``.
+
+_DEFAULT_MIN_PER_ROUND_S = float(
+    os.environ.get("JARVIS_TOOL_LOOP_MIN_PER_ROUND_S", "2.0")
+)
+_DEFAULT_FINAL_WRITE_RESERVE_S = float(
+    os.environ.get("JARVIS_TOOL_LOOP_FINAL_WRITE_RESERVE_S", "10.0")
+)
+_BUDGET_TELEMETRY_ENABLED = os.environ.get(
+    "JARVIS_TOOL_LOOP_BUDGET_TELEMETRY", "true"
+).lower() in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class BudgetPlan:
+    """Structural budget plan for a single ``ToolLoopCoordinator.run()`` call.
+
+    All timing decisions inside the tool loop flow through a ``BudgetPlan``
+    so the per-round timeout and effective max-rounds are **derived** from
+    the total generation deadline, not independently configured.
+
+    Invariants
+    ----------
+    1. ``per_round_timeout`` is never larger than ``max_per_round_s``
+       (the configured ceiling — historically 30s).
+    2. ``per_round_timeout`` is never smaller than ``min_per_round_s``
+       (floor — 2s by default).  Below this, a tool call can't do useful
+       work, so the loop should stop instead.
+    3. ``effective_max_rounds`` is clamped so ``min_per_round_s * rounds``
+       fits within the usable budget (``total_budget_s - final_write_reserve_s``).
+    4. ``final_write_reserve_s`` is always held back from tool rounds so
+       the model has time to produce its final answer after the last tool
+       call — this is the single biggest cause of "generation succeeded
+       then got cancelled" in the prior battle test.
+
+    Example (the bt-2026-04-10-045911 regression):
+        >>> plan = BudgetPlan.build(
+        ...     total_budget_s=60.0, hard_max_rounds=15, max_per_round_s=30.0
+        ... )
+        >>> plan.effective_max_rounds  # 15 rounds × 2s floor = 30s, but only 50s usable
+        15
+        >>> plan.per_round_timeout(remaining_s=60.0, remaining_rounds=15)
+        # usable = 60 - 10 = 50; fair_share = 50 / 15 ≈ 3.33s
+        3.3333...
+        >>> plan.per_round_timeout(remaining_s=12.0, remaining_rounds=10)
+        # usable = 12 - 10 = 2; fair_share = 2 / 10 = 0.2 → clamped to min 2.0
+        2.0
+
+    Why frozen?
+        The plan is computed once per ``run()`` call and must not mutate
+        mid-loop — that would make per-round timeouts non-deterministic and
+        hide subtle bugs.  The **input** (``remaining_s``) changes; the
+        plan itself does not.
+    """
+
+    total_budget_s: float
+    final_write_reserve_s: float
+    min_per_round_s: float
+    max_per_round_s: float
+    hard_max_rounds: int
+
+    @classmethod
+    def build(
+        cls,
+        total_budget_s: float,
+        hard_max_rounds: int,
+        max_per_round_s: float,
+        final_write_reserve_s: Optional[float] = None,
+        min_per_round_s: Optional[float] = None,
+    ) -> "BudgetPlan":
+        """Construct a plan with smart defaults derived from ``total_budget_s``.
+
+        - ``final_write_reserve_s`` default: ``min(10s, 25% of budget)``.
+          For a 60s budget this reserves 10s for the final write; for a
+          20s budget it reserves 5s (25%).
+        - ``min_per_round_s`` default: ``max(1s, min(3s, budget / 20))``.
+          For a 60s budget this is 3s; for a 10s budget it is 1s.
+        - Both params are hard-clamped into sane ranges below to prevent
+          misconfiguration from producing nonsensical plans.
+        """
+        safe_total = max(float(total_budget_s), 1.0)
+        if final_write_reserve_s is None:
+            final_write_reserve_s = min(_DEFAULT_FINAL_WRITE_RESERVE_S, safe_total * 0.25)
+        if min_per_round_s is None:
+            min_per_round_s = max(1.0, min(_DEFAULT_MIN_PER_ROUND_S + 1.0, safe_total / 20.0))
+        # Clamp the reserve so it can never leave <1s of usable budget.
+        safe_reserve = max(0.0, min(float(final_write_reserve_s), safe_total - 1.0))
+        safe_min = max(0.5, float(min_per_round_s))
+        # max_per_round must be ≥ min_per_round for the clamp in
+        # per_round_timeout() to be well-ordered.
+        safe_max = max(safe_min, float(max_per_round_s))
+        return cls(
+            total_budget_s=safe_total,
+            final_write_reserve_s=safe_reserve,
+            min_per_round_s=safe_min,
+            max_per_round_s=safe_max,
+            hard_max_rounds=max(1, int(hard_max_rounds)),
+        )
+
+    @property
+    def usable_budget_s(self) -> float:
+        """Budget available for tool rounds (total minus final-write reserve)."""
+        return max(0.0, self.total_budget_s - self.final_write_reserve_s)
+
+    @property
+    def effective_max_rounds(self) -> int:
+        """Largest round count that fits at minimum per-round time.
+
+        Clamps ``hard_max_rounds`` downward when the budget is too tight
+        to actually run that many rounds.  Always returns at least 1 —
+        the loop will raise ``deadline_exceeded`` on its own if even one
+        round won't fit.
+        """
+        if self.min_per_round_s <= 0:
+            return self.hard_max_rounds
+        by_time = int(self.usable_budget_s / self.min_per_round_s)
+        return max(1, min(self.hard_max_rounds, by_time))
+
+    def per_round_timeout(
+        self, remaining_s: float, remaining_rounds: int
+    ) -> float:
+        """Derive the per-round timeout for the next tool call.
+
+        Formula::
+
+            usable      = max(0, remaining_s - final_write_reserve_s)
+            fair_share  = usable / max(1, remaining_rounds)
+            timeout     = clamp(fair_share, min_per_round_s, max_per_round_s)
+
+        This is called at the top of every round, so fast rounds
+        automatically cede their unused time to future rounds — no
+        explicit redistribution bookkeeping required.
+        """
+        usable = max(0.0, float(remaining_s) - self.final_write_reserve_s)
+        rounds_left = max(1, int(remaining_rounds))
+        fair_share = usable / rounds_left
+        return max(self.min_per_round_s, min(self.max_per_round_s, fair_share))
+
+    def should_stop_for_final_write(self, remaining_s: float) -> bool:
+        """True when remaining budget is at or below the final-write reserve.
+
+        When this returns True, the loop should stop issuing tool calls
+        and force the model to produce its final answer on the next round
+        (the ``final_write_reserve_s`` is precisely the time we held back
+        for exactly that moment).
+        """
+        return float(remaining_s) <= self.final_write_reserve_s
+
+    def describe(self) -> str:
+        """Human-readable one-liner for telemetry logs."""
+        return (
+            f"budget={self.total_budget_s:.1f}s "
+            f"reserve={self.final_write_reserve_s:.1f}s "
+            f"min/round={self.min_per_round_s:.1f}s "
+            f"max/round={self.max_per_round_s:.1f}s "
+            f"hard_rounds={self.hard_max_rounds} "
+            f"effective_rounds={self.effective_max_rounds}"
+        )
+
+
 class ToolLoopCoordinator:
     # Multi-turn tool loop coordinator.
     # All operation state is local to each run() call.
@@ -1500,12 +1681,34 @@ class ToolLoopCoordinator:
         max_rounds: int,
         tool_timeout_s: float,
         on_tool_call: Optional[Callable] = None,
+        min_per_round_s: Optional[float] = None,
+        final_write_reserve_s: Optional[float] = None,
     ) -> None:
+        """Construct the tool loop.
+
+        Parameters
+        ----------
+        max_rounds:
+            Hard safety ceiling on tool rounds.  The actual round budget
+            may be lower if ``BudgetPlan`` determines the deadline is too
+            tight — see ``BudgetPlan.effective_max_rounds``.
+        tool_timeout_s:
+            Configured **ceiling** for a single round's per-tool timeout.
+            The loop may use less than this when the overall deadline is
+            tight (budget-derived fair share).
+        min_per_round_s, final_write_reserve_s:
+            Overrides for the ``BudgetPlan`` defaults.  ``None`` means
+            "use the env-var defaults in ``BudgetPlan.build``".
+        """
         self._backend = backend
         self._policy = policy
         self._max_rounds = max_rounds
         self._tool_timeout_s = tool_timeout_s
+        # Budget plan parameters (consumed on every run() call)
+        self._min_per_round_s = min_per_round_s
+        self._final_write_reserve_s = final_write_reserve_s
         self._last_records: List[ToolExecutionRecord] = []
+        self._last_budget_plan: Optional[BudgetPlan] = None  # for telemetry/tests
         self._on_tool_call = on_tool_call  # Optional callback for real-time display
         self.on_token: Optional[Callable[[str], None]] = None  # Streaming token callback
         # Cost optimization: providers can check this flag to use lower max_tokens
@@ -1522,6 +1725,22 @@ class ToolLoopCoordinator:
         )
         self._EXPLORATION_TOOLS: frozenset = frozenset({"read_file", "search_code", "get_callers"})
 
+    def _build_budget_plan(self, deadline: float) -> BudgetPlan:
+        """Construct a ``BudgetPlan`` for this ``run()`` invocation.
+
+        Reads ``deadline - time.monotonic()`` at call time so the plan
+        reflects the **actual** budget available when the tool loop starts
+        (not when the coordinator was constructed).
+        """
+        total_budget_s = max(0.0, deadline - time.monotonic())
+        return BudgetPlan.build(
+            total_budget_s=total_budget_s,
+            hard_max_rounds=self._max_rounds,
+            max_per_round_s=self._tool_timeout_s,
+            min_per_round_s=self._min_per_round_s,
+            final_write_reserve_s=self._final_write_reserve_s,
+        )
+
     async def run(
         self,
         prompt: str,
@@ -1537,9 +1756,43 @@ class ToolLoopCoordinator:
         ``parse_fn`` returns ``None`` (final answer) or a list of ToolCall
         objects.  When the list contains multiple calls they are independent
         and are executed concurrently via ``asyncio.gather``.
+
+        Budget semantics
+        ----------------
+        At entry, a ``BudgetPlan`` is computed from ``deadline -
+        time.monotonic()``.  The plan structurally bounds three things:
+
+        1. ``effective_max_rounds`` — the true safety ceiling (≤ configured
+           ``max_rounds``), clamped so ``min_per_round_s × rounds`` fits
+           in the usable budget.
+        2. per-round timeouts — re-computed each round as
+           ``plan.per_round_timeout(remaining, remaining_rounds)``,
+           guaranteeing the sum can never exceed the generation deadline.
+        3. the final-write reserve — held back from tool rounds so the
+           model has time to produce its final answer on the last round.
+
+        When the deadline is too tight (usable budget < ``min_per_round_s``)
+        or ``effective_max_rounds`` is exhausted, the loop raises
+        ``tool_loop_max_rounds_exceeded`` so the orchestrator's retry
+        logic can intervene with a bigger budget instead of silently
+        returning a stale tool-call JSON as the "final answer".
         """
         if time.monotonic() >= deadline:
             raise RuntimeError("tool_loop_deadline_exceeded")
+
+        # ── Structural budget plan ──
+        # Built once per run() so all timing decisions are derived from
+        # the same consistent snapshot of the deadline.
+        plan = self._build_budget_plan(deadline)
+        self._last_budget_plan = plan
+        effective_max_rounds = plan.effective_max_rounds
+
+        if _BUDGET_TELEMETRY_ENABLED:
+            logger.info(
+                "[ToolLoop] op=%s BudgetPlan: %s",
+                op_id[:12] if op_id else "?",
+                plan.describe(),
+            )
 
         self._last_records = []
         records: List[ToolExecutionRecord] = []
@@ -1547,24 +1800,39 @@ class ToolLoopCoordinator:
         repo_root = self._policy.repo_root_for(repo)
 
         # Deadline-based loop: iterate until the provider produces a final
-        # answer (no tool call) or the deadline expires. max_rounds is a
-        # safety ceiling, not the primary termination condition.
+        # answer (no tool call) or the deadline expires. effective_max_rounds
+        # is the **budget-derived** safety ceiling — ≤ the configured
+        # self._max_rounds — so the two numbers can never multiply past the
+        # generation deadline.
         round_index = -1
         _explore_only_rounds = 0
+        raw: str = ""
         while True:
             round_index += 1
 
-            # Safety ceiling — prevent infinite loops even if deadline is far
-            if round_index >= self._max_rounds:
+            # Safety ceiling — prevent infinite loops AND enforce the
+            # budget-derived cap.  Raising (vs silent break-and-return) is
+            # intentional: a tool-call JSON from the last round is not a
+            # valid final answer, and silently returning it caused
+            # downstream JSON-parse cascades in bt-2026-04-10-045911.  The
+            # orchestrator's retry loop treats this raise as
+            # ``all_providers_exhausted`` and will retry with a bigger
+            # budget or different strategy.
+            if round_index >= effective_max_rounds:
                 logger.warning(
-                    "[ToolLoop] Safety ceiling reached (%d rounds), returning last response",
+                    "[ToolLoop] op=%s max rounds exceeded "
+                    "(effective=%d, hard=%d, budget=%.1fs)",
+                    op_id[:12] if op_id else "?",
+                    effective_max_rounds,
                     self._max_rounds,
+                    plan.total_budget_s,
                 )
-                break
+                self._last_records = list(records)
+                raise RuntimeError("tool_loop_max_rounds_exceeded")
 
             # Signal to provider: use lower max_tokens for tool rounds
             self.is_tool_round = (round_index > 0)
-            raw: str = await generate_fn(current_prompt)
+            raw = await generate_fn(current_prompt)
             tool_calls = parse_fn(raw)
             if tool_calls is None:
                 return raw, records   # Final non-tool response
@@ -1572,7 +1840,48 @@ class ToolLoopCoordinator:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("tool_loop_deadline_exceeded")
-            per_tool_deadline = time.monotonic() + min(self._tool_timeout_s, max(1.0, remaining))
+
+            # ── Final-write reserve enforcement ──
+            # If remaining budget is at or below the reserve, stop issuing
+            # tool calls and nudge the model to produce its final answer.
+            # Without this, the last tool round eats the write budget and
+            # the model gets cancelled mid-write.
+            if plan.should_stop_for_final_write(remaining):
+                current_prompt += (
+                    "\n\n[SYSTEM] Budget reserve reached — produce your "
+                    "final answer now without calling any more tools.\n"
+                )
+                if _BUDGET_TELEMETRY_ENABLED:
+                    logger.info(
+                        "[ToolLoop] op=%s final-write reserve triggered "
+                        "(remaining=%.1fs, reserve=%.1fs)",
+                        op_id[:12] if op_id else "?",
+                        remaining, plan.final_write_reserve_s,
+                    )
+                # Don't execute the tool calls this round — loop back so
+                # the model produces a non-tool response on the next call.
+                continue
+
+            # ── Budget-derived per-round timeout ──
+            # Fair share of remaining budget across remaining rounds,
+            # clamped to [min_per_round_s, max_per_round_s].  This is the
+            # single line that fixes bt-2026-04-10-045911: previously it
+            # was min(self._tool_timeout_s, remaining), which ignored
+            # max_rounds entirely.
+            remaining_rounds = max(1, effective_max_rounds - round_index)
+            per_round_timeout_s = plan.per_round_timeout(
+                remaining_s=remaining, remaining_rounds=remaining_rounds
+            )
+            per_tool_deadline = time.monotonic() + per_round_timeout_s
+
+            if _BUDGET_TELEMETRY_ENABLED:
+                logger.debug(
+                    "[ToolLoop] op=%s round=%d remaining=%.1fs "
+                    "rounds_left=%d per_round_timeout=%.2fs",
+                    op_id[:12] if op_id else "?",
+                    round_index, remaining, remaining_rounds,
+                    per_round_timeout_s,
+                )
 
             # Process each tool call: policy check, then execute.
             # Allowed calls are gathered for parallel execution.
@@ -1756,10 +2065,10 @@ class ToolLoopCoordinator:
             if len(current_prompt) > _MAX_PROMPT_CHARS:
                 raise RuntimeError(f"tool_loop_budget_exceeded:{len(current_prompt)}")
 
-        # Safety ceiling reached — return last raw response instead of raising.
-        # The provider may have produced useful output in the final round.
-        self._last_records = list(records)
-        return raw, records
+        # Unreachable: the loop above either returns on a final answer,
+        # raises ``tool_loop_deadline_exceeded``, raises
+        # ``tool_loop_max_rounds_exceeded`` at the safety ceiling, or
+        # raises ``tool_loop_budget_exceeded`` on prompt overflow.
 
     # ── Live context auto-compaction (Gap #8) ────────────────────────
     @staticmethod
