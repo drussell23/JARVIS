@@ -210,6 +210,142 @@ def _format_tool_result(call: "ToolCall", result: "ToolResult") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Venom edit/write tools: safety constants + Iron Gate integration
+# ---------------------------------------------------------------------------
+# Protected paths that Venom MUST NEVER write to, regardless of any policy
+# flag or model reasoning. These are the last line of defence before a
+# compromised or hallucinating model could clobber git internals, steal
+# credentials, or corrupt the venv.
+#
+# Matching is substring-based against the repo-relative POSIX path; a single
+# hit anywhere in the path blocks the write. The list is intentionally
+# conservative — accidental denial of a legitimate edit is fine, a false
+# negative is catastrophic.
+_PROTECTED_PATH_SUBSTRINGS: Tuple[str, ...] = (
+    ".git/",            # git internals (HEAD, objects/, config, hooks/, ...)
+    "/.git",            # nested .git anywhere
+    ".env",             # .env, .env.local, .env.production, ...
+    "credentials",      # credentials.json, aws_credentials, ...
+    "secret",           # secrets.json, .secret, secret_key.pem
+    "node_modules/",    # package-manager owned
+    ".venv/",           # virtualenv internals
+    "venv/",            # unprefixed virtualenv
+    ".ssh/",            # SSH private keys + authorized_keys
+    "id_rsa",           # raw private key files
+    "id_ed25519",
+    ".aws/",            # AWS creds dir
+    ".gcp/",            # GCP creds dir
+    ".pypirc",          # PyPI publish token
+    ".netrc",           # HTTP basic-auth creds
+    ".jarvis/",         # JARVIS internal state (ops logs, intake lock, ...)
+    ".ouroboros/",      # Ouroboros session state / ledger / parse failures
+)
+
+
+def _extra_protected_paths() -> Tuple[str, ...]:
+    """Extra protected path substrings from the env var.
+
+    ``JARVIS_VENOM_PROTECTED_PATHS`` is a comma-separated list of
+    substrings to add to the hardcoded list. Empty string or unset =
+    no extra paths. Useful for per-deployment secret dirs.
+    """
+    raw = os.environ.get("JARVIS_VENOM_PROTECTED_PATHS", "").strip()
+    if not raw:
+        return ()
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
+def _is_protected_path(rel_path: str) -> Optional[str]:
+    """Return a human-readable reason if ``rel_path`` is a protected path.
+
+    The match is substring-based against the POSIX-form repo-relative
+    path. Returns ``None`` when the path is safe to write. The hardcoded
+    list is augmented at call time by ``JARVIS_VENOM_PROTECTED_PATHS``.
+    """
+    if not rel_path:
+        return "empty path"
+    norm = rel_path.replace("\\", "/")
+    for pat in _PROTECTED_PATH_SUBSTRINGS:
+        if pat in norm:
+            return f"protected path pattern {pat!r} matched"
+    for pat in _extra_protected_paths():
+        if pat in norm:
+            return f"protected path pattern {pat!r} matched (env)"
+    return None
+
+
+def _run_venom_iron_gates(rel_path: str, new_content: str) -> Optional[str]:
+    """Iron Gate check for a single-file write from Venom.
+
+    Runs the ASCII strict gate and the dependency file integrity gate on
+    a synthetic single-file candidate ``{file_path, full_content}`` — the
+    same shape the orchestrator feeds them post-GENERATE. Returns a
+    formatted error reason if either gate rejects the content, or
+    ``None`` when the content passes.
+
+    Failures here are hard-blocking: the write never touches disk. The
+    gates are pure-text deterministic checks (<1ms for normal files), so
+    running them on every ``edit_file`` / ``write_file`` call is cheap
+    insurance against model hallucinations slipping past the tool loop.
+    """
+    # Lazy imports — these modules import their own env flags and we
+    # don't want to pay their load cost when the edit tools aren't used.
+    try:
+        from backend.core.ouroboros.governance.ascii_strict_gate import (
+            AsciiStrictGate,
+        )
+        from backend.core.ouroboros.governance.dependency_file_gate import (
+            check_requirements_integrity,
+            is_dependency_file,
+        )
+    except Exception as exc:  # pragma: no cover — only on import breakage
+        logger.warning("venom iron gate import failed: %s", exc)
+        return None
+
+    candidate: Dict[str, Any] = {
+        "file_path": rel_path,
+        "full_content": new_content,
+    }
+
+    # Gate 1: ASCII strict (catches Arabic/Cyrillic/etc. corruption, e.g.
+    # the bt-2026-04-10-184157 rapidفuzz incident).
+    gate = AsciiStrictGate()
+    ok, reason, _samples = gate.check(candidate)
+    if not ok:
+        return f"Iron Gate ASCII reject: {reason}"
+
+    # Gate 2: dependency file integrity (catches anthropic -> anthropichttp
+    # style hallucinated renames). Only runs for requirements files.
+    if is_dependency_file(rel_path):
+        # We need the *current* on-disk content as the baseline. We pass
+        # it as the source; the gate canonicalises both sides.
+        # The caller supplies this indirectly via the edit handler which
+        # already has the old content — so we skip it here and let the
+        # handler run it (see _edit_file / _write_file). Return safe.
+        pass
+
+    return None
+
+
+def _validate_python_syntax(rel_path: str, content: str) -> Optional[str]:
+    """AST-parse ``content`` when ``rel_path`` is a Python file.
+
+    Returns a one-line error message on SyntaxError; ``None`` otherwise
+    (including for non-Python files, where the check is a no-op).
+    """
+    if not rel_path.endswith(".py"):
+        return None
+    try:
+        ast.parse(content)
+    except SyntaxError as exc:
+        line = getattr(exc, "lineno", "?")
+        col = getattr(exc, "offset", "?")
+        msg = exc.msg if hasattr(exc, "msg") else str(exc)
+        return f"SyntaxError at {rel_path}:{line}:{col} — {msg}"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # L1 Tool-Use: Tool Manifests
 # ---------------------------------------------------------------------------
 
@@ -335,21 +471,39 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         capabilities=frozenset({"subprocess"}),
     ),
     "edit_file": ToolManifest(
-        name="edit_file", version="1.0",
-        description="Surgical text replacement: find old_text (must be unique) and replace with new_text. Like Claude Code's Edit tool.",
+        name="edit_file", version="2.0",
+        description=(
+            "Surgical text replacement like Claude Code's Edit tool. Finds "
+            "old_text (MUST be unique in the file) and replaces it with "
+            "new_text. You MUST call read_file on the target path first — "
+            "edits to files you have not read are rejected. Protected paths "
+            "(.git, .env, credentials, secrets, .ssh, node_modules, .venv) "
+            "are blocked. Writes are atomic: Iron Gates (ASCII strict + "
+            "dependency integrity) and Python AST validation run on the "
+            "new content BEFORE disk write, and any post-write sanity "
+            "failure triggers automatic rollback from an in-memory snapshot."
+        ),
         arg_schema={
-            "path":     {"type": "string"},
-            "old_text": {"type": "string"},
-            "new_text": {"type": "string"},
+            "path":     {"type": "string", "description": "Repo-relative path to an existing file"},
+            "old_text": {"type": "string", "description": "Exact text to replace (must appear exactly once)"},
+            "new_text": {"type": "string", "description": "Replacement text"},
         },
         capabilities=frozenset({"write"}),
     ),
     "write_file": ToolManifest(
-        name="write_file", version="1.0",
-        description="Create a new file or overwrite an existing file with the given content.",
+        name="write_file", version="2.0",
+        description=(
+            "Create a new file or overwrite an existing file. Like Claude "
+            "Code's Write tool. Protected paths are blocked. To OVERWRITE "
+            "an existing file you MUST call read_file on it first — blind "
+            "rewrites are rejected. New-file creation does not require a "
+            "prior read. Iron Gates (ASCII strict + dependency integrity) "
+            "and Python AST validation run on the content BEFORE disk "
+            "write; post-write failures trigger automatic rollback."
+        ),
         arg_schema={
-            "path":    {"type": "string"},
-            "content": {"type": "string"},
+            "path":    {"type": "string", "description": "Repo-relative path"},
+            "content": {"type": "string", "description": "Full file contents to write"},
         },
         capabilities=frozenset({"write"}),
     ),
@@ -399,6 +553,18 @@ class ToolExecutor:
 
     def __init__(self, repo_root: Path) -> None:
         self._repo_root = repo_root
+        # ---- Venom edit/write safety state ---------------------------------
+        # Must-have-read invariant: before editing or overwriting a file the
+        # model MUST have read it via ``read_file`` in the current tool loop.
+        # Populated on every successful ``_read_file`` call keyed by the
+        # POSIX-form repo-relative path. Instance-scoped — each new op gets
+        # its own ToolExecutor, so reads from other ops don't count.
+        self._files_read: set = set()
+        # Audit trail of every successful edit/write for the orchestrator to
+        # surface in SerpentFlow + write to the ledger after the tool loop
+        # completes. Each entry: {tool, path, action, bytes_before, bytes_after,
+        # sha256_before, sha256_after, ts}.
+        self._edit_history: List[Dict[str, Any]] = []
         self._dispatch: Dict[str, Any] = {
             "read_file": self._read_file,
             "list_symbols": self._list_symbols,
@@ -515,6 +681,17 @@ class ToolExecutor:
             )
 
         text = resolved.read_text(errors="replace")
+        # Must-have-read tracking: record the successful read against the
+        # canonical repo-relative POSIX path so subsequent edit_file /
+        # write_file calls can verify it. We key on BOTH the user-supplied
+        # path AND the canonical form so either shape validates.
+        try:
+            rel = resolved.relative_to(self._repo_root.resolve()).as_posix()
+            self._files_read.add(rel)
+        except ValueError:
+            pass
+        self._files_read.add(path_str.replace("\\", "/"))
+
         all_lines = text.splitlines(keepends=True)
         total = len(all_lines)
         selected = all_lines[lines_from - 1 : lines_to]
@@ -822,60 +999,417 @@ class ToolExecutor:
         except subprocess.TimeoutExpired:
             return f"(command timed out after {timeout:.0f}s)"
 
-    def _edit_file(self, args: Dict[str, Any]) -> str:
-        """Surgical text replacement — like Claude Code's Edit tool.
+    # ------------------------------------------------------------------
+    # Venom edit / write — hardened handlers
+    # ------------------------------------------------------------------
+    #
+    # Both handlers enforce a multi-layer safety chain BEFORE any byte
+    # touches disk:
+    #
+    #   1. Path safety: _safe_resolve (already existing) + protected path
+    #      substring block list.
+    #   2. Must-have-read: the target path must have been returned by a
+    #      successful read_file call earlier in this tool loop. New files
+    #      are exempt (you can't read what doesn't exist).
+    #   3. Iron Gate (ASCII strict): rejects any non-ASCII letter / other
+    #      unlisted codepoint in the new content. Mirrors the
+    #      post-GENERATE gate so the same protection applies whether the
+    #      model emits a patch JSON or uses the tool directly.
+    #   4. Iron Gate (dependency file integrity): for requirements.txt
+    #      writes, rejects hallucinated package renames (e.g. anthropic
+    #      -> anthropichttp). This runs against the prior on-disk content
+    #      as the baseline.
+    #   5. Python AST validation: for .py files, parse the new content
+    #      in memory and reject on SyntaxError.
+    #
+    # Post-write the handler captures a hash of the written content and
+    # verifies it against the intended content. If anything is wrong it
+    # rolls back from the pre-write snapshot (or unlinks a new file).
+    # Every successful call appends an entry to self._edit_history so
+    # the orchestrator can ledger / surface the operation.
+    # ------------------------------------------------------------------
 
-        Finds old_text (must be unique) and replaces with new_text.
-        Requires JARVIS_TOOL_EDIT_ALLOWED=true.
+    def _rel_posix(self, resolved: Path) -> str:
+        """Return the POSIX-form repo-relative path for ``resolved``."""
+        try:
+            return resolved.relative_to(self._repo_root.resolve()).as_posix()
+        except ValueError:
+            return str(resolved)
+
+    def _has_read(self, resolved: Path, path_str: str) -> bool:
+        """True iff the target was read earlier in this tool loop."""
+        rel = self._rel_posix(resolved)
+        norm = path_str.replace("\\", "/")
+        return rel in self._files_read or norm in self._files_read
+
+    def _record_edit(
+        self,
+        *,
+        tool: str,
+        rel_path: str,
+        action: str,
+        before: Optional[str],
+        after: str,
+    ) -> None:
+        """Append an audit record to ``self._edit_history`` and emit
+        a structured log line for SerpentFlow + the debug log.
+        """
+        before_hash = (
+            hashlib.sha256(before.encode("utf-8")).hexdigest()
+            if before is not None
+            else None
+        )
+        after_hash = hashlib.sha256(after.encode("utf-8")).hexdigest()
+        entry = {
+            "tool": tool,
+            "path": rel_path,
+            "action": action,
+            "bytes_before": len(before) if before is not None else 0,
+            "bytes_after": len(after),
+            "sha256_before": before_hash,
+            "sha256_after": after_hash,
+            "ts": time.time(),
+        }
+        self._edit_history.append(entry)
+        # Mirror successful writes into _files_read so the model can
+        # chain edits on a freshly-created file without an extra
+        # read_file round-trip.
+        self._files_read.add(rel_path)
+        # Structured log line — SerpentFlow pattern-matches on
+        # "Venom write:" to surface these in the live dashboard.
+        logger.info(
+            "Venom write: %s %s %s (%d -> %d bytes, sha256 %s -> %s)",
+            tool,
+            action,
+            rel_path,
+            entry["bytes_before"],
+            entry["bytes_after"],
+            (before_hash or "(new)")[:12],
+            after_hash[:12],
+        )
+
+    def get_edit_history(self) -> List[Dict[str, Any]]:
+        """Return a defensive copy of the tool loop's edit audit trail.
+
+        Each entry: ``{tool, path, action, bytes_before, bytes_after,
+        sha256_before, sha256_after, ts}``. The orchestrator can use
+        this to write ledger entries, populate SerpentFlow diffs, or
+        feed the AutoCommitter after a successful operation.
+        """
+        return [dict(e) for e in self._edit_history]
+
+    def _edit_file(self, args: Dict[str, Any]) -> str:
+        """Surgical text replacement — hardened edition.
+
+        Contract:
+          * Requires a prior ``read_file`` of the same path (must-have-read).
+          * Rejects protected paths (.git, .env, credentials, secrets, ...).
+          * old_text must appear exactly once in the file.
+          * New content is validated against Iron Gates + Python AST
+            BEFORE disk write — failures never reach the filesystem.
+          * Post-write hash mismatch triggers automatic rollback.
         """
         path_str: str = args["path"]
         old_text: str = args["old_text"]
         new_text: str = args["new_text"]
 
-        resolved = self._safe_resolve(path_str)
+        if not path_str:
+            return "(edit_file: 'path' is required)"
+        if old_text is None or new_text is None:
+            return "(edit_file: 'old_text' and 'new_text' are required)"
+
+        # --- Layer 1: path safety ------------------------------------
+        try:
+            resolved = self._safe_resolve(path_str)
+        except BlockedPathError as exc:
+            return f"(edit_file: blocked path — {exc})"
+
+        rel_path = self._rel_posix(resolved)
+        reason = _is_protected_path(rel_path)
+        if reason is not None:
+            return f"(edit_file: protected path rejected — {reason}: {rel_path})"
+
         if not resolved.exists():
-            return f"(file not found: {path_str})"
+            return (
+                f"(edit_file: file not found: {rel_path}). "
+                "Use write_file to create new files."
+            )
+        if resolved.is_dir():
+            return f"(edit_file: target is a directory: {rel_path})"
 
-        content = resolved.read_text(errors="replace")
+        # --- Layer 2: must-have-read ---------------------------------
+        if not self._has_read(resolved, path_str):
+            return (
+                f"(edit_file: must-have-read violation — call read_file({rel_path!r}) "
+                f"before editing. Venom requires you to inspect the current "
+                f"content before mutating it.)"
+            )
+
+        # --- Layer 3: read current content + uniqueness check -------
+        try:
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"(edit_file: cannot read {rel_path}: {exc})"
+
         if old_text not in content:
-            return f"(old_text not found in {path_str} — check for exact whitespace/indentation)"
-
+            return (
+                f"(edit_file: old_text not found in {rel_path} — check for "
+                "exact whitespace, indentation, and line endings)"
+            )
         count = content.count(old_text)
         if count > 1:
             return (
-                f"(old_text found {count} times in {path_str} — must be unique. "
-                f"Include more surrounding context to disambiguate.)"
+                f"(edit_file: old_text found {count} times in {rel_path} — "
+                "must be unique. Include more surrounding context to disambiguate.)"
             )
 
         new_content = content.replace(old_text, new_text, 1)
-        resolved.write_text(new_content)
+        if new_content == content:
+            return f"(edit_file: no-op — new_text equals old_text in {rel_path})"
 
-        # Compact diff summary
+        # --- Layer 4: Iron Gate ASCII strict -------------------------
+        gate_reason = _run_venom_iron_gates(rel_path, new_content)
+        if gate_reason is not None:
+            return f"(edit_file: Iron Gate rejected {rel_path} — {gate_reason})"
+
+        # --- Layer 5: Dependency file integrity ----------------------
+        try:
+            from backend.core.ouroboros.governance.dependency_file_gate import (
+                check_requirements_integrity,
+                is_dependency_file,
+            )
+            if is_dependency_file(rel_path):
+                dep_result = check_requirements_integrity(new_content, content)
+                if dep_result is not None:
+                    dep_reason, offenders = dep_result
+                    return (
+                        f"(edit_file: Iron Gate dependency integrity rejected "
+                        f"{rel_path} — {dep_reason}; offenders={offenders})"
+                    )
+        except ImportError:
+            pass
+
+        # --- Layer 6: Python AST validation --------------------------
+        ast_err = _validate_python_syntax(rel_path, new_content)
+        if ast_err is not None:
+            return f"(edit_file: AST validation failed — {ast_err})"
+
+        # --- Layer 7: write with rollback guarantee ------------------
+        snapshot = content  # pre-captured, in-memory
+        snapshot_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+        try:
+            resolved.write_text(new_content, encoding="utf-8")
+        except OSError as exc:
+            return f"(edit_file: write failed for {rel_path}: {exc})"
+
+        # Post-write sanity: hash verify
+        try:
+            verify = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            # Try rollback
+            try:
+                resolved.write_text(snapshot, encoding="utf-8")
+            except OSError:
+                pass
+            return f"(edit_file: post-write read failed for {rel_path}: {exc})"
+
+        expected_hash = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
+        actual_hash = hashlib.sha256(verify.encode("utf-8")).hexdigest()
+        if actual_hash != expected_hash:
+            # Rollback
+            try:
+                resolved.write_text(snapshot, encoding="utf-8")
+                restored = resolved.read_text(encoding="utf-8")
+                if hashlib.sha256(restored.encode("utf-8")).hexdigest() != snapshot_hash:
+                    return (
+                        f"(edit_file: post-write hash mismatch AND rollback "
+                        f"verify failed for {rel_path} — manual inspection required)"
+                    )
+            except OSError as exc:
+                return (
+                    f"(edit_file: post-write hash mismatch AND rollback write "
+                    f"failed for {rel_path}: {exc})"
+                )
+            return (
+                f"(edit_file: post-write hash mismatch for {rel_path} — "
+                "rolled back to prior content)"
+            )
+
+        # Success — record audit entry
+        self._record_edit(
+            tool="edit_file",
+            rel_path=rel_path,
+            action="edited",
+            before=content,
+            after=new_content,
+        )
+
         added = new_text.count("\n") + 1
         removed = old_text.count("\n") + 1
         return (
-            f"OK: edited {path_str}\n"
-            f"  -{removed} lines, +{added} lines"
+            f"OK: edited {rel_path}\n"
+            f"  -{removed} lines, +{added} lines\n"
+            f"  sha256 {snapshot_hash[:12]} -> {expected_hash[:12]}"
         )
 
     def _write_file(self, args: Dict[str, Any]) -> str:
-        """Create or overwrite a file — like Claude Code's Write tool.
+        """Create or overwrite a file — hardened edition.
 
-        Requires JARVIS_TOOL_EDIT_ALLOWED=true (same gate as edit_file).
+        Contract:
+          * Protected paths are rejected (.git, .env, credentials, ...).
+          * Overwriting an EXISTING file requires a prior read_file of
+            the same path. New-file creation is exempt.
+          * Iron Gates (ASCII strict + dependency integrity) and Python
+            AST validation run BEFORE disk write.
+          * Post-write hash mismatch triggers rollback (restore snapshot
+            for overwrites, unlink for new files).
         """
         path_str: str = args["path"]
         file_content: str = args["content"]
 
-        resolved = self._safe_resolve(path_str)
-        existed = resolved.exists()
+        if not path_str:
+            return "(write_file: 'path' is required)"
+        if file_content is None:
+            return "(write_file: 'content' is required)"
 
-        # Ensure parent directory exists
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(file_content)
+        # --- Layer 1: path safety ------------------------------------
+        try:
+            resolved = self._safe_resolve(path_str)
+        except BlockedPathError as exc:
+            return f"(write_file: blocked path — {exc})"
+
+        rel_path = self._rel_posix(resolved)
+        reason = _is_protected_path(rel_path)
+        if reason is not None:
+            return f"(write_file: protected path rejected — {reason}: {rel_path})"
+        # Extra check: don't write INTO a protected directory via a
+        # non-substring-matching final component (e.g. `.git-ignore` is
+        # allowed, but `foo/.git/bar` is already caught by substring).
+        # Parent path containing a protected substring is handled by the
+        # substring match above.
+
+        if resolved.is_dir():
+            return f"(write_file: target is a directory: {rel_path})"
+
+        existed = resolved.exists()
+        prior_content: Optional[str] = None
+
+        # --- Layer 2: must-have-read (for overwrites only) ----------
+        if existed:
+            if not self._has_read(resolved, path_str):
+                return (
+                    f"(write_file: must-have-read violation — call "
+                    f"read_file({rel_path!r}) before overwriting. Venom "
+                    f"requires you to inspect the current content before "
+                    f"replacing it.)"
+                )
+            try:
+                prior_content = resolved.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return f"(write_file: cannot read prior content of {rel_path}: {exc})"
+
+        # --- Layer 3: Iron Gate ASCII strict -------------------------
+        gate_reason = _run_venom_iron_gates(rel_path, file_content)
+        if gate_reason is not None:
+            return f"(write_file: Iron Gate rejected {rel_path} — {gate_reason})"
+
+        # --- Layer 4: Dependency file integrity (overwrite only) ----
+        if existed and prior_content is not None:
+            try:
+                from backend.core.ouroboros.governance.dependency_file_gate import (
+                    check_requirements_integrity,
+                    is_dependency_file,
+                )
+                if is_dependency_file(rel_path):
+                    dep_result = check_requirements_integrity(
+                        file_content, prior_content
+                    )
+                    if dep_result is not None:
+                        dep_reason, offenders = dep_result
+                        return (
+                            f"(write_file: Iron Gate dependency integrity rejected "
+                            f"{rel_path} — {dep_reason}; offenders={offenders})"
+                        )
+            except ImportError:
+                pass
+
+        # --- Layer 5: Python AST validation --------------------------
+        ast_err = _validate_python_syntax(rel_path, file_content)
+        if ast_err is not None:
+            return f"(write_file: AST validation failed — {ast_err})"
+
+        # --- Layer 6: write with rollback guarantee ------------------
+        snapshot_hash: Optional[str] = None
+        if prior_content is not None:
+            snapshot_hash = hashlib.sha256(prior_content.encode("utf-8")).hexdigest()
+
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return f"(write_file: cannot create parent dir for {rel_path}: {exc})"
+
+        try:
+            resolved.write_text(file_content, encoding="utf-8")
+        except OSError as exc:
+            return f"(write_file: write failed for {rel_path}: {exc})"
+
+        # Post-write hash verify
+        try:
+            verify = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            # Attempt rollback
+            self._rollback_write(resolved, prior_content, existed)
+            return f"(write_file: post-write read failed for {rel_path}: {exc})"
+
+        expected_hash = hashlib.sha256(file_content.encode("utf-8")).hexdigest()
+        actual_hash = hashlib.sha256(verify.encode("utf-8")).hexdigest()
+        if actual_hash != expected_hash:
+            self._rollback_write(resolved, prior_content, existed)
+            return (
+                f"(write_file: post-write hash mismatch for {rel_path} — "
+                f"rolled back {'to prior content' if existed else '(unlinked new file)'})"
+            )
+
+        # Success — record audit entry
+        action = "overwritten" if existed else "created"
+        self._record_edit(
+            tool="write_file",
+            rel_path=rel_path,
+            action=action,
+            before=prior_content,
+            after=file_content,
+        )
 
         n_lines = file_content.count("\n") + 1
-        action = "overwritten" if existed else "created"
-        return f"OK: {action} {path_str} ({n_lines} lines)"
+        before_hash_disp = (snapshot_hash[:12] + " -> ") if snapshot_hash else "(new) -> "
+        return (
+            f"OK: {action} {rel_path} ({n_lines} lines)\n"
+            f"  sha256 {before_hash_disp}{expected_hash[:12]}"
+        )
+
+    def _rollback_write(
+        self,
+        resolved: Path,
+        prior_content: Optional[str],
+        existed: bool,
+    ) -> None:
+        """Best-effort rollback helper for _write_file.
+
+        For an overwrite, restores the captured prior content. For a new
+        file, unlinks it. Never raises — errors are logged.
+        """
+        try:
+            if existed and prior_content is not None:
+                resolved.write_text(prior_content, encoding="utf-8")
+            elif not existed:
+                try:
+                    resolved.unlink()
+                except FileNotFoundError:
+                    pass
+        except OSError as exc:  # pragma: no cover — disk failure path
+            logger.error(
+                "Venom rollback failed for %s: %s", resolved, exc
+            )
 
     def _type_check(self, args: Dict[str, Any]) -> str:
         """Run pyright/mypy on specific files — returns diagnostics.
@@ -1148,7 +1682,10 @@ class GoverningToolPolicy:
                 )
 
         # Rule 12: edit_file / write_file — enabled by default under governance
-        # (Manifesto §6: risk engine + approval gates protect against bad writes)
+        # (Manifesto §6: risk engine + approval gates protect against bad writes).
+        # Defence-in-depth: we check protected paths at the policy layer as
+        # well as inside the handlers, so even a bypassed handler can't
+        # touch .git/ / .env / credentials etc.
         elif name in ("edit_file", "write_file"):
             allowed = (
                 os.environ.get("JARVIS_TOOL_EDIT_ALLOWED", "true").lower() == "true"
@@ -1160,11 +1697,26 @@ class GoverningToolPolicy:
                     detail="JARVIS_TOOL_EDIT_ALLOWED is not 'true'",
                 )
             path_arg = call.arguments.get("path", "")
-            if not path_arg or _safe_resolve_policy(path_arg, repo_root) is None:
+            resolved_path = (
+                _safe_resolve_policy(path_arg, repo_root) if path_arg else None
+            )
+            if not path_arg or resolved_path is None:
                 return PolicyResult(
                     decision=PolicyDecision.DENY,
                     reason_code="tool.denied.path_outside_repo",
                     detail=f"edit path {path_arg!r} escapes repo root",
+                )
+            # Protected path defence-in-depth
+            try:
+                rel = resolved_path.relative_to(repo_root).as_posix()
+            except ValueError:
+                rel = path_arg.replace("\\", "/")
+            prot_reason = _is_protected_path(rel)
+            if prot_reason is not None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.protected_path",
+                    detail=f"{rel}: {prot_reason}",
                 )
 
         # Rule 13: type_check — validate file paths within repo
