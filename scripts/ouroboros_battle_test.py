@@ -40,6 +40,7 @@ import logging
 import os
 import sys
 import textwrap
+import time
 import warnings
 from pathlib import Path
 
@@ -118,6 +119,148 @@ def _check_env(key: str) -> str:
 def _check_env_val(key: str, default: str = "") -> str:
     """Return the value of an env var or default."""
     return os.environ.get(key, default)
+
+
+def _reap_zombies() -> int:
+    """Detect and reap any lingering ouroboros_battle_test.py processes.
+
+    A terminal disconnect or crashed session can leave the battle test
+    running in the background, where it continues to burn API budget,
+    compete for the intake router lock, and race this new session on
+    git branches. This reaper scans for zombies at startup and kills
+    them cleanly (SIGTERM, then SIGKILL after 3s) before we boot.
+
+    Only reaps processes:
+      • whose cmdline contains ``ouroboros_battle_test.py``
+      • owned by the current UID
+      • that are not this process
+
+    Returns the number of zombies reaped.
+    """
+    try:
+        import psutil  # type: ignore[import-untyped]
+    except ImportError:
+        return 0  # Silently skip; psutil is in requirements.txt but not hard-required
+
+    my_pid = os.getpid()
+    my_ppid = os.getppid() if hasattr(os, "getppid") else None
+    my_uid = os.getuid() if hasattr(os, "getuid") else None
+
+    def _is_battle_test_proc(cmdline: list) -> bool:
+        """Strict match: a python interpreter running our script path.
+
+        We require:
+          • the first argv is a python-family executable (python/python3/pythonX),
+          • and some argv ends with ``ouroboros_battle_test.py`` as a path segment.
+
+        Substring matching is too loose — a shell or editor whose buffer
+        contains the literal filename would otherwise be reaped.
+        """
+        if not cmdline:
+            return False
+        exe = Path(str(cmdline[0])).name.lower()
+        if not exe.startswith("python"):
+            return False
+        for arg in cmdline[1:]:
+            # Match on trailing path segment so `/abs/path/ouroboros_battle_test.py`
+            # and `scripts/ouroboros_battle_test.py` both qualify, but `-c "... ouroboros_battle_test.py ..."`
+            # embedded in a code string does NOT (that lives in a single argv together
+            # with surrounding code, not as a clean path).
+            tail = Path(str(arg)).name
+            if tail == "ouroboros_battle_test.py":
+                return True
+        return False
+
+    victims: list = []
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline", "uids", "create_time"]):
+        try:
+            pid = proc.info["pid"]
+            if pid == my_pid or pid == my_ppid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            if not _is_battle_test_proc(cmdline):
+                continue
+            if my_uid is not None:
+                uids = proc.info.get("uids")
+                if uids is not None and getattr(uids, "real", my_uid) != my_uid:
+                    continue
+            victims.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if not victims:
+        return 0
+
+    print(f"\n{_BOLD}{_YELLOW}  Zombie Reaper{_RESET}")
+    print(f"{_DIM}  {'─' * 52}{_RESET}")
+    for p in victims:
+        try:
+            age_s = time.time() - p.create_time()
+            m, s = int(age_s) // 60, int(age_s) % 60
+            print(
+                f"  {_YELLOW}→{_RESET} reaping PID {p.pid} "
+                f"{_DIM}(age {m}m{s:02d}s){_RESET}"
+            )
+            p.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            print(f"  {_DIM}  skipped PID {p.pid}: {type(exc).__name__}{_RESET}")
+
+    # Wait up to 3s for graceful shutdown, then SIGKILL holdouts.
+    try:
+        alive = psutil.wait_procs(victims, timeout=3.0)[1]
+    except Exception:
+        alive = victims
+    for p in alive:
+        try:
+            p.kill()
+            print(f"  {_RED}→{_RESET} SIGKILL PID {p.pid} {_DIM}(ignored SIGTERM){_RESET}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    count = len(victims)
+    plural = "s" if count != 1 else ""
+    print(f"  {_GREEN}✓ reaped {count} zombie{plural}{_RESET}\n")
+    return count
+
+
+def _cleanup_stale_router_lock() -> None:
+    """Remove a stale ``.jarvis/intake_router.lock`` left by a crashed session.
+
+    The lock file carries ``{"pid": ..., "ts": ...}`` metadata. If the PID
+    is dead (or the file is corrupt), the intake router would already clean
+    it on startup — but doing it here first avoids a noisy retry and makes
+    the reaper banner tell the whole story in one place.
+    """
+    lock_path = _PROJECT_ROOT / ".jarvis" / "intake_router.lock"
+    if not lock_path.exists():
+        return
+    try:
+        import json as _json
+        data = _json.loads(lock_path.read_text() or "{}")
+    except (ValueError, OSError):
+        try:
+            lock_path.unlink()
+            print(f"  {_DIM}  cleaned corrupt intake_router.lock{_RESET}")
+        except OSError:
+            pass
+        return
+    pid = int(data.get("pid", 0) or 0)
+    if pid <= 0:
+        return
+    try:
+        os.kill(pid, 0)  # existence probe — no signal delivered
+        # PID is alive; leave the lock alone (router will error loudly if it's us).
+    except ProcessLookupError:
+        try:
+            lock_path.unlink()
+            print(
+                f"  {_DIM}  cleaned stale intake_router.lock "
+                f"(dead PID {pid}){_RESET}"
+            )
+        except OSError:
+            pass
+    except PermissionError:
+        pass  # Different user — leave it alone
 
 
 def _print_preflight() -> None:
@@ -481,6 +624,15 @@ def main() -> None:
     # ------------------------------------------------------------------
     _load_env_files()
     os.environ.setdefault("JARVIS_GOVERNANCE_MODE", "governed")
+
+    # ------------------------------------------------------------------
+    # Zombie reaper — kill lingering battle tests from prior sessions
+    # before they race us on API budget, git branches, and the intake
+    # router lock. Opt-out with JARVIS_BATTLE_REAP_ZOMBIES=false.
+    # ------------------------------------------------------------------
+    if os.environ.get("JARVIS_BATTLE_REAP_ZOMBIES", "true").lower() not in ("false", "0", "no", "off"):
+        _reap_zombies()
+        _cleanup_stale_router_lock()
 
     # ------------------------------------------------------------------
     # Preflight checklist

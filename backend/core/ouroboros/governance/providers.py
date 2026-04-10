@@ -94,8 +94,14 @@ _SCHEMA_VERSION_MULTI = "2c.1"
 _SCHEMA_VERSION_EXECUTION_GRAPH = "2d.1"
 _SCHEMA_VERSION_DIFF = "2b.1-diff"   # Task 4: unified-diff output for single-file tasks
 _SCHEMA_TOP_LEVEL_KEYS = frozenset({"schema_version", "candidates", "provider_metadata"})
-_CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "full_content", "rationale"})
+_CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "full_content", "rationale", "files"})
 _DIFF_CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "unified_diff", "rationale"})
+# Multi-file candidate support: when a candidate has a ``files`` list, each entry
+# is validated the same way as the single-file path. ``file_path`` and
+# ``full_content`` continue to describe the PRIMARY file (first in the list),
+# so every single-file consumer keeps working unchanged. The ``files`` list is
+# the source of truth for multi-file VALIDATE and APPLY iteration.
+_MULTI_FILE_ENTRY_KEYS = frozenset({"file_path", "full_content", "rationale"})
 
 
 def _resolve_effective_repo_root(
@@ -2395,12 +2401,69 @@ def _parse_generation_response(
             except OSError:
                 pass  # can't stat — skip length check
 
+        # Step 6b: validate optional `files` list for multi-file coordinated candidates
+        # When present, every entry must have file_path + full_content. Each entry's
+        # content is AST-checked (Python) and placeholder-scanned just like the primary
+        # file. The primary (file_path/full_content) stays authoritative so single-file
+        # consumers don't branch on the presence of `files`.
+        _multi_files_raw = cand.get("files")
+        _validated_multi_files: Optional[List[Dict[str, Any]]] = None
+        if _multi_files_raw is not None:
+            if not isinstance(_multi_files_raw, list) or not _multi_files_raw:
+                raise RuntimeError(
+                    f"{pfx}_schema_invalid:candidate_{i}_files_must_be_nonempty_list"
+                )
+            _validated_multi_files = []
+            _skip_candidate = False
+            for _fi, _fentry in enumerate(_multi_files_raw):
+                if not isinstance(_fentry, dict):
+                    raise RuntimeError(
+                        f"{pfx}_schema_invalid:candidate_{i}_files_entry_{_fi}_not_object"
+                    )
+                for _ff in ("file_path", "full_content"):
+                    if _ff not in _fentry:
+                        raise RuntimeError(
+                            f"{pfx}_schema_invalid:candidate_{i}_files_entry_{_fi}_missing_{_ff}"
+                        )
+                _fp_entry: str = _fentry["file_path"]
+                _fc_entry: str = _fentry["full_content"]
+                # AST preflight on Python files — skip bad candidate, don't hard-fail
+                if _fp_entry.endswith(".py"):
+                    try:
+                        ast.parse(_fc_entry)
+                    except SyntaxError:
+                        logger.warning(
+                            "Skipping multi-file candidate %s: SyntaxError in %s",
+                            cand["candidate_id"], _fp_entry,
+                        )
+                        _skip_candidate = True
+                        break
+                # Placeholder scan — reject summarised content in ANY file
+                _fc_lower = _fc_entry.lower()
+                if any(p.lower() in _fc_lower for p in _PLACEHOLDER_PATTERNS):
+                    logger.warning(
+                        "Skipping multi-file candidate %s: placeholder text in %s",
+                        cand["candidate_id"], _fp_entry,
+                    )
+                    _skip_candidate = True
+                    break
+                _validated_multi_files.append({
+                    "file_path": _fp_entry,
+                    "full_content": _fc_entry,
+                    "rationale": _fentry.get("rationale", ""),
+                    "file_hash": hashlib.sha256(_fc_entry.encode()).hexdigest(),
+                })
+            if _skip_candidate:
+                continue
+
         # Step 7: compute hashes and attach provenance
         candidate_hash = hashlib.sha256(full_content.encode()).hexdigest()
         enriched = dict(cand)
         enriched["candidate_hash"] = candidate_hash
         enriched["source_hash"] = source_hash
         enriched["source_path"] = source_path
+        if _validated_multi_files is not None:
+            enriched["files"] = _validated_multi_files
         validated.append(enriched)
 
     if not validated:
