@@ -2226,6 +2226,10 @@ class GovernedOrchestrator:
             {"files": list(ctx.target_files)}
         )
         if not allowed:
+            logger.warning(
+                "[Orchestrator] GATE BLOCKED: can_write=%s for op=%s files=%s",
+                reason, ctx.op_id, list(ctx.target_files)[:3],
+            )
             ctx = ctx.advance(
                 OperationPhase.CANCELLED,
                 terminal_reason_code=f"gate_blocked:{reason}",
