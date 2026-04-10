@@ -400,16 +400,39 @@ class LongTermMemoryManager:
             logger.exception(f"[LONG-TERM-MEMORY] ChromaDB init failed: {e}")
 
     async def _init_embedder(self) -> None:
-        """Initialize embedding model."""
-        try:
-            from sentence_transformers import SentenceTransformer
+        """Initialize embedding model via shared EmbeddingService singleton.
 
-            self._embedder = SentenceTransformer(self.EMBEDDING_MODEL)
-            logger.info(
-                f"[LONG-TERM-MEMORY] Embedder initialized: {self.EMBEDDING_MODEL}"
-            )
+        Uses the centralized EmbeddingService to avoid creating a second
+        SentenceTransformer instance. Multiple PyTorch/BLAS thread pools
+        cause libmalloc heap corruption on macOS ARM64 (Python 3.9).
+        """
+        try:
+            from backend.core.embedding_service import get_embedding_service
+
+            _svc = await get_embedding_service()
+            # Pre-load model so self._embedder.encode() works synchronously.
+            # EmbeddingService handles the singleton — only one load ever happens.
+            if await _svc._load_model():
+                self._embedder = _svc._model  # shared SentenceTransformer instance
+                logger.info(
+                    "[LONG-TERM-MEMORY] Embedder initialized via shared "
+                    "EmbeddingService (%s)",
+                    _svc._config.model_name,
+                )
+            else:
+                logger.warning("[LONG-TERM-MEMORY] EmbeddingService model load failed")
         except ImportError:
-            logger.warning("[LONG-TERM-MEMORY] SentenceTransformers not available")
+            # Fallback: direct SentenceTransformer (legacy, non-singleton)
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                self._embedder = SentenceTransformer(self.EMBEDDING_MODEL)
+                logger.info(
+                    "[LONG-TERM-MEMORY] Embedder initialized (direct fallback): %s",
+                    self.EMBEDDING_MODEL,
+                )
+            except ImportError:
+                logger.warning("[LONG-TERM-MEMORY] SentenceTransformers not available")
         except Exception as e:
             logger.warning(f"[LONG-TERM-MEMORY] Embedder init failed: {e}")
 

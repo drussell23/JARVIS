@@ -697,7 +697,10 @@ class UnifiedIntakeRouter:
     def _acquire_lock(self) -> None:
         """Acquire an exclusive non-blocking flock on the lock file.
 
-        Raises RouterAlreadyRunningError if another process holds the lock.
+        Writes PID + timestamp metadata so stale locks from crashed processes
+        can be detected and cleaned automatically on next startup.
+
+        Raises RouterAlreadyRunningError if another *live* process holds the lock.
         """
         lock_path = self._config.resolved_lock_path
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -706,10 +709,61 @@ class UnifiedIntakeRouter:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
-            raise RouterAlreadyRunningError(
-                f"Another router instance holds the lock at {lock_path}"
-            )
+            # Check if the holder is still alive before raising
+            if self._cleanup_stale_lock(lock_path):
+                # Stale lock removed — retry once
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(fd)
+                    raise RouterAlreadyRunningError(
+                        f"Another router instance holds the lock at {lock_path}"
+                    )
+            else:
+                raise RouterAlreadyRunningError(
+                    f"Another router instance holds the lock at {lock_path}"
+                )
+        # Write PID metadata for stale-lock detection
         self._lock_fd = fd
+        try:
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            import json as _json
+            _meta = _json.dumps({"pid": os.getpid(), "ts": time.time()})
+            os.write(fd, _meta.encode())
+            os.fsync(fd)
+        except OSError:
+            pass  # Lock is held — metadata is advisory
+
+    @staticmethod
+    def _cleanup_stale_lock(lock_path: Path) -> bool:
+        """Check if the process holding the lock is dead. Remove if so.
+
+        Returns True if a stale lock was removed.
+        """
+        try:
+            import json as _json
+            data = _json.loads(lock_path.read_text())
+            pid = data.get("pid", 0)
+            if pid and pid != os.getpid():
+                try:
+                    os.kill(pid, 0)  # signal 0 = existence check
+                except ProcessLookupError:
+                    # PID is dead — stale lock from a crashed session
+                    lock_path.unlink(missing_ok=True)
+                    logger.warning(
+                        "[IntakeRouter] Removed stale lock (dead PID %d)", pid,
+                    )
+                    return True
+                except PermissionError:
+                    pass  # PID alive, different user
+        except (ValueError, OSError, KeyError):
+            # Corrupt or empty lock file — remove it
+            lock_path.unlink(missing_ok=True)
+            logger.warning("[IntakeRouter] Removed corrupt lock file")
+            return True
+        return False
 
     def _release_lock(self) -> None:
         """Unlock and close the advisory lock file descriptor."""

@@ -1188,39 +1188,42 @@ class OracleSemanticIndex:
             return
 
         try:
-            from sentence_transformers import SentenceTransformer  # type: ignore[import]
+            # Use centralized EmbeddingService singleton — prevents multiple
+            # SentenceTransformer instances from spawning competing PyTorch/BLAS
+            # thread pools, which causes libmalloc heap corruption on macOS ARM64.
+            from backend.core.embedding_service import EmbeddingService
 
-            class _STEmbedder:
-                def __init__(self, model_name: str) -> None:
-                    self._model = SentenceTransformer(model_name)
+            class _SharedEmbedder:
+                """Adapter: wraps centralized EmbeddingService for Oracle."""
+
+                def __init__(self) -> None:
+                    self._service = EmbeddingService()  # singleton — no model load yet
 
                 async def embed(self, text: str) -> Any:
-                    import asyncio as _asyncio
-                    loop = _asyncio.get_event_loop()
-                    return await loop.run_in_executor(
-                        None, lambda: self._model.encode(text, normalize_embeddings=True)
+                    result = await self._service.encode(
+                        text, normalize=True,
                     )
+                    if result is not None and len(result) > 0:
+                        return result[0]
+                    return None
 
                 async def embed_batch(self, texts: List[str]) -> List[Any]:
-                    import asyncio as _asyncio
-                    loop = _asyncio.get_event_loop()
-                    results = await loop.run_in_executor(
-                        None,
-                        lambda: self._model.encode(
-                            texts, normalize_embeddings=True, show_progress_bar=False
-                        ),
+                    result = await self._service.encode(
+                        texts, normalize=True,
                     )
-                    return list(results)
+                    return list(result) if result is not None else []
 
-            self._embedder = _STEmbedder(OracleConfig.SEMANTIC_EMBED_MODEL)
+            self._embedder = _SharedEmbedder()
             self._available = True
             logger.info(
-                "[OracleSemanticIndex] Ready — collection '%s' at %s",
+                "[OracleSemanticIndex] Ready (shared EmbeddingService) — "
+                "collection '%s' at %s",
                 self._collection_name, self._persist_dir,
             )
         except Exception as exc:
             logger.warning(
-                "[OracleSemanticIndex] sentence-transformers unavailable: %s; semantic search disabled",
+                "[OracleSemanticIndex] EmbeddingService unavailable: %s; "
+                "semantic search disabled",
                 exc,
             )
 

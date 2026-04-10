@@ -657,6 +657,14 @@ class BattleTestHarness:
             except Exception as exc:
                 logger.warning("Trinity Consciousness failed to boot: %s", exc)
 
+            # --- Heap stabilization gate ---
+            # Oracle just initialized ChromaDB PersistentClient #1 (C extension).
+            # Force GC before GoalMemoryBridge creates PersistentClient #2 to
+            # prevent concurrent C-heap allocation that triggers libmalloc
+            # corruption on macOS ARM64 (Python 3.9).
+            import gc as _gc
+            _gc.collect()
+
             # --- Goal Memory Bridge (ChromaDB cross-session learning) ---
             try:
                 from backend.core.ouroboros.governance.goal_memory_bridge import (
