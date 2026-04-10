@@ -1342,8 +1342,24 @@ class GovernedOrchestrator:
                 except Exception:
                     pass
 
+                # Route-aware generation timeout (Manifesto §5):
+                #   IMMEDIATE: 45s  — fast reflex, don't burn budget on hung calls
+                #   STANDARD:  120s — DW primary with reasonable wait
+                #   COMPLEX:   180s — Claude planning takes longer
+                #   BACKGROUND/SPECULATIVE: 180s — no urgency
+                _route = getattr(ctx, "provider_route", "") or "standard"
+                _route_timeouts = {
+                    "immediate": 45.0,
+                    "standard": 120.0,
+                    "complex": 180.0,
+                    "background": 180.0,
+                    "speculative": 180.0,
+                }
+                _gen_timeout = _route_timeouts.get(
+                    _route, self._config.generation_timeout_s
+                )
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
-                    seconds=self._config.generation_timeout_s
+                    seconds=_gen_timeout
                 )
                 # Emit streaming=start so SerpentFlow can render the
                 # "synthesizing" header before tokens begin flowing.
@@ -1359,7 +1375,7 @@ class GovernedOrchestrator:
                 # but asyncio.wait_for is the Iron Gate (Manifesto §6).
                 generation = await asyncio.wait_for(
                     self._generator.generate(ctx, deadline),
-                    timeout=self._config.generation_timeout_s + 5.0,
+                    timeout=_gen_timeout + 5.0,
                 )
                 # Emit streaming=end to close the streaming block
                 try:
@@ -1498,7 +1514,25 @@ class GovernedOrchestrator:
                 )
                 generate_retries_remaining -= 1
                 if generate_retries_remaining < 0:
-                    # All retries exhausted
+                    # ── IMMEDIATE → STANDARD demotion ──
+                    # If IMMEDIATE exhausted Claude retries, demote to
+                    # STANDARD (DW primary → Claude fallback) for one
+                    # more attempt. Better to get a DW answer than none.
+                    if _route == "immediate":
+                        logger.info(
+                            "[Orchestrator] IMMEDIATE exhausted — demoting "
+                            "to STANDARD route for DW attempt [%s]",
+                            ctx.op_id,
+                        )
+                        object.__setattr__(ctx, "provider_route", "standard")
+                        object.__setattr__(
+                            ctx, "provider_route_reason",
+                            f"demotion:immediate_exhausted:{_err_msg[:60]}",
+                        )
+                        generate_retries_remaining = 0  # one more attempt
+                        continue
+
+                    # All retries truly exhausted
                     ctx = ctx.advance(
                         OperationPhase.CANCELLED,
                         terminal_reason_code="generation_failed",
