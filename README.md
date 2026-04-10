@@ -678,7 +678,10 @@ Core configuration. All values have sensible defaults; only `ANTHROPIC_API_KEY` 
 | `JARVIS_AUDIO_BUS_ENABLED` | `false` | Enable real-time full-duplex audio bus |
 | `JARVIS_SESSION_LESSONS_MAX` | `20` | Maximum session intelligence lessons carried forward between operations |
 | `JARVIS_VERIFY_TIMEOUT_S` | `60` | Post-apply scoped verification test timeout (seconds) |
-| `JARVIS_L2_ENABLED` | `false` | Enable L2 iterative self-repair engine |
+| `JARVIS_L2_ENABLED` | `true` | Enable L2 iterative self-repair engine (set `false` to disable) |
+| `JARVIS_EXPLORATION_GATE` | `true` | Hard-fail generation with <2 exploration tool calls |
+| `JARVIS_MIN_EXPLORATION_CALLS` | `2` | Minimum exploration tool calls required before patch |
+| `JARVIS_ASCII_GATE` | `true` | Hard-fail generation containing non-ASCII codepoints |
 | `JARVIS_L2_MAX_ITERS` | `5` | Maximum L2 repair iterations before hard stop |
 | `JARVIS_L2_TIMEBOX_S` | `120` | Total wall-clock time budget for entire repair loop |
 | `JARVIS_DEBUG` | `false` | Verbose debug logging |

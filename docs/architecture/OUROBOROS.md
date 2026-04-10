@@ -405,7 +405,7 @@ no-progress streak (2), oscillation detection (signature hash matching).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `JARVIS_L2_ENABLED` | `false` | Master switch for L2 repair |
+| `JARVIS_L2_ENABLED` | `true` | Master switch for L2 repair (set `false` to disable) |
 | `JARVIS_L2_MAX_ITERS` | `5` | Max repair iterations |
 | `JARVIS_L2_TIMEBOX_S` | `120` | Total wall-clock budget |
 | `JARVIS_L2_ITER_TEST_TIMEOUT_S` | `60` | Per-iteration test timeout |
@@ -1466,7 +1466,7 @@ The session stops on whichever fires first:
 | `JARVIS_GRADUATION_THRESHOLD` | `3` | Uses before ephemeral->permanent |
 | `JARVIS_GRADUATION_APPROVAL_TIMEOUT_S` | `1800` | Approval wait (30min) |
 | `JARVIS_MIN_GENERATION_BUDGET_S` | `30` | Minimum generation budget |
-| `JARVIS_L2_ENABLED` | `false` | Enable L2 self-repair engine |
+| `JARVIS_L2_ENABLED` | `true` | Enable L2 self-repair engine (set `false` to disable) |
 | `JARVIS_SHADOW_HARNESS_ENABLED` | `false` | Enable shadow harness |
 | `OUROBOROS_VOICE_DEBOUNCE_S` | `60` | Voice narration debounce |
 | `OUROBOROS_GCP_DAILY_BUDGET` | `0.50` | Daily cost gate budget (USD) |

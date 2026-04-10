@@ -50,7 +50,8 @@ class RepairBudget:
     ----------
     enabled : bool
         Whether L2 iterative repair is enabled. Set via ``JARVIS_L2_ENABLED``
-        (default: ``False``).
+        (default: ``True``). L2 closes the self-repair loop on validation
+        failure — Manifesto §6 threshold-triggered neuroplasticity.
     max_iterations : int
         Maximum repair iterations before hard stop. Set via ``JARVIS_L2_MAX_ITERS``
         (default: ``5``).
@@ -84,7 +85,7 @@ class RepairBudget:
         Set via ``JARVIS_L2_FLAKE_RERUNS`` (default: ``1``).
     """
 
-    enabled: bool = False
+    enabled: bool = True
     max_iterations: int = 5
     timebox_s: float = 120.0
     min_deadline_remaining_s: float = 10.0
@@ -111,9 +112,11 @@ class RepairBudget:
         RepairBudget
             Frozen budget instance with values read from environment.
         """
-        # Boolean parsing: accept "true" (case-insensitive)
-        enabled_str = os.environ.get("JARVIS_L2_ENABLED", "false").lower()
-        enabled = enabled_str == "true"
+        # Boolean parsing: L2 defaults to enabled (Manifesto §6 — the
+        # self-repair loop is load-bearing for the Ouroboros cycle).
+        # Accept explicit "false" / "0" / "no" to opt out.
+        enabled_str = os.environ.get("JARVIS_L2_ENABLED", "true").lower()
+        enabled = enabled_str not in ("false", "0", "no", "off")
 
         # Integer parsing
         max_iterations = int(os.environ.get("JARVIS_L2_MAX_ITERS", "5"))

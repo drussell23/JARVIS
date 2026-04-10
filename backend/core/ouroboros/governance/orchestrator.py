@@ -1395,6 +1395,87 @@ class GovernedOrchestrator:
                     generation = None
                     raise RuntimeError("no_candidates_returned")
 
+                # ── Iron Gate: deterministic post-generation quality checks ──
+                # Manifesto §6: agentic intelligence proposes, deterministic
+                # code validates. These checks hard-fail BEFORE validation
+                # adapters run, routing back through the GENERATE retry loop
+                # with explicit error feedback so the model learns in-flight.
+                #
+                # Gate 1 — Exploration-first enforcement (no patch without
+                # reading the codebase). Trivial ops bypass (small-surface
+                # rewrites don't need the 2-call floor).
+                _task_complexity = getattr(ctx, "task_complexity", "") or ""
+                _EXPLORATION_TOOLS = frozenset({
+                    "read_file", "search_code", "get_callers", "list_symbols",
+                    "glob_files", "list_dir",
+                })
+                _min_explore = int(os.environ.get("JARVIS_MIN_EXPLORATION_CALLS", "2"))
+                _explore_gate_enabled = (
+                    os.environ.get("JARVIS_EXPLORATION_GATE", "true").lower() == "true"
+                    and _task_complexity != "trivial"
+                )
+                if _explore_gate_enabled:
+                    _explore_count = sum(
+                        1 for _rec in (generation.tool_execution_records or ())
+                        if getattr(_rec, "tool_name", "") in _EXPLORATION_TOOLS
+                    )
+                    if _explore_count < _min_explore:
+                        _explore_err = (
+                            f"exploration_insufficient: {_explore_count}/{_min_explore} "
+                            f"exploration tool calls (expected >= {_min_explore}). "
+                            f"You MUST call read_file/search_code/get_callers at least "
+                            f"{_min_explore} times BEFORE proposing any patch. "
+                            f"Use the tool loop to read the target file and grep for "
+                            f"callers, then return your patch."
+                        )
+                        logger.warning(
+                            "[Orchestrator] Iron Gate — exploration_insufficient: "
+                            "%d/%d for op=%s",
+                            _explore_count, _min_explore, ctx.op_id[:12],
+                        )
+                        generation = None
+                        raise RuntimeError(_explore_err)
+
+                # Gate 2 — ASCII/Unicode strictness (prevent rapidفuzz-class
+                # typos where model emits non-ASCII code points in identifier
+                # positions). Deterministic scan; O(n) on candidate size.
+                _ascii_gate_enabled = (
+                    os.environ.get("JARVIS_ASCII_GATE", "true").lower() == "true"
+                )
+                if _ascii_gate_enabled:
+                    _bad_chars: list[Tuple[str, int, str]] = []
+                    for _cand in generation.candidates:
+                        _content = _cand.get("full_content", "") or _cand.get("raw_content", "")
+                        if not isinstance(_content, str):
+                            continue
+                        _fp = str(_cand.get("file_path", "?"))
+                        # Scan every codepoint; record first few offenders.
+                        for _idx, _ch in enumerate(_content):
+                            if ord(_ch) > 127:
+                                _bad_chars.append((_fp, _idx, _ch))
+                                if len(_bad_chars) >= 3:
+                                    break
+                        if _bad_chars:
+                            break
+                    if _bad_chars:
+                        _samples = ", ".join(
+                            f"{_fp}@{_idx}:U+{ord(_ch):04X}"
+                            for _fp, _idx, _ch in _bad_chars
+                        )
+                        _ascii_err = (
+                            f"ascii_corruption: non-ASCII codepoint(s) in generated "
+                            f"content [{_samples}]. ALL identifiers, keywords, and "
+                            f"module names MUST be 7-bit ASCII. String literals may "
+                            f"contain Unicode only inside explicit quotes. Re-emit "
+                            f"the file with correct ASCII spellings."
+                        )
+                        logger.warning(
+                            "[Orchestrator] Iron Gate — ascii_corruption: %s [%s]",
+                            _samples, ctx.op_id[:12],
+                        )
+                        generation = None
+                        raise RuntimeError(_ascii_err)
+
                 # Heartbeat: generation succeeded with candidates
                 try:
                     await self._stack.comm.emit_heartbeat(
@@ -1579,21 +1660,52 @@ class GovernedOrchestrator:
 
                 # Inject direct error feedback so the model knows what went wrong
                 _err_str = str(exc)
-                _error_feedback = (
-                    "## PREVIOUS GENERATION FAILED\n\n"
-                    f"Error: {_err_str[:300]}\n\n"
-                    "INSTRUCTIONS FOR RETRY:\n"
-                    "- Return schema_version '2b.1' with 'full_content' containing the COMPLETE file\n"
-                    "- Do NOT return unified diffs or patches\n"
-                    "- Ensure the JSON is valid (no trailing commas, no unquoted keys)\n"
-                    "- full_content must be the entire file, not a summary or placeholder\n"
-                )
+
+                # ── Iron Gate failures get targeted, in-flight instructions ──
+                if _err_str.startswith("exploration_insufficient"):
+                    _error_feedback = (
+                        "## PREVIOUS GENERATION REJECTED — NO EXPLORATION\n\n"
+                        f"{_err_str[:400]}\n\n"
+                        "INSTRUCTIONS FOR RETRY:\n"
+                        "- BEFORE writing any patch, call read_file on the target file(s).\n"
+                        "- Call search_code or get_callers for any function/symbol you are\n"
+                        "  about to modify so you understand its callers and tests.\n"
+                        "- Only after you have at least 2 exploration tool calls in your\n"
+                        "  tool_execution_records may you emit the final patch.\n"
+                        "- Exploration is NOT optional. Patches without context corrupt code.\n"
+                    )
+                elif _err_str.startswith("ascii_corruption"):
+                    _error_feedback = (
+                        "## PREVIOUS GENERATION REJECTED — UNICODE CORRUPTION\n\n"
+                        f"{_err_str[:400]}\n\n"
+                        "INSTRUCTIONS FOR RETRY:\n"
+                        "- The previous file contained non-ASCII characters in code\n"
+                        "  positions (identifiers, imports, keywords). This is a typo.\n"
+                        "- Re-emit the file using only 7-bit ASCII for all code tokens.\n"
+                        "- Common culprits: Arabic 'ف' for 'f', Cyrillic 'а' for 'a',\n"
+                        "  smart quotes for straight quotes.\n"
+                        "- Double-check package names (rapidfuzz, not rapidفuzz).\n"
+                    )
+                else:
+                    _error_feedback = (
+                        "## PREVIOUS GENERATION FAILED\n\n"
+                        f"Error: {_err_str[:300]}\n\n"
+                        "INSTRUCTIONS FOR RETRY:\n"
+                        "- Return schema_version '2b.1' with 'full_content' containing the COMPLETE file\n"
+                        "- Do NOT return unified diffs or patches\n"
+                        "- Ensure the JSON is valid (no trailing commas, no unquoted keys)\n"
+                        "- full_content must be the entire file, not a summary or placeholder\n"
+                    )
                 _retry_ctx_kwargs["strategic_memory_prompt"] = _error_feedback
 
                 # Record generation failure in episodic memory for downstream use
                 if _episodic_memory is not None:
                     _gen_failure_class = "content"
-                    if "json_parse_error" in _err_str:
+                    if "exploration_insufficient" in _err_str:
+                        _gen_failure_class = "exploration"
+                    elif "ascii_corruption" in _err_str:
+                        _gen_failure_class = "ascii"
+                    elif "json_parse_error" in _err_str:
                         _gen_failure_class = "json_parse"
                     elif "diff_apply_failed" in _err_str:
                         _gen_failure_class = "diff_apply"
@@ -3809,6 +3921,106 @@ class GovernedOrchestrator:
             })
             return ("fatal", ctx)
 
+    @staticmethod
+    def _validate_config_file_format(
+        file_path_str: str, content: str,
+    ) -> Optional[str]:
+        """Deterministic pre-APPLY format check for common config files.
+
+        Manifesto §6 Iron Gate: deterministic perimeter around agentic
+        generation. When the model emits requirements.txt, package.json,
+        or similar, a single typo or Unicode corruption would otherwise
+        only surface at APPLY (pip install, npm install, etc.). This
+        check catches malformed configs BEFORE the change reaches disk.
+
+        Returns ``None`` if the file looks well-formed, or a human-readable
+        error string if it does not. Unknown file extensions pass through.
+
+        Parameters
+        ----------
+        file_path_str : str
+            Path or basename of the target file (used for extension dispatch).
+        content : str
+            Full proposed content.
+        """
+        if not isinstance(content, str):
+            return "config_format: content is not a string"
+
+        _name = Path(file_path_str).name.lower()
+        _suffix = Path(file_path_str).suffix.lower()
+
+        # requirements.txt family
+        if _name.startswith("requirements") and _suffix == ".txt":
+            for _lineno, _raw in enumerate(content.splitlines(), start=1):
+                _line = _raw.strip()
+                if not _line or _line.startswith("#"):
+                    continue
+                # Strip inline comments
+                if " #" in _line:
+                    _line = _line.split(" #", 1)[0].strip()
+                # Skip directives (-r, -e, --index-url, etc.)
+                if _line.startswith("-"):
+                    continue
+                # Skip URLs and VCS refs
+                if "://" in _line or _line.startswith(("git+", "hg+", "bzr+", "svn+")):
+                    continue
+                # First token is the distribution name — must start with an
+                # ASCII letter/digit and contain only PEP 503 normalizable
+                # chars (letters, digits, dash, underscore, dot).
+                _first = _line.split(";", 1)[0]  # drop environment marker
+                # Split on any version/extras separator
+                _pkg_name = ""
+                for _ch in _first:
+                    if _ch.isalnum() or _ch in "-_.":
+                        _pkg_name += _ch
+                    else:
+                        break
+                if not _pkg_name:
+                    return (
+                        f"requirements.txt line {_lineno}: could not parse "
+                        f"package name from {_raw[:60]!r}"
+                    )
+                # Check for non-ASCII codepoints anywhere in the line (the
+                # rapidفuzz class of typo). The global ASCII gate also
+                # catches this earlier, but belt-and-suspenders is cheap.
+                for _ch in _raw:
+                    if ord(_ch) > 127:
+                        return (
+                            f"requirements.txt line {_lineno}: non-ASCII "
+                            f"codepoint U+{ord(_ch):04X} — likely typo "
+                            f"in package name {_raw[:60]!r}"
+                        )
+            return None
+
+        # JSON family
+        if _suffix in (".json",) or _name in (
+            "package.json", "tsconfig.json", "composer.json",
+        ):
+            import json as _json
+            try:
+                _json.loads(content)
+            except _json.JSONDecodeError as exc:
+                return (
+                    f"{_name}: invalid JSON at line {exc.lineno} "
+                    f"col {exc.colno}: {exc.msg[:120]}"
+                )
+            return None
+
+        # YAML (only if PyYAML is available; otherwise pass through)
+        if _suffix in (".yml", ".yaml"):
+            try:
+                import yaml as _yaml  # type: ignore  # noqa: PLC0415
+                try:
+                    _yaml.safe_load(content)
+                except _yaml.YAMLError as exc:  # type: ignore[attr-defined]
+                    return f"{_name}: invalid YAML: {str(exc)[:180]}"
+            except ImportError:
+                pass  # yaml not installed — skip check
+            return None
+
+        # Unknown extension — pass through (no gate)
+        return None
+
     async def _run_validation(
         self,
         ctx: OperationContext,
@@ -3896,16 +4108,35 @@ class GovernedOrchestrator:
             except Exception as exc:
                 logger.debug("[Orchestrator] Duplication check skipped: %s", exc)
 
-        # Non-code files (docs, configs, etc.) need no test/syntax runner
+        # Non-code files (docs, configs, etc.) need no test/syntax runner,
+        # but structured config files get a format sanity check so that
+        # generation-quality failures (malformed deps, bad JSON, etc.) are
+        # caught at VALIDATE instead of blowing up post-APPLY. This is the
+        # pre-APPLY deterministic gate described in Manifesto §6.
         _RUNNABLE_EXTENSIONS = {".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}
         if Path(target_file_str).suffix not in _RUNNABLE_EXTENSIONS:
+            _cfg_err = self._validate_config_file_format(target_file_str, content)
+            if _cfg_err is not None:
+                logger.warning(
+                    "[Orchestrator] config-format gate rejected %s: %s",
+                    target_file_str, _cfg_err[:160],
+                )
+                return ValidationResult(
+                    passed=False,
+                    best_candidate=None,
+                    validation_duration_s=0.0,
+                    error=_cfg_err,
+                    failure_class="build",
+                    short_summary=f"config-format: {_cfg_err[:240]}",
+                    adapter_names_run=(),
+                )
             return ValidationResult(
                 passed=True,
                 best_candidate=candidate,
                 validation_duration_s=0.0,
                 error=None,
                 failure_class=None,
-                short_summary="validation skipped: non-code file",
+                short_summary="validation skipped: non-code file (format-checked)",
                 adapter_names_run=(),
             )
 
