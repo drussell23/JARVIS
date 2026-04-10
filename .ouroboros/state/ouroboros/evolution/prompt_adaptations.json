@@ -1,9 +1,18 @@
 {
-  "adaptations": {},
+  "adaptations": {
+    "test_fix::.py": [
+      {
+        "domain_key": "test_fix::.py",
+        "adapted_instruction": "WARNING: This domain has a 100% failure rate over 5 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (100%)",
+        "created_at": 1775857114.226712
+      }
+    ]
+  },
   "stats": {
     "test_fix::.py": {
       "success": 0,
-      "failure": 1
+      "failure": 5
     }
   }
 }

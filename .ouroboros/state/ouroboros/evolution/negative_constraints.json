@@ -7,6 +7,38 @@
       "source_op_id": "op-001",
       "severity": "soft",
       "created_at": 1775796020.134206
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"saga_stuck\"",
+      "reason": "Operation op-001 failed: saga_stuck",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1775856637.505932
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"saga_stuck\"",
+      "reason": "Operation op-001 failed: saga_stuck",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1775856789.213846
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"saga_stuck\"",
+      "reason": "Operation op-001 failed: saga_stuck",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1775856943.78254
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"saga_stuck\"",
+      "reason": "Operation op-001 failed: saga_stuck",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1775857114.227544
     }
   ]
 }

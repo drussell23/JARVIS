@@ -2722,6 +2722,7 @@ class ToolLoopCoordinator:
                             status=ToolExecStatus.CANCELLED,
                         ))
                         self._last_records = list(records)
+                        self._finalize_run(op_id)
                         raise
                     ended_ns = time.time_ns()
                     exec_results = [(tc, tool_result, c_id, t_ver, started_ns, ended_ns)]
@@ -2737,6 +2738,7 @@ class ToolLoopCoordinator:
                     unwrapped = []
                     for i, res in enumerate(exec_results):
                         if isinstance(res, asyncio.CancelledError):
+                            self._finalize_run(op_id)
                             raise res
                         if isinstance(res, BaseException):
                             tc_err, _, c_id_err, t_ver_err = pending_execs[i]
@@ -2825,6 +2827,7 @@ class ToolLoopCoordinator:
                 )
 
             if len(current_prompt) > _MAX_PROMPT_CHARS:
+                self._finalize_run(op_id)
                 raise RuntimeError(f"tool_loop_budget_exceeded:{len(current_prompt)}")
 
         # Unreachable: the loop above either returns on a final answer,
