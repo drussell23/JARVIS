@@ -57,13 +57,22 @@ Deterministic routing based on signal urgency + source + task complexity. Stampe
 | BACKGROUND | DW only, no Claude fallback | ~$0.002/op | OpportunityMiner, DocStaleness, TODOs, backlog |
 | SPECULATIVE | DW batch fire-and-forget | ~$0.001/op | IntentDiscovery, DreamEngine pre-computation |
 
-### Timeout Enforcement
+### Timeout Enforcement (Route-Aware)
 
-- **Generation**: `asyncio.wait_for(timeout=180s + 5s grace)` in orchestrator
+- **IMMEDIATE generation**: 45s + 5s grace (fast reflex — don't burn budget on hung calls)
+- **STANDARD generation**: 120s + 5s grace
+- **COMPLEX/BACKGROUND generation**: 180s + 5s grace
 - **Fallback provider**: Hard cap at 60s (`_FALLBACK_MAX_TIMEOUT_S`)
 - **Tier 1 reserve**: 25s minimum (not 45s -- reduced to avoid starving Tier 0)
 - **DW poll interval**: 5s (not 15s)
 - **pytest (TestWatcher)**: 30s timeout
+- **IMMEDIATE → STANDARD demotion**: After Claude exhausts retries on IMMEDIATE, demotes to STANDARD (DW primary) for one more attempt
+
+### Worker Pool
+
+- **BackgroundAgentPool**: 3 workers (env: `JARVIS_BG_POOL_SIZE`), PriorityQueue (16 slots)
+- **Priority ordering**: IMMEDIATE(1) > STANDARD/COMPLEX(3) > BACKGROUND(5) > SPECULATIVE(7)
+- **Venom tool loop**: Enabled for IMMEDIATE/STANDARD/COMPLEX routes; skipped for BACKGROUND/SPECULATIVE (cost optimization)
 
 ### 16 Autonomous Sensors
 
