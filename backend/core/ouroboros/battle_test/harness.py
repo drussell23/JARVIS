@@ -815,6 +815,16 @@ class BattleTestHarness:
         elif cmd.startswith("/risk") or cmd.startswith("risk "):
             # /risk is handled entirely in SerpentREPL (env var only)
             pass
+        elif (
+            cmd.startswith("/memory")
+            or cmd.startswith("memory ")
+            or cmd == "memory"
+        ):
+            self._repl_cmd_memory(command.strip())
+        elif cmd.startswith("/remember") or cmd.startswith("remember "):
+            self._repl_cmd_remember(command.strip())
+        elif cmd.startswith("/forget") or cmd.startswith("forget "):
+            self._repl_cmd_forget(command.strip())
         else:
             logger.debug("Unknown REPL command: %s", cmd)
 
@@ -1008,6 +1018,237 @@ class BattleTestHarness:
             self._repl_print(
                 "[dim]Usage: /goal | /goal add <description> | /goal remove <id>[/dim]"
             )
+
+    # -- UserPreferenceMemory sub-commands -------------------------------
+
+    def _user_pref_store(self):
+        """Return the process-wide UserPreferenceStore singleton.
+
+        Lazy import so the harness keeps booting on older checkouts
+        where the module is absent. Returns ``None`` on import failure.
+        """
+        try:
+            from backend.core.ouroboros.governance.user_preference_memory import (
+                get_default_store,
+            )
+        except ImportError:
+            self._repl_print("[red]UserPreferenceStore not available[/red]")
+            return None
+        try:
+            return get_default_store(self._config.repo_path)
+        except Exception as exc:  # noqa: BLE001
+            self._repl_print(f"[red]Store init failed: {exc}[/red]")
+            return None
+
+    def _repl_cmd_memory(self, line: str) -> None:
+        """Manage UserPreferenceStore memories at runtime.
+
+        Usage:
+          /memory                           — list all memories
+          /memory list [type]               — list (optionally filter by type)
+          /memory add <type> <name> | <desc>  — add a memory
+          /memory rm <id>                   — remove a memory by id
+          /memory forbid <path>             — shortcut: add FORBIDDEN_PATH memory
+          /memory show <id>                 — print a single memory's content
+
+        The ``type`` argument accepts any of user/feedback/project/reference/
+        forbidden_path/style. The ``name`` is slugified into the memory id.
+        """
+        from backend.core.ouroboros.governance.user_preference_memory import (
+            MemoryType,
+        )
+
+        store = self._user_pref_store()
+        if store is None:
+            return
+
+        parts = line.replace("/memory", "memory", 1).split(None, 2)
+        subcmd = parts[1].strip().lower() if len(parts) > 1 else "list"
+        rest = parts[2].strip() if len(parts) > 2 else ""
+
+        if subcmd == "list":
+            mem_filter: Optional[MemoryType] = None
+            if rest:
+                try:
+                    mem_filter = MemoryType.from_str(rest)
+                except Exception:
+                    mem_filter = None
+            mems = (
+                store.find_by_type(mem_filter) if mem_filter is not None
+                else store.list_all()
+            )
+            if not mems:
+                self._repl_print("[dim]No memories recorded.[/dim]")
+                return
+            header = (
+                f"[bold]User Preference Memories[/bold]  ({len(mems)})"
+                + (f"  [dim]type={mem_filter.value}[/dim]" if mem_filter else "")
+            )
+            self._repl_print(header)
+            for m in mems:
+                type_tag = f"[cyan]{m.type.value}[/cyan]"
+                tag_str = f" [dim]{', '.join(m.tags)}[/dim]" if m.tags else ""
+                path_str = (
+                    f" [yellow]paths={', '.join(m.paths)}[/yellow]" if m.paths else ""
+                )
+                self._repl_print(
+                    f"  {type_tag}  [bold]{m.name}[/bold] "
+                    f"[dim]({m.id})[/dim]  {m.description}{tag_str}{path_str}"
+                )
+            return
+
+        if subcmd == "add":
+            # Format: /memory add <type> <name> | <description>
+            if "|" not in rest:
+                self._repl_print(
+                    "[red]Usage: /memory add <type> <name> | <description>[/red]"
+                )
+                return
+            head, _, description = rest.partition("|")
+            head_parts = head.strip().split(None, 1)
+            if len(head_parts) < 2:
+                self._repl_print(
+                    "[red]Usage: /memory add <type> <name> | <description>[/red]"
+                )
+                return
+            type_raw, name = head_parts[0], head_parts[1].strip()
+            description = description.strip()
+            if not name or not description:
+                self._repl_print(
+                    "[red]Name and description must both be non-empty[/red]"
+                )
+                return
+            try:
+                mem_type = MemoryType.from_str(type_raw)
+                mem = store.add(mem_type, name, description, source="repl")
+                self._repl_print(
+                    f"[green]Memory added:[/green] [cyan]{mem.type.value}[/cyan]  "
+                    f"[bold]{mem.name}[/bold] [dim]({mem.id})[/dim]"
+                )
+            except ValueError as exc:
+                self._repl_print(f"[red]{exc}[/red]")
+            return
+
+        if subcmd in ("rm", "remove", "delete"):
+            if not rest:
+                self._repl_print("[red]Usage: /memory rm <id>[/red]")
+                return
+            if store.delete(rest):
+                self._repl_print(f"[green]Removed memory: {rest}[/green]")
+            else:
+                self._repl_print(f"[red]No memory matching '{rest}'[/red]")
+            return
+
+        if subcmd == "forbid":
+            if not rest:
+                self._repl_print(
+                    "[red]Usage: /memory forbid <path-substring>[/red]"
+                )
+                return
+            try:
+                mem = store.add(
+                    MemoryType.FORBIDDEN_PATH,
+                    f"forbid_{rest}",
+                    f"Hard-blocked by user: {rest}",
+                    content="Added via /memory forbid — blocks Venom write tools.",
+                    how_to_apply=f"Never edit, write, or delete under {rest}.",
+                    paths=(rest,),
+                    source="repl",
+                )
+                self._repl_print(
+                    f"[green]Forbidden path added:[/green] [yellow]{rest}[/yellow] "
+                    f"[dim]({mem.id})[/dim]"
+                )
+            except ValueError as exc:
+                self._repl_print(f"[red]{exc}[/red]")
+            return
+
+        if subcmd == "show":
+            if not rest:
+                self._repl_print("[red]Usage: /memory show <id>[/red]")
+                return
+            mem = store.get(rest)
+            if mem is None:
+                self._repl_print(f"[red]No memory matching '{rest}'[/red]")
+                return
+            self._repl_print(f"[bold]{mem.type.value}:{mem.name}[/bold]  [dim]({mem.id})[/dim]")
+            self._repl_print(f"  [dim]description:[/dim] {mem.description}")
+            if mem.why:
+                self._repl_print(f"  [dim]why:[/dim] {mem.why}")
+            if mem.how_to_apply:
+                self._repl_print(f"  [dim]how:[/dim] {mem.how_to_apply}")
+            if mem.tags:
+                self._repl_print(f"  [dim]tags:[/dim] {', '.join(mem.tags)}")
+            if mem.paths:
+                self._repl_print(f"  [dim]paths:[/dim] {', '.join(mem.paths)}")
+            if mem.content:
+                self._repl_print(f"  [dim]content:[/dim] {mem.content[:200]}")
+            return
+
+        self._repl_print(
+            "[dim]Usage: /memory | /memory list [type] | /memory add <type> "
+            "<name> | <desc> | /memory rm <id> | /memory forbid <path> | "
+            "/memory show <id>[/dim]"
+        )
+
+    def _repl_cmd_remember(self, line: str) -> None:
+        """Shortcut for /memory add user: stores a free-form USER memory.
+
+        Usage:
+          /remember <text>
+
+        The slug of the first 40 chars becomes the memory id so repeat
+        ``/remember`` calls with matching prefixes upsert rather than
+        pile up. The whole text becomes the description.
+        """
+        from backend.core.ouroboros.governance.user_preference_memory import (
+            MemoryType,
+        )
+
+        store = self._user_pref_store()
+        if store is None:
+            return
+
+        parts = line.replace("/remember", "remember", 1).split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._repl_print("[red]Usage: /remember <text>[/red]")
+            return
+        text = parts[1].strip()
+        # Derive a short memory name from the first ~40 chars.
+        short = text[:60].strip()
+        try:
+            mem = store.add(
+                MemoryType.USER,
+                short,
+                text,
+                source="repl:remember",
+            )
+            self._repl_print(
+                f"[green]Remembered:[/green] [cyan]user[/cyan]  "
+                f"[bold]{mem.name}[/bold] [dim]({mem.id})[/dim]"
+            )
+        except ValueError as exc:
+            self._repl_print(f"[red]{exc}[/red]")
+
+    def _repl_cmd_forget(self, line: str) -> None:
+        """Shortcut for /memory rm: removes a memory by id.
+
+        Usage:
+          /forget <id>
+        """
+        store = self._user_pref_store()
+        if store is None:
+            return
+
+        parts = line.replace("/forget", "forget", 1).split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._repl_print("[red]Usage: /forget <id>[/red]")
+            return
+        mem_id = parts[1].strip()
+        if store.delete(mem_id):
+            self._repl_print(f"[green]Forgotten: {mem_id}[/green]")
+        else:
+            self._repl_print(f"[red]No memory matching '{mem_id}'[/red]")
 
     # ------------------------------------------------------------------
     # Signal handlers

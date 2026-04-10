@@ -2085,6 +2085,19 @@ class SerpentREPL:
                     if line.startswith("/goal") or line.startswith("goal "):
                         await self._handle_goal(line)
                         continue
+                    if (
+                        line.startswith("/memory")
+                        or line.startswith("memory ")
+                        or line == "memory"
+                    ):
+                        await self._handle_memory(line)
+                        continue
+                    if line.startswith("/remember") or line.startswith("remember "):
+                        await self._handle_remember(line)
+                        continue
+                    if line.startswith("/forget") or line.startswith("forget "):
+                        await self._handle_forget(line)
+                        continue
 
                     # Delegate to external handler
                     if self._on_command is not None:
@@ -2134,14 +2147,17 @@ class SerpentREPL:
     def _print_help(self) -> None:
         """Print available REPL commands."""
         lines = [
-            f"  [{_C['dim']}]status[/{_C['dim']}]         organism status panel",
-            f"  [{_C['dim']}]cost[/{_C['dim']}]           cost breakdown",
-            f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]    cancel an in-flight operation",
-            f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]   set risk ceiling (safe_auto|notify_apply)",
-            f"  [{_C['dim']}]/budget <usd>[/{_C['dim']}]  adjust session budget",
-            f"  [{_C['dim']}]/goal [add|rm][/{_C['dim']}] manage active goals",
-            f"  [{_C['dim']}]help[/{_C['dim']}]           this message",
-            f"  [{_C['dim']}]quit[/{_C['dim']}]           graceful shutdown",
+            f"  [{_C['dim']}]status[/{_C['dim']}]            organism status panel",
+            f"  [{_C['dim']}]cost[/{_C['dim']}]              cost breakdown",
+            f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]       cancel an in-flight operation",
+            f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]      set risk ceiling",
+            f"  [{_C['dim']}]/budget <usd>[/{_C['dim']}]     adjust session budget",
+            f"  [{_C['dim']}]/goal [add|rm][/{_C['dim']}]    manage active goals",
+            f"  [{_C['dim']}]/memory [...][/{_C['dim']}]     list/add/rm/forbid user-pref memories",
+            f"  [{_C['dim']}]/remember <text>[/{_C['dim']}]  shortcut: add a USER memory",
+            f"  [{_C['dim']}]/forget <id>[/{_C['dim']}]      shortcut: remove a memory by id",
+            f"  [{_C['dim']}]help[/{_C['dim']}]              this message",
+            f"  [{_C['dim']}]quit[/{_C['dim']}]              graceful shutdown",
         ]
         panel = Panel(
             "\n".join(lines),
@@ -2280,5 +2296,60 @@ class SerpentREPL:
         else:
             self._flow.console.print(
                 f"  [{_C['dim']}]Goal management requires harness connection[/{_C['dim']}]",
+                highlight=False,
+            )
+
+    async def _handle_memory(self, line: str) -> None:
+        """Manage UserPreferenceStore memories at runtime.
+
+        Usage:
+          /memory                         — list all memories
+          /memory list [type]             — list (optionally filter by type)
+          /memory add <type> <name> | <description>
+                                          — add a memory of the given type
+          /memory rm <id>                 — remove a memory by id
+          /memory forbid <path>           — shortcut: add a FORBIDDEN_PATH memory
+          /memory show <id>               — print a single memory's full content
+        """
+        await self._delegate_to_harness(line, error_label="Memory error")
+
+    async def _handle_remember(self, line: str) -> None:
+        """Shortcut: add a free-form USER memory.
+
+        Usage:
+          /remember <text>
+        """
+        await self._delegate_to_harness(line, error_label="Remember error")
+
+    async def _handle_forget(self, line: str) -> None:
+        """Shortcut: remove a memory by id.
+
+        Usage:
+          /forget <id>
+        """
+        await self._delegate_to_harness(line, error_label="Forget error")
+
+    async def _delegate_to_harness(self, line: str, *, error_label: str) -> None:
+        """Forward the raw line to the harness ``on_command`` callback.
+
+        Shared helper for memory-related commands since they all need the
+        harness's ``UserPreferenceStore`` reference — the REPL can't create
+        a new store (would lose the in-process singleton the orchestrator
+        uses) and can't reach across process boundaries. Errors are
+        rendered into the SerpentFlow console with a consistent label.
+        """
+        if self._on_command is None:
+            self._flow.console.print(
+                f"  [{_C['dim']}]{error_label}: requires harness connection[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        try:
+            result = self._on_command(line)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]{error_label}: {exc}[/{_C['death']}]",
                 highlight=False,
             )
