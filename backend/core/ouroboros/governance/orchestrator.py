@@ -67,6 +67,11 @@ from backend.core.ouroboros.governance.forward_progress import (
     ForwardProgressDetector,
     candidate_content_hash,
 )
+from backend.core.ouroboros.governance.productivity_detector import (
+    ProductivityDetector,
+    ProductivityDetectorConfig,
+    productivity_content_hash,
+)
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
@@ -270,6 +275,19 @@ class GovernedOrchestrator:
             ForwardProgressConfig(),
         )
 
+        # ── Productivity-ratio detector (EC9) ──
+        # Catches the silent-burn failure mode: model produces semantically
+        # identical candidates with cosmetic differences (whitespace, import
+        # order, docstring tweaks) that slip past EC8's byte-identical hash
+        # while burning real money on each retry. EC9 normalizes each
+        # candidate (AST dump for Python, canonical JSON, whitespace fallback
+        # for everything else) and trips when cost accumulated since the last
+        # *semantic* change crosses a USD threshold. Disable via
+        # ``JARVIS_EC9_ENABLED=false``.
+        self._productivity_detector: ProductivityDetector = ProductivityDetector(
+            ProductivityDetectorConfig(),
+        )
+
         # ── Session Intelligence: ephemeral lessons buffer ──
         # Accumulates compact lessons from completed/failed ops within this
         # session.  Injected into subsequent generation prompts so the model
@@ -438,6 +456,26 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug(
                     "[Orchestrator] ForwardProgress.finish failed", exc_info=True,
+                )
+            # Finalize the productivity detector entry. Logs the summary
+            # (cost_since_last_change, consecutive_stable, total_cost) at
+            # DEBUG for postmortem productivity analysis.
+            try:
+                _pd_final = self._productivity_detector.finish(ctx.op_id)
+                if _pd_final is not None:
+                    logger.debug(
+                        "[Orchestrator] Productivity summary op=%s "
+                        "stable=%d burn=$%.4f total=$%.4f tripped=%s",
+                        ctx.op_id,
+                        _pd_final.get("consecutive_stable", 0),
+                        _pd_final.get("cost_since_last_change_usd", 0.0),
+                        _pd_final.get("total_cost_usd", 0.0),
+                        _pd_final.get("tripped", False),
+                    )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] ProductivityDetector.finish failed",
+                    exc_info=True,
                 )
 
     # ------------------------------------------------------------------
@@ -1805,6 +1843,53 @@ class GovernedOrchestrator:
                 except Exception:
                     logger.debug(
                         "[Orchestrator] ForwardProgress.observe failed",
+                        exc_info=True,
+                    )
+
+                # ── Productivity-ratio detector (EC9) ──
+                # Complements EC8: EC8 catches byte-identical repetition;
+                # EC9 catches *semantic* stagnation — candidates whose
+                # normalized form (AST dump / canonical JSON / whitespace-
+                # stripped) hasn't changed while the model keeps charging
+                # us for retries. Trip = $ burned since last semantic
+                # change exceeded the threshold AND we've seen enough
+                # stable observations. Escape via phase-aware terminal.
+                try:
+                    _pd_hash = productivity_content_hash(
+                        generation.candidates[0],
+                        level=self._productivity_detector.level,
+                    )
+                    if _pd_hash and self._productivity_detector.observe(
+                        ctx.op_id, _cost_this_call, _pd_hash,
+                    ):
+                        _pd_summary = self._productivity_detector.summary(ctx.op_id) or {}
+                        logger.warning(
+                            "[Orchestrator] Productivity stall: op=%s "
+                            "burned=$%.4f stable=%d level=%s — escaping retry loop",
+                            ctx.op_id,
+                            _pd_summary.get("cost_since_last_change_usd", 0.0),
+                            _pd_summary.get("consecutive_stable", 0),
+                            _pd_summary.get("config", {}).get("normalization_level", "?"),
+                        )
+                        _terminal = self._l2_escape_terminal(ctx.phase)
+                        ctx = ctx.advance(
+                            _terminal,
+                            terminal_reason_code="stalled_productivity",
+                        )
+                        await self._record_ledger(
+                            ctx,
+                            OperationState.FAILED,
+                            {
+                                "reason": "stalled_productivity",
+                                "productivity_summary": dict(_pd_summary),
+                                "entry_phase": "GENERATE",
+                            },
+                        )
+                        self._productivity_detector.finish(ctx.op_id)
+                        return ctx
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] ProductivityDetector.observe failed",
                         exc_info=True,
                     )
 
