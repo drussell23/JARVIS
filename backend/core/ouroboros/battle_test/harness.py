@@ -138,6 +138,17 @@ class BattleTestHarness:
         """Unique session identifier in ``bt-YYYY-MM-DD-HHMMSS`` format."""
         return self._session_id
 
+    @property
+    def stop_reason(self) -> str:
+        """Terminal reason this session stopped.
+
+        Common values: ``shutdown_signal``, ``budget_exhausted``, ``idle_timeout``,
+        ``stale_ops_detected``, ``boot_failure: ...``, ``restart_pending: ...``.
+        The wrapper script reads this after `run()` returns to decide whether
+        to re-exec on the hot-reload restart sentinel.
+        """
+        return self._stop_reason
+
     # ------------------------------------------------------------------
     # Main lifecycle
     # ------------------------------------------------------------------
@@ -353,6 +364,12 @@ class BattleTestHarness:
             # Start provider cost monitor — feeds real API spend into CostTracker
             self._cost_monitor_task = asyncio.ensure_future(self._monitor_provider_costs())
 
+            # Start hot-reload restart-pending monitor — graceful respawn on
+            # quarantined self-modifications. See _monitor_restart_pending.
+            self._restart_monitor_task = asyncio.ensure_future(
+                self._monitor_restart_pending()
+            )
+
             # Register signal handlers
             try:
                 loop = asyncio.get_running_loop()
@@ -378,8 +395,12 @@ class BattleTestHarness:
                 except asyncio.CancelledError:
                     pass
 
-            # Determine stop reason
-            if shutdown_waiter in done:
+            # Determine stop reason — but preserve a restart_pending stamp
+            # if the restart monitor already set it (otherwise it would be
+            # overwritten with the generic "shutdown_signal").
+            if self._stop_reason.startswith("restart_pending:"):
+                pass  # already set by _monitor_restart_pending
+            elif shutdown_waiter in done:
                 self._stop_reason = "shutdown_signal"
             elif budget_waiter in done:
                 self._stop_reason = "budget_exhausted"
@@ -1882,6 +1903,54 @@ class BattleTestHarness:
             pass
 
     # ------------------------------------------------------------------
+    # Hot-reload Restart Monitor
+    # ------------------------------------------------------------------
+
+    async def _monitor_restart_pending(self) -> None:
+        """Background task: poll the orchestrator's hot-reloader for a
+        restart-pending flag, and trigger graceful shutdown when set.
+
+        The flag is raised by ModuleHotReloader when O+V self-modifies a
+        quarantined or unsafe-to-reload module — the running process can't
+        safely swap that code in-place, so we shut down cleanly and let
+        the wrapper script re-exec with the same argv via exit code 75.
+
+        Polls every 3 seconds — frequent enough that the next op doesn't
+        start before we shut down, infrequent enough that the cost is
+        invisible (~0.5ms × 0.33 Hz). Disable via
+        ``JARVIS_HOT_RELOAD_RESTART_MONITOR=false``.
+        """
+        if os.environ.get("JARVIS_HOT_RELOAD_RESTART_MONITOR", "true").lower() == "false":
+            return
+        try:
+            while True:
+                await asyncio.sleep(3.0)
+                gls = self._governed_loop_service
+                if gls is None:
+                    continue
+                orch = getattr(gls, "_orchestrator", None)
+                if orch is None:
+                    continue
+                reloader = getattr(orch, "_hot_reloader", None)
+                if reloader is None:
+                    continue
+                reason = getattr(reloader, "restart_pending", None)
+                if reason:
+                    self._stop_reason = f"restart_pending: {reason}"
+                    logger.warning(
+                        "[RestartMonitor] Hot-reload requires restart: %s; "
+                        "triggering graceful shutdown for re-exec",
+                        reason,
+                    )
+                    if self._shutdown_event is not None:
+                        self._shutdown_event.set()
+                    return
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("[RestartMonitor] crashed: %s", exc, exc_info=True)
+
+    # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
 
@@ -1927,6 +1996,17 @@ class BattleTestHarness:
                 self._cost_monitor_task.cancel()
                 try:
                     await self._cost_monitor_task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
+
+        # 0d. Restart-pending monitor
+        try:
+            if hasattr(self, "_restart_monitor_task") and self._restart_monitor_task:
+                self._restart_monitor_task.cancel()
+                try:
+                    await self._restart_monitor_task
                 except asyncio.CancelledError:
                     pass
         except Exception:

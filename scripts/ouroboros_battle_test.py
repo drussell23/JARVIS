@@ -692,12 +692,44 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
+    interrupted = False
     try:
         loop.run_until_complete(harness.run())
     except KeyboardInterrupt:
+        interrupted = True
         print(f"\n{_YELLOW}Interrupted — shutting down gracefully...{_RESET}")
     finally:
         loop.close()
+
+    # ------------------------------------------------------------------
+    # Hot-reload restart respawn (Manifesto §6)
+    # ------------------------------------------------------------------
+    # If the harness's stop_reason starts with "restart_pending:", the
+    # ModuleHotReloader queued a restart because O+V self-modified a
+    # quarantined or unsafe-to-reload module. Re-exec this same script
+    # with identical argv so the new code is loaded fresh from disk.
+    #
+    # JARVIS_RESTART_GENERATION (private env var) tracks the depth of the
+    # respawn chain to prevent infinite loops if the same self-mod keeps
+    # tripping. Capped at JARVIS_RESTART_MAX (default 5).
+    if not interrupted and getattr(harness, "stop_reason", "").startswith("restart_pending:"):
+        max_restarts = int(os.environ.get("JARVIS_RESTART_MAX", "5"))
+        gen = int(os.environ.get("JARVIS_RESTART_GENERATION", "0"))
+        if gen >= max_restarts:
+            print(
+                f"\n{_YELLOW}[respawn] restart cap reached "
+                f"(JARVIS_RESTART_GENERATION={gen} >= JARVIS_RESTART_MAX={max_restarts}); "
+                f"exiting normally instead of re-execing.{_RESET}"
+            )
+            sys.exit(0)
+        print(
+            f"\n{_YELLOW}[respawn] {harness.stop_reason} — "
+            f"re-execing battle test (generation {gen + 1}/{max_restarts}){_RESET}"
+        )
+        os.environ["JARVIS_RESTART_GENERATION"] = str(gen + 1)
+        # os.execv replaces this process — code after this line is unreachable.
+        # argv[0] is the interpreter, argv[1] is this script, then the original CLI flags.
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 if __name__ == "__main__":
