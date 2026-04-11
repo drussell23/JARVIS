@@ -685,8 +685,19 @@ class GovernedOrchestrator:
         # memory prompt so the generation model aligns its decisions with
         # current priorities. Scoped by target_files + description so a
         # noisy goal tracker doesn't hijack unrelated ops.
+        #
+        # Increment 3: after prompt injection, compute the full activity
+        # entry set (direct matches + descendant credits + optional
+        # sibling bumps) and append to the GoalActivityLedger. Every op
+        # that reaches CLASSIFY writes at least one row so the session-end
+        # drift aggregator sees it as "reached CLASSIFY", even when no
+        # goal scored.
         try:
-            from backend.core.ouroboros.governance.strategic_direction import GoalTracker
+            from backend.core.ouroboros.governance.strategic_direction import (
+                GoalActivityLedger,
+                GoalTracker,
+                get_active_session_id,
+            )
             _goal_tracker = GoalTracker(self._config.project_root)
             _goal_prompt = _goal_tracker.format_for_prompt(
                 target_files=list(ctx.target_files),
@@ -704,6 +715,32 @@ class GovernedOrchestrator:
                     "[Orchestrator] Goal context injected (%d active / scoped)",
                     len(_goal_tracker.active_goals),
                 )
+
+            # Activity ledger append (Increment 3). Ledger-only — does
+            # not feed intake priority math. Zero-match ops still get a
+            # marker row so the drift denominator counts them.
+            _session_id = get_active_session_id() or ""
+            if _session_id:
+                try:
+                    _activity_entries = _goal_tracker.compute_activity_entries(
+                        description=ctx.description or "",
+                        target_files=list(ctx.target_files),
+                    )
+                    GoalActivityLedger(self._config.project_root).append(
+                        session_id=_session_id,
+                        op_id=ctx.op_id,
+                        entries=_activity_entries,
+                    )
+                    logger.debug(
+                        "[Orchestrator] GoalActivity ledger: wrote %d entries for op=%s",
+                        len(_activity_entries) or 1,  # 1 marker row on zero-match
+                        ctx.op_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] GoalActivity ledger append failed",
+                        exc_info=True,
+                    )
         except Exception:
             logger.debug("[Orchestrator] Goal injection skipped", exc_info=True)
 

@@ -196,6 +196,7 @@ class SessionRecorder:
         convergence_state: str,
         convergence_slope: float,
         convergence_r2: float,
+        strategic_drift: Optional[Dict[str, Any]] = None,
     ) -> Path:
         """Write ``summary.json`` and (if any) ``review_queue.jsonl`` to *output_dir*.
 
@@ -243,6 +244,8 @@ class SessionRecorder:
             "top_techniques": self.top_techniques(),
             "operations": self._operations,
         }
+        if strategic_drift is not None:
+            summary["strategic_drift"] = strategic_drift
 
         summary_path = output_dir / "summary.json"
         summary_path.write_text(json.dumps(summary, indent=2))

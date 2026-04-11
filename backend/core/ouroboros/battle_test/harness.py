@@ -149,6 +149,18 @@ class BattleTestHarness:
         self._shutdown_event = asyncio.Event()
         self._cost_tracker.budget_event = asyncio.Event()
         self._idle_watchdog.idle_event = asyncio.Event()
+
+        # Publish the session id to the strategic_direction module global so
+        # that the Orchestrator's CLASSIFY-phase GoalActivityLedger append can
+        # stamp rows with the correct session. Cleared in _generate_report.
+        try:
+            from backend.core.ouroboros.governance.strategic_direction import (
+                set_active_session_id,
+            )
+            set_active_session_id(self._session_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("set_active_session_id(boot) failed", exc_info=True)
+
         try:
             # Boot sequence
             await self.boot_oracle()
@@ -965,6 +977,9 @@ class BattleTestHarness:
           /goal resume <id>                     — resume a paused goal
           /goal complete <id>                   — mark as completed
           /goal purge                           — drop all completed goals
+          /goal activity [--goal <id>] [--limit N]  — read activity ledger
+          /goal drift                           — show strategic-drift summary
+          /goal explain <op-id>                 — per-goal reasons for an op
         """
         parts = line.replace("/goal", "goal", 1).split(None, 2)
         subcmd = parts[1].strip().lower() if len(parts) > 1 else "list"
@@ -1824,6 +1839,25 @@ class BattleTestHarness:
         except Exception as exc:
             logger.warning("Branch stats retrieval failed: %s", exc)
 
+        # --- Compute strategic drift (Increment 3) ---
+        strategic_drift: Optional[dict] = None
+        try:
+            from backend.core.ouroboros.governance.strategic_direction import (
+                GoalActivityLedger,
+            )
+            ledger = GoalActivityLedger(self._config.repo_path)
+            drift_summary = ledger.compute_drift(session_id=self._session_id)
+            strategic_drift = drift_summary.to_dict()
+            logger.info(
+                "[Harness] strategic_drift status=%s total=%d drifted=%d ratio=%s",
+                drift_summary.status,
+                drift_summary.total_ops,
+                drift_summary.drifted_ops,
+                f"{drift_summary.ratio:.3f}" if drift_summary.ratio is not None else "n/a",
+            )
+        except Exception as exc:
+            logger.debug("[Harness] strategic_drift computation failed: %s", exc, exc_info=True)
+
         # --- Save session summary JSON ---
         try:
             self._session_dir.mkdir(parents=True, exist_ok=True)
@@ -1837,6 +1871,7 @@ class BattleTestHarness:
                 convergence_state=convergence_state,
                 convergence_slope=convergence_slope,
                 convergence_r2=convergence_r2,
+                strategic_drift=strategic_drift,
             )
             logger.info("Summary written to %s", summary_path)
         except Exception as exc:
@@ -1864,6 +1899,39 @@ class BattleTestHarness:
         except Exception as exc:
             logger.warning("Failed to format terminal summary: %s", exc)
 
+        # --- Strategic drift line (Increment 3) ---
+        if strategic_drift is not None:
+            try:
+                _status = strategic_drift.get("status", "unknown")
+                _total = strategic_drift.get("total_ops", 0)
+                _drifted = strategic_drift.get("drifted_ops", 0)
+                _ratio = strategic_drift.get("ratio")
+                _ratio_s = f"{_ratio:.2%}" if isinstance(_ratio, (int, float)) else "n/a"
+                if _status == "drift_warning":
+                    _line = (
+                        f"[bold red]⚠ Strategic drift:[/bold red] "
+                        f"{_drifted}/{_total} ops missed every active goal "
+                        f"({_ratio_s}) — goals may be stale or prompts under-aligned."
+                    )
+                elif _status == "insufficient_data":
+                    _min = int(os.environ.get("JARVIS_GOAL_DRIFT_MIN_OPS", "5"))
+                    _line = (
+                        f"[dim]Strategic drift: insufficient data "
+                        f"({_total}/{_min} ops minimum)[/dim]"
+                    )
+                else:
+                    _line = (
+                        f"[green]Strategic drift: ok[/green] "
+                        f"({_drifted}/{_total} missed, {_ratio_s})"
+                    )
+                _c = self._serpent_flow.console if hasattr(self, "_serpent_flow") and self._serpent_flow else None
+                if _c is not None:
+                    _c.print(_line, highlight=False)
+                else:
+                    print(_line)
+            except Exception as exc:
+                logger.debug("[Harness] drift line render failed: %s", exc)
+
         # --- Notebook ---
         try:
             from backend.core.ouroboros.battle_test.notebook_generator import NotebookGenerator
@@ -1875,3 +1943,16 @@ class BattleTestHarness:
                 logger.info("Notebook generated at %s", nb_path)
         except Exception as exc:
             logger.warning("Notebook generation failed: %s", exc)
+
+        # --- Clear session id (Increment 3) ---
+        # Release the strategic_direction module global so that a subsequent
+        # harness run (same process) starts with a clean slate. Post-report
+        # intentionally — any stray ledger append during teardown still lands
+        # in the correct session.
+        try:
+            from backend.core.ouroboros.governance.strategic_direction import (
+                set_active_session_id,
+            )
+            set_active_session_id(None)
+        except Exception:
+            logger.debug("set_active_session_id(clear) failed", exc_info=True)
