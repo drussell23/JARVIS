@@ -121,8 +121,14 @@ backend/swift_bridge/*.pyc
 .jarvis/
 *.json.cache
 
+# Ouroboros oracle graph cache (large binary; exceeds GitHub 100MB limit — regenerate locally)
+.ouroboros/state/sandbox_fallback/oracle/*.pkl
+
 # Git worktrees (development workspaces)
 .worktrees/
+
+# Leftover from aborted git filter-branch (safe to delete if present)
+.git-rewrite/
 
 # Rust build artifacts
 backend/vision/jarvis-rust-core/target/
