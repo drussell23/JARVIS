@@ -396,6 +396,17 @@ _MAX_GOALS = _env_int("JARVIS_MAX_ACTIVE_GOALS", 5)
 # or source type, but breaks ties in favor of goal-aligned work.
 _GOAL_ALIGNMENT_BOOST = _env_int("JARVIS_GOAL_ALIGNMENT_BOOST", 2)
 
+# Score-strength scaling for the v2 alignment path. The raw relevance score
+# (``find_relevant``) is divided by ``_GOAL_SCORE_DIVISOR`` to map the path-
+# overlap space (~10-50+) onto a 1.0-3.0 multiplier range that scales the
+# base boost. Operators can tune all three without code changes so the
+# intake router reacts more (or less) aggressively to high-confidence goal
+# matches. Clamp bounds keep one monster-score goal from starving every
+# other signal in the priority queue.
+_GOAL_SCORE_DIVISOR = _env_float("JARVIS_GOAL_SCORE_DIVISOR", 10.0)
+_GOAL_SCORE_MULT_MIN = _env_float("JARVIS_GOAL_SCORE_MULT_MIN", 1.0)
+_GOAL_SCORE_MULT_MAX = _env_float("JARVIS_GOAL_SCORE_MULT_MAX", 3.0)
+
 # Relevance scoring weights — tuneable via env so operators can bias the
 # injection pipeline without code changes. Higher = stronger signal.
 _SCORE_PATH_MATCH = _env_float("JARVIS_GOAL_SCORE_PATH", 10.0)
@@ -470,6 +481,60 @@ class ActiveGoal:
     def touch(self) -> None:
         """Bump the updated_at timestamp without mutating anything else."""
         self.updated_at = time.time()
+
+
+@dataclass(frozen=True)
+class GoalAlignment:
+    """Rich alignment result for an intake signal.
+
+    Returned by :meth:`GoalTracker.alignment_context`. Carries both the
+    final priority ``boost`` (the legacy ``alignment_boost`` int) *and*
+    the raw signals that produced it so downstream phases can trace *why*
+    a signal was prioritized — the intake router stashes this on
+    ``IntentEnvelope.evidence`` and Zone 6.8 surfaces it in postmortems.
+
+    Fields
+    ------
+    boost:
+        Priority score units to subtract from the queue key. ``0`` when
+        no goal cleared the relevance threshold. Always non-negative.
+    raw_score:
+        The untouched relevance score of the top matching goal, as
+        produced by :meth:`GoalTracker.find_relevant`. Before scaling by
+        ``score_multiplier``. Zero when no match.
+    top_goal_id:
+        ``goal_id`` of the highest-scoring goal, or empty string if none.
+    matched_count:
+        How many distinct goals cleared ``_SCORE_MIN_RELEVANCE``. Useful
+        for traceability — a signal hitting 3 goals is structurally
+        stronger than one hitting a single goal even at equal raw score.
+    score_multiplier:
+        The clamped ``raw_score / _GOAL_SCORE_DIVISOR`` scalar applied
+        on top of ``_GOAL_ALIGNMENT_BOOST * priority_weight``. Always in
+        ``[_GOAL_SCORE_MULT_MIN, _GOAL_SCORE_MULT_MAX]``. Defaults to
+        ``_GOAL_SCORE_MULT_MIN`` on a no-match so arithmetic callers
+        don't need to branch on ``matched_count``.
+    """
+
+    boost: int = 0
+    raw_score: float = 0.0
+    top_goal_id: str = ""
+    matched_count: int = 0
+    score_multiplier: float = field(default=_GOAL_SCORE_MULT_MIN)
+
+    @property
+    def is_match(self) -> bool:
+        return self.matched_count > 0
+
+    def as_evidence(self) -> Dict[str, float]:
+        """Serialize for ``IntentEnvelope.evidence`` stashing."""
+        return {
+            "goal_alignment_boost": float(self.boost),
+            "goal_relevance_score": round(self.raw_score, 3),
+            "goal_top_goal_id": self.top_goal_id,  # type: ignore[dict-item]
+            "goal_matched_count": float(self.matched_count),
+            "goal_score_multiplier": round(self.score_multiplier, 3),
+        }
 
 
 class GoalTracker:
@@ -721,6 +786,54 @@ class GoalTracker:
     # Intake router alignment boost (v1 API, preserved)
     # ------------------------------------------------------------------
 
+    def alignment_context(
+        self,
+        description: str,
+        target_files: Sequence[str] = (),
+    ) -> "GoalAlignment":
+        """Rich alignment result — exposes raw score + top goal + boost.
+
+        Supersedes :meth:`alignment_boost`. Returns a :class:`GoalAlignment`
+        instead of a bare int, so the intake router can stash diagnostics
+        on every envelope (``evidence.goal_relevance_score`` etc.) and
+        priority math can reflect match *strength*, not just match/no-match.
+
+        The boost scales with three factors, in order of operator-tunable
+        strength:
+          1. Base constant (``_GOAL_ALIGNMENT_BOOST``)
+          2. Top goal's ``priority_weight``
+          3. Clamped raw-score multiplier (``raw_score / _GOAL_SCORE_DIVISOR``)
+        """
+        matches = self.find_relevant(
+            description=description,
+            target_files=target_files,
+            limit=_MAX_PROMPT_GOALS,
+        )
+        if not matches:
+            return GoalAlignment()
+
+        best_goal, best_score = matches[0]
+
+        # Raw-score → clamped multiplier. Higher-scoring matches push the
+        # boost up within the operator-defined band without letting any
+        # single goal starve every other signal in the queue.
+        if _GOAL_SCORE_DIVISOR <= 0:
+            mult = _GOAL_SCORE_MULT_MIN
+        else:
+            mult = best_score / _GOAL_SCORE_DIVISOR
+        mult = max(_GOAL_SCORE_MULT_MIN, min(_GOAL_SCORE_MULT_MAX, mult))
+
+        scaled = _GOAL_ALIGNMENT_BOOST * max(0.1, best_goal.priority_weight) * mult
+        boost = max(1, int(round(scaled)))
+
+        return GoalAlignment(
+            boost=boost,
+            raw_score=float(best_score),
+            top_goal_id=best_goal.goal_id,
+            matched_count=len(matches),
+            score_multiplier=float(mult),
+        )
+
     def alignment_boost(
         self,
         description: str,
@@ -732,16 +845,11 @@ class GoalTracker:
         (lower = higher priority). Returns 0 if no goals match above the
         minimum relevance threshold.
 
-        The magnitude scales with ``_GOAL_ALIGNMENT_BOOST`` and the best
-        matching goal's ``priority_weight``.
+        Thin compat wrapper around :meth:`alignment_context` — prefer the
+        context method when you also need the raw relevance score or the
+        matched goal ID for observability.
         """
-        matches = self.find_relevant(
-            description=description, target_files=target_files, limit=1,
-        )
-        if not matches:
-            return 0
-        best_goal, _ = matches[0]
-        return max(1, int(_GOAL_ALIGNMENT_BOOST * max(0.1, best_goal.priority_weight)))
+        return self.alignment_context(description, target_files).boost
 
     # ------------------------------------------------------------------
     # Prompt rendering
