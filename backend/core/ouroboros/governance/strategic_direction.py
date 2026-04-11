@@ -18,7 +18,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -344,39 +344,160 @@ class StrategicDirectionService:
 
 
 # ---------------------------------------------------------------------------
-# GoalTracker — dynamic goal-directed prioritization (P2.4)
+# GoalTracker — dynamic goal-directed prioritization (P2.4 + Week 2 hardening)
 # ---------------------------------------------------------------------------
+#
+# The goal tracker stores user-defined strategic goals, scores them for
+# relevance to the current operation, and injects only the relevant ones
+# into the generation prompt. Every tunable is env-driven — nothing is
+# hardcoded above the default level — and the schema is versioned so
+# future migrations don't break existing ``.jarvis/active_goals.json``
+# files written by earlier sessions.
+
+import enum
 
 _GOAL_FILE = ".jarvis/active_goals.json"
-_MAX_GOALS = int(os.environ.get("JARVIS_MAX_ACTIVE_GOALS", "5"))
+_GOAL_SCHEMA_VERSION = 2  # v1 = pre-Week-2; v2 adds status/tags/due/updated_at
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_set(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Parse a comma-separated env var into a tuple of lowercase strings."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    parts = tuple(p.strip().lower() for p in raw.split(",") if p.strip())
+    return parts or default
+
+
+_MAX_GOALS = _env_int("JARVIS_MAX_ACTIVE_GOALS", 5)
 
 # Priority boost for goal-aligned signals (subtracted from priority score,
-# so lower = higher priority).  Moderate boost — doesn't override urgency
+# so lower = higher priority). Moderate boost — doesn't override urgency
 # or source type, but breaks ties in favor of goal-aligned work.
-_GOAL_ALIGNMENT_BOOST = int(os.environ.get("JARVIS_GOAL_ALIGNMENT_BOOST", "2"))
+_GOAL_ALIGNMENT_BOOST = _env_int("JARVIS_GOAL_ALIGNMENT_BOOST", 2)
+
+# Relevance scoring weights — tuneable via env so operators can bias the
+# injection pipeline without code changes. Higher = stronger signal.
+_SCORE_PATH_MATCH = _env_float("JARVIS_GOAL_SCORE_PATH", 10.0)
+_SCORE_TAG_MATCH = _env_float("JARVIS_GOAL_SCORE_TAG", 6.0)
+_SCORE_KEYWORD_MATCH = _env_float("JARVIS_GOAL_SCORE_KEYWORD", 4.0)
+_SCORE_MIN_RELEVANCE = _env_float("JARVIS_GOAL_MIN_RELEVANCE", 1.0)
+
+# Staleness decay — goals created N days ago lose half their score every
+# ``JARVIS_GOAL_HALFLIFE_DAYS`` days. Set to 0 to disable.
+_STALENESS_HALFLIFE_DAYS = _env_float("JARVIS_GOAL_HALFLIFE_DAYS", 14.0)
+
+# How many top-scoring goals surface in format_for_prompt() for a given op.
+# Separate from _MAX_GOALS which caps *total* stored goals.
+_MAX_PROMPT_GOALS = _env_int("JARVIS_GOAL_PROMPT_MAX", 3)
+
+# Default stopwords for auto-keyword extraction. Every word <4 chars is
+# already dropped; this list removes common words that survive the length
+# filter but carry no semantic weight.
+_DEFAULT_STOPWORDS = _env_set(
+    "JARVIS_GOAL_STOPWORDS",
+    (
+        "with", "from", "that", "this", "have", "been", "what", "when",
+        "where", "which", "will", "would", "could", "should", "their",
+        "there", "into", "some", "such", "than", "then", "they", "them",
+        "about", "after", "again", "also", "because", "before", "between",
+    ),
+)
+
+
+class GoalStatus(enum.Enum):
+    """Lifecycle states for an ActiveGoal."""
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+
+    @classmethod
+    def from_str(cls, raw: str) -> "GoalStatus":
+        """Parse a status from its serialized form, defaulting to ACTIVE."""
+        if not raw:
+            return cls.ACTIVE
+        try:
+            return cls(raw.strip().lower())
+        except ValueError:
+            return cls.ACTIVE
 
 
 @dataclass
 class ActiveGoal:
-    """A user-defined strategic goal that influences O+V prioritization."""
+    """A user-defined strategic goal that influences O+V prioritization.
+
+    The schema is backward-compatible with the v1 (P2.4) format:
+    ``status``, ``tags``, ``due_at``, and ``updated_at`` default when the
+    persisted file doesn't contain them.
+    """
+
     goal_id: str                 # Short slug: "test-coverage", "reduce-governance-complexity"
     description: str             # Human-readable: "Improve test coverage in governance/"
     keywords: Tuple[str, ...]    # Matching keywords: ("test", "coverage", "pytest")
-    path_patterns: Tuple[str, ...] = ()  # File path prefixes: ("backend/core/ouroboros/governance/",)
-    priority_weight: float = 1.0  # 0.5 = mild preference, 1.0 = standard, 2.0 = strong focus
+    path_patterns: Tuple[str, ...] = ()
+    tags: Tuple[str, ...] = ()            # Semantic labels: ("reliability", "sprint-2")
+    priority_weight: float = 1.0
+    status: GoalStatus = GoalStatus.ACTIVE
+    due_at: Optional[float] = None        # Unix epoch seconds, None = open-ended
     created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+    @property
+    def is_active(self) -> bool:
+        return self.status is GoalStatus.ACTIVE
+
+    def touch(self) -> None:
+        """Bump the updated_at timestamp without mutating anything else."""
+        self.updated_at = time.time()
 
 
 class GoalTracker:
-    """Tracks 3-5 active user goals and provides alignment scoring.
+    """Tracks user-defined strategic goals with relevance-scored injection.
 
-    Goals are persisted to ``.jarvis/active_goals.json`` so they survive
-    across sessions.  The intake router queries ``alignment_boost()`` to
-    bias priority toward goal-aligned signals.  The prompt builders query
-    ``format_for_prompt()`` to inject goal context into generation.
+    Storage
+    -------
+    Goals are persisted to ``.jarvis/active_goals.json`` with a versioned
+    schema (``_GOAL_SCHEMA_VERSION``). v1 files load transparently; v2
+    adds status/tags/due_at/updated_at.
+
+    Relevance scoring
+    -----------------
+    When an operation enters CONTEXT_EXPANSION, the orchestrator calls
+    :meth:`format_for_prompt` with the op's ``target_files`` and
+    ``description``. The tracker scores each *active* goal against those
+    signals and injects the top-N matches — not the whole set — so noisy
+    goals don't hijack the generation prompt.
+
+    Scoring signals (highest→lowest weight):
+      * Path overlap (``_SCORE_PATH_MATCH``, default 10)
+      * Tag match against description tokens (``_SCORE_TAG_MATCH``, 6)
+      * Keyword match against description (``_SCORE_KEYWORD_MATCH``, 4)
+      * priority_weight multiplier applied to the combined score
+      * Staleness decay (half-life ``_STALENESS_HALFLIFE_DAYS``, default 14)
 
     Boundary Principle (Manifesto §5):
-      Deterministic: Keyword/path matching, priority arithmetic.
+      Deterministic: Keyword/path/tag matching, staleness arithmetic.
       Agentic: How the model interprets goal context during generation.
     """
 
@@ -385,28 +506,69 @@ class GoalTracker:
         self._goals: List[ActiveGoal] = []
         self._load()
 
+    # ------------------------------------------------------------------
+    # Query
+    # ------------------------------------------------------------------
+
+    @property
+    def all_goals(self) -> List[ActiveGoal]:
+        """Every goal, regardless of status."""
+        return list(self._goals)
+
     @property
     def active_goals(self) -> List[ActiveGoal]:
-        return list(self._goals)
+        """Only goals with ``GoalStatus.ACTIVE`` — the v1 API surface."""
+        return [g for g in self._goals if g.is_active]
+
+    def goals_by_status(self, status: GoalStatus) -> List[ActiveGoal]:
+        return [g for g in self._goals if g.status is status]
+
+    def get(self, goal_id: str) -> Optional[ActiveGoal]:
+        for g in self._goals:
+            if g.goal_id == goal_id:
+                return g
+        return None
+
+    # ------------------------------------------------------------------
+    # Mutate
+    # ------------------------------------------------------------------
 
     def set_goals(self, goals: List[ActiveGoal]) -> None:
         """Replace all active goals. Persists to disk."""
-        self._goals = goals[:_MAX_GOALS]
+        self._goals = list(goals)[:_MAX_GOALS]
         self._persist()
         logger.info(
-            "[GoalTracker] Set %d active goals: %s",
+            "[GoalTracker] Set %d goals: %s",
             len(self._goals),
             ", ".join(g.goal_id for g in self._goals),
         )
 
     def add_goal(self, goal: ActiveGoal) -> None:
-        """Add a goal. If at capacity, drops the oldest."""
-        # Deduplicate by goal_id
-        self._goals = [g for g in self._goals if g.goal_id != goal.goal_id]
+        """Add a goal. If at capacity, drops the oldest *inactive* first;
+        if none are inactive, drops the oldest active.
+
+        Deduped by ``goal_id`` — adding the same id upserts, preserving
+        created_at but bumping updated_at.
+        """
+        existing = self.get(goal.goal_id)
+        if existing is not None:
+            # Upsert — preserve created_at, bump updated_at.
+            goal.created_at = existing.created_at
+            goal.updated_at = time.time()
+            self._goals = [g for g in self._goals if g.goal_id != goal.goal_id]
+
         self._goals.append(goal)
+
         if len(self._goals) > _MAX_GOALS:
-            dropped = self._goals.pop(0)
-            logger.info("[GoalTracker] Dropped oldest goal: %s", dropped.goal_id)
+            # Prefer dropping a non-active goal over an active one.
+            inactives = [g for g in self._goals if not g.is_active]
+            if inactives:
+                dropped = inactives[0]
+                self._goals.remove(dropped)
+            else:
+                dropped = self._goals.pop(0)
+            logger.info("[GoalTracker] Dropped goal at capacity: %s", dropped.goal_id)
+
         self._persist()
 
     def remove_goal(self, goal_id: str) -> bool:
@@ -418,6 +580,147 @@ class GoalTracker:
             return True
         return False
 
+    def set_status(self, goal_id: str, status: GoalStatus) -> bool:
+        """Update a goal's lifecycle status. Returns True if found."""
+        goal = self.get(goal_id)
+        if goal is None:
+            return False
+        goal.status = status
+        goal.touch()
+        self._persist()
+        logger.info(
+            "[GoalTracker] %s → %s", goal_id, status.value,
+        )
+        return True
+
+    def pause(self, goal_id: str) -> bool:
+        return self.set_status(goal_id, GoalStatus.PAUSED)
+
+    def resume(self, goal_id: str) -> bool:
+        return self.set_status(goal_id, GoalStatus.ACTIVE)
+
+    def complete(self, goal_id: str) -> bool:
+        return self.set_status(goal_id, GoalStatus.COMPLETED)
+
+    def purge_completed(self) -> int:
+        """Remove all completed goals. Returns count removed."""
+        before = len(self._goals)
+        self._goals = [
+            g for g in self._goals if g.status is not GoalStatus.COMPLETED
+        ]
+        removed = before - len(self._goals)
+        if removed:
+            self._persist()
+            logger.info("[GoalTracker] Purged %d completed goals", removed)
+        return removed
+
+    # ------------------------------------------------------------------
+    # Relevance scoring
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tokenize(text: str) -> set:
+        """Split free-text into lowercase word tokens for tag matching."""
+        if not text:
+            return set()
+        # Split on any non-alphanumeric, drop empties and <4-char words.
+        return {
+            w for w in re.split(r"[^a-z0-9_]+", text.lower())
+            if len(w) >= 4
+        }
+
+    @staticmethod
+    def _staleness_multiplier(created_at: float, halflife_days: float) -> float:
+        """Exponential decay: score *= 0.5 ** (age_days / halflife_days)."""
+        if halflife_days <= 0 or created_at <= 0:
+            return 1.0
+        age_s = max(0.0, time.time() - created_at)
+        age_days = age_s / 86400.0
+        if age_days <= 0:
+            return 1.0
+        return 0.5 ** (age_days / halflife_days)
+
+    @staticmethod
+    def _score_goal(
+        goal: ActiveGoal,
+        *,
+        description: str,
+        target_files: Sequence[str],
+        halflife_days: float = _STALENESS_HALFLIFE_DAYS,
+    ) -> float:
+        """Return a non-negative relevance score for ``goal`` against the op.
+
+        Scores combine path overlap (strongest), tag match, and keyword
+        match, multiplied by priority_weight and staleness decay. Inactive
+        goals always score 0.
+        """
+        if not goal.is_active:
+            return 0.0
+
+        score = 0.0
+        desc_lower = (description or "").lower()
+        desc_tokens = GoalTracker._tokenize(description or "")
+
+        # Path overlap — any target file starting with any goal path pattern
+        if target_files and goal.path_patterns:
+            for tf in target_files:
+                tf_str = str(tf)
+                for pat in goal.path_patterns:
+                    if pat and tf_str.startswith(pat):
+                        score += _SCORE_PATH_MATCH
+                        break
+
+        # Tag match — goal tags that appear as tokens in the description
+        if goal.tags and desc_tokens:
+            tag_set = {t.lower() for t in goal.tags if t}
+            overlap = tag_set & desc_tokens
+            if overlap:
+                score += _SCORE_TAG_MATCH * len(overlap)
+
+        # Keyword match — keyword substring hits in description
+        if goal.keywords and desc_lower:
+            for kw in goal.keywords:
+                if kw and kw.lower() in desc_lower:
+                    score += _SCORE_KEYWORD_MATCH
+
+        if score <= 0:
+            return 0.0
+
+        # Priority weight multiplier + staleness decay.
+        score *= max(0.1, goal.priority_weight)
+        score *= GoalTracker._staleness_multiplier(goal.created_at, halflife_days)
+        return score
+
+    def find_relevant(
+        self,
+        *,
+        description: str = "",
+        target_files: Sequence[str] = (),
+        limit: Optional[int] = None,
+    ) -> List[Tuple[ActiveGoal, float]]:
+        """Return the top-N active goals by relevance score, descending.
+
+        ``limit`` defaults to ``_MAX_PROMPT_GOALS``. Goals scoring below
+        ``_SCORE_MIN_RELEVANCE`` are dropped entirely — no partial matches.
+        """
+        if limit is None:
+            limit = _MAX_PROMPT_GOALS
+        scored: List[Tuple[ActiveGoal, float]] = []
+        for goal in self._goals:
+            s = self._score_goal(
+                goal,
+                description=description,
+                target_files=target_files,
+            )
+            if s >= _SCORE_MIN_RELEVANCE:
+                scored.append((goal, s))
+        scored.sort(key=lambda gs: (-gs[1], -gs[0].updated_at))
+        return scored[:limit]
+
+    # ------------------------------------------------------------------
+    # Intake router alignment boost (v1 API, preserved)
+    # ------------------------------------------------------------------
+
     def alignment_boost(
         self,
         description: str,
@@ -426,82 +729,144 @@ class GoalTracker:
         """Compute priority boost for a signal based on goal alignment.
 
         Returns a non-negative integer to subtract from priority score
-        (lower = higher priority).  Returns 0 if no goals match.
+        (lower = higher priority). Returns 0 if no goals match above the
+        minimum relevance threshold.
 
-        Matching logic:
-        - Keyword match: any goal keyword appears in the description
-        - Path match: any target file starts with a goal path pattern
-        - Both must match at least one goal to earn the boost
+        The magnitude scales with ``_GOAL_ALIGNMENT_BOOST`` and the best
+        matching goal's ``priority_weight``.
         """
-        if not self._goals:
+        matches = self.find_relevant(
+            description=description, target_files=target_files, limit=1,
+        )
+        if not matches:
             return 0
+        best_goal, _ = matches[0]
+        return max(1, int(_GOAL_ALIGNMENT_BOOST * max(0.1, best_goal.priority_weight)))
 
-        desc_lower = description.lower()
-        best_weight = 0.0
+    # ------------------------------------------------------------------
+    # Prompt rendering
+    # ------------------------------------------------------------------
 
-        for goal in self._goals:
-            matched = False
-            # Keyword matching
-            for kw in goal.keywords:
-                if kw.lower() in desc_lower:
-                    matched = True
-                    break
-            # Path pattern matching (supplement keyword match)
-            if not matched and target_files and goal.path_patterns:
-                for tf in target_files:
-                    for pat in goal.path_patterns:
-                        if tf.startswith(pat):
-                            matched = True
-                            break
-                    if matched:
-                        break
-            if matched and goal.priority_weight > best_weight:
-                best_weight = goal.priority_weight
+    def format_for_prompt(
+        self,
+        *,
+        target_files: Sequence[str] = (),
+        description: str = "",
+    ) -> str:
+        """Format the most relevant active goals for the generation prompt.
 
-        if best_weight <= 0:
-            return 0
-        return max(1, int(_GOAL_ALIGNMENT_BOOST * best_weight))
-
-    def format_for_prompt(self) -> str:
-        """Format active goals for injection into generation prompts.
-
-        Returns a compact (~100-150 token) block that communicates the
-        user's current priorities so the model makes aligned decisions
-        about what to fix, how to approach the work, and what to test.
+        When called with no scoping args, falls back to "show every active
+        goal" behavior (v1 compatible). When either signal is present,
+        the output is scoped to the top-N matches by relevance score,
+        filtering out goals that score below the minimum threshold —
+        noisy goals are never injected into an unrelated op's prompt.
         """
-        if not self._goals:
+        actives = self.active_goals
+        if not actives:
             return ""
+
+        if description or target_files:
+            relevant = self.find_relevant(
+                description=description,
+                target_files=target_files,
+            )
+            if not relevant:
+                return ""
+            goals_to_render: List[Tuple[ActiveGoal, float]] = relevant
+        else:
+            goals_to_render = [(g, 0.0) for g in actives[:_MAX_PROMPT_GOALS]]
+
         lines = [
             "## Active Goals (user-defined priorities)\n",
             "Align your changes with these current objectives:\n",
         ]
-        for g in self._goals:
+        for goal, score in goals_to_render:
             weight_tag = ""
-            if g.priority_weight >= 2.0:
+            if goal.priority_weight >= 2.0:
                 weight_tag = " [HIGH PRIORITY]"
-            elif g.priority_weight <= 0.5:
+            elif goal.priority_weight <= 0.5:
                 weight_tag = " [low priority]"
+            score_tag = f" [relevance={score:.1f}]" if score > 0 else ""
             paths = ""
-            if g.path_patterns:
-                paths = f" (focus: {', '.join(g.path_patterns[:3])})"
-            lines.append(f"- **{g.goal_id}**: {g.description}{paths}{weight_tag}")
+            if goal.path_patterns:
+                paths = f" (focus: {', '.join(goal.path_patterns[:3])})"
+            tags = ""
+            if goal.tags:
+                tags = f" #{' #'.join(goal.tags[:4])}"
+            lines.append(
+                f"- **{goal.goal_id}**: {goal.description}{paths}{tags}"
+                f"{weight_tag}{score_tag}"
+            )
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Keyword / slug helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def extract_keywords(
+        description: str,
+        *,
+        limit: int = 8,
+        min_len: int = 4,
+        stopwords: Tuple[str, ...] = _DEFAULT_STOPWORDS,
+    ) -> Tuple[str, ...]:
+        """Auto-extract keywords from a goal description.
+
+        Lowercase, min-length filtered, stopword filtered. Used by the
+        REPL ``/goal add`` handler so the user doesn't have to think up
+        keywords manually, and centralised here so the stopword list
+        isn't duplicated across call sites.
+        """
+        if not description:
+            return ()
+        stop = set(stopwords)
+        words: List[str] = []
+        seen: set = set()
+        for raw in re.split(r"[^a-zA-Z0-9_]+", description):
+            w = raw.lower()
+            if len(w) < min_len or w in stop or w in seen:
+                continue
+            seen.add(w)
+            words.append(w)
+            if len(words) >= limit:
+                break
+        return tuple(words)
+
+    @staticmethod
+    def slugify(description: str, *, max_len: int = 40) -> str:
+        """Turn a free-text description into a lowercase slug id."""
+        if not description:
+            return "goal"
+        s = re.sub(r"[^a-z0-9]+", "-", description.lower())[:max_len].strip("-")
+        return s or "goal"
+
+    # ------------------------------------------------------------------
+    # Persistence (v1-compatible loader, v2 writer)
+    # ------------------------------------------------------------------
 
     def _persist(self) -> None:
         try:
             path = self._root / _GOAL_FILE
             path.parent.mkdir(parents=True, exist_ok=True)
-            data = [
-                {
-                    "goal_id": g.goal_id,
-                    "description": g.description,
-                    "keywords": list(g.keywords),
-                    "path_patterns": list(g.path_patterns),
-                    "priority_weight": g.priority_weight,
-                    "created_at": g.created_at,
-                }
-                for g in self._goals
-            ]
+            data = {
+                "schema_version": _GOAL_SCHEMA_VERSION,
+                "goals": [
+                    {
+                        "goal_id": g.goal_id,
+                        "description": g.description,
+                        "keywords": list(g.keywords),
+                        "path_patterns": list(g.path_patterns),
+                        "tags": list(g.tags),
+                        "priority_weight": g.priority_weight,
+                        "status": g.status.value,
+                        "due_at": g.due_at,
+                        "created_at": g.created_at,
+                        "updated_at": g.updated_at,
+                    }
+                    for g in self._goals
+                ],
+            }
             path.write_text(json.dumps(data, indent=2))
         except Exception:
             logger.debug("[GoalTracker] Persist failed", exc_info=True)
@@ -511,21 +876,37 @@ class GoalTracker:
             path = self._root / _GOAL_FILE
             if not path.exists():
                 return
-            data = json.loads(path.read_text())
-            self._goals = [
-                ActiveGoal(
-                    goal_id=g["goal_id"],
-                    description=g["description"],
+            raw = json.loads(path.read_text())
+
+            # v1 format was a bare list; v2 is a dict with schema_version.
+            if isinstance(raw, list):
+                entries = raw
+            elif isinstance(raw, dict):
+                entries = raw.get("goals", [])
+            else:
+                return
+
+            goals: List[ActiveGoal] = []
+            for g in entries[:_MAX_GOALS]:
+                if not isinstance(g, dict):
+                    continue
+                goals.append(ActiveGoal(
+                    goal_id=str(g.get("goal_id", "")),
+                    description=str(g.get("description", "")),
                     keywords=tuple(g.get("keywords", ())),
                     path_patterns=tuple(g.get("path_patterns", ())),
-                    priority_weight=g.get("priority_weight", 1.0),
-                    created_at=g.get("created_at", 0.0),
-                )
-                for g in data[:_MAX_GOALS]
-            ]
+                    tags=tuple(g.get("tags", ())),
+                    priority_weight=float(g.get("priority_weight", 1.0)),
+                    status=GoalStatus.from_str(g.get("status", "active")),
+                    due_at=g.get("due_at"),
+                    created_at=float(g.get("created_at", 0.0)),
+                    updated_at=float(g.get("updated_at", g.get("created_at", 0.0))),
+                ))
+            self._goals = [g for g in goals if g.goal_id]
+
             if self._goals:
                 logger.info(
-                    "[GoalTracker] Loaded %d active goals: %s",
+                    "[GoalTracker] Loaded %d goals: %s",
                     len(self._goals),
                     ", ".join(g.goal_id for g in self._goals),
                 )
