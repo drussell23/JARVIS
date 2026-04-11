@@ -12,7 +12,7 @@
   "stats": {
     "test_fix::.py": {
       "success": 0,
-      "failure": 7
+      "failure": 9
     }
   }
 }
