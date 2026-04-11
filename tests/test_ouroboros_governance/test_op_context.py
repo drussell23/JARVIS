@@ -31,12 +31,19 @@ from backend.core.ouroboros.governance.routing_policy import RoutingDecision
 
 
 class TestOperationPhase:
-    """Verify the OperationPhase enum and transition table."""
+    """Verify the OperationPhase enum and transition table.
+
+    The transition table separates *progress* transitions (non-terminal →
+    non-terminal, hand-maintained) from *terminal-escape* transitions
+    (every non-terminal → every terminal, auto-injected at module load).
+    Tests assert both layers independently.
+    """
 
     EXPECTED_PHASES = {
         "CLASSIFY",
         "ROUTE",
         "CONTEXT_EXPANSION",
+        "PLAN",
         "GENERATE",
         "GENERATE_RETRY",
         "VALIDATE",
@@ -70,76 +77,121 @@ class TestOperationPhase:
         }
         assert TERMINAL_PHASES == expected
 
-    def test_classify_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.CLASSIFY] == {
+    # ------------------------------------------------------------------
+    # Invariant: every non-terminal phase can reach every terminal phase
+    # (auto-injected by _inject_terminal_reachability)
+    # ------------------------------------------------------------------
+
+    def test_terminal_reachability_invariant(self) -> None:
+        """Every non-terminal phase must allow transitions to EVERY terminal.
+
+        This was the FSM bug that blocked L2 repair from escaping VERIFY to
+        CANCELLED. The invariant is now enforced at module load; this test
+        guards against future regressions.
+        """
+        for phase in OperationPhase:
+            if phase in TERMINAL_PHASES:
+                continue
+            allowed = PHASE_TRANSITIONS[phase]
+            for terminal in TERMINAL_PHASES:
+                assert terminal in allowed, (
+                    f"{phase.name} cannot reach terminal {terminal.name} — "
+                    f"every non-terminal phase must have all terminals as allowed targets"
+                )
+
+    def test_verify_allows_cancelled_escape(self) -> None:
+        """Regression test for the L2-in-VERIFY illegal-transition bug.
+
+        Before the fix, VERIFY only allowed {COMPLETE, POSTMORTEM}, so L2
+        repair escapes raised ``Illegal phase transition: VERIFY -> CANCELLED``.
+        The invariant now guarantees every terminal is reachable.
+        """
+        verify_allowed = PHASE_TRANSITIONS[OperationPhase.VERIFY]
+        assert OperationPhase.CANCELLED in verify_allowed
+        assert OperationPhase.POSTMORTEM in verify_allowed
+        assert OperationPhase.EXPIRED in verify_allowed
+        assert OperationPhase.COMPLETE in verify_allowed
+
+    # ------------------------------------------------------------------
+    # Progress transitions (non-terminal → non-terminal) — these are the
+    # hand-maintained forward-flow edges. Each phase test asserts the
+    # non-terminal subset; the terminal escapes are covered by the
+    # invariant tests above.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _progress_targets(phase: OperationPhase) -> set:
+        """Return the subset of targets that are non-terminal phases."""
+        return {
+            t for t in PHASE_TRANSITIONS[phase] if t not in TERMINAL_PHASES
+        }
+
+    def test_classify_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.CLASSIFY) == {
             OperationPhase.ROUTE,
-            OperationPhase.CANCELLED,
         }
 
-    def test_route_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.ROUTE] == {
+    def test_route_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.ROUTE) == {
             OperationPhase.CONTEXT_EXPANSION,
+            OperationPhase.PLAN,
             OperationPhase.GENERATE,
-            OperationPhase.CANCELLED,
         }
 
-    def test_generate_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.GENERATE] == {
+    def test_context_expansion_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.CONTEXT_EXPANSION) == {
+            OperationPhase.PLAN,
+            OperationPhase.GENERATE,
+        }
+
+    def test_plan_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.PLAN) == {
+            OperationPhase.GENERATE,
+        }
+
+    def test_generate_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.GENERATE) == {
             OperationPhase.VALIDATE,
             OperationPhase.GENERATE_RETRY,
-            OperationPhase.CANCELLED,
-            OperationPhase.COMPLETE,  # noop fast-path: model signals change already present
         }
 
-    def test_generate_retry_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.GENERATE_RETRY] == {
+    def test_generate_retry_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.GENERATE_RETRY) == {
             OperationPhase.VALIDATE,
             OperationPhase.GENERATE_RETRY,
-            OperationPhase.CANCELLED,
         }
 
-    def test_validate_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.VALIDATE] == {
+    def test_validate_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.VALIDATE) == {
             OperationPhase.GATE,
             OperationPhase.VALIDATE_RETRY,
-            OperationPhase.CANCELLED,
-            OperationPhase.POSTMORTEM,  # infra failures during validation
         }
 
-    def test_validate_retry_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.VALIDATE_RETRY] == {
+    def test_validate_retry_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.VALIDATE_RETRY) == {
             OperationPhase.GATE,
             OperationPhase.VALIDATE_RETRY,
-            OperationPhase.CANCELLED,
-            OperationPhase.POSTMORTEM,  # infra failures during validation
         }
 
-    def test_gate_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.GATE] == {
+    def test_gate_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.GATE) == {
             OperationPhase.APPROVE,
             OperationPhase.APPLY,
-            OperationPhase.CANCELLED,
         }
 
-    def test_approve_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.APPROVE] == {
+    def test_approve_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.APPROVE) == {
             OperationPhase.APPLY,
-            OperationPhase.CANCELLED,
-            OperationPhase.EXPIRED,
         }
 
-    def test_apply_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.APPLY] == {
+    def test_apply_progress(self) -> None:
+        assert self._progress_targets(OperationPhase.APPLY) == {
             OperationPhase.VERIFY,
-            OperationPhase.POSTMORTEM,
-            OperationPhase.CANCELLED,
         }
 
-    def test_verify_transitions(self) -> None:
-        assert PHASE_TRANSITIONS[OperationPhase.VERIFY] == {
-            OperationPhase.COMPLETE,
-            OperationPhase.POSTMORTEM,
-        }
+    def test_verify_progress(self) -> None:
+        """VERIFY has no forward progress — it can only escape to terminals."""
+        assert self._progress_targets(OperationPhase.VERIFY) == set()
 
     def test_every_phase_in_transition_table(self) -> None:
         """Every phase must have a key in PHASE_TRANSITIONS."""

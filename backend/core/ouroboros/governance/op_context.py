@@ -84,68 +84,53 @@ class OperationPhase(Enum):
 # Phase Transition Table
 # ---------------------------------------------------------------------------
 
+# Progress transitions only — terminal escapes (CANCELLED, POSTMORTEM,
+# EXPIRED, COMPLETE-noop) are auto-injected below by
+# _inject_terminal_reachability() so the table does not need to repeat them.
+# Keep this table focused on the *forward flow* of the pipeline.
 PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
     OperationPhase.CLASSIFY: {
         OperationPhase.ROUTE,
-        OperationPhase.CANCELLED,
     },
     OperationPhase.ROUTE: {
         OperationPhase.CONTEXT_EXPANSION,
         OperationPhase.PLAN,            # fast-path: skip expansion, go directly to planning
         OperationPhase.GENERATE,
-        OperationPhase.CANCELLED,
     },
     OperationPhase.CONTEXT_EXPANSION: {
         OperationPhase.PLAN,
         OperationPhase.GENERATE,       # direct-to-GENERATE for trivial ops (skip planning)
-        OperationPhase.CANCELLED,
     },
     OperationPhase.PLAN: {
         OperationPhase.GENERATE,
-        OperationPhase.CANCELLED,
     },
     OperationPhase.GENERATE: {
         OperationPhase.VALIDATE,
         OperationPhase.GENERATE_RETRY,
-        OperationPhase.CANCELLED,
-        OperationPhase.COMPLETE,   # noop fast-path: model signals change already present
     },
     OperationPhase.GENERATE_RETRY: {
         OperationPhase.VALIDATE,
         OperationPhase.GENERATE_RETRY,
-        OperationPhase.CANCELLED,
     },
     OperationPhase.VALIDATE: {
         OperationPhase.GATE,
         OperationPhase.VALIDATE_RETRY,
-        OperationPhase.CANCELLED,
-        OperationPhase.POSTMORTEM,   # infra failures during validation
     },
     OperationPhase.VALIDATE_RETRY: {
         OperationPhase.GATE,
         OperationPhase.VALIDATE_RETRY,
-        OperationPhase.CANCELLED,
-        OperationPhase.POSTMORTEM,   # infra failures during retry
     },
     OperationPhase.GATE: {
         OperationPhase.APPROVE,
         OperationPhase.APPLY,
-        OperationPhase.CANCELLED,
     },
     OperationPhase.APPROVE: {
         OperationPhase.APPLY,
-        OperationPhase.CANCELLED,
-        OperationPhase.EXPIRED,
     },
     OperationPhase.APPLY: {
         OperationPhase.VERIFY,
-        OperationPhase.POSTMORTEM,
-        OperationPhase.CANCELLED,
     },
-    OperationPhase.VERIFY: {
-        OperationPhase.COMPLETE,
-        OperationPhase.POSTMORTEM,
-    },
+    OperationPhase.VERIFY: set(),  # terminals only — no forward progress
     # Terminal phases -- no outgoing transitions
     OperationPhase.COMPLETE: set(),
     OperationPhase.CANCELLED: set(),
@@ -159,6 +144,69 @@ TERMINAL_PHASES: Set[OperationPhase] = {
     OperationPhase.EXPIRED,
     OperationPhase.POSTMORTEM,
 }
+
+# ---------------------------------------------------------------------------
+# Dynamic Terminal Reachability Invariant
+# ---------------------------------------------------------------------------
+#
+# Rule: every non-terminal phase can transition to every terminal phase.
+#
+# Why this is enforced here rather than maintained by hand per-phase:
+#   • The hand-maintained table above only needs to declare *progress*
+#     transitions (non-terminal → non-terminal) — terminal escapes
+#     (CANCELLED / POSTMORTEM / EXPIRED / COMPLETE-noop) are auto-injected.
+#   • Prevents the entire class of bugs where a new phase (e.g. VERIFY)
+#     silently forbids an escape route and corrupts the FSM at runtime.
+#     This was the root cause of the "Illegal phase transition:
+#     VERIFY -> CANCELLED" incident the L2 repair path was hitting.
+#   • COMPLETE is also terminal-reachable from any non-terminal phase to
+#     preserve the noop fast-path semantics (model signals no change needed).
+#
+# Callers that want to restrict specific terminals (e.g. forbid CANCELLED
+# from VERIFY for semantic reasons) should do so at the call site, not via
+# the FSM. The FSM's job is to guarantee reachability; semantic choices
+# belong to the orchestrator/hooks.
+def _inject_terminal_reachability(
+    transitions: Dict[OperationPhase, Set[OperationPhase]],
+    terminals: Set[OperationPhase],
+) -> None:
+    """Auto-inject every terminal phase into every non-terminal phase's
+    allowed-transition set. Idempotent and in-place.
+    """
+    for phase, allowed in transitions.items():
+        if phase in terminals:
+            continue  # terminals stay terminal (empty set)
+        allowed.update(terminals)
+
+
+def _verify_terminal_invariant(
+    transitions: Dict[OperationPhase, Set[OperationPhase]],
+    terminals: Set[OperationPhase],
+) -> None:
+    """Assert the terminal-reachability invariant at module load.
+
+    Raises RuntimeError if any non-terminal phase is missing a terminal
+    target — an explicit fast-fail instead of silently shipping a broken FSM.
+    """
+    for phase, allowed in transitions.items():
+        if phase in terminals:
+            if allowed:
+                raise RuntimeError(
+                    f"Terminal phase {phase.name} has outgoing transitions "
+                    f"{sorted(p.name for p in allowed)} — terminals must be dead ends"
+                )
+            continue
+        missing = terminals - allowed
+        if missing:
+            raise RuntimeError(
+                f"Phase {phase.name} is missing terminal-escape routes: "
+                f"{sorted(p.name for p in missing)}. "
+                f"Every non-terminal phase must be able to reach every terminal phase."
+            )
+
+
+_inject_terminal_reachability(PHASE_TRANSITIONS, TERMINAL_PHASES)
+_verify_terminal_invariant(PHASE_TRANSITIONS, TERMINAL_PHASES)
 
 
 # ---------------------------------------------------------------------------

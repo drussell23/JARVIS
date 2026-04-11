@@ -71,6 +71,14 @@
       "source_op_id": "op-001",
       "severity": "soft",
       "created_at": 1775868677.7458491
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"saga_stuck\"",
+      "reason": "Operation op-001 failed: saga_stuck",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1775875680.697121
     }
   ]
 }

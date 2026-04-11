@@ -3556,8 +3556,29 @@ class GovernedOrchestrator:
                                 )
                         except Exception as _apply_exc:
                             logger.debug("[Orchestrator] L2 repair apply error: %s", _apply_exc)
+                    elif directive[0] in ("cancel", "fatal"):
+                        # L2 decided to escape. _l2_hook has already advanced
+                        # ctx to the phase-appropriate terminal (POSTMORTEM
+                        # from VERIFY per _l2_escape_terminal) and recorded a
+                        # ledger entry. Capture the terminal ctx and return
+                        # immediately — continuing VERIFY logic (benchmark,
+                        # verify gate, rollback) on a terminal ctx would
+                        # violate the FSM and produce spurious transitions.
+                        ctx = directive[1]
+                        logger.info(
+                            "[Orchestrator] L2 escaped VERIFY phase — "
+                            "op ctx advanced to %s [%s]",
+                            ctx.phase.name, ctx.op_id,
+                        )
+                        return ctx
                 except Exception as _l2_exc:
-                    logger.debug("[Orchestrator] L2 repair in VERIFY failed: %s", _l2_exc)
+                    # Log the failure as a one-liner instead of a full traceback;
+                    # the exception path is handled inside _l2_hook which already
+                    # advances ctx to POSTMORTEM.
+                    logger.debug(
+                        "[Orchestrator] L2 repair in VERIFY failed: %s: %s",
+                        type(_l2_exc).__name__, _l2_exc,
+                    )
 
         ctx = await self._run_benchmark(ctx, [])
 
@@ -4517,6 +4538,40 @@ class GovernedOrchestrator:
         updated["patches"] = scheduler.get_merged_patches(graph.graph_id)
         return ctx, updated
 
+    # Phases where code has already been written to disk. An L2 escape from
+    # any of these is a *regression* (disk state diverged from baseline) and
+    # must be recorded as POSTMORTEM so the forensic path runs. Escapes from
+    # earlier phases have touched no files and can safely be CANCELLED
+    # (graceful abort). This set is the single source of truth — any new
+    # post-apply phase added to the FSM should be added here once.
+    _POST_APPLY_PHASES: frozenset = frozenset({
+        OperationPhase.APPLY,
+        OperationPhase.VERIFY,
+    })
+
+    @classmethod
+    def _l2_escape_terminal(cls, current_phase: OperationPhase) -> OperationPhase:
+        """Return the appropriate terminal phase for an L2 escape.
+
+        Principle: once code has touched disk (APPLY/VERIFY), an escape is a
+        regression requiring forensics → POSTMORTEM. Before that, the op
+        hasn't altered any files, so a graceful abort is a user-level
+        cancellation → CANCELLED.
+
+        Parameters
+        ----------
+        current_phase:
+            The phase the ctx is in when L2 is invoked.
+
+        Returns
+        -------
+        OperationPhase
+            Either ``POSTMORTEM`` (post-apply) or ``CANCELLED`` (pre-apply).
+        """
+        if current_phase in cls._POST_APPLY_PHASES:
+            return OperationPhase.POSTMORTEM
+        return OperationPhase.CANCELLED
+
     async def _l2_hook(
         self,
         ctx: "OperationContext",
@@ -4527,28 +4582,49 @@ class GovernedOrchestrator:
 
         Returns:
             ("break", candidate, canonical_val)  → L2 converged; caller breaks to GATE
-            ("cancel", ctx)                      → L2 stopped or canonical validate failed; ctx is advanced
-            ("fatal", ctx)                       → non-CancelledError exception; ctx is advanced
+            ("cancel", ctx)                      → L2 stopped or canonical validate failed; ctx is advanced to the phase-appropriate terminal
+            ("fatal", ctx)                       → non-CancelledError exception; ctx is advanced to POSTMORTEM
         Raises:
-            asyncio.CancelledError — if engine.run() was cancelled (POSTMORTEM recorded first)
+            asyncio.CancelledError — if engine.run() was cancelled (terminal recorded first)
+
+        The terminal phase chosen for ``cancel``/``fatal`` respects the
+        current ctx phase via :meth:`_l2_escape_terminal`:
+          • From VALIDATE/VALIDATE_RETRY (pre-apply) → CANCELLED
+          • From APPLY/VERIFY (post-apply) → POSTMORTEM
+        ``fatal`` classification always routes to POSTMORTEM regardless of
+        phase — an engine-level exception is always a forensic event.
         """
+        # Snapshot the entry phase up front — we use it for every terminal
+        # selection below, even if ctx is later reassigned.
+        _entry_phase = ctx.phase
+        _escape_terminal = self._l2_escape_terminal(_entry_phase)
+
         try:
             l2_result = await self._config.repair_engine.run(ctx, best_validation, deadline)
         except asyncio.CancelledError:
+            # asyncio cancellation is a forensic event — always POSTMORTEM.
             ctx = ctx.advance(
                 OperationPhase.POSTMORTEM,
                 terminal_reason_code="l2_cancelled",
             )
-            await self._record_ledger(ctx, OperationState.FAILED, {"reason": "l2_cancelled"})
+            await self._record_ledger(
+                ctx,
+                OperationState.FAILED,
+                {"reason": "l2_cancelled", "entry_phase": _entry_phase.name},
+            )
             raise
         except Exception as exc:
+            # Engine-level exceptions are always POSTMORTEM (forensic path).
             logger.error("[Orchestrator] L2 engine error: %s", exc, exc_info=True)
             ctx = ctx.advance(
                 OperationPhase.POSTMORTEM,
                 terminal_reason_code=f"l2_fatal:{type(exc).__name__}",
             )
-            await self._record_ledger(ctx, OperationState.FAILED,
-                {"reason": f"l2_fatal:{type(exc).__name__}"})
+            await self._record_ledger(
+                ctx,
+                OperationState.FAILED,
+                {"reason": f"l2_fatal:{type(exc).__name__}", "entry_phase": _entry_phase.name},
+            )
             return ("fatal", ctx)
 
         if l2_result.terminal == "L2_CONVERGED" and l2_result.candidate is not None:
@@ -4562,35 +4638,43 @@ class GovernedOrchestrator:
                 })
                 return ("break", l2_result.candidate, canonical_val)
             else:
+                # Phase-aware escape: post-apply → POSTMORTEM, pre-apply → CANCELLED.
                 ctx = ctx.advance(
-                    OperationPhase.CANCELLED,
+                    _escape_terminal,
                     terminal_reason_code="l2_canonical_validate_failed",
                 )
                 await self._record_ledger(ctx, OperationState.FAILED, {
                     "reason": "l2_canonical_validate_failed",
+                    "entry_phase": _entry_phase.name,
+                    "terminal": _escape_terminal.name,
                     **l2_result.summary,
                 })
                 return ("cancel", ctx)
 
         elif l2_result.terminal == "L2_STOPPED":
+            # Phase-aware escape: post-apply → POSTMORTEM, pre-apply → CANCELLED.
             ctx = ctx.advance(
-                OperationPhase.CANCELLED,
+                _escape_terminal,
                 terminal_reason_code="l2_stopped",
             )
             await self._record_ledger(ctx, OperationState.FAILED, {
                 "reason": "l2_stopped",
+                "entry_phase": _entry_phase.name,
+                "terminal": _escape_terminal.name,
                 "stop_reason": l2_result.stop_reason,
                 **l2_result.summary,
             })
             return ("cancel", ctx)
 
         else:  # L2_CONVERGED with no candidate (shouldn't happen in practice)
+            # No candidate is an engine invariant violation → POSTMORTEM.
             ctx = ctx.advance(
                 OperationPhase.POSTMORTEM,
                 terminal_reason_code="l2_no_candidate",
             )
             await self._record_ledger(ctx, OperationState.FAILED, {
                 "reason": "l2_no_candidate",
+                "entry_phase": _entry_phase.name,
                 **l2_result.summary,
             })
             return ("fatal", ctx)
