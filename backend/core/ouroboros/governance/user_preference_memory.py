@@ -738,6 +738,65 @@ class UserPreferenceStore:
         except ValueError:
             return None
 
+    def record_critique_failure(
+        self,
+        *,
+        op_id: str,
+        description: str,
+        target_files: Sequence[str],
+        rating: int,
+        rationale: str,
+        concerns: Sequence[str] = (),
+    ) -> Optional[UserMemory]:
+        """Convert a poor self-critique verdict into a FEEDBACK memory.
+
+        Called by the Self-Critique Engine (Phase 3a) after a
+        successful APPLY+VERIFY whose resulting diff was rated 1-2/5
+        by the critique provider. The memory encodes the auditor's
+        rationale and any specific concerns so future ops on similar
+        shapes inherit the lesson and can avoid repeating the
+        mistake.
+
+        The name is deduplicated by slugged description, so repeat
+        poor ratings of the same op-shape upsert the existing
+        memory rather than pile up one-per-op.
+        """
+        cleaned_rationale = (rationale or "").strip()
+        if not cleaned_rationale:
+            return None
+        desc_short = (description or "unknown operation").strip()[:100]
+        name = f"critique_poor_{_slug(desc_short, max_len=40)}"
+        if not name.strip("_"):
+            name = f"critique_poor_{op_id}"
+        paths = tuple(p for p in target_files[:4] if p)
+        concerns_str = "; ".join(str(c).strip() for c in concerns if c and str(c).strip())[:400]
+        why_body = cleaned_rationale[:400]
+        if concerns_str:
+            why_body = f"{why_body} Concerns: {concerns_str}"
+        try:
+            return self.add(
+                memory_type=MemoryType.FEEDBACK,
+                name=name,
+                description=f"Low self-critique ({rating}/5): {desc_short}",
+                content=(
+                    "This memory was auto-extracted from a post-VERIFY "
+                    "self-critique pass that rated the applied diff as "
+                    "insufficient relative to the stated goal. A future "
+                    "op with similar shape should revisit the approach "
+                    "before re-attempting the same fix."
+                ),
+                why=why_body,
+                how_to_apply=(
+                    "When a similar op is queued, consider the listed "
+                    "concerns and avoid repeating the flagged approach."
+                ),
+                source=f"self_critique:{op_id}",
+                tags=("critique", "poor_rating", f"rating_{rating}"),
+                paths=paths,
+            )
+        except ValueError:
+            return None
+
     # ------------------------------------------------------------------
     # Internals — persistence
     # ------------------------------------------------------------------
