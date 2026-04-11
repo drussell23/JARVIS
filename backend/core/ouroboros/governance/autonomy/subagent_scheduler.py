@@ -17,6 +17,9 @@ from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     EventType,
 )
 from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
+from backend.core.ouroboros.governance.autonomy.execution_graph_progress import (
+    ExecutionGraphProgressTracker,
+)
 from backend.core.ouroboros.governance.autonomy.execution_graph_store import (
     ExecutionGraphStore,
 )
@@ -277,6 +280,7 @@ class SubagentScheduler:
         executor: Any,
         merge_coordinator: Optional[MergeCoordinator] = None,
         max_concurrent_graphs: int = 2,
+        progress_tracker: Optional[ExecutionGraphProgressTracker] = None,
     ) -> None:
         self._store = store
         self._command_bus = command_bus
@@ -284,6 +288,7 @@ class SubagentScheduler:
         self._executor = executor
         self._merge_coordinator = merge_coordinator or MergeCoordinator()
         self._max_concurrent_graphs = max_concurrent_graphs
+        self._progress_tracker = progress_tracker
         self._graphs: Dict[str, GraphExecutionState] = {}
         self._graph_tasks: Dict[str, asyncio.Task] = {}
         self._graph_futures: Dict[str, asyncio.Future] = {}
@@ -343,6 +348,8 @@ class SubagentScheduler:
             state = GraphExecutionState(graph=graph, ready_units=ready)
             self._graphs[graph.graph_id] = state
             self._store.save(state)
+            if self._progress_tracker is not None:
+                self._progress_tracker.register_graph(graph)
             await self._emit_graph_event(graph.op_id, graph.graph_id, GraphExecutionPhase.CREATED, state)
 
             self._ensure_graph_future(graph.graph_id)
