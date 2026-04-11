@@ -1,0 +1,41 @@
+# provider=claude-api
+# op_id=op-019d7a13-51f7-70d1-b33b-c88769671134-cau
+# exception_type=JSONDecodeError
+# exception_message=Expecting value: line 1 column 1 (char 0)
+# raw_len=3296
+# extracted_len=3296
+# ============================================================
+# RAW (pre-extraction):
+# ============================================================
+Looking at the file, I need to:
+1. Add docstrings to `parse_args()` and `main()` (the 2 undocumented public symbols)
+2. Create a test file for the module
+
+Let me write both files:
+
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/headless_cli.py",
+      "full_content": "\"\"\"\nHeadless CLI — One-shot Ouroboros governance operations via command line.\n\nGap 4: Run Ouroboros without the full supervisor boot.\n  python3 -m backend.core.ouroboros.governance.headless_cli \\\\\n    --goal \"fix test failures in backend/core/\" \\\\\n    --repo jarvis --json\n\nReturns structured JSON result for CI/CD integration.\n\nBoundary Principle:\n  Deterministic: CLI argument parsing, JSON output formatting.\n  Agentic: The governance operation itself (CLASSIFY -> COMPLETE).\n\"\"\"\nfrom __future__ import annotations\n\nimport argparse\nimport asyncio\nimport json\nimport logging\nimport os\nimport sys\nimport time\nfrom pathlib import Path\nfrom typing import Any, Dict, Optional\n\nlogger = logging.getLogger(__name__)\n\n\ndef parse_args() -> argparse.Namespace:\n    \"\"\"Parse command-line arguments for the headless governance CLI.\n\n    Defines all supported flags including --goal (required), --repo,\n    --target-files, --json, --dry-run, --timeout, --project-root, and\n    --verbose. Returns the populated Namespace ready for run_headless().\n    \"\"\"\n    parser = argparse.ArgumentParser(\n        prog=\"ouroboros\",\n        description=\"Run a one-shot Ouroboros governance operation\",\n    )\n    parser.add_argument(\n        \"--goal\", required=True,\n        help=\"What to fix/improve (e.g., 'fix test failures in backend/core/')\",\n    )\n    parser.add_argument(\n        \"--repo\", default=\"jarvis\",\n        help=\"Target repository (jarvis, jarvis-prime, reactor)\",\n    )\n    parser.add_argument(\n        \"--target-files\", nargs=\"*\", default=[],\n        help=\"Specific files to target (space-separated)\",\n    )\n    parser.add_argument(\n        \"--json\", dest=\"json_output\", action=\"store_true\",\n        help=\"Output structured JSON result\",\n    )\n    parser.add_argument(\n        \"--dry-run\", action=\"store_true\",\n        help=\"Classify and route only — don't generate or apply\",\n    )\n    parser.add_argument(\n        \"--timeout\", type=float, default=300.0,\n        help=\"Maximum seconds for the operation (default: 300)\",\n    )\n    parser.add_argument(\n        \"--project-root\", default=\".\",\n        help=\"Project root directory\",\n    )\n    parser.add_argument(\n        \"--verbose\", \"-v\", action=\"store_true\",\n        help=\"Enable verbose logging\",\n    )\n    return parser.parse_args()\n\n\nasync def run_headless(args: argparse.Namespace) -> Dict[str, Any]:\n    \"\"\"Execute a one-shot governance operation headlessly.\n\n    Constructs a minimal governance stack, creates an IntentEnvelope,\n    and runs it through the orchestrator pipeline. Returns structured\n    result without requiring the full supervisor boot.\n    \"\"\"\n    t0 = time.monotonic()\n    project_root = Path(args.project_root).resolve()\n\n    result: Dict[str, Any] = {\n        \"goal\": args.goal,\n        \"repo\":
+
+# ============================================================
+# EXTRACTED (post _extract_json_block):
+# ============================================================
+Looking at the file, I need to:
+1. Add docstrings to `parse_args()` and `main()` (the 2 undocumented public symbols)
+2. Create a test file for the module
+
+Let me write both files:
+
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/headless_cli.py",
+      "full_content": "\"\"\"\nHeadless CLI — One-shot Ouroboros governance operations via command line.\n\nGap 4: Run Ouroboros without the full supervisor boot.\n  python3 -m backend.core.ouroboros.governance.headless_cli \\\\\n    --goal \"fix test failures in backend/core/\" \\\\\n    --repo jarvis --json\n\nReturns structured JSON result for CI/CD integration.\n\nBoundary Principle:\n  Deterministic: CLI argument parsing, JSON output formatting.\n  Agentic: The governance operation itself (CLASSIFY -> COMPLETE).\n\"\"\"\nfrom __future__ import annotations\n\nimport argparse\nimport asyncio\nimport json\nimport logging\nimport os\nimport sys\nimport time\nfrom pathlib import Path\nfrom typing import Any, Dict, Optional\n\nlogger = logging.getLogger(__name__)\n\n\ndef parse_args() -> argparse.Namespace:\n    \"\"\"Parse command-line arguments for the headless governance CLI.\n\n    Defines all supported flags including --goal (required), --repo,\n    --target-files, --json, --dry-run, --timeout, --project-root, and\n    --verbose. Returns the populated Namespace ready for run_headless().\n    \"\"\"\n    parser = argparse.ArgumentParser(\n        prog=\"ouroboros\",\n        description=\"Run a one-shot Ouroboros governance operation\",\n    )\n    parser.add_argument(\n        \"--goal\", required=True,\n        help=\"What to fix/improve (e.g., 'fix test failures in backend/core/')\",\n    )\n    parser.add_argument(\n        \"--repo\", default=\"jarvis\",\n        help=\"Target repository (jarvis, jarvis-prime, reactor)\",\n    )\n    parser.add_argument(\n        \"--target-files\", nargs=\"*\", default=[],\n        help=\"Specific files to target (space-separated)\",\n    )\n    parser.add_argument(\n        \"--json\", dest=\"json_output\", action=\"store_true\",\n        help=\"Output structured JSON result\",\n    )\n    parser.add_argument(\n        \"--dry-run\", action=\"store_true\",\n        help=\"Classify and route only — don't generate or apply\",\n    )\n    parser.add_argument(\n        \"--timeout\", type=float, default=300.0,\n        help=\"Maximum seconds for the operation (default: 300)\",\n    )\n    parser.add_argument(\n        \"--project-root\", default=\".\",\n        help=\"Project root directory\",\n    )\n    parser.add_argument(\n        \"--verbose\", \"-v\", action=\"store_true\",\n        help=\"Enable verbose logging\",\n    )\n    return parser.parse_args()\n\n\nasync def run_headless(args: argparse.Namespace) -> Dict[str, Any]:\n    \"\"\"Execute a one-shot governance operation headlessly.\n\n    Constructs a minimal governance stack, creates an IntentEnvelope,\n    and runs it through the orchestrator pipeline. Returns structured\n    result without requiring the full supervisor boot.\n    \"\"\"\n    t0 = time.monotonic()\n    project_root = Path(args.project_root).resolve()\n\n    result: Dict[str, Any] = {\n        \"goal\": args.goal,\n        \"repo\":
