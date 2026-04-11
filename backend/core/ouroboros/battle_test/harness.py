@@ -954,15 +954,17 @@ class BattleTestHarness:
         """Manage active goals at runtime.
 
         Usage:
-          /goal                        — list active goals
-          /goal all                    — list every goal (active/paused/completed)
-          /goal show <id>              — show one goal in detail
-          /goal add <desc>             — add a goal (keywords/slug auto-extracted)
-          /goal remove <id>            — remove a goal by ID
-          /goal pause <id>             — pause (skips scoring + injection)
-          /goal resume <id>            — resume a paused goal
-          /goal complete <id>          — mark as completed
-          /goal purge                  — drop all completed goals
+          /goal                                 — list active goals
+          /goal all                             — list every goal (any status)
+          /goal tree                            — show hierarchy (v3 parent chains)
+          /goal show <id>                       — one goal + parent + children
+          /goal add <desc>                      — add a goal (auto slug + keywords)
+          /goal add --parent <id> <desc>        — add as child of <id>
+          /goal remove <id>                     — remove by ID
+          /goal pause <id>                      — skip scoring + injection
+          /goal resume <id>                     — resume a paused goal
+          /goal complete <id>                   — mark as completed
+          /goal purge                           — drop all completed goals
         """
         parts = line.replace("/goal", "goal", 1).split(None, 2)
         subcmd = parts[1].strip().lower() if len(parts) > 1 else "list"
@@ -1018,6 +1020,37 @@ class BattleTestHarness:
             for g in goals:
                 self._repl_print(_render_one(g))
 
+        elif subcmd == "tree":
+            tree = tracker.hierarchy_tree(include_inactive=True)
+            if not tree:
+                self._repl_print(
+                    "[dim]No goals stored. Use: /goal add <description>[/dim]"
+                )
+                return
+            self._repl_print(
+                f"[bold]Goal Hierarchy[/bold]  "
+                f"[dim]({len(tree)} goal(s), "
+                f"{len(tracker.roots)} root(s))[/dim]"
+            )
+            for g, depth in tree:
+                indent = "  " * depth
+                branch = "" if depth == 0 else "└─ "
+                status_color = {
+                    GoalStatus.ACTIVE: "green",
+                    GoalStatus.PAUSED: "yellow",
+                    GoalStatus.COMPLETED: "blue",
+                }.get(g.status, "white")
+                weight_tag = ""
+                if g.priority_weight >= 2.0:
+                    weight_tag = " [bold red]HIGH[/bold red]"
+                elif g.priority_weight <= 0.5:
+                    weight_tag = " [dim]low[/dim]"
+                self._repl_print(
+                    f"  {indent}{branch}[cyan]{g.goal_id}[/cyan] "
+                    f"[{status_color}]{g.status.value}[/{status_color}]"
+                    f"{weight_tag}  [dim]{g.description[:60]}[/dim]"
+                )
+
         elif subcmd == "show" and len(parts) > 2:
             goal_id = parts[2].strip()
             g = tracker.get(goal_id)
@@ -1032,9 +1065,37 @@ class BattleTestHarness:
             if g.tags:
                 self._repl_print(f"  tags:        {', '.join(g.tags)}")
             self._repl_print(f"  priority:    {g.priority_weight}")
+            # v3 hierarchy: render ancestor chain + direct children
+            if g.parent_id is not None:
+                chain = tracker.ancestors_of(goal_id)
+                chain_str = " ← ".join(a.goal_id for a in chain)
+                self._repl_print(f"  ancestors:   {chain_str or '(none)'}")
+            children = tracker.children_of(goal_id)
+            if children:
+                kids = ", ".join(sorted(c.goal_id for c in children))
+                self._repl_print(f"  children:    {kids}")
 
         elif subcmd == "add" and len(parts) > 2:
-            desc = parts[2].strip().strip("'\"")
+            rest = parts[2].strip()
+            parent_id: Optional[str] = None
+            # Support: /goal add --parent <id> <desc>
+            if rest.startswith("--parent"):
+                tokens = rest.split(None, 2)
+                if len(tokens) < 3:
+                    self._repl_print(
+                        "[red]Usage: /goal add --parent <parent-id> "
+                        "<description>[/red]"
+                    )
+                    return
+                parent_id = tokens[1].strip()
+                rest = tokens[2].strip()
+                if tracker.get(parent_id) is None:
+                    self._repl_print(
+                        f"[red]Parent '{parent_id}' not found — "
+                        f"run /goal tree to see available ids[/red]"
+                    )
+                    return
+            desc = rest.strip("'\"")
             # Delegate slug + keyword extraction to GoalTracker so the
             # stopword list lives in one place (and is env-overridable).
             slug = GoalTracker.slugify(desc)
@@ -1043,11 +1104,24 @@ class BattleTestHarness:
                 goal_id=slug,
                 description=desc,
                 keywords=keywords,
+                parent_id=parent_id,
             )
+            # Preview cycle check before mutating — defensive, since the
+            # tracker heals this anyway but we surface the reason.
+            if parent_id and tracker.has_cycle(slug, parent_id):
+                self._repl_print(
+                    f"[yellow]Note: parent '{parent_id}' would cycle — "
+                    f"installing '{slug}' as root[/yellow]"
+                )
             tracker.add_goal(goal)
+            stored = tracker.get(slug)
+            parent_note = ""
+            if stored and stored.parent_id:
+                parent_note = f"  [dim]parent: {stored.parent_id}[/dim]"
             self._repl_print(
                 f"[green]Goal added:[/green] [cyan]{slug}[/cyan]  "
                 f"[dim]keywords: {', '.join(keywords) or '(none)'}[/dim]"
+                f"{parent_note}"
             )
 
         elif subcmd in ("remove", "rm") and len(parts) > 2:
@@ -1087,9 +1161,10 @@ class BattleTestHarness:
 
         else:
             self._repl_print(
-                "[dim]Usage: /goal | /goal all | /goal show <id> | "
-                "/goal add <desc> | /goal remove <id> | "
-                "/goal pause|resume|complete <id> | /goal purge[/dim]"
+                "[dim]Usage: /goal | /goal all | /goal tree | "
+                "/goal show <id> | /goal add [--parent <id>] <desc> | "
+                "/goal remove <id> | /goal pause|resume|complete <id> | "
+                "/goal purge[/dim]"
             )
 
     # -- UserPreferenceMemory sub-commands -------------------------------

@@ -426,6 +426,30 @@ _STALENESS_HALFLIFE_DAYS = _env_float("JARVIS_GOAL_HALFLIFE_DAYS", 14.0)
 # Separate from _MAX_GOALS which caps *total* stored goals.
 _MAX_PROMPT_GOALS = _env_int("JARVIS_GOAL_PROMPT_MAX", 3)
 
+# v3 Persistent Goal Hierarchy toggles. Read per-call so tests can flip
+# them via ``os.environ`` without having to reload the module.
+_DEFAULT_SEED_FILE = "config/goal_seeds.json"
+
+
+def _ancestry_injection_enabled() -> bool:
+    """Whether ``format_for_prompt`` should render ancestor chains."""
+    return os.environ.get(
+        "JARVIS_GOAL_INJECT_ANCESTRY", "true",
+    ).lower() not in ("false", "0", "no", "off")
+
+
+def _first_boot_seeding_enabled() -> bool:
+    """Whether ``GoalTracker._load`` should seed from the committed file."""
+    return os.environ.get(
+        "JARVIS_GOAL_SEED_ON_FIRST_BOOT", "true",
+    ).lower() not in ("false", "0", "no", "off")
+
+
+def _seed_file_path() -> str:
+    """Repo-relative path to the committed goal-seed template."""
+    return os.environ.get("JARVIS_GOAL_SEED_FILE", _DEFAULT_SEED_FILE)
+
+
 # Default stopwords for auto-keyword extraction. Every word <4 chars is
 # already dropped; this list removes common words that survive the length
 # filter but carry no semantic weight.
@@ -574,6 +598,8 @@ class GoalMigrationReport:
     healed_orphan_parent: int = 0          # parent_id referenced missing goal
     healed_cycle: int = 0                  # parent chain loops back to self
     upgraded: bool = False                 # True iff v<CURRENT loaded & rewritten
+    seeded: bool = False                   # True iff first-boot seeds were copied
+    seed_source: Optional[str] = None      # Repo-relative path of the seed file used
 
     @property
     def has_issues(self) -> bool:
@@ -713,6 +739,108 @@ class GoalTracker:
             anc = self.get(cursor)
             cursor = anc.parent_id if anc else None
         return False
+
+    def ancestors_of(self, goal_id: str) -> List[ActiveGoal]:
+        """Walk the parent chain upward from ``goal_id``.
+
+        Returns ancestors ordered from nearest → farthest (direct parent
+        first, root last). Empty list if ``goal_id`` is unknown or is a
+        root. Defensively bounded against cycles via a visited set, even
+        though :meth:`_heal_hierarchy` should have purged them at load.
+        """
+        goal = self.get(goal_id)
+        if goal is None:
+            return []
+        chain: List[ActiveGoal] = []
+        visited = {goal_id}
+        cursor = goal.parent_id
+        while cursor is not None:
+            if cursor in visited:
+                break
+            visited.add(cursor)
+            anc = self.get(cursor)
+            if anc is None:
+                break
+            chain.append(anc)
+            cursor = anc.parent_id
+        return chain
+
+    def descendants_of(self, goal_id: str) -> List[ActiveGoal]:
+        """BFS walk of every descendant beneath ``goal_id`` (excluding self).
+
+        Children are visited in ``goal_id`` order within each layer so
+        the output is deterministic. Empty list if the id is unknown or
+        has no children.
+        """
+        if self.get(goal_id) is None:
+            return []
+        result: List[ActiveGoal] = []
+        queue: List[str] = [goal_id]
+        visited: set = {goal_id}
+        while queue:
+            current = queue.pop(0)
+            kids = sorted(self.children_of(current), key=lambda g: g.goal_id)
+            for child in kids:
+                if child.goal_id in visited:
+                    continue
+                visited.add(child.goal_id)
+                result.append(child)
+                queue.append(child.goal_id)
+        return result
+
+    def depth_of(self, goal_id: str) -> int:
+        """Hops from root. Root = 0. Returns ``-1`` for unknown goals."""
+        if self.get(goal_id) is None:
+            return -1
+        return len(self.ancestors_of(goal_id))
+
+    def hierarchy_tree(
+        self,
+        *,
+        include_inactive: bool = True,
+    ) -> List[Tuple[ActiveGoal, int]]:
+        """Return goals in tree order with their depth.
+
+        Traversal is DFS from each root. Roots are sorted by ``goal_id``
+        and children are sorted by ``goal_id`` within each parent so the
+        output is stable across runs — useful for golden-test snapshots
+        and deterministic REPL rendering.
+
+        When ``include_inactive`` is ``False``, paused/completed goals
+        are filtered *before* the adjacency map is built. Active goals
+        whose parent is inactive become transient roots in the filtered
+        view (their depth drops to 0) — otherwise we'd orphan whole
+        subtrees just because an intermediate goal was paused.
+        """
+        pool: List[ActiveGoal]
+        if include_inactive:
+            pool = list(self._goals)
+        else:
+            pool = [g for g in self._goals if g.is_active]
+
+        pool_ids = {g.goal_id for g in pool}
+        children: Dict[str, List[ActiveGoal]] = {}
+        roots: List[ActiveGoal] = []
+        for g in pool:
+            if g.parent_id is None or g.parent_id not in pool_ids:
+                roots.append(g)
+            else:
+                children.setdefault(g.parent_id, []).append(g)
+
+        roots.sort(key=lambda g: g.goal_id)
+        for cs in children.values():
+            cs.sort(key=lambda g: g.goal_id)
+
+        result: List[Tuple[ActiveGoal, int]] = []
+
+        def _dfs(goal: ActiveGoal, depth: int) -> None:
+            result.append((goal, depth))
+            for child in children.get(goal.goal_id, []):
+                _dfs(child, depth + 1)
+
+        for root in roots:
+            _dfs(root, 0)
+        return result
 
     # ------------------------------------------------------------------
     # Mutate
@@ -1043,9 +1171,15 @@ class GoalTracker:
 
         When called with no scoping args, falls back to "show every active
         goal" behavior (v1 compatible). When either signal is present,
-        the output is scoped to the top-N matches by relevance score,
-        filtering out goals that score below the minimum threshold —
-        noisy goals are never injected into an unrelated op's prompt.
+        the output is scoped to the top-N matches by relevance score.
+
+        v3 (Persistent Goal Hierarchy): when ``JARVIS_GOAL_INJECT_ANCESTRY``
+        is enabled (default), matched goals are rendered together with
+        their parent chain so the model sees strategic lineage, not just
+        leaf objectives. Ancestors emit with a "(strategic ancestor)"
+        tag and natural tree-depth indentation; matched goals stay
+        bolded so the model can tell which line was actually selected
+        by relevance scoring.
         """
         actives = self.active_goals
         if not actives:
@@ -1058,31 +1192,67 @@ class GoalTracker:
             )
             if not relevant:
                 return ""
-            goals_to_render: List[Tuple[ActiveGoal, float]] = relevant
+            matched_ids = {g.goal_id for g, _ in relevant}
+            score_by_id: Dict[str, float] = {g.goal_id: s for g, s in relevant}
         else:
-            goals_to_render = [(g, 0.0) for g in actives[:_MAX_PROMPT_GOALS]]
+            top = actives[:_MAX_PROMPT_GOALS]
+            matched_ids = {g.goal_id for g in top}
+            score_by_id = {}
 
-        lines = [
+        # Expand matched set with each match's ancestor chain so the
+        # model reads strategic context top-down. Gated by env so ops
+        # that need terse prompts can flip it off without code changes.
+        render_ids: set = set(matched_ids)
+        if _ancestry_injection_enabled():
+            for gid in matched_ids:
+                for anc in self.ancestors_of(gid):
+                    render_ids.add(anc.goal_id)
+
+        lines: List[str] = [
             "## Active Goals (user-defined priorities)\n",
             "Align your changes with these current objectives:\n",
         ]
-        for goal, score in goals_to_render:
+
+        # Walk the active-only tree in deterministic order. Filtering
+        # to active goals pre-build means paused parents collapse out
+        # of the view rather than dragging inactive context into the
+        # prompt.
+        for goal, depth in self.hierarchy_tree(include_inactive=False):
+            if goal.goal_id not in render_ids:
+                continue
+
+            indent = "  " * depth
+            is_match = goal.goal_id in matched_ids
+            id_marker = (
+                f"**{goal.goal_id}**" if is_match else f"_{goal.goal_id}_"
+            )
+
             weight_tag = ""
             if goal.priority_weight >= 2.0:
                 weight_tag = " [HIGH PRIORITY]"
             elif goal.priority_weight <= 0.5:
                 weight_tag = " [low priority]"
-            score_tag = f" [relevance={score:.1f}]" if score > 0 else ""
+
             paths = ""
             if goal.path_patterns:
                 paths = f" (focus: {', '.join(goal.path_patterns[:3])})"
+
             tags = ""
             if goal.tags:
                 tags = f" #{' #'.join(goal.tags[:4])}"
+
+            score = score_by_id.get(goal.goal_id, 0.0)
+            score_tag = f" [relevance={score:.1f}]" if score > 0 else ""
+
+            ancestry_tag = ""
+            if not is_match:
+                ancestry_tag = " _(strategic ancestor)_"
+
             lines.append(
-                f"- **{goal.goal_id}**: {goal.description}{paths}{tags}"
-                f"{weight_tag}{score_tag}"
+                f"{indent}- {id_marker}: {goal.description}"
+                f"{paths}{tags}{weight_tag}{score_tag}{ancestry_tag}"
             )
+
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -1172,6 +1342,14 @@ class GoalTracker:
         try:
             path = self._root / _GOAL_FILE
             if not path.exists():
+                # First-boot: try to seed from the committed template.
+                if self._seed_if_available(report):
+                    # Seeding wrote active_goals.json via _persist; the
+                    # goals are already installed on ``self._goals`` so
+                    # we're done — no need to re-parse the file we just
+                    # wrote.
+                    self._migration_report = report
+                    return
                 self._migration_report = report
                 return
             raw = json.loads(path.read_text())
@@ -1276,6 +1454,96 @@ class GoalTracker:
         except Exception:
             logger.debug("[GoalTracker] Load failed", exc_info=True)
             self._migration_report = report
+
+    def _seed_if_available(self, report: GoalMigrationReport) -> bool:
+        """Copy the committed seed template into ``self._goals`` on first boot.
+
+        Returns ``True`` if seeds were installed and persisted, ``False``
+        otherwise (seeding disabled, template missing, or parse failure).
+        Never raises — seeding is a best-effort first-boot convenience
+        and should degrade to "empty tracker" rather than blocking the
+        pipeline.
+
+        The seed file uses the same on-disk schema as ``active_goals.json``
+        so operators can hand-edit ``config/goal_seeds.json`` to reshape
+        O+V's default strategic direction without touching Python.
+        """
+        if not _first_boot_seeding_enabled():
+            return False
+
+        seed_rel = _seed_file_path()
+        seed_path = self._root / seed_rel
+        if not seed_path.exists():
+            return False
+
+        try:
+            raw = json.loads(seed_path.read_text())
+        except Exception:
+            logger.debug("[GoalTracker] Seed parse failed", exc_info=True)
+            return False
+
+        if isinstance(raw, list):
+            entries = raw
+        elif isinstance(raw, dict):
+            entries = raw.get("goals", [])
+            if not isinstance(entries, list):
+                return False
+        else:
+            return False
+
+        now = time.time()
+        seeded_goals: List[ActiveGoal] = []
+        seen_ids: set = set()
+        for g in entries[:_MAX_GOALS]:
+            if not isinstance(g, dict):
+                continue
+            goal_id = str(g.get("goal_id", "")).strip()
+            if not goal_id or goal_id in seen_ids:
+                continue
+            seen_ids.add(goal_id)
+
+            parent_id: Optional[str] = None
+            raw_parent = g.get("parent_id")
+            if raw_parent:
+                pid = str(raw_parent).strip()
+                if pid and pid != goal_id:
+                    parent_id = pid
+
+            seeded_goals.append(ActiveGoal(
+                goal_id=goal_id,
+                description=str(g.get("description", "")),
+                keywords=tuple(g.get("keywords", ())),
+                path_patterns=tuple(g.get("path_patterns", ())),
+                tags=tuple(g.get("tags", ())),
+                priority_weight=float(g.get("priority_weight", 1.0)),
+                status=GoalStatus.from_str(g.get("status", "active")),
+                due_at=g.get("due_at"),
+                created_at=float(g.get("created_at", now)),
+                updated_at=float(g.get("updated_at", now)),
+                parent_id=parent_id,
+            ))
+
+        if not seeded_goals:
+            return False
+
+        # Heal any hierarchy issues baked into the seed file before
+        # installing — same invariants as the normal load path.
+        healed = self._heal_hierarchy(seeded_goals, report=report)
+
+        self._goals = healed
+        report.source_version = _GOAL_SCHEMA_VERSION
+        report.loaded_count = len(self._goals)
+        report.seeded = True
+        report.seed_source = seed_rel
+        self._persist()
+
+        logger.info(
+            "[GoalTracker] Seeded %d goals from %s: %s",
+            len(self._goals),
+            seed_rel,
+            ", ".join(g.goal_id for g in self._goals),
+        )
+        return True
 
     @staticmethod
     def _heal_hierarchy(

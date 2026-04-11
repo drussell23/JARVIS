@@ -1,0 +1,52 @@
+{
+  "schema_version": 3,
+  "_comment": "Committed goal-seed template for JARVIS O+V strategic memory. Copied to .jarvis/active_goals.json on first boot by GoalTracker._seed_if_available(). Edit to reshape O+V's default strategic direction; delete .jarvis/active_goals.json and re-run to re-seed. Env gates: JARVIS_GOAL_SEED_ON_FIRST_BOOT (default true), JARVIS_GOAL_SEED_FILE (default config/goal_seeds.json).",
+  "goals": [
+    {
+      "goal_id": "rsi-convergence-v4",
+      "description": "Ship RSI v4 (Wang paper convergence framework) inside Ouroboros — self-improving loop that refines its own prompts, tools, gates and routing from empirical outcomes",
+      "keywords": ["rsi", "convergence", "self-improving", "wang", "ouroboros"],
+      "path_patterns": ["backend/core/ouroboros/governance/"],
+      "tags": ["rsi", "strategic", "north-star"],
+      "priority_weight": 2.0,
+      "status": "active",
+      "parent_id": null
+    },
+    {
+      "goal_id": "goal-hierarchy-v3",
+      "description": "Persistent Goal Hierarchy (strategic memory) — schema v3 parent_id, first-boot seeding, ancestor injection into generation prompts, /goal tree REPL",
+      "keywords": ["goal", "hierarchy", "parent", "strategic", "memory", "seed"],
+      "path_patterns": [
+        "backend/core/ouroboros/governance/strategic_direction.py",
+        "config/goal_seeds.json"
+      ],
+      "tags": ["memory", "perceived-intelligence"],
+      "priority_weight": 1.5,
+      "status": "active",
+      "parent_id": "rsi-convergence-v4"
+    },
+    {
+      "goal_id": "iron-gate-b-to-a",
+      "description": "Push Iron Gate from C+ to A via the 4 deterministic gates: exploration-first hard fail, ASCII-strict, L2 repair default-on, pre-APPLY config-format check",
+      "keywords": ["iron", "gate", "exploration", "ascii", "l2", "repair", "validation"],
+      "path_patterns": ["backend/core/ouroboros/governance/orchestrator.py"],
+      "tags": ["reliability", "gate", "determinism"],
+      "priority_weight": 1.5,
+      "status": "active",
+      "parent_id": "rsi-convergence-v4"
+    },
+    {
+      "goal_id": "battle-test-sustained-completion",
+      "description": "Achieve sustained full-pipeline completions in battle-test harness: >5 autonomous ops per session through CLASSIFY -> APPLY -> VERIFY -> POSTMORTEM without captured-client races or infinite gate loops",
+      "keywords": ["battle", "test", "completion", "provider", "race", "apply", "verify"],
+      "path_patterns": [
+        "backend/core/ouroboros/battle_test/",
+        "backend/core/ouroboros/governance/providers.py"
+      ],
+      "tags": ["reliability", "observability", "breakthrough"],
+      "priority_weight": 2.0,
+      "status": "active",
+      "parent_id": null
+    }
+  ]
+}

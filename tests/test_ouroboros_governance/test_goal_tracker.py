@@ -1228,3 +1228,404 @@ class TestPersistenceV3:
         assert "2 orphan parents" in summary
         assert "1 cycles" in summary
         assert report.has_issues is True
+
+
+# ---------------------------------------------------------------------------
+# Increment 2: hierarchy traversal helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_chain(t: GoalTracker) -> None:
+    """Build a 4-level chain: root → a → b → c, plus sibling root2."""
+    t.add_goal(_mk_goal("root"))
+    t.add_goal(_mk_goal("a"))
+    t.set_goals([
+        _mk_goal("root"),
+        ActiveGoal(goal_id="a", description="a", keywords=(), parent_id="root"),
+        ActiveGoal(goal_id="b", description="b", keywords=(), parent_id="a"),
+        ActiveGoal(goal_id="c", description="c", keywords=(), parent_id="b"),
+        _mk_goal("root2"),
+    ])
+
+
+class TestAncestorsOf:
+    def test_unknown_goal_returns_empty(self, tracker: GoalTracker):
+        assert tracker.ancestors_of("nope") == []
+
+    def test_root_returns_empty(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("root"))
+        assert tracker.ancestors_of("root") == []
+
+    def test_direct_parent(self, tracker: GoalTracker):
+        tracker.set_goals([
+            _mk_goal("root"),
+            ActiveGoal(goal_id="child", description="c", keywords=(), parent_id="root"),
+        ])
+        chain = tracker.ancestors_of("child")
+        assert [g.goal_id for g in chain] == ["root"]
+
+    def test_multi_level_nearest_first(self, tracker: GoalTracker):
+        _build_chain(tracker)
+        chain = tracker.ancestors_of("c")
+        # Nearest parent first, root last.
+        assert [g.goal_id for g in chain] == ["b", "a", "root"]
+
+    def test_cycle_defense_does_not_infinite_loop(self, tracker: GoalTracker):
+        # _heal_hierarchy should have broken the cycle at load, but
+        # ancestors_of is also defensively bounded by a visited set.
+        # We simulate a graph that somehow still carries a cycle in
+        # memory by bypassing add_goal's validation via set_goals +
+        # a malformed internal state.
+        tracker.set_goals([
+            _mk_goal("root"),
+            ActiveGoal(goal_id="a", description="a", keywords=(), parent_id="root"),
+            ActiveGoal(goal_id="b", description="b", keywords=(), parent_id="a"),
+        ])
+        # Poke in-memory to create a cycle (not via public API).
+        stored_a = tracker.get("a")
+        assert stored_a is not None
+        # Rebuild tracker state with a forced cycle by replacing
+        # stored entries directly on the internal list.
+        goals = list(tracker.all_goals)
+        for i, g in enumerate(goals):
+            if g.goal_id == "root":
+                goals[i] = ActiveGoal(
+                    goal_id="root", description="r", keywords=(), parent_id="b",
+                )
+        tracker._goals = goals  # type: ignore[attr-defined]
+        # Should terminate even though root.parent=b → a → root → ...
+        chain = tracker.ancestors_of("a")
+        assert len(chain) < 10  # bounded
+
+
+class TestDescendantsOf:
+    def test_unknown_goal_returns_empty(self, tracker: GoalTracker):
+        assert tracker.descendants_of("nope") == []
+
+    def test_leaf_returns_empty(self, tracker: GoalTracker):
+        _build_chain(tracker)
+        assert tracker.descendants_of("c") == []
+
+    def test_bfs_order(self, tracker: GoalTracker):
+        # _MAX_GOALS default is 5, so stay within that cap.
+        tracker.set_goals([
+            _mk_goal("root"),
+            ActiveGoal(goal_id="a", description="a", keywords=(), parent_id="root"),
+            ActiveGoal(goal_id="b", description="b", keywords=(), parent_id="root"),
+            ActiveGoal(goal_id="a1", description="a1", keywords=(), parent_id="a"),
+            ActiveGoal(goal_id="a2", description="a2", keywords=(), parent_id="a"),
+        ])
+        ids = [g.goal_id for g in tracker.descendants_of("root")]
+        # BFS: root's direct children first (sorted by id), then grandkids.
+        assert ids == ["a", "b", "a1", "a2"]
+
+    def test_deterministic_sort_within_layer(self, tracker: GoalTracker):
+        tracker.set_goals([
+            _mk_goal("root"),
+            ActiveGoal(goal_id="zulu", description="z", keywords=(), parent_id="root"),
+            ActiveGoal(goal_id="alpha", description="a", keywords=(), parent_id="root"),
+            ActiveGoal(goal_id="mike", description="m", keywords=(), parent_id="root"),
+        ])
+        ids = [g.goal_id for g in tracker.descendants_of("root")]
+        assert ids == ["alpha", "mike", "zulu"]
+
+
+class TestDepthOf:
+    def test_unknown_returns_negative_one(self, tracker: GoalTracker):
+        assert tracker.depth_of("missing") == -1
+
+    def test_root_is_zero(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("root"))
+        assert tracker.depth_of("root") == 0
+
+    def test_child_is_one(self, tracker: GoalTracker):
+        tracker.set_goals([
+            _mk_goal("root"),
+            ActiveGoal(goal_id="c", description="c", keywords=(), parent_id="root"),
+        ])
+        assert tracker.depth_of("c") == 1
+
+    def test_grandchild_is_two(self, tracker: GoalTracker):
+        _build_chain(tracker)
+        assert tracker.depth_of("b") == 2
+        assert tracker.depth_of("c") == 3
+
+
+class TestHierarchyTree:
+    def test_empty_tracker_empty_tree(self, tracker: GoalTracker):
+        assert tracker.hierarchy_tree() == []
+
+    def test_single_root(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("solo"))
+        tree = tracker.hierarchy_tree()
+        assert tree == [(tracker.get("solo"), 0)]
+
+    def test_dfs_tree_order(self, tracker: GoalTracker):
+        _build_chain(tracker)
+        tree = tracker.hierarchy_tree()
+        # DFS walks root → a → b → c before visiting sibling root2.
+        # Roots are goal_id-sorted: root, root2.
+        ids_and_depths = [(g.goal_id, d) for g, d in tree]
+        assert ids_and_depths == [
+            ("root", 0),
+            ("a", 1),
+            ("b", 2),
+            ("c", 3),
+            ("root2", 0),
+        ]
+
+    def test_deterministic_goal_id_sort(self, tracker: GoalTracker):
+        tracker.set_goals([
+            _mk_goal("zulu"),
+            _mk_goal("alpha"),
+            _mk_goal("mike"),
+        ])
+        ids = [g.goal_id for g, _ in tracker.hierarchy_tree()]
+        assert ids == ["alpha", "mike", "zulu"]
+
+    def test_include_inactive_false_hides_paused(self, tracker: GoalTracker):
+        tracker.set_goals([
+            _mk_goal("keep"),
+            _mk_goal("hide", status=GoalStatus.PAUSED),
+        ])
+        ids_all = [g.goal_id for g, _ in tracker.hierarchy_tree(include_inactive=True)]
+        ids_active = [g.goal_id for g, _ in tracker.hierarchy_tree(include_inactive=False)]
+        assert "hide" in ids_all
+        assert "hide" not in ids_active
+        assert "keep" in ids_active
+
+    def test_paused_parent_promotes_active_child_to_root(
+        self, tracker: GoalTracker
+    ):
+        # When include_inactive=False, an active child of a paused parent
+        # becomes a transient root at depth 0 rather than being orphaned.
+        tracker.set_goals([
+            ActiveGoal(
+                goal_id="paused_root",
+                description="p",
+                keywords=(),
+                status=GoalStatus.PAUSED,
+            ),
+            ActiveGoal(
+                goal_id="active_child",
+                description="c",
+                keywords=(),
+                parent_id="paused_root",
+            ),
+        ])
+        tree = tracker.hierarchy_tree(include_inactive=False)
+        ids_and_depths = [(g.goal_id, d) for g, d in tree]
+        assert ids_and_depths == [("active_child", 0)]
+
+
+# ---------------------------------------------------------------------------
+# Increment 2: format_for_prompt ancestor injection
+# ---------------------------------------------------------------------------
+
+
+class TestFormatForPromptAncestry:
+    def test_ancestors_rendered_when_child_matches(self, tracker: GoalTracker):
+        # Child matches relevance but parent does not — parent should
+        # still appear in the prompt as a "strategic ancestor".
+        tracker.set_goals([
+            ActiveGoal(
+                goal_id="rsi",
+                description="Ship RSI framework",
+                keywords=("rsi", "framework"),
+            ),
+            ActiveGoal(
+                goal_id="hierarchy",
+                description="Persistent Goal Hierarchy memory",
+                keywords=("hierarchy", "memory"),
+                parent_id="rsi",
+            ),
+        ])
+        out = tracker.format_for_prompt(description="hierarchy memory work")
+        assert "**hierarchy**" in out  # matched (bold)
+        assert "_rsi_" in out  # ancestor (italic)
+        assert "(strategic ancestor)" in out
+
+    def test_ancestry_injection_env_gate_off(self, tracker: GoalTracker):
+        tracker.set_goals([
+            ActiveGoal(
+                goal_id="rsi",
+                description="Ship RSI framework",
+                keywords=("rsi",),
+            ),
+            ActiveGoal(
+                goal_id="hierarchy",
+                description="Hierarchy memory",
+                keywords=("hierarchy",),
+                parent_id="rsi",
+            ),
+        ])
+        with patch.dict(os.environ, {"JARVIS_GOAL_INJECT_ANCESTRY": "false"}):
+            out = tracker.format_for_prompt(description="hierarchy")
+        assert "**hierarchy**" in out
+        assert "rsi" not in out  # ancestor suppressed
+        assert "(strategic ancestor)" not in out
+
+    def test_indentation_reflects_depth(self, tracker: GoalTracker):
+        tracker.set_goals([
+            ActiveGoal(
+                goal_id="root",
+                description="Root objective",
+                keywords=("root",),
+            ),
+            ActiveGoal(
+                goal_id="mid",
+                description="Mid objective",
+                keywords=("mid",),
+                parent_id="root",
+            ),
+            ActiveGoal(
+                goal_id="leaf",
+                description="Leaf objective",
+                keywords=("leaf",),
+                parent_id="mid",
+            ),
+        ])
+        out = tracker.format_for_prompt(description="leaf work")
+        # Depth 0 = "- ", depth 1 = "  - ", depth 2 = "    - "
+        lines = out.splitlines()
+        leaf_line = [l for l in lines if "leaf" in l][0]
+        mid_line = [l for l in lines if "_mid_" in l][0]
+        root_line = [l for l in lines if "_root_" in l][0]
+        assert root_line.startswith("- ")
+        assert mid_line.startswith("  - ")
+        assert leaf_line.startswith("    - ")
+
+    def test_matched_child_not_flagged_as_ancestor(self, tracker: GoalTracker):
+        tracker.set_goals([
+            ActiveGoal(goal_id="root", description="r", keywords=("r",)),
+            ActiveGoal(
+                goal_id="child",
+                description="child",
+                keywords=("child",),
+                parent_id="root",
+            ),
+        ])
+        out = tracker.format_for_prompt(description="child work")
+        # The matched child must not carry the ancestor tag.
+        child_line = [l for l in out.splitlines() if "**child**" in l][0]
+        assert "(strategic ancestor)" not in child_line
+
+
+# ---------------------------------------------------------------------------
+# Increment 2: first-boot seeding
+# ---------------------------------------------------------------------------
+
+
+def _write_seed_file(root: Path, goals: list, *, rel: str = "config/goal_seeds.json") -> Path:
+    """Install a seed template at ``root/rel``."""
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": 3,
+        "goals": goals,
+    }))
+    return path
+
+
+class TestFirstBootSeeding:
+    def test_seed_installs_on_first_boot(self, tmp_root: Path):
+        _write_seed_file(tmp_root, [
+            {
+                "goal_id": "rsi-v4",
+                "description": "Ship RSI v4",
+                "keywords": ["rsi"],
+                "priority_weight": 2.0,
+                "parent_id": None,
+            },
+            {
+                "goal_id": "hierarchy-v3",
+                "description": "Hierarchy memory",
+                "keywords": ["hierarchy"],
+                "parent_id": "rsi-v4",
+            },
+        ])
+        t = GoalTracker(tmp_root)
+        ids = [g.goal_id for g in t.all_goals]
+        assert "rsi-v4" in ids
+        assert "hierarchy-v3" in ids
+        report = t.last_migration_report
+        assert report.seeded is True
+        assert report.seed_source == "config/goal_seeds.json"
+        assert report.loaded_count == 2
+
+    def test_seed_persists_to_active_goals(self, tmp_root: Path):
+        _write_seed_file(tmp_root, [
+            {"goal_id": "g1", "description": "d"},
+        ])
+        GoalTracker(tmp_root)
+        # Subsequent boots should read from active_goals.json, not re-seed.
+        goals_file = tmp_root / ".jarvis" / "active_goals.json"
+        assert goals_file.exists()
+        t2 = GoalTracker(tmp_root)
+        assert [g.goal_id for g in t2.all_goals] == ["g1"]
+        # Second boot: source came from the persisted file, not the seed.
+        assert t2.last_migration_report.seeded is False
+        assert t2.last_migration_report.source_version == 3
+
+    def test_seed_env_gate_disables(self, tmp_root: Path):
+        _write_seed_file(tmp_root, [
+            {"goal_id": "g1", "description": "d"},
+        ])
+        with patch.dict(os.environ, {"JARVIS_GOAL_SEED_ON_FIRST_BOOT": "false"}):
+            t = GoalTracker(tmp_root)
+        assert t.all_goals == []
+        assert t.last_migration_report.seeded is False
+
+    def test_custom_seed_file_path(self, tmp_root: Path):
+        _write_seed_file(
+            tmp_root,
+            [{"goal_id": "custom", "description": "d"}],
+            rel="config/my_seeds.json",
+        )
+        with patch.dict(
+            os.environ,
+            {"JARVIS_GOAL_SEED_FILE": "config/my_seeds.json"},
+        ):
+            t = GoalTracker(tmp_root)
+        assert [g.goal_id for g in t.all_goals] == ["custom"]
+        assert t.last_migration_report.seed_source == "config/my_seeds.json"
+
+    def test_missing_seed_file_degrades_gracefully(self, tmp_root: Path):
+        # No seed file, no active_goals.json → empty tracker, no error.
+        t = GoalTracker(tmp_root)
+        assert t.all_goals == []
+        assert t.last_migration_report.seeded is False
+        assert t.last_migration_report.has_issues is False
+
+    def test_malformed_seed_file_degrades_gracefully(self, tmp_root: Path):
+        seed = tmp_root / "config" / "goal_seeds.json"
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        seed.write_text("{not valid json")
+        t = GoalTracker(tmp_root)
+        assert t.all_goals == []
+        assert t.last_migration_report.seeded is False
+
+    def test_seed_heals_orphan_parent(self, tmp_root: Path):
+        _write_seed_file(tmp_root, [
+            {
+                "goal_id": "child",
+                "description": "d",
+                "parent_id": "nonexistent",
+            },
+        ])
+        t = GoalTracker(tmp_root)
+        stored = t.get("child")
+        assert stored is not None
+        assert stored.parent_id is None  # healed
+        assert t.last_migration_report.healed_orphan_parent == 1
+
+    def test_seed_accepts_bare_list(self, tmp_root: Path):
+        # Some operators prefer the v1-style bare-list seed format.
+        seed = tmp_root / "config" / "goal_seeds.json"
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        seed.write_text(json.dumps([
+            {"goal_id": "bare", "description": "d"},
+        ]))
+        t = GoalTracker(tmp_root)
+        assert [g.goal_id for g in t.all_goals] == ["bare"]
+        assert t.last_migration_report.seeded is True
