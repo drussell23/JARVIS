@@ -2732,7 +2732,23 @@ class ToolLoopCoordinator:
         # Edit history captured from the per-op ToolExecutor at run() exit.
         # Populated by _finalize_run(); reset at the start of each run().
         self._last_edit_history: List[Dict[str, Any]] = []
-        self._on_tool_call = on_tool_call  # Optional callback for real-time display
+        # Narration callback: fires for every tool-call lifecycle event
+        # (start/success/error/cancelled/denied/timeout). When
+        # ``JARVIS_TOOL_NARRATION_ENABLED=false`` the callback is dropped
+        # entirely, which also elides the per-call overhead of building
+        # args summaries and result previews.
+        _narration_on = os.environ.get(
+            "JARVIS_TOOL_NARRATION_ENABLED", "true",
+        ).strip().lower() not in ("false", "0", "no", "off")
+        self._on_tool_call = on_tool_call if _narration_on else None
+        # Result preview truncation — env-driven so narration-heavy sessions
+        # can tighten the budget without touching code.
+        self._narration_preview_chars: int = max(
+            0, int(os.environ.get("JARVIS_TOOL_NARRATION_PREVIEW_CHARS", "500"))
+        )
+        self._narration_args_chars: int = max(
+            0, int(os.environ.get("JARVIS_TOOL_NARRATION_ARGS_CHARS", "80"))
+        )
         self.on_token: Optional[Callable[[str], None]] = None  # Streaming token callback
         # Cost optimization: providers can check this flag to use lower max_tokens
         # during tool rounds (model only needs ~200 tokens for a tool call JSON).
@@ -2747,6 +2763,68 @@ class ToolLoopCoordinator:
             os.environ.get("JARVIS_MAX_EXPLORATION_ROUNDS", "5")
         )
         self._EXPLORATION_TOOLS: frozenset = frozenset({"read_file", "search_code", "get_callers"})
+
+    # ------------------------------------------------------------------
+    # Narration helpers
+    # ------------------------------------------------------------------
+
+    def _args_summary_for(self, tc: "ToolCall") -> str:
+        """Build a short, deterministic preview of a tool call's args.
+
+        Uses the *first* argument value (not a key-ordering dump) because
+        the first positional arg is almost always the identifying target
+        — ``path`` for file tools, ``query`` for search tools, ``cmd`` for
+        bash — and fits the CC-style ``Read(foo.py)`` aesthetic.
+        """
+        if not tc.arguments:
+            return ""
+        try:
+            first_val = next(iter(tc.arguments.values()), "")
+        except Exception:
+            return ""
+        if first_val is None:
+            return ""
+        text = str(first_val)
+        return text[: self._narration_args_chars] if self._narration_args_chars else text
+
+    def _notify_tool_call(
+        self,
+        *,
+        op_id: str,
+        tool_name: str,
+        round_index: int,
+        args_summary: str = "",
+        result_preview: str = "",
+        duration_ms: float = 0.0,
+        status: str = "",
+    ) -> None:
+        """Fire the narration callback safely.
+
+        This is the *only* call site that invokes ``self._on_tool_call``.
+        Errors are logged at DEBUG (never raised) so display failures can
+        never break the tool loop. An empty ``status`` means pre-execution
+        (the "start" event); a non-empty status means post-execution.
+        """
+        cb = self._on_tool_call
+        if cb is None:
+            return
+        try:
+            cb(
+                op_id=op_id,
+                tool_name=tool_name,
+                args_summary=args_summary,
+                round_index=round_index,
+                result_preview=result_preview,
+                duration_ms=duration_ms,
+                status=status,
+            )
+        except Exception:
+            logger.debug(
+                "[ToolLoop] narration callback failed for op=%s tool=%s status=%s",
+                op_id[:12] if op_id else "?",
+                tool_name, status or "start",
+                exc_info=True,
+            )
 
     def _finalize_run(self, op_id: str) -> None:
         """Release the per-op ToolExecutor and capture its edit history.
@@ -2976,22 +3054,26 @@ class ToolLoopCoordinator:
                         output_bytes=0, error_class=None, status=ToolExecStatus.POLICY_DENIED,
                     ))
                     prompt_appendix += _format_denial(tc.name, policy_result)
+                    # Narrate policy denial so the operator sees *why* the
+                    # model was blocked (Manifesto §7 — absolute observability).
+                    self._notify_tool_call(
+                        op_id=op_id,
+                        tool_name=tc.name,
+                        round_index=round_index,
+                        args_summary=self._args_summary_for(tc),
+                        result_preview=(
+                            f"policy_denied: {policy_result.reason_code}"
+                        ),
+                        status="denied",
+                    )
                 else:
-                    # Notify callback for real-time display (Manifesto §7)
-                    if self._on_tool_call is not None:
-                        try:
-                            _args_summary = ""
-                            if tc.arguments:
-                                _first_val = next(iter(tc.arguments.values()), "")
-                                _args_summary = str(_first_val)[:80]
-                            self._on_tool_call(
-                                op_id=op_id,
-                                tool_name=tc.name,
-                                args_summary=_args_summary,
-                                round_index=round_index,
-                            )
-                        except Exception:
-                            pass
+                    # Pre-execution notification (status="" → "start" event)
+                    self._notify_tool_call(
+                        op_id=op_id,
+                        tool_name=tc.name,
+                        round_index=round_index,
+                        args_summary=self._args_summary_for(tc),
+                    )
                     pending_execs.append((tc, policy_ctx, call_id, tool_version))
 
             # Execute allowed tools — parallel when >1, sequential when 1
@@ -3024,6 +3106,15 @@ class ToolLoopCoordinator:
                             output_bytes=0, error_class="CancelledError",
                             status=ToolExecStatus.CANCELLED,
                         ))
+                        self._notify_tool_call(
+                            op_id=op_id,
+                            tool_name=tc.name,
+                            round_index=round_index,
+                            args_summary=self._args_summary_for(tc),
+                            result_preview="cancelled",
+                            duration_ms=(ended_ns - started_ns) / 1_000_000,
+                            status="cancelled",
+                        )
                         self._last_records = list(records)
                         self._finalize_run(op_id)
                         raise
@@ -3060,6 +3151,18 @@ class ToolLoopCoordinator:
                                 f"\n[TOOL ERROR]\ntool: {tc_err.name}\n"
                                 f"error: {type(res).__name__}: {res}\n[END TOOL ERROR]\n"
                             )
+                            # Narrate exec failure — parallel exceptions were
+                            # invisible before; now every failure gets a ✗ in the CLI.
+                            self._notify_tool_call(
+                                op_id=op_id,
+                                tool_name=tc_err.name,
+                                round_index=round_index,
+                                args_summary=self._args_summary_for(tc_err),
+                                result_preview=f"{type(res).__name__}: {res}"[
+                                    : self._narration_preview_chars or None
+                                ],
+                                status="error",
+                            )
                         else:
                             unwrapped.append(res)
                     exec_results = unwrapped
@@ -3079,22 +3182,30 @@ class ToolLoopCoordinator:
                         error_class=(tool_result.error if tool_result.error else None),
                         status=tool_result.status,
                     ))
-                    # Notify callback with result
-                    if self._on_tool_call is not None:
-                        try:
-                            _result_preview = (tool_result.output or "")[:500]
-                            _dur_ms = (ended_ns - started_ns) / 1_000_000
-                            self._on_tool_call(
-                                op_id=op_id,
-                                tool_name=tc.name,
-                                args_summary=str(next(iter(tc.arguments.values()), ""))[:80] if tc.arguments else "",
-                                round_index=round_index,
-                                result_preview=_result_preview,
-                                duration_ms=_dur_ms,
-                                status="success" if not tool_result.error else "error",
-                            )
-                        except Exception:
-                            pass
+                    # Notify callback with result — covers SUCCESS / TIMEOUT /
+                    # EXEC_ERROR distinctly so SerpentFlow can distinguish
+                    # "failed" from "timed out" in the display.
+                    _dur_ms = (ended_ns - started_ns) / 1_000_000
+                    if tool_result.status == ToolExecStatus.TIMEOUT:
+                        _nstatus = "timeout"
+                        _preview = "timeout"
+                    elif tool_result.error:
+                        _nstatus = "error"
+                        _preview = str(tool_result.error)
+                    else:
+                        _nstatus = "success"
+                        _preview = tool_result.output or ""
+                    if self._narration_preview_chars:
+                        _preview = _preview[: self._narration_preview_chars]
+                    self._notify_tool_call(
+                        op_id=op_id,
+                        tool_name=tc.name,
+                        round_index=round_index,
+                        args_summary=self._args_summary_for(tc),
+                        result_preview=_preview,
+                        duration_ms=_dur_ms,
+                        status=_nstatus,
+                    )
                     prompt_appendix += _format_tool_result(tc, tool_result)
 
             self._last_records = list(records)
