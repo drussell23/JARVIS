@@ -2718,6 +2718,10 @@ class GovernedLoopService:
             self._advanced_autonomy = None
 
         if self._config.l3_enabled and self._generator is not None:
+            from backend.core.ouroboros.governance.autonomy.execution_graph_progress import (
+                ExecutionGraphProgressTracker,
+                install_default_tracker,
+            )
             from backend.core.ouroboros.governance.autonomy.execution_graph_store import (
                 ExecutionGraphStore,
             )
@@ -2746,6 +2750,18 @@ class GovernedLoopService:
                 except ImportError:
                     logger.debug("[GovernedLoop] WorktreeManager not available — shared repo mode")
 
+            # ExecutionGraph progress tracker — Phase 3b operational
+            # visibility. Subscribes to the scheduler's event emitter
+            # and exposes a per-graph snapshot for SerpentFlow.
+            self._execution_graph_tracker = ExecutionGraphProgressTracker(
+                self._event_emitter
+            )
+            install_default_tracker(self._execution_graph_tracker)
+            logger.info(
+                "[GovernedLoop] ExecutionGraphProgressTracker wired (enabled=%s)",
+                self._execution_graph_tracker.stats().get("enabled"),
+            )
+
             self._subagent_scheduler = SubagentScheduler(
                 store=ExecutionGraphStore(self._config.execution_graph_state_dir),
                 command_bus=self._command_bus,
@@ -2758,6 +2774,7 @@ class GovernedLoopService:
                 ),
                 merge_coordinator=MergeCoordinator(),
                 max_concurrent_graphs=self._config.max_concurrent_execution_graphs,
+                progress_tracker=self._execution_graph_tracker,
             )
             logger.info(
                 "[GovernedLoop] L3 SubagentScheduler wired: state_dir=%s max_graphs=%d",
