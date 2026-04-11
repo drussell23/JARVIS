@@ -538,6 +538,82 @@ class TestCandidateGenerator:
         with pytest.raises((asyncio.TimeoutError, RuntimeError)):
             await gen.generate(ctx, past_deadline)
 
+    @pytest.mark.asyncio
+    async def test_fallback_refreshes_depleted_deadline(
+        self, ctx: OperationContext
+    ) -> None:
+        """Fallback should refresh the deadline when parent budget is depleted.
+
+        Regression test for bt-2026-04-11-211131: Tier 0 (DW) was burning
+        80-100s of a 120s parent window, leaving Claude with 20-40s — too
+        short for legitimate doc-gen / patch streams. The refresh grants the
+        fallback its own ``_FALLBACK_MIN_GUARANTEED_S`` (90s) window when
+        the parent is depleted-but-alive.
+        """
+        # Primary fails fast → triggers fallback path.
+        primary = _make_mock_provider(
+            name="primary", generate_side_effect=RuntimeError("primary down")
+        )
+        # Fallback inspects the deadline it receives so we can verify the
+        # refresh actually propagates downstream.
+        received_deadline: list = []
+
+        async def _fallback_capture(ctx_arg, deadline_arg):
+            received_deadline.append(deadline_arg)
+            return _make_generation_result(provider_name="fallback")
+
+        fallback = _make_mock_provider(name="fallback")
+        fallback.generate.side_effect = _fallback_capture
+
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+        # Give the parent a tiny window: 5s. Fallback should still get 90s.
+        depleted_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=5)
+
+        result = await gen.generate(ctx, depleted_deadline)
+        assert result.provider_name == "fallback"
+        assert len(received_deadline) == 1
+        # The fallback should have received a refreshed deadline at least
+        # 60s into the future (much greater than the 5s parent window).
+        refreshed_remaining = (
+            received_deadline[0] - datetime.now(tz=timezone.utc)
+        ).total_seconds()
+        assert refreshed_remaining > 60.0, (
+            f"Fallback deadline not refreshed: only {refreshed_remaining:.1f}s remaining"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_does_not_refresh_when_parent_healthy(
+        self, ctx: OperationContext
+    ) -> None:
+        """When the parent deadline has plenty of headroom, no refresh fires."""
+        primary = _make_mock_provider(
+            name="primary", generate_side_effect=RuntimeError("primary down")
+        )
+        received_deadline: list = []
+
+        async def _fallback_capture(ctx_arg, deadline_arg):
+            received_deadline.append(deadline_arg)
+            return _make_generation_result(provider_name="fallback")
+
+        fallback = _make_mock_provider(name="fallback")
+        fallback.generate.side_effect = _fallback_capture
+
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+        # Healthy parent: 100s window. The fallback should receive a deadline
+        # in roughly the same range (NOT bumped to 90 or any other constant).
+        healthy_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=100)
+
+        await gen.generate(ctx, healthy_deadline)
+        assert len(received_deadline) == 1
+        # When healthy, the original deadline should pass through unchanged.
+        delta_from_original = abs(
+            (received_deadline[0] - healthy_deadline).total_seconds()
+        )
+        assert delta_from_original < 0.5, (
+            f"Healthy parent deadline was unexpectedly refreshed: "
+            f"delta={delta_from_original:.2f}s"
+        )
+
     # -- fallback concurrency quota --
 
     @pytest.mark.asyncio

@@ -33,6 +33,18 @@ def enforce_verify_thresholds(
     if result.timed_out:
         return "Benchmark timed out — metrics unreliable"
 
+    # Non-Python target sentinel: PatchBenchmarker intentionally skipped
+    # pytest/ruff/radon because target_files contained zero .py files.
+    # All metric fields (pass_rate, coverage, complexity, lint) carry no
+    # signal in this case — verification of infra/config/docs changes is
+    # delegated to InfraApplicator and the orchestrator scoped-verify path.
+    # Skipping all threshold checks here is the deterministic counterpart
+    # to the orchestrator's `_verify_test_total == 0 → _verify_test_passed
+    # = True` guard. Ref: bt-2026-04-11-213801 / op-019d7e7d (requirements.txt)
+    # blocked the first sustained APPLY before this guard existed.
+    if getattr(result, "non_python_target", False):
+        return None
+
     if result.pass_rate < _MIN_PASS_RATE:
         return (
             f"Test regression: pass_rate={result.pass_rate:.2f} "

@@ -1,8 +1,4 @@
-"""
-Headless CLI — One-shot Ouroboros governance operations via command line.
-
-Gap 4: Run Ouroboros without the full supervisor boot.
-  python3 -m backend.core.ouroboros.governance.headless_cli \\
+"""\nHeadless CLI — One-shot Ouroboros governance operations via command line.\n\nGap 4: Run Ouroboros without the full supervisor boot.\n  python3 -m backend.core.ouroboros.governance.headless_cli \\
     --goal "fix test failures in backend/core/" \\
     --repo jarvis --json
 

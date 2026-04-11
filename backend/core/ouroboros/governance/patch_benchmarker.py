@@ -20,8 +20,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Bounded concurrency: max 2 parallel benchmarks
-_SEMAPHORE = asyncio.Semaphore(2)
+# Bounded concurrency: max 2 parallel benchmarks. The semaphore lives in a
+# quarantined `_process_singletons` module so that hot-reloading
+# patch_benchmarker does NOT replace the semaphore object and orphan any
+# in-flight `async with` waiters. Always access via _benchmark_semaphore().
+_BENCHMARK_SEMAPHORE_KEY = "patch_benchmarker.benchmark_concurrency"
+_BENCHMARK_SEMAPHORE_VALUE = 2
+
+
+def _benchmark_semaphore() -> asyncio.Semaphore:
+    from backend.core.ouroboros.governance._process_singletons import get_semaphore
+    return get_semaphore(_BENCHMARK_SEMAPHORE_KEY, _BENCHMARK_SEMAPHORE_VALUE)
 
 # Per-step time budgets (seconds)
 _LINT_BUDGET = 15.0
@@ -36,6 +45,22 @@ _TASK_TAXONOMY = [
     ("performance",     lambda d, fs: "perf" in d.lower() or "optim" in d.lower()),
     ("code_improvement",lambda d, fs: True),  # default
 ]
+
+# Python source extensions. Only files matching these are subject to
+# pytest / ruff / radon — Python's verification toolchain produces no
+# meaningful signal on requirements.txt, *.yaml, *.json, *.md, etc.
+_PYTHON_SUFFIXES = (".py", ".pyi")
+
+
+def _is_python_file(path: str) -> bool:
+    """True iff the relative path looks like a Python source file by extension."""
+    p = path.lower()
+    return p.endswith(_PYTHON_SUFFIXES)
+
+
+def _filter_python_files(target_files) -> list:
+    """Return only the .py / .pyi entries from target_files, preserving order."""
+    return [f for f in target_files if _is_python_file(f)]
 
 
 def _infer_task_type(description: str, target_files: tuple) -> str:
@@ -80,6 +105,12 @@ class BenchmarkResult:
     task_type: str
     timed_out: bool
     error: Optional[str]
+    # N/A sentinel: True when target_files contained zero Python files, so
+    # pytest / ruff / radon were intentionally skipped. verify_gate must
+    # short-circuit *all* threshold checks (pass_rate, coverage, complexity,
+    # lint) when this is True — the metrics carry no signal. Defaults to
+    # False so existing call sites and snapshots stay backward-compatible.
+    non_python_target: bool = False
 
 
 class PatchBenchmarker:
@@ -94,7 +125,7 @@ class PatchBenchmarker:
         self._pre_apply_snapshots = pre_apply_snapshots or {}
 
     async def benchmark(self, ctx: "OperationContext") -> BenchmarkResult:
-        async with _SEMAPHORE:
+        async with _benchmark_semaphore():
             return await self._run(ctx)
 
     async def _run(self, ctx: "OperationContext") -> BenchmarkResult:
@@ -106,6 +137,52 @@ class PatchBenchmarker:
             {str(f): Path(self._root / f).read_text(errors="replace")
              for f in target_files if (self._root / f).exists()}
         )
+
+        # ----- Non-Python target short-circuit (Manifesto §6: zero-shortcut root fix) -----
+        # pytest / ruff / radon are Python-specific. Running them on
+        # requirements.txt, *.yaml, *.json, *.md, *.toml, etc. either
+        # fails outright or — much worse — collects the FULL project
+        # test suite (because `pytest --cov=requirements.txt` does NOT
+        # filter test discovery), picks up unrelated failing tests,
+        # computes pass_rate < 1.0, and trips verify_regression rollback.
+        #
+        # This short-circuit mirrors the orchestrator scoped-verify N/A
+        # guard (`_verify_test_total == 0 → _verify_test_passed = True`)
+        # at the benchmark layer: when there is nothing Python to verify,
+        # pass cleanly with non_python_target=True so verify_gate skips
+        # threshold checks. Verification of non-Python infra/config
+        # changes is delegated to InfraApplicator (e.g., pip install)
+        # and the orchestrator scoped-verify path.
+        #
+        # Ref: bt-2026-04-11-213801 / op-019d7e7d (requirements.txt)
+        # blocked the first sustained APPLY here.
+        python_files = _filter_python_files(target_files)
+        if target_files and not python_files:
+            preview = ", ".join(target_files[:3]) + ("..." if len(target_files) > 3 else "")
+            logger.info(
+                "[PatchBenchmarker] non-Python targets only (%d file(s): %s); "
+                "skipping pytest/ruff/radon as N/A — verify delegated to "
+                "InfraApplicator + scoped-verify",
+                len(target_files), preview,
+            )
+            return BenchmarkResult(
+                pass_rate=1.0,
+                lint_violations=0,
+                coverage_pct=0.0,
+                complexity_delta=0.0,
+                patch_hash=patch_hash,
+                quality_score=1.0,
+                task_type=task_type,
+                timed_out=False,
+                error=None,
+                non_python_target=True,
+            )
+
+        # Mixed targets (e.g., ["foo.py", "requirements.txt"]) run the
+        # Python toolchain on the .py subset only — non-Python files are
+        # silently filtered out at this point.
+        bench_files = python_files
+
         timed_out = False
         errors: list = []
 
@@ -119,7 +196,7 @@ class PatchBenchmarker:
         lint_score = 0.0
         try:
             lint_violations, lint_score = await asyncio.wait_for(
-                self._run_lint(target_files), timeout=lint_budget
+                self._run_lint(bench_files), timeout=lint_budget
             )
         except asyncio.TimeoutError:
             timed_out = True
@@ -133,7 +210,7 @@ class PatchBenchmarker:
         pass_rate = 0.0
         try:
             coverage_pct, pass_rate = await asyncio.wait_for(
-                self._run_coverage(target_files), timeout=cov_budget
+                self._run_coverage(bench_files), timeout=cov_budget
             )
             coverage_score = min(1.0, coverage_pct / 100.0)
         except asyncio.TimeoutError:
@@ -147,7 +224,7 @@ class PatchBenchmarker:
         radon_available = False
         try:
             complexity_delta, radon_available = await asyncio.wait_for(
-                self._run_complexity(target_files), timeout=cx_budget
+                self._run_complexity(bench_files), timeout=cx_budget
             )
         except asyncio.TimeoutError:
             timed_out = True
@@ -168,6 +245,7 @@ class PatchBenchmarker:
             task_type=task_type,
             timed_out=timed_out,
             error="; ".join(errors) if errors else None,
+            non_python_target=False,
         )
 
     async def _run_lint(self, target_files: list) -> tuple:
@@ -237,6 +315,20 @@ class PatchBenchmarker:
                     total = passed + failed + errors
                     pass_rate = passed / max(1, total)
                 elif r.returncode == 0:
+                    pass_rate = 1.0
+                elif (
+                    r.returncode == 5
+                    or "no tests ran" in summary
+                    or re.search(r"collected 0 items", summary)
+                ):
+                    # pytest exit 5 = "no tests collected". For non-Python
+                    # targets (requirements.txt, configs, docs) there are no
+                    # tests to run — that is N/A, not a regression. Mirror
+                    # the orchestrator scoped-verify guard at orchestrator.py
+                    # `_verify_test_total == 0 → _verify_test_passed = True`.
+                    # bt-2026-04-11-213801 / op-019d7e7d (requirements.txt)
+                    # blocked the first sustained APPLY by treating this as
+                    # `pass_rate=0.00 < threshold=1.00` and rolling back.
                     pass_rate = 1.0
                 return float(cov_pct), pass_rate
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):

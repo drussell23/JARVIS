@@ -88,7 +88,11 @@ from backend.core.ouroboros.governance.policy_engine import PolicyEngine, Policy
 from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
 from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
 from backend.core.ouroboros.governance.saga.saga_types import RepoPatch, SagaTerminalState
-from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult, PatchBenchmarker
+# patch_benchmarker is intentionally NOT imported at module level — see
+# `_run_benchmark` for the deferred import. This makes `patch_benchmarker`
+# safely hot-reloadable via ModuleHotReloader: a module-level
+# `from X import Y` would capture a stale class reference at orchestrator
+# import time and never re-bind on reload.
 from backend.core.ouroboros.integration import PerformanceRecord, TaskDifficulty
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
@@ -338,6 +342,33 @@ class GovernedOrchestrator:
             self._rsi_transition_tracker = TransitionProbabilityTracker()
         except Exception:
             logger.debug("RSI: TransitionProbabilityTracker not available", exc_info=True)
+
+        # ── Module hot-reloader (Manifesto §6 RSI loop closer) ──
+        # When O+V successfully self-modifies a hot-reloadable governance
+        # module (verify_gate, patch_benchmarker, semantic_triage,
+        # plan_generator, strategic_direction), reload the new code in-process
+        # so the very next op picks it up — no process restart required.
+        # Disable via JARVIS_HOT_RELOAD_ENABLED=false. Quarantined modules
+        # (orchestrator, providers, sensors) still require a restart, which
+        # the harness handles via the restart_pending flag.
+        self._hot_reloader: Optional[Any] = None
+        if os.environ.get("JARVIS_HOT_RELOAD_ENABLED", "true").lower() != "false":
+            try:
+                from backend.core.ouroboros.governance.module_hot_reloader import (
+                    ModuleHotReloader,
+                )
+                self._hot_reloader = ModuleHotReloader(
+                    project_root=self._config.project_root,
+                )
+                logger.info(
+                    "[Orchestrator] ModuleHotReloader armed (%d safe modules)",
+                    len(self._hot_reloader.safe_modules),
+                )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] ModuleHotReloader unavailable",
+                    exc_info=True,
+                )
 
     def set_reasoning_bridge(self, bridge: Any) -> None:
         """Attach a ReasoningChainBridge for pre-CLASSIFY reasoning."""
@@ -1734,6 +1765,14 @@ class GovernedOrchestrator:
         if _gen_hashes:
             ctx = dataclasses.replace(ctx, generate_file_hashes=tuple(_gen_hashes))
 
+        # Cumulative exploration credit across the GENERATE retry loop. When a
+        # prior attempt satisfied the floor but failed downstream gates (ASCII,
+        # dependency integrity, etc.), the retry feedback embeds the rejected
+        # file content — re-reading via read_file is wasteful, so the credit
+        # carries forward instead of forcing the model to spend tool rounds on
+        # the same file twice (bt-2026-04-11-204228 / op-019d7e4c).
+        _op_explore_credit = 0
+
         for attempt in range(1 + self._config.max_generate_retries):
             # ── Per-op cost cap check (Manifesto §5/§7) ──
             # If the cumulative spend across previous attempts has already
@@ -1786,14 +1825,21 @@ class GovernedOrchestrator:
                 #              stream 23KB+ full_content patches (first token
                 #              at 1.1s, healthy ~365 bytes/s). The 60s cap was
                 #              cutting legitimate streams off mid-output.
-                #   STANDARD:  120s — DW primary with reasonable wait
-                #   COMPLEX:   180s — Claude planning takes longer
+                #   STANDARD:  220s — DW primary then Claude fallback in
+                #              series. Bumped from 120s after
+                #              bt-2026-04-11-211131 diagnosed every standard
+                #              op as `all_providers_exhausted`: DW eats 60-90s
+                #              of the budget then Claude only has 30-40s left
+                #              — too short for legitimate doc-gen / patch
+                #              streams (which need 60-100s). 220s = ~90s DW
+                #              cap + ~120s fallback hard cap + grace.
+                #   COMPLEX:   240s — Claude planning + DW execution serial
                 #   BACKGROUND/SPECULATIVE: 180s — no urgency
                 _route = getattr(ctx, "provider_route", "") or "standard"
                 _route_timeouts = {
                     "immediate": 120.0,
-                    "standard": 120.0,
-                    "complex": 180.0,
+                    "standard": 220.0,
+                    "complex": 240.0,
                     "background": 180.0,
                     "speculative": 180.0,
                 }
@@ -1976,9 +2022,14 @@ class GovernedOrchestrator:
                         1 for _rec in (generation.tool_execution_records or ())
                         if getattr(_rec, "tool_name", "") in _EXPLORATION_TOOLS
                     )
-                    if _explore_count < _min_explore:
+                    # Roll the per-attempt count into the per-op credit BEFORE
+                    # comparing — a prior attempt that already satisfied the
+                    # floor lets a no-tool retry pass (the rejected file is
+                    # already in the retry-feedback prompt).
+                    _op_explore_credit += _explore_count
+                    if _op_explore_credit < _min_explore:
                         _explore_err = (
-                            f"exploration_insufficient: {_explore_count}/{_min_explore} "
+                            f"exploration_insufficient: {_op_explore_credit}/{_min_explore} "
                             f"exploration tool calls (expected >= {_min_explore}). "
                             f"You MUST call read_file/search_code/get_callers at least "
                             f"{_min_explore} times BEFORE proposing any patch. "
@@ -1987,8 +2038,8 @@ class GovernedOrchestrator:
                         )
                         logger.warning(
                             "[Orchestrator] Iron Gate — exploration_insufficient: "
-                            "%d/%d for op=%s",
-                            _explore_count, _min_explore, ctx.op_id[:12],
+                            "%d/%d (attempt=%d cumulative) for op=%s",
+                            _op_explore_credit, _min_explore, attempt + 1, ctx.op_id[:12],
                         )
                         generation = None
                         raise RuntimeError(_explore_err)
@@ -4053,6 +4104,54 @@ class GovernedOrchestrator:
                 ctx.op_id, exc,
             )
 
+        # ---- Phase 8b2: In-process hot-reload (Manifesto §6 RSI loop closer) ----
+        # If this op modified one of our hot-reloadable governance modules,
+        # reload it now so the next op uses the freshly-fixed code without
+        # a process restart. Quarantined modules trigger a restart_pending
+        # flag that the harness honors after the current op completes.
+        # Fault-isolated — never raises, never alters terminal state.
+        if self._hot_reloader is not None:
+            try:
+                _hr_batch = self._hot_reloader.reload_for_op(
+                    op_id=ctx.op_id,
+                    target_files=ctx.target_files,
+                )
+                if _hr_batch.overall_status == "success":
+                    _reloaded_names = [
+                        o.module_name.rsplit(".", 1)[-1]
+                        for o in _hr_batch.outcomes
+                        if o.status == "reloaded"
+                    ]
+                    logger.info(
+                        "[Orchestrator] Hot-reloaded %d module(s) for op=%s: %s",
+                        len(_reloaded_names), ctx.op_id, _reloaded_names,
+                    )
+                    try:
+                        await self._stack.comm.emit_heartbeat(
+                            op_id=ctx.op_id, phase="hot_reload",
+                            progress_pct=99.0,
+                            reloaded_modules=_reloaded_names,
+                            reload_count=self._hot_reloader.reload_count,
+                        )
+                    except Exception:
+                        pass
+                elif _hr_batch.overall_status in ("reload_failed", "preflight_failed"):
+                    logger.warning(
+                        "[Orchestrator] Hot-reload failed for op=%s: %s; "
+                        "restart will be queued",
+                        ctx.op_id, _hr_batch.restart_reason,
+                    )
+                elif _hr_batch.restart_required:
+                    logger.info(
+                        "[Orchestrator] Hot-reload deferred to restart for op=%s: %s",
+                        ctx.op_id, _hr_batch.restart_reason,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[Orchestrator] Hot-reload hook raised for op=%s: %s",
+                    ctx.op_id, exc,
+                )
+
         # ---- Phase 8c: Self-critique (Phase 3a — post-VERIFY quality signal) ----
         # Runs cheap DW critique over the applied diff against the original
         # goal. Poor ratings (≤2) persist as FEEDBACK memories for future
@@ -4662,6 +4761,12 @@ class GovernedOrchestrator:
         if not self._config.benchmark_enabled:
             return ctx
         try:
+            # Deferred import: re-binds on every call so ModuleHotReloader
+            # changes to patch_benchmarker.py take effect on the next op
+            # without a process restart.
+            from backend.core.ouroboros.governance.patch_benchmarker import (
+                PatchBenchmarker,
+            )
             benchmarker = PatchBenchmarker(
                 project_root=self._config.project_root,
                 timeout_s=self._config.benchmark_timeout_s,

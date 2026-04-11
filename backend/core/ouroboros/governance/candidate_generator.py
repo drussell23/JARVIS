@@ -54,7 +54,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
@@ -101,6 +101,19 @@ _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S
 # the call will almost certainly timeout before the model finishes; skip it
 # and raise immediately to avoid burning network round-trip time.
 _MIN_VIABLE_FALLBACK_S = float(os.environ.get("OUROBOROS_MIN_VIABLE_FALLBACK_S", "10"))
+
+# Guaranteed minimum window for the fallback (Claude) regardless of how much
+# parent-deadline budget Tier 0 consumed before failing. When the parent
+# deadline is depleted (e.g. DW timed out after 80s of a 120s window),
+# `_call_fallback` REFRESHES its own deadline so Claude gets at least this
+# many seconds — otherwise legitimate doc-gen / patch streams (60-100s)
+# get cut off mid-flight and the whole op fails to `all_providers_exhausted`.
+# Diagnosed in bt-2026-04-11-211131 (24x exhaustion, 0 commits).
+# This OVERRIDES the parent wall-clock deadline; the orchestrator's outer
+# `wait_for(_gen_timeout + 5)` is the absolute Iron Gate.
+_FALLBACK_MIN_GUARANTEED_S = float(
+    os.environ.get("OUROBOROS_FALLBACK_MIN_GUARANTEED_S", "90"),
+)
 
 # ---------------------------------------------------------------------------
 # Content failure classification
@@ -1457,12 +1470,31 @@ class CandidateGenerator:
         context: OperationContext,
         deadline: datetime,
     ) -> GenerationResult:
-        """Call fallback provider with concurrency and deadline enforcement."""
+        """Call fallback provider with concurrency and deadline enforcement.
+
+        REFRESHES the deadline if the parent budget is depleted: when Tier 0
+        burns most of the parent's wall-clock window, this method grants the
+        fallback its own ``_FALLBACK_MIN_GUARANTEED_S`` window so legitimate
+        Claude doc-gen / patch streams (60-100s) aren't cut off mid-flight.
+
+        The orchestrator's outer ``wait_for(_gen_timeout + 5)`` is still the
+        absolute Iron Gate — that's why STANDARD route was bumped to 220s.
+        """
         try:
-            remaining = min(
-                self._remaining_seconds(deadline),
-                self._FALLBACK_MAX_TIMEOUT_S,
-            )
+            _parent_remaining = self._remaining_seconds(deadline)
+            # Refresh: guarantee at least _FALLBACK_MIN_GUARANTEED_S when the
+            # parent deadline is *depleted but alive* (Tier 0 burned most of
+            # the window but didn't break the wall clock). When the parent
+            # deadline has fully expired (remaining == 0.0), preserve the
+            # original fast-fail semantics — an expired deadline signals a
+            # stuck worker or runaway loop, and the orchestrator's outer
+            # `wait_for(_gen_timeout + 5)` should be the absolute Iron Gate.
+            if _parent_remaining > 0.0:
+                _budget_target = max(_parent_remaining, _FALLBACK_MIN_GUARANTEED_S)
+            else:
+                _budget_target = _parent_remaining
+            remaining = min(_budget_target, self._FALLBACK_MAX_TIMEOUT_S)
+            _refreshed = remaining > _parent_remaining + 1.0
             if remaining < _MIN_VIABLE_FALLBACK_S:
                 logger.warning(
                     "[CandidateGenerator] Fallback skipped — only %.1fs "
@@ -1472,10 +1504,25 @@ class CandidateGenerator:
                 raise RuntimeError(
                     f"all_providers_exhausted:fallback_budget_starved_{remaining:.0f}s"
                 )
-            logger.info(
-                "[CandidateGenerator] Fallback: budget=%.1fs (cap=%.0fs)",
-                remaining, self._FALLBACK_MAX_TIMEOUT_S,
-            )
+            if _refreshed:
+                logger.info(
+                    "[CandidateGenerator] Fallback: budget=%.1fs REFRESHED "
+                    "(parent=%.1fs depleted, guaranteed_min=%.0fs, cap=%.0fs)",
+                    remaining, _parent_remaining,
+                    _FALLBACK_MIN_GUARANTEED_S, self._FALLBACK_MAX_TIMEOUT_S,
+                )
+                # Build a fresh deadline so downstream provider code (which
+                # also derives timeouts from `deadline - now`) sees the
+                # refreshed budget. Without this, providers.py line 4332
+                # would still compute `timeout_s = remaining_until_old_deadline`.
+                deadline = datetime.now(tz=timezone.utc) + timedelta(
+                    seconds=remaining,
+                )
+            else:
+                logger.info(
+                    "[CandidateGenerator] Fallback: budget=%.1fs (cap=%.0fs)",
+                    remaining, self._FALLBACK_MAX_TIMEOUT_S,
+                )
             async with self._fallback_sem:
                 return await asyncio.wait_for(
                     self._fallback.generate(context, deadline),
