@@ -63,9 +63,9 @@ def _make_provider(**overrides: Any) -> ClaudeProvider:
 
 
 class TestBuildCachedSystemBlocks:
-    def test_long_prompt_returns_list_with_cache_control(self) -> None:
+    def test_nonempty_prompt_returns_list_with_cache_control(self) -> None:
         p = _make_provider()
-        # Default min-chars is 4096; hand over something well above.
+        # Default min-chars is 0; any non-empty string is shaped as blocks.
         text = "x" * 5000
         result = p._build_cached_system_blocks(text)
         assert isinstance(result, list)
@@ -75,7 +75,12 @@ class TestBuildCachedSystemBlocks:
         assert block["text"] == text
         assert block["cache_control"] == {"type": "ephemeral"}
 
-    def test_short_prompt_returns_plain_string(self) -> None:
+    def test_short_prompt_gated_by_explicit_min_chars(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When operator raises the min_chars threshold, short prompts
+        fall back to plain string (safety valve for tiny prompts)."""
+        monkeypatch.setenv("JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS", "100")
         p = _make_provider()
         result = p._build_cached_system_blocks("too short")
         assert result == "too short"
@@ -119,17 +124,20 @@ class TestBuildCachedSystemBlocks:
         assert p._build_cached_system_blocks(sentinel) is sentinel
 
     def test_real_codegen_prompt_is_cached(self) -> None:
-        """The real _CODEGEN_SYSTEM_PROMPT should always hit the cache path.
+        """The real _CODEGEN_SYSTEM_PROMPT should flow through the cache
+        path with the default (threshold=0) configuration.
 
-        If this ever fails, someone has trimmed the system prompt below
-        the 4096-char threshold and caching is effectively disabled.
+        Note: even though the prompt is shaped as a cache_control block,
+        Anthropic silently ignores the breakpoint if it's below its
+        ~1024-token minimum. This test asserts the *shape* contract,
+        not actual cache activation on Anthropic's side.
         """
         p = _make_provider()
         result = p._build_cached_system_blocks(_CODEGEN_SYSTEM_PROMPT)
-        assert isinstance(result, list), (
-            f"System prompt is only {len(_CODEGEN_SYSTEM_PROMPT)} chars — "
-            f"falls below cache threshold of {p._prompt_cache_min_chars}"
-        )
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["cache_control"] == {"type": "ephemeral"}
+        assert result[0]["text"] == _CODEGEN_SYSTEM_PROMPT
 
     @pytest.mark.parametrize(
         "value, expected_enabled",
@@ -163,8 +171,8 @@ class TestBuildCachedSystemBlocks:
             "JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS", "not-a-number"
         )
         p = _make_provider()
-        # Falls back to 4096 default on ValueError.
-        assert p._prompt_cache_min_chars == 4096
+        # Falls back to 0 default on ValueError.
+        assert p._prompt_cache_min_chars == 0
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +314,8 @@ class TestInitWiring:
     def test_default_enabled(self) -> None:
         p = _make_provider()
         assert p._prompt_cache_enabled is True
-        assert p._prompt_cache_min_chars == 4096
+        # Default threshold is 0 — always shape as blocks when enabled.
+        assert p._prompt_cache_min_chars == 0
 
     def test_disable_via_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("JARVIS_CLAUDE_PROMPT_CACHE_ENABLED", "false")
