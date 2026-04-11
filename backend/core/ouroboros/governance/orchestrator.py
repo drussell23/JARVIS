@@ -642,13 +642,18 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] Strategic direction injection failed", exc_info=True)
 
-        # ---- P2.4: Goal-directed context injection ----
-        # Append active user goals to strategic_memory_prompt so the
-        # generation model aligns its decisions with current priorities.
+        # ---- P2.4 + Week 2: Goal-directed context injection ----
+        # Append the *most relevant* active user goals to the strategic
+        # memory prompt so the generation model aligns its decisions with
+        # current priorities. Scoped by target_files + description so a
+        # noisy goal tracker doesn't hijack unrelated ops.
         try:
             from backend.core.ouroboros.governance.strategic_direction import GoalTracker
             _goal_tracker = GoalTracker(self._config.project_root)
-            _goal_prompt = _goal_tracker.format_for_prompt()
+            _goal_prompt = _goal_tracker.format_for_prompt(
+                target_files=list(ctx.target_files),
+                description=ctx.description or "",
+            )
             if _goal_prompt:
                 _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
                 ctx = ctx.with_strategic_memory_context(
@@ -658,7 +663,7 @@ class GovernedOrchestrator:
                     strategic_memory_digest=ctx.strategic_memory_digest,
                 )
                 logger.debug(
-                    "[Orchestrator] Goal context injected (%d active goals)",
+                    "[Orchestrator] Goal context injected (%d active / scoped)",
                     len(_goal_tracker.active_goals),
                 )
         except Exception:

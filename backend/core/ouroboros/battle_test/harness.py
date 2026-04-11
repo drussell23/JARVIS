@@ -954,23 +954,51 @@ class BattleTestHarness:
         """Manage active goals at runtime.
 
         Usage:
-          /goal               — list active goals
-          /goal add <desc>    — add a goal (keywords extracted from description)
-          /goal remove <id>   — remove a goal by ID
+          /goal                        — list active goals
+          /goal all                    — list every goal (active/paused/completed)
+          /goal show <id>              — show one goal in detail
+          /goal add <desc>             — add a goal (keywords/slug auto-extracted)
+          /goal remove <id>            — remove a goal by ID
+          /goal pause <id>             — pause (skips scoring + injection)
+          /goal resume <id>            — resume a paused goal
+          /goal complete <id>          — mark as completed
+          /goal purge                  — drop all completed goals
         """
         parts = line.replace("/goal", "goal", 1).split(None, 2)
         subcmd = parts[1].strip().lower() if len(parts) > 1 else "list"
 
-        # Lazy import GoalTracker
+        # Lazy import GoalTracker — the harness keeps booting on older
+        # checkouts where the new API isn't present.
         try:
             from backend.core.ouroboros.governance.strategic_direction import (
-                ActiveGoal, GoalTracker,
+                ActiveGoal, GoalStatus, GoalTracker,
             )
         except ImportError:
             self._repl_print("[red]GoalTracker not available[/red]")
             return
 
         tracker = GoalTracker(self._config.repo_path)
+
+        def _render_one(g: "ActiveGoal") -> str:
+            kw = ", ".join(g.keywords[:5])
+            weight = ""
+            if g.priority_weight >= 2.0:
+                weight = " [bold red]HIGH[/bold red]"
+            elif g.priority_weight <= 0.5:
+                weight = " [dim]low[/dim]"
+            tags = ""
+            if g.tags:
+                tags = f" [magenta]#{' #'.join(g.tags[:3])}[/magenta]"
+            status_color = {
+                GoalStatus.ACTIVE: "green",
+                GoalStatus.PAUSED: "yellow",
+                GoalStatus.COMPLETED: "blue",
+            }.get(g.status, "white")
+            status_tag = f" [{status_color}]{g.status.value}[/{status_color}]"
+            return (
+                f"  [cyan]{g.goal_id}[/cyan]{status_tag}  {g.description}"
+                f"{tags}  [dim]({kw}){weight}[/dim]"
+            )
 
         if subcmd == "list":
             goals = tracker.active_goals
@@ -979,23 +1007,38 @@ class BattleTestHarness:
                 return
             self._repl_print("[bold]Active Goals[/bold]")
             for g in goals:
-                kw = ", ".join(g.keywords[:5])
-                weight = ""
-                if g.priority_weight >= 2.0:
-                    weight = " [bold red]HIGH[/bold red]"
-                elif g.priority_weight <= 0.5:
-                    weight = " [dim]low[/dim]"
-                self._repl_print(f"  [cyan]{g.goal_id}[/cyan]  {g.description}  [dim]({kw}){weight}[/dim]")
+                self._repl_print(_render_one(g))
+
+        elif subcmd == "all":
+            goals = tracker.all_goals
+            if not goals:
+                self._repl_print("[dim]No goals stored. Use: /goal add <description>[/dim]")
+                return
+            self._repl_print("[bold]All Goals[/bold]")
+            for g in goals:
+                self._repl_print(_render_one(g))
+
+        elif subcmd == "show" and len(parts) > 2:
+            goal_id = parts[2].strip()
+            g = tracker.get(goal_id)
+            if g is None:
+                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+                return
+            self._repl_print(f"[bold cyan]{g.goal_id}[/bold cyan]  [dim]({g.status.value})[/dim]")
+            self._repl_print(f"  description: {g.description}")
+            self._repl_print(f"  keywords:    {', '.join(g.keywords) or '(none)'}")
+            if g.path_patterns:
+                self._repl_print(f"  paths:       {', '.join(g.path_patterns)}")
+            if g.tags:
+                self._repl_print(f"  tags:        {', '.join(g.tags)}")
+            self._repl_print(f"  priority:    {g.priority_weight}")
 
         elif subcmd == "add" and len(parts) > 2:
             desc = parts[2].strip().strip("'\"")
-            # Auto-generate goal_id from description
-            slug = re.sub(r"[^a-z0-9]+", "-", desc.lower())[:40].strip("-")
-            # Auto-extract keywords: split on spaces, keep words 4+ chars
-            keywords = tuple(
-                w.lower() for w in desc.split()
-                if len(w) >= 4 and w.lower() not in ("with", "from", "that", "this", "have", "been")
-            )[:8]
+            # Delegate slug + keyword extraction to GoalTracker so the
+            # stopword list lives in one place (and is env-overridable).
+            slug = GoalTracker.slugify(desc)
+            keywords = GoalTracker.extract_keywords(desc)
             goal = ActiveGoal(
                 goal_id=slug,
                 description=desc,
@@ -1004,7 +1047,7 @@ class BattleTestHarness:
             tracker.add_goal(goal)
             self._repl_print(
                 f"[green]Goal added:[/green] [cyan]{slug}[/cyan]  "
-                f"[dim]keywords: {', '.join(keywords)}[/dim]"
+                f"[dim]keywords: {', '.join(keywords) or '(none)'}[/dim]"
             )
 
         elif subcmd in ("remove", "rm") and len(parts) > 2:
@@ -1014,9 +1057,39 @@ class BattleTestHarness:
             else:
                 self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
 
+        elif subcmd == "pause" and len(parts) > 2:
+            goal_id = parts[2].strip()
+            if tracker.pause(goal_id):
+                self._repl_print(f"[yellow]Paused goal: {goal_id}[/yellow]")
+            else:
+                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+
+        elif subcmd == "resume" and len(parts) > 2:
+            goal_id = parts[2].strip()
+            if tracker.resume(goal_id):
+                self._repl_print(f"[green]Resumed goal: {goal_id}[/green]")
+            else:
+                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+
+        elif subcmd == "complete" and len(parts) > 2:
+            goal_id = parts[2].strip()
+            if tracker.complete(goal_id):
+                self._repl_print(f"[blue]Completed goal: {goal_id}[/blue]")
+            else:
+                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+
+        elif subcmd == "purge":
+            removed = tracker.purge_completed()
+            if removed:
+                self._repl_print(f"[blue]Purged {removed} completed goals[/blue]")
+            else:
+                self._repl_print("[dim]No completed goals to purge[/dim]")
+
         else:
             self._repl_print(
-                "[dim]Usage: /goal | /goal add <description> | /goal remove <id>[/dim]"
+                "[dim]Usage: /goal | /goal all | /goal show <id> | "
+                "/goal add <desc> | /goal remove <id> | "
+                "/goal pause|resume|complete <id> | /goal purge[/dim]"
             )
 
     # -- UserPreferenceMemory sub-commands -------------------------------
