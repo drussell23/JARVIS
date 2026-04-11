@@ -450,6 +450,67 @@ def _seed_file_path() -> str:
     return os.environ.get("JARVIS_GOAL_SEED_FILE", _DEFAULT_SEED_FILE)
 
 
+# --- Increment 3 env helpers (activity ledger, propagation, drift) ---
+
+def _descendant_decay() -> float:
+    """Per-depth decay for descendant propagation in the activity ledger.
+
+    ``score * decay**depth`` is the credit an ancestor receives from a
+    leaf/tactical match. ``0.5`` by default means parent gets half the
+    child's score, grandparent a quarter, etc. Set to ``0`` to disable
+    ancestor credit while still writing direct matches to the ledger.
+    """
+    return _env_float("JARVIS_GOAL_DESCENDANT_DECAY", 0.5)
+
+
+def _sibling_bump_enabled() -> bool:
+    """Whether siblings of a direct match earn a small presence bump.
+
+    Deferred behind an opt-in flag — the baseline ledger collects evidence
+    first, the flag flips on once coupled-goal cluster data supports it.
+    """
+    return os.environ.get(
+        "JARVIS_GOAL_SIBLING_BUMP_ENABLED", "false",
+    ).lower() in ("true", "1", "yes", "on")
+
+
+def _sibling_bump_amount() -> float:
+    """Flat bump applied once per sibling goal per op (when enabled)."""
+    return _env_float("JARVIS_GOAL_SIBLING_BUMP_AMOUNT", 0.1)
+
+
+def _drift_min_threshold() -> int:
+    """Minimum op count before strategic drift is computed.
+
+    Below this, the drift summary reports ``status=insufficient_data`` so
+    a 2-op session with one miss doesn't false-positive as "drifted".
+    """
+    return _env_int("JARVIS_GOAL_DRIFT_MIN_OPS", 5)
+
+
+def _drift_warn_ratio() -> float:
+    """Drift ratio above which a warning is raised in the session summary."""
+    return _env_float("JARVIS_GOAL_DRIFT_WARN_RATIO", 0.30)
+
+
+# Module-global session id for the activity ledger. Harness sets this
+# once at boot so orchestrator-side ledger appends don't need to thread
+# session context through every call site. Mirrors the pattern used by
+# ``_active_goal_tracker`` in the intake router.
+_active_session_id: Optional[str] = None
+
+
+def set_active_session_id(session_id: Optional[str]) -> None:
+    """Install / clear the session id used by the activity ledger."""
+    global _active_session_id
+    _active_session_id = session_id or None
+
+
+def get_active_session_id() -> Optional[str]:
+    """Return the current session id, or ``None`` when not in a session."""
+    return _active_session_id
+
+
 # Default stopwords for auto-keyword extraction. Every word <4 chars is
 # already dropped; this list removes common words that survive the length
 # filter but carry no semantic weight.
@@ -526,6 +587,45 @@ class ActiveGoal:
 
 
 @dataclass(frozen=True)
+class GoalAlignmentEntry:
+    """One goal's contribution to an op, for the activity ledger.
+
+    Returned by :meth:`GoalTracker.compute_activity_entries` and stashed
+    inside :class:`GoalAlignment` via the ``matches`` tuple. Every entry
+    carries provenance: *why* this goal scored, via the ``reasons`` tuple
+    (``prefix:value`` strings with prefixes ``kw:``, ``path:``, ``tag:``,
+    ``descendant:``, ``sibling:``).
+
+    ``kind`` identifies how the entry was produced:
+      * ``"direct"`` — goal scored via keyword / path / tag match.
+      * ``"ancestor"`` — goal received credit via descendant propagation
+        (``score = direct_score * decay**depth``). Does **not** affect
+        the intake router's boost — ancestor credit is ledger-only.
+      * ``"sibling"`` — goal received a flat bump because a sibling
+        scored directly. Deferred behind ``JARVIS_GOAL_SIBLING_BUMP_ENABLED``.
+
+    ``source_goal_id`` names the direct-match goal that credited this
+    ancestor / sibling entry (empty for ``"direct"`` entries).
+    """
+
+    goal_id: str
+    score: float
+    reasons: Tuple[str, ...] = ()
+    kind: str = "direct"  # "direct" | "ancestor" | "sibling"
+    source_goal_id: str = ""
+
+    def to_dict(self) -> Dict[str, object]:
+        """JSON-friendly shape for ledger rows and ``as_evidence``."""
+        return {
+            "goal_id": self.goal_id,
+            "score": round(float(self.score), 4),
+            "reasons": list(self.reasons),
+            "kind": self.kind,
+            "source_goal_id": self.source_goal_id,
+        }
+
+
+@dataclass(frozen=True)
 class GoalAlignment:
     """Rich alignment result for an intake signal.
 
@@ -556,6 +656,12 @@ class GoalAlignment:
         ``[_GOAL_SCORE_MULT_MIN, _GOAL_SCORE_MULT_MAX]``. Defaults to
         ``_GOAL_SCORE_MULT_MIN`` on a no-match so arithmetic callers
         don't need to branch on ``matched_count``.
+    matches:
+        Per-goal provenance tuple. One :class:`GoalAlignmentEntry` per
+        direct match whose score cleared the relevance threshold, in
+        relevance-descending order. Empty on a no-match. Does not
+        include ancestor/sibling credits — those live only in the
+        activity ledger (``compute_activity_entries``).
     """
 
     boost: int = 0
@@ -563,19 +669,80 @@ class GoalAlignment:
     top_goal_id: str = ""
     matched_count: int = 0
     score_multiplier: float = field(default=_GOAL_SCORE_MULT_MIN)
+    matches: Tuple[GoalAlignmentEntry, ...] = field(default=())
 
     @property
     def is_match(self) -> bool:
         return self.matched_count > 0
 
-    def as_evidence(self) -> Dict[str, float]:
-        """Serialize for ``IntentEnvelope.evidence`` stashing."""
+    def as_evidence(self) -> Dict[str, object]:
+        """Serialize for ``IntentEnvelope.evidence`` stashing.
+
+        Legacy numeric fields are preserved unchanged for backward
+        compatibility with the intake router and anything that reads
+        ``evidence.goal_relevance_score`` / ``evidence.goal_top_goal_id``.
+        New consumers can additionally read ``goal_matches`` for the
+        full provenance tuple.
+        """
         return {
             "goal_alignment_boost": float(self.boost),
             "goal_relevance_score": round(self.raw_score, 3),
-            "goal_top_goal_id": self.top_goal_id,  # type: ignore[dict-item]
+            "goal_top_goal_id": self.top_goal_id,
             "goal_matched_count": float(self.matched_count),
             "goal_score_multiplier": round(self.score_multiplier, 3),
+            "goal_matches": [m.to_dict() for m in self.matches],
+        }
+
+
+@dataclass(frozen=True)
+class SessionDriftSummary:
+    """Anti-drift aggregate for a battle-test session.
+
+    Computed by :meth:`GoalActivityLedger.compute_drift` at session end.
+    Captures how many ops reached CLASSIFY (denominator), how many
+    reached it with zero goal matches (numerator), the ratio, and
+    whether the warning threshold was crossed. ``ratio`` is ``None``
+    when fewer than ``min_threshold`` ops ran — below that, the sample
+    is too small to reason about drift.
+
+    Definitions
+    -----------
+    Numerator (``drifted_ops``):
+        Ops whose ledger row set is either empty or contains only
+        ``zero_match`` markers (no ``direct``-kind entry with a
+        positive score).
+    Denominator (``total_ops``):
+        Distinct ``op_id`` values that appear in the ledger for this
+        session. An op "reached CLASSIFY" iff the orchestrator wrote
+        at least one ledger row for it — boot failures and
+        pre-intake-blocks never appear.
+    Minimum threshold:
+        ``JARVIS_GOAL_DRIFT_MIN_OPS`` (default 5). Below this,
+        ``ratio`` is ``None`` and ``status="insufficient_data"``.
+    Warning trigger:
+        ``threshold_met AND ratio > _drift_warn_ratio()``.
+    """
+
+    total_ops: int = 0
+    drifted_ops: int = 0
+    ratio: Optional[float] = None
+    threshold_met: bool = False
+    warning: bool = False
+
+    @property
+    def status(self) -> str:
+        if not self.threshold_met:
+            return "insufficient_data"
+        return "drift_warning" if self.warning else "ok"
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "total_ops": int(self.total_ops),
+            "drifted_ops": int(self.drifted_ops),
+            "ratio": round(self.ratio, 4) if self.ratio is not None else None,
+            "threshold_met": bool(self.threshold_met),
+            "warning": bool(self.warning),
+            "status": self.status,
         }
 
 
@@ -625,6 +792,252 @@ class GoalMigrationReport:
         if self.healed_cycle:
             parts.append(f"{self.healed_cycle} cycles")
         return ", ".join(parts)
+
+
+class GoalActivityLedger:
+    """Append-only cross-session record of which goals each op touched.
+
+    **Purpose.** Every op that reaches CLASSIFY writes one or more rows
+    to ``.jarvis/goal_activity.jsonl`` (redirected via
+    :func:`backend.core.ouroboros.governance.sandbox_paths.sandbox_fallback`
+    when the primary path is not writable — Iron Gate stays up). Rows
+    document the direct matches, ancestor credits, and sibling bumps
+    that a goal received for that op, complete with the scoring reasons
+    that produced them. Zero-match ops write a single marker row so
+    drift math knows they reached CLASSIFY without scoring anything.
+
+    **Row schema** (one JSON object per line):
+
+    .. code-block:: json
+
+        {
+          "ts": 1755000000.123,
+          "session_id": "bt-2026-04-11-194937",
+          "op_id": "op-019d7e1a-8f9d-...",
+          "goal_id": "iron-gate-b-to-a",
+          "score": 12.5,
+          "reasons": ["path:backend/core/ouroboros/governance/",
+                      "tag:reliability"],
+          "kind": "direct",
+          "source_goal_id": "",
+          "zero_match": false
+        }
+
+    The ``zero_match`` field is ``true`` *only* on a marker row (no
+    goal hit); it is omitted for per-goal rows.
+
+    **Append-only guarantee.** :meth:`append` opens the file in ``"a"``
+    mode and never rewrites. :meth:`read` is pure — it never truncates
+    or compacts. Rotation / compaction is explicitly out of scope for
+    Increment 3 (Manifesto §7: append-only, no silent mutation of
+    historical log lines).
+    """
+
+    _FILE = ".jarvis/goal_activity.jsonl"
+
+    def __init__(self, project_root: Path) -> None:
+        self._root = Path(project_root).resolve()
+
+    @property
+    def path(self) -> Path:
+        """Resolved ledger path (primary or sandbox fallback)."""
+        primary = self._root / self._FILE
+        try:
+            from backend.core.ouroboros.governance.sandbox_paths import (
+                sandbox_fallback,
+            )
+        except ImportError:
+            return primary
+        return sandbox_fallback(primary)
+
+    # ------------------------------------------------------------------
+    # Writer
+    # ------------------------------------------------------------------
+
+    def append(
+        self,
+        *,
+        session_id: str,
+        op_id: str,
+        entries: Sequence[GoalAlignmentEntry],
+        ts: Optional[float] = None,
+    ) -> int:
+        """Append ledger rows for one op. Returns rows written.
+
+        ``entries`` may be empty — in that case a single zero-match
+        marker row is written so drift aggregation can count the op as
+        "reached CLASSIFY". Never raises: filesystem errors downgrade
+        to a WARN log and return ``0``.
+        """
+        if not session_id or not op_id:
+            return 0
+        now = ts if ts is not None else time.time()
+        rows: List[Dict[str, object]] = []
+        if not entries:
+            rows.append(
+                {
+                    "ts": now,
+                    "session_id": session_id,
+                    "op_id": op_id,
+                    "zero_match": True,
+                }
+            )
+        else:
+            for entry in entries:
+                row: Dict[str, object] = {
+                    "ts": now,
+                    "session_id": session_id,
+                    "op_id": op_id,
+                    "goal_id": entry.goal_id,
+                    "score": round(float(entry.score), 4),
+                    "reasons": list(entry.reasons),
+                    "kind": entry.kind,
+                    "source_goal_id": entry.source_goal_id,
+                }
+                rows.append(row)
+
+        target = self.path
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("a", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row, ensure_ascii=True) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "[GoalActivityLedger] append failed (%s): %s", target, exc,
+            )
+            return 0
+        return len(rows)
+
+    # ------------------------------------------------------------------
+    # Reader
+    # ------------------------------------------------------------------
+
+    def read(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        op_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, object]]:
+        """Return ledger rows filtered by session/op/goal, newest last.
+
+        Pure read; never raises. Malformed lines are skipped silently
+        — the ledger tolerates partial writes from a crashed session.
+        ``limit`` trims from the end (the newest rows) when positive.
+        """
+        target = self.path
+        if not target.exists():
+            return []
+        out: List[Dict[str, object]] = []
+        try:
+            with target.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    if session_id and row.get("session_id") != session_id:
+                        continue
+                    if op_id and row.get("op_id") != op_id:
+                        continue
+                    if goal_id and row.get("goal_id") != goal_id:
+                        continue
+                    out.append(row)
+        except OSError:
+            return []
+        if limit and limit > 0:
+            return out[-limit:]
+        return out
+
+    # ------------------------------------------------------------------
+    # Drift aggregation
+    # ------------------------------------------------------------------
+
+    def compute_drift(
+        self,
+        *,
+        session_id: str,
+        min_threshold: Optional[int] = None,
+        drift_threshold: Optional[float] = None,
+    ) -> SessionDriftSummary:
+        """Compute the strategic-drift summary for ``session_id``.
+
+        **Numerator (drifted_ops)**: ops whose ledger row set has no
+        ``direct``-kind row with ``score > 0`` (either ``zero_match``
+        marker rows only, or no direct hits).
+
+        **Denominator (total_ops)**: distinct ``op_id`` values present
+        in the ledger for this session. An op "reached CLASSIFY" iff
+        the orchestrator wrote at least one ledger row for it.
+
+        **Insufficient data**: when ``total_ops < min_threshold``
+        (default ``_drift_min_threshold()``), the ratio is set to
+        ``None`` and ``threshold_met=False`` so callers can distinguish
+        "noisy sample" from "legitimate zero drift".
+
+        **Warning**: set when ``threshold_met AND
+        ratio > drift_threshold`` (default ``_drift_warn_ratio()``).
+        """
+        min_ops = _drift_min_threshold() if min_threshold is None else int(min_threshold)
+        warn_ratio = (
+            _drift_warn_ratio() if drift_threshold is None else float(drift_threshold)
+        )
+        rows = self.read(session_id=session_id)
+        if not rows:
+            return SessionDriftSummary()
+
+        # Per-op: does it have at least one direct-kind positive score?
+        has_direct: Dict[str, bool] = {}
+        seen: set = set()
+        for row in rows:
+            op_id = row.get("op_id")
+            if not isinstance(op_id, str):
+                continue
+            seen.add(op_id)
+            if has_direct.get(op_id):
+                continue  # already satisfied
+            if row.get("zero_match"):
+                has_direct.setdefault(op_id, False)
+                continue
+            if row.get("kind") == "direct":
+                raw_score = row.get("score")
+                try:
+                    score_val = float(raw_score) if raw_score is not None else 0.0  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    score_val = 0.0
+                if score_val > 0:
+                    has_direct[op_id] = True
+                else:
+                    has_direct.setdefault(op_id, False)
+            else:
+                has_direct.setdefault(op_id, False)
+
+        total_ops = len(seen)
+        drifted_ops = sum(1 for op_id in seen if not has_direct.get(op_id))
+
+        if total_ops < min_ops:
+            return SessionDriftSummary(
+                total_ops=total_ops,
+                drifted_ops=drifted_ops,
+                ratio=None,
+                threshold_met=False,
+                warning=False,
+            )
+        ratio = (drifted_ops / total_ops) if total_ops > 0 else 0.0
+        return SessionDriftSummary(
+            total_ops=total_ops,
+            drifted_ops=drifted_ops,
+            ratio=ratio,
+            threshold_met=True,
+            warning=ratio > warn_ratio,
+        )
 
 
 class GoalTracker:
@@ -1021,46 +1434,88 @@ class GoalTracker:
     ) -> float:
         """Return a non-negative relevance score for ``goal`` against the op.
 
-        Scores combine path overlap (strongest), tag match, and keyword
-        match, multiplied by priority_weight and staleness decay. Inactive
-        goals always score 0.
+        Thin wrapper over :meth:`_score_goal_verbose` that drops the
+        reason tuple — preserved for v1/v2 callers that only need the
+        numeric score.
+        """
+        score, _reasons = GoalTracker._score_goal_verbose(
+            goal,
+            description=description,
+            target_files=target_files,
+            halflife_days=halflife_days,
+        )
+        return score
+
+    @staticmethod
+    def _score_goal_verbose(
+        goal: ActiveGoal,
+        *,
+        description: str,
+        target_files: Sequence[str],
+        halflife_days: float = _STALENESS_HALFLIFE_DAYS,
+    ) -> Tuple[float, Tuple[str, ...]]:
+        """Return ``(score, reasons)`` — the verbose scoring path.
+
+        Reasons are ``prefix:value`` strings so downstream consumers
+        can reconstruct *why* a goal matched without re-running the
+        scorer. Prefixes: ``path:``, ``tag:``, ``kw:``. Deduplicated
+        per reason kind — scoring math is unchanged, but a pattern that
+        matches two target files produces only one ``path:<pat>`` reason.
+
+        Inactive goals return ``(0.0, ())``. Below-threshold scores
+        (pre-multiplier) return ``(0.0, ())`` so callers don't see
+        reason residue for a zero-score goal.
         """
         if not goal.is_active:
-            return 0.0
+            return 0.0, ()
 
         score = 0.0
+        reasons: List[str] = []
         desc_lower = (description or "").lower()
         desc_tokens = GoalTracker._tokenize(description or "")
 
-        # Path overlap — any target file starting with any goal path pattern
+        # Path overlap — any target file starting with any goal path pattern.
+        # Scoring preserves the original semantics (one +_SCORE_PATH_MATCH
+        # per target file whose first matching pattern hits); reasons are
+        # deduped to the unique pattern set so a hot pattern doesn't
+        # produce a wall of duplicate strings in the ledger.
         if target_files and goal.path_patterns:
+            seen_path_reasons: set = set()
             for tf in target_files:
                 tf_str = str(tf)
                 for pat in goal.path_patterns:
                     if pat and tf_str.startswith(pat):
                         score += _SCORE_PATH_MATCH
+                        reason = f"path:{pat}"
+                        if reason not in seen_path_reasons:
+                            seen_path_reasons.add(reason)
+                            reasons.append(reason)
                         break
 
-        # Tag match — goal tags that appear as tokens in the description
+        # Tag match — goal tags that appear as tokens in the description.
+        # Sorted for determinism so reason tuples are stable across runs.
         if goal.tags and desc_tokens:
             tag_set = {t.lower() for t in goal.tags if t}
-            overlap = tag_set & desc_tokens
+            overlap = sorted(tag_set & desc_tokens)
             if overlap:
                 score += _SCORE_TAG_MATCH * len(overlap)
+                for tag in overlap:
+                    reasons.append(f"tag:{tag}")
 
-        # Keyword match — keyword substring hits in description
+        # Keyword match — keyword substring hits in description.
         if goal.keywords and desc_lower:
             for kw in goal.keywords:
                 if kw and kw.lower() in desc_lower:
                     score += _SCORE_KEYWORD_MATCH
+                    reasons.append(f"kw:{kw.lower()}")
 
         if score <= 0:
-            return 0.0
+            return 0.0, ()
 
         # Priority weight multiplier + staleness decay.
         score *= max(0.1, goal.priority_weight)
         score *= GoalTracker._staleness_multiplier(goal.created_at, halflife_days)
-        return score
+        return score, tuple(reasons)
 
     def find_relevant(
         self,
@@ -1073,19 +1528,45 @@ class GoalTracker:
 
         ``limit`` defaults to ``_MAX_PROMPT_GOALS``. Goals scoring below
         ``_SCORE_MIN_RELEVANCE`` are dropped entirely — no partial matches.
+
+        Backward-compatible wrapper around
+        :meth:`find_relevant_with_reasons` — use the verbose variant
+        when the caller also needs scoring provenance.
+        """
+        return [
+            (g, s)
+            for (g, s, _reasons) in self.find_relevant_with_reasons(
+                description=description,
+                target_files=target_files,
+                limit=limit,
+            )
+        ]
+
+    def find_relevant_with_reasons(
+        self,
+        *,
+        description: str = "",
+        target_files: Sequence[str] = (),
+        limit: Optional[int] = None,
+    ) -> List[Tuple[ActiveGoal, float, Tuple[str, ...]]]:
+        """Return the top-N active goals with their scoring reasons.
+
+        Identical ordering to :meth:`find_relevant`: relevance-descending,
+        then ``updated_at``-descending as the tie-breaker. Deterministic
+        — no timestamp drift between calls for the same input.
         """
         if limit is None:
             limit = _MAX_PROMPT_GOALS
-        scored: List[Tuple[ActiveGoal, float]] = []
+        scored: List[Tuple[ActiveGoal, float, Tuple[str, ...]]] = []
         for goal in self._goals:
-            s = self._score_goal(
+            s, reasons = self._score_goal_verbose(
                 goal,
                 description=description,
                 target_files=target_files,
             )
             if s >= _SCORE_MIN_RELEVANCE:
-                scored.append((goal, s))
-        scored.sort(key=lambda gs: (-gs[1], -gs[0].updated_at))
+                scored.append((goal, s, reasons))
+        scored.sort(key=lambda gsr: (-gsr[1], -gsr[0].updated_at))
         return scored[:limit]
 
     # ------------------------------------------------------------------
@@ -1109,8 +1590,13 @@ class GoalTracker:
           1. Base constant (``_GOAL_ALIGNMENT_BOOST``)
           2. Top goal's ``priority_weight``
           3. Clamped raw-score multiplier (``raw_score / _GOAL_SCORE_DIVISOR``)
+
+        The returned :class:`GoalAlignment` also carries a ``matches``
+        tuple of :class:`GoalAlignmentEntry` for every direct match —
+        the richer provenance consumed by the activity ledger, the
+        ``/goal explain`` REPL, and future governance surfaces.
         """
-        matches = self.find_relevant(
+        matches = self.find_relevant_with_reasons(
             description=description,
             target_files=target_files,
             limit=_MAX_PROMPT_GOALS,
@@ -1118,7 +1604,7 @@ class GoalTracker:
         if not matches:
             return GoalAlignment()
 
-        best_goal, best_score = matches[0]
+        best_goal, best_score, _best_reasons = matches[0]
 
         # Raw-score → clamped multiplier. Higher-scoring matches push the
         # boost up within the operator-defined band without letting any
@@ -1132,13 +1618,148 @@ class GoalTracker:
         scaled = _GOAL_ALIGNMENT_BOOST * max(0.1, best_goal.priority_weight) * mult
         boost = max(1, int(round(scaled)))
 
+        entries = tuple(
+            GoalAlignmentEntry(
+                goal_id=g.goal_id,
+                score=round(float(s), 4),
+                reasons=reasons,
+                kind="direct",
+                source_goal_id="",
+            )
+            for (g, s, reasons) in matches
+        )
+
         return GoalAlignment(
             boost=boost,
             raw_score=float(best_score),
             top_goal_id=best_goal.goal_id,
             matched_count=len(matches),
             score_multiplier=float(mult),
+            matches=entries,
         )
+
+    def compute_activity_entries(
+        self,
+        *,
+        description: str = "",
+        target_files: Sequence[str] = (),
+    ) -> List[GoalAlignmentEntry]:
+        """Return the full activity-ledger entry set for an op.
+
+        Composition:
+          * **Direct matches** — one entry per goal that scored above
+            ``_SCORE_MIN_RELEVANCE`` via keyword/path/tag matching. Each
+            carries its scoring ``reasons`` tuple.
+          * **Ancestor credits** — for every direct match, each node up
+            its parent chain receives ``score * decay**depth`` credit,
+            where ``depth=1`` is the immediate parent. ``decay`` defaults
+            to ``0.5`` (env: ``JARVIS_GOAL_DESCENDANT_DECAY``). A single
+            ancestor credited by multiple children accumulates credit
+            additively and stores every ``descendant:<child_id>`` reason.
+            Ancestor credit is ledger-only — it does **not** feed the
+            intake router's boost math, per Manifesto §5 (deterministic
+            priority code).
+          * **Sibling bumps** — deferred behind
+            ``JARVIS_GOAL_SIBLING_BUMP_ENABLED`` (default ``false``).
+            When enabled, same-``parent_id`` siblings of any direct
+            match get a flat ``_sibling_bump_amount()`` credit once per
+            op, tagged ``sibling:<source_id>``.
+
+        Collision policy (same ``goal_id`` across roles):
+          * ``direct`` always wins — ancestor / sibling credit is
+            skipped for a goal that is already a direct match.
+          * ``ancestor`` wins over ``sibling`` — a goal credited as an
+            ancestor of any direct match is skipped for sibling bump
+            even if it is also a sibling of another direct match.
+
+        Returns an empty list when no direct match clears the relevance
+        threshold. Callers (orchestrator CLASSIFY hook, ledger append)
+        should still record a zero-match marker so drift math sees the
+        op as "reached CLASSIFY".
+        """
+        directs = self.find_relevant_with_reasons(
+            description=description,
+            target_files=target_files,
+            limit=_MAX_PROMPT_GOALS,
+        )
+        if not directs:
+            return []
+
+        entries: List[GoalAlignmentEntry] = []
+        direct_ids: set = set()
+        for goal, score, reasons in directs:
+            direct_ids.add(goal.goal_id)
+            entries.append(
+                GoalAlignmentEntry(
+                    goal_id=goal.goal_id,
+                    score=round(float(score), 4),
+                    reasons=reasons,
+                    kind="direct",
+                    source_goal_id="",
+                )
+            )
+
+        # Descendant propagation: accumulate ancestor credits additively.
+        decay = _descendant_decay()
+        ancestor_score: Dict[str, float] = {}
+        ancestor_reasons: Dict[str, List[str]] = {}
+        ancestor_source: Dict[str, str] = {}  # first-seen direct match
+
+        if decay > 0:
+            for goal, score, _reasons in directs:
+                for depth, anc in enumerate(self.ancestors_of(goal.goal_id), start=1):
+                    if anc.goal_id in direct_ids:
+                        continue  # direct match takes precedence
+                    credit = float(score) * (decay ** depth)
+                    if credit <= 0:
+                        continue
+                    ancestor_score[anc.goal_id] = (
+                        ancestor_score.get(anc.goal_id, 0.0) + credit
+                    )
+                    reason_str = f"descendant:{goal.goal_id}"
+                    reasons_list = ancestor_reasons.setdefault(anc.goal_id, [])
+                    if reason_str not in reasons_list:
+                        reasons_list.append(reason_str)
+                    ancestor_source.setdefault(anc.goal_id, goal.goal_id)
+
+        for anc_id, total in ancestor_score.items():
+            entries.append(
+                GoalAlignmentEntry(
+                    goal_id=anc_id,
+                    score=round(float(total), 4),
+                    reasons=tuple(ancestor_reasons[anc_id]),
+                    kind="ancestor",
+                    source_goal_id=ancestor_source[anc_id],
+                )
+            )
+
+        # Sibling bump — env-gated, deferred default.
+        if _sibling_bump_enabled():
+            bump = _sibling_bump_amount()
+            if bump > 0:
+                ancestor_ids = set(ancestor_score.keys())
+                sibling_source: Dict[str, str] = {}
+                for goal, _score, _reasons in directs:
+                    if goal.parent_id is None:
+                        continue
+                    for sib in self.children_of(goal.parent_id):
+                        if sib.goal_id == goal.goal_id:
+                            continue
+                        if sib.goal_id in direct_ids or sib.goal_id in ancestor_ids:
+                            continue
+                        sibling_source.setdefault(sib.goal_id, goal.goal_id)
+                for sib_id, source in sibling_source.items():
+                    entries.append(
+                        GoalAlignmentEntry(
+                            goal_id=sib_id,
+                            score=round(float(bump), 4),
+                            reasons=(f"sibling:{source}",),
+                            kind="sibling",
+                            source_goal_id=source,
+                        )
+                    )
+
+        return entries
 
     def alignment_boost(
         self,
