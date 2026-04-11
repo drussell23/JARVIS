@@ -686,3 +686,66 @@ class TestDefaultTracker:
         assert get_default_tracker() is tracker
         reset_default_tracker()
         assert get_default_tracker() is None
+
+
+# ---------------------------------------------------------------------------
+# SerpentFlow renderer smoke test
+# ---------------------------------------------------------------------------
+
+
+class TestSerpentFlowRenderer:
+    def test_render_execution_graph_smoke(self) -> None:
+        """Renderer must not crash on a realistic GraphProgress with
+        mixed-state units and a merge decision. We don't assert on
+        console output (that's Rich's job) — just that the code path
+        exits cleanly."""
+        from backend.core.ouroboros.battle_test.serpent_flow import SerpentFlow
+
+        flow = SerpentFlow()
+        graph = _make_graph(
+            (
+                _make_unit("u1"),
+                _make_unit("u2", deps=("u1",)),
+                _make_unit("u3", deps=("u2",)),
+            )
+        )
+        progress = GraphProgress.from_graph(graph)
+        progress.phase = GraphExecutionPhase.RUNNING
+        progress.started_at_ns = 0
+        progress.units["u1"].state = WorkUnitState.COMPLETED
+        progress.units["u1"].runtime_ms = 120.0
+        progress.units["u2"].state = WorkUnitState.RUNNING
+        progress.units["u2"].started_at_ns = 1_000
+        progress.merge_decisions.append(
+            {
+                "barrier_id": "b1",
+                "repo": "jarvis",
+                "merged_unit_ids": ["u1"],
+                "skipped_unit_ids": [],
+                "conflict_units": [],
+                "decision_hash": "abc",
+                "ts_ns": 100,
+            }
+        )
+        flow.render_execution_graph(progress)
+
+    def test_render_graph_event_smoke(self) -> None:
+        from backend.core.ouroboros.battle_test.serpent_flow import SerpentFlow
+
+        flow = SerpentFlow()
+        for kind in (
+            GraphEventKind.GRAPH_STARTED,
+            GraphEventKind.UNIT_STARTED,
+            GraphEventKind.UNIT_COMPLETED,
+            GraphEventKind.MERGE_DECIDED,
+            GraphEventKind.GRAPH_COMPLETED,
+        ):
+            event = GraphEvent(
+                kind=kind,
+                graph_id="g1",
+                op_id="op1",
+                ts_ns=1,
+                unit_id="u1" if "unit" in kind.value else None,
+                payload={"runtime_ms": 250.0},
+            )
+            flow.render_graph_event(event)
