@@ -1629,3 +1629,735 @@ class TestFirstBootSeeding:
         t = GoalTracker(tmp_root)
         assert [g.goal_id for g in t.all_goals] == ["bare"]
         assert t.last_migration_report.seeded is True
+
+
+# ---------------------------------------------------------------------------
+# Increment 3: Scoring provenance, propagation, ledger, drift
+# ---------------------------------------------------------------------------
+
+
+from backend.core.ouroboros.governance.strategic_direction import (  # noqa: E402
+    GoalActivityLedger,
+    GoalAlignment,
+    GoalAlignmentEntry,
+    SessionDriftSummary,
+    get_active_session_id,
+    set_active_session_id,
+)
+
+
+class TestGoalAlignmentEntry:
+    def test_to_dict_round_trip(self):
+        entry = GoalAlignmentEntry(
+            goal_id="g1",
+            score=1.23456,
+            reasons=("kw:test", "path:backend/"),
+            kind="direct",
+            source_goal_id="",
+        )
+        d = entry.to_dict()
+        assert d["goal_id"] == "g1"
+        assert d["score"] == 1.2346  # rounded to 4 decimals
+        assert d["reasons"] == ["kw:test", "path:backend/"]
+        assert d["kind"] == "direct"
+        assert d["source_goal_id"] == ""
+
+    def test_defaults(self):
+        e = GoalAlignmentEntry(goal_id="x", score=0.5)
+        assert e.kind == "direct"
+        assert e.reasons == ()
+        assert e.source_goal_id == ""
+
+
+class TestScoringProvenance:
+    def test_keyword_reason_emitted(self, tracker: GoalTracker):
+        goal = _mk_goal(
+            gid="kw-goal",
+            keywords=("alpha", "beta"),
+            path_patterns=(),
+            tags=(),
+        )
+        tracker.add_goal(goal)
+        matches = tracker.find_relevant_with_reasons(
+            description="We need to improve alpha handling",
+        )
+        assert len(matches) == 1
+        g, score, reasons = matches[0]
+        assert g.goal_id == "kw-goal"
+        assert score > 0
+        assert "kw:alpha" in reasons
+        assert "kw:beta" not in reasons  # only alpha in desc
+
+    def test_path_reason_deduped(self, tracker: GoalTracker):
+        # Two target files hitting the same pattern produce one reason
+        # but still score twice (per-file path semantics preserved).
+        goal = _mk_goal(
+            gid="path-goal",
+            keywords=(),
+            path_patterns=("backend/core/ouroboros/",),
+            tags=(),
+        )
+        tracker.add_goal(goal)
+        matches = tracker.find_relevant_with_reasons(
+            description="unrelated",
+            target_files=(
+                "backend/core/ouroboros/governance/orchestrator.py",
+                "backend/core/ouroboros/governance/providers.py",
+            ),
+        )
+        assert len(matches) == 1
+        _g, _s, reasons = matches[0]
+        path_reasons = [r for r in reasons if r.startswith("path:")]
+        assert path_reasons == ["path:backend/core/ouroboros/"]
+
+    def test_tag_reasons_sorted_deterministic(self, tracker: GoalTracker):
+        # Tag ordering must be deterministic (sorted) so ledger rows
+        # do not drift between runs for the same input.
+        goal = _mk_goal(
+            gid="tag-goal",
+            keywords=(),
+            path_patterns=(),
+            tags=("zebra", "alpha", "mango"),
+        )
+        tracker.add_goal(goal)
+        matches = tracker.find_relevant_with_reasons(
+            description="zebra alpha mango",
+        )
+        assert len(matches) == 1
+        _g, _s, reasons = matches[0]
+        tag_reasons = [r for r in reasons if r.startswith("tag:")]
+        assert tag_reasons == ["tag:alpha", "tag:mango", "tag:zebra"]
+
+    def test_mixed_prefixes(self, tracker: GoalTracker):
+        # Note: _tokenize drops <4-char words, so the tag needs ≥4 chars
+        # AND must appear as a standalone token in the description.
+        goal = _mk_goal(
+            gid="mixed",
+            keywords=("foo",),
+            path_patterns=("backend/",),
+            tags=("reliability",),
+        )
+        tracker.add_goal(goal)
+        matches = tracker.find_relevant_with_reasons(
+            description="foo involves reliability work",
+            target_files=("backend/x.py",),
+        )
+        assert len(matches) == 1
+        _g, _s, reasons = matches[0]
+        prefixes = {r.split(":", 1)[0] for r in reasons}
+        assert prefixes == {"kw", "path", "tag"}
+
+    def test_inactive_goal_returns_no_reasons(self, tracker: GoalTracker):
+        goal = _mk_goal(
+            gid="paused-g",
+            keywords=("alpha",),
+            status=GoalStatus.PAUSED,
+        )
+        tracker.add_goal(goal)
+        matches = tracker.find_relevant_with_reasons(description="alpha path")
+        assert matches == []
+
+    def test_below_threshold_drops_reasons(self, tracker: GoalTracker):
+        # If nothing matches, caller sees (0.0, ()) — no reason residue.
+        goal = _mk_goal(
+            gid="sad",
+            keywords=("zzz",),
+            path_patterns=(),
+            tags=(),
+        )
+        tracker.add_goal(goal)
+        matches = tracker.find_relevant_with_reasons(description="unrelated text")
+        assert matches == []
+
+
+class TestGoalAlignmentMatches:
+    def test_alignment_context_populates_matches(self, tracker: GoalTracker):
+        tracker.add_goal(
+            _mk_goal(gid="g1", keywords=("alpha",), path_patterns=(), tags=())
+        )
+        tracker.add_goal(
+            _mk_goal(gid="g2", keywords=("alpha",), path_patterns=(), tags=())
+        )
+        align = tracker.alignment_context("alpha process")
+        assert isinstance(align, GoalAlignment)
+        assert align.matched_count == 2
+        assert len(align.matches) == 2
+        for entry in align.matches:
+            assert entry.kind == "direct"
+            assert entry.score > 0
+            assert any(r.startswith("kw:") for r in entry.reasons)
+
+    def test_as_evidence_exposes_goal_matches(self, tracker: GoalTracker):
+        tracker.add_goal(
+            _mk_goal(gid="g1", keywords=("alpha",), path_patterns=(), tags=())
+        )
+        evidence = tracker.alignment_context("alpha").as_evidence()
+        assert "goal_matches" in evidence
+        matches = evidence["goal_matches"]
+        assert isinstance(matches, list)
+        assert len(matches) == 1
+        assert matches[0]["goal_id"] == "g1"
+        assert matches[0]["kind"] == "direct"
+        # Legacy numeric fields preserved for backward compat.
+        assert "goal_alignment_boost" in evidence
+        assert "goal_relevance_score" in evidence
+        assert "goal_top_goal_id" in evidence
+
+    def test_no_match_evidence_has_empty_list(self, tracker: GoalTracker):
+        tracker.add_goal(
+            _mk_goal(gid="g1", keywords=("alpha",), path_patterns=(), tags=())
+        )
+        evidence = tracker.alignment_context("nothing here").as_evidence()
+        assert evidence["goal_matches"] == []
+        assert evidence["goal_top_goal_id"] == ""
+
+
+class TestDescendantPropagation:
+    def test_depth_1_credit_is_half(self, tracker: GoalTracker):
+        # Parent + child; child matches directly → parent gets score * 0.5.
+        tracker.add_goal(
+            _mk_goal(gid="parent", keywords=("parent-only-kw",))
+        )
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="child",
+                description="child",
+                keywords=("uniquekw",),
+                parent_id="parent",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="uniquekw here")
+        directs = [e for e in entries if e.kind == "direct"]
+        ancestors = [e for e in entries if e.kind == "ancestor"]
+        assert len(directs) == 1
+        assert directs[0].goal_id == "child"
+        assert len(ancestors) == 1
+        assert ancestors[0].goal_id == "parent"
+        # 0.5**1 = 0.5 exactly.
+        assert abs(ancestors[0].score - directs[0].score * 0.5) < 1e-3
+        assert ancestors[0].source_goal_id == "child"
+        assert "descendant:child" in ancestors[0].reasons
+
+    def test_depth_2_credit_is_quarter(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal(gid="grand", keywords=("gonly",)))
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="mid",
+                description="m",
+                keywords=(),
+                parent_id="grand",
+            )
+        )
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="leaf",
+                description="l",
+                keywords=("uniqleaf",),
+                parent_id="mid",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="uniqleaf")
+        by_id = {e.goal_id: e for e in entries}
+        assert "leaf" in by_id and by_id["leaf"].kind == "direct"
+        assert "mid" in by_id and by_id["mid"].kind == "ancestor"
+        assert "grand" in by_id and by_id["grand"].kind == "ancestor"
+        direct_score = by_id["leaf"].score
+        # mid = direct * 0.5, grand = direct * 0.25
+        assert abs(by_id["mid"].score - direct_score * 0.5) < 1e-3
+        assert abs(by_id["grand"].score - direct_score * 0.25) < 1e-3
+
+    def test_additive_accumulation_from_two_children(self, tracker: GoalTracker):
+        # Two sibling children both match directly; their shared parent
+        # accumulates both credits additively.
+        tracker.add_goal(_mk_goal(gid="parent", keywords=("pnope",)))
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="child1",
+                description="c1",
+                keywords=("alpha",),
+                parent_id="parent",
+            )
+        )
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="child2",
+                description="c2",
+                keywords=("beta",),
+                parent_id="parent",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="alpha beta")
+        by_id = {e.goal_id: e for e in entries}
+        assert by_id["child1"].kind == "direct"
+        assert by_id["child2"].kind == "direct"
+        expected_parent = (by_id["child1"].score + by_id["child2"].score) * 0.5
+        assert abs(by_id["parent"].score - expected_parent) < 1e-3
+        # Both descendant reasons recorded.
+        parent_reasons = set(by_id["parent"].reasons)
+        assert "descendant:child1" in parent_reasons
+        assert "descendant:child2" in parent_reasons
+
+    def test_direct_match_beats_ancestor_credit(self, tracker: GoalTracker):
+        # A goal that is ALSO an ancestor of a direct match should still
+        # appear as direct (direct wins the collision).
+        tracker.add_goal(
+            _mk_goal(gid="parent", keywords=("bothkw",))
+        )
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="child",
+                description="c",
+                keywords=("bothkw",),
+                parent_id="parent",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="bothkw")
+        kinds = {e.goal_id: e.kind for e in entries}
+        assert kinds.get("parent") == "direct"
+        assert kinds.get("child") == "direct"
+        # No ancestor credit row for "parent".
+        ancestor_rows = [e for e in entries if e.kind == "ancestor"]
+        assert all(e.goal_id != "parent" for e in ancestor_rows)
+
+    def test_decay_zero_disables_propagation(
+        self, tracker: GoalTracker, monkeypatch
+    ):
+        monkeypatch.setenv("JARVIS_GOAL_DESCENDANT_DECAY", "0")
+        tracker.add_goal(_mk_goal(gid="parent", keywords=("pnope",)))
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="child",
+                description="c",
+                keywords=("uniqkw",),
+                parent_id="parent",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="uniqkw")
+        assert all(e.kind == "direct" for e in entries)
+
+    def test_no_match_returns_empty(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal(gid="g1", keywords=("xyz",)))
+        entries = tracker.compute_activity_entries(description="completely unrelated")
+        assert entries == []
+
+
+class TestSiblingBump:
+    def test_disabled_by_default(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal(gid="parent", keywords=("p",)))
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="c1",
+                description="c1",
+                keywords=("uniqkw",),
+                parent_id="parent",
+            )
+        )
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="c2",
+                description="c2",
+                keywords=("nothere",),
+                parent_id="parent",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="uniqkw")
+        assert all(e.kind != "sibling" for e in entries)
+
+    def test_enabled_emits_sibling_entry(
+        self, tracker: GoalTracker, monkeypatch
+    ):
+        monkeypatch.setenv("JARVIS_GOAL_SIBLING_BUMP_ENABLED", "true")
+        monkeypatch.setenv("JARVIS_GOAL_SIBLING_BUMP_AMOUNT", "0.25")
+        tracker.add_goal(_mk_goal(gid="parent", keywords=("pnope",)))
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="c1",
+                description="c1",
+                keywords=("uniqkw",),
+                parent_id="parent",
+            )
+        )
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="c2",
+                description="c2",
+                keywords=("nothere",),
+                parent_id="parent",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="uniqkw")
+        siblings = [e for e in entries if e.kind == "sibling"]
+        assert len(siblings) == 1
+        assert siblings[0].goal_id == "c2"
+        assert siblings[0].source_goal_id == "c1"
+        assert siblings[0].score == 0.25
+        assert siblings[0].reasons == ("sibling:c1",)
+
+    def test_direct_excluded_from_sibling(
+        self, tracker: GoalTracker, monkeypatch
+    ):
+        monkeypatch.setenv("JARVIS_GOAL_SIBLING_BUMP_ENABLED", "true")
+        tracker.add_goal(_mk_goal(gid="parent", keywords=("pnope",)))
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="c1",
+                description="c1",
+                keywords=("both",),
+                parent_id="parent",
+            )
+        )
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="c2",
+                description="c2",
+                keywords=("both",),
+                parent_id="parent",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="both")
+        # Both children match directly — neither should get a sibling row.
+        assert all(e.kind != "sibling" for e in entries)
+
+    def test_ancestor_excluded_from_sibling(
+        self, tracker: GoalTracker, monkeypatch
+    ):
+        # A goal that is ancestor-credited must NOT also be sibling-credited.
+        monkeypatch.setenv("JARVIS_GOAL_SIBLING_BUMP_ENABLED", "true")
+        tracker.add_goal(_mk_goal(gid="root", keywords=("rnope",)))
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="b1",
+                description="b1",
+                keywords=("bnope",),
+                parent_id="root",
+            )
+        )
+        # b2 is both a sibling of b1 and a potential sibling bump target
+        # when b1 matched — but b1 doesn't match here; b2 matches directly
+        # and b1 becomes ancestor via its own branch.
+        tracker.add_goal(
+            ActiveGoal(
+                goal_id="b2",
+                description="b2",
+                keywords=("uniqkw",),
+                parent_id="root",
+            )
+        )
+        entries = tracker.compute_activity_entries(description="uniqkw")
+        # b1 is sibling of b2's direct match — gets sibling row.
+        siblings = [e for e in entries if e.kind == "sibling"]
+        sibling_ids = {e.goal_id for e in siblings}
+        # root is not a sibling (it's the parent of b2), so excluded.
+        assert "root" not in sibling_ids
+
+
+class TestGoalActivityLedger:
+    def test_append_and_read_single(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        n = ledger.append(
+            session_id="s1",
+            op_id="op1",
+            entries=[
+                GoalAlignmentEntry(
+                    goal_id="g1",
+                    score=5.0,
+                    reasons=("kw:alpha",),
+                    kind="direct",
+                )
+            ],
+        )
+        assert n == 1
+        rows = ledger.read(session_id="s1")
+        assert len(rows) == 1
+        assert rows[0]["op_id"] == "op1"
+        assert rows[0]["goal_id"] == "g1"
+        assert rows[0]["kind"] == "direct"
+        assert rows[0]["reasons"] == ["kw:alpha"]
+
+    def test_empty_entries_write_zero_match_marker(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        n = ledger.append(session_id="s1", op_id="op1", entries=[])
+        assert n == 1
+        rows = ledger.read(session_id="s1")
+        assert len(rows) == 1
+        assert rows[0].get("zero_match") is True
+        assert "goal_id" not in rows[0]
+
+    def test_append_rejects_blank_ids(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        assert ledger.append(session_id="", op_id="op1", entries=[]) == 0
+        assert ledger.append(session_id="s1", op_id="", entries=[]) == 0
+        assert ledger.read() == []
+
+    def test_read_filters_by_session(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        ledger.append(
+            session_id="s1", op_id="op1",
+            entries=[GoalAlignmentEntry(goal_id="g1", score=1.0)],
+        )
+        ledger.append(
+            session_id="s2", op_id="op2",
+            entries=[GoalAlignmentEntry(goal_id="g2", score=2.0)],
+        )
+        rows_s1 = ledger.read(session_id="s1")
+        rows_s2 = ledger.read(session_id="s2")
+        assert len(rows_s1) == 1 and rows_s1[0]["op_id"] == "op1"
+        assert len(rows_s2) == 1 and rows_s2[0]["op_id"] == "op2"
+
+    def test_read_filters_by_op_and_goal(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        ledger.append(
+            session_id="s1", op_id="opA",
+            entries=[
+                GoalAlignmentEntry(goal_id="g1", score=1.0),
+                GoalAlignmentEntry(goal_id="g2", score=2.0),
+            ],
+        )
+        ledger.append(
+            session_id="s1", op_id="opB",
+            entries=[GoalAlignmentEntry(goal_id="g1", score=3.0)],
+        )
+        op_a = ledger.read(session_id="s1", op_id="opA")
+        assert len(op_a) == 2
+        g1_rows = ledger.read(session_id="s1", goal_id="g1")
+        assert len(g1_rows) == 2
+        assert all(r["goal_id"] == "g1" for r in g1_rows)
+
+    def test_read_limit_trims_end(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        for i in range(5):
+            ledger.append(
+                session_id="s1", op_id=f"op{i}",
+                entries=[GoalAlignmentEntry(goal_id=f"g{i}", score=float(i))],
+            )
+        rows = ledger.read(session_id="s1", limit=2)
+        assert len(rows) == 2
+        # limit trims from the end → the 2 newest
+        assert [r["op_id"] for r in rows] == ["op3", "op4"]
+
+    def test_missing_file_returns_empty(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        assert ledger.read() == []
+        assert ledger.read(session_id="nope") == []
+
+    def test_malformed_lines_skipped(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        # Seed a good row, then corrupt the file with bad JSON.
+        ledger.append(
+            session_id="s1", op_id="op1",
+            entries=[GoalAlignmentEntry(goal_id="g1", score=1.0)],
+        )
+        with ledger.path.open("a", encoding="utf-8") as fh:
+            fh.write("{not valid json\n")
+            fh.write("\n")  # blank line
+            fh.write('{"session_id": "s1", "op_id": "op2", "goal_id": "g2", '
+                     '"score": 2.0, "kind": "direct"}\n')
+        rows = ledger.read(session_id="s1")
+        assert len(rows) == 2
+        assert {r["op_id"] for r in rows} == {"op1", "op2"}
+
+    def test_append_only_never_rewrites(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        ledger.append(
+            session_id="s1", op_id="op1",
+            entries=[GoalAlignmentEntry(goal_id="g1", score=1.0)],
+        )
+        first_text = ledger.path.read_text()
+        ledger.append(
+            session_id="s1", op_id="op2",
+            entries=[GoalAlignmentEntry(goal_id="g2", score=2.0)],
+        )
+        second_text = ledger.path.read_text()
+        # The first text is a prefix of the second — append-only.
+        assert second_text.startswith(first_text)
+        assert len(second_text) > len(first_text)
+
+
+class TestAntiDriftDetector:
+    def _ledger_with_ops(
+        self,
+        tmp_root: Path,
+        session: str,
+        ops: list,
+    ) -> GoalActivityLedger:
+        """Append a list of (op_id, entries) tuples to a fresh ledger."""
+        ledger = GoalActivityLedger(tmp_root)
+        for op_id, entries in ops:
+            ledger.append(session_id=session, op_id=op_id, entries=entries)
+        return ledger
+
+    def test_insufficient_data_below_threshold(self, tmp_root: Path):
+        # Default threshold is 5 — give it 4.
+        ops = [
+            (f"op{i}", [GoalAlignmentEntry(goal_id="g", score=1.0)])
+            for i in range(4)
+        ]
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1")
+        assert summary.status == "insufficient_data"
+        assert summary.ratio is None
+        assert summary.total_ops == 4
+        assert summary.warning is False
+
+    def test_exactly_threshold_meets(self, tmp_root: Path):
+        ops = [
+            (f"op{i}", [GoalAlignmentEntry(goal_id="g", score=1.0)])
+            for i in range(5)
+        ]
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1")
+        assert summary.threshold_met is True
+        assert summary.status == "ok"
+        assert summary.total_ops == 5
+        assert summary.drifted_ops == 0
+        assert summary.ratio == 0.0
+
+    def test_all_drift_triggers_warning(self, tmp_root: Path):
+        # 6 zero-match marker rows → ratio 1.0 > 0.30 default.
+        ops = [(f"op{i}", []) for i in range(6)]
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1")
+        assert summary.threshold_met is True
+        assert summary.warning is True
+        assert summary.status == "drift_warning"
+        assert summary.drifted_ops == 6
+        assert summary.total_ops == 6
+        assert summary.ratio == 1.0
+
+    def test_boundary_ratio_exactly_threshold_not_warn(self, tmp_root: Path):
+        # 10 ops, 3 drifted → ratio 0.30 → NOT warn (> is strict).
+        ops = (
+            [(f"op{i}", [GoalAlignmentEntry(goal_id="g", score=1.0)]) for i in range(7)]
+            + [(f"drift{i}", []) for i in range(3)]
+        )
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1")
+        assert summary.threshold_met is True
+        assert summary.total_ops == 10
+        assert summary.drifted_ops == 3
+        assert summary.ratio is not None
+        assert abs(summary.ratio - 0.30) < 1e-9
+        assert summary.warning is False  # 0.30 is not > 0.30
+        assert summary.status == "ok"
+
+    def test_boundary_ratio_just_over_threshold_warns(self, tmp_root: Path):
+        # 10 ops, 4 drifted → ratio 0.40 → warns.
+        ops = (
+            [(f"op{i}", [GoalAlignmentEntry(goal_id="g", score=1.0)]) for i in range(6)]
+            + [(f"drift{i}", []) for i in range(4)]
+        )
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1")
+        assert summary.warning is True
+        assert summary.drifted_ops == 4
+        assert summary.total_ops == 10
+
+    def test_ancestor_only_still_counts_as_drift(self, tmp_root: Path):
+        # Important: ancestor credit does NOT save an op from drift —
+        # only direct matches count for the numerator.
+        ops = [
+            (
+                f"op{i}",
+                [
+                    GoalAlignmentEntry(
+                        goal_id="g",
+                        score=1.0,
+                        kind="ancestor",
+                        source_goal_id="child",
+                    )
+                ],
+            )
+            for i in range(6)
+        ]
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1")
+        assert summary.drifted_ops == 6
+        assert summary.warning is True
+
+    def test_mixed_direct_and_drift(self, tmp_root: Path):
+        ops = (
+            [
+                (f"hit{i}", [GoalAlignmentEntry(goal_id="g", score=1.0)])
+                for i in range(8)
+            ]
+            + [(f"miss{i}", []) for i in range(2)]
+        )
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1")
+        assert summary.total_ops == 10
+        assert summary.drifted_ops == 2
+        assert summary.ratio is not None
+        assert abs(summary.ratio - 0.20) < 1e-9
+        assert summary.warning is False
+
+    def test_zero_score_direct_still_counts_as_drift(self, tmp_root: Path):
+        # A direct row with score==0 should NOT rescue an op from drift.
+        ops = [
+            (
+                f"op{i}",
+                [GoalAlignmentEntry(goal_id="g", score=0.0, kind="direct")],
+            )
+            for i in range(6)
+        ]
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1")
+        assert summary.drifted_ops == 6
+
+    def test_session_isolation(self, tmp_root: Path):
+        ledger = GoalActivityLedger(tmp_root)
+        # 5 good ops in session s1
+        for i in range(5):
+            ledger.append(
+                session_id="s1", op_id=f"op{i}",
+                entries=[GoalAlignmentEntry(goal_id="g", score=1.0)],
+            )
+        # 5 zero-match ops in session s2
+        for i in range(5):
+            ledger.append(session_id="s2", op_id=f"op{i}", entries=[])
+        s1 = ledger.compute_drift(session_id="s1")
+        s2 = ledger.compute_drift(session_id="s2")
+        assert s1.drifted_ops == 0 and s1.total_ops == 5
+        assert s2.drifted_ops == 5 and s2.total_ops == 5
+
+    def test_custom_threshold_overrides(self, tmp_root: Path):
+        # 3 ops — below default 5, but caller overrides to min_threshold=3.
+        ops = [
+            (f"op{i}", [GoalAlignmentEntry(goal_id="g", score=1.0)])
+            for i in range(3)
+        ]
+        ledger = self._ledger_with_ops(tmp_root, "s1", ops)
+        summary = ledger.compute_drift(session_id="s1", min_threshold=3)
+        assert summary.threshold_met is True
+        assert summary.status == "ok"
+
+    def test_drift_summary_to_dict_shape(self):
+        s = SessionDriftSummary(
+            total_ops=10, drifted_ops=4, ratio=0.4,
+            threshold_met=True, warning=True,
+        )
+        d = s.to_dict()
+        assert d["status"] == "drift_warning"
+        assert d["total_ops"] == 10
+        assert d["drifted_ops"] == 4
+        assert d["ratio"] == 0.4
+        assert d["warning"] is True
+
+    def test_drift_summary_insufficient_to_dict(self):
+        s = SessionDriftSummary()
+        d = s.to_dict()
+        assert d["status"] == "insufficient_data"
+        assert d["ratio"] is None
+        assert d["threshold_met"] is False
+
+
+class TestSessionIdModuleGlobal:
+    def test_set_and_get(self):
+        set_active_session_id("s-test-1")
+        assert get_active_session_id() == "s-test-1"
+        set_active_session_id(None)
+        assert get_active_session_id() is None
+
+    def test_empty_string_clears(self):
+        set_active_session_id("s1")
+        set_active_session_id("")
+        assert get_active_session_id() is None

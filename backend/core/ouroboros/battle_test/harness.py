@@ -1174,13 +1174,204 @@ class BattleTestHarness:
             else:
                 self._repl_print("[dim]No completed goals to purge[/dim]")
 
+        elif subcmd == "activity":
+            self._repl_goal_activity(parts[2] if len(parts) > 2 else "")
+
+        elif subcmd == "drift":
+            self._repl_goal_drift()
+
+        elif subcmd == "explain" and len(parts) > 2:
+            self._repl_goal_explain(parts[2].strip())
+
+        elif subcmd == "explain":
+            self._repl_print("[red]Usage: /goal explain <op-id>[/red]")
+
         else:
             self._repl_print(
                 "[dim]Usage: /goal | /goal all | /goal tree | "
                 "/goal show <id> | /goal add [--parent <id>] <desc> | "
                 "/goal remove <id> | /goal pause|resume|complete <id> | "
-                "/goal purge[/dim]"
+                "/goal purge | /goal activity [--goal <id>] [--limit N] | "
+                "/goal drift | /goal explain <op-id>[/dim]"
             )
+
+    # -- /goal activity|drift|explain helpers (Increment 3) -------------
+
+    def _goal_activity_ledger(self):
+        """Return a GoalActivityLedger bound to this repo, or None on import err."""
+        try:
+            from backend.core.ouroboros.governance.strategic_direction import (
+                GoalActivityLedger,
+            )
+        except ImportError:
+            self._repl_print("[red]GoalActivityLedger not available[/red]")
+            return None
+        return GoalActivityLedger(self._config.repo_path)
+
+    def _repl_goal_activity(self, rest: str) -> None:
+        """Render recent ledger rows for the current session.
+
+        Supports ``--goal <id>`` and ``--limit N`` flags. Defaults to
+        the current harness session; ``--session <sid>`` overrides.
+        """
+        ledger = self._goal_activity_ledger()
+        if ledger is None:
+            return
+
+        tokens = rest.split() if rest else []
+        goal_filter: Optional[str] = None
+        session_filter: Optional[str] = self._session_id
+        limit: Optional[int] = 20
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--goal" and i + 1 < len(tokens):
+                goal_filter = tokens[i + 1]
+                i += 2
+            elif tok == "--session" and i + 1 < len(tokens):
+                session_filter = tokens[i + 1]
+                i += 2
+            elif tok == "--limit" and i + 1 < len(tokens):
+                try:
+                    limit = max(1, int(tokens[i + 1]))
+                except ValueError:
+                    self._repl_print(f"[red]Invalid --limit '{tokens[i + 1]}'[/red]")
+                    return
+                i += 2
+            else:
+                self._repl_print(f"[red]Unknown token '{tok}'[/red]")
+                return
+
+        try:
+            rows = ledger.read(
+                session_id=session_filter,
+                goal_id=goal_filter,
+                limit=limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._repl_print(f"[red]Ledger read failed: {exc}[/red]")
+            return
+
+        if not rows:
+            self._repl_print(
+                f"[dim]No activity rows for session={session_filter or '*'}"
+                f"{' goal=' + goal_filter if goal_filter else ''}[/dim]"
+            )
+            return
+
+        self._repl_print(
+            f"[bold]Goal Activity[/bold]  [dim](session={session_filter or '*'}, "
+            f"{len(rows)} row(s))[/dim]"
+        )
+        for row in rows:
+            op_id = str(row.get("op_id", "?"))[:12]
+            if row.get("zero_match"):
+                self._repl_print(
+                    f"  [dim]{op_id}  ·  (no matches)[/dim]"
+                )
+                continue
+            gid = str(row.get("goal_id", "?"))
+            kind = str(row.get("kind", "direct"))
+            score = row.get("score", 0.0)
+            try:
+                score_f = float(score) if score is not None else 0.0  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                score_f = 0.0
+            reasons = row.get("reasons") or []
+            if not isinstance(reasons, list):
+                reasons = []
+            reason_str = ", ".join(str(r) for r in reasons[:4])
+            color = {"direct": "green", "ancestor": "cyan", "sibling": "yellow"}.get(kind, "white")
+            self._repl_print(
+                f"  {op_id}  [{color}]{kind:<8}[/{color}]  "
+                f"[cyan]{gid}[/cyan]  [bold]{score_f:.2f}[/bold]  "
+                f"[dim]{reason_str}[/dim]"
+            )
+
+    def _repl_goal_drift(self) -> None:
+        """Render the live drift summary for the current session."""
+        ledger = self._goal_activity_ledger()
+        if ledger is None:
+            return
+        try:
+            summary = ledger.compute_drift(session_id=self._session_id)
+        except Exception as exc:  # noqa: BLE001
+            self._repl_print(f"[red]Drift compute failed: {exc}[/red]")
+            return
+
+        status = summary.status
+        total = summary.total_ops
+        drifted = summary.drifted_ops
+        ratio = summary.ratio
+        ratio_s = f"{ratio:.2%}" if ratio is not None else "n/a"
+        min_ops = int(os.environ.get("JARVIS_GOAL_DRIFT_MIN_OPS", "5"))
+        warn_ratio = float(os.environ.get("JARVIS_GOAL_DRIFT_WARN_RATIO", "0.30"))
+
+        if status == "drift_warning":
+            self._repl_print(
+                f"[bold red]⚠ Strategic drift: WARN[/bold red]  "
+                f"{drifted}/{total} ops missed all goals ({ratio_s})  "
+                f"[dim]threshold: {warn_ratio:.0%}[/dim]"
+            )
+        elif status == "insufficient_data":
+            self._repl_print(
+                f"[dim]Strategic drift: insufficient data "
+                f"({total}/{min_ops} ops minimum)[/dim]"
+            )
+        else:
+            self._repl_print(
+                f"[green]Strategic drift: ok[/green]  "
+                f"({drifted}/{total} missed, {ratio_s})  "
+                f"[dim]threshold: {warn_ratio:.0%}[/dim]"
+            )
+
+    def _repl_goal_explain(self, op_id: str) -> None:
+        """Dump per-goal alignment reasons for a single op."""
+        ledger = self._goal_activity_ledger()
+        if ledger is None:
+            return
+        if not op_id:
+            self._repl_print("[red]Usage: /goal explain <op-id>[/red]")
+            return
+        try:
+            rows = ledger.read(session_id=self._session_id, op_id=op_id)
+        except Exception as exc:  # noqa: BLE001
+            self._repl_print(f"[red]Ledger read failed: {exc}[/red]")
+            return
+        if not rows:
+            self._repl_print(
+                f"[dim]No ledger rows for op '{op_id}' in session "
+                f"{self._session_id}[/dim]"
+            )
+            return
+        self._repl_print(
+            f"[bold]Explain op[/bold] [cyan]{op_id}[/cyan]  "
+            f"[dim]({len(rows)} row(s))[/dim]"
+        )
+        for row in rows:
+            if row.get("zero_match"):
+                self._repl_print("  [dim](zero-match marker — no goals scored)[/dim]")
+                continue
+            gid = str(row.get("goal_id", "?"))
+            kind = str(row.get("kind", "direct"))
+            score = row.get("score", 0.0)
+            try:
+                score_f = float(score) if score is not None else 0.0  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                score_f = 0.0
+            src = str(row.get("source_goal_id") or "")
+            src_note = f"  [dim](from {src})[/dim]" if src else ""
+            reasons = row.get("reasons") or []
+            if not isinstance(reasons, list):
+                reasons = []
+            reason_str = ", ".join(str(r) for r in reasons)
+            color = {"direct": "green", "ancestor": "cyan", "sibling": "yellow"}.get(kind, "white")
+            self._repl_print(
+                f"  [cyan]{gid}[/cyan]  [{color}]{kind}[/{color}]  "
+                f"[bold]{score_f:.2f}[/bold]{src_note}"
+            )
+            if reason_str:
+                self._repl_print(f"      [dim]reasons: {reason_str}[/dim]")
 
     # -- UserPreferenceMemory sub-commands -------------------------------
 
