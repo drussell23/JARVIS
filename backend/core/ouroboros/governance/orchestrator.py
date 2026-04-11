@@ -238,6 +238,7 @@ class GovernedOrchestrator:
         self._dialogue_store: Optional[Any] = None  # set via set_dialogue_store()
         self._pre_action_narrator: Optional[Any] = None  # set via set_pre_action_narrator()
         self._exploration_fleet: Optional[Any] = None  # set via set_exploration_fleet()
+        self._critique_engine: Optional[Any] = None  # set via set_critique_engine()
 
         # ── Session Intelligence: ephemeral lessons buffer ──
         # Accumulates compact lessons from completed/failed ops within this
@@ -313,6 +314,15 @@ class GovernedOrchestrator:
     def set_exploration_fleet(self, fleet: Any) -> None:
         """Attach an ExplorationFleet for parallel codebase exploration."""
         self._exploration_fleet = fleet
+
+    def set_critique_engine(self, engine: Any) -> None:
+        """Attach a self-critique engine (Phase 3a).
+
+        The engine runs after successful VERIFY + auto-commit and before
+        the COMPLETE transition. Passing ``None`` detaches it. See
+        ``self_critique.CritiqueEngine`` for the expected shape.
+        """
+        self._critique_engine = engine
 
     def _is_cancel_requested(self, op_id: str) -> bool:
         """Check if REPL /cancel was requested for this operation."""
@@ -3628,6 +3638,7 @@ class GovernedOrchestrator:
         # ---- Phase 8b: Auto-commit (Gap #6 — autonomy loop closer) ----
         # After successful APPLY+VERIFY, commit with structured O+V signature.
         # Commit failures are non-fatal — the change is already applied on disk.
+        _committed_hash: Optional[str] = None  # captured for Phase 3a critique below
         try:
             from backend.core.ouroboros.governance.auto_committer import AutoCommitter
             _committer = AutoCommitter(repo_root=self._config.project_root)
@@ -3650,6 +3661,7 @@ class GovernedOrchestrator:
                 timeout=30.0,
             )
             if _commit_result.committed:
+                _committed_hash = _commit_result.commit_hash
                 try:
                     await self._stack.comm.emit_heartbeat(
                         op_id=ctx.op_id, phase="commit",
@@ -3677,6 +3689,85 @@ class GovernedOrchestrator:
                 "change is applied but not committed",
                 ctx.op_id, exc,
             )
+
+        # ---- Phase 8c: Self-critique (Phase 3a — post-VERIFY quality signal) ----
+        # Runs cheap DW critique over the applied diff against the original
+        # goal. Poor ratings (≤2) persist as FEEDBACK memories for future
+        # ops; excellent ratings (=5) reinforce file reputation. Fully
+        # non-blocking — every failure mode is swallowed.
+        if self._critique_engine is not None:
+            try:
+                _test_summary = "(no test summary captured)"
+                _vr = ctx.validation
+                if _vr is not None:
+                    _passed = getattr(_vr, "tests_passed", 0) or 0
+                    _total = getattr(_vr, "tests_total", 0) or 0
+                    if _total:
+                        _test_summary = f"{_passed}/{_total} tests passed"
+                    elif _passed:
+                        _test_summary = f"{_passed} tests passed"
+                _critique_result = await asyncio.wait_for(
+                    self._critique_engine.critique_op(
+                        op_id=ctx.op_id,
+                        description=ctx.description,
+                        target_files=ctx.target_files,
+                        risk_tier=ctx.risk_tier,
+                        commit_hash=_committed_hash,
+                        test_summary=_test_summary,
+                    ),
+                    timeout=float(os.environ.get("JARVIS_CRITIQUE_TIMEOUT_S", "30")) + 5.0,
+                )
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id,
+                        phase="critique",
+                        progress_pct=99.0,
+                        critique_rating=int(getattr(_critique_result, "rating", 0)),
+                        critique_matches_goal=bool(
+                            getattr(_critique_result, "matches_goal", True)
+                        ),
+                        critique_rationale=str(
+                            getattr(_critique_result, "rationale", "")
+                        )[:200],
+                        critique_provider=str(
+                            getattr(_critique_result, "provider_name", "")
+                        ),
+                        critique_parse_ok=bool(
+                            getattr(_critique_result, "parse_ok", True)
+                        ),
+                    )
+                except Exception:
+                    pass
+                # Session lesson: record poor critiques intra-session so
+                # retries this session avoid repeating the pattern.
+                if (
+                    getattr(_critique_result, "parse_ok", False)
+                    and getattr(_critique_result, "is_poor", False)
+                ):
+                    _files_short = ", ".join(
+                        p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
+                    )
+                    self._session_lessons.append((
+                        "code",
+                        f"[CRITIQUE POOR {getattr(_critique_result, 'rating', '?')}/5] "
+                        f"{ctx.description[:60]} ({_files_short}): "
+                        f"{str(getattr(_critique_result, 'rationale', ''))[:120]}",
+                    ))
+                    if len(self._session_lessons) > self._session_lessons_max:
+                        self._session_lessons = (
+                            self._session_lessons[-self._session_lessons_max:]
+                        )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "[Orchestrator] Self-critique timed out for op=%s — "
+                    "non-blocking, continuing to COMPLETE",
+                    ctx.op_id,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[Orchestrator] Self-critique failed for op=%s: %s",
+                    ctx.op_id, exc,
+                )
 
         if _serpent: _serpent.update_phase("COMPLETE")
         ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")

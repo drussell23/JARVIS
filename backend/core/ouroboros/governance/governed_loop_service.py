@@ -2932,6 +2932,69 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] ExplorationFleet skipped: %s", exc)
 
+        # ---- Wire Self-Critique Engine (Phase 3a — post-VERIFY quality signal) ----
+        # Cheap DW critique over the applied diff against the original goal.
+        # Poor ratings become FEEDBACK memories; excellent ratings reinforce
+        # file reputation. Fully non-blocking — all failures are swallowed.
+        self._critique_engine = None
+        try:
+            _self_critique_enabled = (
+                os.environ.get("JARVIS_SELF_CRITIQUE_ENABLED", "true").lower() == "true"
+            )
+            if _self_critique_enabled:
+                from backend.core.ouroboros.governance.self_critique import (
+                    CritiqueEngine,
+                    DoublewordCritiqueProvider,
+                    set_default_engine,
+                )
+                from backend.core.ouroboros.governance.user_preference_memory import (
+                    get_default_store,
+                )
+                _dw_ref = getattr(self, "_doubleword_ref", None)
+                if _dw_ref is not None:
+                    _critique_provider = DoublewordCritiqueProvider(
+                        dw_provider=_dw_ref,
+                        max_tokens=int(
+                            os.environ.get("JARVIS_CRITIQUE_MAX_TOKENS", "512")
+                        ),
+                    )
+                    _user_store = None
+                    try:
+                        _user_store = get_default_store()
+                    except Exception:
+                        _user_store = None
+                    _memory_engine = None
+                    try:
+                        _consciousness = getattr(self, "_consciousness", None)
+                        if _consciousness is not None:
+                            _memory_engine = getattr(
+                                _consciousness, "memory_engine", None,
+                            )
+                    except Exception:
+                        _memory_engine = None
+                    self._critique_engine = CritiqueEngine(
+                        provider=_critique_provider,
+                        repo_root=self._config.project_root,
+                        user_preference_store=_user_store,
+                        memory_engine=_memory_engine,
+                    )
+                    self._orchestrator.set_critique_engine(self._critique_engine)
+                    set_default_engine(self._critique_engine)
+                    logger.info(
+                        "[GLS] Self-critique engine wired (provider=doubleword, "
+                        "user_prefs=%s, memory_engine=%s)",
+                        "yes" if _user_store is not None else "no",
+                        "yes" if _memory_engine is not None else "no",
+                    )
+                else:
+                    logger.info(
+                        "[GLS] Self-critique skipped: DoublewordProvider not available"
+                    )
+            else:
+                logger.info("[GLS] Self-critique disabled via JARVIS_SELF_CRITIQUE_ENABLED")
+        except Exception as exc:
+            logger.debug("[GLS] Self-critique wiring skipped: %s", exc)
+
         # ---- Wire UnlimitedFleetOrchestrator (recursive agent spawning) ----
         self._unlimited_fleet = None
         try:
