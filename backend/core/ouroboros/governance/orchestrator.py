@@ -3828,6 +3828,12 @@ class GovernedOrchestrator:
                     _verify_test_total += _ar.test_result.total
                     _verify_test_failures += _ar.test_result.failed
                     _verify_failed_names += _ar.test_result.failed_tests
+                # 0/0 → N/A, not failure. When no test adapter has any tests
+                # for the changed files (deps-only changes, docs, configs),
+                # treat verify as a no-op rather than routing to L2 repair.
+                # Manifesto §6: only real signals trigger neuroplasticity.
+                if _verify_test_total == 0 and _verify_test_failures == 0:
+                    _verify_test_passed = True
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 logger.warning("[Orchestrator] Verify scoped test timed out [%s]", ctx.op_id)
                 _verify_test_passed = False

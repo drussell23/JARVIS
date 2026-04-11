@@ -162,6 +162,43 @@ _UNICODE_REPAIR_MAP: Dict[int, str] = {
     0x00F7: "/",   # DIVISION SIGN
     0x00B7: ".",   # MIDDLE DOT
     0x2044: "/",   # FRACTION SLASH
+    # Section / paragraph marks — Claude emits these in Manifesto-style
+    # comments (§5, §6, ¶3) and they're harmless inside prose. Single-
+    # char substitutes keep file offsets stable for downstream tools.
+    0x00A7: "S",   # SECTION SIGN (§)  — main offender in §6 references
+    0x00B6: "P",   # PILCROW SIGN  (¶)
+    # Daggers / footnote markers (used in academic prose, never in code)
+    0x2020: "+",   # DAGGER
+    0x2021: "++",  # DOUBLE DAGGER
+    # Math comparison symbols Claude emits in comment-side commentary.
+    # These have unambiguous ASCII operator forms; we never expect to see
+    # them inside actual Python code (where != >= <= already exist).
+    0x2260: "!=",  # NOT EQUAL TO
+    0x2264: "<=",  # LESS-THAN OR EQUAL TO
+    0x2265: ">=",  # GREATER-THAN OR EQUAL TO
+    0x2248: "~=",  # ALMOST EQUAL TO
+    0x00B1: "+/-", # PLUS-MINUS SIGN
+    # Arrows — Claude leans on these heavily in flow diagrams in
+    # docstrings (CLASSIFY → ROUTE → GENERATE …). Map to ASCII arrow forms.
+    0x2190: "<-",  # LEFTWARDS ARROW
+    0x2192: "->",  # RIGHTWARDS ARROW
+    0x2191: "^",   # UPWARDS ARROW
+    0x2193: "v",   # DOWNWARDS ARROW
+    0x21D0: "<=",  # LEFTWARDS DOUBLE ARROW
+    0x21D2: "=>",  # RIGHTWARDS DOUBLE ARROW
+    0x2194: "<->", # LEFT RIGHT ARROW
+    # Trademark / copyright marks — common in license headers
+    0x00A9: "(c)", # COPYRIGHT SIGN
+    0x00AE: "(r)", # REGISTERED SIGN
+    0x2122: "(tm)", # TRADE MARK SIGN
+    # Check / cross marks — often slip into TUI/banner strings
+    0x2713: "v",   # CHECK MARK
+    0x2714: "v",   # HEAVY CHECK MARK
+    0x2717: "x",   # BALLOT X
+    0x2718: "x",   # HEAVY BALLOT X
+    # Degree / per mille
+    0x00B0: "deg", # DEGREE SIGN
+    0x2030: "/1000", # PER MILLE SIGN
 }
 
 
