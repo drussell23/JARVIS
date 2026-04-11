@@ -34,7 +34,7 @@ import time
 logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Set, Tuple, runtime_checkable
 
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
 
@@ -69,10 +69,16 @@ class TestRunStatus(str, enum.Enum):
 
 @dataclass(frozen=True)
 class ToolCall:
-    """A single tool invocation request from J-Prime."""
+    """A single tool invocation request from J-Prime.
+
+    The optional ``preamble`` is a one-sentence WHY spoken by Ouroboros
+    before the tool round runs. In a parallel batch it is shared across
+    every call in the round (same narration covers the whole batch).
+    """
 
     name: str
     arguments: Dict[str, Any] = field(default_factory=dict)
+    preamble: str = ""
 
 
 @dataclass(frozen=True)
@@ -2540,6 +2546,12 @@ _BUDGET_TELEMETRY_ENABLED = os.environ.get(
     "JARVIS_TOOL_LOOP_BUDGET_TELEMETRY", "true"
 ).lower() in ("1", "true", "yes", "on")
 
+# Sentinel parked on ``ToolLoopCoordinator._karen_voice`` when the lazy
+# import of KarenPreambleVoice fails — headless envs, missing audio stack,
+# import errors. Using a sentinel (not ``None``) prevents the import
+# retry loop from firing on every subsequent tool round.
+_KAREN_DISABLED: object = object()
+
 
 @dataclass(frozen=True)
 class BudgetPlan:
@@ -2764,6 +2776,24 @@ class ToolLoopCoordinator:
         )
         self._EXPLORATION_TOOLS: frozenset = frozenset({"read_file", "search_code", "get_callers"})
 
+        # Karen voice channel — the spoken half of the tool-call preamble.
+        # Constructed lazily on first preamble emission so headless runs
+        # (tests, CI, API-only deployments) never pull the audio stack.
+        # ``_KAREN_DISABLED`` sentinel means "lazy-import failed, stop
+        # retrying for the lifetime of this coordinator".
+        self._karen_voice: Any = None
+        # Dedup set of (op_id, round_index) pairs that have already had
+        # their preamble spoken. Parallel tool batches emit one "start"
+        # narration per call; without this, Karen would speak the same
+        # sentence N times for a batch of N parallel tools.
+        self._spoken_preamble_keys: Set[Tuple[str, int]] = set()
+        # Bound on _spoken_preamble_keys so a long-running op with many
+        # rounds doesn't leak entries forever. When the cap is reached,
+        # the oldest half of entries (insertion order) are evicted.
+        self._SPOKEN_KEY_CAP: int = max(
+            16, int(os.environ.get("JARVIS_TOOL_SPOKEN_KEY_CAP", "256"))
+        )
+
     # ------------------------------------------------------------------
     # Narration helpers
     # ------------------------------------------------------------------
@@ -2797,6 +2827,7 @@ class ToolLoopCoordinator:
         result_preview: str = "",
         duration_ms: float = 0.0,
         status: str = "",
+        preamble: str = "",
     ) -> None:
         """Fire the narration callback safely.
 
@@ -2804,20 +2835,42 @@ class ToolLoopCoordinator:
         Errors are logged at DEBUG (never raised) so display failures can
         never break the tool loop. An empty ``status`` means pre-execution
         (the "start" event); a non-empty status means post-execution.
+
+        ``preamble`` is the model's one-sentence WHY for the tool round,
+        extracted from the parsed ``ToolCall.preamble`` field. It is only
+        passed on pre-execution (``status=""``) so the tool-narration
+        channel doesn't re-render it after the round completes, and it is
+        spoken once by Karen per round (see ``_speak_preamble_once``).
         """
         cb = self._on_tool_call
         if cb is None:
             return
         try:
-            cb(
-                op_id=op_id,
-                tool_name=tool_name,
-                args_summary=args_summary,
-                round_index=round_index,
-                result_preview=result_preview,
-                duration_ms=duration_ms,
-                status=status,
-            )
+            # Narration callback signature is *kwarg-only* but we must
+            # stay backward-compatible with older callbacks that don't
+            # accept the new ``preamble`` kwarg. Try the modern form
+            # first, fall back on TypeError.
+            try:
+                cb(
+                    op_id=op_id,
+                    tool_name=tool_name,
+                    args_summary=args_summary,
+                    round_index=round_index,
+                    result_preview=result_preview,
+                    duration_ms=duration_ms,
+                    status=status,
+                    preamble=preamble,
+                )
+            except TypeError:
+                cb(
+                    op_id=op_id,
+                    tool_name=tool_name,
+                    args_summary=args_summary,
+                    round_index=round_index,
+                    result_preview=result_preview,
+                    duration_ms=duration_ms,
+                    status=status,
+                )
         except Exception:
             logger.debug(
                 "[ToolLoop] narration callback failed for op=%s tool=%s status=%s",
@@ -2825,6 +2878,70 @@ class ToolLoopCoordinator:
                 tool_name, status or "start",
                 exc_info=True,
             )
+
+        # Speak the preamble through Karen's voice once per round. Only
+        # fires on the "start" event (post-exec events leave preamble=""),
+        # which is enforced both here and inside KarenPreambleVoice.
+        if preamble and not status:
+            try:
+                self._speak_preamble_once(
+                    op_id=op_id,
+                    round_index=round_index,
+                    preamble=preamble,
+                )
+            except Exception:
+                logger.debug(
+                    "[ToolLoop] Karen preamble dispatch failed op=%s round=%s",
+                    op_id[:12] if op_id else "?", round_index,
+                    exc_info=True,
+                )
+
+    def _speak_preamble_once(
+        self,
+        *,
+        op_id: str,
+        round_index: int,
+        preamble: str,
+    ) -> None:
+        """Dispatch one Karen-voice preamble for this (op_id, round) pair.
+
+        Deduplication is needed because the tool-call start narration is
+        emitted once *per tool* in a parallel batch (see the per-call
+        ``_notify_tool_call(status="")`` loop above). Without the guard,
+        Karen would speak the same sentence N times for a batch of N
+        parallel tools — exactly the spam we built KarenPreambleVoice's
+        rate limiter to catch, except better to short-circuit at source.
+        """
+        key = (op_id, round_index)
+        if key in self._spoken_preamble_keys:
+            return
+        if self._karen_voice is None:
+            # Lazy-import keeps the audio stack out of headless runs and
+            # unit tests. Any failure (missing module, no event loop,
+            # audio device unavailable) degrades to "no voice" silently.
+            try:
+                from backend.core.ouroboros.governance.comms.karen_voice import (
+                    KarenPreambleVoice,
+                )
+                self._karen_voice = KarenPreambleVoice()
+            except Exception:
+                logger.debug("[ToolLoop] KarenPreambleVoice unavailable", exc_info=True)
+                # Stash a sentinel so we don't retry the import every round.
+                self._karen_voice = _KAREN_DISABLED
+                return
+        if self._karen_voice is _KAREN_DISABLED:
+            return
+        # Bounded dedup set — cap so a long-running op with many rounds
+        # doesn't leak entries forever.
+        self._spoken_preamble_keys.add(key)
+        if len(self._spoken_preamble_keys) > self._SPOKEN_KEY_CAP:
+            # Drop arbitrary entries back to half the cap. Set iteration
+            # order is insertion order in CPython 3.7+, so this evicts
+            # the oldest half.
+            _victims = list(self._spoken_preamble_keys)[: self._SPOKEN_KEY_CAP // 2]
+            for _v in _victims:
+                self._spoken_preamble_keys.discard(_v)
+        self._karen_voice.speak(preamble)
 
     def _finalize_run(self, op_id: str) -> None:
         """Release the per-op ToolExecutor and capture its edit history.

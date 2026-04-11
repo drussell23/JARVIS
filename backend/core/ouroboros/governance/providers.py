@@ -632,10 +632,22 @@ def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str
         "## Available Tools\n\n"
         "If you need more information before writing the patch, respond with ONLY a\n"
         "tool call JSON (no other text).\n\n"
+        "### Preamble (REQUIRED)\n"
+        "Every tool-call JSON MUST include a top-level `preamble` field: one short\n"
+        "sentence (<=120 chars) of WHY you are making this call, in plain English,\n"
+        "first person, narrator voice. This is spoken aloud by Ouroboros and rendered\n"
+        "above the tool spinner, so make it human and specific:\n"
+        "- GOOD: `\"Let me check how cascade telemetry is wired into the orchestrator.\"`\n"
+        "- GOOD: `\"Tracing callers of _call_with_backoff to see what passes a deadline.\"`\n"
+        "- BAD: `\"calling read_file\"` (mechanical, no semantic content)\n"
+        "- BAD: `\"I will now invoke the tool.\"` (vacuous, no WHY)\n"
+        "In a parallel `tool_calls` batch, the preamble covers the whole round, not\n"
+        "each individual call. Keep it under 120 chars — longer strings are truncated.\n\n"
         "### Single tool call\n"
         "```json\n"
         "{\n"
         f'  "schema_version": "{_TOOL_SCHEMA_VERSION}",\n'
+        '  "preamble": "<one-sentence WHY, <=120 chars>",\n'
         '  "tool_call": {\n'
         '    "name": "<tool_name>",\n'
         '    "arguments": {...}\n'
@@ -646,6 +658,7 @@ def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str
         "```json\n"
         "{\n"
         f'  "schema_version": "{_TOOL_SCHEMA_VERSION}",\n'
+        '  "preamble": "<one-sentence WHY for the whole batch>",\n'
         '  "tool_calls": [\n'
         '    {"name": "<tool_a>", "arguments": {...}},\n'
         '    {"name": "<tool_b>", "arguments": {...}}\n'
@@ -2128,12 +2141,49 @@ def _find_balanced_json(text: str, start_search: int) -> Optional[str]:
     return None
 
 
+#: Hard cap on the preamble narration string. Longer preambles are
+#: truncated at parse time so downstream consumers (SerpentFlow, Karen
+#: voice channel) can treat the value as bounded without re-checking.
+#: Configurable via ``JARVIS_TOOL_PREAMBLE_MAX_CHARS`` — default 160 leaves
+#: ~30 chars of slack above the 120-char budget we advertise to the model,
+#: so a slightly-over-budget preamble still surfaces instead of being
+#: hard-dropped.
+_TOOL_PREAMBLE_MAX_CHARS = max(
+    0, int(os.environ.get("JARVIS_TOOL_PREAMBLE_MAX_CHARS", "160"))
+)
+
+
+def _extract_preamble(data: Dict[str, Any]) -> str:
+    """Return a sanitised preamble string from parsed tool_call JSON.
+
+    The model's preamble is a one-sentence WHY spoken by Ouroboros before
+    the tool round executes. We accept only string values, strip whitespace,
+    collapse newlines to spaces (so TTS and the TUI see a single line), and
+    truncate at ``_TOOL_PREAMBLE_MAX_CHARS``. Any other type is dropped
+    silently — the tool call itself remains valid even without narration.
+    """
+    raw = data.get("preamble")
+    if not isinstance(raw, str):
+        return ""
+    # Collapse internal whitespace so a stray embedded newline doesn't
+    # split Karen's spoken output or break SerpentFlow's single-line render.
+    cleaned = " ".join(raw.split())
+    if not cleaned:
+        return ""
+    if _TOOL_PREAMBLE_MAX_CHARS and len(cleaned) > _TOOL_PREAMBLE_MAX_CHARS:
+        cleaned = cleaned[: _TOOL_PREAMBLE_MAX_CHARS].rstrip() + "…"
+    return cleaned
+
+
 def _parse_tool_call_response(raw: str) -> Optional[List["ToolCall"]]:
     """Parse a 2b.2-tool response into ToolCall(s), or return None.
 
     Supports both singular ``tool_call`` and plural ``tool_calls`` (parallel).
     Returns None for any parse/validation failure (including patch responses),
     so callers can treat None as "not a tool call".
+
+    A top-level ``preamble`` field (one-sentence WHY) is extracted and
+    attached to *every* returned ToolCall — the batch shares one narration.
     """
     try:
         data = json.loads(_extract_json_block(raw))
@@ -2146,6 +2196,8 @@ def _parse_tool_call_response(raw: str) -> Optional[List["ToolCall"]]:
 
     from backend.core.ouroboros.governance.tool_executor import ToolCall
 
+    preamble = _extract_preamble(data)
+
     def _parse_one(tc: Any) -> Optional["ToolCall"]:
         if not isinstance(tc, dict):
             return None
@@ -2155,7 +2207,7 @@ def _parse_tool_call_response(raw: str) -> Optional[List["ToolCall"]]:
         arguments = tc.get("arguments", {})
         if not isinstance(arguments, dict):
             arguments = {}
-        return ToolCall(name=name, arguments=arguments)
+        return ToolCall(name=name, arguments=arguments, preamble=preamble)
 
     # Parallel: tool_calls (plural) — list of tool call objects
     plural = data.get("tool_calls")
@@ -3157,6 +3209,50 @@ _CLAUDE_RETRY_MAX_ATTEMPTS = int(
 _CLAUDE_RETRY_BASE_DELAY_S = float(
     os.environ.get("JARVIS_CLAUDE_RETRY_BASE_DELAY_S", "2.0")
 )
+# Budget-aware backoff (Task #4 — cascade hardening):
+# A retry that cannot finish inside the remaining deadline is guaranteed to
+# fail and, worse, will starve the downstream fallback provider. We refuse
+# to start an attempt when ``budget_remaining < _CLAUDE_MIN_RETRY_CYCLE_S``
+# and we cap each sleep to ``budget * _CLAUDE_BACKOFF_BUDGET_FRACTION`` so
+# the backoff never consumes more than a quarter of what's left.
+_CLAUDE_MIN_RETRY_CYCLE_S = float(
+    os.environ.get("JARVIS_CLAUDE_MIN_RETRY_CYCLE_S", "8.0")
+)
+_CLAUDE_BACKOFF_BUDGET_FRACTION = float(
+    os.environ.get("JARVIS_CLAUDE_BACKOFF_BUDGET_FRACTION", "0.25")
+)
+# Client recycling (Task #4 — cascade hardening):
+# The shared ``anthropic.AsyncAnthropic`` client owns a lazily-created
+# ``httpx.AsyncClient`` connection pool. When a pool connection enters a
+# degraded state (half-open TCP, exhausted keep-alive, stuck thread), the
+# pool never self-heals and every subsequent call inherits the sickness.
+# We drop and recreate the client on two triggers:
+#   (a) retry-exhausted path — the next op starts clean
+#   (b) hard pool signals mid-retry — PoolTimeout etc.
+_CLAUDE_RECYCLE_ON_EXHAUST = (
+    os.environ.get("JARVIS_CLAUDE_RECYCLE_ON_EXHAUST", "true").lower()
+    not in ("false", "0", "no", "off")
+)
+_CLAUDE_RECYCLE_ON_POOL_TIMEOUT = (
+    os.environ.get("JARVIS_CLAUDE_RECYCLE_ON_POOL_TIMEOUT", "true").lower()
+    not in ("false", "0", "no", "off")
+)
+# Exception classes that are "hard signals" a pool-level recycle is needed
+# NOW rather than at the end of the retry cycle. These indicate the pool
+# itself is degraded, not the upstream API.
+_CLAUDE_HARD_POOL_EXC_NAMES = frozenset(
+    _raw.strip()
+    for _raw in os.environ.get(
+        "JARVIS_CLAUDE_HARD_POOL_EXC_NAMES",
+        "PoolTimeout,ConnectError,RemoteProtocolError,ReadError",
+    ).split(",")
+    if _raw.strip()
+)
+# Ring buffer cap for cascade telemetry — bounded so long-running sessions
+# don't accumulate unbounded memory.
+_CLAUDE_CASCADE_TELEMETRY_CAP = int(
+    os.environ.get("JARVIS_CLAUDE_CASCADE_TELEMETRY_CAP", "64")
+)
 
 # Retryable HTTP status codes (transient server conditions).
 _CLAUDE_RETRYABLE_STATUSES = frozenset({502, 503, 504, 529})
@@ -3391,6 +3487,18 @@ class ClaudeProvider:
         self._daily_spend: float = 0.0
         self._budget_reset_date = datetime.now(tz=timezone.utc).date()
         self._client: Any = None  # Lazy init
+        # Client recycling state (Task #4 — cascade hardening).
+        # ``_client_generation`` increments every time the client is
+        # recycled; included in all cascade log lines so operators can
+        # correlate "new pool started" with downstream latency shifts.
+        self._client_generation: int = 0
+        # Ring buffer of (ts_mono, reason, generation_before, generation_after)
+        # tuples; capped at _CLAUDE_CASCADE_TELEMETRY_CAP.
+        self._recycle_events: List[Dict[str, Any]] = []
+        # Ring buffer of per-attempt cascade events (label, attempt, elapsed_ms,
+        # remaining_ms, exc_class, outcome, client_generation). Surfaced via
+        # get_cascade_telemetry() for postmortem analysis.
+        self._cascade_attempts: List[Dict[str, Any]] = []
         self._repo_root = repo_root
         self._repo_roots = repo_roots
         self._tools_enabled = tools_enabled or (tool_loop is not None)
@@ -3574,14 +3682,122 @@ class ClaudeProvider:
             )
             logger.info(
                 "[ClaudeProvider] anthropic client initialized "
-                "(connect=%.0fs read=%.0fs write=%.0fs pool=%.0fs thinking=%s)",
+                "(connect=%.0fs read=%.0fs write=%.0fs pool=%.0fs thinking=%s "
+                "generation=%d)",
                 _CLAUDE_HTTP_CONNECT_TIMEOUT_S,
                 _read_timeout,
                 _CLAUDE_HTTP_WRITE_TIMEOUT_S,
                 _CLAUDE_HTTP_POOL_TIMEOUT_S,
                 "on" if self._extended_thinking else "off",
+                self._client_generation,
             )
         return self._client
+
+    # ------------------------------------------------------------------
+    # Client recycling (Task #4 — cascade hardening)
+    # ------------------------------------------------------------------
+
+    def _recycle_client(self, reason: str) -> int:
+        """Drop the current anthropic client so a fresh pool is created.
+
+        Called on two triggers:
+
+        * ``retry_exhausted`` — every downstream op would inherit the same
+          degraded pool state, so we cut it loose preemptively.
+        * ``hard_pool_signal`` — mid-retry exception class matches the
+          ``_CLAUDE_HARD_POOL_EXC_NAMES`` set (PoolTimeout, ConnectError,
+          etc.), indicating the pool itself is sick rather than the API.
+
+        Returns the new ``_client_generation``. The next call to
+        :meth:`_ensure_client` will lazily construct a fresh
+        ``AsyncAnthropic`` with a fresh ``httpx`` connection pool.
+
+        **Best-effort close**: we call ``close()`` on the dropped client
+        if the SDK exposes it, but an exception there is NOT fatal — the
+        pool will be GC'd regardless. We prioritize forward progress.
+        """
+        before = self._client_generation
+        old_client = self._client
+        self._client = None
+        self._client_generation += 1
+
+        # Best-effort async close — schedule on the running loop but don't
+        # await. The event loop will reap the old pool shortly.
+        if old_client is not None:
+            try:
+                _close = getattr(old_client, "close", None)
+                if callable(_close):
+                    _coro = _close()
+                    if asyncio.iscoroutine(_coro):
+                        try:
+                            asyncio.get_running_loop().create_task(_coro)
+                        except RuntimeError:
+                            # No running loop (sync context) — let GC handle it.
+                            _coro.close()
+            except Exception:
+                pass
+
+        # Ring-buffer the event for postmortem telemetry.
+        event = {
+            "ts_mono": time.monotonic(),
+            "reason": reason,
+            "generation_before": before,
+            "generation_after": self._client_generation,
+        }
+        self._recycle_events.append(event)
+        if len(self._recycle_events) > _CLAUDE_CASCADE_TELEMETRY_CAP:
+            self._recycle_events = self._recycle_events[-_CLAUDE_CASCADE_TELEMETRY_CAP:]
+
+        logger.warning(
+            "[ClaudeProvider] client pool recycled (reason=%s gen %d -> %d)",
+            reason, before, self._client_generation,
+        )
+        return self._client_generation
+
+    def _record_cascade_attempt(
+        self,
+        *,
+        label: str,
+        attempt: int,
+        max_attempts: int,
+        elapsed_ms: int,
+        remaining_ms: Optional[int],
+        exc_class: Optional[str],
+        outcome: str,
+    ) -> None:
+        """Append a structured cascade attempt record to the ring buffer."""
+        record = {
+            "ts_mono": time.monotonic(),
+            "label": label,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "elapsed_ms": elapsed_ms,
+            "remaining_ms": remaining_ms,
+            "exc_class": exc_class,
+            "outcome": outcome,
+            "client_generation": self._client_generation,
+        }
+        self._cascade_attempts.append(record)
+        if len(self._cascade_attempts) > _CLAUDE_CASCADE_TELEMETRY_CAP:
+            self._cascade_attempts = self._cascade_attempts[-_CLAUDE_CASCADE_TELEMETRY_CAP:]
+
+    def get_cascade_telemetry(self) -> Dict[str, Any]:
+        """Return recent cascade attempts and recycle events for postmortem.
+
+        Returns a shallow snapshot so callers can't mutate live state.
+        """
+        return {
+            "client_generation": self._client_generation,
+            "cascade_attempts": list(self._cascade_attempts),
+            "recycle_events": list(self._recycle_events),
+            "config": {
+                "min_retry_cycle_s": _CLAUDE_MIN_RETRY_CYCLE_S,
+                "backoff_budget_fraction": _CLAUDE_BACKOFF_BUDGET_FRACTION,
+                "recycle_on_exhaust": _CLAUDE_RECYCLE_ON_EXHAUST,
+                "recycle_on_pool_timeout": _CLAUDE_RECYCLE_ON_POOL_TIMEOUT,
+                "hard_pool_exc_names": sorted(_CLAUDE_HARD_POOL_EXC_NAMES),
+            },
+        }
 
     async def _call_with_backoff(
         self,
@@ -3591,12 +3807,35 @@ class ClaudeProvider:
         max_attempts: int = _CLAUDE_RETRY_MAX_ATTEMPTS,
         base_delay: float = _CLAUDE_RETRY_BASE_DELAY_S,
         progress_probe: Any = None,  # Optional[Callable[[], bool]]
+        deadline: Optional[datetime] = None,
     ) -> Any:
-        """Execute ``fn`` with exponential-backoff retry on transient failures.
+        """Execute ``fn`` with budget-aware backoff retry on transient failures.
 
         Retries only on genuine network/server transients (see
         :func:`_is_retryable_transient_error`). Non-retryable exceptions
         propagate on the first occurrence.
+
+        Task #4 hardening (2026-04-10):
+
+        * **Deadline-aware.** ``deadline`` propagates from the caller's
+          generation budget. Each iteration verifies that at least
+          ``_CLAUDE_MIN_RETRY_CYCLE_S`` remains before starting a new
+          attempt — if not, we abort early rather than launching a call
+          that's guaranteed to timeout and starve the downstream fallback
+          provider.
+        * **Budget-capped backoff.** Sleep duration is capped at
+          ``budget_remaining * _CLAUDE_BACKOFF_BUDGET_FRACTION`` (default
+          25%) so exponential growth never devours the deadline.
+        * **Client recycling.** On retry exhaustion (or on a "hard pool"
+          exception class — ``PoolTimeout``, ``ConnectError``, etc.)
+          the anthropic client is dropped so the next op starts with a
+          fresh ``httpx`` connection pool. Fixes the "once a pool goes
+          degraded, every subsequent op inherits the sickness" failure
+          mode observed during battle tests.
+        * **Structured telemetry.** Every attempt records
+          ``(label, attempt, elapsed_ms, remaining_ms, exc_class, outcome,
+          client_generation)`` into a bounded ring buffer surfaced via
+          :meth:`get_cascade_telemetry` for postmortem analysis.
 
         Parameters
         ----------
@@ -3607,13 +3846,18 @@ class ClaudeProvider:
         max_attempts:
             Total attempts (default 3 → 2s/4s backoff between).
         base_delay:
-            Starting delay in seconds. Doubles per attempt.
+            Starting delay in seconds. Doubles per attempt, capped to
+            ``budget_remaining * _CLAUDE_BACKOFF_BUDGET_FRACTION``.
         progress_probe:
             Optional zero-arg callable returning True if ``fn`` made
             partial progress (e.g. streamed tokens already visible to
             the caller). When it returns True, retry is aborted to
             avoid duplicating emitted output. Only matters for the
             streaming path.
+        deadline:
+            Optional absolute UTC deadline for the overall operation.
+            When given, backoff is budget-aware and attempts that would
+            exceed it are refused.
 
         Notes
         -----
@@ -3621,47 +3865,181 @@ class ClaudeProvider:
         the event loop so SerpentFlow, telemetry, and REPL remain
         responsive during the cognitive wait.
         """
+        start_mono = time.monotonic()
         last_exc: Optional[BaseException] = None
+
+        def _remaining_s() -> Optional[float]:
+            """Seconds until ``deadline`` (None if no deadline supplied)."""
+            if deadline is None:
+                return None
+            return (deadline - datetime.now(tz=timezone.utc)).total_seconds()
+
+        def _remaining_ms_now() -> Optional[int]:
+            """Milliseconds until deadline, or None (single-call helper)."""
+            rem = _remaining_s()
+            return int(rem * 1000) if rem is not None else None
+
         for attempt in range(max_attempts):
+            # ── Pre-attempt deadline check ──
+            # Refuse to start an attempt that cannot plausibly finish
+            # inside the remaining budget. The floor protects the
+            # downstream fallback provider from deadline starvation.
+            rem_pre = _remaining_s()
+            if rem_pre is not None and rem_pre < _CLAUDE_MIN_RETRY_CYCLE_S:
+                self._record_cascade_attempt(
+                    label=label, attempt=attempt + 1, max_attempts=max_attempts,
+                    elapsed_ms=int((time.monotonic() - start_mono) * 1000),
+                    remaining_ms=int(rem_pre * 1000),
+                    exc_class=None, outcome="budget_starved_skip",
+                )
+                logger.warning(
+                    "[ClaudeProvider] %s skipping attempt %d/%d — "
+                    "only %.1fs remaining (floor %.1fs)",
+                    label, attempt + 1, max_attempts,
+                    rem_pre, _CLAUDE_MIN_RETRY_CYCLE_S,
+                )
+                if last_exc is not None:
+                    raise last_exc
+                raise asyncio.TimeoutError(
+                    f"{label}_budget_starved:{rem_pre:.1f}s_remaining"
+                )
+
+            attempt_start_mono = time.monotonic()
             try:
-                return await fn()
+                result = await fn()
+                # Success — record the win and return.
+                self._record_cascade_attempt(
+                    label=label, attempt=attempt + 1, max_attempts=max_attempts,
+                    elapsed_ms=int((time.monotonic() - attempt_start_mono) * 1000),
+                    remaining_ms=_remaining_ms_now(),
+                    exc_class=None, outcome="success",
+                )
+                return result
             except BaseException as exc:  # noqa: BLE001 — we rethrow below
+                exc_class = type(exc).__name__
+                attempt_elapsed_ms = int((time.monotonic() - attempt_start_mono) * 1000)
+
                 if not _is_retryable_transient_error(exc):
+                    self._record_cascade_attempt(
+                        label=label, attempt=attempt + 1, max_attempts=max_attempts,
+                        elapsed_ms=attempt_elapsed_ms,
+                        remaining_ms=_remaining_ms_now(),
+                        exc_class=exc_class, outcome="non_retryable",
+                    )
                     raise
+
+                # Hard-pool signal → recycle the client NOW, not at end-of-cycle.
+                # The current pool is degraded; continuing to use it wastes
+                # retries. The next attempt builds a fresh connection pool.
+                if (
+                    _CLAUDE_RECYCLE_ON_POOL_TIMEOUT
+                    and exc_class in _CLAUDE_HARD_POOL_EXC_NAMES
+                ):
+                    self._recycle_client(
+                        reason=f"hard_pool_signal:{label}:{exc_class}"
+                    )
+
+                # Streaming progress check — can't retry once bytes are out.
                 if progress_probe is not None:
                     _has_progress = False
                     try:
                         _has_progress = bool(progress_probe())
                     except BaseException:
-                        # If the probe itself explodes, treat as "no
-                        # progress" and fall through to retry — the
-                        # original error is still the reason we're here.
                         _has_progress = False
                     if _has_progress:
+                        self._record_cascade_attempt(
+                            label=label, attempt=attempt + 1, max_attempts=max_attempts,
+                            elapsed_ms=attempt_elapsed_ms,
+                            remaining_ms=_remaining_ms_now(),
+                            exc_class=exc_class, outcome="progress_no_retry",
+                        )
                         logger.warning(
                             "[ClaudeProvider] %s transient failure after "
                             "partial progress (%s) — aborting retry to "
-                            "avoid duplicated output",
-                            label, type(exc).__name__,
+                            "avoid duplicated output [gen=%d elapsed=%dms]",
+                            label, exc_class, self._client_generation,
+                            attempt_elapsed_ms,
                         )
                         raise
+
+                # Exhausted — recycle on exhaust (next op gets a clean pool),
+                # then re-raise.
                 if attempt == max_attempts - 1:
+                    self._record_cascade_attempt(
+                        label=label, attempt=attempt + 1, max_attempts=max_attempts,
+                        elapsed_ms=attempt_elapsed_ms,
+                        remaining_ms=_remaining_ms_now(),
+                        exc_class=exc_class, outcome="exhausted",
+                    )
                     logger.warning(
                         "[ClaudeProvider] %s transient failure exhausted "
-                        "retries (%d/%d): %s",
-                        label, attempt + 1, max_attempts, type(exc).__name__,
+                        "retries (%d/%d): %s [gen=%d total_elapsed=%dms "
+                        "remaining=%s]",
+                        label, attempt + 1, max_attempts, exc_class,
+                        self._client_generation,
+                        int((time.monotonic() - start_mono) * 1000),
+                        (
+                            f"{_remaining_s():.1f}s"
+                            if _remaining_s() is not None else "∞"
+                        ),
                     )
+                    if _CLAUDE_RECYCLE_ON_EXHAUST:
+                        self._recycle_client(
+                            reason=f"retry_exhausted:{label}:{exc_class}"
+                        )
                     raise
+
                 last_exc = exc
+
+                # ── Budget-aware backoff computation ──
+                # Classic exponential delay, then capped to a fraction of
+                # whatever budget remains. Never backoff past the grave.
                 delay = base_delay * (2 ** attempt)
+                rem_post = _remaining_s()
+                capped = delay
+                if rem_post is not None:
+                    max_allowed = max(0.0, rem_post * _CLAUDE_BACKOFF_BUDGET_FRACTION)
+                    capped = min(delay, max_allowed)
+                    # If even the capped delay plus a minimal retry cycle
+                    # won't fit, refuse to retry — raise now and let the
+                    # cascade try the fallback with the surviving budget.
+                    if rem_post - capped < _CLAUDE_MIN_RETRY_CYCLE_S:
+                        self._record_cascade_attempt(
+                            label=label, attempt=attempt + 1, max_attempts=max_attempts,
+                            elapsed_ms=attempt_elapsed_ms,
+                            remaining_ms=int(rem_post * 1000),
+                            exc_class=exc_class, outcome="budget_starved_no_retry",
+                        )
+                        logger.warning(
+                            "[ClaudeProvider] %s transient failure (%s) but "
+                            "only %.1fs remains — refusing retry to preserve "
+                            "fallback budget [gen=%d]",
+                            label, exc_class, rem_post, self._client_generation,
+                        )
+                        if _CLAUDE_RECYCLE_ON_EXHAUST:
+                            self._recycle_client(
+                                reason=f"budget_starved:{label}:{exc_class}"
+                            )
+                        raise
+
+                self._record_cascade_attempt(
+                    label=label, attempt=attempt + 1, max_attempts=max_attempts,
+                    elapsed_ms=attempt_elapsed_ms,
+                    remaining_ms=(int(rem_post * 1000) if rem_post is not None else None),
+                    exc_class=exc_class, outcome=f"retry_backoff_{capped:.1f}s",
+                )
                 logger.warning(
                     "[ClaudeProvider] %s transient failure (%s), "
-                    "backing off %.1fs (attempt %d/%d)",
-                    label, type(exc).__name__, delay, attempt + 1, max_attempts,
+                    "backing off %.1fs (attempt %d/%d gen=%d elapsed=%dms "
+                    "remaining=%s raw_delay=%.1fs)",
+                    label, exc_class, capped, attempt + 1, max_attempts,
+                    self._client_generation, attempt_elapsed_ms,
+                    (f"{rem_post:.1f}s" if rem_post is not None else "∞"),
+                    delay,
                 )
                 # asyncio.sleep — NOT time.sleep — yields to the event loop
                 # so telemetry/REPL/SerpentFlow stay live during backoff.
-                await asyncio.sleep(delay)
+                await asyncio.sleep(capped)
         # Unreachable under normal flow (last attempt re-raises above),
         # but defensive just in case.
         if last_exc is not None:
@@ -4091,11 +4469,14 @@ class ClaudeProvider:
                 # exponential-backoff retry. Only retries when no tokens
                 # have streamed yet (progress_probe) — mid-stream failures
                 # are fatal because re-running would duplicate output.
+                # Deadline propagates so the backoff respects the remaining
+                # generation budget (Task #4 cascade hardening).
                 async def _stream_with_resilience() -> None:
                     await self._call_with_backoff(
                         _stream_with_prefill_fallback,
                         label="claude_stream",
                         progress_probe=lambda: bool(raw_content),
+                        deadline=deadline,
                     )
 
                 try:
@@ -4154,10 +4535,13 @@ class ClaudeProvider:
 
                 # Reinforced transport: non-stream path is fully idempotent
                 # (no partial emission to callers), so we can retry freely.
+                # Deadline propagates so the backoff respects the remaining
+                # generation budget (Task #4 cascade hardening).
                 async def _create_with_resilience() -> Any:
                     return await self._call_with_backoff(
                         _create_with_prefill_fallback,
                         label="claude_create",
+                        deadline=deadline,
                     )
 
                 try:
@@ -4295,6 +4679,7 @@ class ClaudeProvider:
                 msg = await asyncio.wait_for(
                     self._call_with_backoff(
                         _legacy_create, label="claude_legacy_tool_loop",
+                        deadline=deadline,
                     ),
                     timeout=timeout_s,
                 )
@@ -4434,7 +4819,7 @@ class ClaudeProvider:
             )
 
         message = await self._call_with_backoff(
-            _plan_create, label="claude_plan",
+            _plan_create, label="claude_plan", deadline=deadline,
         )
         input_tokens = getattr(message.usage, "input_tokens", 0)
         output_tokens = getattr(message.usage, "output_tokens", 0)

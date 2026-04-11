@@ -277,6 +277,12 @@ class SerpentFlow:
         self._op_sensors: Dict[str, str] = {}
         # Per-op reasoning — captured at GENERATE, shown at ⏺ Update
         self._op_rationales: Dict[str, str] = {}
+        # Dedup (op_id, round_index) set for tool-call preamble rendering.
+        # A parallel batch of N tools emits N "start" narration events with
+        # the same shared preamble; without this, op_tool_start would print
+        # the same dim italic line N times. Bounded at 512 entries — see
+        # op_tool_start for the eviction logic.
+        self._rendered_preamble_keys: set = set()
 
         # Rich console — force_terminal=True ensures ANSI codes survive
         # prompt_toolkit's patch_stdout proxy (which replaces sys.stdout
@@ -862,9 +868,16 @@ class SerpentFlow:
 
     def op_tool_start(
         self, op_id: str, tool_name: str, args_summary: str = "",
-        round_index: int = 0,
+        round_index: int = 0, preamble: str = "",
     ) -> None:
-        """Spin a masking spinner while a Venom tool executes."""
+        """Spin a masking spinner while a Venom tool executes.
+
+        ``preamble`` is the model's one-sentence WHY for this tool round.
+        When non-empty, it is printed as a dim italic line above the
+        spinner — Claude-Code-style narrator voice. The line is emitted
+        once per (op_id, round_index) pair so a parallel batch doesn't
+        print the same sentence for each tool.
+        """
         tool_icons = {
             "read_file": "📄", "search_code": "🔍", "run_tests": "🧪",
             "bash": "💻", "web_search": "🌐", "web_fetch": "🌐",
@@ -875,6 +888,25 @@ class SerpentFlow:
 
         # Include │ prefix in spinner text so it aligns with the op block
         prefix = f"  │  " if op_id in self._active_ops else "  "
+
+        # Dim italic preamble line ABOVE the spinner — Ouroboros' narrator
+        # voice. We dedupe on (op_id, round_index) so a 3-parallel tool
+        # batch prints the shared preamble once, not three times.
+        if preamble:
+            key = (op_id, round_index)
+            if key not in self._rendered_preamble_keys:
+                self._rendered_preamble_keys.add(key)
+                # Bound the dedup set so long-running ops don't leak.
+                if len(self._rendered_preamble_keys) > 512:
+                    # Evict the oldest half (insertion order in CPython 3.7+).
+                    _victims = list(self._rendered_preamble_keys)[:256]
+                    for _v in _victims:
+                        self._rendered_preamble_keys.discard(_v)
+                self._op_line(
+                    op_id,
+                    f"[{_C['dim']} italic]🗣 {preamble}[/{_C['dim']} italic]",
+                )
+
         self._start_status(
             f"{prefix}{icon} T{round_index + 1} {tool_name}{summary}",
             spinner="dots",
@@ -1975,6 +2007,7 @@ class SerpentTransport:
                             tool_name=payload["tool_name"],
                             args_summary=payload.get("tool_args_summary", ""),
                             round_index=payload.get("round_index", 0),
+                            preamble=payload.get("preamble", ""),
                         )
                     else:
                         self._flow.op_tool_call(

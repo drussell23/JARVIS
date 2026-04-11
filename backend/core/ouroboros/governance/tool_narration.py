@@ -69,6 +69,11 @@ LIFECYCLE_STATUSES: FrozenSet[str] = frozenset({
 
 #: Keys SerpentFlow reads from the CommMessage payload. Duplicated here as
 #: the authoritative contract between producer and consumer.
+#:
+#: ``preamble`` (new) carries the model's one-sentence WHY that SerpentFlow
+#: renders above the spinner and the Karen voice channel speaks aloud. It
+#: is only meaningful on ``status="start"`` events — post-exec emissions
+#: leave it empty.
 PAYLOAD_KEYS = (
     "phase",
     "tool_name",
@@ -78,6 +83,7 @@ PAYLOAD_KEYS = (
     "duration_ms",
     "status",
     "tool_starting",
+    "preamble",
 )
 
 
@@ -124,6 +130,14 @@ class NarrationConfig:
     max_args_chars: int = field(
         default_factory=lambda: _env_int_min(
             "JARVIS_TOOL_NARRATION_MAX_ARGS", 80, minimum=0,
+        )
+    )
+    #: Hard cap on the preamble narration string reaching the TUI. Set to 0
+    #: to disable truncation. Defaults to 160 — same as the parser cap, so
+    #: the TUI and Karen voice see identical strings.
+    max_preamble_chars: int = field(
+        default_factory=lambda: _env_int_min(
+            "JARVIS_TOOL_NARRATION_MAX_PREAMBLE", 160, minimum=0,
         )
     )
     #: When True, failures in the emit path log a warning. False keeps
@@ -196,12 +210,17 @@ class ToolNarrationChannel:
         result_preview: str = "",
         duration_ms: float = 0.0,
         status: str = "",
+        preamble: str = "",
     ) -> None:
         """Emit a narration event. Safe to call from any sync context.
 
         ``status=""`` is normalised to ``"start"`` (the pre-execution
         event). Unknown statuses are accepted verbatim — the channel
         never rejects input; SerpentFlow is the visual arbiter.
+
+        ``preamble`` is the model's one-sentence WHY for the tool round.
+        Only meaningful on ``start`` — the channel drops it on every
+        other status so post-exec events don't re-render or re-speak it.
         """
         if not self._config.enabled:
             return
@@ -215,6 +234,18 @@ class ToolNarrationChannel:
         if self._config.max_preview_chars and result_preview:
             result_preview = result_preview[: self._config.max_preview_chars]
 
+        # Preamble is only meaningful pre-exec. Drop it on success/error/
+        # etc. so SerpentFlow doesn't re-render it after the round ends.
+        if norm_status != "start":
+            preamble = ""
+        elif preamble:
+            # Collapse whitespace (parser already does this, but defence
+            # in depth — a direct caller may pass raw text).
+            preamble = " ".join(preamble.split())
+            cap = self._config.max_preamble_chars
+            if cap and len(preamble) > cap:
+                preamble = preamble[:cap].rstrip() + "…"
+
         payload = self._build_payload(
             tool_name=tool_name,
             args_summary=args_summary,
@@ -222,6 +253,7 @@ class ToolNarrationChannel:
             result_preview=result_preview,
             duration_ms=duration_ms,
             status=norm_status,
+            preamble=preamble,
         )
 
         msg = self._build_message(op_id=op_id, payload=payload)
@@ -242,6 +274,7 @@ class ToolNarrationChannel:
         result_preview: str,
         duration_ms: float,
         status: str,
+        preamble: str = "",
     ) -> Dict[str, Any]:
         return {
             "phase": "generate",
@@ -254,6 +287,10 @@ class ToolNarrationChannel:
             # Back-compat key — SerpentTransport reads this to decide
             # between "start spinner" and "stop spinner + print artifact".
             "tool_starting": status == "start",
+            # One-sentence WHY spoken by Ouroboros / rendered above spinner.
+            # Always present in the payload (empty string on non-start
+            # events) so consumers can use a single dict-get access path.
+            "preamble": preamble,
         }
 
     def _build_message(
