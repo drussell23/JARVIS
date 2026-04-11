@@ -260,6 +260,16 @@ class GovernedOrchestrator:
         # ``JARVIS_OP_COST_GOVERNOR_ENABLED=false``.
         self._cost_governor: CostGovernor = CostGovernor(CostGovernorConfig())
 
+        # ── Forward-progress detector ──
+        # Detects when the GENERATE retry loop is stuck producing the same
+        # candidate repeatedly (content-hash identity). Trips after
+        # ``JARVIS_FORWARD_PROGRESS_MAX_REPEATS`` consecutive identical
+        # candidates and aborts the op via the phase-aware terminal picker.
+        # Disable via ``JARVIS_FORWARD_PROGRESS_ENABLED=false``.
+        self._forward_progress: ForwardProgressDetector = ForwardProgressDetector(
+            ForwardProgressConfig(),
+        )
+
         # ── Session Intelligence: ephemeral lessons buffer ──
         # Accumulates compact lessons from completed/failed ops within this
         # session.  Injected into subsequent generation prompts so the model
@@ -420,6 +430,14 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug(
                     "[Orchestrator] CostGovernor.finish failed", exc_info=True,
+                )
+            # Finalize the forward-progress detector entry. Safe to call
+            # whether or not the op actually observed anything.
+            try:
+                self._forward_progress.finish(ctx.op_id)
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] ForwardProgress.finish failed", exc_info=True,
                 )
 
     # ------------------------------------------------------------------
@@ -1745,6 +1763,45 @@ class GovernedOrchestrator:
                 if generation is None or len(generation.candidates) == 0:
                     generation = None
                     raise RuntimeError("no_candidates_returned")
+
+                # ── Forward-progress detector ──
+                # Hash the first candidate's content and flag if the
+                # retry loop is producing the same candidate repeatedly.
+                # A trip means we're burning retries without any actual
+                # change — escape the loop via the phase-aware terminal.
+                try:
+                    _fp_hash = candidate_content_hash(generation.candidates[0])
+                    if _fp_hash and self._forward_progress.observe(
+                        ctx.op_id, _fp_hash,
+                    ):
+                        _fp_summary = self._forward_progress.summary(ctx.op_id) or {}
+                        logger.warning(
+                            "[Orchestrator] Forward-progress trip: op=%s "
+                            "stuck after %d repeats — escaping retry loop",
+                            ctx.op_id,
+                            _fp_summary.get("repeat_count", 0),
+                        )
+                        _terminal = self._l2_escape_terminal(ctx.phase)
+                        ctx = ctx.advance(
+                            _terminal,
+                            terminal_reason_code="no_forward_progress",
+                        )
+                        await self._record_ledger(
+                            ctx,
+                            OperationState.FAILED,
+                            {
+                                "reason": "no_forward_progress",
+                                "progress_summary": dict(_fp_summary),
+                                "entry_phase": "GENERATE",
+                            },
+                        )
+                        self._forward_progress.finish(ctx.op_id)
+                        return ctx
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] ForwardProgress.observe failed",
+                        exc_info=True,
+                    )
 
                 # ── Iron Gate: deterministic post-generation quality checks ──
                 # Manifesto §6: agentic intelligence proposes, deterministic

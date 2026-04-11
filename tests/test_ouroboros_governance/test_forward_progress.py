@@ -4,8 +4,6 @@ from __future__ import annotations
 import hashlib
 import time
 
-import pytest
-
 from backend.core.ouroboros.governance.forward_progress import (
     ForwardProgressConfig,
     ForwardProgressDetector,
