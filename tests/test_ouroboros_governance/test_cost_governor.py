@@ -292,3 +292,99 @@ class TestOpCostCapExceeded:
         assert exc.op_id == "op-p"
         assert exc.summary["cap_usd"] == 0.3
         assert "op_cost_cap_exceeded" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator integration — the governor is wired onto GovernedOrchestrator
+# and uses the phase-aware terminal picker for cost-cap aborts.
+# ---------------------------------------------------------------------------
+
+class TestOrchestratorWiring:
+    def test_orchestrator_instantiates_cost_governor(self, tmp_path):
+        """GovernedOrchestrator constructs a CostGovernor in __init__."""
+        from unittest.mock import MagicMock
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator,
+            OrchestratorConfig,
+        )
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        orch = GovernedOrchestrator(
+            stack=MagicMock(),
+            generator=MagicMock(),
+            approval_provider=MagicMock(),
+            config=cfg,
+        )
+        assert hasattr(orch, "_cost_governor")
+        assert isinstance(orch._cost_governor, CostGovernor)
+
+    def test_cost_cap_abort_uses_phase_aware_terminal(self):
+        """Cost-cap abort uses _l2_escape_terminal semantics.
+
+        Pre-apply phase (GENERATE) → CANCELLED.
+        Post-apply phase (VERIFY)  → POSTMORTEM.
+        """
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator,
+        )
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+        # GENERATE is pre-apply → CANCELLED
+        assert GovernedOrchestrator._l2_escape_terminal(
+            OperationPhase.GENERATE
+        ) == OperationPhase.CANCELLED
+        # VERIFY is post-apply → POSTMORTEM
+        assert GovernedOrchestrator._l2_escape_terminal(
+            OperationPhase.VERIFY
+        ) == OperationPhase.POSTMORTEM
+
+    def test_governor_respects_env_kill_switch(self, tmp_path, monkeypatch):
+        """Setting JARVIS_OP_COST_GOVERNOR_ENABLED=false disables enforcement."""
+        from unittest.mock import MagicMock
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator,
+            OrchestratorConfig,
+        )
+        monkeypatch.setenv("JARVIS_OP_COST_GOVERNOR_ENABLED", "false")
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        orch = GovernedOrchestrator(
+            stack=MagicMock(),
+            generator=MagicMock(),
+            approval_provider=MagicMock(),
+            config=cfg,
+        )
+        # Even charging $100 on an op that wasn't started yields no
+        # is_exceeded=True when disabled.
+        orch._cost_governor.charge("op-kill-switch", 100.0, "claude")
+        assert not orch._cost_governor.is_exceeded("op-kill-switch")
+
+    def test_governor_charge_and_exceed_flow(self, tmp_path):
+        """End-to-end: start → charge → exceed → summary matches expectations."""
+        from unittest.mock import MagicMock
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator,
+            OrchestratorConfig,
+        )
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        orch = GovernedOrchestrator(
+            stack=MagicMock(),
+            generator=MagicMock(),
+            approval_provider=MagicMock(),
+            config=cfg,
+        )
+        # Use a tight in-process config
+        orch._cost_governor = CostGovernor(config=CostGovernorConfig(
+            baseline_usd=0.05,
+            retry_headroom=1.0,
+            route_factors={"standard": 1.0},
+            complexity_factors={"light": 1.0},
+            min_cap_usd=0.01,
+            max_cap_usd=1.0,
+            enabled=True,
+        ))
+        orch._cost_governor.start("op-wired", "standard", "light")  # cap 0.05
+        assert not orch._cost_governor.is_exceeded("op-wired")
+        orch._cost_governor.charge("op-wired", 0.02, "dw")
+        orch._cost_governor.charge("op-wired", 0.04, "claude")
+        assert orch._cost_governor.is_exceeded("op-wired")
+        summary = orch._cost_governor.finish("op-wired")
+        assert summary["exceeded"] is True
+        assert summary["cumulative_usd"] == pytest.approx(0.06)

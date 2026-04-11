@@ -57,6 +57,16 @@ from backend.core.ouroboros.governance.change_engine import (
 )
 from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
 from backend.core.ouroboros.governance.learning_bridge import OperationOutcome
+from backend.core.ouroboros.governance.cost_governor import (
+    CostGovernor,
+    CostGovernorConfig,
+    OpCostCapExceeded,
+)
+from backend.core.ouroboros.governance.forward_progress import (
+    ForwardProgressConfig,
+    ForwardProgressDetector,
+    candidate_content_hash,
+)
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
@@ -240,6 +250,16 @@ class GovernedOrchestrator:
         self._exploration_fleet: Optional[Any] = None  # set via set_exploration_fleet()
         self._critique_engine: Optional[Any] = None  # set via set_critique_engine()
 
+        # ── Per-op cost governor ──
+        # Enforces a dynamic cumulative cost ceiling per op, derived from
+        # route + complexity. Prevents cost-runaway cascades (e.g. DW→Claude
+        # fallback + 3 retries + 5 L2 iterations collectively spending >$2
+        # while each individual call stays under its own per-provider cap).
+        # Cap formula and factor table are fully env-var driven — see
+        # cost_governor.py::CostGovernorConfig. Disable via
+        # ``JARVIS_OP_COST_GOVERNOR_ENABLED=false``.
+        self._cost_governor: CostGovernor = CostGovernor(CostGovernorConfig())
+
         # ── Session Intelligence: ephemeral lessons buffer ──
         # Accumulates compact lessons from completed/failed ops within this
         # session.  Injected into subsequent generation prompts so the model
@@ -349,37 +369,58 @@ class GovernedOrchestrator:
             The terminal context after pipeline completion or failure.
         """
         try:
-            return await self._run_pipeline(ctx)
-        except Exception as exc:
-            logger.error(
-                "Unhandled exception in pipeline for %s: %s",
-                ctx.op_id,
-                exc,
-                exc_info=True,
-            )
-            # Try to advance to POSTMORTEM from current phase.
-            # If we can't (e.g. already terminal), just return ctx.
             try:
-                ctx = ctx.advance(
-                    OperationPhase.POSTMORTEM,
-                    terminal_reason_code="unhandled_pipeline_exception",
+                return await self._run_pipeline(ctx)
+            except Exception as exc:
+                logger.error(
+                    "Unhandled exception in pipeline for %s: %s",
+                    ctx.op_id,
+                    exc,
+                    exc_info=True,
                 )
-            except ValueError:
-                # POSTMORTEM not legal from this phase — fall back to CANCELLED
-                # (legal from all non-terminal phases except VERIFY).
+                # Try to advance to POSTMORTEM from current phase.
+                # If we can't (e.g. already terminal), just return ctx.
                 try:
                     ctx = ctx.advance(
-                        OperationPhase.CANCELLED,
+                        OperationPhase.POSTMORTEM,
                         terminal_reason_code="unhandled_pipeline_exception",
                     )
                 except ValueError:
-                    pass  # Already terminal — safe to return as-is
-            await self._record_ledger(
-                ctx,
-                OperationState.FAILED,
-                {"error": str(exc), "phase": ctx.phase.name},
-            )
-            return ctx
+                    # POSTMORTEM not legal from this phase — fall back to CANCELLED
+                    # (legal from all non-terminal phases except VERIFY).
+                    try:
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="unhandled_pipeline_exception",
+                        )
+                    except ValueError:
+                        pass  # Already terminal — safe to return as-is
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"error": str(exc), "phase": ctx.phase.name},
+                )
+                return ctx
+        finally:
+            # Finalize the cost-governor entry no matter how the op ended.
+            # This also logs the full summary (cap, cumulative, per-provider
+            # breakdown) at DEBUG for postmortem analysis.
+            try:
+                _cost_final = self._cost_governor.finish(ctx.op_id)
+                if _cost_final is not None:
+                    logger.info(
+                        "[Orchestrator] Cost summary op=%s phase=%s "
+                        "spent=$%.4f / cap=$%.4f (%d calls)",
+                        ctx.op_id,
+                        ctx.phase.name,
+                        _cost_final.get("cumulative_usd", 0.0),
+                        _cost_final.get("cap_usd", 0.0),
+                        _cost_final.get("call_count", 0),
+                    )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] CostGovernor.finish failed", exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # Pipeline implementation
@@ -829,6 +870,20 @@ class GovernedOrchestrator:
                     pass
         except Exception:
             logger.debug("[Orchestrator] UrgencyRouter not available", exc_info=True)
+
+        # ── Start per-op cost governor ──
+        # Called here (post-ROUTE) so the cap is derived from the actual
+        # stamped route + task_complexity. If either field is empty the
+        # governor uses safe "standard/light" defaults. Safe to call even
+        # when governor is disabled — returns +inf cap.
+        try:
+            self._cost_governor.start(
+                op_id=ctx.op_id,
+                route=getattr(ctx, "provider_route", "") or "",
+                complexity=getattr(ctx, "task_complexity", "") or "",
+            )
+        except Exception:
+            logger.debug("[Orchestrator] CostGovernor.start failed", exc_info=True)
 
         if self._config.context_expansion_enabled:
             # ── PreActionNarrator: voice WHAT before CONTEXT_EXPANSION ──
@@ -1582,6 +1637,39 @@ class GovernedOrchestrator:
             ctx = dataclasses.replace(ctx, generate_file_hashes=tuple(_gen_hashes))
 
         for attempt in range(1 + self._config.max_generate_retries):
+            # ── Per-op cost cap check (Manifesto §5/§7) ──
+            # If the cumulative spend across previous attempts has already
+            # exceeded the dynamic cap, refuse to initiate another provider
+            # call. Routes through the phase-aware terminal picker.
+            if self._cost_governor.is_exceeded(ctx.op_id):
+                _cost_summary = self._cost_governor.summary(ctx.op_id) or {}
+                logger.warning(
+                    "[Orchestrator] Per-op cost cap exceeded before attempt %d: "
+                    "cumulative=$%.4f cap=$%.4f route=%s complexity=%s [%s]",
+                    attempt + 1,
+                    _cost_summary.get("cumulative_usd", 0.0),
+                    _cost_summary.get("cap_usd", 0.0),
+                    _cost_summary.get("route", "?"),
+                    _cost_summary.get("complexity", "?"),
+                    ctx.op_id,
+                )
+                _terminal = self._l2_escape_terminal(ctx.phase)
+                ctx = ctx.advance(
+                    _terminal,
+                    terminal_reason_code="op_cost_cap_exceeded",
+                )
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {
+                        "reason": "op_cost_cap_exceeded",
+                        "cost_summary": dict(_cost_summary),
+                        "entry_phase": "GENERATE",
+                    },
+                )
+                self._cost_governor.finish(ctx.op_id)
+                return ctx
+
             try:
                 # Heartbeat: GENERATE phase starting (Manifesto §7: Absolute Observability)
                 try:
@@ -1627,6 +1715,19 @@ class GovernedOrchestrator:
                     self._generator.generate(ctx, deadline),
                     timeout=_gen_timeout + 5.0,
                 )
+                # Charge the CostGovernor with the actual generation cost.
+                # Non-positive costs (cache hits, fallback stubs) are a no-op.
+                try:
+                    _cost_this_call = float(getattr(generation, "cost_usd", 0.0) or 0.0)
+                    _prov_name = getattr(generation, "provider_name", "") or ""
+                    if _cost_this_call > 0.0:
+                        self._cost_governor.charge(
+                            ctx.op_id, _cost_this_call, _prov_name,
+                        )
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] CostGovernor.charge failed", exc_info=True,
+                    )
                 # Emit streaming=end to close the streaming block
                 try:
                     await self._stack.comm.emit_heartbeat(
@@ -1931,20 +2032,49 @@ class GovernedOrchestrator:
                             f"demotion:immediate_exhausted:{_err_msg[:60]}",
                         )
                         _route = "standard"  # update local for timeout calc
+                        # Refresh the cost-governor cap for the new route so
+                        # the demotion gets a proportional budget headroom.
                         try:
-                            _dem_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=120.0)
-                            generation = await asyncio.wait_for(
-                                self._generator.generate(ctx, _dem_deadline),
-                                timeout=125.0,
+                            self._cost_governor.start(
+                                op_id=ctx.op_id,
+                                route="standard",
+                                complexity=getattr(ctx, "task_complexity", "") or "",
                             )
-                            if generation is not None and len(generation.candidates) > 0:
-                                break  # success — continue pipeline
-                            generation = None
-                        except Exception as dem_exc:
+                        except Exception:
+                            pass
+                        # Guard the demotion call itself: if cumulative spend
+                        # already blew past the new cap, skip the demotion.
+                        if self._cost_governor.is_exceeded(ctx.op_id):
                             logger.warning(
-                                "[Orchestrator] STANDARD demotion also failed: %s [%s]",
-                                dem_exc, ctx.op_id,
+                                "[Orchestrator] Skipping STANDARD demotion — "
+                                "cost cap already exceeded [%s]",
+                                ctx.op_id,
                             )
+                        else:
+                            try:
+                                _dem_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=120.0)
+                                generation = await asyncio.wait_for(
+                                    self._generator.generate(ctx, _dem_deadline),
+                                    timeout=125.0,
+                                )
+                                # Charge demotion call cost (may be zero).
+                                try:
+                                    _dem_cost = float(getattr(generation, "cost_usd", 0.0) or 0.0)
+                                    _dem_prov = getattr(generation, "provider_name", "") or ""
+                                    if _dem_cost > 0.0:
+                                        self._cost_governor.charge(
+                                            ctx.op_id, _dem_cost, _dem_prov,
+                                        )
+                                except Exception:
+                                    pass
+                                if generation is not None and len(generation.candidates) > 0:
+                                    break  # success — continue pipeline
+                                generation = None
+                            except Exception as dem_exc:
+                                logger.warning(
+                                    "[Orchestrator] STANDARD demotion also failed: %s [%s]",
+                                    dem_exc, ctx.op_id,
+                                )
 
                     # All retries truly exhausted
                     ctx = ctx.advance(
