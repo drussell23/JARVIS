@@ -377,6 +377,7 @@ class IntakeLayerService:
                 )
                 for rc in enabled_repos
             ]
+            _coalescer = getattr(self._gls, "_graph_coalescer", None)
             miner_sensors = [
                 OpportunityMinerSensor(
                     repo_root=rc.local_path,
@@ -385,6 +386,7 @@ class IntakeLayerService:
                     complexity_threshold=self._config.miner_complexity_threshold,
                     poll_interval_s=self._config.miner_scan_interval_s,
                     repo=rc.name,
+                    graph_coalescer=_coalescer,
                 )
                 for rc in enabled_repos
             ]
@@ -409,6 +411,7 @@ class IntakeLayerService:
                     ),
                 )
             ]
+            _coalescer = getattr(self._gls, "_graph_coalescer", None)
             miner_sensors = [
                 OpportunityMinerSensor(
                     repo_root=self._config.project_root,
@@ -416,6 +419,7 @@ class IntakeLayerService:
                     scan_paths=self._config.miner_scan_paths,
                     complexity_threshold=self._config.miner_complexity_threshold,
                     poll_interval_s=self._config.miner_scan_interval_s,
+                    graph_coalescer=_coalescer,
                 )
             ]
 

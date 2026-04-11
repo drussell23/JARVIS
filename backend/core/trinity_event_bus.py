@@ -514,9 +514,17 @@ class CrossRepoTransport:
         self._sync_task: Optional[asyncio.Task] = None
         self._event_handlers: List[Callable[[TrinityEvent], Awaitable[None]]] = []
 
-        # Sync directory
-        self._sync_dir = Path.home() / ".jarvis" / "trinity" / "bus_sync"
-        self._sync_dir.mkdir(parents=True, exist_ok=True)
+        # Sync directory — Iron Gate compliant: route around PermissionError
+        # via sandbox_fallback into .ouroboros/state/sandbox_fallback/.
+        # Lazy import avoids any risk of a circular dep at module-init time.
+        from backend.core.ouroboros.governance.sandbox_paths import sandbox_fallback
+        _primary_sync = Path.home() / ".jarvis" / "trinity" / "bus_sync"
+        self._sync_dir = sandbox_fallback(_primary_sync)
+        try:
+            self._sync_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # sandbox_fallback already warned; swallow to keep boot path alive.
+            pass
 
         # Track processed events
         self._processed_events: Set[str] = set()

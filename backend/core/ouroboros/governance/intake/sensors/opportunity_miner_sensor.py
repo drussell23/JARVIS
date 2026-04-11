@@ -242,6 +242,7 @@ class OpportunityMinerSensor:
         repo: str = "jarvis",
         poll_interval_s: float = 3600.0,
         max_candidates_per_scan: int = 0,
+        graph_coalescer: Optional[Any] = None,
     ) -> None:
         self._repo_root = repo_root
         self._router = router
@@ -251,6 +252,10 @@ class OpportunityMinerSensor:
         self._poll_interval_s = poll_interval_s
         self._running = False
         self._seen_file_paths: set[str] = set()
+        # Graph coalescer: when >=2 candidates are selected in a scan, they
+        # are merged into a single ExecutionGraph envelope instead of N
+        # independent ops (Manifesto §3 parallel DAG execution).
+        self._graph_coalescer = graph_coalescer
 
         # Per-scan cap
         self._max_per_scan = max_candidates_per_scan or int(
@@ -464,8 +469,49 @@ class OpportunityMinerSensor:
         # Phase 2: Diverse candidate selection
         selected = self._select_diverse_candidates(analyses, sort_field)
 
-        # Phase 3: Ingest selected candidates
+        # Phase 2.5: Try graph coalescing — collapse N selected candidates
+        # into a single ExecutionGraph envelope (Manifesto §3 parallel DAG).
         ingested: List[StaticCandidate] = []
+        if (
+            self._graph_coalescer is not None
+            and hasattr(self._graph_coalescer, "should_coalesce")
+            and self._graph_coalescer.should_coalesce(selected)
+        ):
+            batch = await self._graph_coalescer.coalesce(
+                selected,
+                strategy=strategy_name,
+                sort_field=sort_field,
+                repo=self._repo,
+            )
+            if batch is not None:
+                coalesced = await self._ingest_coalesced_batch(
+                    batch, selected, strategy_name,
+                )
+                if coalesced:
+                    ingested.extend(coalesced)
+                    logger.info(
+                        "OpportunityMinerSensor: coalesced %d candidates into "
+                        "graph=%s (strategy=%s, submitted=%s)",
+                        len(coalesced), batch.graph.graph_id, strategy_name,
+                        batch.submitted_to_scheduler,
+                    )
+                    # Prune old cooldowns, log, and return early — skip the
+                    # per-file ingest loop below.
+                    self._prune_cooldowns()
+                    self._log_scan_complete(
+                        strategy_name, scanned, len(analyses),
+                        ingested, errors, skipped_non_package,
+                    )
+                    return ingested
+                # Coalescing envelope was rejected — fall through to per-file
+                # ingest as a best-effort fallback.
+                logger.info(
+                    "OpportunityMinerSensor: coalesced envelope rejected, "
+                    "falling back to per-file ingest (strategy=%s)",
+                    strategy_name,
+                )
+
+        # Phase 3: Ingest selected candidates
         for analysis in selected:
             rel = analysis.file_path
             value = getattr(analysis, sort_field, 0)
@@ -530,31 +576,111 @@ class OpportunityMinerSensor:
                     "OpportunityMinerSensor: ingest failed for %s", rel
                 )
 
-        # Prune old cooldowns (keep last N cycles)
-        max_history = self._cooldown_cycles * 2
-        if self._cooldown_map:
-            oldest_allowed = self._scan_cycle - max_history
-            self._cooldown_map = {
-                k: v for k, v in self._cooldown_map.items()
-                if v >= oldest_allowed
-            }
+        # Prune old cooldowns + log completion summary.
+        self._prune_cooldowns()
+        self._log_scan_complete(
+            strategy_name, scanned, len(analyses),
+            ingested, errors, skipped_non_package,
+        )
+        return ingested
 
-        # Module coverage stats
+    # ------------------------------------------------------------------
+    # Internal helpers (shared between coalesced and per-file paths)
+    # ------------------------------------------------------------------
+
+    def _prune_cooldowns(self) -> None:
+        """Drop cooldown entries older than 2× cooldown window."""
+        if not self._cooldown_map:
+            return
+        max_history = self._cooldown_cycles * 2
+        oldest_allowed = self._scan_cycle - max_history
+        self._cooldown_map = {
+            k: v for k, v in self._cooldown_map.items()
+            if v >= oldest_allowed
+        }
+
+    def _log_scan_complete(
+        self,
+        strategy_name: str,
+        scanned: int,
+        analyses_count: int,
+        ingested: List[StaticCandidate],
+        errors: int,
+        skipped_non_package: int,
+    ) -> None:
         modules_covered: Set[str] = set()
         for c in ingested:
             modules_covered.add(self._get_module_name(c.file_path))
-
         logger.info(
             "OpportunityMinerSensor: cycle %d complete — scanned %d files, "
             "strategy=%s, candidates=%d, ingested=%d, modules=%s, "
             "errors=%d, skipped=%d, cooldown_pool=%d, seen_total=%d",
             self._scan_cycle, scanned, strategy_name,
-            len(analyses), len(ingested),
+            analyses_count, len(ingested),
             sorted(modules_covered) if modules_covered else "none",
             errors, skipped_non_package,
             len(self._cooldown_map), len(self._seen_file_paths),
         )
-        return ingested
+
+    async def _ingest_coalesced_batch(
+        self,
+        batch: Any,  # graph_coalescer.CoalescedBatch — duck-typed to avoid import cycle
+        selected: List[_FileAnalysis],
+        strategy_name: str,
+    ) -> List[StaticCandidate]:
+        """Ingest a single coalesced envelope carrying all selected files.
+
+        Returns the list of StaticCandidate records (one per file in the
+        graph) on success, or an empty list if the router rejects the
+        envelope. Marks all files as seen + on cooldown on success.
+        """
+        selected_by_path: Dict[str, _FileAnalysis] = {a.file_path: a for a in selected}
+        envelope = make_envelope(
+            source="ai_miner",
+            description=batch.description,
+            target_files=batch.target_files,
+            repo=self._repo,
+            confidence=batch.confidence,
+            urgency="low",
+            evidence={
+                **batch.envelope_evidence,
+                "scan_cycle": self._scan_cycle,
+                "signature": f"{strategy_name}:coalesced:{batch.graph.graph_id}",
+            },
+            requires_human_ack=True,  # AC2 safety invariant preserved
+        )
+        try:
+            result = await self._router.ingest(envelope)
+        except Exception:
+            logger.exception(
+                "OpportunityMinerSensor: coalesced ingest raised (graph=%s)",
+                batch.graph.graph_id,
+            )
+            return []
+
+        if result not in ("enqueued", "pending_ack"):
+            logger.info(
+                "OpportunityMinerSensor: coalesced envelope not accepted "
+                "(result=%s, graph=%s)",
+                result, batch.graph.graph_id,
+            )
+            return []
+
+        out: List[StaticCandidate] = []
+        for rel in batch.target_files:
+            analysis = selected_by_path.get(rel)
+            cc = getattr(analysis, "cyclomatic_complexity", 0) if analysis else 0
+            score = getattr(analysis, "composite_score", batch.confidence) if analysis else batch.confidence
+            self._seen_file_paths.add(rel)
+            self._cooldown_map[rel] = self._scan_cycle
+            out.append(StaticCandidate(
+                file_path=rel,
+                cyclomatic_complexity=cc,
+                static_evidence_score=score,
+                strategy=strategy_name,
+                analysis_detail=f"{batch.description} [graph={batch.graph.graph_id}]",
+            ))
+        return out
 
     async def start(self) -> None:
         """Start background scanning loop."""

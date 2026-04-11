@@ -807,6 +807,8 @@ class GovernedLoopService:
         self._feedback_loop_task: Optional[asyncio.Task] = None
         self._safety_net: Optional[ProductionSafetyNet] = None
         self._subagent_scheduler: Optional[Any] = None
+        # Miner graph coalescer — wired alongside the L3 scheduler below.
+        self._graph_coalescer: Optional[Any] = None
         self._advanced_autonomy: Optional[Any] = None
         self._mcp_client: Optional[Any] = None  # Phase A: GovernanceMCPClient, wired in start()
 
@@ -2781,8 +2783,34 @@ class GovernedLoopService:
                 self._config.execution_graph_state_dir,
                 self._config.max_concurrent_execution_graphs,
             )
+
+            # Manifesto §3 parallel DAG: miner signal coalescer — collapses
+            # N same-strategy miner candidates into a single ExecutionGraph
+            # instead of N independent ops. Lights up the Phase 3b
+            # ExecutionGraphProgressTracker with a real multi-op workload.
+            try:
+                from backend.core.ouroboros.governance.graph_coalescer import (
+                    MinerGraphCoalescer,
+                )
+                self._graph_coalescer: Optional[Any] = MinerGraphCoalescer(
+                    scheduler=self._subagent_scheduler,
+                    repo="jarvis",
+                )
+                logger.info(
+                    "[GovernedLoop] MinerGraphCoalescer wired "
+                    "(enabled=%s, auto_submit=%s)",
+                    self._graph_coalescer.enabled,
+                    getattr(self._graph_coalescer, "_auto_submit", False),
+                )
+            except Exception as _coalescer_exc:
+                logger.warning(
+                    "[GovernedLoop] MinerGraphCoalescer wire failed: %s",
+                    _coalescer_exc,
+                )
+                self._graph_coalescer = None
         else:
             self._subagent_scheduler = None
+            self._graph_coalescer = None
 
         # Create SagaMessageBus for passive saga observability
         try:

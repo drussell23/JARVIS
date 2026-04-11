@@ -1625,7 +1625,14 @@ class TheOracle:
 
         Note: pickle is used here for internal cache only — the graph
         contains only our own dataclasses, not untrusted data.
+
+        Iron Gate compliance: writes to ``~/.jarvis/oracle/`` may be blocked
+        by the sandbox; ``sandbox_fallback`` routes to
+        ``.ouroboros/state/sandbox_fallback/oracle/`` without lowering shields.
         """
+        # Lazy import avoids any risk of circular deps at module init.
+        from backend.core.ouroboros.governance.sandbox_paths import sandbox_fallback
+
         try:
             data = {
                 "graph": self._graph._graph,
@@ -1637,11 +1644,13 @@ class TheOracle:
                 "file_hashes": self._file_hashes,
             }
 
-            OracleConfig.GRAPH_CACHE_FILE.write_bytes(
+            cache_path = sandbox_fallback(OracleConfig.GRAPH_CACHE_FILE)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(
                 pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),  # noqa: S301
             )
 
-            logger.info(f"Saved cache to {OracleConfig.GRAPH_CACHE_FILE}")
+            logger.info(f"Saved cache to {cache_path}")
         except Exception as e:
             logger.error(f"Error saving cache: {e}")
 
