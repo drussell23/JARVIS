@@ -1,8 +1,11 @@
 # [Ouroboros] Modified by Ouroboros (op=op-019d7d3e-) at 2026-04-10 19:13 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019d7d3e-) at 2026-04-11 15:57 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019d7e1a-) at 2026-04-11 16:00 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019d7e1a-) at 2026-04-11 19:54 UTC
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
 
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
+# Python 3.11+ is now the minimum supported interpreter version.
 
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.2
@@ -175,3 +178,4 @@ google-cloud-monitoring>=2.0.0
 
 # Python 3.9.x is EOL (2025-10). Minimum supported version is now 3.11.
 # Upgrade your interpreter to Python 3.11 or 3.12 before installing.
+# Requires-Python: >=3.11
