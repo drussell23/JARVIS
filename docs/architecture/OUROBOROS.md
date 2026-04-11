@@ -1613,3 +1613,125 @@ The organism uses 6 layers of cost optimization to maximize operations per budge
 | `backend/core/ouroboros/governance/strategic_direction.py` | StrategicDirectionService (Manifesto → prompt) |
 | `backend/core/ouroboros/governance/saga/cross_repo_verifier.py` | Cross-repo patch verification |
 | `backend/core/ouroboros/governance/multi_repo/registry.py` | RepoRegistry for 3 repos |
+
+---
+
+## Battle Test Breakthrough Log
+
+Empirical milestones reached by the autonomous loop under the full 6-layer harness. Each entry is sourced from the corresponding session's `debug.log` — anecdote is not evidence, only the harness counts.
+
+### 2026-04-11 — First sustained full-pipeline completion (session `bt-2026-04-11-154947`)
+
+**Headline:** O+V autonomously generated, Iron-Gated, repaired, applied, verified, and post-mortemed its first operation end-to-end since the Apr 9–10 Iron Gate tightening. The same session shipped two further worker completions within an 11-minute idle budget.
+
+**Operation that reached APPLY + VERIFY:**
+- Op ID: `op-019d7d3e-7f4a-7391-ae2a-5cdca6a9f3c5-cau`
+- Source sensor: `RuntimeHealthSensor` (critical urgency)
+- Goal: "Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required."
+- Target: `requirements.txt`
+- Classification: `trivial` complexity, `SAFE_AUTO` risk tier, `fast_path=True`
+- Route: `IMMEDIATE` (critical_urgency:runtime_health) → 120s Claude-direct budget
+- Total cost: $0.2503 across 2 generate calls
+- Worker elapsed: 402.38s
+
+**Phase-by-phase trace (from debug.log):**
+
+```
+08:52:51  CLASSIFY   trivial/SAFE_AUTO/auto_approve/fast_path
+08:52:51  ROUTE      immediate (critical_urgency:runtime_health)
+08:52:51  PLAN       skipped (trivial_op: 1 file, short description)
+08:52:51  GENERATE   stream start, thinking=on, 16384 max_tokens, 12341 prompt chars
+08:54:49  GENERATE   end_turn, 117.8s, 4756+9999 tokens, $0.1643, 1 candidate
+08:54:49  IRON_GATE  dependency_file_integrity REJECTED attempt 1:
+                     "anthropic -> anthropichttp" (hallucinated package rename)
+08:54:49  RETRY      episodic failure injected, attempt 2/2 launched
+08:55:59  GENERATE   end_turn, 70s, $0.0861 cumulative=$0.2503, 1 candidate
+08:55:59  VALIDATE   hash 03a420e57acc advanced
+08:56:04  GATE       entropy=healthy, trigger=False
+08:56:20  APPLY      phase=APPLY target=requirements.txt
+08:57:42  DECISION   applied / safe_auto_passed
+08:57:42  INFRA      InfrastructureApplicator triggered Python dependency install
+08:57:47  INFRA      SUCCESS (4.7s)
+08:57:47  VERIFY     phase=verify
+08:58:29  VERIFY     test failed (0/0) -> routed to L2 repair
+08:59:33  L2         escaped VERIFY phase, ctx advanced to POSTMORTEM
+08:59:33  COMPLETE   cost summary $0.2503/$0.7500 (2 calls), productivity stable=1
+08:59:33  WORKER     bgop-3b7c9bfa3b11 completed in 402.38s
+```
+
+**Other worker completions in the same session:**
+- `bgop-45a495e6509a` — docstring coverage on `graduation_orchestrator.py` (simple, NOTIFY_APPLY) — 364.91s
+- `bgop-7f373cc4a35b` — docstring coverage on `graduation_orchestrator.py` second op — 11.21s (short-circuit)
+
+**Captured-client race fix (the unblocker):**
+
+The breakthrough was gated on a race condition that had silently broken every battle test of the preceding stretch. `ClaudeProvider.generate()` captured `client = self._ensure_client()` at the top, then closure-referenced that local inside the nested `_do_stream` / `_create_with_prefill_fallback` / `_legacy_create` / `_plan_create` coroutines. When a transport-level hard failure (httpx `RemoteProtocolError`, `ReadError`) unwrapped from an Anthropic `APIConnectionError` fired `_recycle_client()` mid-backoff, `self._client` was replaced but the closure-captured local still pointed at the now-closed client. The next retry through `_call_with_backoff` therefore raised:
+
+```
+APIConnectionError(cause=RuntimeError:Cannot send a request,
+as the client has been closed.) elapsed=3ms
+```
+
+— zero bytes transmitted, zero chance of progress. This masked the hard-pool recycle entirely: recycle fired, retry fired, retry instantly failed on stale client, generation exhausted retries, worker completed with zero calls charged.
+
+**The fix** re-acquires `self._client` on every attempt:
+
+```python
+async def _do_stream() -> None:
+    nonlocal raw_content, input_tokens, output_tokens, _cached_input
+    # Re-acquire the client on every attempt so retries after
+    # _recycle_client() pick up the new generation instead of
+    # the original closure-captured instance.
+    _current_client = self._ensure_client()
+    _stream_kwargs: Dict[str, Any] = { ... }
+    async with _current_client.messages.stream(**_stream_kwargs) as stream:
+        ...
+```
+
+Applied identically to `_create_with_prefill_fallback` (non-streaming path), `_legacy_create` (backward-compat tool loop), and `_plan_create` (PLAN phase). Validation criterion was deliberately narrow: **zero `client has been closed` occurrences across the full debug log of a 10-minute session**. Met.
+
+**Iron Gate vindication:**
+
+Attempt 1 of `op-019d7d3e` produced a real code pathology — the model mutated the existing `anthropic==X.Y.Z` pin into `anthropichttp==X.Y.Z`, a hallucinated package name that would have broken `pip install` and silently deleted the real dependency. The `dependency_file_integrity` Iron Gate caught it on first production exposure:
+
+```
+Iron Gate — dependency_file_integrity: 1 offender(s)
+[anthropic -> anthropichttp] op=op-019d7d3e-
+Generation attempt 1/2 failed: Dependency file rename/truncation suspected:
+1 package(s) deleted and replaced with near-identical name(s).
+These look like model hallucinations or typos, not legitimate upgrades.
+```
+
+The retry loop then injected the rejection reason as an episodic failure into the attempt-2 prompt, and the model produced a clean patch. This is exactly the Manifesto §6 Iron Discipline loop: gate catches pathology → structured feedback → model self-corrects → patch graduates to APPLY. No brute-force retry, no bypass, no silent drift.
+
+**What this session did NOT yet validate:**
+
+- **Iron Gate `exploration_insufficient` with `complexity=simple → threshold=1`** — The three simple ops that entered the pipeline (`op-019d7d40`, `op-019d7d43` both variants) all hit provider-level exhaustion (`all_providers_exhausted`) before reaching the gate. The threshold-scaling fix in `orchestrator.py:1908-1941` is deployed but unexercised. Next battle test must force a simple-complexity op to reach GENERATE cleanly.
+- **Hard-pool recycle on ReadError causes** — No `ReadError` / `RemoteProtocolError` was observed in this session's log. The fix is believed correct on mechanism (the prior session `bf1vf9icr` validated the recycle firing with both cause classes via the split `exc_class_bare` / `exc_class_display` logger), but a clean in-session reproduction is still pending.
+- **Full L2 repair on a real verification failure** — L2 engaged and escaped in this session, but the underlying cause was `0/0 tests` (no tests exist for `requirements.txt`), not a genuine failing test. L2's `generate → test → classify → revise` loop still needs an honest signal to prove itself against.
+
+**Stacked preconditions that had to land first (historical context):**
+
+1. `Claude-sonnet-4-6` stream endpoint prefill incompatibility — disabled `JARVIS_CLAUDE_JSON_PREFILL` by default, stream path now tolerates plain messages array
+2. IMMEDIATE generation budget raised 60s → 120s to accommodate Venom tool rounds
+3. Claude retry demotion IMMEDIATE → STANDARD added after upstream provider exhaustion
+4. `CancelledError` correct re-raise (PEP 479 / asyncio contract) so outer `wait_for` races don't swallow diagnostics
+5. `_CLAUDE_HARD_POOL_EXC_NAMES` check made cause-aware (unwrap `APIConnectionError` → `ReadError` / `RemoteProtocolError`) — the `exc_class_bare` vs `exc_class_display` split
+6. Iron Gate `exploration_insufficient` threshold scaled by complexity (`simple=1`, else `2`, trivial bypassed)
+7. LiveWorkSensor unblocked on stale `requirements.txt` (one-time `git stash`)
+8. **This session's fix:** captured-client race across all four `ClaudeProvider` invocation paths
+
+Only (8) was actually the unblocker. (1)–(7) were necessary but not sufficient — they ensured that when the loop finally ran, it ran on the right rails.
+
+**Files changed for the breakthrough:**
+- `backend/core/ouroboros/governance/providers.py` — captured-client re-acquire on every `_call_with_backoff` attempt (4 call sites)
+- `backend/core/ouroboros/governance/orchestrator.py` — `_min_explore` scaled by `task_complexity` with `JARVIS_MIN_EXPLORATION_CALLS` override
+
+**Session metadata:**
+- Runtime: 678.77s (11 min 19 s)
+- Stop reason: `idle_timeout` (expected — harness idle watchdog, not a crash)
+- Cost: $0.4257 (entirely Claude; DW Tier 0 was primed but the one DW RT attempt hit a CancelledError during harness shutdown at 09:01:02)
+- Provider errors observed: 1 `APITimeoutError(cause=ConnectTimeout:)` on op-019d7d43 during worker shutdown race — cosmetic, post-test, unrelated to the fix
+- **Zero** `client has been closed` occurrences across 119KB of debug log — the fix held
+- Known counter bug: `summary.json.stats.attempted=0` even though 3 workers completed and 1 op reached APPLY. The counter only increments on specific phase transitions; the debug log is the authoritative source. Filing follow-up to fix the counter semantics.
+

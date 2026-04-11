@@ -1742,13 +1742,19 @@ class GovernedOrchestrator:
                     pass
 
                 # Route-aware generation timeout (Manifesto §5):
-                #   IMMEDIATE: 45s  — fast reflex, don't burn budget on hung calls
+                #   IMMEDIATE: 120s — fast reflex, but must accommodate Venom
+                #              tool-round + full_content patch generation.
+                #              Raised from 60s after bt-2026-04-11-085020
+                #              diagnosed tool_round=yes calls needing 63s+ to
+                #              stream 23KB+ full_content patches (first token
+                #              at 1.1s, healthy ~365 bytes/s). The 60s cap was
+                #              cutting legitimate streams off mid-output.
                 #   STANDARD:  120s — DW primary with reasonable wait
                 #   COMPLEX:   180s — Claude planning takes longer
                 #   BACKGROUND/SPECULATIVE: 180s — no urgency
                 _route = getattr(ctx, "provider_route", "") or "standard"
                 _route_timeouts = {
-                    "immediate": 60.0,
+                    "immediate": 120.0,
                     "standard": 120.0,
                     "complex": 180.0,
                     "background": 180.0,
@@ -1901,13 +1907,29 @@ class GovernedOrchestrator:
                 #
                 # Gate 1 — Exploration-first enforcement (no patch without
                 # reading the codebase). Trivial ops bypass (small-surface
-                # rewrites don't need the 2-call floor).
+                # rewrites don't need the floor).
+                #
+                # Complexity-scaled threshold (bt-2026-04-11-090651 root cause):
+                # simple ops (single target file, mechanical change) need only
+                # 1 exploration call — one read_file IS reading the codebase.
+                # moderate/complex ops keep the 2-call floor because they
+                # touch multiple surfaces. Claude-sonnet-4-6 reliably refused
+                # retry feedback on simple ops ("1/2 → 0/2") because the
+                # exploration demand didn't match the task size; scaling by
+                # complexity restores intent-alignment while preserving the
+                # gate's purpose.
                 _task_complexity = getattr(ctx, "task_complexity", "") or ""
                 _EXPLORATION_TOOLS = frozenset({
                     "read_file", "search_code", "get_callers", "list_symbols",
                     "glob_files", "list_dir",
                 })
-                _min_explore = int(os.environ.get("JARVIS_MIN_EXPLORATION_CALLS", "2"))
+                _env_min = os.environ.get("JARVIS_MIN_EXPLORATION_CALLS")
+                if _env_min is not None:
+                    _min_explore = int(_env_min)
+                elif _task_complexity == "simple":
+                    _min_explore = 1
+                else:
+                    _min_explore = 2
                 _explore_gate_enabled = (
                     os.environ.get("JARVIS_EXPLORATION_GATE", "true").lower() == "true"
                     and _task_complexity != "trivial"

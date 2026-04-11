@@ -1446,7 +1446,11 @@ class CandidateGenerator:
 
     # Hard ceiling for fallback provider — fail fast when unreachable
     # rather than burning the entire pipeline budget (Manifesto §6: Iron Gate).
-    _FALLBACK_MAX_TIMEOUT_S: float = 60.0
+    # Raised from 60s to 120s after bt-2026-04-11-085020 diagnosed tool_round
+    # full_content patches legitimately needing 60-90s of stream time. IMMEDIATE
+    # route also funnels through this cap, and a 60s cap was cutting mid-stream
+    # healthy generation (23KB received at 365 bytes/s — normal Claude rate).
+    _FALLBACK_MAX_TIMEOUT_S: float = 120.0
 
     async def _call_fallback(
         self,

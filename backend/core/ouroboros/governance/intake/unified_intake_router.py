@@ -59,25 +59,55 @@ _BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
 # the function signature at every call site.
 _active_goal_tracker: Optional[Any] = None
 
+# Counters for the goal-alignment fault path — visible failure accounting
+# replaces the old silent `except: pass`. The first failure logs at WARNING
+# with full exc_info so operators notice; subsequent failures log at DEBUG
+# so a broken tracker doesn't flood the logs. Aggregate counters are
+# exposed via ``goal_alignment_failure_stats()`` for health endpoints.
+_goal_alignment_failures: int = 0
+_goal_alignment_warned: bool = False
+
+
+def goal_alignment_failure_stats() -> Dict[str, int]:
+    """Return cumulative failure counts for the goal-alignment scorer.
+
+    Callers use this to surface broken strategic-direction integration on
+    health dashboards or battle-test postmortems without parsing logs.
+    """
+    return {"failures": _goal_alignment_failures}
+
 
 def _compute_priority(
     envelope: "IntentEnvelope",
     dependency_credit: int = 0,
-) -> int:
-    """Compute cost-aware priority score for an envelope.
+) -> Tuple[int, Optional[Any]]:
+    """Compute cost-aware priority score + rich goal alignment for an envelope.
 
-    Lower int = higher priority.  Factors:
+    Returns ``(priority_int, goal_alignment_or_none)``. Lower int = higher
+    priority. ``goal_alignment`` is a :class:`GoalAlignment` when a tracker
+    is installed and the scorer ran successfully (even on a no-match), and
+    ``None`` when no tracker is present or the scorer raised — callers can
+    branch on ``is None`` to tell "scoring didn't run" apart from
+    "scoring ran and found nothing".
+
+    Factors:
     1. Base priority from source type
     2. Urgency boost (critical/high get promoted)
     3. Cost-awareness: operations touching many files are penalized
        (they consume more generation tokens for less focused impact)
     4. Dependency credit: ops that unblock queued signals get priority boost
-    5. Goal alignment: signals that match active user goals get boosted (P2.4)
+    5. Goal alignment: signals that match active user goals get boosted —
+       boost magnitude now scales with raw relevance score, not just
+       match/no-match, so a signal that hits three goals wins over one
+       that hits a single low-confidence goal at the same source tier.
 
-    The cost penalty is mild (0-2 points) — urgency and source type
-    still dominate, but within the same tier, focused single-file ops
-    are preferred over sprawling multi-file ones.
+    Fault isolation: a broken or misconfigured GoalTracker MUST NOT break
+    the intake router. Exceptions are logged (warn-once, debug-after) and
+    counted so operators can tell "goal scoring is down" from a status
+    endpoint rather than wondering why prioritization looks flat.
     """
+    global _goal_alignment_failures, _goal_alignment_warned
+
     base = _PRIORITY_MAP.get(envelope.source, 99)
     urgency = _URGENCY_BOOST.get(envelope.urgency, 0)
     # Cost penalty: 0 for 1 file, 1 for 2-4 files, 2 for 5+ files
@@ -88,16 +118,33 @@ def _compute_priority(
     # Dependency credit: ops that would unblock queued signals get boosted
     # Capped at 3 to prevent runaway priority from large queues
     dep_bonus = min(dependency_credit, 3)
-    # P2.4: Goal alignment boost — signals aligned with active user goals
+
+    # P2.4 / Item 3: Goal alignment — visible failure, rich result.
     goal_boost = 0
+    alignment: Optional[Any] = None
     if _active_goal_tracker is not None:
         try:
-            goal_boost = _active_goal_tracker.alignment_boost(
+            alignment = _active_goal_tracker.alignment_context(
                 envelope.description, envelope.target_files,
             )
-        except Exception:
-            pass  # Goal scoring is best-effort
-    return base - urgency + cost_penalty - confidence_bonus - dep_bonus - goal_boost
+            goal_boost = int(getattr(alignment, "boost", 0) or 0)
+        except Exception as exc:
+            _goal_alignment_failures += 1
+            if not _goal_alignment_warned:
+                _goal_alignment_warned = True
+                logger.warning(
+                    "[Router] goal alignment scorer failed (first occurrence, "
+                    "subsequent failures will log at DEBUG): %s",
+                    exc, exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "[Router] goal alignment scorer failed (total=%d): %s",
+                    _goal_alignment_failures, exc,
+                )
+
+    priority = base - urgency + cost_penalty - confidence_bonus - dep_bonus - goal_boost
+    return priority, alignment
 
 
 @dataclass(frozen=True)
@@ -295,7 +342,19 @@ class UnifiedIntakeRouter:
             if _blocking_entry is not None:
                 _blocking_id, _ = _blocking_entry
                 _dep_credit += len(self._queued_behind.get(_blocking_id, []))
-        priority = _compute_priority(envelope, dependency_credit=_dep_credit)
+        priority, alignment = _compute_priority(
+            envelope, dependency_credit=_dep_credit,
+        )
+        # Stash goal-alignment diagnostics on the envelope so downstream
+        # phases (orchestrator, SerpentFlow postmortems, dead-letter audit)
+        # can trace why this signal landed where it did. Mutating evidence
+        # in place is safe: frozen=True protects top-level fields but the
+        # dict reference itself is writable (matches intent_envelope.py:166).
+        if alignment is not None and alignment.is_match:
+            try:
+                envelope.evidence.update(alignment.as_evidence())
+            except Exception as _stash_exc:  # pragma: no cover — defence in depth
+                logger.debug("[Router] evidence stash failed: %s", _stash_exc)
         await self._queue.put((priority, envelope.submitted_at, envelope))
 
         # Fire A-narrator hook — non-critical; failures logged only
@@ -575,7 +634,7 @@ class UnifiedIntakeRouter:
                 # Re-enqueue for retry at the same priority.
                 # Use put_nowait() to avoid blocking the dispatch loop (self-deadlock).
                 # If the queue is full, dead-letter immediately rather than stall.
-                priority = _compute_priority(envelope)
+                priority, _alignment = _compute_priority(envelope)
                 try:
                     self._queue.put_nowait((priority, envelope.submitted_at, envelope))
                 except asyncio.QueueFull:
@@ -601,7 +660,12 @@ class UnifiedIntakeRouter:
         for entry in pending:
             try:
                 envelope = IE.from_dict(entry.envelope_dict)
-                priority = _compute_priority(envelope)
+                # WAL replay preserves whatever alignment metadata was
+                # already stashed in envelope.evidence from the original
+                # ingest — no need to re-score and pollute the replay path
+                # with a second round of scorer failures if the tracker
+                # happens to be broken at replay time.
+                priority, _alignment = _compute_priority(envelope)
                 await self._queue.put((priority, envelope.submitted_at, envelope))
                 logger.debug(
                     "Router: replayed lease_id=%s source=%s",

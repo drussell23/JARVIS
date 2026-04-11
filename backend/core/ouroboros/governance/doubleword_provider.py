@@ -516,10 +516,9 @@ class DoublewordProvider:
     ) -> int:
         """Compute max_tokens for a DW generation call.
 
-        Tool rounds get a small fixed budget (tool call JSON is ~1K
-        tokens). Code-gen rounds start from the complexity-derived
-        ceiling, then scale *up* by the actual target file size so
-        full-file rewrites don't truncate mid-string.
+        Always starts from the complexity-derived ceiling, then scales *up*
+        by the actual target file size so full-file rewrites don't truncate
+        mid-string.
 
         Formula:
             raw = total_bytes / _DW_CHARS_PER_TOKEN
@@ -533,16 +532,16 @@ class DoublewordProvider:
             The current ``OperationContext``. Expected attributes:
             ``task_complexity`` (str) and ``target_files`` (seq of rel paths).
         is_tool_round:
-            When True, return the tool-round cap (``_tool_round_max_tokens``
-            from the tool loop, or 1024 default).
+            Advisory only — no longer affects the budget. The flag is set
+            *before* the call based on ``round_index > 0``, but the model
+            decides per-response whether to emit a short tool-call JSON or
+            the final ``full_content`` candidate. Capping at 1024 on
+            ``round > 0`` truncated the terminal round's patch mid-string
+            (battle test bt-2026-04-11-065233). DW bills on actual output
+            tokens, so a generous cap on every round costs nothing when the
+            model naturally stops short on an intermediate tool-call round.
         """
-        # Tool round — small fixed budget (same behaviour as before).
-        if is_tool_round:
-            base = 1024
-            if self._tool_loop is not None:
-                base = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
-            return min(int(base), _DW_MAX_TOKENS)
-
+        del is_tool_round  # advisory only — see docstring
         complexity = getattr(context, "task_complexity", "") or ""
         complexity_ceiling = _DW_COMPLEXITY_MAX_TOKENS.get(
             complexity, self._max_tokens,
@@ -934,16 +933,22 @@ class DoublewordProvider:
             return None
 
         # Execute with or without tool loop.
-        # Complexity routing: skip Venom for TRIVIAL and SIMPLE tasks on DW.
-        # DW 397B tool loop adds 80-100s for simple tasks where one-shot suffices.
-        # Claude keeps tools for simple tasks (it's the fallback and has thinking).
+        # Complexity routing: skip Venom only for TRIVIAL tasks on DW.
+        # Previously also skipped SIMPLE, but those still face the Iron Gate
+        # exploration-first check (per CLAUDE.md: "trivial ops bypass").
+        # Battle test bt-2026-04-11-085929 traced STANDARD route failures to
+        # DW producing one-shot patches on simple ops → Iron Gate rejection
+        # (0/2 exploration) → 71s of 120s budget burned → Claude fallback
+        # starved to 48.7s → stream cut mid-output at 9KB. Keeping Venom on
+        # for simple ops means DW does its own exploration and either passes
+        # the gate directly or produces a correctly-shaped candidate for Claude.
         _complexity = getattr(context, "task_complexity", "")
         _ceiling = _DW_COMPLEXITY_MAX_TOKENS.get(_complexity, self._max_tokens)
         # Dynamic budget: complexity ceiling is the floor, scale up by
         # actual target file bytes. Matches what _generate_raw will
         # actually pass to the API (kept in sync so the log is truthful).
         _eff_mt = self._compute_dynamic_max_tokens(context, is_tool_round=False)
-        _skip_tools = _complexity in ("trivial", "simple")
+        _skip_tools = _complexity == "trivial"
         if _skip_tools:
             if _eff_mt > _ceiling:
                 logger.info(

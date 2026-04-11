@@ -991,27 +991,34 @@ def _build_lean_codegen_prompt(
     # ── 8. Output schema ────────────────────────────────────────────────
     # Lean mode always uses full_content schema — simpler for the model
     # and avoids diff-anchoring issues with partial source snapshots.
+    #
+    # CRITICAL: the schema example is shown as a plain indented block,
+    # NOT a ```json fence. Parse failures in bt-2026-04-11-065233 showed
+    # the model mimicking the fence from a prior fenced example — it
+    # emitted ```json\n{...} without a closing ``` and the response was
+    # truncated mid-string, breaking the extractor. Plain indentation
+    # teaches the model to output raw JSON with no wrapper.
     schema_instruction = f"""## Output Schema
 
-After exploring with tools, return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION}"):
+CRITICAL OUTPUT CONTRACT: Your very first character MUST be `{{`. Do not write any prose, analysis, headers, or markdown fences before or after the JSON. The response is parsed by `json.loads` on the raw text — anything else breaks the parser.
 
-```json
-{{
-  "schema_version": "{_SCHEMA_VERSION}",
-  "candidates": [
+Return a JSON object matching this structure (schema_version: "{_SCHEMA_VERSION}"):
+
     {{
-      "candidate_id": "c1",
-      "file_path": "<repo-relative path matching the target file>",
-      "full_content": "<complete modified file content — not a diff>",
-      "rationale": "<one sentence, max 200 chars>"
+      "schema_version": "{_SCHEMA_VERSION}",
+      "candidates": [
+        {{
+          "candidate_id": "c1",
+          "file_path": "<repo-relative path matching the target file>",
+          "full_content": "<complete modified file content — not a diff>",
+          "rationale": "<one sentence, max 200 chars>"
+        }}
+      ],
+      "provider_metadata": {{
+        "model_id": "<your model identifier>",
+        "reasoning_summary": "<max 200 chars>"
+      }}
     }}
-  ],
-  "provider_metadata": {{
-    "model_id": "<your model identifier>",
-    "reasoning_summary": "<max 200 chars>"
-  }}
-}}
-```
 
 Rules:
 - **Explore first**: Use `read_file` to read the full target file before generating.
@@ -1019,7 +1026,7 @@ Rules:
 - `full_content` must be the **complete** file (not a diff or patch).
 - Python files must be syntactically valid (`ast.parse()`-clean).
 - If the change is already implemented, return `{{"schema_version": "2b.1-noop", "reason": "<why>"}}`.
-- No extra keys. Return ONLY the JSON object."""
+- NEVER wrap the JSON in ```json ... ``` fences. NEVER emit prose before the opening `{{`. Your first character is `{{`."""
     parts.append(schema_instruction)
 
     return "\n\n".join(parts)
@@ -1981,7 +1988,37 @@ def _extract_json_block(raw: str) -> str:
         if balanced:
             return balanced
 
-    # 6. Fallback — return cleaned text
+    # 6. Fallback — prose-prefix / truncated-JSON recovery.
+    #
+    # When none of the above paths matched, the response is usually one
+    # of two shapes observed in parse_failures/:
+    #
+    # (a) Prose preamble + truncated JSON
+    #     "Looking at the code, I need to:\n\n...\n\n{...unclosed"
+    #     The model emitted reasoning text before the JSON and then ran
+    #     out of output tokens (or voluntarily stopped) mid-string. The
+    #     leading prose fails json.loads at col 0, and _repair_json can't
+    #     help because its step-6 brace-closer still returns text that
+    #     starts with prose.
+    #
+    # (b) Opening ```json fence without a closing ```
+    #     "```json\n{...unclosed"
+    #     The fence regex in step 3 requires a balanced ```...``` pair
+    #     so a truncated response (no closing fence) falls through.
+    #
+    # Both shapes become recoverable if we strip whatever precedes the
+    # first `{` and drop any trailing partial fence close. `_repair_json`
+    # downstream then counts unbalanced braces and appends `}` as needed.
+    # If there is no `{` at all, we return cleaned unchanged so the caller
+    # gets a meaningful parse error instead of an empty string.
+    if first_brace > 0:
+        tail = cleaned[first_brace:]
+        # Drop a trailing partial fence close ("```" with optional
+        # whitespace) so _repair_json's brace-counter isn't confused
+        # by backtick characters.
+        tail = re.sub(r"\s*`{1,3}\s*$", "", tail)
+        if tail:
+            return tail
     return cleaned
 
 
@@ -2064,9 +2101,27 @@ def _repair_json(text: str) -> str:
     except (ValueError, _json.JSONDecodeError):
         pass
 
-    # 6. Truncated JSON — close unbalanced braces/brackets
-    depth_brace = 0
-    depth_bracket = 0
+    # 6. Truncated JSON — close unbalanced strings, braces, and brackets.
+    #
+    # We walk the text once, tracking string state AND a container STACK
+    # (not two independent counters), because JSON is LIFO: the opener
+    # sequence ``{ [ {`` must be closed as ``} ] }``, not ``] } }``.
+    # At end-of-text three things may be unclosed:
+    #
+    #   1. A string (``in_str`` still True) — model was cut off mid-value.
+    #      The trailing char may be a dangling escape (``\``), which would
+    #      cause an appended ``"`` to be read as an escaped quote. We strip
+    #      a lone trailing backslash before appending the close quote.
+    #
+    #   2. Container stack — each open that wasn't closed gets a matching
+    #      closer emitted in reverse order (innermost first).
+    #
+    # Close order: string first, then a possible trailing comma, then
+    # containers popped LIFO. This handles the truncation-inside-
+    # full_content shape from parse_failures/claude-api_op-019d7b54-*.txt
+    # where the response was cut off mid-string deep inside a candidate
+    # entry, with multiple levels of object+array nesting above it.
+    stack: List[str] = []
     in_str = False
     esc = False
     for ch in repaired:
@@ -2082,18 +2137,25 @@ def _repair_json(text: str) -> str:
         if in_str:
             continue
         if ch == "{":
-            depth_brace += 1
-        elif ch == "}":
-            depth_brace -= 1
+            stack.append("}")
         elif ch == "[":
-            depth_bracket += 1
-        elif ch == "]":
-            depth_bracket -= 1
-    if depth_brace > 0 or depth_bracket > 0:
-        # Strip trailing comma if present, then close containers
-        closed = repaired.rstrip().rstrip(",")
-        closed += "]" * max(depth_bracket, 0)
-        closed += "}" * max(depth_brace, 0)
+            stack.append("]")
+        elif ch == "}" or ch == "]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+            # Mismatched close — leave stack alone; the parser will
+            # surface the error later, we're not a validator.
+    if stack or in_str:
+        closed = repaired
+        if in_str:
+            closed = closed.rstrip()
+            if closed.endswith("\\") and not closed.endswith("\\\\"):
+                closed = closed[:-1]
+            closed += '"'
+        # Strip a trailing comma if we're now right after a closed value.
+        closed = closed.rstrip().rstrip(",")
+        # Pop the stack innermost-first to get LIFO close order.
+        closed += "".join(reversed(stack))
         try:
             _json.loads(closed)
             return closed
@@ -3183,14 +3245,23 @@ _CLAUDE_OUTPUT_OVERHEAD_TOKENS = 2048  # schema wrapper + rationale + misc
 # the connection while the model is still generating invisible reasoning
 # tokens. We override with a generous read budget and layer exponential
 # backoff retry on top for transient 5xx/timeout conditions.
+#
+# Write and pool timeouts default to ``_CLAUDE_HTTP_READ_TIMEOUT_THINKING_S``
+# (600s) to match Anthropic's own SDK defaults. The previous values (30s /
+# 10s) caused httpx ``WriteTimeout``/``PoolTimeout`` exceptions — which the
+# Anthropic SDK wraps as ``APITimeoutError`` — to fire 17–36 seconds into
+# streaming calls with extended thinking enabled, before any tokens had
+# arrived. Battle test bt-2026-04-11-075739 traced the failure to these
+# tight values; Anthropic's own defaults (``Timeout(connect=5, read=600,
+# write=600, pool=600)``) are the correct reference.
 _CLAUDE_HTTP_CONNECT_TIMEOUT_S = float(
     os.environ.get("JARVIS_CLAUDE_HTTP_CONNECT_TIMEOUT_S", "10.0")
 )
 _CLAUDE_HTTP_WRITE_TIMEOUT_S = float(
-    os.environ.get("JARVIS_CLAUDE_HTTP_WRITE_TIMEOUT_S", "30.0")
+    os.environ.get("JARVIS_CLAUDE_HTTP_WRITE_TIMEOUT_S", "600.0")
 )
 _CLAUDE_HTTP_POOL_TIMEOUT_S = float(
-    os.environ.get("JARVIS_CLAUDE_HTTP_POOL_TIMEOUT_S", "10.0")
+    os.environ.get("JARVIS_CLAUDE_HTTP_POOL_TIMEOUT_S", "600.0")
 )
 # Read timeout — when extended thinking is on, the API may hold the
 # connection open for minutes before emitting the first token. 600s
@@ -3916,7 +3987,30 @@ class ClaudeProvider:
                 )
                 return result
             except BaseException as exc:  # noqa: BLE001 — we rethrow below
-                exc_class = type(exc).__name__
+                # Bare class name is used for set-membership lookups against
+                # _CLAUDE_HARD_POOL_EXC_NAMES and _CLAUDE_RETRYABLE_EXC_NAMES.
+                # Never mutate it — see the cause-walking bug fix below.
+                exc_class_bare = type(exc).__name__
+                # Anthropic SDK wraps httpx exceptions as APIConnectionError /
+                # APITimeoutError, which hides the real cause (ReadError /
+                # RemoteProtocolError / PoolTimeout / etc). Walk __cause__ so
+                # the log tells us what *actually* happened at the socket.
+                # Bug fix (bt-2026-04-11-090651): previously we mutated
+                # exc_class in place with the cause suffix, which broke the
+                # hard-pool-exc-names set lookup below — recycle silently
+                # stopped firing and attempt 2 reused the degraded pool,
+                # producing first_token=NEVER hangs. Keep lookup + display
+                # separate.
+                _cause = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+                # Unwrap to the bare name of the innermost cause for lookup
+                # purposes too — ReadError nested inside APIConnectionError
+                # should still trigger the ReadError-keyed recycle.
+                if _cause is not None:
+                    cause_cls_bare = type(_cause).__name__
+                    exc_class_display = f"{exc_class_bare}(cause={cause_cls_bare}:{_cause})"
+                else:
+                    cause_cls_bare = ""
+                    exc_class_display = exc_class_bare
                 attempt_elapsed_ms = int((time.monotonic() - attempt_start_mono) * 1000)
 
                 if not _is_retryable_transient_error(exc):
@@ -3924,19 +4018,24 @@ class ClaudeProvider:
                         label=label, attempt=attempt + 1, max_attempts=max_attempts,
                         elapsed_ms=attempt_elapsed_ms,
                         remaining_ms=_remaining_ms_now(),
-                        exc_class=exc_class, outcome="non_retryable",
+                        exc_class=exc_class_display, outcome="non_retryable",
                     )
                     raise
 
                 # Hard-pool signal → recycle the client NOW, not at end-of-cycle.
                 # The current pool is degraded; continuing to use it wastes
                 # retries. The next attempt builds a fresh connection pool.
-                if (
-                    _CLAUDE_RECYCLE_ON_POOL_TIMEOUT
-                    and exc_class in _CLAUDE_HARD_POOL_EXC_NAMES
-                ):
+                # Check BOTH the wrapper class and the unwrapped cause — the
+                # Anthropic SDK wraps httpx.ReadError as APIConnectionError,
+                # so the ReadError-triggered recycle only fires if we look
+                # through the wrapper.
+                _hard_pool_hit = (
+                    exc_class_bare in _CLAUDE_HARD_POOL_EXC_NAMES
+                    or (cause_cls_bare and cause_cls_bare in _CLAUDE_HARD_POOL_EXC_NAMES)
+                )
+                if _CLAUDE_RECYCLE_ON_POOL_TIMEOUT and _hard_pool_hit:
                     self._recycle_client(
-                        reason=f"hard_pool_signal:{label}:{exc_class}"
+                        reason=f"hard_pool_signal:{label}:{exc_class_display}"
                     )
 
                 # Streaming progress check — can't retry once bytes are out.
@@ -3951,13 +4050,13 @@ class ClaudeProvider:
                             label=label, attempt=attempt + 1, max_attempts=max_attempts,
                             elapsed_ms=attempt_elapsed_ms,
                             remaining_ms=_remaining_ms_now(),
-                            exc_class=exc_class, outcome="progress_no_retry",
+                            exc_class=exc_class_display, outcome="progress_no_retry",
                         )
                         logger.warning(
                             "[ClaudeProvider] %s transient failure after "
                             "partial progress (%s) — aborting retry to "
                             "avoid duplicated output [gen=%d elapsed=%dms]",
-                            label, exc_class, self._client_generation,
+                            label, exc_class_display, self._client_generation,
                             attempt_elapsed_ms,
                         )
                         raise
@@ -3969,13 +4068,13 @@ class ClaudeProvider:
                         label=label, attempt=attempt + 1, max_attempts=max_attempts,
                         elapsed_ms=attempt_elapsed_ms,
                         remaining_ms=_remaining_ms_now(),
-                        exc_class=exc_class, outcome="exhausted",
+                        exc_class=exc_class_display, outcome="exhausted",
                     )
                     logger.warning(
                         "[ClaudeProvider] %s transient failure exhausted "
                         "retries (%d/%d): %s [gen=%d total_elapsed=%dms "
                         "remaining=%s]",
-                        label, attempt + 1, max_attempts, exc_class,
+                        label, attempt + 1, max_attempts, exc_class_display,
                         self._client_generation,
                         int((time.monotonic() - start_mono) * 1000),
                         (
@@ -3985,7 +4084,7 @@ class ClaudeProvider:
                     )
                     if _CLAUDE_RECYCLE_ON_EXHAUST:
                         self._recycle_client(
-                            reason=f"retry_exhausted:{label}:{exc_class}"
+                            reason=f"retry_exhausted:{label}:{exc_class_display}"
                         )
                     raise
 
@@ -4008,17 +4107,19 @@ class ClaudeProvider:
                             label=label, attempt=attempt + 1, max_attempts=max_attempts,
                             elapsed_ms=attempt_elapsed_ms,
                             remaining_ms=int(rem_post * 1000),
-                            exc_class=exc_class, outcome="budget_starved_no_retry",
+                            exc_class=exc_class_display,
+                            outcome="budget_starved_no_retry",
                         )
                         logger.warning(
                             "[ClaudeProvider] %s transient failure (%s) but "
                             "only %.1fs remains — refusing retry to preserve "
                             "fallback budget [gen=%d]",
-                            label, exc_class, rem_post, self._client_generation,
+                            label, exc_class_display, rem_post,
+                            self._client_generation,
                         )
                         if _CLAUDE_RECYCLE_ON_EXHAUST:
                             self._recycle_client(
-                                reason=f"budget_starved:{label}:{exc_class}"
+                                reason=f"budget_starved:{label}:{exc_class_display}"
                             )
                         raise
 
@@ -4026,13 +4127,14 @@ class ClaudeProvider:
                     label=label, attempt=attempt + 1, max_attempts=max_attempts,
                     elapsed_ms=attempt_elapsed_ms,
                     remaining_ms=(int(rem_post * 1000) if rem_post is not None else None),
-                    exc_class=exc_class, outcome=f"retry_backoff_{capped:.1f}s",
+                    exc_class=exc_class_display,
+                    outcome=f"retry_backoff_{capped:.1f}s",
                 )
                 logger.warning(
                     "[ClaudeProvider] %s transient failure (%s), "
                     "backing off %.1fs (attempt %d/%d gen=%d elapsed=%dms "
                     "remaining=%s raw_delay=%.1fs)",
-                    label, exc_class, capped, attempt + 1, max_attempts,
+                    label, exc_class_display, capped, attempt + 1, max_attempts,
                     self._client_generation, attempt_elapsed_ms,
                     (f"{rem_post:.1f}s" if rem_post is not None else "∞"),
                     delay,
@@ -4093,20 +4195,27 @@ class ClaudeProvider:
     ) -> int:
         """Compute the per-call output token budget.
 
-        Tool rounds: small fixed budget (tool call JSON is ~1K tokens).
-        Codegen rounds: scale with target file size so full-file rewrites
-        don't truncate mid-string. Floors at :data:`_CLAUDE_OUTPUT_FLOOR`,
-        caps at ``self._output_ceiling`` (env-tunable).
+        Always scales with target file size so full-file rewrites don't
+        truncate mid-string. Floors at :data:`_CLAUDE_OUTPUT_FLOOR`, caps at
+        ``self._output_ceiling`` (env-tunable).
+
+        The ``is_tool_round`` flag is advisory only — kept for logging /
+        observability but no longer affects the budget. Rationale: the flag
+        is set *before* the call based on ``round_index > 0``, but the model
+        decides per-response whether to emit a short tool-call JSON or the
+        final ``full_content`` candidate. We can't distinguish them ahead of
+        time, so capping at 1024 on ``round > 0`` truncated the terminal
+        round's patch mid-string (battle test bt-2026-04-11-065233). Since
+        Anthropic bills on actual output tokens (not ``max_tokens``), setting
+        a generous cap on every round costs nothing when the model naturally
+        stops short on an intermediate tool-call round.
 
         Root-cause rationale: parse failures in ``.ouroboros/parse_failures/``
         showed 1137-line targets being truncated at the legacy 8192 cap.
         The only way to make full_content generation reliable is to
         budget output tokens from the actual file size.
         """
-        if is_tool_round:
-            base = getattr(self._tool_loop, "_tool_round_max_tokens", 1024) if self._tool_loop else 1024
-            return min(int(base), self._output_ceiling)
-
+        del is_tool_round  # advisory only — see docstring
         target_files = getattr(context, "target_files", ()) or ()
         primary_repo = getattr(context, "primary_repo", "jarvis")
         total_bytes = 0
@@ -4402,6 +4511,14 @@ class ClaudeProvider:
 
                 async def _do_stream() -> None:
                     nonlocal raw_content, input_tokens, output_tokens, _cached_input
+                    # Re-acquire the client on every attempt so retries after
+                    # _recycle_client() pick up the new generation instead of
+                    # the original closure-captured instance. Without this,
+                    # a hard_pool_signal recycle mid-backoff leaves _do_stream
+                    # holding a .close()'d client and the next retry fails
+                    # with "Cannot send a request, as the client has been
+                    # closed" — battle test bf1vf9icr session.
+                    _current_client = self._ensure_client()
                     _stream_kwargs: Dict[str, Any] = {
                         "model": self._model,
                         "max_tokens": _effective_max_tokens,
@@ -4411,7 +4528,7 @@ class ClaudeProvider:
                     }
                     if _thinking_param is not None:
                         _stream_kwargs["thinking"] = _thinking_param
-                    async with client.messages.stream(**_stream_kwargs) as stream:
+                    async with _current_client.messages.stream(**_stream_kwargs) as stream:
                         async for text in stream.text_stream:
                             if _stream_first_token_at[0] is None:
                                 _stream_first_token_at[0] = time.monotonic()
@@ -4483,17 +4600,36 @@ class ClaudeProvider:
                     await asyncio.wait_for(
                         _stream_with_resilience(), timeout=timeout_s,
                     )
-                except asyncio.TimeoutError as _te:
-                    # Re-raise with enough context that the cascade log and
-                    # postmortem can explain what actually happened. Without
-                    # this, callers see a bare `TimeoutError: ` with no
-                    # message, which is useless for debugging.
+                except (asyncio.TimeoutError, asyncio.CancelledError) as _te:
+                    # Catch BOTH timeout and cancellation so we always get
+                    # diagnostic data. Outer candidate_generator wait_for
+                    # often wins the race and fires CancelledError into us
+                    # a tick before our own asyncio.TimeoutError could fire
+                    # (battle test bt-2026-04-11-083742 — both timeouts
+                    # were 56-60s; outer won and the rich TimeoutError
+                    # message below never ran).
                     _elapsed = time.monotonic() - _call_start
                     _ttft = _stream_first_token_at[0]
                     _ttft_str = (
                         f"{_ttft - _call_start:.1f}s" if _ttft is not None
                         else "NEVER"
                     )
+                    logger.warning(
+                        "[ClaudeProvider] stream terminated via %s: "
+                        "elapsed=%.1fs budget=%.1fs first_token=%s "
+                        "bytes_received=%d tool_round=%s thinking=%s",
+                        type(_te).__name__,
+                        _elapsed,
+                        timeout_s,
+                        _ttft_str,
+                        len(raw_content),
+                        "yes" if _is_tool_round else "no",
+                        "on" if _thinking_param is not None else "off",
+                    )
+                    # On CancelledError we MUST re-raise the exact same
+                    # exception (not wrap it) — PEP 479 / asyncio contract.
+                    if isinstance(_te, asyncio.CancelledError):
+                        raise
                     raise asyncio.TimeoutError(
                         f"claude stream timed out after {_elapsed:.1f}s "
                         f"(budget={timeout_s:.1f}s, first_token={_ttft_str}, "
@@ -4514,8 +4650,12 @@ class ClaudeProvider:
                     _create_kwargs["thinking"] = _thinking_param
                 async def _create_with_prefill_fallback() -> Any:
                     """Same prefill-rejection fallback as the stream path."""
+                    # Re-acquire the client on every attempt — see the
+                    # matching comment in _do_stream. Closure-captured
+                    # clients go stale after _recycle_client() fires.
+                    _current_client = self._ensure_client()
                     try:
-                        return await client.messages.create(**_create_kwargs)
+                        return await _current_client.messages.create(**_create_kwargs)
                     except Exception as _exc:
                         _msg = str(_exc).lower()
                         if (
@@ -4530,7 +4670,7 @@ class ClaudeProvider:
                                 type(_exc).__name__,
                             )
                             _messages.pop()
-                            return await client.messages.create(**_create_kwargs)
+                            return await _current_client.messages.create(**_create_kwargs)
                         raise
 
                 # Reinforced transport: non-stream path is fully idempotent
@@ -4596,6 +4736,34 @@ class ClaudeProvider:
                         "[ClaudeProvider] \U0001f9e0 Extended thinking: ~%d thinking tokens "
                         "(budget: %d) — deep reasoning before generation",
                         _thinking_tokens, self._thinking_budget,
+                    )
+            # Log stop_reason so parse failures can be correlated to
+            # max_tokens truncation vs end_turn vs refusal. Prior to this
+            # log line, a response truncated mid-string was indistinguishable
+            # from a response the model voluntarily cut short — both just
+            # failed at json.loads with no diagnostic. Manifesto §7.
+            if _last_msg[0] is not None:
+                _stop_reason = getattr(_last_msg[0], "stop_reason", None)
+                _stop_seq = getattr(_last_msg[0], "stop_sequence", None)
+                if _stop_reason and _stop_reason != "end_turn":
+                    logger.warning(
+                        "[ClaudeProvider] non-end_turn stop: reason=%s seq=%r "
+                        "output_tokens=%d max_tokens=%d tool_round=%s — "
+                        "response may be truncated",
+                        _stop_reason,
+                        _stop_seq,
+                        output_tokens,
+                        _effective_max_tokens,
+                        "yes" if _is_tool_round else "no",
+                    )
+                else:
+                    logger.debug(
+                        "[ClaudeProvider] stop_reason=%s output_tokens=%d "
+                        "raw_chars=%d tool_round=%s",
+                        _stop_reason,
+                        output_tokens,
+                        len(raw_content),
+                        "yes" if _is_tool_round else "no",
                     )
             cost = self._estimate_cost(input_tokens, output_tokens, _cached_input)
             self._record_cost(cost)
@@ -4666,7 +4834,9 @@ class ClaudeProvider:
                 )
 
                 async def _legacy_create() -> Any:
-                    return await client.messages.create(
+                    # Re-acquire per attempt — see _do_stream comment.
+                    _current_client = self._ensure_client()
+                    return await _current_client.messages.create(
                         model=self._model,
                         max_tokens=self._compute_output_budget(
                             context, is_tool_round=False,
@@ -4802,10 +4972,12 @@ class ClaudeProvider:
         if self._daily_spend >= self._daily_budget:
             raise RuntimeError("claude_budget_exhausted")
 
-        client = self._ensure_client()
+        self._ensure_client()  # prime; _plan_create re-reads on each attempt
 
         async def _plan_create() -> Any:
-            return await client.messages.create(
+            # Re-acquire per attempt — see _do_stream comment.
+            _current_client = self._ensure_client()
+            return await _current_client.messages.create(
                 model=self._model,
                 max_tokens=512,
                 system=(

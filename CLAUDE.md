@@ -186,3 +186,9 @@ This is not a software refactor. It is the genesis of an autonomous, self-evolvi
 7. **Absolute observability** -- every autonomous decision is visible
 
 **Zero-shortcut mandate**: No brute-force retries without diagnosis. No hardcoded routing tables. Structural repair, not bypasses.
+
+## Battle Test Milestones
+
+Full postmortems for sustained battle-test breakthroughs live in `docs/architecture/OUROBOROS.md#battle-test-breakthrough-log`. The canonical source of truth for any "did the loop work" question is the session `debug.log` under `.ouroboros/sessions/<session-id>/`, not `summary.json` (which has a known `attempted` counter bug).
+
+**2026-04-11 (`bt-2026-04-11-154947`)** — First sustained full-pipeline completion since the Apr 9–10 Iron Gate tightening. `op-019d7d3e` (requirements.txt upgrade) traversed CLASSIFY → GENERATE → IRON_GATE_REJECT → REGENERATE → APPLY → DECISION(applied) → VERIFY → L2 → POSTMORTEM autonomously. `dependency_file_integrity` Iron Gate caught a hallucinated `anthropic → anthropichttp` rename on attempt 1. Unblocker: captured-client race fix in `providers.py` — `_do_stream`/`_create_with_prefill_fallback`/`_legacy_create`/`_plan_create` now re-acquire `self._client` on every `_call_with_backoff` retry so recycles after hard-pool signals are visible to subsequent attempts.
