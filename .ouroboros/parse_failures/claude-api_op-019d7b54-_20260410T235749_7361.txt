@@ -1,0 +1,55 @@
+# provider=claude-api
+# op_id=op-019d7b54-804b-7521-9e30-d99682f27e24-cau
+# exception_type=JSONDecodeError
+# exception_message=Expecting value: line 1 column 1 (char 0)
+# raw_len=3352
+# extracted_len=3352
+# ============================================================
+# RAW (pre-extraction):
+# ============================================================
+Looking at the code, I need to:
+
+1. Fix the HACK at line 291 - the comment says "XXX are often quick fixes that can be resolved" but this is actually a legitimate code comment describing the logic below it. The actual HACK/issue is that the `_is_auto_resolvable` method could be improved to also handle `XXX` markers with a broader set of keywords, and the comment itself is the target of the op.
+
+2. Generate a test file for the uncovered module.
+
+Let me analyze what the op is asking: The HACK comment at line 291 says `/XXX are often quick fixes that can be resolved` - this is the marker comment itself being flagged. The fix is to resolve this by improving the logic - specifically, the comment is accurate but the code could be cleaner and more explicit about what it's doing.
+
+The actual structural repair here is: the comment at line 291 is a `# HACK` marker that the scanner itself would detect. The fix is to convert this into proper, clean code that doesn't need a HACK comment - i.e., make the logic more explicit and remove the self-referential HACK comment.
+
+Looking at line 291: `# HACK/XXX are often quick fixes that can be resolved` - this is actually a code comment (not a HACK marker), but the op-ID says it's at line 291 and the goal mentions "XXX are often quick fixes". The comment is just a regular comment explaining the logic. The "fix" is to make this code cleaner - perhaps by extracting the auto-resolvable keywords into named constants and removing the informal comment style.
+
+The real fix: replace the informal `# HACK/XXX are often quick fixes that can be resolved` comment with a proper docstring-style explanation, and potentially expand the keyword list for better coverage.
+
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/intake/sensors/todo_scanner_sensor.py",
+      "full_content": "\"\"\"\nTodoScannerSensor — Finds unfinished work in the Trinity codebase.\n\nScans all Python files for TODO, FIXME, HACK, XXX, NOQA, and\nDEPRECATED markers. Classifies by priority and routes actionable\nitems through the Ouroboros pipeline.\n\nBoundary Principle:\n  Deterministic: Regex scan, file enumeration, priority classification.\n  Agentic: Resolution of the TODO (code generation) via pipeline.\n\"\"\"\nfrom __future__ import annotations\n\nimport logging\nimport os\nimport re\nfrom dataclasses import dataclass, field\nfrom pathlib import Path\nfrom typing import Any, Dict, List, Optional, Tuple\nimport asyncio\n\nfrom backend.core.ouroboros.governance.intake.intent_envelope import make_envelope\n\nlogger = logging.getLogger(__name__)\n\n_POLL_INTERVAL_S = float(os.environ.get(\"JARVIS_TODO_SCAN_INTERVAL_S\", \"86400\"))\n\n# Markers to scan for, with priority weights\n_MARKERS: Dict[str, Tuple[str, float]] = {\n    \"FIXME\":      (\"high\", 0.9),\n    \"HACK\":       (\"high\", 0.8),\n    \"XXX\":        (\"high\", 0.7),\n    \"BUG\":        (\"high\", 0.9),\n    \"TODO\":       (\"normal\", 0.5),\n    \"DEPRECATED\": (\"normal\", 0.4),\n    \"OPTIMIZE\":   (\"low\", 0.3),\n    \"REFACTOR\":   (\"low\", 0.3),\n    \"NOTE\":       (\"low\", 0.1),  # Low priority — informational only\n}\n\n_MARKER_PATTERN = re.compile(\n    r\"#\\s*(\" + \"|\".join(_MARKERS.keys()) + r\")\\b[:\\s]*(.*)\",\n    re.IGNORECASE,\n
+
+# ============================================================
+# EXTRACTED (post _extract_json_block):
+# ============================================================
+Looking at the code, I need to:
+
+1. Fix the HACK at line 291 - the comment says "XXX are often quick fixes that can be resolved" but this is actually a legitimate code comment describing the logic below it. The actual HACK/issue is that the `_is_auto_resolvable` method could be improved to also handle `XXX` markers with a broader set of keywords, and the comment itself is the target of the op.
+
+2. Generate a test file for the uncovered module.
+
+Let me analyze what the op is asking: The HACK comment at line 291 says `/XXX are often quick fixes that can be resolved` - this is the marker comment itself being flagged. The fix is to resolve this by improving the logic - specifically, the comment is accurate but the code could be cleaner and more explicit about what it's doing.
+
+The actual structural repair here is: the comment at line 291 is a `# HACK` marker that the scanner itself would detect. The fix is to convert this into proper, clean code that doesn't need a HACK comment - i.e., make the logic more explicit and remove the self-referential HACK comment.
+
+Looking at line 291: `# HACK/XXX are often quick fixes that can be resolved` - this is actually a code comment (not a HACK marker), but the op-ID says it's at line 291 and the goal mentions "XXX are often quick fixes". The comment is just a regular comment explaining the logic. The "fix" is to make this code cleaner - perhaps by extracting the auto-resolvable keywords into named constants and removing the informal comment style.
+
+The real fix: replace the informal `# HACK/XXX are often quick fixes that can be resolved` comment with a proper docstring-style explanation, and potentially expand the keyword list for better coverage.
+
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/intake/sensors/todo_scanner_sensor.py",
+      "full_content": "\"\"\"\nTodoScannerSensor — Finds unfinished work in the Trinity codebase.\n\nScans all Python files for TODO, FIXME, HACK, XXX, NOQA, and\nDEPRECATED markers. Classifies by priority and routes actionable\nitems through the Ouroboros pipeline.\n\nBoundary Principle:\n  Deterministic: Regex scan, file enumeration, priority classification.\n  Agentic: Resolution of the TODO (code generation) via pipeline.\n\"\"\"\nfrom __future__ import annotations\n\nimport logging\nimport os\nimport re\nfrom dataclasses import dataclass, field\nfrom pathlib import Path\nfrom typing import Any, Dict, List, Optional, Tuple\nimport asyncio\n\nfrom backend.core.ouroboros.governance.intake.intent_envelope import make_envelope\n\nlogger = logging.getLogger(__name__)\n\n_POLL_INTERVAL_S = float(os.environ.get(\"JARVIS_TODO_SCAN_INTERVAL_S\", \"86400\"))\n\n# Markers to scan for, with priority weights\n_MARKERS: Dict[str, Tuple[str, float]] = {\n    \"FIXME\":      (\"high\", 0.9),\n    \"HACK\":       (\"high\", 0.8),\n    \"XXX\":        (\"high\", 0.7),\n    \"BUG\":        (\"high\", 0.9),\n    \"TODO\":       (\"normal\", 0.5),\n    \"DEPRECATED\": (\"normal\", 0.4),\n    \"OPTIMIZE\":   (\"low\", 0.3),\n    \"REFACTOR\":   (\"low\", 0.3),\n    \"NOTE\":       (\"low\", 0.1),  # Low priority — informational only\n}\n\n_MARKER_PATTERN = re.compile(\n    r\"#\\s*(\" + \"|\".join(_MARKERS.keys()) + r\")\\b[:\\s]*(.*)\",\n    re.IGNORECASE,\n
