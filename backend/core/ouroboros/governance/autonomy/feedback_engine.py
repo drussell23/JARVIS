@@ -43,6 +43,7 @@ from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     EventType,
 )
 from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
+from backend.core.ouroboros.governance.sandbox_paths import sandbox_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -678,7 +679,10 @@ class AutonomyFeedbackEngine:
     # ------------------------------------------------------------------
 
     def _cursor_path(self) -> Path:
-        return self._config.state_dir / _CURSOR_FILENAME
+        # Iron Gate compliance: sandbox_fallback catches PermissionError on
+        # the state_dir and routes to .ouroboros/state/sandbox_fallback/.
+        primary = self._config.state_dir / _CURSOR_FILENAME
+        return sandbox_fallback(primary)
 
     def _load_cursor(self) -> None:
         """Load the persisted cursor from disk, populating ``_seen_files``."""

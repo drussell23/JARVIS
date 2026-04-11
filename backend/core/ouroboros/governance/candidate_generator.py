@@ -62,6 +62,10 @@ from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
 )
+from backend.core.ouroboros.governance.dw_latency_tracker import (
+    DwLatencyTracker,
+    get_default_tracker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -619,6 +623,7 @@ class CandidateGenerator:
         fallback_concurrency: int = 2,
         tier0: Optional[Any] = None,  # DoublewordProvider (batch, async)
         ledger: Optional[Any] = None,  # OperationLedger for batch traceability
+        latency_tracker: Optional[DwLatencyTracker] = None,
     ) -> None:
         self._primary = primary
         self._fallback = fallback
@@ -627,6 +632,9 @@ class CandidateGenerator:
         self._primary_sem = asyncio.Semaphore(primary_concurrency)
         self._fallback_sem = asyncio.Semaphore(fallback_concurrency)
         self.fsm = FailbackStateMachine()
+        # Manifesto §5: rolling p95 DW RT latency → dynamic Tier 0 budget.
+        # Cold endpoints get full ceiling, hot endpoints dial down aggressively.
+        self._latency_tracker = latency_tracker or get_default_tracker()
         # Async Tier 0 tracking: op_id → CompletedBatch
         self._completed_batches: dict[str, Any] = {}
         # Background polling tasks (kept to prevent GC)
@@ -715,16 +723,18 @@ class CandidateGenerator:
                 _tier0_attempted = True
                 remaining = self._remaining_seconds(deadline)
                 _complexity = getattr(context, "task_complexity", "trivial")
-                tier0_budget = self._compute_tier0_budget(
+                tier0_budget = self._compute_tier0_budget_dynamic(
                     remaining, _complexity, _provider_route,
                 )
                 tier1_reserve = remaining - tier0_budget
+                _tracker_p95 = self._latency_tracker.p95() if self._latency_tracker else None
 
                 logger.info(
                     "[CandidateGenerator] Tier 0 RT: budget=%.1fs of %.1fs "
-                    "(Tier 1 reserve=%.1fs), complexity=%s, model=%s",
+                    "(Tier 1 reserve=%.1fs), complexity=%s, model=%s, p95=%s",
                     tier0_budget, remaining, tier1_reserve, _complexity,
                     getattr(self._tier0, "_model", "unknown"),
+                    f"{_tracker_p95:.1f}s" if _tracker_p95 is not None else "cold",
                 )
 
                 if tier0_budget <= 0:
@@ -750,6 +760,10 @@ class CandidateGenerator:
                             # RT success — record recovery if coming back from failure
                             if self.fsm._consecutive_failures > 0:
                                 self.fsm.record_primary_success()
+                            if self._latency_tracker is not None:
+                                self._latency_tracker.record_success(
+                                    result.generation_duration_s,
+                                )
                             logger.info(
                                 "[CandidateGenerator] Tier 0 RT: %d candidates in %.1fs "
                                 "(zero polling)",
@@ -797,6 +811,10 @@ class CandidateGenerator:
                                 if result is not None and len(result.candidates) > 0:
                                     if self.fsm._consecutive_failures > 0:
                                         self.fsm.record_primary_success()
+                                    if self._latency_tracker is not None:
+                                        self._latency_tracker.record_success(
+                                            result.generation_duration_s,
+                                        )
                                     logger.info(
                                         "[CandidateGenerator] Tier 0 RT: %d candidates "
                                         "in %.1fs (stream extension saved it)",
@@ -830,6 +848,8 @@ class CandidateGenerator:
                             tier0_budget, self._remaining_seconds(deadline),
                         )
                         self.fsm.record_primary_failure(mode=FailureMode.TIMEOUT)
+                        if self._latency_tracker is not None:
+                            self._latency_tracker.record_failure()
                     except asyncio.CancelledError:
                         _gen_task.cancel()
                         raise
@@ -844,6 +864,8 @@ class CandidateGenerator:
                         )
                         if mode is not FailureMode.CONTENT_FAILURE:
                             self.fsm.record_primary_failure(mode=mode)
+                            if self._latency_tracker is not None:
+                                self._latency_tracker.record_failure()
 
             else:
                 # ── Legacy batch path (DOUBLEWORD_REALTIME_ENABLED=false) ──
@@ -1546,6 +1568,53 @@ class CandidateGenerator:
             total_s - tier1_reserve,
         )
         return max(budget, 0.0)
+
+    def _compute_tier0_budget_dynamic(
+        self,
+        total_s: float,
+        complexity: str = "trivial",
+        provider_route: str = "standard",
+    ) -> float:
+        """Tier 0 budget with rolling p95 awareness (Manifesto §5).
+
+        Computes the static deterministic budget first (preserving all Tier 1
+        reserve invariants), then tightens it using the latency tracker's p95
+        recommendation when the endpoint is hot. On cold start (few samples
+        or recent failures), falls through to the static budget so the first
+        calls get full runway.
+
+        The tracker NEVER loosens beyond the static ceiling — it only dials
+        down when DW RT has proven fast enough.
+        """
+        static_budget = self._compute_tier0_budget(total_s, complexity, provider_route)
+        if static_budget <= 0:
+            return 0.0
+
+        # Routes that skip tracker scaling entirely.
+        if provider_route in ("immediate", "background", "speculative"):
+            return static_budget
+
+        tracker = self._latency_tracker
+        if tracker is None:
+            return static_budget
+
+        # Use the static budget as the caller-provided ceiling — the tracker
+        # can only dial down from here, never above it. Tier 1 reserve is
+        # already guaranteed by _compute_tier0_budget.
+        complexity_mult = _TIER0_COMPLEXITY_MULTIPLIER.get(complexity, 1.0)
+        recommended = tracker.recommended_budget(
+            route_ceiling_s=static_budget,
+            complexity_multiplier=complexity_mult,
+        )
+        final_budget = max(0.0, min(static_budget, recommended))
+
+        if final_budget < static_budget - 0.5:
+            logger.info(
+                "[CandidateGenerator] DW dynamic budget: %.1fs → %.1fs "
+                "(hot endpoint, p95=%.1fs)",
+                static_budget, final_budget, tracker.p95() or 0.0,
+            )
+        return final_budget
 
     @staticmethod
     def _compute_primary_budget(total_s: float) -> float:

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from backend.core.ouroboros.governance.comm_protocol import CommMessage
+from backend.core.ouroboros.governance.sandbox_paths import sandbox_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +30,12 @@ class OpsLogger:
         log_dir: Optional[Path] = None,
         retention_days: int = 30,
     ) -> None:
-        self._log_dir = Path(
+        _primary = Path(
             log_dir
             or os.environ.get("JARVIS_OPS_LOG_DIR", str(_DEFAULT_LOG_DIR))
         )
+        # Iron Gate compliance: route around PermissionError, don't lower shields.
+        self._log_dir = sandbox_fallback(_primary)
         self._retention_days = int(
             os.environ.get("JARVIS_OPS_LOG_RETENTION_DAYS", str(retention_days))
         )
