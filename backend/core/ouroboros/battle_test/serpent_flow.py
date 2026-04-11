@@ -1666,6 +1666,221 @@ class SerpentFlow:
         return ""
 
 
+    # ══════════════════════════════════════════════════════════
+    # ExecutionGraph rendering (Phase 3b multi-op visibility)
+    # ══════════════════════════════════════════════════════════
+
+    def render_execution_graph(
+        self,
+        progress: Any,
+        *,
+        op_id: str = "",
+        show_critical_path: bool = True,
+        max_units_rendered: int = 12,
+    ) -> None:
+        """Render a live multi-op graph progress view.
+
+        Displays a compact summary of an ``ExecutionGraph`` as tracked
+        by ``ExecutionGraphProgressTracker``: header with graph id /
+        phase / completion ratio, per-unit lanes with status markers
+        and timing, the current critical path highlight, and any
+        recorded merge decisions.
+
+        Parameters
+        ----------
+        progress:
+            A ``GraphProgress`` snapshot. Typed as ``Any`` so this
+            module doesn't pull the autonomy package as a hard import
+            (SerpentFlow should still work if L3 is disabled).
+        op_id:
+            Parent operation id — used to indent the rendering inside
+            an active op block so the graph belongs to the op visually.
+        show_critical_path:
+            Whether to compute and highlight the DAG critical path.
+        max_units_rendered:
+            Cap on per-unit lane rows (large graphs get a "...N more"
+            footer instead of pages of output).
+        """
+        if progress is None:
+            return
+
+        # Header — graph id, phase, completion %.
+        pct = int(round(progress.completion_pct() * 100))
+        phase_value = getattr(progress.phase, "value", str(progress.phase))
+        phase_color = {
+            "created": _C["dim"],
+            "running": _C["neural"],
+            "completed": _C["life"],
+            "failed": _C["death"],
+            "cancelled": _C["heal"],
+        }.get(phase_value, _C["dim"])
+
+        header = (
+            f"[{_C['neural']}]⏺ Graph[/{_C['neural']}]"
+            f"([{_C['file']}]{progress.graph_id[:12]}[/{_C['file']}])"
+            f"  [{phase_color}]{phase_value}[/{phase_color}]"
+            f"  [{_C['dim']}]{pct}% done"
+            f"  {len(progress.units)} units[/{_C['dim']}]"
+        )
+        self._op_line(op_id, header)
+
+        if progress.runtime_ms > 0:
+            runtime_str = (
+                f"{progress.runtime_ms:.0f}ms"
+                if progress.runtime_ms < 1000
+                else f"{progress.runtime_ms / 1000:.1f}s"
+            )
+            self._op_line(
+                op_id,
+                f"[{_C['dim']}]⎿  runtime: {runtime_str}  "
+                f"concurrency: {progress.concurrency_limit}[/{_C['dim']}]",
+            )
+
+        # Critical path highlight.
+        critical_set: set = set()
+        if show_critical_path:
+            try:
+                critical_set = set(progress.critical_path())
+            except Exception:
+                critical_set = set()
+            if critical_set:
+                chain_repr = " → ".join(
+                    f"[{_C['heal']}]{uid}[/{_C['heal']}]" if uid in critical_set else uid
+                    for uid in list(critical_set)[:6]
+                )
+                self._op_line(
+                    op_id,
+                    f"[{_C['dim']}]⎿  critical path: {chain_repr}[/{_C['dim']}]",
+                )
+
+        # Per-unit lanes.
+        unit_status_glyph = {
+            "pending": ("○", _C["dim"]),
+            "running": ("◐", _C["neural"]),
+            "completed": ("●", _C["life"]),
+            "failed": ("✗", _C["death"]),
+            "cancelled": ("◌", _C["heal"]),
+        }
+
+        rendered = 0
+        for unit_id, unit in progress.units.items():
+            if rendered >= max_units_rendered:
+                break
+            state_value = getattr(unit.state, "value", str(unit.state))
+            glyph, color = unit_status_glyph.get(state_value, ("?", _C["dim"]))
+            is_critical = unit_id in critical_set
+
+            # Timing: ms when running, runtime_ms when terminal.
+            if state_value in ("completed", "failed", "cancelled"):
+                ms = getattr(unit, "runtime_ms", 0.0)
+            else:
+                ms = getattr(unit, "elapsed_ms", 0.0)
+            timing = ""
+            if ms > 0:
+                timing = (
+                    f"  [{_C['dim']}]{ms:.0f}ms[/{_C['dim']}]"
+                    if ms < 1000
+                    else f"  [{_C['dim']}]{ms / 1000:.1f}s[/{_C['dim']}]"
+                )
+
+            target_repr = ""
+            if unit.target_files:
+                first = unit.target_files[0]
+                if len(first) > 48:
+                    parts = first.split("/")
+                    first = "/".join(parts[-3:]) if len(parts) >= 3 else first
+                target_repr = f"  [{_C['file']}]{first}[/{_C['file']}]"
+                if len(unit.target_files) > 1:
+                    target_repr += (
+                        f"  [{_C['dim']}](+{len(unit.target_files) - 1})[/{_C['dim']}]"
+                    )
+
+            crit_marker = "★ " if is_critical else "  "
+            lane = (
+                f"  {crit_marker}[{color}]{glyph}[/{color}] "
+                f"{unit_id:<14}{target_repr}{timing}"
+            )
+            self._op_line(op_id, lane)
+
+            # Failure detail for failed units — single line.
+            if state_value == "failed" and getattr(unit, "error", ""):
+                err = unit.error.replace("[", "\\[")[:80]
+                self._op_line(
+                    op_id,
+                    f"       [{_C['death']}]⎿ {err}[/{_C['death']}]",
+                )
+            rendered += 1
+
+        overflow = len(progress.units) - rendered
+        if overflow > 0:
+            self._op_line(
+                op_id,
+                f"  [{_C['dim']}]... +{overflow} more unit"
+                f"{'s' if overflow != 1 else ''}[/{_C['dim']}]",
+            )
+
+        # Merge decisions.
+        decisions = getattr(progress, "merge_decisions", [])
+        if decisions:
+            for decision in decisions[-3:]:  # last 3 barriers
+                barrier = decision.get("barrier_id", "?")
+                repo = decision.get("repo", "?")
+                merged = decision.get("merged_unit_ids", [])
+                conflict = decision.get("conflict_units", [])
+                conflict_note = (
+                    f"  [{_C['death']}]{len(conflict)} conflict"
+                    f"{'s' if len(conflict) != 1 else ''}[/{_C['death']}]"
+                    if conflict
+                    else ""
+                )
+                self._op_line(
+                    op_id,
+                    f"  [{_C['provider']}]⚭ merge[/{_C['provider']}]"
+                    f"  [{_C['dim']}]{repo}:{barrier}  "
+                    f"{len(merged)} units merged{conflict_note}[/{_C['dim']}]",
+                )
+
+    def render_graph_event(self, event: Any, op_id: str = "") -> None:
+        """Render a single ``GraphEvent`` as a compact status line.
+
+        Used when consuming the progress tracker's subscribe()
+        iterator — gives the operator a ticker of graph activity
+        without re-rendering the full multi-lane view each time.
+        """
+        if event is None:
+            return
+        kind_value = getattr(event.kind, "value", str(event.kind))
+        glyphs = {
+            "graph.submitted": ("⏺", _C["dim"], "submitted"),
+            "graph.started": ("⏵", _C["neural"], "started"),
+            "graph.completed": ("✔", _C["life"], "completed"),
+            "graph.failed": ("✗", _C["death"], "failed"),
+            "graph.cancelled": ("◌", _C["heal"], "cancelled"),
+            "unit.ready": ("◎", _C["dim"], "ready"),
+            "unit.started": ("◐", _C["neural"], "started"),
+            "unit.completed": ("●", _C["life"], "completed"),
+            "unit.failed": ("✗", _C["death"], "failed"),
+            "unit.cancelled": ("◌", _C["heal"], "cancelled"),
+            "merge.decided": ("⚭", _C["provider"], "merged"),
+        }
+        glyph, color, label = glyphs.get(kind_value, ("·", _C["dim"], kind_value))
+        target = event.unit_id or event.graph_id[:10]
+        payload = event.payload or {}
+        extra = ""
+        runtime_ms = payload.get("runtime_ms")
+        if isinstance(runtime_ms, (int, float)) and runtime_ms > 0:
+            extra = (
+                f"  [{_C['dim']}]{runtime_ms:.0f}ms[/{_C['dim']}]"
+                if runtime_ms < 1000
+                else f"  [{_C['dim']}]{runtime_ms / 1000:.1f}s[/{_C['dim']}]"
+            )
+        self._op_line(
+            op_id,
+            f"  [{color}]{glyph}[/{color}] {target:<16} "
+            f"[{_C['dim']}]{label}[/{_C['dim']}]{extra}",
+        )
+
+
 # ══════════════════════════════════════════════════════════════
 # SerpentTransport — CommProtocol adapter
 # ══════════════════════════════════════════════════════════════
