@@ -26,6 +26,7 @@ import pytest
 
 from backend.core.ouroboros.governance.strategic_direction import (
     ActiveGoal,
+    GoalMigrationReport,
     GoalStatus,
     GoalTracker,
 )
@@ -795,7 +796,8 @@ class TestPersistence:
             (tmp_root / ".jarvis" / "active_goals.json").read_text()
         )
         assert isinstance(raw, dict)
-        assert raw["schema_version"] == 2
+        # Schema bumped to v3 for Persistent Goal Hierarchy (parent_id).
+        assert raw["schema_version"] == 3
         assert "goals" in raw
 
 
@@ -858,3 +860,371 @@ class TestEnvConfig:
         assert _env_set(
             "JARVIS_TEST_SET_MISSING", ("a", "b"),
         ) == ("a", "b")
+
+
+# ---------------------------------------------------------------------------
+# v3 schema — Persistent Goal Hierarchy (parent_id)
+# ---------------------------------------------------------------------------
+
+
+def _write_goals_file(root: Path, payload) -> Path:
+    """Write a goals JSON file at the v1/v2/v3 path. Returns the path."""
+    path = root / ".jarvis" / "active_goals.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+    return path
+
+
+class TestActiveGoalV3:
+    def test_parent_id_defaults_none(self):
+        g = _mk_goal("g1")
+        assert g.parent_id is None
+        assert g.is_root is True
+
+    def test_is_root_false_when_parent_set(self):
+        g = ActiveGoal(
+            goal_id="child",
+            description="child goal",
+            keywords=("x",),
+            parent_id="parent",
+        )
+        assert g.is_root is False
+        assert g.parent_id == "parent"
+
+
+class TestHierarchyQueries:
+    def test_roots_and_active_roots(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("root-a"))
+        tracker.add_goal(_mk_goal("root-b"))
+        tracker.add_goal(ActiveGoal(
+            goal_id="child-a",
+            description="child of root-a",
+            keywords=("x",),
+            parent_id="root-a",
+        ))
+        assert {g.goal_id for g in tracker.roots} == {"root-a", "root-b"}
+        assert {g.goal_id for g in tracker.active_roots} == {"root-a", "root-b"}
+
+        # Paused root still counts as root but not active.
+        tracker.pause("root-b")
+        assert {g.goal_id for g in tracker.roots} == {"root-a", "root-b"}
+        assert {g.goal_id for g in tracker.active_roots} == {"root-a"}
+
+    def test_children_of(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("parent"))
+        tracker.add_goal(ActiveGoal(
+            goal_id="c1", description="c1", keywords=("x",), parent_id="parent",
+        ))
+        tracker.add_goal(ActiveGoal(
+            goal_id="c2", description="c2", keywords=("x",), parent_id="parent",
+        ))
+        tracker.add_goal(_mk_goal("unrelated"))
+        assert {g.goal_id for g in tracker.children_of("parent")} == {"c1", "c2"}
+        assert tracker.children_of("unrelated") == []
+        assert tracker.children_of("missing") == []
+
+    def test_parent_of(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("p"))
+        tracker.add_goal(ActiveGoal(
+            goal_id="c", description="c", keywords=("x",), parent_id="p",
+        ))
+        parent = tracker.parent_of("c")
+        assert parent is not None
+        assert parent.goal_id == "p"
+        assert tracker.parent_of("p") is None
+        assert tracker.parent_of("missing") is None
+
+    def test_has_cycle_self_reference(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("g1"))
+        assert tracker.has_cycle("g1", "g1") is True
+
+    def test_has_cycle_transitive(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("a"))
+        tracker.add_goal(ActiveGoal(
+            goal_id="b", description="b", keywords=("x",), parent_id="a",
+        ))
+        tracker.add_goal(ActiveGoal(
+            goal_id="c", description="c", keywords=("x",), parent_id="b",
+        ))
+        # Making a's parent c would close the loop a → c → b → a
+        assert tracker.has_cycle("a", "c") is True
+        # Making c's parent a would just reinforce the existing chain — fine.
+        assert tracker.has_cycle("c", "a") is False
+
+
+class TestAddGoalParentValidation:
+    def test_self_reference_is_dropped(self, tracker: GoalTracker):
+        bad = ActiveGoal(
+            goal_id="loop",
+            description="loop",
+            keywords=("x",),
+            parent_id="loop",
+        )
+        tracker.add_goal(bad)
+        stored = tracker.get("loop")
+        assert stored is not None
+        assert stored.parent_id is None
+
+    def test_orphan_parent_installed_as_root(self, tracker: GoalTracker):
+        orphan = ActiveGoal(
+            goal_id="lone",
+            description="lone",
+            keywords=("x",),
+            parent_id="nonexistent",
+        )
+        tracker.add_goal(orphan)
+        stored = tracker.get("lone")
+        assert stored is not None
+        assert stored.parent_id is None
+
+    def test_valid_parent_is_preserved(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("p"))
+        tracker.add_goal(ActiveGoal(
+            goal_id="c", description="c", keywords=("x",), parent_id="p",
+        ))
+        stored = tracker.get("c")
+        assert stored is not None
+        assert stored.parent_id == "p"
+
+    def test_cycle_via_upsert_is_broken(self, tracker: GoalTracker):
+        tracker.add_goal(_mk_goal("a"))
+        tracker.add_goal(ActiveGoal(
+            goal_id="b", description="b", keywords=("x",), parent_id="a",
+        ))
+        # Upserting a to have parent=b closes the loop a → b → a
+        tracker.add_goal(ActiveGoal(
+            goal_id="a",
+            description="a upserted",
+            keywords=("x",),
+            parent_id="b",
+        ))
+        stored_a = tracker.get("a")
+        assert stored_a is not None
+        assert stored_a.parent_id is None  # cycle broken
+        assert stored_a.description == "a upserted"
+
+    def test_capacity_eviction_heals_child_pointers(self, tmp_root: Path):
+        """When a parent is dropped at capacity, children are promoted."""
+        with patch(
+            "backend.core.ouroboros.governance.strategic_direction._MAX_GOALS", 3
+        ):
+            t = GoalTracker(tmp_root)
+            # Mark parent as PAUSED so eviction picks it as the drop target.
+            t.add_goal(_mk_goal("p", status=GoalStatus.PAUSED))
+            t.add_goal(ActiveGoal(
+                goal_id="c1", description="c1", keywords=("x",), parent_id="p",
+            ))
+            t.add_goal(ActiveGoal(
+                goal_id="c2", description="c2", keywords=("x",), parent_id="p",
+            ))
+            # Fourth add triggers eviction — "p" (inactive) is dropped.
+            t.add_goal(_mk_goal("new-one"))
+            assert t.get("p") is None
+            # Children were promoted to roots (parent_id nulled).
+            c1 = t.get("c1")
+            c2 = t.get("c2")
+            assert c1 is not None and c1.parent_id is None
+            assert c2 is not None and c2.parent_id is None
+
+
+class TestPersistenceV3:
+    def test_round_trip_v3_with_parent_id(self, tmp_root: Path):
+        t1 = GoalTracker(tmp_root)
+        t1.add_goal(_mk_goal("parent"))
+        t1.add_goal(ActiveGoal(
+            goal_id="child",
+            description="child",
+            keywords=("y",),
+            parent_id="parent",
+        ))
+
+        t2 = GoalTracker(tmp_root)
+        parent = t2.get("parent")
+        child = t2.get("child")
+        assert parent is not None and parent.parent_id is None
+        assert child is not None and child.parent_id == "parent"
+
+    def test_persist_writes_schema_version_3(self, tmp_root: Path):
+        t = GoalTracker(tmp_root)
+        t.add_goal(_mk_goal("g1"))
+        raw = json.loads((tmp_root / ".jarvis" / "active_goals.json").read_text())
+        assert raw["schema_version"] == 3
+        assert raw["goals"][0]["parent_id"] is None
+
+    def test_v2_auto_upgrades_to_v3(self, tmp_root: Path):
+        """Loading a v2 file should upgrade it to v3 in place."""
+        _write_goals_file(tmp_root, {
+            "schema_version": 2,
+            "goals": [
+                {
+                    "goal_id": "legacy",
+                    "description": "legacy v2 goal",
+                    "keywords": ["x"],
+                    "path_patterns": [],
+                    "tags": [],
+                    "priority_weight": 1.0,
+                    "status": "active",
+                    "due_at": None,
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                },
+            ],
+        })
+        t = GoalTracker(tmp_root)
+        assert t.last_migration_report.source_version == 2
+        assert t.last_migration_report.upgraded is True
+        raw = json.loads((tmp_root / ".jarvis" / "active_goals.json").read_text())
+        assert raw["schema_version"] == 3
+        # parent_id is written even though the v2 source didn't have it.
+        assert "parent_id" in raw["goals"][0]
+        assert raw["goals"][0]["parent_id"] is None
+
+    def test_v1_bare_list_upgrades_to_v3(self, tmp_root: Path):
+        _write_goals_file(tmp_root, [
+            {
+                "goal_id": "g1",
+                "description": "ancient",
+                "keywords": ["old"],
+            },
+        ])
+        t = GoalTracker(tmp_root)
+        assert t.last_migration_report.source_version == 1
+        assert t.last_migration_report.upgraded is True
+        stored = t.get("g1")
+        assert stored is not None and stored.parent_id is None
+        raw = json.loads((tmp_root / ".jarvis" / "active_goals.json").read_text())
+        assert raw["schema_version"] == 3
+
+    def test_load_heals_self_reference(self, tmp_root: Path):
+        _write_goals_file(tmp_root, {
+            "schema_version": 3,
+            "goals": [
+                {
+                    "goal_id": "narcissist",
+                    "description": "points at self",
+                    "keywords": ["x"],
+                    "path_patterns": [],
+                    "tags": [],
+                    "priority_weight": 1.0,
+                    "status": "active",
+                    "parent_id": "narcissist",
+                },
+            ],
+        })
+        t = GoalTracker(tmp_root)
+        stored = t.get("narcissist")
+        assert stored is not None and stored.parent_id is None
+        assert t.last_migration_report.healed_self_reference == 1
+        assert t.last_migration_report.has_issues is True
+
+    def test_load_heals_orphan_parent(self, tmp_root: Path):
+        _write_goals_file(tmp_root, {
+            "schema_version": 3,
+            "goals": [
+                {
+                    "goal_id": "lone",
+                    "description": "parent vanished",
+                    "keywords": ["x"],
+                    "path_patterns": [],
+                    "tags": [],
+                    "priority_weight": 1.0,
+                    "status": "active",
+                    "parent_id": "ghost",
+                },
+            ],
+        })
+        t = GoalTracker(tmp_root)
+        stored = t.get("lone")
+        assert stored is not None
+        assert stored.parent_id is None
+        assert t.last_migration_report.healed_orphan_parent == 1
+
+    def test_load_breaks_cycle(self, tmp_root: Path):
+        _write_goals_file(tmp_root, {
+            "schema_version": 3,
+            "goals": [
+                {
+                    "goal_id": "a",
+                    "description": "a",
+                    "keywords": ["x"],
+                    "path_patterns": [],
+                    "tags": [],
+                    "priority_weight": 1.0,
+                    "status": "active",
+                    "parent_id": "b",
+                },
+                {
+                    "goal_id": "b",
+                    "description": "b",
+                    "keywords": ["x"],
+                    "path_patterns": [],
+                    "tags": [],
+                    "priority_weight": 1.0,
+                    "status": "active",
+                    "parent_id": "a",
+                },
+            ],
+        })
+        t = GoalTracker(tmp_root)
+        # At least one goal in the cycle had its parent_id nulled.
+        roots = t.roots
+        assert len(roots) >= 1
+        assert t.last_migration_report.healed_cycle >= 1
+
+    def test_load_drops_duplicate_ids(self, tmp_root: Path):
+        _write_goals_file(tmp_root, {
+            "schema_version": 3,
+            "goals": [
+                {"goal_id": "dup", "description": "first", "keywords": ["x"]},
+                {"goal_id": "dup", "description": "second", "keywords": ["y"]},
+            ],
+        })
+        t = GoalTracker(tmp_root)
+        assert len(t.all_goals) == 1
+        stored = t.get("dup")
+        assert stored is not None
+        assert stored.description == "first"
+        assert t.last_migration_report.dropped_duplicate_id == 1
+
+    def test_load_drops_invalid_entries(self, tmp_root: Path):
+        _write_goals_file(tmp_root, {
+            "schema_version": 3,
+            "goals": [
+                "not-a-dict",
+                {"description": "no goal_id"},
+                {"goal_id": "", "description": "empty id"},
+                {"goal_id": "good", "description": "ok", "keywords": ["x"]},
+            ],
+        })
+        t = GoalTracker(tmp_root)
+        assert [g.goal_id for g in t.all_goals] == ["good"]
+        assert t.last_migration_report.dropped_invalid == 3
+
+    def test_atomic_persist_uses_temp_file(self, tmp_root: Path):
+        """Persist must route through a .tmp sibling before os.replace."""
+        t = GoalTracker(tmp_root)
+        t.add_goal(_mk_goal("g1"))
+        goals_file = tmp_root / ".jarvis" / "active_goals.json"
+        tmp_file = tmp_root / ".jarvis" / "active_goals.json.tmp"
+        assert goals_file.exists()
+        # Atomic rename should leave no stray .tmp after a successful write.
+        assert not tmp_file.exists()
+
+    def test_migration_report_clean_on_fresh_tracker(self, tmp_root: Path):
+        t = GoalTracker(tmp_root)
+        report = t.last_migration_report
+        assert report.source_version is None  # no file existed
+        assert report.loaded_count == 0
+        assert report.has_issues is False
+        assert report.upgraded is False
+
+    def test_migration_report_summary_reads_cleanly(self):
+        report = GoalMigrationReport(
+            source_version=3,
+            healed_orphan_parent=2,
+            healed_cycle=1,
+        )
+        summary = report.summary()
+        assert "2 orphan parents" in summary
+        assert "1 cycles" in summary
+        assert report.has_issues is True

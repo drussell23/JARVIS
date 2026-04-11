@@ -16,7 +16,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -357,7 +357,11 @@ class StrategicDirectionService:
 import enum
 
 _GOAL_FILE = ".jarvis/active_goals.json"
-_GOAL_SCHEMA_VERSION = 2  # v1 = pre-Week-2; v2 adds status/tags/due/updated_at
+# Schema history:
+#   v1 — pre-Week-2 bare list
+#   v2 — adds status / tags / due_at / updated_at
+#   v3 — adds parent_id for persistent goal hierarchy (strategic memory)
+_GOAL_SCHEMA_VERSION = 3
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -458,9 +462,12 @@ class GoalStatus(enum.Enum):
 class ActiveGoal:
     """A user-defined strategic goal that influences O+V prioritization.
 
-    The schema is backward-compatible with the v1 (P2.4) format:
-    ``status``, ``tags``, ``due_at``, and ``updated_at`` default when the
-    persisted file doesn't contain them.
+    Schema is backward-compatible across v1/v2/v3:
+      * v1 (pre-Week-2): goal_id / description / keywords / path_patterns
+      * v2 adds: status / tags / due_at / updated_at
+      * v3 adds: parent_id (Persistent Goal Hierarchy — strategic memory)
+
+    Missing fields default sensibly when loaded from an older schema.
     """
 
     goal_id: str                 # Short slug: "test-coverage", "reduce-governance-complexity"
@@ -473,10 +480,21 @@ class ActiveGoal:
     due_at: Optional[float] = None        # Unix epoch seconds, None = open-ended
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    # v3: parent_id points to another goal's ``goal_id`` to form a
+    # hierarchy. ``None`` means "top-level objective". Cycles, self-
+    # references and orphan pointers are healed at load time (see
+    # ``GoalTracker._heal_hierarchy``) and rejected at add time (see
+    # ``GoalTracker.add_goal``) — callers never see a corrupt tree.
+    parent_id: Optional[str] = None
 
     @property
     def is_active(self) -> bool:
         return self.status is GoalStatus.ACTIVE
+
+    @property
+    def is_root(self) -> bool:
+        """``True`` when this goal has no parent (top-level objective)."""
+        return self.parent_id is None
 
     def touch(self) -> None:
         """Bump the updated_at timestamp without mutating anything else."""
@@ -537,6 +555,52 @@ class GoalAlignment:
         }
 
 
+@dataclass
+class GoalMigrationReport:
+    """Diagnostic record of what ``GoalTracker._load`` had to repair.
+
+    The loader never throws on corrupt / older-schema input — it repairs
+    what it can, drops what it can't, and stashes a report here so tests,
+    the ``/goal`` REPL and future CLI diagnostics can explain *why* the
+    on-disk state was mutated. Pure data container; behaviour lives on
+    :class:`GoalTracker`.
+    """
+
+    source_version: Optional[int] = None   # 1/2/3, or None if no file existed
+    loaded_count: int = 0                  # goals that survived all checks
+    dropped_invalid: int = 0               # non-dict / missing goal_id entries
+    dropped_duplicate_id: int = 0          # same goal_id seen twice in file
+    healed_self_reference: int = 0         # parent_id == goal_id → nulled
+    healed_orphan_parent: int = 0          # parent_id referenced missing goal
+    healed_cycle: int = 0                  # parent chain loops back to self
+    upgraded: bool = False                 # True iff v<CURRENT loaded & rewritten
+
+    @property
+    def has_issues(self) -> bool:
+        return any((
+            self.dropped_invalid,
+            self.dropped_duplicate_id,
+            self.healed_self_reference,
+            self.healed_orphan_parent,
+            self.healed_cycle,
+        ))
+
+    def summary(self) -> str:
+        """Human-readable issue digest (empty string when clean)."""
+        parts: List[str] = []
+        if self.dropped_invalid:
+            parts.append(f"{self.dropped_invalid} invalid")
+        if self.dropped_duplicate_id:
+            parts.append(f"{self.dropped_duplicate_id} duplicate ids")
+        if self.healed_self_reference:
+            parts.append(f"{self.healed_self_reference} self-refs")
+        if self.healed_orphan_parent:
+            parts.append(f"{self.healed_orphan_parent} orphan parents")
+        if self.healed_cycle:
+            parts.append(f"{self.healed_cycle} cycles")
+        return ", ".join(parts)
+
+
 class GoalTracker:
     """Tracks user-defined strategic goals with relevance-scored injection.
 
@@ -569,7 +633,19 @@ class GoalTracker:
     def __init__(self, project_root: Path) -> None:
         self._root = project_root.resolve()
         self._goals: List[ActiveGoal] = []
+        self._migration_report: GoalMigrationReport = GoalMigrationReport()
         self._load()
+
+    @property
+    def last_migration_report(self) -> GoalMigrationReport:
+        """Diagnostic record of the most recent ``_load`` pass.
+
+        Non-``None`` once ``__init__`` returns. ``has_issues`` will be
+        ``True`` if the loader had to heal self-refs, orphan parents or
+        cycles; ``upgraded`` is ``True`` when the on-disk file was
+        rewritten to the current schema version.
+        """
+        return self._migration_report
 
     # ------------------------------------------------------------------
     # Query
@@ -595,6 +671,50 @@ class GoalTracker:
         return None
 
     # ------------------------------------------------------------------
+    # Hierarchy (v3 schema — Persistent Goal Hierarchy)
+    # ------------------------------------------------------------------
+
+    @property
+    def roots(self) -> List[ActiveGoal]:
+        """Top-level goals (``parent_id is None``), all statuses."""
+        return [g for g in self._goals if g.is_root]
+
+    @property
+    def active_roots(self) -> List[ActiveGoal]:
+        """Top-level goals with ``GoalStatus.ACTIVE``."""
+        return [g for g in self._goals if g.is_root and g.is_active]
+
+    def children_of(self, goal_id: str) -> List[ActiveGoal]:
+        """Direct children of ``goal_id`` (one hop, any status)."""
+        return [g for g in self._goals if g.parent_id == goal_id]
+
+    def parent_of(self, goal_id: str) -> Optional[ActiveGoal]:
+        """Parent of ``goal_id``, or ``None`` for roots / missing ids."""
+        goal = self.get(goal_id)
+        if goal is None or goal.parent_id is None:
+            return None
+        return self.get(goal.parent_id)
+
+    def has_cycle(self, goal_id: str, candidate_parent: str) -> bool:
+        """Would installing ``candidate_parent`` on ``goal_id`` form a cycle?
+
+        Pure query — does not mutate. Returns ``True`` for self-references
+        and for parent chains that walk back to ``goal_id``. Used by the
+        REPL's ``/goal add --parent`` preview and by tests.
+        """
+        if candidate_parent == goal_id:
+            return True
+        seen = {goal_id}
+        cursor: Optional[str] = candidate_parent
+        while cursor is not None:
+            if cursor in seen:
+                return True
+            seen.add(cursor)
+            anc = self.get(cursor)
+            cursor = anc.parent_id if anc else None
+        return False
+
+    # ------------------------------------------------------------------
     # Mutate
     # ------------------------------------------------------------------
 
@@ -609,12 +729,56 @@ class GoalTracker:
         )
 
     def add_goal(self, goal: ActiveGoal) -> None:
-        """Add a goal. If at capacity, drops the oldest *inactive* first;
-        if none are inactive, drops the oldest active.
+        """Add a goal, validating ``parent_id`` before installing it.
 
         Deduped by ``goal_id`` — adding the same id upserts, preserving
-        created_at but bumping updated_at.
+        ``created_at`` but bumping ``updated_at``. Parent validation:
+          * ``parent_id == goal_id`` (self-ref) → nulled, logged.
+          * parent doesn't exist → nulled, goal installs as root.
+          * parent chain loops back to this goal → nulled (cycle).
+        Capacity eviction heals any child goals that were pointing at
+        the evicted parent by promoting them to roots.
         """
+        # ------------------------------------------------------------------
+        # Parent validation — fail safely, always install
+        # ------------------------------------------------------------------
+        if goal.parent_id is not None:
+            if goal.parent_id == goal.goal_id:
+                logger.warning(
+                    "[GoalTracker] %s: self-reference parent_id dropped",
+                    goal.goal_id,
+                )
+                goal = replace(goal, parent_id=None)
+            elif self.get(goal.parent_id) is None:
+                logger.warning(
+                    "[GoalTracker] %s: parent %s does not exist — "
+                    "installing as root",
+                    goal.goal_id, goal.parent_id,
+                )
+                goal = replace(goal, parent_id=None)
+            else:
+                # Cycle check — would making ``goal.parent_id`` the new
+                # parent create a loop? Walks the chain on the *current*
+                # state (the upsert-removal below hasn't happened yet,
+                # so a self-loop via upsert-with-old-ancestry is caught).
+                seen = {goal.goal_id}
+                cursor: Optional[str] = goal.parent_id
+                cycle = False
+                while cursor is not None:
+                    if cursor in seen:
+                        cycle = True
+                        break
+                    seen.add(cursor)
+                    anc = self.get(cursor)
+                    cursor = anc.parent_id if anc else None
+                if cycle:
+                    logger.warning(
+                        "[GoalTracker] %s: parent %s would create cycle "
+                        "— installing as root",
+                        goal.goal_id, goal.parent_id,
+                    )
+                    goal = replace(goal, parent_id=None)
+
         existing = self.get(goal.goal_id)
         if existing is not None:
             # Upsert — preserve created_at, bump updated_at.
@@ -632,7 +796,21 @@ class GoalTracker:
                 self._goals.remove(dropped)
             else:
                 dropped = self._goals.pop(0)
-            logger.info("[GoalTracker] Dropped goal at capacity: %s", dropped.goal_id)
+            logger.info(
+                "[GoalTracker] Dropped goal at capacity: %s", dropped.goal_id,
+            )
+            # Heal any goals whose parent was just dropped — promote
+            # them to roots rather than leaving dangling references.
+            orphaned = 0
+            for i, g in enumerate(self._goals):
+                if g.parent_id == dropped.goal_id:
+                    self._goals[i] = replace(g, parent_id=None)
+                    orphaned += 1
+            if orphaned:
+                logger.info(
+                    "[GoalTracker] Promoted %d child(ren) of %s to roots",
+                    orphaned, dropped.goal_id,
+                )
 
         self._persist()
 
@@ -954,11 +1132,18 @@ class GoalTracker:
     # ------------------------------------------------------------------
 
     def _persist(self) -> None:
+        """Write goals to disk atomically at the current schema version.
+
+        Uses a ``.tmp`` sibling + ``os.replace`` so a crash mid-write
+        never leaves a truncated goals file — the prior good state wins
+        until the full payload is flushed.
+        """
         try:
             path = self._root / _GOAL_FILE
             path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "schema_version": _GOAL_SCHEMA_VERSION,
+                "written_at": time.time(),
                 "goals": [
                     {
                         "goal_id": g.goal_id,
@@ -971,35 +1156,75 @@ class GoalTracker:
                         "due_at": g.due_at,
                         "created_at": g.created_at,
                         "updated_at": g.updated_at,
+                        "parent_id": g.parent_id,
                     }
                     for g in self._goals
                 ],
             }
-            path.write_text(json.dumps(data, indent=2))
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(data, indent=2))
+            os.replace(tmp_path, path)
         except Exception:
             logger.debug("[GoalTracker] Persist failed", exc_info=True)
 
     def _load(self) -> None:
+        report = GoalMigrationReport()
         try:
             path = self._root / _GOAL_FILE
             if not path.exists():
+                self._migration_report = report
                 return
             raw = json.loads(path.read_text())
 
-            # v1 format was a bare list; v2 is a dict with schema_version.
+            # v1 = bare list. v2/v3 = dict with ``schema_version``.
             if isinstance(raw, list):
+                report.source_version = 1
                 entries = raw
             elif isinstance(raw, dict):
+                try:
+                    report.source_version = int(raw.get("schema_version", 2))
+                except (TypeError, ValueError):
+                    report.source_version = 2
                 entries = raw.get("goals", [])
+                if not isinstance(entries, list):
+                    entries = []
             else:
+                self._migration_report = report
                 return
 
-            goals: List[ActiveGoal] = []
+            src_v = report.source_version or 2
+
+            parsed: List[ActiveGoal] = []
+            seen_ids: set = set()
             for g in entries[:_MAX_GOALS]:
                 if not isinstance(g, dict):
+                    report.dropped_invalid += 1
                     continue
-                goals.append(ActiveGoal(
-                    goal_id=str(g.get("goal_id", "")),
+                goal_id = str(g.get("goal_id", "")).strip()
+                if not goal_id:
+                    report.dropped_invalid += 1
+                    continue
+                if goal_id in seen_ids:
+                    report.dropped_duplicate_id += 1
+                    continue
+                seen_ids.add(goal_id)
+
+                # parent_id only exists in v3+; older schemas default None.
+                parent_id: Optional[str] = None
+                if src_v >= 3:
+                    raw_parent = g.get("parent_id")
+                    if raw_parent:
+                        pid = str(raw_parent).strip()
+                        if pid:
+                            if pid == goal_id:
+                                # Self-reference: nulled here so the hier-
+                                # archy heal pass sees a clean graph.
+                                report.healed_self_reference += 1
+                            else:
+                                parent_id = pid
+
+                parsed.append(ActiveGoal(
+                    goal_id=goal_id,
                     description=str(g.get("description", "")),
                     keywords=tuple(g.get("keywords", ())),
                     path_patterns=tuple(g.get("path_patterns", ())),
@@ -1008,15 +1233,97 @@ class GoalTracker:
                     status=GoalStatus.from_str(g.get("status", "active")),
                     due_at=g.get("due_at"),
                     created_at=float(g.get("created_at", 0.0)),
-                    updated_at=float(g.get("updated_at", g.get("created_at", 0.0))),
+                    updated_at=float(
+                        g.get("updated_at", g.get("created_at", 0.0))
+                    ),
+                    parent_id=parent_id,
                 ))
-            self._goals = [g for g in goals if g.goal_id]
+
+            # Hierarchy integrity pass — null out orphan parents + cycles
+            # rather than dropping the goals. Hierarchy corruption should
+            # degrade to a flat list, never to data loss.
+            healed = self._heal_hierarchy(parsed, report=report)
+
+            self._goals = [g for g in healed if g.goal_id]
+            report.loaded_count = len(self._goals)
+            self._migration_report = report
 
             if self._goals:
                 logger.info(
-                    "[GoalTracker] Loaded %d goals: %s",
+                    "[GoalTracker] Loaded %d goals (schema v%d): %s",
                     len(self._goals),
+                    src_v,
                     ", ".join(g.goal_id for g in self._goals),
+                )
+                if report.has_issues:
+                    logger.warning(
+                        "[GoalTracker] Migration healed: %s",
+                        report.summary(),
+                    )
+
+            # Auto-upgrade: if the file is older than the current schema,
+            # rewrite it immediately so v3 fields (parent_id) persist even
+            # on a read-only session. Guarded by ``self._goals`` so we
+            # don't splat an empty file over a corrupt one the user might
+            # want to inspect.
+            if src_v < _GOAL_SCHEMA_VERSION and self._goals:
+                self._persist()
+                report.upgraded = True
+                logger.info(
+                    "[GoalTracker] Upgraded %s: v%d → v%d",
+                    _GOAL_FILE, src_v, _GOAL_SCHEMA_VERSION,
                 )
         except Exception:
             logger.debug("[GoalTracker] Load failed", exc_info=True)
+            self._migration_report = report
+
+    @staticmethod
+    def _heal_hierarchy(
+        goals: List[ActiveGoal],
+        *,
+        report: GoalMigrationReport,
+    ) -> List[ActiveGoal]:
+        """Detect and repair orphan parents + cycles in the parsed graph.
+
+        Runs after per-goal parsing but before goals are installed on the
+        tracker. Each goal is checked against a snapshot of all parsed
+        ids; failures null out ``parent_id`` (the goal becomes a root)
+        and increment the matching ``report`` counter. Never drops a
+        goal.
+        """
+        by_id: Dict[str, ActiveGoal] = {g.goal_id: g for g in goals}
+        healed: List[ActiveGoal] = []
+
+        for goal in goals:
+            if goal.parent_id is None:
+                healed.append(goal)
+                continue
+
+            # Orphan: parent_id points to a goal that wasn't parsed.
+            if goal.parent_id not in by_id:
+                report.healed_orphan_parent += 1
+                healed.append(replace(goal, parent_id=None))
+                continue
+
+            # Cycle: walk the ancestor chain — bail out if we re-enter
+            # any id we've already seen (``goal.goal_id`` primed so a
+            # direct A→B→A loop is caught immediately).
+            seen = {goal.goal_id}
+            cursor: Optional[str] = goal.parent_id
+            cycle = False
+            while cursor is not None:
+                if cursor in seen:
+                    cycle = True
+                    break
+                seen.add(cursor)
+                anc = by_id.get(cursor)
+                cursor = anc.parent_id if anc else None
+
+            if cycle:
+                report.healed_cycle += 1
+                healed.append(replace(goal, parent_id=None))
+                continue
+
+            healed.append(goal)
+
+        return healed
