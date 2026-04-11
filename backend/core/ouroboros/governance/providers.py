@@ -3408,9 +3408,129 @@ class ClaudeProvider:
             os.environ.get("JARVIS_THINKING_BUDGET", "10000")
         )
 
+        # ------------------------------------------------------------------
+        # Prompt caching (Phase 3a) — Anthropic ephemeral cache control on
+        # the stable system prompt. Cached input tokens cost $0.30/M vs
+        # $3.00/M (90% savings). The system prompt + boilerplate are
+        # identical across all codegen calls, making this highly effective
+        # after the first hit.
+        #
+        # Env gates:
+        #   JARVIS_CLAUDE_PROMPT_CACHE_ENABLED  (default "true")
+        #   JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS (default "0" — always shape
+        #       as cacheable blocks when enabled. Anthropic silently ignores
+        #       cache_control on prompts below its ~1024-token minimum, so
+        #       marking is harmless. Operators can raise this as a safety
+        #       valve to avoid cache-request overhead on tiny prompts.)
+        # ------------------------------------------------------------------
+        self._prompt_cache_enabled = (
+            os.environ.get("JARVIS_CLAUDE_PROMPT_CACHE_ENABLED", "true").lower()
+            not in ("false", "0", "no", "off")
+        )
+        try:
+            self._prompt_cache_min_chars = max(
+                0,
+                int(os.environ.get("JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS", "0")),
+            )
+        except ValueError:
+            self._prompt_cache_min_chars = 0
+
+        # Cumulative cache telemetry — surfaced via get_cache_stats() and
+        # logged periodically so operators can verify the savings path is
+        # actually firing.
+        self._cache_stats: Dict[str, Any] = {
+            "hits": 0,                # calls where cached_tokens > 0
+            "misses": 0,              # calls where cached_tokens == 0
+            "total_calls": 0,         # total Claude API calls observed
+            "cached_tokens": 0,       # cumulative cached input tokens
+            "uncached_tokens": 0,     # cumulative uncached input tokens
+            "usd_saved": 0.0,         # cumulative USD saved vs. no-cache
+            "enabled": self._prompt_cache_enabled,
+            "min_chars": self._prompt_cache_min_chars,
+        }
+
     @property
     def provider_name(self) -> str:
         return "claude-api"
+
+    # ------------------------------------------------------------------
+    # Prompt caching helpers (Phase 3a)
+    # ------------------------------------------------------------------
+
+    def _build_cached_system_blocks(
+        self, system_text: str
+    ) -> Any:
+        """Return the Anthropic ``system`` parameter for a codegen call.
+
+        When prompt caching is enabled *and* the text meets the minimum
+        length threshold, returns a list of content blocks with
+        ``cache_control={"type": "ephemeral"}`` on the final block — the
+        supported shape for writing a cache breakpoint. Otherwise returns
+        the plain string, which Anthropic accepts unchanged.
+
+        This helper is the single source of truth for how the system
+        prompt is shaped so callsites never drift. Gated by
+        ``JARVIS_CLAUDE_PROMPT_CACHE_ENABLED`` and
+        ``JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS``.
+        """
+        if not self._prompt_cache_enabled:
+            return system_text
+        if not isinstance(system_text, str) or not system_text:
+            return system_text
+        if len(system_text) < self._prompt_cache_min_chars:
+            return system_text
+        return [
+            {
+                "type": "text",
+                "text": system_text,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    def _record_cache_observation(
+        self, input_tokens: int, cached_tokens: int
+    ) -> None:
+        """Update cumulative cache telemetry after a Claude API response.
+
+        Increments hits/misses, accumulates cached/uncached token counts,
+        and computes the USD saved relative to the uncached-rate baseline
+        ($3.00/M → $0.30/M → $2.70/M savings on cached tokens).
+        """
+        try:
+            _input = int(input_tokens or 0)
+            _cached = int(cached_tokens or 0)
+        except (TypeError, ValueError):
+            return
+        _cached = max(0, min(_cached, _input))
+        _uncached = max(0, _input - _cached)
+        self._cache_stats["total_calls"] += 1
+        self._cache_stats["cached_tokens"] += _cached
+        self._cache_stats["uncached_tokens"] += _uncached
+        if _cached > 0:
+            self._cache_stats["hits"] += 1
+            # Savings = cached × (full_rate − cached_rate)
+            _savings_per_m = _CLAUDE_INPUT_COST_PER_M - 0.30
+            self._cache_stats["usd_saved"] += (
+                (_cached / 1_000_000) * _savings_per_m
+            )
+        else:
+            self._cache_stats["misses"] += 1
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Return a snapshot of cumulative prompt-cache telemetry.
+
+        Safe to call from any thread — returns a shallow copy so callers
+        can't mutate the live counter dict. Used by governed_loop_service
+        and diagnostics endpoints to surface cost savings.
+        """
+        snapshot = dict(self._cache_stats)
+        _calls = max(1, snapshot["total_calls"])
+        snapshot["hit_rate"] = snapshot["hits"] / _calls
+        _total_input = snapshot["cached_tokens"] + snapshot["uncached_tokens"]
+        snapshot["cache_coverage"] = (
+            snapshot["cached_tokens"] / _total_input if _total_input else 0.0
+        )
+        return snapshot
 
     def _ensure_client(self) -> Any:
         """Lazily initialize the Anthropic client with extended-cognition timeouts.
@@ -3820,18 +3940,14 @@ class ClaudeProvider:
                     getattr(context, "provider_route", ""),
                 )
 
-            # Prompt caching: mark the system prompt as cacheable.
-            # Anthropic caches identical system prompts across calls —
-            # cached input tokens cost $0.30/M instead of $3.00/M (90% savings).
-            # The system prompt + tool definitions are identical across all
-            # generation calls, making this highly effective.
-            _system_with_cache = [
-                {
-                    "type": "text",
-                    "text": _CODEGEN_SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                },
-            ]
+            # Prompt caching: use the unified helper so shape decisions
+            # (ephemeral-block vs plain string) flow through one code path.
+            # Env-gated via JARVIS_CLAUDE_PROMPT_CACHE_ENABLED /
+            # JARVIS_CLAUDE_PROMPT_CACHE_MIN_CHARS. On a cache hit, cached
+            # input tokens cost $0.30/M instead of $3.00/M (90% savings).
+            _system_with_cache = self._build_cached_system_blocks(
+                _CODEGEN_SYSTEM_PROMPT
+            )
 
             # Streaming: use stream() for token-by-token output via TUI callback.
             # Falls back to create() if streaming unavailable or callback not set.
@@ -4075,12 +4191,16 @@ class ClaudeProvider:
                 except (TypeError, ValueError):
                     _cached_input = 0
 
+            # Update cumulative cache telemetry — stats are surfaced via
+            # get_cache_stats() so governance can report hit rate & savings.
+            self._record_cache_observation(input_tokens, _cached_input)
             if _cached_input > 0:
                 logger.info(
                     "[ClaudeProvider] \U0001f4b0 Prompt cache hit: %d cached tokens "
-                    "(90%% savings, $%.4f saved)",
+                    "(90%% savings, $%.4f saved, cumulative $%.4f)",
                     _cached_input,
                     (_cached_input / 1_000_000) * (_CLAUDE_INPUT_COST_PER_M - 0.30),
+                    self._cache_stats["usd_saved"],
                 )
             if _use_thinking and _last_msg[0] is not None:
                 _thinking_tokens = 0
@@ -4157,6 +4277,10 @@ class ClaudeProvider:
                         "(round %d)", timeout_s, tool_rounds,
                     )
                     break
+                _legacy_system = self._build_cached_system_blocks(
+                    _CODEGEN_SYSTEM_PROMPT
+                )
+
                 async def _legacy_create() -> Any:
                     return await client.messages.create(
                         model=self._model,
@@ -4164,7 +4288,7 @@ class ClaudeProvider:
                             context, is_tool_round=False,
                         ),
                         temperature=0.2,
-                        system=_CODEGEN_SYSTEM_PROMPT,
+                        system=_legacy_system,
                         messages=messages,
                     )
 
@@ -4178,7 +4302,17 @@ class ClaudeProvider:
                 raw = msg.content[0].text if msg.content else ""
                 input_tokens = getattr(msg.usage, "input_tokens", 0)
                 output_tokens = getattr(msg.usage, "output_tokens", 0)
-                cost = self._estimate_cost(input_tokens, output_tokens)
+                # Phase 3a: legacy loop now honours cache hits too.
+                try:
+                    _legacy_cached = int(
+                        getattr(msg.usage, "cache_read_input_tokens", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    _legacy_cached = 0
+                self._record_cache_observation(input_tokens, _legacy_cached)
+                cost = self._estimate_cost(
+                    input_tokens, output_tokens, _legacy_cached,
+                )
                 self._record_cost(cost)
                 total_cost += cost
                 if total_cost >= self._max_cost_per_op:

@@ -2494,7 +2494,16 @@ class GovernedLoopService:
                     repo_roots=repo_roots_map,
                     tool_loop=_tool_coordinator,
                 )
-                logger.info("[GovernedLoop] ClaudeProvider: configured")
+                # Phase 3a: hold a reference so get_provider_stats() can
+                # surface prompt-cache telemetry (hit rate, $ saved).
+                self._claude_ref = fallback
+                _cache_stats = fallback.get_cache_stats()
+                logger.info(
+                    "[GovernedLoop] ClaudeProvider: configured "
+                    "(prompt_cache=%s, min_chars=%d)",
+                    "on" if _cache_stats["enabled"] else "off",
+                    _cache_stats["min_chars"],
+                )
             except Exception as exc:
                 logger.warning(
                     "[GovernedLoop] ClaudeProvider build failed: %s", exc
