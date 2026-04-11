@@ -1,7 +1,6 @@
 """Unit tests for the sandbox path fallback helper (Phase 1.1)."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from unittest.mock import patch
 
