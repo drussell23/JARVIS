@@ -5521,12 +5521,10 @@ class GovernedOrchestrator:
         with tempfile.TemporaryDirectory(prefix="ouroboros_validate_") as sandbox_str:
             sandbox = Path(sandbox_str)
             runner_changed: list[Path] = []
+            _original_paths: Dict[Path, Path] = {}
             for _fp, _fc in _all_files:
                 _rel = Path(_fp)
                 if _rel.is_absolute():
-                    # Collapse absolute paths into just the basename to keep
-                    # everything under the sandbox root. This preserves the
-                    # legacy single-file behaviour for absolute inputs.
                     _sandbox_file = sandbox / _rel.name
                 else:
                     _sandbox_file = sandbox / _rel
@@ -5534,14 +5532,21 @@ class GovernedOrchestrator:
                 _sandbox_file.write_text(_fc, encoding="utf-8")
                 if _sandbox_file.suffix in _RUNNABLE_EXTENSIONS:
                     runner_changed.append(_sandbox_file)
+                    _original_paths[_sandbox_file] = (
+                        self._config.project_root / _rel
+                        if not _rel.is_absolute()
+                        else _rel
+                    )
 
-            # Safety net: if nothing qualifies for the runner (shouldn't
-            # happen — the all-non-code early return would have fired),
-            # fall back to the primary file path anchor.
             if not runner_changed:
                 _primary_rel = Path(target_file_str)
                 _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
                 runner_changed = [_primary_file]
+                _original_paths[_primary_file] = (
+                    self._config.project_root / _primary_rel
+                    if not _primary_rel.is_absolute()
+                    else _primary_rel
+                )
 
             # Step 4: Run LanguageRouter (or any duck-typed runner)
             try:
@@ -5550,6 +5555,7 @@ class GovernedOrchestrator:
                     sandbox_dir=sandbox,
                     timeout_budget_s=remaining_s,
                     op_id=ctx.op_id,
+                    original_paths=_original_paths,
                 )
             except BlockedPathError as exc:
                 # Security gate rejection → failure_class="security" → CANCELLED (not POSTMORTEM)

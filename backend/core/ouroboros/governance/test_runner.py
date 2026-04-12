@@ -1,8 +1,9 @@
 """TestRunner — Pytest subprocess wrapper for the governed self-development pipeline.
 
 Provides deterministic test scoping and async pytest execution with:
-- Name-convention mapping (foo.py -> test_foo.py)
-- Package and repo-level fallbacks
+- Multi-strategy test discovery (name convention, recursive search, package/repo fallback)
+- Original-path-aware resolution for sandbox validation paths
+- Env-configurable timeouts, retry, max files, and test directory names
 - Flake detection via single retry
 - Structured JSON output parsing via pytest-json-report
 - Security: symlinks pointing outside repo_root are rejected
@@ -22,6 +23,19 @@ from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Env-driven configuration — no hardcoded constants
+# ---------------------------------------------------------------------------
+
+_TEST_TIMEOUT_S = float(os.environ.get("JARVIS_TEST_TIMEOUT_S", "120"))
+_TEST_RETRY_ENABLED = os.environ.get(
+    "JARVIS_TEST_RETRY_ENABLED", "true"
+).lower() in ("1", "true", "yes")
+_TEST_MAX_FILES = int(os.environ.get("JARVIS_TEST_MAX_FILES", "50"))
+_TEST_DIR_NAMES: FrozenSet[str] = frozenset(
+    os.environ.get("JARVIS_TEST_DIR_NAMES", "tests,test").split(",")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -189,27 +203,37 @@ class PythonAdapter:
     async def resolve(
         self,
         changed_files: Tuple[Path, ...],
-        _repo_root: Path,  # protocol-required; PythonAdapter uses self._repo_root for consistency with run()
+        _repo_root: Path,
+        original_paths: Optional[Dict[Path, Path]] = None,
     ) -> Tuple[Path, ...]:
-        """Delegate to TestRunner.resolve_affected_tests()."""
+        """Delegate to TestRunner.resolve_affected_tests().
+
+        Passes *original_paths* through so sandbox paths are mapped back
+        to repo-relative paths for correct test directory discovery.
+        """
         runner = TestRunner(repo_root=self._repo_root, timeout=self._timeout)
-        return await runner.resolve_affected_tests(changed_files)
+        return await runner.resolve_affected_tests(
+            changed_files, original_paths=original_paths,
+        )
 
     async def run(
         self,
         test_files: Tuple[Path, ...],
         sandbox_dir: Optional[Path],
         timeout_budget_s: float,
-        # TODO: forward _op_id to TestRunner once TestRunner supports tracing (Task 4+)
         _op_id: str,
     ) -> AdapterResult:
-        """Run pytest and wrap result in AdapterResult."""
+        """Run pytest and wrap result in AdapterResult.
+
+        Always runs pytest from ``repo_root`` (not sandbox_dir) so that
+        Python imports resolve correctly against the actual project layout.
+        """
         t0 = time.monotonic()
         runner = TestRunner(
             repo_root=self._repo_root,
             timeout=min(timeout_budget_s, self._timeout),
         )
-        test_result = await runner.run(test_files=test_files, sandbox_dir=sandbox_dir)
+        test_result = await runner.run(test_files=test_files, sandbox_dir=None)
         elapsed = time.monotonic() - t0
         return AdapterResult(
             adapter="python",
@@ -292,6 +316,7 @@ class CppAdapter:
         self,
         _changed_files: Tuple[Path, ...],
         _repo_root: Path,
+        original_paths: Optional[Dict[Path, Path]] = None,
     ) -> Tuple[Path, ...]:
         """ctest is label/name-driven, not file-path-driven.
         Returns () — always run full ctest suite deterministically.
@@ -520,8 +545,17 @@ class LanguageRouter:
         sandbox_dir: Optional[Path],
         timeout_budget_s: float,
         op_id: str,
+        original_paths: Optional[Dict[Path, Path]] = None,
     ) -> MultiAdapterResult:
-        """Run all required adapters and merge results into MultiAdapterResult."""
+        """Run all required adapters and merge results into MultiAdapterResult.
+
+        Parameters
+        ----------
+        original_paths:
+            Optional mapping from sandbox paths to original repo-relative
+            paths.  Passed through to adapter ``resolve()`` so test
+            discovery can use the real repo layout.
+        """
         t0 = time.monotonic()
         # Raises BlockedPathError if any file is outside repo_root
         required_names = _route(changed_files, self._repo_root)
@@ -535,7 +569,10 @@ class LanguageRouter:
                 )
                 continue
 
-            test_files = await adapter.resolve(changed_files, self._repo_root)
+            test_files = await adapter.resolve(
+                changed_files, self._repo_root,
+                original_paths=original_paths,
+            )
             remaining = timeout_budget_s - (time.monotonic() - t0)
             if remaining <= 0:
                 results.append(AdapterResult(
@@ -602,15 +639,63 @@ def _is_safe_path(path: Path, repo_root: Path) -> bool:
     return False
 
 
-def _find_sibling_tests_dir(source_file: Path) -> Optional[Path]:
-    """Walk up from *source_file* looking for a sibling ``tests/`` directory."""
+def _find_sibling_tests_dir(
+    source_file: Path,
+    dir_names: FrozenSet[str] = _TEST_DIR_NAMES,
+) -> Optional[Path]:
+    """Walk up from *source_file* looking for a sibling test directory.
+
+    Checks each directory name in *dir_names* at every level.
+    """
     current = source_file.parent
     while current != current.parent:
-        candidate = current / "tests"
-        if candidate.is_dir():
-            return candidate
+        for name in sorted(dir_names):
+            candidate = current / name
+            if candidate.is_dir():
+                return candidate
         current = current.parent
     return None
+
+
+def _resolve_original_path(
+    sandbox_path: Path,
+    original_paths: Optional[Dict[Path, Path]],
+) -> Path:
+    """Map a sandbox path back to the original repo-relative path.
+
+    When the orchestrator writes candidate files to a temp sandbox for
+    VALIDATE, test discovery needs the *original* path to locate the
+    correct test directory in the repo.  Returns *sandbox_path* unchanged
+    when no mapping is available.
+    """
+    if original_paths is None:
+        return sandbox_path
+    return original_paths.get(sandbox_path, sandbox_path)
+
+
+async def _find_test_recursive(
+    source_stem: str,
+    repo_root: Path,
+    dir_names: FrozenSet[str] = _TEST_DIR_NAMES,
+) -> Optional[Path]:
+    """Search recursively for ``test_<stem>.py`` under any top-level test directory.
+
+    Runs the filesystem walk in a thread executor to avoid blocking the
+    event loop on large repos.
+    """
+    target = f"test_{source_stem}.py"
+    loop = asyncio.get_running_loop()
+
+    def _scan() -> Optional[Path]:
+        for tdn in sorted(dir_names):
+            top_tests = repo_root / tdn
+            if top_tests.is_dir():
+                for match in top_tests.rglob(target):
+                    if match.is_file():
+                        return match
+        return None
+
+    return await loop.run_in_executor(None, _scan)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +713,7 @@ class TestRunner:
         Per-invocation timeout in seconds (default 120).
     """
 
-    def __init__(self, repo_root: Path, timeout: float = 120.0) -> None:
+    def __init__(self, repo_root: Path, timeout: float = _TEST_TIMEOUT_S) -> None:
         self._repo_root = repo_root.resolve()
         self._timeout = timeout
 
@@ -637,64 +722,125 @@ class TestRunner:
     async def resolve_affected_tests(
         self,
         changed_files: Tuple[Path, ...],
+        original_paths: Optional[Dict[Path, Path]] = None,
     ) -> Tuple[Path, ...]:
         """Deterministically scope which test files to run.
 
-        Strategy (evaluated per changed file):
-        1. **Name convention**: ``foo.py`` -> ``test_foo.py`` in nearest
-           sibling ``tests/`` directory.
-        2. **Package fallback**: if no name match, run *all* tests in the
-           nearest ``tests/`` directory.
-        3. **Repo fallback**: if still empty, return the repo-level
-           ``tests/`` directory.
+        Parameters
+        ----------
+        changed_files:
+            Paths to changed source files.  May be sandbox paths (from
+            VALIDATE) or repo paths (from VERIFY).
+        original_paths:
+            Optional mapping from sandbox paths to their original
+            repo-relative paths.  When the orchestrator writes candidates
+            to a temp sandbox, test discovery must use the *original*
+            repo path to locate sibling ``tests/`` directories.
 
-        Symlinks that resolve outside *repo_root* (and outside /tmp, /var)
+        Strategy (evaluated per changed file, first match wins):
+        1. **Name convention** — ``foo.py`` → ``test_foo.py`` in nearest
+           sibling ``tests/`` directory (using original path).
+        2. **Recursive search** — ``test_foo.py`` anywhere under repo
+           test directories (async, off-main-thread).
+        3. **Package fallback** — all ``test_*.py`` files in the nearest
+           sibling ``tests/`` directory.
+        4. **Repo fallback** — repo-level ``tests/`` directory.
+
+        Results are capped at ``JARVIS_TEST_MAX_FILES`` (default 50).
+        Symlinks resolving outside ``repo_root`` (and outside /tmp, /var)
         are silently filtered.
         """
         matched: List[Path] = []
         seen: set = set()
 
         for changed in changed_files:
-            # Security: reject symlinks outside repo
-            if not _is_safe_path(changed, self._repo_root):
+            effective = _resolve_original_path(changed, original_paths)
+
+            if not _is_safe_path(effective, self._repo_root):
                 logger.warning(
-                    "Skipping path outside repo_root: %s", changed,
+                    "[TestRunner] Skipping path outside repo_root: %s (original: %s)",
+                    changed, effective,
                 )
                 continue
 
-            # Strategy 1: name convention
-            test_name = "test_" + changed.name
-            tests_dir = _find_sibling_tests_dir(changed)
+            stem = effective.stem
+            test_name = "test_" + effective.name
+            tests_dir = _find_sibling_tests_dir(effective)
 
+            # Strategy 1: name convention in sibling tests/
             if tests_dir is not None:
                 candidate = tests_dir / test_name
                 if candidate.is_file() and candidate not in seen:
                     seen.add(candidate)
                     matched.append(candidate)
+                    logger.debug(
+                        "[TestRunner] Strategy 1 (name convention): %s → %s",
+                        effective.name, candidate,
+                    )
                     continue
 
-                # Strategy 2: package fallback -- all test files in tests_dir
-                if tests_dir not in seen:
-                    test_files = sorted(tests_dir.glob("test_*.py"))
-                    for tf in test_files:
-                        if tf not in seen:
-                            seen.add(tf)
-                            matched.append(tf)
-                    if test_files:
-                        continue
+            # Strategy 2: recursive search under all test directories
+            recursive_match = await _find_test_recursive(
+                stem, self._repo_root,
+            )
+            if recursive_match is not None and recursive_match not in seen:
+                seen.add(recursive_match)
+                matched.append(recursive_match)
+                logger.debug(
+                    "[TestRunner] Strategy 2 (recursive): %s → %s",
+                    effective.name, recursive_match,
+                )
+                continue
 
-            # Strategy 3: repo fallback
-            repo_tests = self._repo_root / "tests"
-            if repo_tests.is_dir() and repo_tests not in seen:
-                seen.add(repo_tests)
-                matched.append(repo_tests)
+            # Strategy 3: package fallback — all test files in tests_dir
+            if tests_dir is not None and tests_dir not in seen:
+                test_files = sorted(tests_dir.glob("test_*.py"))
+                for tf in test_files:
+                    if tf not in seen:
+                        seen.add(tf)
+                        matched.append(tf)
+                if test_files:
+                    logger.debug(
+                        "[TestRunner] Strategy 3 (package fallback): %s → %d files in %s",
+                        effective.name, len(test_files), tests_dir,
+                    )
+                    continue
 
-        # If nothing matched at all, fall back to repo tests/
+            # Strategy 4: repo fallback
+            for tdn in sorted(_TEST_DIR_NAMES):
+                repo_tests = self._repo_root / tdn
+                if repo_tests.is_dir() and repo_tests not in seen:
+                    seen.add(repo_tests)
+                    matched.append(repo_tests)
+                    logger.debug(
+                        "[TestRunner] Strategy 4 (repo fallback): %s → %s",
+                        effective.name, repo_tests,
+                    )
+                    break
+
+        # Last resort: repo-level test dir if nothing matched at all
         if not matched:
-            repo_tests = self._repo_root / "tests"
-            if repo_tests.is_dir():
-                matched.append(repo_tests)
+            for tdn in sorted(_TEST_DIR_NAMES):
+                repo_tests = self._repo_root / tdn
+                if repo_tests.is_dir():
+                    matched.append(repo_tests)
+                    logger.info(
+                        "[TestRunner] No strategy matched — falling back to %s",
+                        repo_tests,
+                    )
+                    break
 
+        if len(matched) > _TEST_MAX_FILES:
+            logger.info(
+                "[TestRunner] Capping test files from %d to %d (JARVIS_TEST_MAX_FILES)",
+                len(matched), _TEST_MAX_FILES,
+            )
+            matched = matched[:_TEST_MAX_FILES]
+
+        logger.info(
+            "[TestRunner] Resolved %d test targets for %d changed files",
+            len(matched), len(changed_files),
+        )
         return tuple(matched)
 
     async def run(
@@ -710,6 +856,8 @@ class TestRunner:
             Paths to test files or directories.
         sandbox_dir:
             If provided, pytest ``cwd`` is set to this directory.
+            For Python tests, callers should generally leave this ``None``
+            so pytest runs from ``repo_root`` (correct for import resolution).
 
         Returns
         -------
@@ -722,9 +870,10 @@ class TestRunner:
             if _is_safe_path(tf, self._repo_root):
                 safe_files.append(str(tf))
             else:
-                logger.warning("Skipping test path outside repo root: %s", tf)
+                logger.warning("[TestRunner] Skipping test path outside repo root: %s", tf)
 
         if not safe_files:
+            logger.info("[TestRunner] No safe test files to run — returning vacuous pass")
             return TestResult(
                 passed=True,
                 total=0,
@@ -742,9 +891,16 @@ class TestRunner:
         if first.passed:
             return first
 
+        if not _TEST_RETRY_ENABLED:
+            logger.info(
+                "[TestRunner] First run failed (%d/%d), retry disabled (JARVIS_TEST_RETRY_ENABLED=false)",
+                first.failed, first.total,
+            )
+            return first
+
         # Retry once for flake detection
         logger.info(
-            "First run failed (%d/%d). Retrying for flake detection...",
+            "[TestRunner] First run failed (%d/%d). Retrying for flake detection...",
             first.failed, first.total,
         )
         retry = await self._run_pytest(paths, cwd=cwd)
@@ -895,6 +1051,12 @@ class TestRunner:
         failed_count = summary.get("failed", 0)
         error_count = summary.get("error", 0)
         effective_failed = failed_count + error_count
+
+        if total == 0:
+            logger.warning(
+                "[TestRunner] JSON report has 0 tests — likely a discovery or cwd issue. "
+                "stdout snippet: %.300s", stdout[:300],
+            )
 
         # Collect failed test node IDs
         failed_tests: List[str] = []

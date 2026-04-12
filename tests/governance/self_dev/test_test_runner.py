@@ -11,15 +11,22 @@ Validates that TestRunner correctly:
 8. Detects flaky tests (fail-then-pass -> flake_suspected=True)
 9. Rejects symlinks pointing outside repo_root
 10. Handles corrupt/missing JSON report with graceful fallback
+11. Resolves sandbox paths via original_paths mapping
+12. Finds tests recursively when sibling tests/ doesn't have exact name match
+13. Caps test files at JARVIS_TEST_MAX_FILES
+14. Respects JARVIS_TEST_RETRY_ENABLED toggle
 """
 from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Dict
 
 from backend.core.ouroboros.governance.test_runner import (
     TestRunner,
+    _find_test_recursive,
     _is_safe_path,
+    _resolve_original_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -313,3 +320,124 @@ class TestIsSafePathHelper:
         repo = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
         outside = Path("/etc/passwd")
         assert _is_safe_path(outside, repo) is False
+
+
+# ---------------------------------------------------------------------------
+# 12. test_resolve_original_path helper
+# ---------------------------------------------------------------------------
+
+class TestResolveOriginalPath:
+    """Unit tests for the _resolve_original_path sandbox→repo mapping."""
+
+    def test_returns_original_when_mapping_exists(self) -> None:
+        sandbox = Path("/tmp/ouroboros_validate_xyz/verify_gate.py")
+        original = REPO_ROOT / "backend" / "core" / "ouroboros" / "governance" / "verify_gate.py"
+        mapping: Dict[Path, Path] = {sandbox: original}
+        assert _resolve_original_path(sandbox, mapping) == original
+
+    def test_returns_sandbox_path_when_no_mapping(self) -> None:
+        sandbox = Path("/tmp/ouroboros_validate_xyz/verify_gate.py")
+        assert _resolve_original_path(sandbox, None) == sandbox
+
+    def test_returns_sandbox_path_when_not_in_mapping(self) -> None:
+        sandbox = Path("/tmp/ouroboros_validate_xyz/verify_gate.py")
+        other = Path("/tmp/ouroboros_validate_xyz/other.py")
+        mapping: Dict[Path, Path] = {other: REPO_ROOT / "other.py"}
+        assert _resolve_original_path(sandbox, mapping) == sandbox
+
+
+# ---------------------------------------------------------------------------
+# 13. test_resolve_with_original_paths (the core sandbox fix)
+# ---------------------------------------------------------------------------
+
+class TestResolveWithOriginalPaths:
+    """Validates that sandbox paths are correctly mapped to repo paths for
+    test discovery — the P0 fix for VALIDATE phase 0/0 tests."""
+
+    async def test_sandbox_path_maps_to_repo_test(self) -> None:
+        """Sandbox path for calculator.py should find test_calculator.py
+        via original_paths mapping."""
+        sandbox = Path("/tmp/ouroboros_validate_xyz/calculator.py")
+        original = FIXTURE_SRC
+        mapping: Dict[Path, Path] = {sandbox: original}
+
+        runner = TestRunner(repo_root=REPO_ROOT)
+        result = await runner.resolve_affected_tests(
+            changed_files=(sandbox,),
+            original_paths=mapping,
+        )
+        assert any(
+            p.name == "test_calculator.py" for p in result
+        ), f"Expected test_calculator.py in {result}"
+
+    async def test_sandbox_without_mapping_falls_back(self) -> None:
+        """Without original_paths, sandbox path should fall back to repo tests/."""
+        sandbox = Path("/tmp/ouroboros_validate_xyz/some_module.py")
+
+        runner = TestRunner(repo_root=REPO_ROOT)
+        result = await runner.resolve_affected_tests(
+            changed_files=(sandbox,),
+        )
+        assert len(result) > 0, "Expected at least repo-level fallback"
+
+
+# ---------------------------------------------------------------------------
+# 14. test_recursive_search
+# ---------------------------------------------------------------------------
+
+class TestRecursiveSearch:
+    """Validates the recursive test file search under repo test directories."""
+
+    async def test_finds_test_file_recursively(self) -> None:
+        result = await _find_test_recursive("calculator", REPO_ROOT)
+        assert result is not None
+        assert result.name == "test_calculator.py"
+
+    async def test_returns_none_for_nonexistent(self) -> None:
+        result = await _find_test_recursive(
+            "zzz_no_such_module_exists_12345", REPO_ROOT,
+        )
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# 15. test_max_files_cap
+# ---------------------------------------------------------------------------
+
+class TestMaxFilesCap:
+    """Validates that resolve_affected_tests caps results."""
+
+    async def test_caps_at_configured_max(self, monkeypatch) -> None:
+        import backend.core.ouroboros.governance.test_runner as tr_mod
+        monkeypatch.setattr(tr_mod, "_TEST_MAX_FILES", 1)
+
+        runner = TestRunner(repo_root=REPO_ROOT)
+        result = await runner.resolve_affected_tests(
+            changed_files=(
+                FIXTURE_SRC,
+                FIXTURE_SRC.parent / "nonexistent_module.py",
+            ),
+        )
+        assert len(result) <= 1
+
+
+# ---------------------------------------------------------------------------
+# 16. test_retry_toggle
+# ---------------------------------------------------------------------------
+
+class TestRetryToggle:
+    """Validates that JARVIS_TEST_RETRY_ENABLED=false skips retry."""
+
+    async def test_no_retry_when_disabled(self, tmp_path, monkeypatch) -> None:
+        import backend.core.ouroboros.governance.test_runner as tr_mod
+        monkeypatch.setattr(tr_mod, "_TEST_RETRY_ENABLED", False)
+
+        fail_path = tmp_path / "test_always_fail.py"
+        fail_path.write_text(
+            "def test_always_fails():\n    assert False, 'intentional'\n"
+        )
+
+        runner = TestRunner(repo_root=REPO_ROOT, timeout=30.0)
+        result = await runner.run(test_files=(fail_path,))
+        assert result.passed is False
+        assert "--- RETRY ---" not in result.stdout
