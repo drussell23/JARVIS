@@ -2349,10 +2349,10 @@ class GovernedOrchestrator:
                             )
                         else:
                             try:
-                                _dem_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=120.0)
+                                _dem_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=220.0)
                                 generation = await asyncio.wait_for(
                                     self._generator.generate(ctx, _dem_deadline),
-                                    timeout=125.0,
+                                    timeout=225.0,
                                 )
                                 # Charge demotion call cost (may be zero).
                                 try:
