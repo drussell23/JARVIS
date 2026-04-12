@@ -233,6 +233,7 @@ class FailureMode(Enum):
     SERVER_ERROR = auto()       # 500/502/503 — minutes
     CONNECTION_ERROR = auto()   # Can't reach host — minutes to hours
     CONTENT_FAILURE = auto()    # Bad output, infra healthy — no penalty
+    TRANSIENT_TRANSPORT = auto()  # HTTP/2 disconnect, premature stream close — seconds
 
 
 # Mode-specific recovery parameters for exponential backoff.
@@ -243,7 +244,60 @@ _RECOVERY_PARAMS: dict[FailureMode, dict[str, float]] = {
     FailureMode.SERVER_ERROR:    {"base_s": 60.0,  "max_s": 600.0},
     FailureMode.CONNECTION_ERROR: {"base_s": 120.0, "max_s": 900.0},
     FailureMode.CONTENT_FAILURE: {"base_s": 0.0,   "max_s": 0.0},
+    # TRANSIENT_TRANSPORT: HTTP/2 GOAWAY, RemoteProtocolError, ClosedResourceError.
+    # The transport layer flapped (often a single dropped connection in a keep-alive
+    # pool) but the upstream API is healthy. A 5s base backs off to 30s after 4
+    # consecutive failures, then immediately retries — much shorter than TIMEOUT
+    # (45s/300s) which it would otherwise be misclassified as. Diagnosed in
+    # bt-2026-04-12-005521 where 9 consecutive ops died with all_providers_exhausted
+    # because RemoteProtocolError fell through to the TIMEOUT default and the
+    # CONNECTION_ERROR-only deep-backoff guard never engaged.
+    FailureMode.TRANSIENT_TRANSPORT: {"base_s": 5.0, "max_s": 30.0},
 }
+
+
+# Exception class names that indicate transient transport-layer flap rather than
+# upstream API failure. Match by name (not isinstance) so we don't pull in httpx
+# or anyio at module import time — the actual SDK may not be installed on hosts
+# where the FSM is constructed (battle test harness, planner-only deployments).
+_TRANSIENT_TRANSPORT_NAMES: frozenset = frozenset({
+    "RemoteProtocolError",     # httpx — server disconnected without response
+    "ClosedResourceError",     # anyio — stream got closed mid-read
+    "ProtocolError",           # h11/h2 — generic protocol violation
+    "LocalProtocolError",      # h11 — local-side protocol violation
+    "IncompleteRead",          # http.client — short read
+    "StreamConsumed",          # httpx — re-read of consumed stream
+    "StreamClosed",            # httpx — read after close
+    "ResponseNotRead",         # httpx — async stream race
+})
+
+
+def _walk_exception_chain(exc: BaseException, max_depth: int = 8) -> tuple:
+    """Walk __cause__/__context__ chain returning a tuple of exceptions.
+
+    Anthropic SDK wraps httpx exceptions in APIConnectionError; the inner
+    httpx exception is the actual signal we need to classify. Walks both
+    __cause__ (explicit `raise X from Y`) and __context__ (implicit during
+    `except` handler), with cycle protection.
+
+    Returns the chain ordered outermost-first.
+    """
+    chain: list = []
+    seen: set = set()
+    current: Optional[BaseException] = exc
+    depth = 0
+    while current is not None and depth < max_depth:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        chain.append(current)
+        # Prefer __cause__ (explicit) over __context__ (implicit).
+        nxt = getattr(current, "__cause__", None)
+        if nxt is None:
+            nxt = getattr(current, "__context__", None)
+        current = nxt
+        depth += 1
+    return tuple(chain)
 
 
 # ---------------------------------------------------------------------------
@@ -547,12 +601,56 @@ class FailbackStateMachine:
     def classify_exception(exc: BaseException) -> FailureMode:
         """Classify an exception into a failure mode for recovery prediction.
 
-        Uses string-based type checking to avoid hard dependency on aiohttp.
+        Walks the ``__cause__`` / ``__context__`` chain because the Anthropic SDK
+        (and other modern HTTP clients) wraps low-level transport errors in a
+        higher-level wrapper class — e.g. ``APIConnectionError(cause=
+        RemoteProtocolError("Server disconnected without sending a response."))``.
+        Classifying only the outer wrapper would have us treat a 50ms HTTP/2
+        keep-alive flap as a 120s CONNECTION_ERROR deep-backoff. Instead we walk
+        every layer and let the most specific (transient transport) classification
+        win.
+
+        Uses string-based type checking to avoid hard dependency on httpx/anyio.
         """
-        # Content failures first (don't penalize infra)
+        # Content failures first (don't penalize infra). Check the outermost
+        # exception's full message — content failure markers are stamped on
+        # the wrapper (e.g. RuntimeError("diff_apply_failed: ...")).
         if _is_content_failure(exc):
             return FailureMode.CONTENT_FAILURE
 
+        chain = _walk_exception_chain(exc)
+
+        # First pass: any layer that names a known transient transport class
+        # wins, regardless of how deep it is. This is the highest-priority
+        # signal because the recovery profile (5s base / 30s max) is so much
+        # cheaper than CONNECTION_ERROR (120s/900s).
+        for layer in chain:
+            if type(layer).__name__ in _TRANSIENT_TRANSPORT_NAMES:
+                return FailureMode.TRANSIENT_TRANSPORT
+
+        # Second pass: classic classification on the outermost exception.
+        # Falls through layers using the existing rules.
+        for layer in chain:
+            mode = FailbackStateMachine._classify_single(layer)
+            if mode is not FailureMode.TIMEOUT:
+                # Anything more specific than the conservative TIMEOUT default
+                # is preferred — e.g. an inner ConnectionError beats an outer
+                # asyncio.TimeoutError because the connection layer is closer
+                # to the truth.
+                return mode
+
+        # All layers landed on the conservative TIMEOUT default.
+        return FailureMode.TIMEOUT
+
+    @staticmethod
+    def _classify_single(exc: BaseException) -> FailureMode:
+        """Classify a single exception (no chain walking).
+
+        Extracted from ``classify_exception`` so the chain walker can call
+        it on each layer. Preserves the original classification rules
+        verbatim minus the transient-transport handling (which is checked
+        separately in the priority-1 pass).
+        """
         exc_type = type(exc).__name__
         msg = str(exc).lower()
 
@@ -654,6 +752,21 @@ class CandidateGenerator:
         self._background_polls: dict[str, asyncio.Task[Any]] = {}
         # Cap concurrent background polls to avoid connector exhaustion
         self._max_background_polls: int = 3
+        # Per-op tier rotation: belt-and-suspenders for the FSM ETA-based skip.
+        # When the classifier mis-routes (e.g. an unfamiliar wrapper exception
+        # falls through to TIMEOUT instead of TRANSIENT_TRANSPORT) the FSM's
+        # `should_attempt_primary()` keeps returning True and consecutive ops
+        # all hit the same dead Tier 0. Once N failures land within W seconds,
+        # we hard-skip Tier 0 for the next op regardless of FSM mode — buying
+        # the human one cheap Claude success while DW recovers underneath.
+        self._consecutive_tier0_failures: int = 0
+        self._last_tier0_failure_at: float = 0.0
+        self._tier0_skip_threshold: int = int(
+            os.environ.get("OUROBOROS_TIER0_SKIP_THRESHOLD", "2")
+        )
+        self._tier0_skip_window_s: float = float(
+            os.environ.get("OUROBOROS_TIER0_SKIP_WINDOW_S", "30")
+        )
 
     async def generate(
         self,
@@ -714,16 +827,33 @@ class CandidateGenerator:
         _tier0_attempted = False
 
         if self._tier0 is not None and getattr(self._tier0, "is_available", False):
-            # Skip if DW is in deep CONNECTION_ERROR backoff
-            _in_deep_backoff = (
-                self.fsm._failure_mode is FailureMode.CONNECTION_ERROR
+            # Skip if DW is in any failure mode whose recovery ETA hasn't elapsed.
+            # Previously this only fired on CONNECTION_ERROR — meaning a misclassified
+            # TRANSIENT_TRANSPORT or TIMEOUT could keep hammering DW back-to-back
+            # and exhaust every op until the human stopped the loop. Generalized
+            # in bt-2026-04-12-005521 fix to honor whichever mode is active.
+            _fsm_in_backoff = (
+                self.fsm._failure_mode is not None
+                and self.fsm._failure_mode is not FailureMode.CONTENT_FAILURE
                 and not self.fsm.should_attempt_primary()
             )
+            # Per-op rotation guard: even when the FSM says "go", if N consecutive
+            # ops just died on Tier 0 within the rotation window, give DW a break.
+            _rotation_skip = self._should_skip_tier0_for_op()
 
-            if _in_deep_backoff:
+            if _rotation_skip:
                 logger.info(
-                    "[CandidateGenerator] Tier 0 skipped: DW in CONNECTION_ERROR "
-                    "backoff (failures=%d, ETA=%.0fs)",
+                    "[CandidateGenerator] Tier 0 skipped: per-op rotation "
+                    "(consecutive_failures=%d threshold=%d window=%.0fs)",
+                    self._consecutive_tier0_failures,
+                    self._tier0_skip_threshold,
+                    self._tier0_skip_window_s,
+                )
+            elif _fsm_in_backoff:
+                logger.info(
+                    "[CandidateGenerator] Tier 0 skipped: DW in %s backoff "
+                    "(failures=%d, ETA=%.0fs)",
+                    self.fsm._failure_mode.name if self.fsm._failure_mode else "UNKNOWN",
                     self.fsm._consecutive_failures,
                     max(0, self.fsm.recovery_eta() - time.monotonic()),
                 )
@@ -773,6 +903,7 @@ class CandidateGenerator:
                             # RT success — record recovery if coming back from failure
                             if self.fsm._consecutive_failures > 0:
                                 self.fsm.record_primary_success()
+                            self._record_tier0_success()
                             if self._latency_tracker is not None:
                                 self._latency_tracker.record_success(
                                     result.generation_duration_s,
@@ -824,6 +955,7 @@ class CandidateGenerator:
                                 if result is not None and len(result.candidates) > 0:
                                     if self.fsm._consecutive_failures > 0:
                                         self.fsm.record_primary_success()
+                                    self._record_tier0_success()
                                     if self._latency_tracker is not None:
                                         self._latency_tracker.record_success(
                                             result.generation_duration_s,
@@ -846,6 +978,7 @@ class CandidateGenerator:
                                 if _late is not None and len(_late.candidates) > 0:
                                     if self.fsm._consecutive_failures > 0:
                                         self.fsm.record_primary_success()
+                                    self._record_tier0_success()
                                     logger.info(
                                         "[CandidateGenerator] Tier 0 RT: %d candidates "
                                         "recovered from timeout race",
@@ -861,6 +994,7 @@ class CandidateGenerator:
                             tier0_budget, self._remaining_seconds(deadline),
                         )
                         self.fsm.record_primary_failure(mode=FailureMode.TIMEOUT)
+                        self._record_tier0_failure()
                         if self._latency_tracker is not None:
                             self._latency_tracker.record_failure()
                     except asyncio.CancelledError:
@@ -877,6 +1011,7 @@ class CandidateGenerator:
                         )
                         if mode is not FailureMode.CONTENT_FAILURE:
                             self.fsm.record_primary_failure(mode=mode)
+                            self._record_tier0_failure()
                             if self._latency_tracker is not None:
                                 self._latency_tracker.record_failure()
 
@@ -1548,6 +1683,43 @@ class CandidateGenerator:
         now = datetime.now(tz=timezone.utc)
         remaining = (deadline - now).total_seconds()
         return max(remaining, 0.0)
+
+    # ------------------------------------------------------------------
+    # Per-op Tier 0 rotation (Manifesto §5 — defensive cost guard)
+    # ------------------------------------------------------------------
+
+    def _should_skip_tier0_for_op(self) -> bool:
+        """Return True if Tier 0 should be skipped for the current op.
+
+        Skips when ``_consecutive_tier0_failures`` reaches the threshold
+        AND the most recent failure happened within ``_tier0_skip_window_s``
+        seconds. Outside the window the counter resets implicitly because
+        the elapsed-time check fails — equivalent to a stale-feed reset.
+
+        This is independent of the FSM's mode-based ETA: even if the
+        classifier mis-routes a transport flap to TIMEOUT (default), this
+        guard still kicks in after N back-to-back failures.
+        """
+        if self._consecutive_tier0_failures < self._tier0_skip_threshold:
+            return False
+        elapsed = time.monotonic() - self._last_tier0_failure_at
+        return elapsed < self._tier0_skip_window_s
+
+    def _record_tier0_failure(self) -> None:
+        """Increment the per-op rotation counter and stamp the timestamp."""
+        self._consecutive_tier0_failures += 1
+        self._last_tier0_failure_at = time.monotonic()
+
+    def _record_tier0_success(self) -> None:
+        """Reset the per-op rotation counter on Tier 0 success."""
+        if self._consecutive_tier0_failures > 0:
+            logger.info(
+                "[CandidateGenerator] Tier 0 rotation reset after %d "
+                "consecutive failures",
+                self._consecutive_tier0_failures,
+            )
+        self._consecutive_tier0_failures = 0
+        self._last_tier0_failure_at = 0.0
 
     # ------------------------------------------------------------------
     # Deadline budget allocation (deterministic — Manifesto §5)
