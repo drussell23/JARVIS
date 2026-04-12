@@ -2661,13 +2661,46 @@ class GovernedLoopService:
                 _fallback_concurrency, _pool_size,
             )
 
+            # HIBERNATION_MODE step 5: wire the ProviderExhaustionWatcher
+            # onto the CandidateGenerator so a sustained provider outage
+            # trips the SupervisorOuroborosController into HIBERNATION
+            # instead of crashing the loop with all_providers_exhausted.
+            _exhaustion_watcher: Any = None
+            _controller = (
+                getattr(self._stack, "controller", None)
+                if self._stack is not None
+                else None
+            )
+            if _controller is not None:
+                try:
+                    from backend.core.ouroboros.governance.provider_exhaustion_watcher import (  # noqa: PLC0415  # type: ignore[import-not-found]
+                        ProviderExhaustionWatcher,
+                    )
+                    _watcher_instance: Any = ProviderExhaustionWatcher(
+                        controller=_controller,
+                    )
+                    logger.info(
+                        "[GovernedLoop] ProviderExhaustionWatcher wired "
+                        "(threshold=%s)",
+                        getattr(_watcher_instance, "threshold", "?"),
+                    )
+                    _exhaustion_watcher = _watcher_instance
+                except Exception as _watcher_exc:
+                    logger.warning(
+                        "[GovernedLoop] ProviderExhaustionWatcher wiring "
+                        "failed (non-fatal): %s",
+                        _watcher_exc,
+                    )
+
             self._generator = CandidateGenerator(
                 primary=effective_primary,
                 fallback=effective_fallback,
                 fallback_concurrency=_fallback_concurrency,
                 tier0=tier0,
                 ledger=self._ledger,
+                exhaustion_watcher=_exhaustion_watcher,
             )
+            self._exhaustion_watcher = _exhaustion_watcher
 
             # Sync FSM to reflect actual startup probe result.
             # Without this, the FSM stays at PRIMARY_READY even when the startup
