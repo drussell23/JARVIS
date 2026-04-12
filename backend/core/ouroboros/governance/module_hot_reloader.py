@@ -49,7 +49,7 @@ import logging
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
@@ -199,6 +199,14 @@ class ModuleHotReloader:
         self._restart_reason: Optional[str] = None
         self._reload_count: int = 0
         self._last_batch: Optional[ReloadBatch] = None
+        # Per-module "imported hash" — the disk hash captured at the moment we
+        # first observed the module loaded. As long as the reloader is created
+        # before any safe module is mutated on disk, these faithfully represent
+        # the bytecode currently live in sys.modules. We refuse to derive
+        # change-detection from a fresh disk read because the file may have
+        # already been rewritten by O+V's APPLY phase before reload_for_op runs.
+        self._loaded_hashes: Dict[str, str] = {}
+        self._prime_loaded_hashes()
 
     @property
     def safe_modules(self) -> FrozenSet[str]:
@@ -237,6 +245,38 @@ class ModuleHotReloader:
         """Test-only: clear the restart-pending flag."""
         with self._lock:
             self._restart_reason = None
+
+    def _prime_loaded_hashes(self) -> None:
+        """Snapshot the on-disk hash of every currently-loaded safe module.
+
+        Called once at construction time. Captures the 'imported hash' for
+        each safe module that is already in sys.modules. Modules not yet
+        loaded are silently skipped — they'll be picked up the first time
+        `reload_for_op` sees them via the lazy-prime fallback in
+        `_loaded_hash_for`.
+        """
+        for mod_name in self._safe:
+            if mod_name in sys.modules:
+                snap = self.snapshot(mod_name)
+                if snap is not None:
+                    self._loaded_hashes[mod_name] = snap.source_sha256
+
+    def _loaded_hash_for(self, mod_name: str, fallback: str) -> str:
+        """Return the cached imported-hash for a module, lazily seeding it.
+
+        If the module was loaded after construction (and so missed the eager
+        prime), seed the cache with the provided fallback hash. The fallback
+        is the current disk hash; this is best-effort and means the very
+        first reload after such a lazy import cannot detect a change. In
+        practice this is fine because deferred imports run during early
+        pipeline phases (PLAN/GENERATE) before APPLY mutates the file.
+        """
+        with self._lock:
+            cached = self._loaded_hashes.get(mod_name)
+            if cached is None:
+                self._loaded_hashes[mod_name] = fallback
+                return fallback
+            return cached
 
     def stats(self) -> dict:
         """Lightweight observability snapshot."""
@@ -395,6 +435,13 @@ class ModuleHotReloader:
         # PREFLIGHT: snapshot every candidate and capture probe ids. If any
         # candidate cannot be snapshotted, abort the entire batch — atomicity
         # over partial progress.
+        #
+        # NOTE on the snapshot's source_sha256: snapshot() reads disk, but the
+        # disk may already reflect APPLY's mutation. The TRUE "before" hash is
+        # the imported-hash captured at reloader construction (or lazy-seeded
+        # on first observation). We rebuild each snapshot with the cached
+        # imported-hash so change detection compares in-memory vs disk, not
+        # disk vs disk.
         before_snapshots: Dict[str, ModuleSnapshot] = {}
         before_probe_ids: Dict[str, Optional[int]] = {}
         for mod in decision.safe_modules:
@@ -408,6 +455,9 @@ class ModuleHotReloader:
                     restart_required=True,
                     restart_reason=reason,
                 )
+            imported_sha = self._loaded_hash_for(mod, snap.source_sha256)
+            if imported_sha != snap.source_sha256:
+                snap = replace(snap, source_sha256=imported_sha)
             before_snapshots[mod] = snap
             before_probe_ids[mod] = self._probe_id(mod)
 
@@ -424,6 +474,14 @@ class ModuleHotReloader:
             outcomes.append(outcome)
             if outcome.status in ("failed", "verify_failed"):
                 any_failed = True
+            elif outcome.status == "reloaded" and outcome.new_sha:
+                # Promote the new disk hash to the imported-hash cache so the
+                # next reload_for_op compares against the freshly-loaded code,
+                # not the previous generation.
+                self._loaded_hashes[mod] = outcome.new_sha
+            elif outcome.status == "no_change" and outcome.new_sha:
+                # Keep cache aligned with disk for no-op rounds too.
+                self._loaded_hashes[mod] = outcome.new_sha
 
         if any_failed:
             failed_mods = [

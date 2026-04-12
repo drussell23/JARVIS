@@ -2153,6 +2153,46 @@ class GovernedOrchestrator:
                         _dep_exc._dep_file_rejected_content = _rejected_content  # type: ignore[attr-defined]
                         raise _dep_exc
 
+                # Gate 4 — Docstring multi-line collapse detection. Catches
+                # the regression where Claude rewrites a multi-line module
+                # or function docstring as a single-line literal containing
+                # ``\n`` escape sequences (bt-2026-04-11-211131,
+                # headless_cli.py). Valid Python that breaks every reader.
+                try:
+                    from backend.core.ouroboros.governance.docstring_collapse_gate import (
+                        check_candidate as _docstring_check,
+                    )
+                except ImportError:
+                    _docstring_check = None  # type: ignore[assignment]
+                if _docstring_check is not None:
+                    for _cand in generation.candidates:
+                        _ds_result = _docstring_check(_cand, self._config.project_root)
+                        if _ds_result is None:
+                            continue
+                        _ds_reason, _ds_offenders = _ds_result
+                        logger.warning(
+                            "[Orchestrator] Iron Gate — docstring_collapse: "
+                            "%d offender(s) [%s] op=%s",
+                            len(_ds_offenders),
+                            ", ".join(_ds_offenders[:5]),
+                            ctx.op_id[:12],
+                        )
+                        _rejected_content = ""
+                        if isinstance(_cand, dict):
+                            _rejected_content = _cand.get("full_content", "") or ""
+                            if not _rejected_content and isinstance(_cand.get("files"), list):
+                                for _entry in _cand["files"]:
+                                    if isinstance(_entry, dict) and (
+                                        _entry.get("file_path", "") or ""
+                                    ).endswith(".py"):
+                                        _rejected_content = _entry.get("full_content", "") or ""
+                                        break
+                        generation = None
+                        _ds_exc = RuntimeError(_ds_reason)
+                        _ds_exc._docstring_collapse_offenders = _ds_offenders  # type: ignore[attr-defined]
+                        _ds_exc._docstring_collapse_rejected_content = _rejected_content  # type: ignore[attr-defined]
+                        raise _ds_exc
+
                 # Heartbeat: generation succeeded with candidates
                 try:
                     await self._stack.comm.emit_heartbeat(
