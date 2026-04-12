@@ -74,6 +74,12 @@ class SupervisorOuroborosController:
         self._safe_mode: bool = False
         self._gates_passed: bool = False
         self._emergency_reason: Optional[str] = None
+        # HIBERNATION_MODE state — tracked here so the controller can
+        # restore the exact pre-outage mode on wake. _hibernation_reason
+        # is surfaced in logs and health() for postmortem.
+        self._pre_hibernation_mode: Optional[AutonomyMode] = None
+        self._hibernation_reason: Optional[str] = None
+        self._hibernation_count: int = 0
         logger.info("SupervisorOuroborosController initialised — mode=%s", self._mode.value)
 
     # ------------------------------------------------------------------
@@ -135,10 +141,16 @@ class SupervisorOuroborosController:
             logger.info("start() — entering SANDBOX")
 
     async def stop(self) -> None:
-        """Stop the autonomy loop and reset all transient state."""
+        """Stop the autonomy loop and reset all transient state.
+
+        Any pending hibernation state is cleared — stop() is the ultimate
+        teardown and supersedes hibernation even mid-outage.
+        """
         previous = self._mode
         self._mode = AutonomyMode.DISABLED
         self._gates_passed = False
+        self._pre_hibernation_mode = None
+        self._hibernation_reason = None
         logger.info("stop() — %s → DISABLED (gates_passed reset)", previous.value)
 
     async def pause(self) -> None:
@@ -212,6 +224,72 @@ class SupervisorOuroborosController:
         self._gates_passed = True
         logger.info("mark_gates_passed() — governance gates satisfied")
 
+    async def enter_hibernation(self, reason: str) -> bool:
+        """Transition into HIBERNATION mode, preserving the prior mode.
+
+        Called by the provider-exhaustion watcher (step 5) when DoubleWord
+        and Claude both become unreachable. The controller records the
+        current mode so ``wake_from_hibernation()`` can restore it exactly.
+
+        Refuses when:
+          - Already HIBERNATING (idempotent no-op returning False)
+          - In EMERGENCY_STOP — a human must clear the emergency first
+          - In DISABLED — nothing to hibernate
+        """
+        if self._mode is AutonomyMode.HIBERNATION:
+            logger.debug("enter_hibernation() no-op — already hibernating")
+            return False
+        if self._mode is AutonomyMode.EMERGENCY_STOP:
+            logger.error(
+                "enter_hibernation() blocked — EMERGENCY_STOP active (reason=%r)",
+                self._emergency_reason,
+            )
+            raise RuntimeError(
+                "Cannot hibernate from EMERGENCY_STOP — clear the emergency first"
+            )
+        if self._mode is AutonomyMode.DISABLED:
+            logger.warning("enter_hibernation() rejected — controller is DISABLED")
+            return False
+
+        self._pre_hibernation_mode = self._mode
+        self._hibernation_reason = reason
+        self._hibernation_count += 1
+        self._mode = AutonomyMode.HIBERNATION
+        logger.warning(
+            "enter_hibernation() — %s → HIBERNATION (reason=%r, cycle #%d)",
+            self._pre_hibernation_mode.value,
+            reason,
+            self._hibernation_count,
+        )
+        return True
+
+    async def wake_from_hibernation(self, *, reason: str = "") -> bool:
+        """Restore the pre-hibernation mode after providers recover.
+
+        The prober (step 6) calls this once health probes pass. The
+        controller transitions back to the exact mode it was in before
+        the outage — GOVERNED, SANDBOX, READ_ONLY, or SAFE_MODE — so the
+        DAG resumes without losing its capability envelope.
+
+        Returns False if not currently hibernating (idempotent).
+        """
+        if self._mode is not AutonomyMode.HIBERNATION:
+            logger.debug(
+                "wake_from_hibernation() no-op — current mode is %s",
+                self._mode.value,
+            )
+            return False
+        target = self._pre_hibernation_mode or AutonomyMode.SANDBOX
+        self._mode = target
+        self._pre_hibernation_mode = None
+        self._hibernation_reason = None
+        logger.info(
+            "wake_from_hibernation() — HIBERNATION → %s (reason=%r)",
+            target.value,
+            reason or "unspecified",
+        )
+        return True
+
     async def emergency_stop(self, reason: str) -> None:
         """Immediately halt all autonomy.
 
@@ -222,6 +300,9 @@ class SupervisorOuroborosController:
         self._emergency_reason = reason
         previous = self._mode
         self._mode = AutonomyMode.EMERGENCY_STOP
+        # Hibernation state is discarded — emergency supersedes.
+        self._pre_hibernation_mode = None
+        self._hibernation_reason = None
         logger.critical(
             "emergency_stop() — %s → EMERGENCY_STOP (reason: %s)",
             previous.value,

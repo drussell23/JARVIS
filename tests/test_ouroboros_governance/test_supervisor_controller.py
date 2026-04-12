@@ -218,3 +218,126 @@ class TestHibernationMode:
         with pytest.raises(RuntimeError, match="HIBERNAT"):
             await controller.enable_governed_autonomy()
         assert controller.mode is AutonomyMode.HIBERNATION  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# TestHibernationTransitions — enter/wake methods (step 4)
+# ---------------------------------------------------------------------------
+
+
+class TestHibernationTransitions:
+    """Verify enter_hibernation/wake_from_hibernation transition correctness."""
+
+    @pytest.mark.asyncio
+    async def test_enter_from_governed_restores_on_wake(self, controller):
+        """GOVERNED → HIBERNATION → GOVERNED is the canonical cycle."""
+        await controller.start()
+        await controller.mark_gates_passed()
+        await controller.enable_governed_autonomy()
+        assert controller.mode is AutonomyMode.GOVERNED
+
+        entered = await controller.enter_hibernation(reason="all_providers_exhausted")
+        assert entered is True
+        assert controller.mode is AutonomyMode.HIBERNATION
+        assert controller._pre_hibernation_mode is AutonomyMode.GOVERNED
+
+        woke = await controller.wake_from_hibernation(reason="providers_recovered")
+        assert woke is True
+        assert controller.mode is AutonomyMode.GOVERNED
+        assert controller._pre_hibernation_mode is None
+
+    @pytest.mark.asyncio
+    async def test_enter_from_sandbox_restores_sandbox(self, controller):
+        """SANDBOX → HIBERNATION → SANDBOX — capability envelope preserved."""
+        await controller.start()
+        assert controller.mode is AutonomyMode.SANDBOX
+
+        await controller.enter_hibernation(reason="outage")
+        assert controller.mode is AutonomyMode.HIBERNATION
+
+        await controller.wake_from_hibernation()
+        assert controller.mode is AutonomyMode.SANDBOX
+
+    @pytest.mark.asyncio
+    async def test_enter_from_read_only_restores_read_only(self, controller):
+        """READ_ONLY → HIBERNATION → READ_ONLY — pause state preserved."""
+        await controller.start()
+        await controller.pause()
+        assert controller.mode is AutonomyMode.READ_ONLY
+
+        await controller.enter_hibernation(reason="outage")
+        await controller.wake_from_hibernation()
+        assert controller.mode is AutonomyMode.READ_ONLY
+
+    @pytest.mark.asyncio
+    async def test_enter_hibernation_is_idempotent(self, controller):
+        """A second enter_hibernation() call is a no-op returning False."""
+        await controller.start()
+        assert await controller.enter_hibernation(reason="first") is True
+        assert await controller.enter_hibernation(reason="second") is False
+        assert controller.mode is AutonomyMode.HIBERNATION
+        # pre-hibernation mode must not be overwritten by the second call
+        assert controller._pre_hibernation_mode is AutonomyMode.SANDBOX
+
+    @pytest.mark.asyncio
+    async def test_wake_without_hibernation_is_noop(self, controller):
+        """wake_from_hibernation() on a non-hibernating controller returns False."""
+        await controller.start()
+        assert await controller.wake_from_hibernation() is False
+        assert controller.mode is AutonomyMode.SANDBOX
+
+    @pytest.mark.asyncio
+    async def test_enter_from_disabled_rejected(self, controller):
+        """DISABLED → HIBERNATION is rejected — nothing to hibernate."""
+        assert controller.mode is AutonomyMode.DISABLED
+        result = await controller.enter_hibernation(reason="pointless")
+        assert result is False
+        assert controller.mode is AutonomyMode.DISABLED
+
+    @pytest.mark.asyncio
+    async def test_enter_from_emergency_stop_raises(self, controller):
+        """EMERGENCY_STOP blocks enter_hibernation() — human must clear first."""
+        await controller.start()
+        await controller.emergency_stop("test")
+        with pytest.raises(RuntimeError, match="EMERGENCY"):
+            await controller.enter_hibernation(reason="too late")
+
+    @pytest.mark.asyncio
+    async def test_hibernation_count_tracks_cycles(self, controller):
+        """_hibernation_count increments on each successful entry."""
+        await controller.start()
+        for i in range(3):
+            await controller.enter_hibernation(reason=f"cycle {i}")
+            await controller.wake_from_hibernation()
+        assert controller._hibernation_count == 3
+
+    @pytest.mark.asyncio
+    async def test_stop_during_hibernation_clears_state(self, controller):
+        """stop() must clear pre_hibernation_mode and reason."""
+        await controller.start()
+        await controller.enter_hibernation(reason="test")
+        assert controller._pre_hibernation_mode is AutonomyMode.SANDBOX
+        await controller.stop()
+        assert controller.mode is AutonomyMode.DISABLED
+        assert controller._pre_hibernation_mode is None
+        assert controller._hibernation_reason is None
+
+    @pytest.mark.asyncio
+    async def test_emergency_stop_during_hibernation_clears_state(self, controller):
+        """emergency_stop() must clear pre_hibernation state."""
+        await controller.start()
+        await controller.enter_hibernation(reason="outage")
+        await controller.emergency_stop("critical")
+        assert controller.mode is AutonomyMode.EMERGENCY_STOP
+        assert controller._pre_hibernation_mode is None
+        assert controller._hibernation_reason is None
+
+    @pytest.mark.asyncio
+    async def test_hibernation_reason_recorded(self, controller):
+        """enter_hibernation() records the reason for postmortem."""
+        await controller.start()
+        await controller.enter_hibernation(reason="dw+claude both down")
+        assert controller._hibernation_reason == "dw+claude both down"
+        # wake clears it
+        await controller.wake_from_hibernation()
+        assert controller._hibernation_reason is None
