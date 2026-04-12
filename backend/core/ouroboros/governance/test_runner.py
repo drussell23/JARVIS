@@ -946,6 +946,7 @@ class TestRunner:
 
         cmd = [
             "python3", "-m", "pytest",
+            "-o", "addopts=",
             "--json-report",
             "--json-report-file=" + report_path,
             "-q",
