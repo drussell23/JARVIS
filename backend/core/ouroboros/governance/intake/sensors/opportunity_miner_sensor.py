@@ -89,6 +89,55 @@ class _FileAnalysis:
         )
 
 
+@dataclass
+class _CycleCounters:
+    """Per-cycle drain counters for safe-module starvation diagnostics (Task #69).
+
+    Definitions are pinned here AND in
+    tests/test_ouroboros_governance/test_opportunity_miner_cycle_summary.py;
+    keep them in sync. Each counter measures one specific gate so the
+    summary line tells you which layer is closed:
+
+      mined           — analyses surviving Phase 1 strategy thresholds
+      eligible        — analyses surviving cooldown + seen-file filter
+                        (returned by _select_diverse_candidates so the
+                         metric cannot drift from the predicate it measures)
+      selected        — analyses surviving cap + module diversity + explore
+      graph_built     — 1 if MinerGraphCoalescer.coalesce() returned a
+                        non-None CoalescedBatch (else 0). Distinguishes
+                        "coalesce attempted and built a batch" from
+                        "coalesce not attempted / failed".
+      graph_submitted — batch.submitted_to_scheduler if a batch exists
+                        (gated by JARVIS_MINER_GRAPH_AUTO_SUBMIT + scheduler)
+      enqueued        — UnifiedIntakeRouter.ingest() returned "enqueued"
+                        (past pending_ack gate, on the priority queue)
+      pending_ack     — ingest() returned "pending_ack" (parked, AC2 gate)
+      queued_behind   — ingest() returned "queued_behind" (file conflict)
+      deduplicated    — ingest() returned "deduplicated" (dedup window hit)
+      backpressure    — ingest() returned "backpressure" (queue full)
+
+    Reading the summary line:
+      mined=N selected=M graph_built=1 graph_submitted=0 …
+        → C1: JARVIS_MINER_GRAPH_AUTO_SUBMIT=false is the wall.
+      … pending_ack=K enqueued=0
+        → C3: AC2 requires_human_ack=True is the wall.
+      … enqueued=K (K small relative to mined)
+        → C2 (JARVIS_MINER_MAX_PER_SCAN + module_cap) is the next knob.
+    """
+
+    mined: int = 0
+    eligible: int = 0
+    selected: int = 0
+    graph_built: int = 0
+    graph_submitted: int = 0
+    enqueued: int = 0
+    pending_ack: int = 0
+    queued_behind: int = 0
+    deduplicated: int = 0
+    backpressure: int = 0
+
+
+
 # ---------------------------------------------------------------------------
 # Analysis functions
 # ---------------------------------------------------------------------------
@@ -330,15 +379,20 @@ class OpportunityMinerSensor:
         self,
         analyses: List[_FileAnalysis],
         sort_field: str,
-    ) -> List[_FileAnalysis]:
+    ) -> Tuple[int, List[_FileAnalysis]]:
         """Select candidates using exploit/explore strategy with module diversity.
 
         - Top portion (1 - explore_ratio) chosen by strategy score (exploit)
         - Bottom portion (explore_ratio) chosen by weighted random (explore)
         - Module dedup: at most 2 files per top-level module
+
+        Returns ``(eligible_count, selected)``. ``eligible_count`` is the size
+        of the post-cooldown / post-seen pool that selection actually sees —
+        the same predicate the function applies, returned alongside so the
+        ``_CycleCounters.eligible`` metric can never drift from behavior.
         """
         if not analyses:
-            return []
+            return 0, []
 
         # Filter out cooled-down and already-seen files
         eligible = [
@@ -353,7 +407,8 @@ class OpportunityMinerSensor:
                 if a.file_path not in self._seen_file_paths
             ]
         if not eligible:
-            return []
+            return 0, []
+        eligible_count = len(eligible)
 
         # Sort by the strategy's primary metric
         eligible.sort(key=lambda a: getattr(a, sort_field, 0), reverse=True)
@@ -397,7 +452,7 @@ class OpportunityMinerSensor:
             except (ValueError, IndexError):
                 pass
 
-        return selected[:self._max_per_scan]
+        return eligible_count, selected[:self._max_per_scan]
 
     async def scan_once(self) -> List[StaticCandidate]:
         """Run one multi-strategy analysis scan with diversity mechanisms.
@@ -467,7 +522,10 @@ class OpportunityMinerSensor:
                 analyses.append(analysis)
 
         # Phase 2: Diverse candidate selection
-        selected = self._select_diverse_candidates(analyses, sort_field)
+        counters = _CycleCounters(mined=len(analyses))
+        eligible_count, selected = self._select_diverse_candidates(analyses, sort_field)
+        counters.eligible = eligible_count
+        counters.selected = len(selected)
 
         # Phase 2.5: Try graph coalescing — collapse N selected candidates
         # into a single ExecutionGraph envelope (Manifesto §3 parallel DAG).
@@ -484,8 +542,10 @@ class OpportunityMinerSensor:
                 repo=self._repo,
             )
             if batch is not None:
+                counters.graph_built = 1
+                counters.graph_submitted = 1 if batch.submitted_to_scheduler else 0
                 coalesced = await self._ingest_coalesced_batch(
-                    batch, selected, strategy_name,
+                    batch, selected, strategy_name, counters,
                 )
                 if coalesced:
                     ingested.extend(coalesced)
@@ -502,6 +562,7 @@ class OpportunityMinerSensor:
                         strategy_name, scanned, len(analyses),
                         ingested, errors, skipped_non_package,
                     )
+                    self._emit_cycle_summary(counters, strategy_name)
                     return ingested
                 # Coalescing envelope was rejected — fall through to per-file
                 # ingest as a best-effort fallback.
@@ -555,6 +616,7 @@ class OpportunityMinerSensor:
             )
             try:
                 result = await self._router.ingest(envelope)
+                self._record_ingest_result(counters, result)
                 if result in ("enqueued", "pending_ack"):
                     self._seen_file_paths.add(rel)
                     self._cooldown_map[rel] = self._scan_cycle
@@ -582,6 +644,7 @@ class OpportunityMinerSensor:
             strategy_name, scanned, len(analyses),
             ingested, errors, skipped_non_package,
         )
+        self._emit_cycle_summary(counters, strategy_name)
         return ingested
 
     # ------------------------------------------------------------------
@@ -622,17 +685,65 @@ class OpportunityMinerSensor:
             len(self._cooldown_map), len(self._seen_file_paths),
         )
 
+    @staticmethod
+    def _record_ingest_result(counters: _CycleCounters, result: str) -> None:
+        """Tally a UnifiedIntakeRouter.ingest() return value.
+
+        The router's five canonical return strings each feed a distinct
+        counter so the per-cycle summary can distinguish "parked at the
+        AC2 gate" from "dropped by dedup" from "queue full". Unknown
+        return values are silently ignored — defense in depth against
+        a future router adding a sixth string.
+        """
+        if result == "enqueued":
+            counters.enqueued += 1
+        elif result == "pending_ack":
+            counters.pending_ack += 1
+        elif result == "queued_behind":
+            counters.queued_behind += 1
+        elif result == "deduplicated":
+            counters.deduplicated += 1
+        elif result == "backpressure":
+            counters.backpressure += 1
+
+    def _emit_cycle_summary(
+        self, counters: _CycleCounters, strategy_name: str,
+    ) -> None:
+        """Emit one deterministic per-cycle summary line for grep + dashboards.
+
+        The key set is stable (same keys every cycle, zeros included) so
+        downstream parsers and tests can rely on a single regex. Only
+        ``logger.info`` — no policy effects, no metric drift.
+        """
+        logger.info(
+            "OpportunityMinerSensor cycle_summary "
+            "cycle=%d strategy=%s max_per_scan=%d "
+            "mined=%d eligible=%d selected=%d "
+            "graph_built=%d graph_submitted=%d "
+            "enqueued=%d pending_ack=%d queued_behind=%d "
+            "deduplicated=%d backpressure=%d",
+            self._scan_cycle, strategy_name, self._max_per_scan,
+            counters.mined, counters.eligible, counters.selected,
+            counters.graph_built, counters.graph_submitted,
+            counters.enqueued, counters.pending_ack, counters.queued_behind,
+            counters.deduplicated, counters.backpressure,
+        )
+
     async def _ingest_coalesced_batch(
         self,
         batch: Any,  # graph_coalescer.CoalescedBatch — duck-typed to avoid import cycle
         selected: List[_FileAnalysis],
         strategy_name: str,
+        counters: _CycleCounters,
     ) -> List[StaticCandidate]:
         """Ingest a single coalesced envelope carrying all selected files.
 
         Returns the list of StaticCandidate records (one per file in the
         graph) on success, or an empty list if the router rejects the
         envelope. Marks all files as seen + on cooldown on success.
+
+        ``counters`` is updated with the router's ingest result so the
+        coalesced and per-file paths feed the same per-cycle summary.
         """
         selected_by_path: Dict[str, _FileAnalysis] = {a.file_path: a for a in selected}
         envelope = make_envelope(
@@ -657,6 +768,8 @@ class OpportunityMinerSensor:
                 batch.graph.graph_id,
             )
             return []
+
+        self._record_ingest_result(counters, result)
 
         if result not in ("enqueued", "pending_ack"):
             logger.info(
