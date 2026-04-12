@@ -706,3 +706,427 @@ class TestCandidateGeneratorPlan:
 
         assert isinstance(result, str)
         mock_fallback.plan.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task #67 — RemoteProtocolError + DW exhaustion fix
+# ---------------------------------------------------------------------------
+#
+# Battle test bt-2026-04-12-005521 saw 9 consecutive ops die with
+# `all_providers_exhausted` because the Anthropic SDK wraps httpx errors
+# in `APIConnectionError(cause=RemoteProtocolError("Server disconnected ..."))`
+# and the FSM classifier did not walk `__cause__` — every op fell through
+# to the conservative TIMEOUT default (45s base, 300s max). The
+# CONNECTION_ERROR-only deep-backoff guard never engaged, so consecutive
+# ops kept hammering the dead provider.
+#
+# These tests cover three independent fix layers:
+#  1. New TRANSIENT_TRANSPORT FailureMode with short recovery (5s/30s)
+#  2. classify_exception walks __cause__/__context__ chains and routes
+#     RemoteProtocolError, ClosedResourceError, ProtocolError to it.
+#  3. Per-op tier rotation (CandidateGenerator._should_skip_tier0_for_op)
+#     as a belt-and-suspenders guard for misclassification.
+
+
+def _make_remote_protocol_error(msg: str = "Server disconnected without sending a response."):
+    """Synthesize a RemoteProtocolError-named exception WITHOUT importing httpx.
+
+    The classifier matches on class name (to avoid hard SDK imports), so a
+    locally-defined class with the same name is sufficient for the test.
+    """
+    class RemoteProtocolError(Exception):
+        pass
+    return RemoteProtocolError(msg)
+
+
+def _make_closed_resource_error(msg: str = ""):
+    """Synthesize a ClosedResourceError-named exception."""
+    class ClosedResourceError(Exception):
+        pass
+    return ClosedResourceError(msg)
+
+
+def _make_api_connection_error_wrapping(inner: BaseException):
+    """Synthesize APIConnectionError-name wrapping an inner cause.
+
+    Mirrors the Anthropic SDK pattern where httpx exceptions are wrapped
+    in APIConnectionError. The classifier should walk __cause__ to surface
+    the inner exception.
+    """
+    class APIConnectionError(Exception):
+        pass
+    wrapper = APIConnectionError(f"Connection error: {type(inner).__name__}: {inner}")
+    wrapper.__cause__ = inner
+    return wrapper
+
+
+class TestTransientTransportClassification:
+    """The classifier's __cause__-walk and TRANSIENT_TRANSPORT routing."""
+
+    def test_remote_protocol_error_classified_as_transient_transport(self):
+        exc = _make_remote_protocol_error()
+        mode = FailbackStateMachine.classify_exception(exc)
+        assert mode is FailureMode.TRANSIENT_TRANSPORT
+
+    def test_closed_resource_error_classified_as_transient_transport(self):
+        exc = _make_closed_resource_error()
+        mode = FailbackStateMachine.classify_exception(exc)
+        assert mode is FailureMode.TRANSIENT_TRANSPORT
+
+    def test_protocol_error_classified_as_transient_transport(self):
+        class ProtocolError(Exception):
+            pass
+        mode = FailbackStateMachine.classify_exception(ProtocolError("h11 violation"))
+        assert mode is FailureMode.TRANSIENT_TRANSPORT
+
+    def test_api_connection_error_wrapping_remote_protocol_unwraps(self):
+        """The actual production failure mode: SDK wrapper hides the real error.
+
+        APIConnectionError → was being classified as 'connection' (TIMEOUT
+        default). Walking __cause__ surfaces the inner RemoteProtocolError
+        and routes to TRANSIENT_TRANSPORT.
+        """
+        inner = _make_remote_protocol_error()
+        wrapper = _make_api_connection_error_wrapping(inner)
+        mode = FailbackStateMachine.classify_exception(wrapper)
+        assert mode is FailureMode.TRANSIENT_TRANSPORT
+
+    def test_chain_walks_cause_not_just_context(self):
+        """`raise X from Y` sets __cause__; explicit chain must be walked."""
+        inner = _make_remote_protocol_error()
+        outer = RuntimeError("higher-level wrap")
+        outer.__cause__ = inner
+        mode = FailbackStateMachine.classify_exception(outer)
+        assert mode is FailureMode.TRANSIENT_TRANSPORT
+
+    def test_chain_walks_context_when_no_cause(self):
+        """Implicit `except` chains expose __context__; classifier handles both."""
+        inner = _make_closed_resource_error()
+        outer = RuntimeError("implicit chain")
+        outer.__context__ = inner
+        # No explicit __cause__ — must fall through to __context__
+        outer.__cause__ = None
+        mode = FailbackStateMachine.classify_exception(outer)
+        assert mode is FailureMode.TRANSIENT_TRANSPORT
+
+    def test_chain_cycle_protection(self):
+        """Self-referential chain must not cause infinite walk."""
+        inner = _make_remote_protocol_error()
+        outer = RuntimeError("cycle")
+        outer.__cause__ = inner
+        inner.__cause__ = outer  # cycle
+        # Should not hang or recurse infinitely; should still find the
+        # transient transport class somewhere in the chain.
+        mode = FailbackStateMachine.classify_exception(outer)
+        assert mode is FailureMode.TRANSIENT_TRANSPORT
+
+    def test_chain_max_depth_respected(self):
+        """Walk caps at max_depth to bound work on adversarial chains."""
+        from backend.core.ouroboros.governance.candidate_generator import (
+            _walk_exception_chain,
+        )
+        # Build a long linear chain of plain exceptions (no transport class)
+        deepest = ValueError("leaf")
+        current: BaseException = deepest
+        for i in range(50):
+            outer = RuntimeError(f"level-{i}")
+            outer.__cause__ = current
+            current = outer
+        chain = _walk_exception_chain(current, max_depth=8)
+        assert len(chain) == 8
+
+    def test_classification_falls_back_to_existing_rules_on_unrelated(self):
+        """Plain RuntimeError still routes via existing rules."""
+        mode = FailbackStateMachine.classify_exception(asyncio.TimeoutError())
+        assert mode is FailureMode.TIMEOUT
+
+    def test_classification_recognizes_classic_connection_error_unchanged(self):
+        """Existing ConnectionError handling is preserved."""
+        mode = FailbackStateMachine.classify_exception(
+            ConnectionRefusedError("conn refused")
+        )
+        assert mode is FailureMode.CONNECTION_ERROR
+
+    def test_content_failure_outranks_transient_transport(self):
+        """Content failures still beat infra classification — they say
+        'don't penalize the provider', and that priority must be preserved.
+        """
+        class RemoteProtocolError(Exception):
+            pass
+        # Outermost message includes a content-failure marker
+        outer = RemoteProtocolError("diff_apply_failed: stale")
+        mode = FailbackStateMachine.classify_exception(outer)
+        assert mode is FailureMode.CONTENT_FAILURE
+
+
+class TestTransientTransportRecoveryParams:
+    """The new mode's recovery profile is appropriately short."""
+
+    def test_recovery_eta_starts_at_5s_base(self):
+        fsm = FailbackStateMachine()
+        fsm.record_primary_failure(mode=FailureMode.TRANSIENT_TRANSPORT)
+        eta = fsm.recovery_eta()
+        # First failure: base_s * 2^0 = 5s
+        delay = eta - fsm._last_failure_at
+        assert 4.9 <= delay <= 5.1
+
+    def test_recovery_eta_caps_at_30s(self):
+        fsm = FailbackStateMachine()
+        for _ in range(10):
+            fsm.record_primary_failure(mode=FailureMode.TRANSIENT_TRANSPORT)
+        eta = fsm.recovery_eta()
+        delay = eta - fsm._last_failure_at
+        assert delay <= 30.1
+
+    def test_transient_recovery_much_shorter_than_connection_error(self):
+        """The whole point of the new mode: it recovers far faster.
+
+        With 3 consecutive failures:
+        - TRANSIENT_TRANSPORT: 5 * 4 = 20s (capped at 30)
+        - CONNECTION_ERROR: 120 * 4 = 480s
+        """
+        fsm_transient = FailbackStateMachine()
+        for _ in range(3):
+            fsm_transient.record_primary_failure(mode=FailureMode.TRANSIENT_TRANSPORT)
+        transient_delay = (
+            fsm_transient.recovery_eta() - fsm_transient._last_failure_at
+        )
+
+        fsm_conn = FailbackStateMachine()
+        for _ in range(3):
+            fsm_conn.record_primary_failure(mode=FailureMode.CONNECTION_ERROR)
+        conn_delay = fsm_conn.recovery_eta() - fsm_conn._last_failure_at
+
+        assert transient_delay < conn_delay
+        assert transient_delay <= 30.0
+        assert conn_delay >= 480.0
+
+    def test_should_attempt_primary_after_short_backoff(self):
+        """After 5s base, should_attempt_primary returns True past ETA."""
+        fsm = FailbackStateMachine()
+        fsm.record_primary_failure(mode=FailureMode.TRANSIENT_TRANSPORT)
+        # Force ETA into the past by mutating _last_failure_at
+        fsm._last_failure_at = time.monotonic() - 10.0
+        assert fsm.should_attempt_primary() is True
+
+
+class TestPerOpTier0Rotation:
+    """Per-op rotation guard for misclassification belt-and-suspenders."""
+
+    def _make_gen_with_tier0(self, threshold: int = 2, window_s: float = 30.0):
+        """Build a CandidateGenerator with a mock Tier 0 provider."""
+        import os
+        os.environ["OUROBOROS_TIER0_SKIP_THRESHOLD"] = str(threshold)
+        os.environ["OUROBOROS_TIER0_SKIP_WINDOW_S"] = str(window_s)
+        try:
+            primary = _make_mock_provider(name="primary")
+            fallback = _make_mock_provider(name="fallback")
+            tier0 = _make_mock_provider(name="tier0")
+            type(tier0).is_available = PropertyMock(return_value=True)
+            type(tier0)._realtime_enabled = PropertyMock(return_value=True)
+            gen = CandidateGenerator(primary=primary, fallback=fallback, tier0=tier0)
+            return gen
+        finally:
+            os.environ.pop("OUROBOROS_TIER0_SKIP_THRESHOLD", None)
+            os.environ.pop("OUROBOROS_TIER0_SKIP_WINDOW_S", None)
+
+    def test_zero_failures_does_not_skip(self):
+        gen = self._make_gen_with_tier0()
+        assert gen._should_skip_tier0_for_op() is False
+
+    def test_one_failure_below_threshold_does_not_skip(self):
+        gen = self._make_gen_with_tier0(threshold=2)
+        gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is False
+
+    def test_threshold_failures_within_window_skips(self):
+        gen = self._make_gen_with_tier0(threshold=2, window_s=30.0)
+        gen._record_tier0_failure()
+        gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is True
+
+    def test_threshold_failures_outside_window_does_not_skip(self):
+        gen = self._make_gen_with_tier0(threshold=2, window_s=30.0)
+        gen._record_tier0_failure()
+        gen._record_tier0_failure()
+        # Force the most-recent failure timestamp into the past
+        gen._last_tier0_failure_at = time.monotonic() - 60.0
+        assert gen._should_skip_tier0_for_op() is False
+
+    def test_success_resets_counter(self):
+        gen = self._make_gen_with_tier0(threshold=2)
+        gen._record_tier0_failure()
+        gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is True
+        gen._record_tier0_success()
+        assert gen._consecutive_tier0_failures == 0
+        assert gen._should_skip_tier0_for_op() is False
+
+    def test_threshold_env_override_respected(self):
+        gen = self._make_gen_with_tier0(threshold=5)
+        for _ in range(4):
+            gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is False
+        gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is True
+
+    def test_window_env_override_respected(self):
+        gen = self._make_gen_with_tier0(threshold=2, window_s=5.0)
+        gen._record_tier0_failure()
+        gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is True
+        # 6 seconds elapsed → past the 5s window
+        gen._last_tier0_failure_at = time.monotonic() - 6.0
+        assert gen._should_skip_tier0_for_op() is False
+
+    def test_independence_from_fsm_mode(self):
+        """Rotation guard fires regardless of FSM classifier output.
+
+        The whole point: even if classify_exception mis-routes a transport
+        flap to TIMEOUT (default), the rotation guard still kicks in.
+        """
+        gen = self._make_gen_with_tier0(threshold=2)
+        # Don't touch FSM at all — rotation must work standalone
+        assert gen.fsm._failure_mode is None
+        gen._record_tier0_failure()
+        gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is True
+
+
+class TestFsmDeepBackoffGeneralization:
+    """Generalized backoff guard honors any failure mode, not just CONNECTION_ERROR."""
+
+    def test_transient_transport_blocks_should_attempt_when_in_backoff(self):
+        """TRANSIENT_TRANSPORT in backoff window prevents retry."""
+        fsm = FailbackStateMachine()
+        fsm.record_primary_failure(mode=FailureMode.TRANSIENT_TRANSPORT)
+        # Within the 5s base window
+        assert fsm.should_attempt_primary() is False
+
+    def test_transient_transport_allows_after_window(self):
+        fsm = FailbackStateMachine()
+        fsm.record_primary_failure(mode=FailureMode.TRANSIENT_TRANSPORT)
+        fsm._last_failure_at = time.monotonic() - 6.0
+        assert fsm.should_attempt_primary() is True
+
+    def test_timeout_mode_recovery_eta_unchanged(self):
+        """Existing TIMEOUT recovery profile preserved."""
+        fsm = FailbackStateMachine()
+        fsm.record_primary_failure(mode=FailureMode.TIMEOUT)
+        delay = fsm.recovery_eta() - fsm._last_failure_at
+        assert 44.9 <= delay <= 45.1
+
+
+class TestProductionFailureScenario:
+    """Reproduce the exact pattern from bt-2026-04-12-005521.
+
+    9 consecutive ops dying because:
+      1. Anthropic SDK raises APIConnectionError(cause=RemoteProtocolError(...))
+      2. Old classifier returned TIMEOUT (45s/300s recovery)
+      3. CONNECTION_ERROR-only deep-backoff guard never fired
+      4. Each op hit the same dead transport on the next attempt
+      5. Fallback also failed → all_providers_exhausted
+
+    The fix should: classify as TRANSIENT_TRANSPORT (5s/30s), trigger the
+    generalized deep-backoff guard, and after 2 consecutive failures the
+    per-op rotation kicks in to skip Tier 0 entirely until recovery.
+    """
+
+    def test_repro_full_chain_ends_in_short_backoff(self):
+        # Step 1: classifier sees the wrapper
+        inner = _make_remote_protocol_error()
+        wrapper = _make_api_connection_error_wrapping(inner)
+        mode = FailbackStateMachine.classify_exception(wrapper)
+        assert mode is FailureMode.TRANSIENT_TRANSPORT, (
+            f"misclassified — got {mode}, the bug would still be present"
+        )
+
+        # Step 2: FSM records the failure with the correct mode
+        fsm = FailbackStateMachine()
+        fsm.record_primary_failure(mode=mode)
+        eta = fsm.recovery_eta()
+        delay = eta - fsm._last_failure_at
+        assert delay <= 30.0, (
+            f"recovery delay {delay}s exceeds the 30s cap — bug still present"
+        )
+
+        # Step 3: should_attempt_primary returns False inside the window
+        assert fsm.should_attempt_primary() is False
+
+        # Step 4: After ~5s the FSM unblocks (TRANSIENT_TRANSPORT base)
+        fsm._last_failure_at = time.monotonic() - 5.5
+        assert fsm.should_attempt_primary() is True
+
+    def test_repro_rotation_engages_after_two_failures(self):
+        """Per-op rotation engages even if the FSM mis-routed."""
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+        tier0 = _make_mock_provider(name="tier0")
+        type(tier0).is_available = PropertyMock(return_value=True)
+        type(tier0)._realtime_enabled = PropertyMock(return_value=True)
+
+        gen = CandidateGenerator(primary=primary, fallback=fallback, tier0=tier0)
+        # Default: threshold=2, window=30s
+        assert gen._tier0_skip_threshold == 2
+        assert gen._tier0_skip_window_s == 30.0
+
+        # Op 1 fails on Tier 0
+        gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is False  # below threshold
+
+        # Op 2 fails on Tier 0
+        gen._record_tier0_failure()
+        # Now skip — Op 3 will route directly to Claude fallback
+        assert gen._should_skip_tier0_for_op() is True
+
+    def test_repro_rotation_clears_on_recovery(self):
+        """Once Tier 0 recovers, the rotation counter clears so subsequent
+        ops resume the cheap path.
+        """
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+        tier0 = _make_mock_provider(name="tier0")
+        type(tier0).is_available = PropertyMock(return_value=True)
+
+        gen = CandidateGenerator(primary=primary, fallback=fallback, tier0=tier0)
+        gen._record_tier0_failure()
+        gen._record_tier0_failure()
+        assert gen._should_skip_tier0_for_op() is True
+
+        gen._record_tier0_success()
+        assert gen._should_skip_tier0_for_op() is False
+        assert gen._consecutive_tier0_failures == 0
+
+
+class TestExceptionChainHelper:
+    """Direct unit tests on _walk_exception_chain helper."""
+
+    def test_returns_single_element_for_unchained(self):
+        from backend.core.ouroboros.governance.candidate_generator import (
+            _walk_exception_chain,
+        )
+        chain = _walk_exception_chain(ValueError("alone"))
+        assert len(chain) == 1
+        assert isinstance(chain[0], ValueError)
+
+    def test_returns_outermost_first(self):
+        from backend.core.ouroboros.governance.candidate_generator import (
+            _walk_exception_chain,
+        )
+        inner = ValueError("inner")
+        outer = RuntimeError("outer")
+        outer.__cause__ = inner
+        chain = _walk_exception_chain(outer)
+        assert len(chain) == 2
+        assert isinstance(chain[0], RuntimeError)
+        assert isinstance(chain[1], ValueError)
+
+    def test_handles_none_cause(self):
+        from backend.core.ouroboros.governance.candidate_generator import (
+            _walk_exception_chain,
+        )
+        exc = RuntimeError("nothing")
+        exc.__cause__ = None
+        exc.__context__ = None
+        chain = _walk_exception_chain(exc)
+        assert chain == (exc,)
