@@ -1735,3 +1735,105 @@ Only (8) was actually the unblocker. (1)–(7) were necessary but not sufficient
 - **Zero** `client has been closed` occurrences across 119KB of debug log — the fix held
 - Known counter bug: `summary.json.stats.attempted=0` even though 3 workers completed and 1 op reached APPLY. The counter only increments on specific phase transitions; the debug log is the authoritative source. Filing follow-up to fix the counter semantics.
 
+### 2026-04-12 — IMMEDIATE thinking cap + DurableJSONL sandbox fix (session `bt-2026-04-12-073546`)
+
+**Headline:** First session with IMMEDIATE thinking cap and DurableJSONL sandbox fix. Validated 5 independent fixes. Pipeline reached VALIDATE but blocked by test runner empty JSON report (0/0 tests).
+
+**Duration:** 7m12s, clean `budget_exhausted` shutdown at $0.505.
+
+**Fixes validated:**
+1. `fallback_concurrency=3` aligned with pool size — zero sem contention across 3 concurrent workers
+2. Outer gate grace raised 5s → 15s
+3. Async sensor scans (OpportunityMiner, TodoScanner, DocStaleness) via `run_in_executor`
+4. IMMEDIATE route thinking disabled — first_token dropped from 94.5s to 961ms (98x improvement)
+5. DurableJSONL routed through `sandbox_fallback()` with error suppression after first occurrence
+
+**Furthest progression:** INTENT → GENERATE → IRON_GATE(ascii_auto_repaired) → VALIDATE (blocked by test runner 0/0)
+
+**Key metrics:**
+- 3 workers concurrent with zero sem contention
+- 0 DurableJSONL error spam (previously flooded logs)
+- 19 trigger-tagged TODO items detected by TodoScanner
+
+**Remaining blocker:** `resolve_affected_tests()` walks temp sandbox path instead of repo-relative path, resulting in 0/0 test results. Fix pending — this is the single gate between current state and full APPLY → VERIFY → COMPLETE progression.
+
+## O+V Capability Assessment (2026-04-12)
+
+### Current Pipeline Maturity
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| CLASSIFY | Production | SemanticTriage with 35B model, <1ms routing |
+| ROUTE | Production | UrgencyRouter: 5 routes (IMMEDIATE/STANDARD/COMPLEX/BACKGROUND/SPECULATIVE) |
+| CONTEXT_EXPANSION | Production | Oracle 242K nodes, semantic index, strategic direction injection |
+| PLAN | Production | PlanGenerator schema plan.1, model-reasoned implementation strategy |
+| GENERATE | Production | 3-tier failback, Venom 16-tool loop, route-aware thinking, Iron Gate |
+| VALIDATE | **Broken** | Test runner sandbox path resolution fails -- 0/0 tests, empty JSON report. Root cause: `resolve_affected_tests()` walks temp sandbox path instead of repo-relative path; pytest runs from wrong cwd |
+| GATE | Production | 4-tier risk escalation (SAFE_AUTO/NOTIFY_APPLY/APPROVAL_REQUIRED/BLOCKED) |
+| APPROVE | Production | SerpentFlow CLI approval + Orange PR async path |
+| APPLY | **Blocked** | Never reached in battle tests -- VALIDATE failure prevents progression |
+| VERIFY | **Blocked** | Depends on APPLY |
+| COMPLETE | **Blocked** | Depends on VERIFY |
+
+### O+V vs Claude Code Comparison
+
+**Features O+V has that CC doesn't:**
+
+- 16 autonomous sensors (proactive signal discovery vs reactive human prompting)
+- 3-tier provider failback with cost-aware routing ($0.002/op DW -> $0.03/op Claude -> J-Prime)
+- Cost governor with per-op tracking, session budget caps, priority queue (16 slots)
+- Iron Gate: hard-enforced exploration-first (2+ read/search calls before any patch)
+- L2 self-repair: 5-iteration repair FSM when VALIDATE fails (120s timebox)
+- 4-tier risk escalation with Orange PR async review for APPROVAL_REQUIRED
+- Consciousness layer: MemoryEngine (file reputation), ProphecyEngine (regression prediction), DreamEngine (idle speculation)
+- Strategic direction: Manifesto principles + git-history momentum injected into every generation
+- Cross-repo saga support with atomic multi-file generation and batch-level rollback
+- CommProtocol 5-phase observability: INTENT -> PLAN -> HEARTBEAT -> DECISION -> POSTMORTEM
+- Route-aware extended thinking: IMMEDIATE=off (reflex), SIMPLE=4K, MODERATE=8K, COMPLEX=16K, ARCHITECTURAL=24K
+- Signal coalescing (30s window) + deduplication + WAL persistence
+
+**Features CC has that O+V is missing or incomplete:**
+
+1. **Reliable VERIFY -> APPLY cycle** -- test runner sandbox bug blocks all downstream phases (P0)
+2. **Streaming reasoning visibility** -- thinking tokens not surfaced to TUI; model reasoning is opaque
+3. **Interactive mid-operation steering** -- no Ctrl+C mid-stream redirect; `/cancel` requires op-id
+4. **IDE integration** -- no VSCode/JetBrains plugin for hover diagnostics, inline edits, symbol jumps
+5. **Token streaming to TUI** -- `on_token` callback exists but not wired to SerpentFlow character-by-character
+6. **Command history/completion** in SerpentFlow REPL
+7. **Parallel op visualization** -- 3 workers but serial scroll view in Zone 1
+8. **Remote sandboxed execution** -- all tool execution is local
+9. **Diff preview for SAFE_AUTO** -- Green tier auto-applies without showing diff
+10. **Session summary in TUI** -- `summary.json` exists but not surfaced; has known `attempted` counter bug
+
+### Known Issues & Edge Cases
+
+1. **all_providers_exhausted frequency**: 30-50% of ops in battle tests die to budget geometry -- DW Tier 0 consumes 70s, leaving Claude with insufficient budget for tool rounds. Mitigation: IMMEDIATE route now skips DW; STANDARD route needs budget preemption for Tier 0.
+
+2. **Signal-to-noise ratio**: 16 sensors flood the 16-slot queue within minutes. IMMEDIATE signals can sit behind BACKGROUND opportunities. Need: separate priority-tier queues or preemption.
+
+3. **Noop vs failure distinction**: Model classifying failed-validation as noop instead of routing to L2 repair. Need: separate noop-classification from validation-failure paths.
+
+4. **Session lessons don't persist**: `_session_lessons` buffer (20 max) resets each run. Discovery from one session lost by next. Wire into UserPreferenceMemory (PROJECT type).
+
+5. **Missing signal selection narration**: O+V picks signals without explaining why. Need one-line narration at INTENT phase for trust in autonomy.
+
+6. **DurableJSONL sandbox writes**: Fixed in commit 5bde550 -- routed through `sandbox_fallback()`, error suppression after first occurrence.
+
+7. **Extended thinking budget theft on IMMEDIATE route**: Fixed in commit 5bde550 -- IMMEDIATE route now disables thinking by default (was 94.5s/116.7s budget consumed by thinking alone).
+
+### Current Letter Grade: B+
+
+| Dimension | Grade | Rationale |
+|-----------|-------|-----------|
+| Architecture | A | 11-phase pipeline, 3-tier providers, consciousness layer, Iron Gate |
+| Sensor/Discovery | A- | 16 sensors, trigger-tags, event-driven. Slightly noisy |
+| Generation | B+ | Extended thinking, Venom tool loop, exploration-first, route-aware budgets |
+| Validation/Apply | D | Test runner broken, never lands patches |
+| Self-repair | B | L2 exists and wired, never fires because VALIDATE never passes |
+| Observability | A- | CommProtocol, SerpentFlow, debug.log. Missing: thinking visibility |
+| UX | B- | SerpentFlow functional but not interactive. No streaming tokens |
+| Cost efficiency | A | DW routing, prompt caching, route-aware thinking. $0.50 runs 7+ ops |
+| **Overall** | **B+** | Architecturally A-tier, execution B-tier, blocked by test runner |
+
+**The path from B+ to A-:** Fix test runner -> VALIDATE passes -> APPLY fires -> L2 repair engages -> AutoCommitter lands patches.
+

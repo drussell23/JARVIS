@@ -66,6 +66,7 @@ Deterministic routing based on signal urgency + source + task complexity. Stampe
 - **Tier 1 reserve**: 25s minimum (not 45s -- reduced to avoid starving Tier 0)
 - **DW poll interval**: 5s (not 15s)
 - **pytest (TestWatcher)**: 30s timeout
+- **IMMEDIATE extended thinking**: Disabled by default (env: `JARVIS_THINKING_BUDGET_IMMEDIATE`, default 0). Route check fires before complexity checks.
 - **IMMEDIATE → STANDARD demotion**: After Claude exhausts retries on IMMEDIATE, demotes to STANDARD (DW primary) for one more attempt
 
 ### Worker Pool
@@ -96,6 +97,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **AutoCommitter** (`auto_committer.py`): Structured git commits with O+V signature after successful APPLY+VERIFY. Conventional commit format, risk-tier metadata, protected-branch push prevention.
 - **OrangePRReviewer** (`orange_pr_reviewer.py`): Async-review path for Orange-tier (`APPROVAL_REQUIRED`) changes. Instead of blocking the loop on a synchronous CLI approval, creates a `ouroboros/review/{op-id}` branch, commits the candidate, pushes, and files a GitHub PR via `gh pr create` with evidence + review checklist in the body. The autonomous loop continues immediately; the human reviews asynchronously. Opt-in via `JARVIS_ORANGE_PR_ENABLED` (default `false`). On any failure, falls back to the existing CLI approval provider. Manifesto §7 (absolute observability) — the PR is the auditable artifact.
 - **DreamEngine** (`consciousness/dream_engine.py`): Idle GPU speculative improvement blueprints
+- **TestRunner** (`test_runner.py`): Language-agnostic test execution with pytest JSON report parsing. **Known issue**: `resolve_affected_tests()` fails when candidate files are in temp sandbox -- walks sandbox path instead of repo-relative path, resulting in 0/0 test results. Fix pending.
 
 ### Autonomous Developer Intelligence (O+V)
 
@@ -192,3 +194,5 @@ This is not a software refactor. It is the genesis of an autonomous, self-evolvi
 Full postmortems for sustained battle-test breakthroughs live in `docs/architecture/OUROBOROS.md#battle-test-breakthrough-log`. The canonical source of truth for any "did the loop work" question is the session `debug.log` under `.ouroboros/sessions/<session-id>/`, not `summary.json` (which has a known `attempted` counter bug).
 
 **2026-04-11 (`bt-2026-04-11-154947`)** — First sustained full-pipeline completion since the Apr 9–10 Iron Gate tightening. `op-019d7d3e` (requirements.txt upgrade) traversed CLASSIFY → GENERATE → IRON_GATE_REJECT → REGENERATE → APPLY → DECISION(applied) → VERIFY → L2 → POSTMORTEM autonomously. `dependency_file_integrity` Iron Gate caught a hallucinated `anthropic → anthropichttp` rename on attempt 1. Unblocker: captured-client race fix in `providers.py` — `_do_stream`/`_create_with_prefill_fallback`/`_legacy_create`/`_plan_create` now re-acquire `self._client` on every `_call_with_backoff` retry so recycles after hard-pool signals are visible to subsequent attempts.
+
+**2026-04-12 (`bt-2026-04-12-073546`)** — First session with IMMEDIATE thinking cap and DurableJSONL sandbox fix. Validated 5 independent fixes: (1) fallback_concurrency=3 aligned with pool size — zero sem contention across 3 concurrent workers, (2) outer gate grace raised 5s→15s, (3) async sensor scans (OpportunityMiner, TodoScanner, DocStaleness) via run_in_executor, (4) IMMEDIATE route thinking disabled — first_token dropped from 94.5s to 961ms (98x), (5) DurableJSONL routed through sandbox_fallback with error suppression. Pipeline reached VALIDATE but blocked by test runner empty JSON report (0/0 tests). Root cause identified: resolve_affected_tests() walks temp sandbox path instead of repo-relative path. Remaining blocker: fix test runner sandbox path resolution to unlock APPLY→VERIFY→COMPLETE.
