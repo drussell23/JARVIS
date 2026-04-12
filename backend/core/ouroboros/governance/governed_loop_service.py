@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 from backend.core.ouroboros.governance.approval_provider import CLIApprovalProvider
 from backend.core.ouroboros.governance.candidate_generator import (
@@ -743,6 +743,145 @@ class GovernedLoopService:
     No side effects in constructor. All async initialization in start().
     """
 
+    @staticmethod
+    def _build_hibernation_observability_hooks(
+        stack: Any,
+    ) -> Tuple[
+        Callable[..., Awaitable[None]],
+        Callable[..., Awaitable[None]],
+    ]:
+        """Factory for the step-7 hibernation observability hook pair.
+
+        Produces two async hooks that share a closure-captured cycle
+        counter and in-flight ``op_id``. Every enter/wake pair forms a
+        single logical "hibernation cycle" in the CommProtocol message
+        stream:
+
+            HEARTBEAT(hibernation_enter, proactive_alert)
+                → DECISION(hibernation_entered)
+                → HEARTBEAT(hibernation_wake, proactive_alert)
+                → DECISION(hibernation_wake)
+                → POSTMORTEM
+
+        Every message is fanned out through ``stack.comm._transports``,
+        so SerpentFlow (via SerpentTransport) renders a proactive alert
+        Panel, LogTransport writes to debug.log, and any dashboard
+        transport picks up the event feed — all from a single code
+        path. No subsystem is imported here; the indirection through
+        CommProtocol keeps this layer decoupled from the battle-test
+        harness.
+
+        Parameters
+        ----------
+        stack:
+            The governance stack (typically ``self._stack``). Must
+            expose a ``.comm`` attribute that is a :class:`CommProtocol`
+            — or ``None`` at hook-fire time, in which case the hook
+            becomes a debug-logged no-op.
+
+        Returns
+        -------
+        Tuple of ``(on_hibernate, on_wake)`` async callables. Each
+        accepts a single keyword argument ``reason``. Exceptions from
+        CommProtocol are logged and swallowed — observability must
+        never block a lifecycle transition.
+        """
+        _stack_ref = stack
+        # Mutable one-element lists so both closures share the cycle
+        # counter and current op_id without needing a nonlocal block.
+        _obs_cycle: List[int] = [0]
+        _obs_current_op: List[str] = [""]
+
+        async def _hibernate_obs(*, reason: str) -> None:
+            if _stack_ref is None:
+                return
+            comm = getattr(_stack_ref, "comm", None)
+            if comm is None:
+                logger.debug(
+                    "[GLS] hibernation obs: no comm on stack — skipping"
+                )
+                return
+            _obs_cycle[0] += 1
+            op_id = f"hibernation-{_obs_cycle[0]:03d}-{int(time.time())}"
+            _obs_current_op[0] = op_id
+            reason_text = reason or "unspecified"
+            try:
+                await comm.emit_heartbeat(
+                    op_id=op_id,
+                    phase="hibernation_enter",
+                    progress_pct=0.0,
+                    proactive_alert=True,
+                    alert_title="HIBERNATING",
+                    alert_body=(
+                        f"Organism entering hibernation — {reason_text}"
+                    ),
+                    alert_severity="critical",
+                    alert_source="provider_exhaustion",
+                    hibernation_cycle=_obs_cycle[0],
+                )
+                await comm.emit_decision(
+                    op_id=op_id,
+                    outcome="hibernation_entered",
+                    reason_code="provider_exhaustion",
+                    diff_summary=reason_text,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[GLS] hibernation enter observability hook failed"
+                )
+
+        async def _wake_obs(*, reason: str) -> None:
+            if _stack_ref is None:
+                return
+            comm = getattr(_stack_ref, "comm", None)
+            if comm is None:
+                logger.debug(
+                    "[GLS] hibernation obs: no comm on stack — skipping"
+                )
+                return
+            # Reuse the in-flight op_id so enter/wake share a seq space.
+            # If wake fires without a prior enter (e.g. emergency_stop
+            # racing), synthesize a standalone id so the sequence is
+            # still well-formed.
+            op_id = _obs_current_op[0] or (
+                f"hibernation-wake-{int(time.time())}"
+            )
+            reason_text = reason or "unspecified"
+            try:
+                await comm.emit_heartbeat(
+                    op_id=op_id,
+                    phase="hibernation_wake",
+                    progress_pct=100.0,
+                    proactive_alert=True,
+                    alert_title="RECOVERED",
+                    alert_body=(
+                        f"Provider substrate back online — {reason_text}"
+                    ),
+                    alert_severity="info",
+                    alert_source="provider_recovery",
+                    hibernation_cycle=_obs_cycle[0],
+                )
+                await comm.emit_decision(
+                    op_id=op_id,
+                    outcome="hibernation_wake",
+                    reason_code="provider_recovery",
+                    diff_summary=reason_text,
+                )
+                await comm.emit_postmortem(
+                    op_id=op_id,
+                    root_cause=reason_text,
+                    failed_phase=None,
+                    next_safe_action="resume_governed_loop",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[GLS] hibernation wake observability hook failed"
+                )
+            finally:
+                _obs_current_op[0] = ""
+
+        return _hibernate_obs, _wake_obs
+
     def __init__(
         self,
         stack: Any = None,
@@ -782,6 +921,8 @@ class GovernedLoopService:
         self._hibernation_prober: Any = None
         self._hibernate_bridge: Any = None
         self._wake_bridge: Any = None
+        self._hibernate_obs_hook: Any = None
+        self._wake_obs_hook: Any = None
         self._ledger: Any = None  # set in _build_components from stack.ledger
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
         self._trust_graduator: Optional[Any] = None
@@ -3296,6 +3437,63 @@ class GovernedLoopService:
                     "[GLS] hibernation hook registration failed "
                     "(non-fatal): %s",
                     _hook_exc,
+                )
+
+        # ---- HIBERNATION_MODE step 7: observability (SerpentFlow + CommProtocol) ----
+        # Emit structured CommProtocol messages around every hibernation
+        # transition. CommProtocol fans the messages out to all registered
+        # transports, which include:
+        #
+        #   - LogTransport       → debug.log (always)
+        #   - SerpentTransport   → renders a proactive_alert Panel in the
+        #                          flowing CLI (battle-test sessions)
+        #   - DashboardTransport → LiveDashboard event feed (if wired)
+        #
+        # We do NOT import SerpentFlow/LiveDashboard here — they are owned
+        # by the battle-test harness and may not exist in production. The
+        # CommProtocol indirection keeps this layer clean.
+        #
+        # A single hibernation "cycle" shares one op_id across enter/wake so
+        # the message sequence reads HEARTBEAT(enter) → DECISION(entered) →
+        # HEARTBEAT(wake) → DECISION(wake) → POSTMORTEM in the transport.
+        # The controller's hook layer awaits async hooks, so we can use the
+        # plain async comm API directly.
+        #
+        # Master switch: JARVIS_HIBERNATION_OBS_ENABLED (default "true"). Set
+        # to "0"/"false" in tests that don't want comm traffic.
+        _obs_enabled = os.environ.get(
+            "JARVIS_HIBERNATION_OBS_ENABLED", "true"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        if (
+            _obs_enabled
+            and _ctrl_for_hooks is not None
+            and hasattr(_ctrl_for_hooks, "register_hibernation_hooks")
+        ):
+            _hibernate_obs_hook, _wake_obs_hook = (
+                self._build_hibernation_observability_hooks(self._stack)
+            )
+            try:
+                _ctrl_for_hooks.register_hibernation_hooks(
+                    on_hibernate=_hibernate_obs_hook,
+                    on_wake=_wake_obs_hook,
+                    name="governed_loop_service.observability",
+                )
+                self._hibernate_obs_hook = _hibernate_obs_hook
+                self._wake_obs_hook = _wake_obs_hook
+                logger.info(
+                    "[GLS] hibernation observability hooks registered "
+                    "(comm fan-out: %d transport(s))",
+                    len(getattr(
+                        getattr(self._stack, "comm", None),
+                        "_transports",
+                        [],
+                    ) or []),
+                )
+            except Exception as _obs_exc:
+                logger.warning(
+                    "[GLS] hibernation observability registration failed "
+                    "(non-fatal): %s",
+                    _obs_exc,
                 )
 
         # ---- Wire LifecycleHookEngine (P1: 15 lifecycle events) ----
