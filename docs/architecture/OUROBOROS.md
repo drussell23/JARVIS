@@ -1755,7 +1755,7 @@ Only (8) was actually the unblocker. (1)–(7) were necessary but not sufficient
 - 0 DurableJSONL error spam (previously flooded logs)
 - 19 trigger-tagged TODO items detected by TodoScanner
 
-**Remaining blocker:** `resolve_affected_tests()` walks temp sandbox path instead of repo-relative path, resulting in 0/0 test results. Fix pending — this is the single gate between current state and full APPLY → VERIFY → COMPLETE progression.
+**Remaining blocker (now resolved):** `resolve_affected_tests()` walked temp sandbox path instead of repo-relative path, resulting in 0/0 test results. Fixed in commit 22f297d — `original_paths` mapping + multi-strategy test discovery. This was the single gate between current state and full APPLY → VERIFY → COMPLETE progression.
 
 ## O+V Capability Assessment (2026-04-12)
 
@@ -1768,58 +1768,58 @@ Only (8) was actually the unblocker. (1)–(7) were necessary but not sufficient
 | CONTEXT_EXPANSION | Production | Oracle 242K nodes, semantic index, strategic direction injection |
 | PLAN | Production | PlanGenerator schema plan.1, model-reasoned implementation strategy |
 | GENERATE | Production | 3-tier failback, Venom 16-tool loop, route-aware thinking, Iron Gate |
-| VALIDATE | **Broken** | Test runner sandbox path resolution fails -- 0/0 tests, empty JSON report. Root cause: `resolve_affected_tests()` walks temp sandbox path instead of repo-relative path; pytest runs from wrong cwd |
-| GATE | Production | 4-tier risk escalation (SAFE_AUTO/NOTIFY_APPLY/APPROVAL_REQUIRED/BLOCKED) |
-| APPROVE | Production | SerpentFlow CLI approval + Orange PR async path |
-| APPLY | **Blocked** | Never reached in battle tests -- VALIDATE failure prevents progression |
-| VERIFY | **Blocked** | Depends on APPLY |
-| COMPLETE | **Blocked** | Depends on VERIFY |
+| VALIDATE | Fixed | Was Broken -- sandbox path bug resolved in commit 22f297d (original_paths mapping + multi-strategy discovery) |
+| GATE | Production | Iron Gate: exploration-first + ASCII strictness |
+| APPROVE | Production | 4-tier risk escalation (SAFE_AUTO/NOTIFY_APPLY/APPROVAL_REQUIRED/BLOCKED) |
+| APPLY | Unblocked | Previously blocked by VALIDATE, now unblocked |
+| VERIFY | Unblocked | Previously blocked by VALIDATE, now unblocked |
+| COMPLETE | Unblocked | Previously blocked by VALIDATE, now unblocked |
 
 ### O+V vs Claude Code Comparison
 
-**Features O+V has that CC doesn't:**
+**Advantages O+V has over CC (12):**
 
-- 16 autonomous sensors (proactive signal discovery vs reactive human prompting)
-- 3-tier provider failback with cost-aware routing ($0.002/op DW -> $0.03/op Claude -> J-Prime)
-- Cost governor with per-op tracking, session budget caps, priority queue (16 slots)
-- Iron Gate: hard-enforced exploration-first (2+ read/search calls before any patch)
-- L2 self-repair: 5-iteration repair FSM when VALIDATE fails (120s timebox)
-- 4-tier risk escalation with Orange PR async review for APPROVAL_REQUIRED
-- Consciousness layer: MemoryEngine (file reputation), ProphecyEngine (regression prediction), DreamEngine (idle speculation)
-- Strategic direction: Manifesto principles + git-history momentum injected into every generation
-- Cross-repo saga support with atomic multi-file generation and batch-level rollback
-- CommProtocol 5-phase observability: INTENT -> PLAN -> HEARTBEAT -> DECISION -> POSTMORTEM
-- Route-aware extended thinking: IMMEDIATE=off (reflex), SIMPLE=4K, MODERATE=8K, COMPLEX=16K, ARCHITECTURAL=24K
-- Signal coalescing (30s window) + deduplication + WAL persistence
+1. Proactive autonomous operation (self-initiating, no human prompt needed)
+2. 16 autonomous sensors (TestFailure, OpportunityMiner, RuntimeHealth, etc.)
+3. 4-tier risk escalation (SAFE_AUTO/NOTIFY_APPLY/APPROVAL_REQUIRED/BLOCKED)
+4. Multi-provider failback (DW 397B -> Claude API -> J-Prime)
+5. Route-aware extended thinking budgets
+6. Iron Gate enforcement (exploration-first, ASCII strictness)
+7. L2 self-repair (iterative FSM, 5 iterations, 120s timebox)
+8. Signal coalescing and dependency DAG
+9. Strategic direction injection (manifesto principles in every prompt)
+10. Consciousness bridge (memory/prediction integration)
+11. DreamEngine (idle GPU speculative analysis)
+12. Auto-commit with O+V signature
 
-**Features CC has that O+V is missing or incomplete:**
+**Gaps where CC leads (10):**
 
-1. **Reliable VERIFY -> APPLY cycle** -- test runner sandbox bug blocks all downstream phases (P0)
-2. **Streaming reasoning visibility** -- thinking tokens not surfaced to TUI; model reasoning is opaque
-3. **Interactive mid-operation steering** -- no Ctrl+C mid-stream redirect; `/cancel` requires op-id
-4. **IDE integration** -- no VSCode/JetBrains plugin for hover diagnostics, inline edits, symbol jumps
-5. **Token streaming to TUI** -- `on_token` callback exists but not wired to SerpentFlow character-by-character
-6. **Command history/completion** in SerpentFlow REPL
-7. **Parallel op visualization** -- 3 workers but serial scroll view in Zone 1
-8. **Remote sandboxed execution** -- all tool execution is local
-9. **Diff preview for SAFE_AUTO** -- Green tier auto-applies without showing diff
-10. **Session summary in TUI** -- `summary.json` exists but not surfaced; has known `attempted` counter bug
+1. Interactive context gathering (CC asks clarifying questions naturally)
+2. File-level diff preview before apply (CC shows unified diffs)
+3. Undo/rollback UX (CC has git-integrated undo)
+4. Streaming incremental output (CC streams tokens to terminal)
+5. Session persistence and resume (CC resumes mid-task)
+6. Multi-turn refinement (CC iterates based on feedback)
+7. Test-first development (CC runs tests before and after)
+8. Dependency analysis (CC traces imports and call graphs)
+9. Concurrent file editing (CC edits multiple files atomically)
+10. Plugin/extension ecosystem (CC has MCP servers, hooks, skills)
 
 ### Known Issues & Edge Cases
 
-1. **all_providers_exhausted frequency**: 30-50% of ops in battle tests die to budget geometry -- DW Tier 0 consumes 70s, leaving Claude with insufficient budget for tool rounds. Mitigation: IMMEDIATE route now skips DW; STANDARD route needs budget preemption for Tier 0.
+1. **all_providers_exhausted (30-50% of ops)** -- budget geometry mismatch: DW Tier 0 consumes 70s, leaving Claude with insufficient budget for tool rounds. Mitigation: IMMEDIATE route now skips DW; STANDARD route needs budget preemption for Tier 0.
 
-2. **Signal-to-noise ratio**: 16 sensors flood the 16-slot queue within minutes. IMMEDIATE signals can sit behind BACKGROUND opportunities. Need: separate priority-tier queues or preemption.
+2. **Signal-to-noise in sensor queue** -- TodoScanner/DocStaleness flooding the 16-slot queue within minutes. IMMEDIATE signals can sit behind BACKGROUND opportunities. Need: separate priority-tier queues or preemption.
 
-3. **Noop vs failure distinction**: Model classifying failed-validation as noop instead of routing to L2 repair. Need: separate noop-classification from validation-failure paths.
+3. **Session lessons not persisting across sessions** -- `_session_lessons` buffer (20 max) resets each run. Discovery from one session lost by next. Wire into UserPreferenceMemory (PROJECT type).
 
-4. **Session lessons don't persist**: `_session_lessons` buffer (20 max) resets each run. Discovery from one session lost by next. Wire into UserPreferenceMemory (PROJECT type).
+4. **Cost tracking accuracy** -- Tier 0 DW costs estimated, not metered. Per-op cost attribution relies on token counts from provider responses, but DW batch responses lack granular token breakdown.
 
-5. **Missing signal selection narration**: O+V picks signals without explaining why. Need one-line narration at INTENT phase for trust in autonomy.
+5. **Venom tool loop context overflow on deep explorations** -- when tool loop exceeds 75% of context budget, auto-compaction fires but can discard critical early-round context. Preserves recent 6 chunks only.
 
-6. **DurableJSONL sandbox writes**: Fixed in commit 5bde550 -- routed through `sandbox_fallback()`, error suppression after first occurrence.
+6. **No incremental apply** -- full file replacement only. ChangeEngine writes complete file content; no line-level diff application. Large files risk unnecessary churn.
 
-7. **Extended thinking budget theft on IMMEDIATE route**: Fixed in commit 5bde550 -- IMMEDIATE route now disables thinking by default (was 94.5s/116.7s budget consumed by thinking alone).
+7. **No cross-session learning persistence** -- consciousness layer (MemoryEngine, ProphecyEngine) state resets per session. UserPreferenceMemory provides typed persistence but is not yet wired to session lessons or prediction history.
 
 ### Current Letter Grade: B+
 
