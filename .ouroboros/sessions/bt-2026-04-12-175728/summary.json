@@ -1,0 +1,83 @@
+{
+  "session_id": "bt-2026-04-12-175728",
+  "stop_reason": "budget_exhausted",
+  "duration_s": 1062.2549169063568,
+  "stats": {
+    "attempted": 2,
+    "completed": 0,
+    "failed": 2,
+    "cancelled": 0,
+    "queued": 0
+  },
+  "cost_total": 0.5303789999999999,
+  "cost_breakdown": {
+    "claude": 0.5303789999999999
+  },
+  "branch_stats": {
+    "commits": 0,
+    "files_changed": 0,
+    "insertions": 0,
+    "deletions": 0
+  },
+  "convergence_state": "INSUFFICIENT_DATA",
+  "convergence_slope": 0.0,
+  "convergence_r2": 0.0,
+  "top_sensors": [
+    [
+      "governed_loop",
+      2
+    ]
+  ],
+  "top_techniques": [
+    [
+      "",
+      1
+    ],
+    [
+      "claude-api",
+      1
+    ]
+  ],
+  "operations": [
+    {
+      "op_id": "op-019d82dd-8fad-743e-9285-5f66f02d2d5e-cau",
+      "status": "failed",
+      "sensor": "governed_loop",
+      "technique": "",
+      "composite_score": 0.0,
+      "elapsed_s": 251.60913683399997,
+      "recorded_at": 1776017340.8308191,
+      "provider": "",
+      "cost_usd": 0.0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "tool_calls": 0,
+      "files_changed": 1
+    },
+    {
+      "op_id": "op-019d82dd-8fc5-7e32-a635-b29fc6652b39-cau",
+      "status": "failed",
+      "sensor": "governed_loop",
+      "technique": "claude-api",
+      "composite_score": 0.0,
+      "elapsed_s": 268.7705219999999,
+      "recorded_at": 1776017678.8262668,
+      "provider": "claude-api",
+      "cost_usd": 0.0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "tool_calls": 0,
+      "files_changed": 1
+    }
+  ],
+  "strategic_drift": {
+    "total_ops": 9,
+    "drifted_ops": 0,
+    "ratio": 0.0,
+    "threshold_met": true,
+    "warning": false,
+    "status": "ok"
+  }
+}
