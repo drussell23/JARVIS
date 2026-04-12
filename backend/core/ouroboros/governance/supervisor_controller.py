@@ -38,11 +38,78 @@ prior mode (GOVERNED) and resumes the DAG exactly where it left off.
 
 from __future__ import annotations
 
+import asyncio
 import enum
+import inspect
 import logging
-from typing import Optional
+import os
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger("Ouroboros.Controller")
+
+
+# ---------------------------------------------------------------------------
+# HIBERNATION hook plumbing (step 6.5)
+# ---------------------------------------------------------------------------
+#
+# The controller owns the authoritative lifecycle mode, but it does NOT
+# directly know about the BackgroundAgentPool, IdleWatchdog, SerpentFlow TUI,
+# or any other subsystem that needs to react to hibernation transitions.
+# Rather than injecting concrete refs (and introducing circular imports),
+# we expose a tiny pub/sub so any subsystem can register callbacks that
+# fire after the mode flip completes. GovernedLoopService uses this to wire
+# pool.pause()/watchdog.freeze() without coupling the controller to either.
+
+
+HibernationHook = Callable[..., Union[None, Awaitable[None]]]
+"""Signature for hibernation enter/wake callbacks.
+
+Hooks receive a single keyword argument ``reason`` and may be sync or
+async. Async hooks are detected at call time via ``inspect.isawaitable``
+on the return value, so both ``async def foo(*, reason)`` and
+``lambda *, reason: some_coro(reason=reason)`` are accepted.
+"""
+
+
+_ENV_HOOK_TIMEOUT = "JARVIS_HIBERNATION_HOOK_TIMEOUT_S"
+_DEFAULT_HOOK_TIMEOUT_S = 10.0
+
+
+def _resolve_hook_timeout() -> float:
+    """Resolve per-hook timeout from env var, falling back to default."""
+    raw = os.environ.get(_ENV_HOOK_TIMEOUT, "").strip()
+    if not raw:
+        return _DEFAULT_HOOK_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a float — falling back to default %s",
+            _ENV_HOOK_TIMEOUT, raw, _DEFAULT_HOOK_TIMEOUT_S,
+        )
+        return _DEFAULT_HOOK_TIMEOUT_S
+    if value <= 0:
+        logger.warning(
+            "%s=%s is non-positive — falling back to default %s",
+            _ENV_HOOK_TIMEOUT, value, _DEFAULT_HOOK_TIMEOUT_S,
+        )
+        return _DEFAULT_HOOK_TIMEOUT_S
+    return value
+
+
+async def _call_maybe_async(fn: Callable[..., Any], **kwargs: Any) -> Any:
+    """Invoke *fn* and await its result if it is awaitable.
+
+    Handles both ``async def`` callables and sync callables that return
+    a coroutine (common for lambda adapters that defer to an async impl).
+    Plain sync callables are called directly on the event loop thread, so
+    they must not perform blocking I/O.
+    """
+    result = fn(**kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 class AutonomyMode(enum.Enum):
@@ -80,7 +147,27 @@ class SupervisorOuroborosController:
         self._pre_hibernation_mode: Optional[AutonomyMode] = None
         self._hibernation_reason: Optional[str] = None
         self._hibernation_count: int = 0
-        logger.info("SupervisorOuroborosController initialised — mode=%s", self._mode.value)
+        # HIBERNATION_MODE step 6.5 — hook registry fired around enter/wake
+        # transitions so external subsystems (BG pool, idle watchdog, TUI)
+        # can react without the controller needing direct references.
+        self._on_hibernate_hooks: List[HibernationHook] = []
+        self._on_wake_hooks: List[HibernationHook] = []
+        self._hook_lock: asyncio.Lock = asyncio.Lock()
+        self._hook_timeout_s: float = _resolve_hook_timeout()
+        self._hook_stats: Dict[str, Any] = {
+            "hibernate_fires": 0,
+            "wake_fires": 0,
+            "hibernate_hook_failures": 0,
+            "wake_hook_failures": 0,
+            "last_hibernate_elapsed_ms": None,
+            "last_wake_elapsed_ms": None,
+        }
+        logger.info(
+            "SupervisorOuroborosController initialised — mode=%s "
+            "(hook_timeout=%.1fs)",
+            self._mode.value,
+            self._hook_timeout_s,
+        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -144,13 +231,17 @@ class SupervisorOuroborosController:
         """Stop the autonomy loop and reset all transient state.
 
         Any pending hibernation state is cleared — stop() is the ultimate
-        teardown and supersedes hibernation even mid-outage.
+        teardown and supersedes hibernation even mid-outage. Registered
+        hibernation hooks are also cleared so a subsequent ``start()`` /
+        re-registration cycle doesn't reference stale pool/watchdog
+        closures from the previous lifecycle.
         """
         previous = self._mode
         self._mode = AutonomyMode.DISABLED
         self._gates_passed = False
         self._pre_hibernation_mode = None
         self._hibernation_reason = None
+        self.clear_hibernation_hooks()
         logger.info("stop() — %s → DISABLED (gates_passed reset)", previous.value)
 
     async def pause(self) -> None:
@@ -224,6 +315,148 @@ class SupervisorOuroborosController:
         self._gates_passed = True
         logger.info("mark_gates_passed() — governance gates satisfied")
 
+    # ------------------------------------------------------------------
+    # Hibernation hook registration (step 6.5)
+    # ------------------------------------------------------------------
+
+    def register_hibernation_hooks(
+        self,
+        *,
+        on_hibernate: Optional[HibernationHook] = None,
+        on_wake: Optional[HibernationHook] = None,
+        name: str = "unnamed",
+    ) -> None:
+        """Register callbacks fired around HIBERNATION transitions.
+
+        Parameters
+        ----------
+        on_hibernate:
+            Called after the controller enters HIBERNATION, with a single
+            keyword argument ``reason``. Sync or async.
+        on_wake:
+            Called after the controller leaves HIBERNATION (either via
+            :meth:`wake_from_hibernation` or via :meth:`emergency_stop`
+            superseding hibernation), with keyword ``reason``.
+        name:
+            Human-readable tag used in logs so we can tell which subsystem
+            owns a given hook. Pass a unique name per registration site.
+
+        Duplicate registrations (same callable object) are deduped — it
+        is safe to call this twice from an idempotent boot path. Hooks
+        are fired in the order they were registered.
+        """
+        registered: List[str] = []
+        if on_hibernate is not None and on_hibernate not in self._on_hibernate_hooks:
+            self._on_hibernate_hooks.append(on_hibernate)
+            registered.append("on_hibernate")
+        if on_wake is not None and on_wake not in self._on_wake_hooks:
+            self._on_wake_hooks.append(on_wake)
+            registered.append("on_wake")
+        if registered:
+            logger.info(
+                "[Controller] hibernation hooks registered "
+                "(name=%s, kinds=%s, total=%d/%d)",
+                name,
+                ",".join(registered),
+                len(self._on_hibernate_hooks),
+                len(self._on_wake_hooks),
+            )
+
+    def unregister_hibernation_hooks(
+        self,
+        *,
+        on_hibernate: Optional[HibernationHook] = None,
+        on_wake: Optional[HibernationHook] = None,
+    ) -> None:
+        """Remove previously-registered hooks. No-op if callable not found.
+
+        Useful for teardown paths and tests that rebuild the controller
+        without leaving stale references pointing at disposed objects.
+        """
+        if on_hibernate is not None:
+            try:
+                self._on_hibernate_hooks.remove(on_hibernate)
+            except ValueError:
+                pass
+        if on_wake is not None:
+            try:
+                self._on_wake_hooks.remove(on_wake)
+            except ValueError:
+                pass
+
+    def clear_hibernation_hooks(self) -> None:
+        """Drop every registered hook. Used by ``stop()`` and tests."""
+        self._on_hibernate_hooks.clear()
+        self._on_wake_hooks.clear()
+
+    def hibernation_hook_snapshot(self) -> Dict[str, Any]:
+        """Lock-free observability dict for health()/TUI surfaces."""
+        return {
+            "hibernate_hooks_registered": len(self._on_hibernate_hooks),
+            "wake_hooks_registered": len(self._on_wake_hooks),
+            "hook_timeout_s": self._hook_timeout_s,
+            **self._hook_stats,
+        }
+
+    async def _fire_hibernation_hooks(
+        self,
+        hooks: List[HibernationHook],
+        *,
+        kind: str,
+        reason: str,
+    ) -> None:
+        """Run a list of hibernation hooks sequentially under the hook lock.
+
+        Each hook runs via :func:`asyncio.wait_for` with
+        ``self._hook_timeout_s`` so a stuck hook cannot block the
+        transition indefinitely. Individual timeouts and exceptions are
+        logged and counted in ``_hook_stats`` but otherwise swallowed —
+        one broken hook must never prevent the others from firing, and
+        hook failures must never propagate back to the transition caller
+        because the controller state is already authoritative.
+
+        The list is snapshotted before firing so a concurrent
+        :meth:`unregister_hibernation_hooks` / :meth:`clear_hibernation_hooks`
+        cannot mutate it mid-iteration.
+        """
+        if not hooks:
+            return
+        async with self._hook_lock:
+            pending = list(hooks)
+            start = time.monotonic()
+            failures = 0
+            for hook in pending:
+                hook_name = getattr(
+                    hook,
+                    "__qualname__",
+                    getattr(hook, "__name__", repr(hook)),
+                )
+                try:
+                    await asyncio.wait_for(
+                        _call_maybe_async(hook, reason=reason),
+                        timeout=self._hook_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    failures += 1
+                    logger.error(
+                        "[Controller] %s hook %s timed out after %.1fs",
+                        kind, hook_name, self._hook_timeout_s,
+                    )
+                except Exception:  # noqa: BLE001
+                    failures += 1
+                    logger.exception(
+                        "[Controller] %s hook %s raised — continuing",
+                        kind, hook_name,
+                    )
+            elapsed_ms = (time.monotonic() - start) * 1000.0
+            self._hook_stats[f"{kind}_fires"] += 1
+            self._hook_stats[f"{kind}_hook_failures"] += failures
+            self._hook_stats[f"last_{kind}_elapsed_ms"] = elapsed_ms
+            logger.info(
+                "[Controller] fired %d %s hook(s) in %.1fms (failures=%d)",
+                len(pending), kind, elapsed_ms, failures,
+            )
+
     async def enter_hibernation(self, reason: str) -> bool:
         """Transition into HIBERNATION mode, preserving the prior mode.
 
@@ -261,6 +494,15 @@ class SupervisorOuroborosController:
             reason,
             self._hibernation_count,
         )
+        # Fire on_hibernate hooks AFTER the mode flip so hooks that
+        # inspect ``controller.mode`` observe the new state. Failures
+        # are swallowed inside _fire_hibernation_hooks — the transition
+        # itself must remain authoritative.
+        await self._fire_hibernation_hooks(
+            self._on_hibernate_hooks,
+            kind="hibernate",
+            reason=reason,
+        )
         return True
 
     async def wake_from_hibernation(self, *, reason: str = "") -> bool:
@@ -288,6 +530,15 @@ class SupervisorOuroborosController:
             target.value,
             reason or "unspecified",
         )
+        # Fire on_wake hooks AFTER the mode flip so hooks see the
+        # restored mode. Pool.resume / watchdog.unfreeze are idempotent
+        # so duplicate fires across wake paths (explicit wake vs.
+        # emergency_stop) are safe.
+        await self._fire_hibernation_hooks(
+            self._on_wake_hooks,
+            kind="wake",
+            reason=reason or "unspecified",
+        )
         return True
 
     async def emergency_stop(self, reason: str) -> None:
@@ -296,9 +547,16 @@ class SupervisorOuroborosController:
         Stores *reason* and transitions to EMERGENCY_STOP.  Any
         subsequent :meth:`resume` will raise ``RuntimeError`` until
         the emergency is manually cleared.
+
+        If the controller was hibernating, the wake hooks are fired so
+        that the BG pool pause / idle watchdog freeze acquired on the
+        way in are released on the way out. EMERGENCY_STOP's own guards
+        still prevent new work from being scheduled — we're just not
+        leaving subsystems stranded in paused state.
         """
         self._emergency_reason = reason
         previous = self._mode
+        was_hibernating = previous is AutonomyMode.HIBERNATION
         self._mode = AutonomyMode.EMERGENCY_STOP
         # Hibernation state is discarded — emergency supersedes.
         self._pre_hibernation_mode = None
@@ -308,3 +566,9 @@ class SupervisorOuroborosController:
             previous.value,
             reason,
         )
+        if was_hibernating:
+            await self._fire_hibernation_hooks(
+                self._on_wake_hooks,
+                kind="wake",
+                reason=f"emergency_stop supersedes hibernation: {reason}",
+            )
