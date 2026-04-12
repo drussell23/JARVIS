@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _TEST_TIMEOUT_S = float(os.environ.get("JARVIS_TEST_TIMEOUT_S", "120"))
+_TEST_PER_TEST_TIMEOUT_S = int(os.environ.get("JARVIS_TEST_PER_TEST_TIMEOUT_S", "10"))
 _TEST_RETRY_ENABLED = os.environ.get(
     "JARVIS_TEST_RETRY_ENABLED", "true"
 ).lower() in ("1", "true", "yes")
@@ -767,6 +768,19 @@ class TestRunner:
             test_name = "test_" + effective.name
             tests_dir = _find_sibling_tests_dir(effective)
 
+            # Strategy 0: if the changed file is already a test file, use it directly.
+            # Prevents double-resolving (e.g. candidate edits both foo.py and test_foo.py
+            # → test_foo.py would otherwise fall through to the 44-file package fallback).
+            if effective.name.startswith("test_") and effective.suffix == ".py" and effective.is_file():
+                if effective not in seen:
+                    seen.add(effective)
+                    matched.append(effective)
+                    logger.debug(
+                        "[TestRunner] Strategy 0 (self): %s is already a test file",
+                        effective.name,
+                    )
+                continue
+
             # Strategy 1: name convention in sibling tests/
             if tests_dir is not None:
                 candidate = tests_dir / test_name
@@ -948,6 +962,8 @@ class TestRunner:
             "python3", "-m", "pytest",
             "-o", "addopts=",
             "--continue-on-collection-errors",
+            "--timeout=" + str(_TEST_PER_TEST_TIMEOUT_S),
+            "--timeout-method=thread",
             "--json-report",
             "--json-report-file=" + report_path,
             "-q",
