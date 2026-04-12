@@ -755,6 +755,7 @@ class CandidateGenerator:
         self._tier0 = tier0
         self._ledger = ledger
         self._primary_sem = asyncio.Semaphore(primary_concurrency)
+        self._fallback_concurrency = fallback_concurrency
         self._fallback_sem = asyncio.Semaphore(fallback_concurrency)
         self.fsm = FailbackStateMachine()
         # Manifesto §5: rolling p95 DW RT latency → dynamic Tier 0 budget.
@@ -1513,6 +1514,10 @@ class CandidateGenerator:
 
         # FALLBACK_ACTIVE, PRIMARY_DEGRADED, or primary plan() just failed
         _sem_t0 = time.monotonic()
+        logger.debug(
+            "[CandidateGenerator] Plan fallback sem acquire: slots_free=%d/%d",
+            self._fallback_sem._value, self._fallback_concurrency,
+        )
         async with self._fallback_sem:
             _sem_wait_s = time.monotonic() - _sem_t0
             _parent_remaining = self._remaining_seconds(deadline)
@@ -1645,6 +1650,14 @@ class CandidateGenerator:
         """
         _pre_sem_remaining = self._remaining_seconds(deadline)
         _sem_t0 = time.monotonic()
+        logger.debug(
+            "[CandidateGenerator] Fallback sem acquire: slots_free=%d/%d "
+            "remaining=%.1fs route=%s op=%s",
+            self._fallback_sem._value, self._fallback_concurrency,
+            _pre_sem_remaining,
+            getattr(context, "provider_route", "?"),
+            getattr(context, "op_id", "?")[:16],
+        )
 
         try:
             async with self._fallback_sem:

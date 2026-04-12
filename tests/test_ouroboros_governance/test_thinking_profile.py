@@ -6,6 +6,7 @@ resolution order so future refactors can't silently flip which ops reason
 deeply before writing patches.
 
 Resolution order (first hit wins):
+  0. immediate route → off (unless JARVIS_THINKING_BUDGET_IMMEDIATE > 0)
   1. trivial → off (unless JARVIS_THINKING_BUDGET_TRIVIAL > 0)
   2. architectural → force-on (overrides global off)
   3. complex (by complexity OR route) → force-on
@@ -359,3 +360,66 @@ class TestMinimumFloor:
             base_budget=10000,
         )
         assert tokens == 1024
+
+
+# ---------------------------------------------------------------------------
+# IMMEDIATE route (step 0) — reflex path, thinking disabled by default
+# ---------------------------------------------------------------------------
+
+
+class TestImmediateRoute:
+    def test_immediate_disables_thinking_by_default(self, clean_env):
+        enabled, tokens, reason = _compute_thinking_profile(
+            _ctx(task_complexity="simple", provider_route="immediate"),
+            extended_thinking_default=True,
+            base_budget=10000,
+        )
+        assert enabled is False
+        assert tokens == 0
+        assert reason == "immediate-reflex"
+
+    def test_immediate_overrides_complex_complexity(self, clean_env):
+        """IMMEDIATE route wins even when complexity says 'complex'."""
+        enabled, _, reason = _compute_thinking_profile(
+            _ctx(task_complexity="complex", provider_route="immediate"),
+            extended_thinking_default=True,
+            base_budget=10000,
+        )
+        assert enabled is False
+        assert reason == "immediate-reflex"
+
+    def test_immediate_explicit_env_override(
+        self, clean_env, monkeypatch: pytest.MonkeyPatch
+    ):
+        """JARVIS_THINKING_BUDGET_IMMEDIATE=2000 enables thinking for reflex."""
+        monkeypatch.setenv("JARVIS_THINKING_BUDGET_IMMEDIATE", "2000")
+        enabled, tokens, reason = _compute_thinking_profile(
+            _ctx(task_complexity="simple", provider_route="immediate"),
+            extended_thinking_default=True,
+            base_budget=10000,
+        )
+        assert enabled is True
+        assert tokens == 2000
+        assert reason == "immediate-explicit"
+
+    def test_immediate_explicit_floors_at_1024(
+        self, clean_env, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("JARVIS_THINKING_BUDGET_IMMEDIATE", "500")
+        _, tokens, _ = _compute_thinking_profile(
+            _ctx(task_complexity="simple", provider_route="immediate"),
+            extended_thinking_default=True,
+            base_budget=10000,
+        )
+        assert tokens == 1024
+
+    def test_standard_route_still_gets_thinking(self, clean_env):
+        """STANDARD route should NOT be affected by the IMMEDIATE override."""
+        enabled, tokens, reason = _compute_thinking_profile(
+            _ctx(task_complexity="simple", provider_route="standard"),
+            extended_thinking_default=True,
+            base_budget=10000,
+        )
+        assert enabled is True
+        assert tokens == 4000
+        assert reason == "simple"

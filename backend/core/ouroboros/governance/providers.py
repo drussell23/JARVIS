@@ -3411,6 +3411,7 @@ def _is_retryable_transient_error(exc: BaseException) -> bool:
 _COMPLEX_TASK_COMPLEXITIES = frozenset({"complex", "heavy_code", "architectural"})
 _COMPLEX_PROVIDER_ROUTES = frozenset({"complex"})
 _ARCHITECTURAL_COMPLEXITIES = frozenset({"architectural"})
+_REFLEX_ROUTES = frozenset({"immediate"})
 
 
 def _compute_thinking_profile(
@@ -3425,6 +3426,7 @@ def _compute_thinking_profile(
     visible in SerpentFlow and debug.log.
 
     Resolution order (first hit wins):
+      0. ``provider_route == "immediate"`` → disable (reason="immediate-reflex")
       1. ``task_complexity == "trivial"`` → disable (reason="trivial-skip")
       2. ``task_complexity == "architectural"`` → force-on, architectural budget
       3. ``task_complexity in _COMPLEX_TASK_COMPLEXITIES`` or
@@ -3438,6 +3440,7 @@ def _compute_thinking_profile(
     value — matching the user directive that complex ops MUST reason.
 
     All budgets are env-overridable:
+      JARVIS_THINKING_BUDGET_IMMEDIATE     (default 0 — disabled for reflex path)
       JARVIS_THINKING_BUDGET_TRIVIAL       (default 0 — effectively disabled)
       JARVIS_THINKING_BUDGET_SIMPLE        (default 4000)
       JARVIS_THINKING_BUDGET_MODERATE      (default 8000)
@@ -3459,6 +3462,18 @@ def _compute_thinking_profile(
     _force_on_complex = os.environ.get(
         "JARVIS_THINKING_FORCE_ON_COMPLEX", "true"
     ).lower() not in ("false", "0", "no", "off")
+
+    # 0. IMMEDIATE route: reflex path where wall-clock latency matters more
+    # than reasoning depth. Extended thinking burned 94.5s of a 116.7s
+    # IMMEDIATE budget in bt-2026-04-12-065143 — pure budget theft. Default
+    # is OFF; override with JARVIS_THINKING_BUDGET_IMMEDIATE (tokens, 0=off).
+    if provider_route in _REFLEX_ROUTES:
+        _budget_immediate = int(
+            os.environ.get("JARVIS_THINKING_BUDGET_IMMEDIATE", "0")
+        )
+        if _budget_immediate > 0:
+            return (True, max(_budget_immediate, 1024), "immediate-explicit")
+        return (False, 0, "immediate-reflex")
 
     # 1. Trivial: default 0 (skip). If a user explicitly sets a
     # JARVIS_THINKING_BUDGET_TRIVIAL > 0, honor it — some power users may
@@ -4323,6 +4338,8 @@ class ClaudeProvider:
         tool_rounds = 0
         total_cost = 0.0
         start = time.monotonic()
+        _first_token_ms: List[Optional[float]] = [None]
+        _thinking_reason_out: List[str] = [""]
 
         _last_msg: list = [None]
         _token_usage: Dict[str, int] = {"input": 0, "output": 0}
@@ -4404,6 +4421,7 @@ class ClaudeProvider:
                 _thinking_tokens = 0
                 _thinking_reason = "budget-starved"
 
+            _thinking_reason_out[0] = _thinking_reason
             _temperature = 1.0 if _use_thinking else 0.2
             _thinking_param: Optional[Dict[str, Any]] = None
             if _use_thinking and _thinking_tokens > 0:
@@ -4532,6 +4550,7 @@ class ClaudeProvider:
                         async for text in stream.text_stream:
                             if _stream_first_token_at[0] is None:
                                 _stream_first_token_at[0] = time.monotonic()
+                                _first_token_ms[0] = (_stream_first_token_at[0] - _call_start) * 1000.0
                             raw_content += text
                             try:
                                 _stream_callback(text)
@@ -4934,10 +4953,15 @@ class ClaudeProvider:
                 cost_usd=total_cost,
             )
 
+        _ftms = _first_token_ms[0]
+        _ftms_str = f"{_ftms:.0f}ms" if _ftms is not None else "n/a"
+        _route_str = getattr(context, "provider_route", "") or "?"
         logger.info(
-            "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f, %d+%d tokens",
+            "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f, "
+            "%d+%d tokens, first_token=%s thinking=%s route=%s",
             len(result.candidates), duration, tool_rounds, total_cost,
             _token_usage["input"], _token_usage["output"],
+            _ftms_str, _thinking_reason_out[0], _route_str,
         )
         return result.with_tool_records(tool_records).with_venom_edits(venom_edits)
 

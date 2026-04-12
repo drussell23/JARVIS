@@ -131,8 +131,13 @@ class DurableJSONLTransport:
         log_dir: Path,
         queue_maxsize: int = _QUEUE_MAXSIZE,
     ) -> None:
-        self._log_dir = log_dir
-        log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        from backend.core.ouroboros.governance.sandbox_paths import sandbox_fallback
+        self._log_dir = sandbox_fallback(log_dir)
+        self._log_dir.mkdir(parents=True, exist_ok=True)
         self._queue: "asyncio.Queue[EventLogEntry]" = asyncio.Queue(
             maxsize=queue_maxsize
         )
@@ -142,6 +147,7 @@ class DurableJSONLTransport:
         self._seen_keys: set = set()
         self._shed_count: int = 0
         self._written_count: int = 0
+        self._write_error_logged: bool = False
 
     # ------------------------------------------------------------------
     # CommProtocol transport interface
@@ -268,7 +274,9 @@ class DurableJSONLTransport:
                     await asyncio.to_thread(current_fh.flush)
                     self._written_count += 1
                 except Exception as exc:
-                    logger.error("[DurableJSONL] write error: %s", exc)
+                    if not self._write_error_logged:
+                        logger.warning("[DurableJSONL] write error (suppressing further): %s", exc)
+                        self._write_error_logged = True
                 finally:
                     self._queue.task_done()
         except asyncio.CancelledError:
