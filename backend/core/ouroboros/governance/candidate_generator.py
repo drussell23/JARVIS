@@ -56,7 +56,7 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
-from typing import Any, Dict, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, NoReturn, Optional, Protocol, runtime_checkable
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -142,6 +142,29 @@ def _is_content_failure(exc: BaseException) -> bool:
     """
     msg = str(exc).lower()
     return any(pattern.lower() in msg for pattern in _CONTENT_FAILURE_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Exhaustion log helpers
+# ---------------------------------------------------------------------------
+
+
+def _trim_exc_msg(exc: BaseException, limit: int = 200) -> str:
+    """Stringify *exc*, clip to *limit* chars, collapse whitespace."""
+    msg = str(exc)
+    if len(msg) > limit:
+        msg = msg[:limit] + "..."
+    return msg.replace("\n", "\\n").replace("\t", " ")
+
+
+def _fmt_val(value: Any) -> str:
+    """Format *value* for a ``key=value`` structured log line.
+
+    Values with whitespace are underscored so grep-based audits can
+    treat one log line as a flat sequence of ``key=value`` tokens.
+    """
+    s = str(value)
+    return s.replace(" ", "_")
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +812,105 @@ class CandidateGenerator:
         self._tier0_skip_window_s: float = float(
             os.environ.get("OUROBOROS_TIER0_SKIP_WINDOW_S", "30")
         )
+        # Structured exhaustion instrumentation — incremented on every
+        # raise through `_raise_exhausted`. Lets the log-line audit
+        # sequence exhaustion events across a session without scraping
+        # the aggregate `summary.json` counters (which have the known
+        # `attempted` bug — use debug.log as the authoritative source).
+        self._exhaustion_events: int = 0
+
+    def _raise_exhausted(
+        self,
+        cause: str,
+        *,
+        context: Optional[Any] = None,
+        deadline: Optional[datetime] = None,
+        primary_exc: Optional[BaseException] = None,
+        fallback_exc: Optional[BaseException] = None,
+        **breadcrumbs: Any,
+    ) -> NoReturn:
+        """Log a structured exhaustion breadcrumb line and raise RuntimeError.
+
+        Never returns. Every raise of ``all_providers_exhausted`` from this
+        class should go through this helper so the battle-test audit can
+        grep a single log line and learn:
+
+            * which cause fired (queue_only_dispatch, fallback_failed, ...)
+            * the FailbackStateMachine state at that moment
+            * the classified ``FailureMode`` of the most recent attempt
+            * the route, op_id, complexity, and remaining deadline budget
+            * the primary / fallback provider names
+            * the underlying exception class + trimmed message (if any)
+            * any cause-specific breadcrumbs passed as ``**breadcrumbs``
+
+        The raised ``RuntimeError`` carries the full report dict as
+        ``.exhaustion_report`` so downstream observers (orchestrator
+        postmortem, ProviderExhaustionWatcher, ledger) can use it
+        without re-parsing the log line.
+
+        The exception message remains the stable ``"all_providers_exhausted"``
+        prefix plus a ``:{cause}`` suffix, so every existing substring /
+        regex match (``"all_providers_exhausted" in str(exc)``,
+        ``pytest.raises(RuntimeError, match="all_providers_exhausted")``,
+        and the orchestrator ``_INFRA_PATTERNS`` set) keeps working.
+        """
+        self._exhaustion_events += 1
+
+        fm = self.fsm._failure_mode
+        report: Dict[str, Any] = {
+            "event_n": self._exhaustion_events,
+            "cause": cause,
+            "fsm_state": self.fsm.state.name,
+            "fsm_failure_mode": fm.name if fm is not None else "NONE",
+            "fsm_consecutive_failures": self.fsm._consecutive_failures,
+            "tier0_consecutive_failures": self._consecutive_tier0_failures,
+            "primary_name": getattr(self._primary, "provider_name", "?"),
+            "fallback_name": (
+                getattr(self._fallback, "provider_name", "?")
+                if self._fallback is not None else "none"
+            ),
+            "tier0_name": (
+                getattr(self._tier0, "provider_name", "?")
+                if self._tier0 is not None else "none"
+            ),
+        }
+        if context is not None:
+            report["op_id"] = (
+                getattr(context, "op_id", None)
+                or getattr(context, "operation_id", None)
+                or "?"
+            )
+            report["route"] = getattr(context, "provider_route", "?") or "?"
+            report["complexity"] = (
+                getattr(context, "task_complexity", "?") or "?"
+            )
+        if deadline is not None:
+            report["remaining_s"] = round(self._remaining_seconds(deadline), 2)
+        if primary_exc is not None:
+            report["primary_err_class"] = type(primary_exc).__name__
+            report["primary_err_msg"] = _trim_exc_msg(primary_exc)
+        if fallback_exc is not None:
+            report["fallback_err_class"] = type(fallback_exc).__name__
+            report["fallback_err_msg"] = _trim_exc_msg(fallback_exc)
+        report.update(breadcrumbs)
+
+        log_parts = " ".join(
+            f"{k}={_fmt_val(v)}" for k, v in report.items()
+        )
+        logger.error(
+            "[CandidateGenerator] EXHAUSTION %s", log_parts,
+        )
+
+        err = RuntimeError(f"all_providers_exhausted:{cause}")
+        try:
+            setattr(err, "exhaustion_report", report)
+        except Exception:
+            pass  # attribute attachment is best-effort — never mask the raise
+        if fallback_exc is not None:
+            raise err from fallback_exc
+        if primary_exc is not None:
+            raise err from primary_exc
+        raise err
 
     async def generate(
         self,
@@ -1178,7 +1300,13 @@ class CandidateGenerator:
         state = self.fsm.state
 
         if state is FailbackState.QUEUE_ONLY:
-            raise RuntimeError("all_providers_exhausted")
+            self._raise_exhausted(
+                "queue_only_dispatch",
+                context=context,
+                deadline=deadline,
+                tier0_attempted=_tier0_attempted,
+                dw_is_primary=_dw_is_primary,
+            )
 
         if _tier0_attempted and _dw_is_primary:
             logger.info(
@@ -1266,7 +1394,11 @@ class CandidateGenerator:
         # Skip the entire Tier 0 / DW path.
         state = self.fsm.state
         if state is FailbackState.QUEUE_ONLY:
-            raise RuntimeError("all_providers_exhausted")
+            self._raise_exhausted(
+                "queue_only_immediate",
+                context=context,
+                deadline=deadline,
+            )
 
         # If DW IS the primary, go straight to Claude (the fallback).
         _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
@@ -1548,7 +1680,11 @@ class CandidateGenerator:
         state = self.fsm.state
 
         if state is FailbackState.QUEUE_ONLY:
-            raise RuntimeError("all_providers_exhausted")
+            self._raise_exhausted(
+                "queue_only_plan",
+                deadline=deadline,
+                phase="plan",
+            )
 
         if state is FailbackState.PRIMARY_READY:
             try:
@@ -1733,13 +1869,15 @@ class CandidateGenerator:
                 _refreshed = remaining > _parent_remaining + 1.0
 
                 if remaining < _MIN_VIABLE_FALLBACK_S:
-                    logger.warning(
-                        "[CandidateGenerator] Fallback skipped — only %.1fs "
-                        "remaining (need >= %.0fs, sem_wait=%.1fs).",
-                        remaining, _MIN_VIABLE_FALLBACK_S, _sem_wait_s,
-                    )
-                    raise RuntimeError(
-                        f"all_providers_exhausted:fallback_budget_starved_{remaining:.0f}s"
+                    self._raise_exhausted(
+                        "fallback_budget_starved",
+                        context=context,
+                        deadline=deadline,
+                        sem_wait_s=round(_sem_wait_s, 2),
+                        pre_sem_remaining_s=round(_pre_sem_remaining, 2),
+                        parent_remaining_s=round(_parent_remaining, 2),
+                        fallback_budget_s=round(remaining, 2),
+                        min_viable_fallback_s=_MIN_VIABLE_FALLBACK_S,
                     )
 
                 if _refreshed:
@@ -1766,15 +1904,23 @@ class CandidateGenerator:
                     timeout=remaining,
                 )
         except (Exception, asyncio.CancelledError) as exc:
+            # If the exception is already instrumented (e.g. the inner
+            # ``fallback_budget_starved`` raise), re-raise as-is so we
+            # preserve the more-specific cause and don't double-count
+            # the exhaustion event counter.
+            if hasattr(exc, "exhaustion_report"):
+                raise
             mode = FailbackStateMachine.classify_exception(exc)
-            logger.error(
-                "[CandidateGenerator] Fallback also failed (mode=%s, %s: %s, "
-                "sem_wait=%.1fs)",
-                mode.name, type(exc).__name__, exc,
-                time.monotonic() - _sem_t0,
-            )
             self.fsm.record_fallback_failure(mode=mode)
-            raise RuntimeError("all_providers_exhausted") from exc
+            self._raise_exhausted(
+                "fallback_failed",
+                context=context,
+                deadline=deadline,
+                fallback_exc=exc,
+                fallback_failure_mode=mode.name,
+                sem_wait_total_s=round(time.monotonic() - _sem_t0, 2),
+                pre_sem_remaining_s=round(_pre_sem_remaining, 2),
+            )
 
     @staticmethod
     def _remaining_seconds(deadline: datetime) -> float:

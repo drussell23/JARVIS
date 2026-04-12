@@ -1319,3 +1319,175 @@ class TestFallbackSemStarvation:
         assert refreshed > 60.0, (
             f"Plan fallback should refresh depleted deadline: {refreshed:.1f}s"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestExhaustionInstrumentation
+# ---------------------------------------------------------------------------
+
+
+class TestExhaustionInstrumentation:
+    """Verify the ``_raise_exhausted`` helper contract.
+
+    Every ``all_providers_exhausted`` raise must emit a structured
+    breadcrumb log line AND attach a ``.exhaustion_report`` dict to the
+    raised ``RuntimeError`` so downstream battle-test audits can find the
+    root cause without re-parsing free-form log messages.
+    """
+
+    def _required_report_keys(self) -> set:
+        return {
+            "event_n",
+            "cause",
+            "fsm_state",
+            "fsm_failure_mode",
+            "fsm_consecutive_failures",
+            "tier0_consecutive_failures",
+            "primary_name",
+            "fallback_name",
+            "tier0_name",
+        }
+
+    @pytest.mark.asyncio
+    async def test_queue_only_dispatch_attaches_report(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """QUEUE_ONLY on the standard cascade → cause=queue_only_dispatch."""
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+        gen.fsm.record_primary_failure()
+        gen.fsm.record_fallback_failure(mode=FailureMode.CONNECTION_ERROR)
+        assert gen.fsm.state is FailbackState.QUEUE_ONLY
+
+        ctx = _make_context(op_id="op-queue-001")
+        deadline = _make_deadline(5.0)
+
+        caplog.set_level("ERROR")
+        with pytest.raises(RuntimeError, match="all_providers_exhausted") as ei:
+            await gen.generate(ctx, deadline)
+
+        err = ei.value
+        report = getattr(err, "exhaustion_report", None)
+        assert isinstance(report, dict)
+        assert self._required_report_keys().issubset(report.keys())
+        assert report["cause"] == "queue_only_dispatch"
+        assert report["event_n"] == 1
+        assert report["fsm_state"] == "QUEUE_ONLY"
+        assert report["primary_name"] == "primary"
+        assert report["fallback_name"] == "fallback"
+        assert report["op_id"] == "op-queue-001"
+        assert "remaining_s" in report
+
+        assert any(
+            "EXHAUSTION" in rec.message
+            and "cause=queue_only_dispatch" in rec.message
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_failed_chains_cause_and_err_class(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Both-providers-down → cause=fallback_failed with chained exc info."""
+        primary = _make_mock_provider(
+            name="primary",
+            generate_side_effect=RuntimeError("primary down"),
+        )
+        fallback = _make_mock_provider(
+            name="fallback",
+            generate_side_effect=TimeoutError("fallback tcp timeout"),
+        )
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+
+        ctx = _make_context(op_id="op-fallback-002")
+        deadline = _make_deadline(5.0)
+
+        caplog.set_level("ERROR")
+        with pytest.raises(RuntimeError, match="all_providers_exhausted") as ei:
+            await gen.generate(ctx, deadline)
+
+        err = ei.value
+        report = getattr(err, "exhaustion_report")
+        assert report["cause"] == "fallback_failed"
+        assert report["fallback_err_class"] == "TimeoutError"
+        assert "fallback tcp timeout" in report["fallback_err_msg"]
+        assert "fallback_failure_mode" in report
+        assert err.__cause__ is not None, "should chain from fallback exc"
+
+    @pytest.mark.asyncio
+    async def test_budget_starved_carries_sem_and_budget_breadcrumbs(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Depleted parent budget → cause=fallback_budget_starved with
+        sem_wait_s, parent_remaining_s, and fallback_budget_s.
+
+        To force the ``remaining < _MIN_VIABLE_FALLBACK_S`` branch we
+        monkey-patch the module constants — guarantees the test triggers
+        the budget-starved raise instead of the sem-wait-refresh path.
+        """
+        from backend.core.ouroboros.governance import candidate_generator as cg
+
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+        gen.fsm.record_primary_failure()  # FALLBACK_ACTIVE
+
+        ctx = _make_context(op_id="op-starved-003")
+        deadline = _make_deadline(2.0)
+
+        caplog.set_level("ERROR")
+        with (
+            patch.object(cg, "_FALLBACK_MIN_GUARANTEED_S", 0.5),
+            patch.object(cg, "_MIN_VIABLE_FALLBACK_S", 100.0),
+            patch.object(CandidateGenerator, "_FALLBACK_MAX_TIMEOUT_S", 0.5),
+        ):
+            with pytest.raises(RuntimeError, match="all_providers_exhausted") as ei:
+                await gen._call_fallback(ctx, deadline)
+
+        report = getattr(ei.value, "exhaustion_report")
+        assert report["cause"] == "fallback_budget_starved"
+        assert "sem_wait_s" in report
+        assert "parent_remaining_s" in report
+        assert "fallback_budget_s" in report
+        assert report["min_viable_fallback_s"] == 100.0
+        fallback.generate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_event_counter_increments_across_raises(self) -> None:
+        """Multiple exhaustion raises on the same generator must share
+        a monotonic event_n counter so the audit can sequence events."""
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+        gen.fsm.record_primary_failure()
+        gen.fsm.record_fallback_failure(mode=FailureMode.CONNECTION_ERROR)
+        assert gen.fsm.state is FailbackState.QUEUE_ONLY
+
+        ctx = _make_context(op_id="op-counter-004")
+        deadline = _make_deadline(3.0)
+
+        with pytest.raises(RuntimeError) as e1:
+            await gen.generate(ctx, deadline)
+        with pytest.raises(RuntimeError) as e2:
+            await gen.generate(ctx, deadline)
+        with pytest.raises(RuntimeError) as e3:
+            await gen.generate(ctx, deadline)
+
+        assert getattr(e1.value, "exhaustion_report")["event_n"] == 1
+        assert getattr(e2.value, "exhaustion_report")["event_n"] == 2
+        assert getattr(e3.value, "exhaustion_report")["event_n"] == 3
+        assert gen._exhaustion_events == 3
+
+    def test_raise_exhausted_message_keeps_substring_contract(self) -> None:
+        """``str(exc)`` must still contain ``all_providers_exhausted`` so
+        every downstream substring check (orchestrator _INFRA_PATTERNS,
+        ProviderExhaustionWatcher, pytest ``match=`` regexes) keeps
+        working after the cause suffix was added."""
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+        with pytest.raises(RuntimeError) as ei:
+            gen._raise_exhausted("queue_only_dispatch")
+        assert "all_providers_exhausted" in str(ei.value)
+        assert ":queue_only_dispatch" in str(ei.value)
