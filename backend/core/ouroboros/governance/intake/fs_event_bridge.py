@@ -11,10 +11,13 @@ Boundary Principle (Manifesto §3 / §5):
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+_HEARTBEAT_EVERY_N = int(os.environ.get("JARVIS_FS_BRIDGE_HEARTBEAT_EVERY", "100"))
 
 
 class FileSystemEventBridge:
@@ -90,7 +93,15 @@ class FileSystemEventBridge:
             )
 
     async def _on_file_event(self, event: Any) -> None:
-        """Translate a FileEvent into a TrinityEventBus publication."""
+        """Translate a FileEvent into a TrinityEventBus publication.
+
+        Logs the FIRST published event at INFO so battle test logs carry a
+        positive signal that the watchdog → bridge → bus chain is alive.
+        Subsequent events log only at DEBUG to avoid spam, with a periodic
+        heartbeat every ``_HEARTBEAT_EVERY_N`` events. The "did the chain
+        ever fire" question that bt-2026-04-12-005521 could not answer
+        from logs alone is now a single grep away.
+        """
         try:
             topic = f"fs.changed.{event.event_type.value}"
 
@@ -126,6 +137,19 @@ class FileSystemEventBridge:
                 persist=False,  # High-volume, no need to WAL file events
             )
             self._events_published += 1
+
+            if self._events_published == 1:
+                logger.info(
+                    "[FSEventBridge] First fs.changed event published: "
+                    "topic=%s path=%s — chain is live",
+                    topic, rel_path,
+                )
+            elif self._events_published % _HEARTBEAT_EVERY_N == 0:
+                logger.info(
+                    "[FSEventBridge] Heartbeat: %d events published "
+                    "(latest topic=%s path=%s)",
+                    self._events_published, topic, rel_path,
+                )
         except Exception:
             logger.debug("[FSEventBridge] Failed to publish event", exc_info=True)
 

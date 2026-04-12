@@ -494,12 +494,43 @@ class FileWatchGuard:
         logger.info("[FileWatchGuard] Stopped")
 
     async def _start_watchdog(self) -> None:
-        """Start the watchdog observer."""
+        """Start the watchdog observer.
+
+        Backend selection:
+          - On macOS we use ``PollingObserver`` by default. The native FSEvents
+            backend segfaults inside ``Observer.join()`` on macOS 26 / ARM64 /
+            Python 3.9.6 with ``KERN_PROTECTION_FAILURE`` (pointer auth fail),
+            and silently dies inside long-running processes. Battle test
+            bt-2026-04-12-005521 ran 30+ minutes with zero fs.changed events
+            delivered to any sensor — the FSEvents thread had crashed but no
+            error surfaced to the parent process. PollingObserver is safe.
+          - On other platforms we keep the default Observer (inotify on Linux,
+            ReadDirectoryChangesW on Windows).
+          - ``JARVIS_FILE_WATCH_BACKEND`` env var overrides: ``polling``,
+            ``native``, or ``auto`` (default).
+        """
         try:
             from watchdog.observers import Observer
+            from watchdog.observers.polling import PollingObserver
             from watchdog.events import FileSystemEventHandler, FileSystemEvent
         except ImportError:
             raise RuntimeError("watchdog package required: pip install watchdog")
+
+        backend_pref = os.environ.get("JARVIS_FILE_WATCH_BACKEND", "auto").lower()
+        import platform
+        if backend_pref == "polling":
+            observer_cls = PollingObserver
+            backend_name = "polling (forced)"
+        elif backend_pref == "native":
+            observer_cls = Observer
+            backend_name = "native (forced)"
+        else:  # auto
+            if platform.system() == "Darwin":
+                observer_cls = PollingObserver
+                backend_name = "polling (macOS auto)"
+            else:
+                observer_cls = Observer
+                backend_name = "native (auto)"
 
         # Create handler that bridges to async
         guard = self
@@ -534,7 +565,8 @@ class FileWatchGuard:
                 except Exception as e:
                     logger.error(f"[FileWatchGuard] Event handler error: {e}")
 
-        self._observer = Observer()
+        self._observer = observer_cls()
+        self._backend_name = backend_name
         handler = AsyncEventHandler()
 
         self._observer.schedule(
@@ -543,6 +575,7 @@ class FileWatchGuard:
             recursive=self.config.recursive,
         )
         self._observer.start()
+        logger.info(f"[FileWatchGuard] Observer backend: {backend_name}")
 
     async def _stop_watchdog(self) -> None:
         """Stop the watchdog observer."""
