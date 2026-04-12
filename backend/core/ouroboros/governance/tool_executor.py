@@ -162,7 +162,7 @@ def _compute_args_hash(arguments: Dict[str, Any]) -> str:
 # L1 Tool-Use: Protocols (B-ready seams)
 # ---------------------------------------------------------------------------
 
-_OUTPUT_CAP_DEFAULT = 32_768  # CC-parity: was 4096, raised to match Claude Code's full-file reads
+_OUTPUT_CAP_DEFAULT = 16_384  # Balanced: large enough for useful context, small enough to prevent prompt overflow (131K limit / ~8 results)
 
 @runtime_checkable
 class ToolPolicy(Protocol):
@@ -3346,25 +3346,43 @@ class ToolLoopCoordinator:
                     )
 
             # ── Live context auto-compaction (Gap #8) ──
-            # When the accumulated prompt exceeds 75% of budget, compact
-            # older tool results into a deterministic summary to reclaim
-            # context space. Preserves recent rounds and safety-critical
-            # entries. No model inference — pure counting.
-            if len(current_prompt) > _COMPACT_THRESHOLD_CHARS and round_index >= 2:
+            # When the accumulated prompt exceeds the compaction threshold,
+            # compact older tool results into a deterministic summary.
+            # Runs on ANY round (including 0-1) to defend against single
+            # large tool results that would otherwise blow past the hard cap.
+            if len(current_prompt) > _COMPACT_THRESHOLD_CHARS:
                 current_prompt = self._compact_prompt(
                     base_prompt=prompt,
                     current_prompt=current_prompt,
                     op_id=op_id,
                 )
 
+            # Pre-overflow shrink: if compaction didn't save enough (e.g. one
+            # giant chunk that _compact_prompt can't split), force-truncate the
+            # appendix tail to fit under the hard cap.
             if len(current_prompt) > _MAX_PROMPT_CHARS:
-                self._finalize_run(op_id)
-                raise RuntimeError(f"tool_loop_budget_exceeded:{len(current_prompt)}")
+                _overflow = len(current_prompt) - _MAX_PROMPT_CHARS + 1024
+                _appendix_start = len(prompt)
+                if len(current_prompt) - _appendix_start > _overflow:
+                    _keep = len(current_prompt) - _appendix_start - _overflow
+                    current_prompt = (
+                        prompt
+                        + current_prompt[_appendix_start:_appendix_start + _keep]
+                        + f"\n[CONTEXT FORCE-TRUNCATED: {_overflow:,} chars removed to fit {_MAX_PROMPT_CHARS:,} limit]\n"
+                    )
+                    logger.warning(
+                        "[ToolLoop] Force-truncated %d chars for %s (prompt was %d, now %d)",
+                        _overflow, op_id[:12],
+                        len(prompt) + _keep + _overflow, len(current_prompt),
+                    )
+                else:
+                    self._finalize_run(op_id)
+                    raise RuntimeError(f"tool_loop_context_overflow:{len(current_prompt)}")
 
         # Unreachable: the loop above either returns on a final answer,
         # raises ``tool_loop_deadline_exceeded``, raises
         # ``tool_loop_max_rounds_exceeded`` at the safety ceiling, or
-        # raises ``tool_loop_budget_exceeded`` on prompt overflow.
+        # raises ``tool_loop_context_overflow`` on prompt overflow.
 
     # ── Live context auto-compaction (Gap #8) ────────────────────────
     @staticmethod

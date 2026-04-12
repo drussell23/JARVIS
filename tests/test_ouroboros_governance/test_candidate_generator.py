@@ -1130,3 +1130,42 @@ class TestExceptionChainHelper:
         exc.__context__ = None
         chain = _walk_exception_chain(exc)
         assert chain == (exc,)
+
+
+# ---------------------------------------------------------------------------
+# Context Overflow classification
+# ---------------------------------------------------------------------------
+
+
+class TestContextOverflowClassification:
+    """Verify tool_loop_budget_exceeded / tool_loop_context_overflow map to
+    CONTEXT_OVERFLOW, not TIMEOUT."""
+
+    def test_budget_exceeded_classified_as_context_overflow(self):
+        exc = RuntimeError("tool_loop_budget_exceeded:142000")
+        mode = FailbackStateMachine.classify_exception(exc)
+        assert mode is FailureMode.CONTEXT_OVERFLOW
+
+    def test_context_overflow_classified_as_context_overflow(self):
+        exc = RuntimeError("tool_loop_context_overflow:155000")
+        mode = FailbackStateMachine.classify_exception(exc)
+        assert mode is FailureMode.CONTEXT_OVERFLOW
+
+    def test_context_overflow_zero_backoff(self):
+        from backend.core.ouroboros.governance.candidate_generator import (
+            _RECOVERY_PARAMS,
+        )
+        params = _RECOVERY_PARAMS[FailureMode.CONTEXT_OVERFLOW]
+        assert params["base_s"] == 0.0
+        assert params["max_s"] == 0.0
+
+    def test_context_overflow_does_not_penalize_fsm(self):
+        fsm = FailbackStateMachine()
+        fsm.record_primary_failure(mode=FailureMode.CONTEXT_OVERFLOW)
+        eta = fsm.recovery_eta()
+        assert eta <= time.monotonic()
+
+    def test_context_overflow_not_misclassified_as_timeout(self):
+        exc = RuntimeError("tool_loop_budget_exceeded:131500")
+        mode = FailbackStateMachine.classify_exception(exc)
+        assert mode is not FailureMode.TIMEOUT

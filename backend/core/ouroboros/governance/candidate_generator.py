@@ -233,6 +233,7 @@ class FailureMode(Enum):
     SERVER_ERROR = auto()       # 500/502/503 — minutes
     CONNECTION_ERROR = auto()   # Can't reach host — minutes to hours
     CONTENT_FAILURE = auto()    # Bad output, infra healthy — no penalty
+    CONTEXT_OVERFLOW = auto()   # Tool loop prompt exceeded char limit — immediate fallback
     TRANSIENT_TRANSPORT = auto()  # HTTP/2 disconnect, premature stream close — seconds
 
 
@@ -244,6 +245,11 @@ _RECOVERY_PARAMS: dict[FailureMode, dict[str, float]] = {
     FailureMode.SERVER_ERROR:    {"base_s": 60.0,  "max_s": 600.0},
     FailureMode.CONNECTION_ERROR: {"base_s": 120.0, "max_s": 900.0},
     FailureMode.CONTENT_FAILURE: {"base_s": 0.0,   "max_s": 0.0},
+    # CONTEXT_OVERFLOW: Tool loop prompt exceeded char limit. The provider
+    # infrastructure is healthy — the prompt was just too large. Immediate
+    # fallback to Tier 1 with zero backoff penalty (same profile as
+    # CONTENT_FAILURE). No timeout ETA penalty on the FSM.
+    FailureMode.CONTEXT_OVERFLOW: {"base_s": 0.0,  "max_s": 0.0},
     # TRANSIENT_TRANSPORT: HTTP/2 GOAWAY, RemoteProtocolError, ClosedResourceError.
     # The transport layer flapped (often a single dropped connection in a keep-alive
     # pool) but the upstream API is healthy. A 5s base backs off to 30s after 4
@@ -397,9 +403,11 @@ class FailbackStateMachine:
             return
 
         if mode in (FailureMode.TIMEOUT, FailureMode.RATE_LIMITED,
-                    FailureMode.SERVER_ERROR):
-            # Transient: DON'T go to QUEUE_ONLY. The next operation will
-            # re-evaluate should_attempt_primary() and may succeed.
+                    FailureMode.SERVER_ERROR, FailureMode.CONTEXT_OVERFLOW,
+                    FailureMode.CONTENT_FAILURE):
+            # Transient / non-infra: DON'T go to QUEUE_ONLY. The next
+            # operation will re-evaluate should_attempt_primary() and may
+            # succeed. CONTEXT_OVERFLOW is a prompt-size issue, not infra.
             logger.warning(
                 "[FailbackFSM] Fallback transient failure (mode=%s) — "
                 "staying FALLBACK_ACTIVE (recoverable)",
@@ -668,6 +676,12 @@ class FailbackStateMachine:
             return FailureMode.RATE_LIMITED
         if "429" in msg or "rate" in msg or "too many" in msg:
             return FailureMode.RATE_LIMITED
+
+        # Context overflow — tool loop prompt exceeded char limit.
+        # Must be checked before server errors because the char count
+        # in the message (e.g. "155000") can contain "500".
+        if "tool_loop_budget_exceeded" in msg or "tool_loop_context_overflow" in msg:
+            return FailureMode.CONTEXT_OVERFLOW
 
         # Connection errors
         if isinstance(exc, ConnectionError):
