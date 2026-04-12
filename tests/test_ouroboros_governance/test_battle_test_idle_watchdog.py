@@ -74,3 +74,117 @@ class TestIdleWatchdog:
             assert watchdog.poke_count == 3
         finally:
             watchdog.stop()
+
+
+# ---------------------------------------------------------------------------
+# HIBERNATION_MODE: freeze() / unfreeze() tests
+# ---------------------------------------------------------------------------
+
+
+class TestIdleWatchdogFreeze:
+    @pytest.mark.asyncio
+    async def test_freeze_prevents_fire_past_timeout(self):
+        """While frozen, idle_event must NOT fire even well past timeout_s."""
+        watchdog = IdleWatchdog(timeout_s=0.2)
+        await watchdog.start()
+        try:
+            assert watchdog.freeze(reason="test") is True
+            assert watchdog.is_frozen is True
+            # Sleep far past the timeout.
+            await asyncio.sleep(0.6)
+            assert not watchdog.idle_event.is_set(), (
+                "idle_event must not fire while frozen"
+            )
+        finally:
+            watchdog.stop()
+
+    @pytest.mark.asyncio
+    async def test_unfreeze_resets_clock(self):
+        """unfreeze() must reset _last_poke so the idle window starts fresh.
+
+        Otherwise a long hibernation would make elapsed > timeout and fire
+        immediately on wake.
+        """
+        watchdog = IdleWatchdog(timeout_s=0.3)
+        await watchdog.start()
+        try:
+            watchdog.freeze()
+            await asyncio.sleep(0.5)  # Would-be idle time.
+            assert not watchdog.idle_event.is_set()
+            watchdog.unfreeze(reason="test")
+            # Immediately after unfreeze we should have a full fresh window.
+            await asyncio.sleep(0.15)
+            assert not watchdog.idle_event.is_set(), (
+                "idle_event fired too early — clock not reset on unfreeze"
+            )
+            # Past the new window, it should fire.
+            await asyncio.sleep(0.3)
+            assert watchdog.idle_event.is_set()
+        finally:
+            watchdog.stop()
+
+    @pytest.mark.asyncio
+    async def test_freeze_unfreeze_are_idempotent(self):
+        """Repeated freeze()/unfreeze() return False on second call."""
+        watchdog = IdleWatchdog(timeout_s=60.0)
+        await watchdog.start()
+        try:
+            assert watchdog.freeze() is True
+            assert watchdog.freeze() is False  # already frozen
+            assert watchdog.is_frozen is True
+            assert watchdog.unfreeze() is True
+            assert watchdog.unfreeze() is False  # already running
+            assert watchdog.is_frozen is False
+        finally:
+            watchdog.stop()
+
+    @pytest.mark.asyncio
+    async def test_fire_stale_suppressed_while_frozen(self):
+        """fire_stale() must be a no-op during hibernation — stale ops are expected."""
+        watchdog = IdleWatchdog(timeout_s=60.0)
+        await watchdog.start()
+        try:
+            watchdog.freeze()
+            watchdog.fire_stale(stale_ops=[{"op_id": "test-1"}])
+            assert not watchdog.idle_event.is_set()
+            assert watchdog.diagnostics is None
+        finally:
+            watchdog.stop()
+
+    @pytest.mark.asyncio
+    async def test_fire_stale_fires_when_not_frozen(self):
+        """Baseline: fire_stale() still works normally when not frozen."""
+        watchdog = IdleWatchdog(timeout_s=60.0)
+        await watchdog.start()
+        try:
+            watchdog.fire_stale(stale_ops=[{"op_id": "test-1"}])
+            assert watchdog.idle_event.is_set()
+            assert watchdog.diagnostics is not None
+            assert watchdog.diagnostics.reason == "all_ops_stale"
+        finally:
+            watchdog.stop()
+
+    @pytest.mark.asyncio
+    async def test_freeze_count_tracks_cycles(self):
+        """freeze_count increments on each fresh freeze() transition."""
+        watchdog = IdleWatchdog(timeout_s=60.0)
+        await watchdog.start()
+        try:
+            assert watchdog.freeze_count == 0
+            for _ in range(3):
+                watchdog.freeze()
+                watchdog.unfreeze()
+            assert watchdog.freeze_count == 3
+        finally:
+            watchdog.stop()
+
+    @pytest.mark.asyncio
+    async def test_unfreeze_without_prior_freeze_is_noop(self):
+        """unfreeze() on a running watchdog returns False, no state change."""
+        watchdog = IdleWatchdog(timeout_s=60.0)
+        await watchdog.start()
+        try:
+            assert watchdog.unfreeze() is False
+            assert watchdog.is_frozen is False
+        finally:
+            watchdog.stop()

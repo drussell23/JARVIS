@@ -63,6 +63,11 @@ class IdleWatchdog:
         self.idle_event: asyncio.Event = asyncio.Event()
         self._task: asyncio.Task | None = None
         self.diagnostics: Optional[WatchdogDiagnostics] = None
+        # HIBERNATION_MODE: while frozen, _watch() does not count elapsed
+        # time and fire_stale() is a no-op. unfreeze() resets the clock so
+        # a long outage does not immediately trigger idle on wake.
+        self._frozen: bool = False
+        self._freeze_count: int = 0
 
     # ------------------------------------------------------------------
     # Properties
@@ -72,6 +77,16 @@ class IdleWatchdog:
     def poke_count(self) -> int:
         """Number of times poke() has been called."""
         return self._poke_count
+
+    @property
+    def is_frozen(self) -> bool:
+        """True if freeze() has been called and unfreeze() has not yet fired."""
+        return self._frozen
+
+    @property
+    def freeze_count(self) -> int:
+        """Number of freeze() transitions — observability for hibernation cycles."""
+        return self._freeze_count
 
     # ------------------------------------------------------------------
     # Public API
@@ -87,7 +102,16 @@ class IdleWatchdog:
 
         Called by the ActivityMonitor when all in-flight ops have exceeded
         the staleness threshold — the system is alive but not progressing.
+
+        No-op while frozen: during HIBERNATION the staleness signal is
+        expected (nothing is progressing because providers are down) and
+        must not tear the session down.
         """
+        if self._frozen:
+            logger.debug(
+                "[IdleWatchdog] fire_stale suppressed — frozen (hibernation)"
+            )
+            return
         self.diagnostics = WatchdogDiagnostics(
             reason="all_ops_stale",
             stale_ops=stale_ops,
@@ -99,6 +123,46 @@ class IdleWatchdog:
             len(stale_ops),
         )
         self.idle_event.set()
+
+    def freeze(self, *, reason: str = "") -> bool:
+        """Freeze the idle clock — used during HIBERNATION_MODE outages.
+
+        While frozen:
+          - _watch() does not accumulate elapsed time against _last_poke
+          - fire_stale() is a no-op
+          - idle_event is never set
+
+        Idempotent. Returns True on transition, False if already frozen.
+        """
+        if self._frozen:
+            return False
+        self._frozen = True
+        self._freeze_count += 1
+        logger.info(
+            "[IdleWatchdog] FROZEN (reason=%r, poke_count=%d)",
+            reason or "unspecified",
+            self._poke_count,
+        )
+        return True
+
+    def unfreeze(self, *, reason: str = "") -> bool:
+        """Release the idle clock and reset it to the current monotonic time.
+
+        The reset is critical: without it, a 30-minute hibernation would
+        fire idle immediately on wake because elapsed time > timeout_s.
+        After unfreeze the organism gets a full fresh idle window.
+
+        Idempotent. Returns True on transition, False if not frozen.
+        """
+        if not self._frozen:
+            return False
+        self._frozen = False
+        self._last_poke = time.monotonic()
+        logger.info(
+            "[IdleWatchdog] UNFROZEN — idle clock reset (reason=%r)",
+            reason or "unspecified",
+        )
+        return True
 
     async def start(self) -> None:
         """Start the background watchdog task."""
@@ -119,6 +183,13 @@ class IdleWatchdog:
         """Internal loop: check elapsed time, sleep, fire event when idle."""
         try:
             while True:
+                # HIBERNATION_MODE: while frozen the clock does not advance.
+                # Poll at 100ms so unfreeze() is observed within a tick — the
+                # sleep is cheap and keeps the idle window from silently
+                # over-running when we wake.
+                if self._frozen:
+                    await asyncio.sleep(0.1)
+                    continue
                 elapsed = time.monotonic() - self._last_poke
                 remaining = self._timeout_s - elapsed
                 if remaining <= 0:
