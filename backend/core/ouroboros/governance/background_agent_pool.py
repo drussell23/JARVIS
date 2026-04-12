@@ -210,6 +210,17 @@ class BackgroundAgentPool:
         self._workers: List[asyncio.Task] = []  # type: ignore[type-arg]
         self._running: bool = False
 
+        # Pause gate for HIBERNATION_MODE. Default set == "not paused".
+        # Workers await this before dequeuing; pause() clears it, resume()
+        # sets it. In-flight ops are NOT interrupted — they finish naturally.
+        # Queued items stay in the PriorityQueue untouched, so state is
+        # preserved across the outage window.
+        self._unpaused_event: asyncio.Event = asyncio.Event()
+        self._unpaused_event.set()
+        self._paused: bool = False
+        self._paused_at: Optional[float] = None
+        self._pause_count: int = 0
+
         # Counters for health reporting
         self._completed_count: int = 0
         self._failed_count: int = 0
@@ -279,6 +290,67 @@ class BackgroundAgentPool:
             logger.info("Drained %d queued operations during shutdown", drained)
 
         logger.info("Background agent pool stopped")
+
+    # -- Pause / Resume (HIBERNATION_MODE) -----------------------------------
+
+    def pause(self, *, reason: str = "") -> bool:
+        """Pause dequeuing without draining the queue.
+
+        Workers finish their in-flight op naturally, then block on
+        ``_unpaused_event`` before picking up the next one. The queue and
+        all tracked ops are preserved — ``resume()`` restores throughput
+        exactly where it left off.
+
+        Idempotent. Safe to call while the pool is stopped (no-op).
+
+        Returns True if a state transition occurred, False if already paused
+        or not running.
+        """
+        if not self._running:
+            logger.debug("pause() called on stopped pool — no-op")
+            return False
+        if self._paused:
+            return False
+        self._unpaused_event.clear()
+        self._paused = True
+        self._paused_at = time.monotonic()
+        self._pause_count += 1
+        logger.info(
+            "Background agent pool PAUSED (queue_depth=%d, reason=%r)",
+            self._queue.qsize(),
+            reason or "unspecified",
+        )
+        return True
+
+    def resume(self, *, reason: str = "") -> bool:
+        """Release workers to dequeue again.
+
+        Idempotent. Returns True on transition, False if already running
+        (not paused) or pool is stopped.
+        """
+        if not self._running:
+            logger.debug("resume() called on stopped pool — no-op")
+            return False
+        if not self._paused:
+            return False
+        paused_for = (
+            time.monotonic() - self._paused_at if self._paused_at is not None else 0.0
+        )
+        self._unpaused_event.set()
+        self._paused = False
+        self._paused_at = None
+        logger.info(
+            "Background agent pool RESUMED after %.1fs (queue_depth=%d, reason=%r)",
+            paused_for,
+            self._queue.qsize(),
+            reason or "unspecified",
+        )
+        return True
+
+    @property
+    def is_paused(self) -> bool:
+        """True if pause() has been called and resume() has not yet fired."""
+        return self._paused
 
     # -- Submit / Query ------------------------------------------------------
 
@@ -429,8 +501,16 @@ class BackgroundAgentPool:
         - ``active_ops``: list of active operation summaries
         """
         active_ops = self.list_active()
+        paused_for = (
+            time.monotonic() - self._paused_at
+            if self._paused and self._paused_at is not None
+            else None
+        )
         return {
             "running": self._running,
+            "paused": self._paused,
+            "paused_for_s": round(paused_for, 2) if paused_for is not None else None,
+            "pause_count": self._pause_count,
             "pool_size": self._pool_size,
             "queue_depth": self._queue.qsize(),
             "queue_capacity": self._queue_size,
@@ -469,12 +549,33 @@ class BackgroundAgentPool:
         logger.debug("Worker %d started", worker_id)
         try:
             while self._running:
+                # HIBERNATION_MODE: block here while paused. Bounded wait so
+                # stop() still reacts within ~2s even if resume() never fires.
+                if not self._unpaused_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            self._unpaused_event.wait(),
+                            timeout=2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+
                 try:
                     _item = await asyncio.wait_for(
                         self._queue.get(),
                         timeout=2.0,  # Periodic check of self._running
                     )
                 except asyncio.TimeoutError:
+                    continue
+
+                # Race guard: pause() may have fired while we were blocked
+                # inside get(). If so, re-enqueue the item and loop back to
+                # the pause-wait gate. This preserves queue ordering (the
+                # tuple carries its original priority + submission counter)
+                # and keeps unfinished_tasks balanced (task_done + put).
+                if not self._unpaused_event.is_set():
+                    self._queue.task_done()
+                    self._queue.put_nowait(_item)
                     continue
 
                 # Unpack PriorityQueue tuple: (priority, counter, op)
