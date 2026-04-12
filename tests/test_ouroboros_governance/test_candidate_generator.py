@@ -526,17 +526,36 @@ class TestCandidateGenerator:
     # -- deadline propagation --
 
     @pytest.mark.asyncio
-    async def test_expired_deadline_raises_immediately(
+    async def test_expired_deadline_refreshes_for_fallback(
         self, ctx: OperationContext
     ) -> None:
-        """An already-past deadline should raise, not hang."""
-        primary = _make_mock_provider(name="primary")
+        """An expired parent deadline should refresh for fallback, not hang.
+
+        The orchestrator's outer wait_for is the absolute Iron Gate.
+        An expired parent deadline typically means Tier 0 burned the window
+        or the op queued behind _fallback_sem — the fallback still deserves
+        a viable window.
+        """
+        received_deadline: list = []
+
+        async def _capture(ctx_arg, deadline_arg):
+            received_deadline.append(deadline_arg)
+            return _make_generation_result(provider_name="fallback")
+
+        primary = _make_mock_provider(
+            name="primary", generate_side_effect=asyncio.TimeoutError()
+        )
         fallback = _make_mock_provider(name="fallback")
+        fallback.generate.side_effect = _capture
         gen = CandidateGenerator(primary=primary, fallback=fallback)
         past_deadline = datetime.now(tz=timezone.utc) - timedelta(seconds=1)
 
-        with pytest.raises((asyncio.TimeoutError, RuntimeError)):
-            await gen.generate(ctx, past_deadline)
+        result = await gen.generate(ctx, past_deadline)
+        assert result.provider_name == "fallback"
+        refreshed = (
+            received_deadline[0] - datetime.now(tz=timezone.utc)
+        ).total_seconds()
+        assert refreshed > 60.0
 
     @pytest.mark.asyncio
     async def test_fallback_refreshes_depleted_deadline(
@@ -1169,3 +1188,134 @@ class TestContextOverflowClassification:
         exc = RuntimeError("tool_loop_budget_exceeded:131500")
         mode = FailbackStateMachine.classify_exception(exc)
         assert mode is not FailureMode.TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# TestFallbackSemStarvation — post-acquire deadline refresh
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackSemStarvation:
+    """Verify _call_fallback computes budget AFTER acquiring _fallback_sem.
+
+    When multiple ops queue behind the semaphore, the original parent
+    deadline burns while waiting.  The fix: budget computation + deadline
+    refresh happen post-acquire, so the fallback always gets at least
+    _FALLBACK_MIN_GUARANTEED_S regardless of queue wait time.
+    """
+
+    @pytest.fixture()
+    def ctx(self) -> OperationContext:
+        return _make_context()
+
+    @pytest.mark.asyncio
+    async def test_sem_wait_does_not_starve_fallback(
+        self, ctx: OperationContext
+    ) -> None:
+        """Simulate sem contention burning the parent deadline.
+
+        Slot 1 holds the semaphore for 3s.  Slot 2 queues and its parent
+        deadline (4s) expires during the wait.  Post-acquire refresh should
+        still give it a viable window.
+        """
+        call_count = 0
+        received_deadlines: list = []
+
+        async def _slow_then_fast(ctx_arg, deadline_arg):
+            nonlocal call_count
+            call_count += 1
+            received_deadlines.append(deadline_arg)
+            if call_count == 1:
+                await asyncio.sleep(3.0)
+            return _make_generation_result(provider_name="fallback")
+
+        primary = _make_mock_provider(
+            name="primary", generate_side_effect=RuntimeError("down")
+        )
+        fallback = _make_mock_provider(name="fallback")
+        fallback.generate.side_effect = _slow_then_fast
+
+        gen = CandidateGenerator(
+            primary=primary, fallback=fallback, fallback_concurrency=1,
+        )
+
+        short_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=4)
+
+        results = await asyncio.gather(
+            gen._call_fallback(ctx, short_deadline),
+            gen._call_fallback(ctx, short_deadline),
+        )
+        assert len(results) == 2
+        assert all(r.provider_name == "fallback" for r in results)
+
+        # The second call's deadline should have been refreshed — it queued
+        # for ~3s, parent had 4s, so post-acquire parent_remaining ≈ 1s.
+        # Refresh should bump it to _FALLBACK_MIN_GUARANTEED_S (90s).
+        second_remaining = (
+            received_deadlines[1] - datetime.now(tz=timezone.utc)
+        ).total_seconds()
+        assert second_remaining > 60.0, (
+            f"Queued fallback was starved: only {second_remaining:.1f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_expired_parent_still_gets_guaranteed_window(
+        self, ctx: OperationContext
+    ) -> None:
+        """Even with parent_remaining == 0, fallback gets a guaranteed window."""
+        received_deadline: list = []
+
+        async def _capture(ctx_arg, deadline_arg):
+            received_deadline.append(deadline_arg)
+            return _make_generation_result(provider_name="fallback")
+
+        primary = _make_mock_provider(
+            name="primary", generate_side_effect=RuntimeError("down")
+        )
+        fallback = _make_mock_provider(name="fallback")
+        fallback.generate.side_effect = _capture
+
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+
+        # Deadline already expired
+        expired = datetime.now(tz=timezone.utc) - timedelta(seconds=5)
+        result = await gen._call_fallback(ctx, expired)
+        assert result.provider_name == "fallback"
+        assert len(received_deadline) == 1
+
+        refreshed = (
+            received_deadline[0] - datetime.now(tz=timezone.utc)
+        ).total_seconds()
+        assert refreshed > 60.0, (
+            f"Expired parent should refresh: got {refreshed:.1f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_plan_fallback_sem_post_acquire_budget(self) -> None:
+        """plan() fallback path also computes budget post-acquire."""
+        primary = _make_mock_provider(name="primary")
+        primary.plan = AsyncMock(side_effect=RuntimeError("plan down"))
+
+        received_deadline: list = []
+
+        async def _plan_capture(prompt, deadline_arg):
+            received_deadline.append(deadline_arg)
+            return "plan text"
+
+        fallback = _make_mock_provider(name="fallback")
+        fallback.plan = AsyncMock(side_effect=_plan_capture)
+
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+        gen.fsm.record_primary_failure()  # Force FALLBACK_ACTIVE
+
+        depleted = datetime.now(tz=timezone.utc) + timedelta(seconds=3)
+        result = await gen.plan("Generate a plan", depleted)
+        assert result == "plan text"
+        assert len(received_deadline) == 1
+
+        refreshed = (
+            received_deadline[0] - datetime.now(tz=timezone.utc)
+        ).total_seconds()
+        assert refreshed > 60.0, (
+            f"Plan fallback should refresh depleted deadline: {refreshed:.1f}s"
+        )
