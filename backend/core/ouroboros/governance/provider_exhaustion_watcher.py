@@ -94,6 +94,13 @@ class ProviderExhaustionWatcher:
     threshold:
         Consecutive-exhaustion count that triggers hibernation. ``None``
         reads ``JARVIS_HIBERNATION_TRIGGER_THRESHOLD`` with a default of 3.
+    prober:
+        Optional :class:`HibernationProber` (or any object with an async
+        ``start()`` method). When supplied, ``prober.start()`` is awaited
+        immediately after the controller accepts ``enter_hibernation()``
+        so the health-probe loop can schedule the wake. The prober is
+        idempotent, so a burst of exhaustion events will not spawn
+        duplicate tasks.
     """
 
     def __init__(
@@ -101,6 +108,7 @@ class ProviderExhaustionWatcher:
         controller: Any,
         *,
         threshold: Optional[int] = None,
+        prober: Optional[Any] = None,
     ) -> None:
         self._controller = controller
         self._threshold: int = _resolve_threshold(threshold)
@@ -110,9 +118,25 @@ class ProviderExhaustionWatcher:
         self._hibernations_triggered: int = 0
         self._last_reason: Optional[str] = None
         self._lock: asyncio.Lock = asyncio.Lock()
+        self._prober = prober
         logger.info(
-            "ProviderExhaustionWatcher initialised — threshold=%d",
+            "ProviderExhaustionWatcher initialised — threshold=%d prober=%s",
             self._threshold,
+            "yes" if prober is not None else "no",
+        )
+
+    def attach_prober(self, prober: Any) -> None:
+        """Install a :class:`HibernationProber` after construction.
+
+        Used by the governance stack, which has to build the
+        CandidateGenerator (and therefore the provider list) before it
+        can build the prober. The watcher is constructed first and the
+        prober is stitched in once the providers are known.
+        """
+        self._prober = prober
+        logger.info(
+            "[ExhaustionWatcher] prober attached (%s)",
+            type(prober).__name__ if prober is not None else "None",
         )
 
     # ------------------------------------------------------------------
@@ -256,4 +280,19 @@ class ProviderExhaustionWatcher:
                 self._hibernations_triggered,
                 reason,
             )
+            if self._prober is not None:
+                prober_start = getattr(self._prober, "start", None)
+                if prober_start is None:
+                    logger.warning(
+                        "[ExhaustionWatcher] prober has no start() method "
+                        "— wake will not be scheduled"
+                    )
+                else:
+                    try:
+                        await prober_start()
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[ExhaustionWatcher] prober.start() raised — "
+                            "hibernation entered but wake loop not running"
+                        )
         return bool(result)

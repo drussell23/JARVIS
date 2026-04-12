@@ -778,6 +778,8 @@ class GovernedLoopService:
         self._approval_provider: Optional[CLIApprovalProvider] = None
         self._validation_runner: Optional[Any] = None
         self._health_probe_task: Optional[asyncio.Task] = None
+        self._exhaustion_watcher: Any = None
+        self._hibernation_prober: Any = None
         self._ledger: Any = None  # set in _build_components from stack.ledger
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
         self._trust_graduator: Optional[Any] = None
@@ -2701,6 +2703,49 @@ class GovernedLoopService:
                 exhaustion_watcher=_exhaustion_watcher,
             )
             self._exhaustion_watcher = _exhaustion_watcher
+
+            # HIBERNATION_MODE step 6: construct a HibernationProber over the
+            # real provider handles and attach it to the watcher so that
+            # entering HIBERNATION automatically arms a wake loop. Sequencing:
+            # the watcher must exist before the CandidateGenerator is built
+            # (so the generator can call record_exhaustion/record_success),
+            # while the prober needs the live provider objects — hence the
+            # post-construction attach_prober() hook.
+            if _exhaustion_watcher is not None and _controller is not None:
+                try:
+                    from backend.core.ouroboros.governance.hibernation_prober import (  # noqa: PLC0415  # type: ignore[import-not-found]
+                        HibernationProber,
+                    )
+                    # De-dupe providers: effective_primary/effective_fallback
+                    # alias to the same object when only one side exists.
+                    _probe_targets: list[Any] = []
+                    for _candidate in (tier0, effective_primary, effective_fallback):
+                        if _candidate is None:
+                            continue
+                        if any(existing is _candidate for existing in _probe_targets):
+                            continue
+                        _probe_targets.append(_candidate)
+                    _prober_instance: Any = HibernationProber(
+                        controller=_controller,
+                        providers=_probe_targets,
+                    )
+                    _attach = getattr(
+                        _exhaustion_watcher, "attach_prober", None,
+                    )
+                    if _attach is not None:
+                        _attach(_prober_instance)
+                    self._hibernation_prober = _prober_instance
+                    logger.info(
+                        "[GovernedLoop] HibernationProber wired "
+                        "(providers=%d)",
+                        len(_probe_targets),
+                    )
+                except Exception as _prober_exc:
+                    logger.warning(
+                        "[GovernedLoop] HibernationProber wiring failed "
+                        "(non-fatal): %s",
+                        _prober_exc,
+                    )
 
             # Sync FSM to reflect actual startup probe result.
             # Without this, the FSM stays at PRIMARY_READY even when the startup
