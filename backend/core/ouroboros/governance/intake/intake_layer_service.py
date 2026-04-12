@@ -694,6 +694,18 @@ class IntakeLayerService:
                             "[IntakeLayer] Sensor bus subscription failed: %s", exc
                         )
 
+            # Subscribe hot-reloader to event bus for event-driven reload
+            # (G3: Manifesto §3 zero-polling). Gated by JARVIS_HOT_RELOAD_EVENT_DRIVEN.
+            try:
+                _orch = getattr(self._gls, "_orchestrator", None)
+                _reloader = getattr(_orch, "_hot_reloader", None) if _orch else None
+                if _reloader and hasattr(_reloader, "subscribe_to_bus"):
+                    await _reloader.subscribe_to_bus(_event_bus)
+            except Exception as exc:
+                logger.debug(
+                    "[IntakeLayer] Hot-reloader bus subscription skipped: %s", exc
+                )
+
             logger.info(
                 "[IntakeLayer] Event Spine active: FileWatch → TrinityEventBus → "
                 "%d/%d sensors subscribed",

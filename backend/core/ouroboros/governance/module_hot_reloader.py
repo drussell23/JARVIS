@@ -43,17 +43,25 @@ op uses the freshly-fixed code.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import logging
+import os
 import sys
 import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_EVENT_DRIVEN_ENABLED = os.environ.get(
+    "JARVIS_HOT_RELOAD_EVENT_DRIVEN", "false"
+).lower() in ("true", "1", "yes")
+
+_DEBOUNCE_WINDOW_S = float(os.environ.get("JARVIS_HOT_RELOAD_DEBOUNCE_S", "0.75"))
 
 
 # Modules safe to hot-reload. Each must satisfy the constraints in the
@@ -206,6 +214,8 @@ class ModuleHotReloader:
         # change-detection from a fresh disk read because the file may have
         # already been rewritten by O+V's APPLY phase before reload_for_op runs.
         self._loaded_hashes: Dict[str, str] = {}
+        self._debounce_times: Dict[str, float] = {}
+        self._event_in_flight: bool = False
         self._prime_loaded_hashes()
 
     @property
@@ -695,3 +705,98 @@ class ModuleHotReloader:
             ],
         }
         self._emit_event(event)
+
+    # ------------------------------------------------------------------
+    # Event-driven path (G2: Manifesto §3 zero-polling reflex)
+    # ------------------------------------------------------------------
+
+    async def subscribe_to_bus(self, event_bus: Any) -> None:
+        """Subscribe to fs.changed.modified for instant hot-reload on save.
+
+        Gated by JARVIS_HOT_RELOAD_EVENT_DRIVEN (default false). When
+        enabled, file saves to safe modules trigger an immediate reload
+        without waiting for the post-VERIFY hook.
+        """
+        if not _EVENT_DRIVEN_ENABLED:
+            logger.debug(
+                "[HotReload] Event-driven reload disabled "
+                "(set JARVIS_HOT_RELOAD_EVENT_DRIVEN=true to enable)"
+            )
+            return
+        await event_bus.subscribe("fs.changed.modified", self._on_fs_changed)
+        logger.info(
+            "[HotReload] Event-driven reload active: subscribed to "
+            "fs.changed.modified (%d safe modules)",
+            len(self._safe),
+        )
+
+    async def _on_fs_changed(self, event: Any) -> None:
+        """React to a file-change event — reload if the file is a safe module."""
+        payload = event.payload
+        if payload.get("extension") != ".py":
+            return
+        rel_path = payload.get("path", "")
+        mod_name = self.path_to_module(rel_path)
+        if mod_name is None:
+            return
+        if mod_name not in self._safe or mod_name in self._quarantine:
+            return
+        if mod_name not in sys.modules:
+            return
+
+        now = time.monotonic()
+        last = self._debounce_times.get(mod_name, 0.0)
+        if now - last < _DEBOUNCE_WINDOW_S:
+            return
+        self._debounce_times[mod_name] = now
+
+        with self._lock:
+            if self._event_in_flight:
+                logger.debug(
+                    "[HotReload] Event-driven reload skipped (in-flight): %s",
+                    mod_name,
+                )
+                return
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._reload_for_event, mod_name)
+
+    def _reload_for_event(self, mod_name: str) -> None:
+        """Execute an event-driven reload on a thread-pool worker.
+
+        Uses the same reload_for_op machinery so all safety properties
+        (preflight, hash verify, probe identity) are preserved.
+        """
+        with self._lock:
+            if self._event_in_flight:
+                return
+            self._event_in_flight = True
+        try:
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                return
+            file_path = getattr(mod, "__file__", None)
+            if not file_path:
+                return
+            try:
+                rel_path = str(Path(file_path).relative_to(self._root))
+            except ValueError:
+                return
+            synthetic_op = f"event-{time.time_ns()}"
+            batch = self.reload_for_op(synthetic_op, [rel_path])
+            if batch.overall_status == "success":
+                logger.info(
+                    "[HotReload] Event-driven reload succeeded: %s", mod_name,
+                )
+            elif batch.restart_required:
+                logger.warning(
+                    "[HotReload] Event-driven reload requires restart: %s",
+                    batch.restart_reason,
+                )
+        except Exception:
+            logger.debug(
+                "[HotReload] Event-driven reload error", exc_info=True
+            )
+        finally:
+            with self._lock:
+                self._event_in_flight = False

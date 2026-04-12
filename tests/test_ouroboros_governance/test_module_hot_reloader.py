@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import importlib
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List
+from typing import Any, Iterator, List
 
 import pytest
 
+import backend.core.ouroboros.governance.module_hot_reloader as mhr_module
 from backend.core.ouroboros.governance.module_hot_reloader import (
     DEFAULT_QUARANTINE,
     DEFAULT_SAFE_MODULES,
@@ -598,3 +600,141 @@ class TestProcessSingletonSurvivesReload:
         importlib.reload(pb)
         sem_after = pb._benchmark_semaphore()
         assert sem_before is sem_after
+
+
+# ----------------------------------------------------------------------
+# 12. Event-driven hot-reload (G2+G3)
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class FakeEvent:
+    """Minimal event stub matching TrinityEventBus event shape."""
+    topic: str
+    payload: dict
+
+
+class FakeEventBus:
+    """Minimal event bus stub that records subscriptions."""
+
+    def __init__(self) -> None:
+        self.subscriptions: dict[str, list] = {}
+
+    async def subscribe(self, topic: str, handler: Any) -> None:
+        self.subscriptions.setdefault(topic, []).append(handler)
+
+
+class TestEventDrivenHotReload:
+    @pytest.fixture
+    def event_reloader(
+        self, synthetic_workspace: Path,
+    ) -> Iterator[ModuleHotReloader]:
+        """Reloader with a synthetic safe module loaded and ready."""
+        mod_name = "synthetic_event_test"
+        mod_file = synthetic_workspace / f"{mod_name}.py"
+        mod_file.write_text("VALUE = 1\ndef probe(): pass\n")
+        importlib.import_module(mod_name)
+
+        r = ModuleHotReloader(
+            project_root=synthetic_workspace,
+            safe_modules=frozenset({mod_name}),
+            quarantine=frozenset(),
+            in_scope_prefix="synthetic_",
+        )
+        yield r
+        sys.modules.pop(mod_name, None)
+
+    @pytest.mark.asyncio
+    async def test_subscribe_disabled_by_default(
+        self, reloader: ModuleHotReloader,
+    ) -> None:
+        bus = FakeEventBus()
+        await reloader.subscribe_to_bus(bus)
+        assert "fs.changed.modified" not in bus.subscriptions
+
+    @pytest.mark.asyncio
+    async def test_subscribe_enabled(
+        self, reloader: ModuleHotReloader, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(mhr_module, "_EVENT_DRIVEN_ENABLED", True)
+        bus = FakeEventBus()
+        await reloader.subscribe_to_bus(bus)
+        assert len(bus.subscriptions.get("fs.changed.modified", [])) == 1
+
+    @pytest.mark.asyncio
+    async def test_on_fs_changed_skips_non_py(
+        self, event_reloader: ModuleHotReloader,
+    ) -> None:
+        event = FakeEvent(
+            topic="fs.changed.modified",
+            payload={"path": "synthetic_event_test.txt", "extension": ".txt"},
+        )
+        await event_reloader._on_fs_changed(event)
+        assert event_reloader.last_batch is None
+
+    @pytest.mark.asyncio
+    async def test_on_fs_changed_skips_non_safe(
+        self, event_reloader: ModuleHotReloader,
+    ) -> None:
+        event = FakeEvent(
+            topic="fs.changed.modified",
+            payload={"path": "some_other_module.py", "extension": ".py"},
+        )
+        await event_reloader._on_fs_changed(event)
+        assert event_reloader.last_batch is None
+
+    @pytest.mark.asyncio
+    async def test_on_fs_changed_debounce(
+        self, event_reloader: ModuleHotReloader, synthetic_workspace: Path,
+    ) -> None:
+        mod_file = synthetic_workspace / "synthetic_event_test.py"
+        mod_file.write_text("VALUE = 2\ndef probe(): pass\n")
+
+        event = FakeEvent(
+            topic="fs.changed.modified",
+            payload={"path": "synthetic_event_test.py", "extension": ".py"},
+        )
+        await event_reloader._on_fs_changed(event)
+        first_batch = event_reloader.last_batch
+        assert first_batch is not None
+
+        await event_reloader._on_fs_changed(event)
+        assert event_reloader.last_batch is first_batch
+
+    @pytest.mark.asyncio
+    async def test_on_fs_changed_reloads_safe_module(
+        self, event_reloader: ModuleHotReloader, synthetic_workspace: Path,
+    ) -> None:
+        mod_file = synthetic_workspace / "synthetic_event_test.py"
+        mod_file.write_text("VALUE = 42\ndef probe(): pass\n")
+
+        event = FakeEvent(
+            topic="fs.changed.modified",
+            payload={"path": "synthetic_event_test.py", "extension": ".py"},
+        )
+        await event_reloader._on_fs_changed(event)
+        batch = event_reloader.last_batch
+        assert batch is not None
+        assert batch.overall_status in ("success", "no_change")
+        if batch.overall_status == "success":
+            mod = sys.modules.get("synthetic_event_test")
+            assert mod is not None
+            assert getattr(mod, "VALUE", None) == 42
+
+    @pytest.mark.asyncio
+    async def test_in_flight_guard_skips_concurrent(
+        self, event_reloader: ModuleHotReloader,
+    ) -> None:
+        event_reloader._event_in_flight = True
+        event = FakeEvent(
+            topic="fs.changed.modified",
+            payload={"path": "synthetic_event_test.py", "extension": ".py"},
+        )
+        await event_reloader._on_fs_changed(event)
+        assert event_reloader.last_batch is None
+
+    def test_reload_for_event_clears_in_flight(
+        self, event_reloader: ModuleHotReloader,
+    ) -> None:
+        event_reloader._reload_for_event("synthetic_event_test")
+        assert event_reloader._event_in_flight is False
