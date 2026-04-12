@@ -780,6 +780,8 @@ class GovernedLoopService:
         self._health_probe_task: Optional[asyncio.Task] = None
         self._exhaustion_watcher: Any = None
         self._hibernation_prober: Any = None
+        self._hibernate_bridge: Any = None
+        self._wake_bridge: Any = None
         self._ledger: Any = None  # set in _build_components from stack.ledger
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
         self._trust_graduator: Optional[Any] = None
@@ -3212,6 +3214,89 @@ class GovernedLoopService:
             )
         except Exception as exc:
             logger.debug("[GLS] BackgroundAgentPool skipped: %s", exc)
+
+        # ---- HIBERNATION_MODE step 6.5: bridge controller transitions ----
+        # Register hibernation hooks on the SupervisorOuroborosController so
+        # that enter_hibernation() actually pauses the BG pool and freezes
+        # the idle watchdog (and wake_from_hibernation() restores them).
+        # Without this bridge the controller's mode flip is purely cosmetic
+        # and the organism keeps burning work during a provider outage,
+        # which is the exact failure HIBERNATION is supposed to prevent.
+        #
+        # Hooks receive a keyword ``reason`` and may be sync — pool.pause /
+        # watchdog.freeze are already sync and idempotent. Pause-first,
+        # resume-last ordering mirrors lock acquisition: shut the gate
+        # before freezing the clock, unfreeze the clock before reopening
+        # the gate, so observers never see "unfrozen & paused".
+        _ctrl_for_hooks = (
+            getattr(self._stack, "controller", None)
+            if self._stack is not None
+            else None
+        )
+        if (
+            _ctrl_for_hooks is not None
+            and hasattr(_ctrl_for_hooks, "register_hibernation_hooks")
+        ):
+            _bg_ref = self._bg_pool
+            _watchdog_ref = getattr(self, "_idle_watchdog", None)
+
+            def _hibernate_bridge(*, reason: str) -> None:
+                # Pause the pool first so in-flight workers drain to the
+                # unpaused gate before any later hook observes state.
+                if _bg_ref is not None:
+                    try:
+                        _bg_ref.pause(reason=f"hibernation: {reason}")
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[GLS] bg_pool.pause failed under hibernation"
+                        )
+                if _watchdog_ref is not None:
+                    try:
+                        _watchdog_ref.freeze(reason=f"hibernation: {reason}")
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[GLS] idle_watchdog.freeze failed under hibernation"
+                        )
+
+            def _wake_bridge(*, reason: str) -> None:
+                # Unfreeze first so the watchdog resets its clock before
+                # the pool starts dequeuing — avoids a spurious stale-fire
+                # immediately on wake against stale _last_poke.
+                if _watchdog_ref is not None:
+                    try:
+                        _watchdog_ref.unfreeze(reason=f"wake: {reason}")
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[GLS] idle_watchdog.unfreeze failed under wake"
+                        )
+                if _bg_ref is not None:
+                    try:
+                        _bg_ref.resume(reason=f"wake: {reason}")
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[GLS] bg_pool.resume failed under wake"
+                        )
+
+            try:
+                _ctrl_for_hooks.register_hibernation_hooks(
+                    on_hibernate=_hibernate_bridge,
+                    on_wake=_wake_bridge,
+                    name="governed_loop_service",
+                )
+                self._hibernate_bridge = _hibernate_bridge
+                self._wake_bridge = _wake_bridge
+                logger.info(
+                    "[GLS] hibernation hooks registered on controller "
+                    "(pool=%s, watchdog=%s)",
+                    "yes" if _bg_ref is not None else "no",
+                    "yes" if _watchdog_ref is not None else "no",
+                )
+            except Exception as _hook_exc:
+                logger.warning(
+                    "[GLS] hibernation hook registration failed "
+                    "(non-fatal): %s",
+                    _hook_exc,
+                )
 
         # ---- Wire LifecycleHookEngine (P1: 15 lifecycle events) ----
         self._hook_engine = None

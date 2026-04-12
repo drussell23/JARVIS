@@ -44,7 +44,7 @@ import inspect
 import logging
 import os
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("Ouroboros.Controller")
 
@@ -62,13 +62,15 @@ logger = logging.getLogger("Ouroboros.Controller")
 # pool.pause()/watchdog.freeze() without coupling the controller to either.
 
 
-HibernationHook = Callable[..., Union[None, Awaitable[None]]]
+HibernationHook = Callable[..., Any]
 """Signature for hibernation enter/wake callbacks.
 
 Hooks receive a single keyword argument ``reason`` and may be sync or
-async. Async hooks are detected at call time via ``inspect.isawaitable``
-on the return value, so both ``async def foo(*, reason)`` and
-``lambda *, reason: some_coro(reason=reason)`` are accepted.
+async. Return values are ignored: async returns are detected at call
+time via ``inspect.isawaitable`` and awaited, sync returns are dropped.
+This deliberately accepts ``Callable[..., Any]`` so lambda adapters
+that wrap multiple sync side-effects (e.g. returning a tuple from
+``(pool.pause(), watchdog.freeze())``) don't trip the type checker.
 """
 
 
