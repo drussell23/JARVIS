@@ -1,0 +1,205 @@
+{
+  "cancelled_units": [],
+  "checksum": "1d47828e534ee653",
+  "completed_units": [],
+  "failed_units": [
+    "u_complexity_backend_api_unified_command_processor_py_5e06ece0",
+    "u_complexity_backend_core_ouroboros_native_integration_py_bffd8786",
+    "u_complexity_backend_core_race_condition_prevention_py_cf2d7216",
+    "u_complexity_backend_core_trinity_integrator_py_16c5a15b"
+  ],
+  "graph": {
+    "causal_trace_id": "miner_complexity_1775968946_f0201da8:84ecefb1b7ee",
+    "concurrency_limit": 4,
+    "graph_id": "miner_complexity_1775968946_f0201da8",
+    "op_id": "op-b966a60d-4820-4f35-966f-21005419dcfc",
+    "plan_digest": "84ecefb1b7eeb51d910d7abf97eb68bbfb25c803af4619852f048814df51e2a5",
+    "planner_id": "miner_graph_coalescer",
+    "schema_version": "miner_graph.1",
+    "units": [
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "complexity: refactor backend/supervisor/cross_repo_startup_orchestrator.py to reduce complexity (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/supervisor/cross_repo_startup_orchestrator.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/supervisor/cross_repo_startup_orchestrator.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_complexity_backend_supervisor_cross_repo_startup_orchestrat_67e039f4"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "complexity: refactor backend/core/ouroboros/native_integration.py to reduce complexity (composite=0.93)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/ouroboros/native_integration.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/ouroboros/native_integration.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_complexity_backend_core_ouroboros_native_integration_py_bffd8786"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "complexity: refactor backend/vision/yabai_space_detector.py to reduce complexity (composite=0.88)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/vision/yabai_space_detector.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/vision/yabai_space_detector.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_complexity_backend_vision_yabai_space_detector_py_47b85b4f"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "complexity: refactor backend/core/trinity_integrator.py to reduce complexity (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/trinity_integrator.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/trinity_integrator.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_complexity_backend_core_trinity_integrator_py_16c5a15b"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "complexity: refactor backend/api/unified_command_processor.py to reduce complexity (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/api/unified_command_processor.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/api/unified_command_processor.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_complexity_backend_api_unified_command_processor_py_5e06ece0"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "complexity: refactor backend/neural_mesh/agents/visual_monitor_agent.py to reduce complexity (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/neural_mesh/agents/visual_monitor_agent.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/neural_mesh/agents/visual_monitor_agent.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_complexity_backend_neural_mesh_agents_visual_monitor_agent__1efe8f28"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "complexity: refactor backend/core/race_condition_prevention.py to reduce complexity (composite=0.77)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/race_condition_prevention.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/race_condition_prevention.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_complexity_backend_core_race_condition_prevention_py_cf2d7216"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "complexity: refactor backend/voice/intelligent_command_handler.py to reduce complexity (composite=0.87)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/voice/intelligent_command_handler.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/voice/intelligent_command_handler.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_complexity_backend_voice_intelligent_command_handler_py_b112c26d"
+      }
+    ]
+  },
+  "last_error": "all_providers_exhausted",
+  "phase": "failed",
+  "ready_units": [],
+  "results": {
+    "u_complexity_backend_api_unified_command_processor_py_5e06ece0": {
+      "attempt_count": 1,
+      "causal_parent_id": "miner_complexity_1775968946_f0201da8:84ecefb1b7ee",
+      "error": "all_providers_exhausted",
+      "failure_class": "infra",
+      "finished_at_ns": 318056202375,
+      "patch": null,
+      "repo": "jarvis",
+      "started_at_ns": 167138884916,
+      "status": "failed",
+      "unit_id": "u_complexity_backend_api_unified_command_processor_py_5e06ece0"
+    },
+    "u_complexity_backend_core_ouroboros_native_integration_py_bffd8786": {
+      "attempt_count": 1,
+      "causal_parent_id": "miner_complexity_1775968946_f0201da8:84ecefb1b7ee",
+      "error": "all_providers_exhausted",
+      "failure_class": "infra",
+      "finished_at_ns": 360484493375,
+      "patch": null,
+      "repo": "jarvis",
+      "started_at_ns": 167205049791,
+      "status": "failed",
+      "unit_id": "u_complexity_backend_core_ouroboros_native_integration_py_bffd8786"
+    },
+    "u_complexity_backend_core_race_condition_prevention_py_cf2d7216": {
+      "attempt_count": 1,
+      "causal_parent_id": "miner_complexity_1775968946_f0201da8:84ecefb1b7ee",
+      "error": "all_providers_exhausted",
+      "failure_class": "infra",
+      "finished_at_ns": 277133640291,
+      "patch": null,
+      "repo": "jarvis",
+      "started_at_ns": 167239638000,
+      "status": "failed",
+      "unit_id": "u_complexity_backend_core_race_condition_prevention_py_cf2d7216"
+    },
+    "u_complexity_backend_core_trinity_integrator_py_16c5a15b": {
+      "attempt_count": 1,
+      "causal_parent_id": "miner_complexity_1775968946_f0201da8:84ecefb1b7ee",
+      "error": "all_providers_exhausted",
+      "failure_class": "infra",
+      "finished_at_ns": 360485058625,
+      "patch": null,
+      "repo": "jarvis",
+      "started_at_ns": 173819414333,
+      "status": "failed",
+      "unit_id": "u_complexity_backend_core_trinity_integrator_py_16c5a15b"
+    }
+  },
+  "running_units": [],
+  "updated_at_ns": 728938311500
+}

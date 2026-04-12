@@ -1,0 +1,167 @@
+{
+  "cancelled_units": [],
+  "checksum": "829b3346bc807316",
+  "completed_units": [],
+  "failed_units": [],
+  "graph": {
+    "causal_trace_id": "miner_long_functions_1775969440_9f3b6f43:fa4d412f8dd9",
+    "concurrency_limit": 4,
+    "graph_id": "miner_long_functions_1775969440_9f3b6f43",
+    "op_id": "op-f1d98f2f-97f1-4625-9969-60125bb58aea",
+    "plan_digest": "fa4d412f8dd9cd6995310af1aa1cdd8dbb6388b6dd82d900818024ebb1c88315",
+    "planner_id": "miner_graph_coalescer",
+    "schema_version": "miner_graph.1",
+    "units": [
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/ouroboros/governance/orchestrator.py to reduce long functions (composite=0.85)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/ouroboros/governance/orchestrator.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/ouroboros/governance/orchestrator.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_ouroboros_governance_orchestrator_p_aecb42de"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/vision/claude_vision_analyzer_main.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/vision/claude_vision_analyzer_main.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/vision/claude_vision_analyzer_main.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_vision_claude_vision_analyzer_main_py_c80e9f97"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/api/jarvis_voice_api.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/api/jarvis_voice_api.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/api/jarvis_voice_api.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_api_jarvis_voice_api_py_f02a832d"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/ouroboros/governance/governed_loop_service.py to reduce long functions (composite=0.85)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/ouroboros/governance/governed_loop_service.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/ouroboros/governance/governed_loop_service.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_ouroboros_governance_governed_loop__3a48d782"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/voice_unlock/metrics_database.py to reduce long functions (composite=0.87)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/voice_unlock/metrics_database.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/voice_unlock/metrics_database.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_voice_unlock_metrics_database_py_4a895a57"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/voice_unlock/intelligent_voice_unlock_service.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/voice_unlock/intelligent_voice_unlock_service.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/voice_unlock/intelligent_voice_unlock_service.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_voice_unlock_intelligent_voice_unlock_se_14e31a5a"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/intelligence/code_ownership.py to reduce long functions (composite=0.51)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/intelligence/code_ownership.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/intelligence/code_ownership.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_intelligence_code_ownership_py_9b7bf376"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/macos_helper/autonomy/action_registry.py to reduce long functions (composite=0.53)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/macos_helper/autonomy/action_registry.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/macos_helper/autonomy/action_registry.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_macos_helper_autonomy_action_registry_py_5fd78d03"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/configuration/unified_engine.py to reduce long functions (composite=0.62)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/configuration/unified_engine.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/configuration/unified_engine.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_configuration_unified_engine_py_5825863c"
+      }
+    ]
+  },
+  "last_error": "graph_cancelled",
+  "phase": "cancelled",
+  "ready_units": [],
+  "results": {},
+  "running_units": [],
+  "updated_at_ns": 754221991625
+}

@@ -311,7 +311,7 @@ class TodoScannerSensor:
                         "sensor": "TodoScannerSensor",
                         "trigger_tag": item.trigger_tag,
                     },
-                    requires_human_ack=not item.auto_resolvable,
+                    requires_human_ack=not item.auto_resolvable and not item.trigger_tag,
                 )
                 result = await self._router.ingest(envelope)
                 if result == "enqueued":

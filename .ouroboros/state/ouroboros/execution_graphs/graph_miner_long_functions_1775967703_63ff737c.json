@@ -1,0 +1,221 @@
+{
+  "cancelled_units": [],
+  "checksum": "bc5bfb822a7a3137",
+  "completed_units": [],
+  "failed_units": [
+    "u_long_functions_backend_core_structured_logging_realtime_log_mon_6214a7e1",
+    "u_long_functions_backend_intelligence_agi_orchestrator_py_c911ad4a",
+    "u_long_functions_backend_vision_claude_vision_analyzer_main_py_c80e9f97",
+    "u_long_functions_backend_vision_enhanced_vision_pipeline_coordina_e33ed5ec"
+  ],
+  "graph": {
+    "causal_trace_id": "miner_long_functions_1775967703_63ff737c:21b2be2b118d",
+    "concurrency_limit": 4,
+    "graph_id": "miner_long_functions_1775967703_63ff737c",
+    "op_id": "op-43c71ed9-b8f9-467b-b00d-6cb22330661d",
+    "plan_digest": "21b2be2b118d4000f8b95da4045292295f137876df42f6c972af6686d9cac87e",
+    "planner_id": "miner_graph_coalescer",
+    "schema_version": "miner_graph.1",
+    "units": [
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/ouroboros/governance/orchestrator.py to reduce long functions (composite=0.85)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/ouroboros/governance/orchestrator.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/ouroboros/governance/orchestrator.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_ouroboros_governance_orchestrator_p_aecb42de"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/vision/claude_vision_analyzer_main.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/vision/claude_vision_analyzer_main.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/vision/claude_vision_analyzer_main.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_vision_claude_vision_analyzer_main_py_c80e9f97"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/api/jarvis_voice_api.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/api/jarvis_voice_api.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/api/jarvis_voice_api.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_api_jarvis_voice_api_py_f02a832d"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/ouroboros/governance/governed_loop_service.py to reduce long functions (composite=0.85)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/ouroboros/governance/governed_loop_service.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/ouroboros/governance/governed_loop_service.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_ouroboros_governance_governed_loop__3a48d782"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/voice_unlock/metrics_database.py to reduce long functions (composite=0.87)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/voice_unlock/metrics_database.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/voice_unlock/metrics_database.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_voice_unlock_metrics_database_py_4a895a57"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/api/unified_websocket.py to reduce long functions (composite=0.87)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/api/unified_websocket.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/api/unified_websocket.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_api_unified_websocket_py_cc582a60"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/intelligence/agi_orchestrator.py to reduce long functions (composite=0.47)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/intelligence/agi_orchestrator.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/intelligence/agi_orchestrator.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_intelligence_agi_orchestrator_py_c911ad4a"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/structured_logging/realtime_log_monitor.py to reduce long functions (composite=0.42)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/structured_logging/realtime_log_monitor.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/structured_logging/realtime_log_monitor.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_structured_logging_realtime_log_mon_6214a7e1"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/vision/enhanced_vision_pipeline/coordinate_calculator.py to reduce long functions (composite=0.14)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/vision/enhanced_vision_pipeline/coordinate_calculator.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/vision/enhanced_vision_pipeline/coordinate_calculator.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_vision_enhanced_vision_pipeline_coordina_e33ed5ec"
+      }
+    ]
+  },
+  "last_error": "all_providers_exhausted",
+  "phase": "failed",
+  "ready_units": [],
+  "results": {
+    "u_long_functions_backend_core_structured_logging_realtime_log_mon_6214a7e1": {
+      "attempt_count": 1,
+      "causal_parent_id": "miner_long_functions_1775967703_63ff737c:21b2be2b118d",
+      "error": "all_providers_exhausted",
+      "failure_class": "infra",
+      "finished_at_ns": 266956449791,
+      "patch": null,
+      "repo": "jarvis",
+      "started_at_ns": 18959476916,
+      "status": "failed",
+      "unit_id": "u_long_functions_backend_core_structured_logging_realtime_log_mon_6214a7e1"
+    },
+    "u_long_functions_backend_intelligence_agi_orchestrator_py_c911ad4a": {
+      "attempt_count": 1,
+      "causal_parent_id": "miner_long_functions_1775967703_63ff737c:21b2be2b118d",
+      "error": "all_providers_exhausted",
+      "failure_class": "infra",
+      "finished_at_ns": 295325912833,
+      "patch": null,
+      "repo": "jarvis",
+      "started_at_ns": 18972511958,
+      "status": "failed",
+      "unit_id": "u_long_functions_backend_intelligence_agi_orchestrator_py_c911ad4a"
+    },
+    "u_long_functions_backend_vision_claude_vision_analyzer_main_py_c80e9f97": {
+      "attempt_count": 1,
+      "causal_parent_id": "miner_long_functions_1775967703_63ff737c:21b2be2b118d",
+      "error": "all_providers_exhausted",
+      "failure_class": "infra",
+      "finished_at_ns": 295296021916,
+      "patch": null,
+      "repo": "jarvis",
+      "started_at_ns": 20494990708,
+      "status": "failed",
+      "unit_id": "u_long_functions_backend_vision_claude_vision_analyzer_main_py_c80e9f97"
+    },
+    "u_long_functions_backend_vision_enhanced_vision_pipeline_coordina_e33ed5ec": {
+      "attempt_count": 1,
+      "causal_parent_id": "miner_long_functions_1775967703_63ff737c:21b2be2b118d",
+      "error": "all_providers_exhausted",
+      "failure_class": "infra",
+      "finished_at_ns": 295423923625,
+      "patch": null,
+      "repo": "jarvis",
+      "started_at_ns": 20515290541,
+      "status": "failed",
+      "unit_id": "u_long_functions_backend_vision_enhanced_vision_pipeline_coordina_e33ed5ec"
+    }
+  },
+  "running_units": [],
+  "updated_at_ns": 295926440041
+}

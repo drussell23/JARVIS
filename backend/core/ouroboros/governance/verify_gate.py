@@ -13,6 +13,8 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# TODO(rsi-trigger): verify gate scan — validate TodoScanner trigger-tag e2e (task #63)
+
 _MIN_PASS_RATE = float(os.environ.get("JARVIS_VERIFY_MIN_PASS_RATE", "1.0"))
 _COVERAGE_DROP_MAX = float(os.environ.get("JARVIS_VERIFY_COVERAGE_DROP_MAX", "5.0"))
 _MAX_COMPLEXITY_DELTA = float(os.environ.get("JARVIS_VERIFY_MAX_COMPLEXITY_DELTA", "2.0"))
