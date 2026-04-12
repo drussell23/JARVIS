@@ -151,3 +151,70 @@ class TestSafeModeBoot:
         ctrl._safe_mode = True
         await ctrl.start()
         assert ctrl.interactive_allowed is True
+
+
+# ---------------------------------------------------------------------------
+# TestHibernationMode — enum + property guards (step 3 of HIBERNATION_MODE)
+# ---------------------------------------------------------------------------
+
+
+class TestHibernationMode:
+    """Verify the HIBERNATION enum value and property semantics.
+
+    Transition methods (enter_hibernation/wake_from_hibernation) are added
+    in a later step. These tests validate the enum + guards only: that
+    setting _mode directly to HIBERNATION yields the correct capability
+    flags and the existing transitions refuse to mis-route out.
+    """
+
+    def test_hibernation_enum_exists(self):
+        """AutonomyMode.HIBERNATION must exist with the expected value."""
+        assert AutonomyMode.HIBERNATION.value == "HIBERNATION"
+
+    def test_writes_blocked_in_hibernation(self, controller):
+        """writes_allowed must be False in HIBERNATION."""
+        controller._mode = AutonomyMode.HIBERNATION
+        assert controller.writes_allowed is False
+
+    def test_sandbox_blocked_in_hibernation(self, controller):
+        """sandbox_allowed must be False in HIBERNATION — no new ops."""
+        controller._mode = AutonomyMode.HIBERNATION
+        assert controller.sandbox_allowed is False
+
+    def test_interactive_allowed_in_hibernation(self, controller):
+        """interactive_allowed must be True — operator can still inspect state."""
+        controller._mode = AutonomyMode.HIBERNATION
+        assert controller.interactive_allowed is True
+
+    def test_is_hibernating_property(self, controller):
+        """is_hibernating reflects the HIBERNATION mode."""
+        assert controller.is_hibernating is False
+        controller._mode = AutonomyMode.HIBERNATION
+        assert controller.is_hibernating is True
+        controller._mode = AutonomyMode.GOVERNED
+        assert controller.is_hibernating is False
+
+    @pytest.mark.asyncio
+    async def test_pause_blocked_in_hibernation(self, controller):
+        """pause() must refuse while HIBERNATING."""
+        controller._mode = AutonomyMode.HIBERNATION
+        with pytest.raises(RuntimeError, match="HIBERNAT"):
+            await controller.pause()
+        assert controller.mode is AutonomyMode.HIBERNATION  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_resume_blocked_in_hibernation(self, controller):
+        """resume() must refuse while HIBERNATING — wake_from_hibernation only."""
+        controller._mode = AutonomyMode.HIBERNATION
+        with pytest.raises(RuntimeError, match="HIBERNAT"):
+            await controller.resume()
+        assert controller.mode is AutonomyMode.HIBERNATION  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_enable_governed_autonomy_blocked_in_hibernation(self, controller):
+        """enable_governed_autonomy() must refuse while HIBERNATING."""
+        controller._mode = AutonomyMode.HIBERNATION
+        controller._gates_passed = True  # ensure the hibernation check fires first
+        with pytest.raises(RuntimeError, match="HIBERNAT"):
+            await controller.enable_governed_autonomy()
+        assert controller.mode is AutonomyMode.HIBERNATION  # unchanged
