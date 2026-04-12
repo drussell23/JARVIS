@@ -378,15 +378,29 @@ class UnifiedIntakeRouter:
         """Number of envelopes parked awaiting human acknowledgement."""
         return self._pending_ack.count()
 
-    async def acknowledge(self, idempotency_key: str) -> bool:
+    async def acknowledge(
+        self,
+        idempotency_key: str,
+        *,
+        extra_evidence: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Release a parked envelope back into the pipeline.
 
         Returns ``True`` if the envelope was found and successfully re-ingested.
+
+        ``extra_evidence`` is merged into the released envelope's evidence
+        dict before re-ingest. Used by the OpportunityMiner auto-ack lane to
+        stamp ``auto_acked``/``auto_ack_reason`` on the queued envelope so
+        downstream phases (Orange PR review, postmortem) can see the lane
+        was used. The merge is shallow — top-level keys overwrite.
         """
         envelope = self._pending_ack.acknowledge(idempotency_key)
         if envelope is None:
             return False
         from .intent_envelope import make_envelope
+        merged_evidence = dict(envelope.evidence)
+        if extra_evidence:
+            merged_evidence.update(extra_evidence)
         unblocked = make_envelope(
             source=envelope.source,
             description=envelope.description,
@@ -394,7 +408,7 @@ class UnifiedIntakeRouter:
             repo=envelope.repo,
             confidence=envelope.confidence,
             urgency=envelope.urgency,
-            evidence=dict(envelope.evidence),
+            evidence=merged_evidence,
             requires_human_ack=False,
             causal_id=envelope.causal_id,
             signal_id=envelope.signal_id,

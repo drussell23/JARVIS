@@ -43,6 +43,56 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Auto-ack lane configuration (Task #69 — C1+C3 fix)
+# ---------------------------------------------------------------------------
+# The auto-ack lane lets the OpportunityMiner rescue coalesced graph batches
+# from the AC2 pending_ack gate when the batch passes a strict guard set.
+# Without it, every miner batch sits at pending_ack forever and the loop
+# never makes safe-module progress (empirically: enqueued=0 across all
+# observed cycles in bt-2026-04-12-005521 / bt-2026-04-12-025527).
+#
+# Why guards matter: the orchestrator's _build_profile (orchestrator.py:4892)
+# does NOT thread `source` into OperationProfile, so source-specific risk
+# rules are bypassed for ai_miner ops. The empirical risk-tier audit (Apr 11)
+# showed 1-file plain miner refactors land in SAFE_AUTO and 2-file in
+# NOTIFY_APPLY — silent or near-silent auto-apply. The lane enforces N>=3
+# so re-ingested batches always trip the classifier's `too_many_files` /
+# `blast_radius_exceeded` rules and route to APPROVAL_REQUIRED (Orange).
+#
+# Master switches:
+#   JARVIS_MINER_AUTO_ACK_LANE        — default false; flip on with
+#                                        JARVIS_MINER_GRAPH_AUTO_SUBMIT=true
+#   JARVIS_MINER_AUTO_ACK_MIN_FILES   — default 3 (matches the classifier's
+#                                        too_many_files threshold)
+#   JARVIS_MINER_AUTO_ACK_MAX_FILES   — default 8 (cap blast radius)
+#
+# Hard constants (not env-tunable; changing them is a code review concern):
+_AUTO_ACK_LANE_ENABLED: bool = (
+    os.environ.get("JARVIS_MINER_AUTO_ACK_LANE", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+_AUTO_ACK_MIN_FILES: int = int(os.environ.get("JARVIS_MINER_AUTO_ACK_MIN_FILES", "3"))
+_AUTO_ACK_MAX_FILES: int = int(os.environ.get("JARVIS_MINER_AUTO_ACK_MAX_FILES", "8"))
+
+# Allowlist of path prefixes for the lane. Excludes scripts/ for v1 because
+# loose scripts are a broader blast radius than packaged backend code.
+_AUTO_ACK_ALLOWED_PREFIXES: Tuple[str, ...] = ("backend/", "tests/")
+
+# Defense-in-depth fragments — even though the risk classifier already blocks
+# these, the lane double-checks before bypassing the AC2 gate. Order matters
+# for grep-friendly diagnostics: kernel sentinels first, then security.
+_AUTO_ACK_FORBIDDEN_FRAGMENTS: Tuple[str, ...] = (
+    "supervisor",
+    "auth/",
+    "credential",
+    "secret",
+    "token",
+    "encrypt",
+    ".env",
+)
+
+
+# ---------------------------------------------------------------------------
 # Analysis result types
 # ---------------------------------------------------------------------------
 
@@ -115,12 +165,18 @@ class _CycleCounters:
       queued_behind   — ingest() returned "queued_behind" (file conflict)
       deduplicated    — ingest() returned "deduplicated" (dedup window hit)
       backpressure    — ingest() returned "backpressure" (queue full)
+      auto_acked      — Auto-ack lane successfully rescued a parked envelope
+                        via router.acknowledge() (Task #69 C1+C3 fix). When
+                        non-zero, expect enqueued >= auto_acked because each
+                        rescue increments both counters.
 
     Reading the summary line:
       mined=N selected=M graph_built=1 graph_submitted=0 …
         → C1: JARVIS_MINER_GRAPH_AUTO_SUBMIT=false is the wall.
-      … pending_ack=K enqueued=0
-        → C3: AC2 requires_human_ack=True is the wall.
+      … pending_ack=K enqueued=0 auto_acked=0
+        → C3: AC2 requires_human_ack=True is the wall AND lane is off/blocked.
+      … pending_ack=K enqueued=K auto_acked=K
+        → Lane is working: every parked batch was rescued.
       … enqueued=K (K small relative to mined)
         → C2 (JARVIS_MINER_MAX_PER_SCAN + module_cap) is the next knob.
     """
@@ -135,6 +191,7 @@ class _CycleCounters:
     queued_behind: int = 0
     deduplicated: int = 0
     backpressure: int = 0
+    auto_acked: int = 0
 
 
 
@@ -721,13 +778,68 @@ class OpportunityMinerSensor:
             "mined=%d eligible=%d selected=%d "
             "graph_built=%d graph_submitted=%d "
             "enqueued=%d pending_ack=%d queued_behind=%d "
-            "deduplicated=%d backpressure=%d",
+            "deduplicated=%d backpressure=%d auto_acked=%d",
             self._scan_cycle, strategy_name, self._max_per_scan,
             counters.mined, counters.eligible, counters.selected,
             counters.graph_built, counters.graph_submitted,
             counters.enqueued, counters.pending_ack, counters.queued_behind,
-            counters.deduplicated, counters.backpressure,
+            counters.deduplicated, counters.backpressure, counters.auto_acked,
         )
+
+    @staticmethod
+    def _check_auto_ack_lane(target_files: Tuple[str, ...]) -> Tuple[bool, str]:
+        """Decide whether the auto-ack lane may rescue a parked miner batch.
+
+        Returns ``(eligible, reason)``. ``reason`` is a stable, grep-friendly
+        token explaining the decision — emitted in the audit log on both
+        success and skip so the lane is fully observable.
+
+        The guards (in evaluation order, first failure wins):
+          1. Lane disabled by env var → ``lane_disabled``
+          2. Below ``_AUTO_ACK_MIN_FILES`` (default 3) → ``below_min_files``
+          3. Above ``_AUTO_ACK_MAX_FILES`` (default 8) → ``above_max_files``
+          4. Any file outside ``_AUTO_ACK_ALLOWED_PREFIXES`` → ``path_not_allowed``
+          5. Any file matches a forbidden fragment → ``forbidden_fragment``
+          6. Any file matches a UserPreferenceMemory FORBIDDEN_PATH substring
+             → ``forbidden_user_pref``
+          7. All passed → ``ok``
+
+        Defense in depth: rules 4–6 enforce a hard floor even if the risk
+        classifier is later modified. The lane never widens its own scope.
+        """
+        if not _AUTO_ACK_LANE_ENABLED:
+            return False, "lane_disabled"
+        n = len(target_files)
+        if n < _AUTO_ACK_MIN_FILES:
+            return False, "below_min_files"
+        if n > _AUTO_ACK_MAX_FILES:
+            return False, "above_max_files"
+        for f in target_files:
+            if not any(f.startswith(p) for p in _AUTO_ACK_ALLOWED_PREFIXES):
+                return False, "path_not_allowed"
+            f_lower = f.lower()
+            for frag in _AUTO_ACK_FORBIDDEN_FRAGMENTS:
+                if frag in f_lower:
+                    return False, "forbidden_fragment"
+        # FORBIDDEN_PATH check via the same global hook ToolExecutor uses.
+        # Fault-isolated: a missing/broken provider must not break the lane.
+        try:
+            from backend.core.ouroboros.governance.user_preference_memory import (
+                get_protected_path_provider,
+            )
+            provider = get_protected_path_provider()
+            if provider is not None:
+                forbidden_substrings = list(provider() or ())
+                for f in target_files:
+                    for sub in forbidden_substrings:
+                        if sub and sub in f:
+                            return False, "forbidden_user_pref"
+        except Exception:
+            logger.debug(
+                "OpportunityMinerSensor: forbidden-path provider check failed",
+                exc_info=True,
+            )
+        return True, "ok"
 
     async def _ingest_coalesced_batch(
         self,
@@ -770,6 +882,58 @@ class OpportunityMinerSensor:
             return []
 
         self._record_ingest_result(counters, result)
+
+        # Auto-ack lane: if the batch landed at pending_ack and the lane
+        # guards pass, rescue it via router.acknowledge(). The lane is
+        # gated on JARVIS_MINER_AUTO_ACK_LANE (default off) and a strict
+        # file count + path allowlist + forbidden-fragment check that
+        # bounds the bypass to coalesced batches that will route to
+        # APPROVAL_REQUIRED in the risk classifier (3+ files trips
+        # too_many_files; see Task #69 audit).
+        if result == "pending_ack":
+            lane_ok, lane_reason = self._check_auto_ack_lane(batch.target_files)
+            if lane_ok:
+                extra_evidence = {
+                    "auto_acked": True,
+                    "auto_ack_reason": "miner_graph_lane",
+                    "auto_ack_graph_id": batch.graph.graph_id,
+                    "auto_ack_file_count": len(batch.target_files),
+                }
+                try:
+                    rescued = await self._router.acknowledge(
+                        envelope.idempotency_key,
+                        extra_evidence=extra_evidence,
+                    )
+                except Exception:
+                    logger.exception(
+                        "OpportunityMinerSensor: auto_ack lane raised "
+                        "(graph=%s)", batch.graph.graph_id,
+                    )
+                    rescued = False
+                if rescued:
+                    counters.enqueued += 1
+                    counters.auto_acked += 1
+                    result = "enqueued"  # treat as success below
+                    logger.info(
+                        "OpportunityMinerSensor auto_ack lane=miner_graph "
+                        "graph_id=%s files=%d strategy=%s reason=%s",
+                        batch.graph.graph_id, len(batch.target_files),
+                        strategy_name, lane_reason,
+                    )
+                else:
+                    logger.info(
+                        "OpportunityMinerSensor auto_ack lane=miner_graph "
+                        "graph_id=%s files=%d strategy=%s status=reingest_failed",
+                        batch.graph.graph_id, len(batch.target_files),
+                        strategy_name,
+                    )
+            else:
+                logger.info(
+                    "OpportunityMinerSensor auto_ack lane=miner_graph "
+                    "graph_id=%s files=%d strategy=%s status=skipped reason=%s",
+                    batch.graph.graph_id, len(batch.target_files),
+                    strategy_name, lane_reason,
+                )
 
         if result not in ("enqueued", "pending_ack"):
             logger.info(
