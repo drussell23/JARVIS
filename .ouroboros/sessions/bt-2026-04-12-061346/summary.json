@@ -1,0 +1,34 @@
+{
+  "session_id": "bt-2026-04-12-061346",
+  "stop_reason": "unknown",
+  "duration_s": 61.5662260055542,
+  "stats": {
+    "attempted": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "queued": 0
+  },
+  "cost_total": 0.0,
+  "cost_breakdown": {},
+  "branch_stats": {
+    "commits": 0,
+    "files_changed": 0,
+    "insertions": 0,
+    "deletions": 0
+  },
+  "convergence_state": "INSUFFICIENT_DATA",
+  "convergence_slope": 0.0,
+  "convergence_r2": 0.0,
+  "top_sensors": [],
+  "top_techniques": [],
+  "operations": [],
+  "strategic_drift": {
+    "total_ops": 0,
+    "drifted_ops": 0,
+    "ratio": null,
+    "threshold_met": false,
+    "warning": false,
+    "status": "insufficient_data"
+  }
+}
