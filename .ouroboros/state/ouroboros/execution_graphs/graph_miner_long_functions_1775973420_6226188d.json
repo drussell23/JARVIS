@@ -1,0 +1,178 @@
+{
+  "cancelled_units": [],
+  "checksum": "1bbbb113db1515c4",
+  "completed_units": [],
+  "failed_units": [],
+  "graph": {
+    "causal_trace_id": "miner_long_functions_1775973420_6226188d:b446374a2640",
+    "concurrency_limit": 4,
+    "graph_id": "miner_long_functions_1775973420_6226188d",
+    "op_id": "op-57d04f8d-a132-40d8-a541-6e84a36a196b",
+    "plan_digest": "b446374a2640e50d414ad47c9adf35ff21bfa697e42afae1b1c556899595d40f",
+    "planner_id": "miner_graph_coalescer",
+    "schema_version": "miner_graph.1",
+    "units": [
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/ouroboros/governance/orchestrator.py to reduce long functions (composite=0.85)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/ouroboros/governance/orchestrator.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/ouroboros/governance/orchestrator.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_ouroboros_governance_orchestrator_p_aecb42de"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/vision/claude_vision_analyzer_main.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/vision/claude_vision_analyzer_main.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/vision/claude_vision_analyzer_main.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_vision_claude_vision_analyzer_main_py_c80e9f97"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/ouroboros/governance/governed_loop_service.py to reduce long functions (composite=0.85)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/ouroboros/governance/governed_loop_service.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/ouroboros/governance/governed_loop_service.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_ouroboros_governance_governed_loop__3a48d782"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/voice_unlock/metrics_database.py to reduce long functions (composite=0.87)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/voice_unlock/metrics_database.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/voice_unlock/metrics_database.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_voice_unlock_metrics_database_py_4a895a57"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/voice_unlock/intelligent_voice_unlock_service.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/voice_unlock/intelligent_voice_unlock_service.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/voice_unlock/intelligent_voice_unlock_service.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_voice_unlock_intelligent_voice_unlock_se_14e31a5a"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/intelligence/learning_database.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/intelligence/learning_database.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/intelligence/learning_database.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_intelligence_learning_database_py_71b28d17"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/core/ouroboros/architect/reasoning_agent.py to reduce long functions (composite=0.48)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/core/ouroboros/architect/reasoning_agent.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/core/ouroboros/architect/reasoning_agent.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_core_ouroboros_architect_reasoning_agent_d307bf71"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/vision/vision_reflex.py to reduce long functions (composite=0.62)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/vision/vision_reflex.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/vision/vision_reflex.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_vision_vision_reflex_py_a18a048d"
+      },
+      {
+        "acceptance_tests": [],
+        "barrier_id": "",
+        "dependency_ids": [],
+        "goal": "long_functions: refactor backend/agi_os/agi_os_coordinator.py to reduce long functions (composite=0.90)",
+        "max_attempts": 1,
+        "owned_paths": [
+          "backend/agi_os/agi_os_coordinator.py"
+        ],
+        "repo": "jarvis",
+        "target_files": [
+          "backend/agi_os/agi_os_coordinator.py"
+        ],
+        "timeout_s": 180.0,
+        "unit_id": "u_long_functions_backend_agi_os_agi_os_coordinator_py_1f11761e"
+      }
+    ]
+  },
+  "last_error": "",
+  "phase": "running",
+  "ready_units": [
+    "u_long_functions_backend_intelligence_learning_database_py_71b28d17",
+    "u_long_functions_backend_vision_claude_vision_analyzer_main_py_c80e9f97",
+    "u_long_functions_backend_vision_vision_reflex_py_a18a048d",
+    "u_long_functions_backend_voice_unlock_intelligent_voice_unlock_se_14e31a5a",
+    "u_long_functions_backend_voice_unlock_metrics_database_py_4a895a57"
+  ],
+  "results": {},
+  "running_units": [
+    "u_long_functions_backend_agi_os_agi_os_coordinator_py_1f11761e",
+    "u_long_functions_backend_core_ouroboros_architect_reasoning_agent_d307bf71",
+    "u_long_functions_backend_core_ouroboros_governance_governed_loop__3a48d782",
+    "u_long_functions_backend_core_ouroboros_governance_orchestrator_p_aecb42de"
+  ],
+  "updated_at_ns": 485273502958
+}
