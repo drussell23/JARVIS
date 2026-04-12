@@ -25,6 +25,25 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_S = float(os.environ.get("JARVIS_TODO_SCAN_INTERVAL_S", "86400"))
 
+# Trigger tag: a parenthesized suffix on any marker that elevates that single
+# item to high urgency, max confidence, and bypasses dedup. Used by battle
+# tests and the human seeding workflow to land a deterministic emission that
+# beats coalescing — the standard `normal`/`low` urgency markers (TODO,
+# DEPRECATED, OPTIMIZE, REFACTOR, NOTE) never emit on their own, so without
+# this tag a battle test cannot inject a TODO and have it survive the gate.
+#
+# Default tag is ``rsi-trigger`` and matches case-insensitively. Example:
+#   # TODO(rsi-trigger): scan this file
+#   # FIXME(rsi-trigger): seeded by bt-2026-04-12-005521
+# Override via JARVIS_TODO_SCANNER_TRIGGER_TAG. Set to an empty string to
+# disable the bypass entirely (production tightening).
+_TRIGGER_TAG = os.environ.get("JARVIS_TODO_SCANNER_TRIGGER_TAG", "rsi-trigger").strip()
+_TRIGGER_PATTERN = (
+    re.compile(r"\(\s*" + re.escape(_TRIGGER_TAG) + r"\s*\)", re.IGNORECASE)
+    if _TRIGGER_TAG
+    else None
+)
+
 # Markers to scan for, with priority weights
 _MARKERS: Dict[str, Tuple[str, float]] = {
     "FIXME":      ("high", 0.9),
@@ -38,8 +57,12 @@ _MARKERS: Dict[str, Tuple[str, float]] = {
     "NOTE":       ("low", 0.1),  # Low priority — informational only
 }
 
+# Marker pattern allows an optional parenthesized tag immediately after the
+# marker name. The tag itself is captured by the standalone _TRIGGER_PATTERN
+# scan on the body so we can detect the trigger anywhere in the comment text,
+# not just adjacent to the marker.
 _MARKER_PATTERN = re.compile(
-    r"#\s*(" + "|".join(_MARKERS.keys()) + r")\b[:\s]*(.*)",
+    r"#\s*(" + "|".join(_MARKERS.keys()) + r")\b(?:\([^)]*\))?[:\s]*(.*)",
     re.IGNORECASE,
 )
 
@@ -65,6 +88,32 @@ class TodoItem:
     urgency: str               # high, normal, low
     priority: float            # 0.0–1.0
     auto_resolvable: bool = False  # Can Ouroboros fix this?
+    trigger_tag: bool = False  # Battle-test seeded trigger — bypasses gate + dedup
+
+
+def _parse_marker_line(line: str) -> Optional[Tuple[str, str, str, float, bool]]:
+    """Parse one source line for a TODO marker.
+
+    Returns ``(marker, text, urgency, priority, has_trigger_tag)`` or
+    ``None`` if no marker is present. ``has_trigger_tag`` is True when the
+    line contains the trigger tag (default ``rsi-trigger``); when set, the
+    caller should elevate the item to high urgency / max priority and bypass
+    dedup so battle-test seeds always land.
+    """
+    match = _MARKER_PATTERN.search(line)
+    if not match:
+        return None
+    marker = match.group(1).upper()
+    text = match.group(2).strip()
+    urgency, priority = _MARKERS.get(marker, ("low", 0.1))
+
+    has_trigger = bool(_TRIGGER_PATTERN and _TRIGGER_PATTERN.search(line))
+    if has_trigger:
+        # Trigger tag wins regardless of base marker — even a bare TODO can
+        # pierce the high-urgency gate when explicitly seeded.
+        urgency = "high"
+        priority = 1.0
+    return marker, text, urgency, priority, has_trigger
 
 
 class TodoScannerSensor:
@@ -134,23 +183,22 @@ class TodoScannerSensor:
         try:
             content = py_file.read_text(errors="replace")
             for line_num, line in enumerate(content.split("\n"), 1):
-                match = _MARKER_PATTERN.search(line)
-                if match:
-                    marker = match.group(1).upper()
-                    text = match.group(2).strip()
-                    urgency, priority = _MARKERS.get(marker, ("low", 0.1))
-                    auto = self._is_auto_resolvable(marker, text)
-
-                    rel_path = str(py_file.relative_to(self._root))
-                    items.append(TodoItem(
-                        file_path=rel_path,
-                        line_number=line_num,
-                        marker=marker,
-                        text=text[:200],
-                        urgency=urgency,
-                        priority=priority,
-                        auto_resolvable=auto,
-                    ))
+                parsed = _parse_marker_line(line)
+                if parsed is None:
+                    continue
+                marker, text, urgency, priority, has_trigger = parsed
+                auto = self._is_auto_resolvable(marker, text)
+                rel_path = str(py_file.relative_to(self._root))
+                items.append(TodoItem(
+                    file_path=rel_path,
+                    line_number=line_num,
+                    marker=marker,
+                    text=text[:200],
+                    urgency=urgency,
+                    priority=priority,
+                    auto_resolvable=auto,
+                    trigger_tag=has_trigger,
+                ))
         except Exception:
             return items
 
@@ -191,23 +239,22 @@ class TodoScannerSensor:
                 try:
                     content = py_file.read_text(errors="replace")
                     for line_num, line in enumerate(content.split("\n"), 1):
-                        match = _MARKER_PATTERN.search(line)
-                        if match:
-                            marker = match.group(1).upper()
-                            text = match.group(2).strip()
-                            urgency, priority = _MARKERS.get(marker, ("low", 0.1))
-                            auto = self._is_auto_resolvable(marker, text)
-
-                            rel_path = str(py_file.relative_to(self._root))
-                            items.append(TodoItem(
-                                file_path=rel_path,
-                                line_number=line_num,
-                                marker=marker,
-                                text=text[:200],
-                                urgency=urgency,
-                                priority=priority,
-                                auto_resolvable=auto,
-                            ))
+                        parsed = _parse_marker_line(line)
+                        if parsed is None:
+                            continue
+                        marker, text, urgency, priority, has_trigger = parsed
+                        auto = self._is_auto_resolvable(marker, text)
+                        rel_path = str(py_file.relative_to(self._root))
+                        items.append(TodoItem(
+                            file_path=rel_path,
+                            line_number=line_num,
+                            marker=marker,
+                            text=text[:200],
+                            urgency=urgency,
+                            priority=priority,
+                            auto_resolvable=auto,
+                            trigger_tag=has_trigger,
+                        ))
                 except Exception:
                     pass
 
@@ -219,16 +266,30 @@ class TodoScannerSensor:
     # ------------------------------------------------------------------
 
     async def _emit_items(self, items: List[TodoItem]) -> int:
-        """Emit high-priority items as IntentEnvelopes. Returns count emitted."""
+        """Emit high-priority items as IntentEnvelopes. Returns count emitted.
+
+        Standard items must be ``high`` urgency to emit (FIXME, HACK, BUG, XXX).
+        Trigger-tagged items (``# TODO(rsi-trigger): ...``) bypass both the
+        urgency gate and the dedup set so battle-test seeds re-fire on every
+        scan even if the file/line is unchanged. Without the bypass, a seed
+        committed once would never be picked up by subsequent scans because
+        ``self._seen`` persists for the lifetime of the sensor.
+        """
         emitted = 0
+        trigger_count = 0
         for item in items:
-            if item.urgency not in ("high",):
+            if not item.trigger_tag and item.urgency not in ("high",):
                 continue
 
             dedup_key = f"{item.file_path}:{item.line_number}:{item.marker}"
-            if dedup_key in self._seen:
+            if not item.trigger_tag and dedup_key in self._seen:
                 continue
-            self._seen.add(dedup_key)
+            # Standard items get added to dedup; trigger items intentionally
+            # do NOT — every scan should re-emit the same seed.
+            if not item.trigger_tag:
+                self._seen.add(dedup_key)
+            else:
+                trigger_count += 1
 
             try:
                 envelope = make_envelope(
@@ -248,6 +309,7 @@ class TodoScannerSensor:
                         "text": item.text,
                         "auto_resolvable": item.auto_resolvable,
                         "sensor": "TodoScannerSensor",
+                        "trigger_tag": item.trigger_tag,
                     },
                     requires_human_ack=not item.auto_resolvable,
                 )
@@ -258,14 +320,15 @@ class TodoScannerSensor:
                 pass
 
         if items:
-            by_marker = {}
+            by_marker: Dict[str, int] = {}
             for item in items:
                 by_marker[item.marker] = by_marker.get(item.marker, 0) + 1
             logger.info(
-                "[TodoScanner] Found %d markers: %s (%d emitted)",
+                "[TodoScanner] Found %d markers: %s (%d emitted, %d trigger-tagged)",
                 len(items),
                 ", ".join(f"{k}={v}" for k, v in sorted(by_marker.items())),
                 emitted,
+                trigger_count,
             )
         return emitted
 
