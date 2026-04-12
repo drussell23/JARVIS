@@ -531,52 +531,13 @@ class OpportunityMinerSensor:
         )
 
         # Phase 1: Full filesystem scan + multi-dimensional analysis
-        analyses: List[_FileAnalysis] = []
-        scanned = 0
-        skipped_non_package = 0
-        errors = 0
-
-        for scan_path in self._scan_paths:
-            root = self._repo_root / scan_path
-            if not root.exists():
-                continue
-            for py_file in root.rglob("*.py"):
-                rel = str(py_file.relative_to(self._repo_root))
-
-                if not self._is_production_code(py_file, root):
-                    skipped_non_package += 1
-                    continue
-
-                scanned += 1
-                try:
-                    source = py_file.read_text(encoding="utf-8")
-                    tree = ast.parse(source)
-                except SyntaxError:
-                    errors += 1
-                    continue
-                except (OSError, UnicodeDecodeError):
-                    errors += 1
-                    continue
-
-                analysis = _analyze_file(rel, source, tree)
-                self._analysis_cache[rel] = analysis
-
-                # Strategy-specific threshold gate
-                value = getattr(analysis, sort_field, 0)
-                if sort_field == "cyclomatic_complexity" and value < self._threshold:
-                    continue
-                elif sort_field == "max_function_length" and value < 80:
-                    continue
-                elif sort_field == "cognitive_complexity" and value < 50:
-                    continue
-                elif sort_field == "duplicate_block_count" and value < 3:
-                    continue
-                elif sort_field == "import_fan_out" and value < 15:
-                    continue
-                elif sort_field == "todo_fixme_count" and value < 3:
-                    continue
-
-                analyses.append(analysis)
+        # Offloaded to a thread so rglob + ast.parse don't block the loop.
+        loop = asyncio.get_running_loop()
+        scanned, skipped_non_package, errors, analyses = await loop.run_in_executor(
+            None,
+            self._scan_files_sync,
+            sort_field,
+        )
 
         # Phase 2: Diverse candidate selection
         counters = _CycleCounters(mined=len(analyses))
@@ -707,6 +668,58 @@ class OpportunityMinerSensor:
     # ------------------------------------------------------------------
     # Internal helpers (shared between coalesced and per-file paths)
     # ------------------------------------------------------------------
+
+    def _scan_files_sync(
+        self, sort_field: str,
+    ) -> Tuple[int, int, int, List[_FileAnalysis]]:
+        """CPU-bound Phase 1 scan — runs in a thread via run_in_executor."""
+        analyses: List[_FileAnalysis] = []
+        scanned = 0
+        skipped_non_package = 0
+        errors = 0
+
+        for scan_path in self._scan_paths:
+            root = self._repo_root / scan_path
+            if not root.exists():
+                continue
+            for py_file in root.rglob("*.py"):
+                rel = str(py_file.relative_to(self._repo_root))
+
+                if not self._is_production_code(py_file, root):
+                    skipped_non_package += 1
+                    continue
+
+                scanned += 1
+                try:
+                    source = py_file.read_text(encoding="utf-8")
+                    tree = ast.parse(source)
+                except SyntaxError:
+                    errors += 1
+                    continue
+                except (OSError, UnicodeDecodeError):
+                    errors += 1
+                    continue
+
+                analysis = _analyze_file(rel, source, tree)
+                self._analysis_cache[rel] = analysis
+
+                value = getattr(analysis, sort_field, 0)
+                if sort_field == "cyclomatic_complexity" and value < self._threshold:
+                    continue
+                elif sort_field == "max_function_length" and value < 80:
+                    continue
+                elif sort_field == "cognitive_complexity" and value < 50:
+                    continue
+                elif sort_field == "duplicate_block_count" and value < 3:
+                    continue
+                elif sort_field == "import_fan_out" and value < 15:
+                    continue
+                elif sort_field == "todo_fixme_count" and value < 3:
+                    continue
+
+                analyses.append(analysis)
+
+        return scanned, skipped_non_package, errors, analyses
 
     def _prune_cooldowns(self) -> None:
         """Drop cooldown entries older than 2× cooldown window."""

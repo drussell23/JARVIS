@@ -150,25 +150,8 @@ class DocStalenessSensor:
 
     async def scan_once(self) -> List[DocFinding]:
         """Scan Python files for documentation gaps via AST analysis."""
-        findings: List[DocFinding] = []
-
-        for scan_path in self._scan_paths:
-            full_path = self._project_root / scan_path
-            if not full_path.exists():
-                continue
-
-            for py_file in full_path.rglob("*.py"):
-                # Skip test files, __pycache__, venv, migrations
-                rel = str(py_file.relative_to(self._project_root))
-                if any(skip in rel for skip in (
-                    "__pycache__", "venv/", "site-packages/",
-                    "test_", "_test.py", "migrations/",
-                )):
-                    continue
-
-                finding = self._analyze_file(py_file, rel)
-                if finding:
-                    findings.append(finding)
+        loop = asyncio.get_running_loop()
+        findings = await loop.run_in_executor(None, self._scan_files_sync)
 
         # Emit envelopes
         emitted = 0
@@ -207,6 +190,29 @@ class DocStalenessSensor:
                 "[DocSensor] Scan: %d undocumented modules, %d emitted",
                 len(findings), emitted,
             )
+        return findings
+
+    def _scan_files_sync(self) -> List[DocFinding]:
+        """CPU-bound scan — runs in a thread via run_in_executor."""
+        findings: List[DocFinding] = []
+
+        for scan_path in self._scan_paths:
+            full_path = self._project_root / scan_path
+            if not full_path.exists():
+                continue
+
+            for py_file in full_path.rglob("*.py"):
+                rel = str(py_file.relative_to(self._project_root))
+                if any(skip in rel for skip in (
+                    "__pycache__", "venv/", "site-packages/",
+                    "test_", "_test.py", "migrations/",
+                )):
+                    continue
+
+                finding = self._analyze_file(py_file, rel)
+                if finding:
+                    findings.append(finding)
+
         return findings
 
     # ------------------------------------------------------------------

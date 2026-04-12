@@ -225,6 +225,13 @@ class TodoScannerSensor:
 
     async def scan_once(self) -> List[TodoItem]:
         """Scan all Python files for TODO markers. Returns found items."""
+        loop = asyncio.get_running_loop()
+        items = await loop.run_in_executor(None, self._scan_files_sync)
+        await self._emit_items(items)
+        return items
+
+    def _scan_files_sync(self) -> List[TodoItem]:
+        """CPU-bound scan — runs in a thread via run_in_executor."""
         items: List[TodoItem] = []
 
         for scan_dir in _SCAN_DIRS:
@@ -258,7 +265,6 @@ class TodoScannerSensor:
                 except Exception:
                     pass
 
-        await self._emit_items(items)
         return items
 
     # ------------------------------------------------------------------

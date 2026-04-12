@@ -2651,9 +2651,20 @@ class GovernedLoopService:
             assert effective_primary is not None
             assert effective_fallback is not None
 
+            _pool_size = int(os.environ.get("JARVIS_BG_POOL_SIZE", "3"))
+            _fallback_concurrency = int(os.environ.get(
+                "JARVIS_FALLBACK_CONCURRENCY",
+                str(min(_pool_size, 4)),
+            ))
+            logger.info(
+                "[GovernedLoop] fallback_concurrency=%d (pool_size=%d, cap=4)",
+                _fallback_concurrency, _pool_size,
+            )
+
             self._generator = CandidateGenerator(
                 primary=effective_primary,
                 fallback=effective_fallback,
+                fallback_concurrency=_fallback_concurrency,
                 tier0=tier0,
                 ledger=self._ledger,
             )

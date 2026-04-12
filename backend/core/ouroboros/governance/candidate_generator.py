@@ -110,7 +110,7 @@ _MIN_VIABLE_FALLBACK_S = float(os.environ.get("OUROBOROS_MIN_VIABLE_FALLBACK_S",
 # get cut off mid-flight and the whole op fails to `all_providers_exhausted`.
 # Diagnosed in bt-2026-04-11-211131 (24x exhaustion, 0 commits).
 # This OVERRIDES the parent wall-clock deadline; the orchestrator's outer
-# `wait_for(_gen_timeout + 5)` is the absolute Iron Gate.
+# `wait_for(_gen_timeout + _OUTER_GATE_GRACE_S)` is the absolute Iron Gate.
 _FALLBACK_MIN_GUARANTEED_S = float(
     os.environ.get("OUROBOROS_FALLBACK_MIN_GUARANTEED_S", "90"),
 )
@@ -1639,8 +1639,9 @@ class CandidateGenerator:
         ``_parent_remaining``.  The post-acquire refresh guarantees at least
         ``_FALLBACK_MIN_GUARANTEED_S`` regardless of how long the wait was.
 
-        The orchestrator's outer ``wait_for(_gen_timeout + 5)`` is still the
-        absolute Iron Gate — that's why STANDARD route was bumped to 220s.
+        The orchestrator's outer ``wait_for(_gen_timeout + _OUTER_GATE_GRACE_S)``
+        is still the absolute Iron Gate — grace raised from 5s to 15s after
+        bt-2026-04-12-061609 diagnosed 129s Claude streams cut by 125s gate.
         """
         _pre_sem_remaining = self._remaining_seconds(deadline)
         _sem_t0 = time.monotonic()

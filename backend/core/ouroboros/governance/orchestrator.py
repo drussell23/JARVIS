@@ -103,6 +103,14 @@ logger = logging.getLogger("Ouroboros.Orchestrator")
 _CONSOLIDATION_BUFFER: list = []
 _CONSOLIDATION_THRESHOLD: int = 10
 
+# Grace period added to route-based _gen_timeout for the outer wait_for
+# Iron Gate.  The generator may internally refresh the fallback budget to
+# _FALLBACK_MIN_GUARANTEED_S (90s) even when the parent deadline is nearly
+# exhausted — 5s was too tight and caused 129s Claude streams to be cut
+# by the 125s outer gate (bt-2026-04-12-061609).  15s accommodates Tier 0
+# overhead + asyncio cancellation propagation delay on streaming responses.
+_OUTER_GATE_GRACE_S = float(os.environ.get("JARVIS_OUTER_GATE_GRACE_S", "15"))
+
 
 # ---------------------------------------------------------------------------
 # OrchestratorConfig
@@ -1863,7 +1871,7 @@ class GovernedOrchestrator:
                 # but asyncio.wait_for is the Iron Gate (Manifesto §6).
                 generation = await asyncio.wait_for(
                     self._generator.generate(ctx, deadline),
-                    timeout=_gen_timeout + 5.0,
+                    timeout=_gen_timeout + _OUTER_GATE_GRACE_S,
                 )
                 # Charge the CostGovernor with the actual generation cost.
                 # Non-positive costs (cache hits, fallback stubs) are a no-op.
@@ -2352,7 +2360,7 @@ class GovernedOrchestrator:
                                 _dem_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=220.0)
                                 generation = await asyncio.wait_for(
                                     self._generator.generate(ctx, _dem_deadline),
-                                    timeout=225.0,
+                                    timeout=220.0 + _OUTER_GATE_GRACE_S,
                                 )
                                 # Charge demotion call cost (may be zero).
                                 try:
