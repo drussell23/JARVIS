@@ -1825,15 +1825,21 @@ Only (8) was actually the unblocker. (1)–(7) were necessary but not sufficient
 
 | Dimension | Grade | Rationale |
 |-----------|-------|-----------|
-| Architecture | A | 11-phase pipeline, 3-tier providers, consciousness layer, Iron Gate |
-| Sensor/Discovery | A- | 16 sensors, trigger-tags, event-driven. Slightly noisy |
-| Generation | B+ | Extended thinking, Venom tool loop, exploration-first, route-aware budgets |
-| Validation/Apply | D | Test runner broken, never lands patches |
-| Self-repair | B | L2 exists and wired, never fires because VALIDATE never passes |
-| Observability | A- | CommProtocol, SerpentFlow, debug.log. Missing: thinking visibility |
-| UX | B- | SerpentFlow functional but not interactive. No streaming tokens |
-| Cost efficiency | A | DW routing, prompt caching, route-aware thinking. $0.50 runs 7+ ops |
-| **Overall** | **B+** | Architecturally A-tier, execution B-tier, blocked by test runner |
+| Architecture | A | 11-phase pipeline, clean FSM, 3-tier providers, consciousness layer |
+| Autonomy | A- | 16 sensors, proactive signal discovery, trigger-tags, event-driven |
+| Reliability | C+ | 30-50% provider exhaustion rate still wastes budget and blocks ops |
+| UX/Observability | B+ | SerpentFlow + LiveDashboard, CommProtocol, debug.log |
+| Testing | B | 81 governance tests, but VALIDATE was broken until commit 22f297d |
+| Cost Efficiency | B- | DW Tier 0 works but exhaustion wastes budget on failed cascades |
+| Safety | A- | Iron Gate (exploration-first + ASCII), 4-tier risk, protected branches |
+| Documentation | B+ | CLAUDE.md comprehensive, battle test logs with phase traces |
+| **Overall** | **B+** | Architecturally A-tier, execution improving, test runner fix unblocks pipeline |
 
-**The path from B+ to A-:** Fix test runner -> VALIDATE passes -> APPLY fires -> L2 repair engages -> AutoCommitter lands patches.
+### Path from B+ to A-
+
+1. Fix test runner (done -- commit 22f297d)
+2. Reduce provider exhaustion rate below 10% (budget geometry + preemption)
+3. Add incremental diff apply (line-level patches instead of full file replacement)
+4. Persist session lessons across sessions (wire to UserPreferenceMemory)
+5. Add rate-limited sensor priority (separate IMMEDIATE/BACKGROUND queues)
 
