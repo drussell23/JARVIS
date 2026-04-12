@@ -1498,8 +1498,8 @@ class CandidateGenerator:
 
         if state is FailbackState.PRIMARY_READY:
             try:
-                remaining = self._remaining_seconds(deadline)
                 async with self._primary_sem:
+                    remaining = self._remaining_seconds(deadline)
                     return await asyncio.wait_for(
                         self._primary.plan(prompt, deadline),
                         timeout=remaining,
@@ -1512,8 +1512,21 @@ class CandidateGenerator:
                 )
 
         # FALLBACK_ACTIVE, PRIMARY_DEGRADED, or primary plan() just failed
-        remaining = self._remaining_seconds(deadline)
+        _sem_t0 = time.monotonic()
         async with self._fallback_sem:
+            _sem_wait_s = time.monotonic() - _sem_t0
+            _parent_remaining = self._remaining_seconds(deadline)
+            _budget_target = max(_parent_remaining, _FALLBACK_MIN_GUARANTEED_S)
+            remaining = min(_budget_target, self._FALLBACK_MAX_TIMEOUT_S)
+            if remaining > _parent_remaining + 1.0:
+                deadline = datetime.now(tz=timezone.utc) + timedelta(
+                    seconds=remaining,
+                )
+            if _sem_wait_s > 1.0:
+                logger.info(
+                    "[CandidateGenerator] Plan fallback sem_wait=%.1fs "
+                    "(budget=%.1fs)", _sem_wait_s, remaining,
+                )
             return await asyncio.wait_for(
                 self._fallback.plan(prompt, deadline),
                 timeout=remaining,
@@ -1593,14 +1606,14 @@ class CandidateGenerator:
         remaining time, guaranteeing ``_FALLBACK_MIN_RESERVE_S`` for the
         fallback provider if the primary hangs until timeout.
         """
-        remaining = self._remaining_seconds(deadline)
-        primary_budget = self._compute_primary_budget(remaining)
-        logger.debug(
-            "[CandidateGenerator] Primary budget: %.1fs of %.1fs remaining "
-            "(fallback reserve: %.1fs)",
-            primary_budget, remaining, remaining - primary_budget,
-        )
         async with self._primary_sem:
+            remaining = self._remaining_seconds(deadline)
+            primary_budget = self._compute_primary_budget(remaining)
+            logger.debug(
+                "[CandidateGenerator] Primary budget: %.1fs of %.1fs remaining "
+                "(fallback reserve: %.1fs)",
+                primary_budget, remaining, remaining - primary_budget,
+            )
             return await asyncio.wait_for(
                 self._primary.generate(context, deadline),
                 timeout=primary_budget,
@@ -1621,58 +1634,66 @@ class CandidateGenerator:
     ) -> GenerationResult:
         """Call fallback provider with concurrency and deadline enforcement.
 
-        REFRESHES the deadline if the parent budget is depleted: when Tier 0
-        burns most of the parent's wall-clock window, this method grants the
-        fallback its own ``_FALLBACK_MIN_GUARANTEED_S`` window so legitimate
-        Claude doc-gen / patch streams (60-100s) aren't cut off mid-flight.
+        Budget computation happens AFTER acquiring ``_fallback_sem`` so that
+        time spent queued behind other ops doesn't silently zero out
+        ``_parent_remaining``.  The post-acquire refresh guarantees at least
+        ``_FALLBACK_MIN_GUARANTEED_S`` regardless of how long the wait was.
 
         The orchestrator's outer ``wait_for(_gen_timeout + 5)`` is still the
         absolute Iron Gate — that's why STANDARD route was bumped to 220s.
         """
+        _pre_sem_remaining = self._remaining_seconds(deadline)
+        _sem_t0 = time.monotonic()
+
         try:
-            _parent_remaining = self._remaining_seconds(deadline)
-            # Refresh: guarantee at least _FALLBACK_MIN_GUARANTEED_S when the
-            # parent deadline is *depleted but alive* (Tier 0 burned most of
-            # the window but didn't break the wall clock). When the parent
-            # deadline has fully expired (remaining == 0.0), preserve the
-            # original fast-fail semantics — an expired deadline signals a
-            # stuck worker or runaway loop, and the orchestrator's outer
-            # `wait_for(_gen_timeout + 5)` should be the absolute Iron Gate.
-            if _parent_remaining > 0.0:
-                _budget_target = max(_parent_remaining, _FALLBACK_MIN_GUARANTEED_S)
-            else:
-                _budget_target = _parent_remaining
-            remaining = min(_budget_target, self._FALLBACK_MAX_TIMEOUT_S)
-            _refreshed = remaining > _parent_remaining + 1.0
-            if remaining < _MIN_VIABLE_FALLBACK_S:
-                logger.warning(
-                    "[CandidateGenerator] Fallback skipped — only %.1fs "
-                    "remaining (need >= %.0fs). Tier 0 consumed too much budget.",
-                    remaining, _MIN_VIABLE_FALLBACK_S,
-                )
-                raise RuntimeError(
-                    f"all_providers_exhausted:fallback_budget_starved_{remaining:.0f}s"
-                )
-            if _refreshed:
-                logger.info(
-                    "[CandidateGenerator] Fallback: budget=%.1fs REFRESHED "
-                    "(parent=%.1fs depleted, guaranteed_min=%.0fs, cap=%.0fs)",
-                    remaining, _parent_remaining,
-                    _FALLBACK_MIN_GUARANTEED_S, self._FALLBACK_MAX_TIMEOUT_S,
-                )
-                # Build a fresh deadline so downstream provider code (which
-                # also derives timeouts from `deadline - now`) sees the
-                # refreshed budget. Without this, providers.py line 4332
-                # would still compute `timeout_s = remaining_until_old_deadline`.
-                deadline = datetime.now(tz=timezone.utc) + timedelta(
-                    seconds=remaining,
-                )
-            else:
-                logger.info(
-                    "[CandidateGenerator] Fallback: budget=%.1fs (cap=%.0fs)",
-                    remaining, self._FALLBACK_MAX_TIMEOUT_S,
-                )
             async with self._fallback_sem:
+                _sem_wait_s = time.monotonic() - _sem_t0
+                _parent_remaining = self._remaining_seconds(deadline)
+
+                if _sem_wait_s > 1.0:
+                    logger.info(
+                        "[CandidateGenerator] Fallback sem_wait=%.1fs "
+                        "(pre=%.1fs → post=%.1fs)",
+                        _sem_wait_s, _pre_sem_remaining, _parent_remaining,
+                    )
+
+                # Post-acquire refresh: guarantee _FALLBACK_MIN_GUARANTEED_S
+                # even when the parent deadline burned during sem wait or
+                # Tier 0 consumed most of the window.  The orchestrator's
+                # outer wait_for is the absolute Iron Gate.
+                _budget_target = max(_parent_remaining, _FALLBACK_MIN_GUARANTEED_S)
+                remaining = min(_budget_target, self._FALLBACK_MAX_TIMEOUT_S)
+                _refreshed = remaining > _parent_remaining + 1.0
+
+                if remaining < _MIN_VIABLE_FALLBACK_S:
+                    logger.warning(
+                        "[CandidateGenerator] Fallback skipped — only %.1fs "
+                        "remaining (need >= %.0fs, sem_wait=%.1fs).",
+                        remaining, _MIN_VIABLE_FALLBACK_S, _sem_wait_s,
+                    )
+                    raise RuntimeError(
+                        f"all_providers_exhausted:fallback_budget_starved_{remaining:.0f}s"
+                    )
+
+                if _refreshed:
+                    logger.info(
+                        "[CandidateGenerator] Fallback: budget=%.1fs REFRESHED "
+                        "(parent=%.1fs, guaranteed_min=%.0fs, cap=%.0fs, "
+                        "sem_wait=%.1fs)",
+                        remaining, _parent_remaining,
+                        _FALLBACK_MIN_GUARANTEED_S, self._FALLBACK_MAX_TIMEOUT_S,
+                        _sem_wait_s,
+                    )
+                    deadline = datetime.now(tz=timezone.utc) + timedelta(
+                        seconds=remaining,
+                    )
+                else:
+                    logger.info(
+                        "[CandidateGenerator] Fallback: budget=%.1fs "
+                        "(cap=%.0fs, sem_wait=%.1fs)",
+                        remaining, self._FALLBACK_MAX_TIMEOUT_S, _sem_wait_s,
+                    )
+
                 return await asyncio.wait_for(
                     self._fallback.generate(context, deadline),
                     timeout=remaining,
@@ -1680,8 +1701,10 @@ class CandidateGenerator:
         except (Exception, asyncio.CancelledError) as exc:
             mode = FailbackStateMachine.classify_exception(exc)
             logger.error(
-                "[CandidateGenerator] Fallback also failed (mode=%s, %s: %s)",
+                "[CandidateGenerator] Fallback also failed (mode=%s, %s: %s, "
+                "sem_wait=%.1fs)",
                 mode.name, type(exc).__name__, exc,
+                time.monotonic() - _sem_t0,
             )
             self.fsm.record_fallback_failure(mode=mode)
             raise RuntimeError("all_providers_exhausted") from exc

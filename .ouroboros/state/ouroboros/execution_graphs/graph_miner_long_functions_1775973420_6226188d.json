@@ -1,6 +1,6 @@
 {
   "cancelled_units": [],
-  "checksum": "1bbbb113db1515c4",
+  "checksum": "7a0da6049ade63dd",
   "completed_units": [],
   "failed_units": [],
   "graph": {
@@ -158,21 +158,10 @@
       }
     ]
   },
-  "last_error": "",
-  "phase": "running",
-  "ready_units": [
-    "u_long_functions_backend_intelligence_learning_database_py_71b28d17",
-    "u_long_functions_backend_vision_claude_vision_analyzer_main_py_c80e9f97",
-    "u_long_functions_backend_vision_vision_reflex_py_a18a048d",
-    "u_long_functions_backend_voice_unlock_intelligent_voice_unlock_se_14e31a5a",
-    "u_long_functions_backend_voice_unlock_metrics_database_py_4a895a57"
-  ],
+  "last_error": "graph_cancelled",
+  "phase": "cancelled",
+  "ready_units": [],
   "results": {},
-  "running_units": [
-    "u_long_functions_backend_agi_os_agi_os_coordinator_py_1f11761e",
-    "u_long_functions_backend_core_ouroboros_architect_reasoning_agent_d307bf71",
-    "u_long_functions_backend_core_ouroboros_governance_governed_loop__3a48d782",
-    "u_long_functions_backend_core_ouroboros_governance_orchestrator_p_aecb42de"
-  ],
-  "updated_at_ns": 485273502958
+  "running_units": [],
+  "updated_at_ns": 738717053708
 }
