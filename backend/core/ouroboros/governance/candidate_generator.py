@@ -749,6 +749,7 @@ class CandidateGenerator:
         tier0: Optional[Any] = None,  # DoublewordProvider (batch, async)
         ledger: Optional[Any] = None,  # OperationLedger for batch traceability
         latency_tracker: Optional[DwLatencyTracker] = None,
+        exhaustion_watcher: Optional[Any] = None,  # ProviderExhaustionWatcher
     ) -> None:
         self._primary = primary
         self._fallback = fallback
@@ -758,6 +759,12 @@ class CandidateGenerator:
         self._fallback_concurrency = fallback_concurrency
         self._fallback_sem = asyncio.Semaphore(fallback_concurrency)
         self.fsm = FailbackStateMachine()
+        # HIBERNATION_MODE step 5: optional watcher that counts
+        # consecutive all_providers_exhausted raises and transitions
+        # the SupervisorOuroborosController into HIBERNATION at the
+        # configured threshold. Kept structural/optional so unit tests
+        # of CandidateGenerator don't need to build a controller.
+        self._exhaustion_watcher = exhaustion_watcher
         # Manifesto §5: rolling p95 DW RT latency → dynamic Tier 0 budget.
         # Cold endpoints get full ceiling, hot endpoints dial down aggressively.
         self._latency_tracker = latency_tracker or get_default_tracker()
@@ -790,6 +797,11 @@ class CandidateGenerator:
     ) -> GenerationResult:
         """Generate candidate code changes, with automatic failover.
 
+        Thin wrapper around :meth:`_generate_dispatch` that notifies
+        the optional :class:`ProviderExhaustionWatcher` on the way out
+        so the watcher can flip the controller into HIBERNATION once
+        exhaustion events cross the configured threshold.
+
         Parameters
         ----------
         context:
@@ -808,6 +820,47 @@ class CandidateGenerator:
             If all providers are exhausted (``"all_providers_exhausted"``).
         asyncio.TimeoutError
             If the deadline is already past and no provider can be tried.
+        """
+        try:
+            result = await self._generate_dispatch(context, deadline)
+        except RuntimeError as exc:
+            if (
+                self._exhaustion_watcher is not None
+                and "all_providers_exhausted" in str(exc)
+            ):
+                try:
+                    await self._exhaustion_watcher.record_exhaustion(
+                        reason=str(exc),
+                    )
+                except Exception:
+                    logger.debug(
+                        "[CandidateGenerator] exhaustion_watcher "
+                        "record_exhaustion failed",
+                        exc_info=True,
+                    )
+            raise
+        else:
+            if self._exhaustion_watcher is not None:
+                try:
+                    await self._exhaustion_watcher.record_success()
+                except Exception:
+                    logger.debug(
+                        "[CandidateGenerator] exhaustion_watcher "
+                        "record_success failed",
+                        exc_info=True,
+                    )
+            return result
+
+    async def _generate_dispatch(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+    ) -> GenerationResult:
+        """Internal dispatch — the original body of :meth:`generate`.
+
+        Route-based dispatch with Tier 0 → fallback cascade. This is
+        the hot path; the public ``generate()`` above wraps it only to
+        observe exhaustion and success signals.
         """
         # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
         _provider_route = getattr(context, "provider_route", "") or "standard"
