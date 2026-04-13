@@ -745,3 +745,290 @@ class TestStrategicMemoryPromptBlock:
         strategic_pos = prompt.index("## Strategic Memory")
         snapshot_pos = prompt.index("## Source Snapshot")
         assert sys_ctx_pos < strategic_pos < snapshot_pos
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 Step 3B — Provider state hoist acceptance tests
+# ---------------------------------------------------------------------------
+
+
+class TestProviderStateUnquarantine:
+    """Verify ``JARVIS_UNQUARANTINE_PROVIDERS`` routes provider state
+    through the process-lifetime singletons in ``_governance_state``.
+
+    The three providers (Claude, Prime, DoubleWord) each maintain
+    reload-hostile state — HTTP clients with open connection pools,
+    daily spend counters, cascade telemetry ring buffers, aiohttp
+    sessions — that ``importlib.reload()`` on the provider module
+    would otherwise drop on the floor. This class mirrors
+    ``TestGeneratorStateUnquarantine`` from ``test_candidate_generator.py``
+    and locks in the two-path contract: fresh per-instance state when
+    the flag is off, singleton-shared state when it is on.
+    """
+
+    def _reset_singletons(self) -> None:
+        """Clear every provider state singleton.
+
+        Global singletons leak across tests because they live in a
+        module-level dict — every test in this class must start clean
+        or a sibling test's Claude client would still be wired up.
+        """
+        from backend.core.ouroboros.governance import _governance_state
+        _governance_state.reset_for_tests()
+
+    # ------------------------------------------------------------------
+    # ClaudeProvider
+    # ------------------------------------------------------------------
+
+    def test_claude_flag_off_mints_fresh_state(self, monkeypatch):
+        """Default path: two ClaudeProviders get independent state.
+
+        Incrementing the client generation on one instance must not
+        bleed into a sibling — proves the legacy per-instance
+        behavior is preserved when the un-quarantine flag is off.
+        """
+        monkeypatch.delenv("JARVIS_UNQUARANTINE_PROVIDERS", raising=False)
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+
+        a = ClaudeProvider(api_key="test-a")
+        b = ClaudeProvider(api_key="test-b")
+
+        assert a._state is not b._state
+        assert a._state.counters is not b._state.counters
+        a._client_generation += 5
+        a._daily_spend += 1.25
+        assert b._client_generation == 0
+        assert b._daily_spend == 0.0
+
+    def test_claude_flag_on_shares_singleton(self, monkeypatch):
+        """Un-quarantine path: Claude instances share one state blob.
+
+        Mutating cascade counters or injecting a fake client on the
+        first instance must be visible on every subsequent instance —
+        this is the whole point of the hoist.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+
+        a = ClaudeProvider(api_key="test-a")
+        a._client = "fake-anthropic-client"
+        a._client_generation = 3
+        a._daily_spend = 0.85
+        a._recycle_events.append({"reason": "seed", "gen": 3})
+
+        b = ClaudeProvider(api_key="test-b")
+        assert b._state is a._state
+        assert b._client == "fake-anthropic-client"
+        assert b._client_generation == 3
+        assert b._daily_spend == 0.85
+        assert b._recycle_events[-1] == {"reason": "seed", "gen": 3}
+
+    def test_claude_setter_prevents_shadow_on_client_rebind(self, monkeypatch):
+        """Derek's critical invariant: ``self._client = None`` must
+        route through the setter into ``_state.client``, NOT plant a
+        real instance attribute on ``self`` that shadows the descriptor.
+
+        If the setter is missing, this test fails because ``b._client``
+        would still read the singleton while ``a._client`` would be the
+        stale ``None`` alias — exactly the split-brain the property
+        pair exists to prevent.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+
+        a = ClaudeProvider(api_key="test-a")
+        a._client = "client-v1"
+        b = ClaudeProvider(api_key="test-b")
+        assert b._client == "client-v1"
+
+        # Here's the shadowing hazard: a plain getter-only @property
+        # would let this write land on a.__dict__ and leave
+        # a._state.client untouched. With the setter, it routes.
+        a._client = None
+        assert a._state.client is None
+        assert b._client is None  # b sees the same state
+        # And a._client reads back from state, not from any shadow.
+        assert a._client is None
+        assert "_client" not in a.__dict__
+
+    def test_claude_recycle_client_preserves_state_identity(self, monkeypatch):
+        """``_recycle_client`` reassigns ``self._client = None`` and
+        truncates ring buffers via slice rebind. Every mutation must
+        land on the shared state, not drift into instance shadows.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+
+        p = ClaudeProvider(api_key="test")
+        p._client = "client-before"
+        new_gen = p._recycle_client("unit_test_trigger")
+        assert new_gen == 1
+        assert p._state.client is None
+        assert p._state.counters.client_generation == 1
+        assert p._state.recycle_events[-1]["reason"] == "unit_test_trigger"
+
+    # ------------------------------------------------------------------
+    # PrimeProvider
+    # ------------------------------------------------------------------
+
+    def test_prime_flag_on_first_wins_semantics(self, monkeypatch):
+        """PrimeProvider gets first-wins semantics on the singleton
+        path: the second instance's ``prime_client`` param is ignored
+        because the singleton already holds a live client handle from
+        the pre-reload incarnation. This mirrors ``get_generator_state``
+        first-call-wins.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+
+        first = PrimeProvider(prime_client="client-A")
+        second = PrimeProvider(prime_client="client-B")
+        assert first._state is second._state
+        assert first._client == "client-A"
+        assert second._client == "client-A"  # B was ignored — first wins
+
+    def test_prime_flag_off_each_instance_gets_its_own_client(self, monkeypatch):
+        """Legacy path: every PrimeProvider binds to the constructor
+        argument, no singleton sharing."""
+        monkeypatch.delenv("JARVIS_UNQUARANTINE_PROVIDERS", raising=False)
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+
+        first = PrimeProvider(prime_client="client-A")
+        second = PrimeProvider(prime_client="client-B")
+        assert first._state is not second._state
+        assert first._client == "client-A"
+        assert second._client == "client-B"
+
+    # ------------------------------------------------------------------
+    # DoubleWordProvider
+    # ------------------------------------------------------------------
+
+    def test_doubleword_flag_on_shares_session_and_stats(self, monkeypatch):
+        """aiohttp session, cumulative stats, and counters flow through
+        the shared singleton when the flag is on.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.doubleword_provider import (
+            DoublewordProvider,
+        )
+
+        a = DoublewordProvider(api_key="test-a")
+        a._session = "fake-aiohttp-session"
+        a._daily_spend = 2.50
+        a._last_error_status = 429
+        a._stats.total_batches += 7
+
+        b = DoublewordProvider(api_key="test-b")
+        assert b._state is a._state
+        assert b._session == "fake-aiohttp-session"
+        assert b._daily_spend == 2.50
+        assert b._last_error_status == 429
+        assert b._stats.total_batches == 7
+
+    def test_doubleword_flag_off_mints_fresh_state(self, monkeypatch):
+        """Legacy path: DoubleWord instances get independent state."""
+        monkeypatch.delenv("JARVIS_UNQUARANTINE_PROVIDERS", raising=False)
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.doubleword_provider import (
+            DoublewordProvider,
+        )
+
+        a = DoublewordProvider(api_key="test-a")
+        b = DoublewordProvider(api_key="test-b")
+        assert a._state is not b._state
+        a._daily_spend += 3.14
+        a._stats.total_batches += 1
+        assert b._daily_spend == 0.0
+        assert b._stats.total_batches == 0
+
+    def test_doubleword_session_rebind_goes_through_state(self, monkeypatch):
+        """Critical: ``self._session = aiohttp.ClientSession(...)``
+        in ``_get_session`` must land in ``_state.session``, not on a
+        shadow instance attribute. Replays the split-brain check from
+        the Claude tests but against DoubleWord's setter.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+        from backend.core.ouroboros.governance.doubleword_provider import (
+            DoublewordProvider,
+        )
+
+        a = DoublewordProvider(api_key="test-a")
+        a._session = "session-v1"
+        b = DoublewordProvider(api_key="test-b")
+        assert b._session == "session-v1"
+
+        a._session = None
+        assert a._state.session is None
+        assert b._session is None
+        assert "_session" not in a.__dict__
+
+    # ------------------------------------------------------------------
+    # importlib.reload acceptance test
+    # ------------------------------------------------------------------
+
+    def test_reload_providers_preserves_claude_client_and_counters(
+        self, monkeypatch
+    ):
+        """The acceptance test for Phase 1 Step 3B (Claude arm).
+
+        Build a ClaudeProvider, inject a fake client and mutate
+        counters, then ``importlib.reload(providers)``. Rebuilding
+        ClaudeProvider after the reload must observe the same client
+        identity and the same counter values — proving the reload did
+        not discard live state.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+
+        import importlib
+        from backend.core.ouroboros.governance import providers
+
+        before = providers.ClaudeProvider(api_key="pre-reload")
+        before._client = "live-anthropic-client"
+        before._client_generation = 9
+        before._daily_spend = 4.42
+        before._recycle_events.append({"reason": "warmup", "gen": 9})
+
+        reloaded = importlib.reload(providers)
+
+        after = reloaded.ClaudeProvider(api_key="post-reload")
+        assert after._client == "live-anthropic-client"
+        assert after._client_generation == 9
+        assert after._daily_spend == 4.42
+        assert after._recycle_events[-1] == {"reason": "warmup", "gen": 9}
+        assert after._state is before._state
+
+    def test_reload_doubleword_preserves_session_and_stats(self, monkeypatch):
+        """The acceptance test for Phase 1 Step 3B (DoubleWord arm).
+
+        Same shape as the Claude reload test — verifies the DoubleWord
+        state path survives ``importlib.reload(doubleword_provider)``.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+
+        import importlib
+        from backend.core.ouroboros.governance import doubleword_provider
+
+        before = doubleword_provider.DoublewordProvider(api_key="pre-reload")
+        before._session = "live-aiohttp-session"
+        before._daily_spend = 1.23
+        before._last_error_status = 503
+        before._stats.total_batches += 4
+
+        reloaded = importlib.reload(doubleword_provider)
+
+        after = reloaded.DoublewordProvider(api_key="post-reload")
+        assert after._session == "live-aiohttp-session"
+        assert after._daily_spend == 1.23
+        assert after._last_error_status == 503
+        assert after._stats.total_batches == 4
+        assert after._state is before._state

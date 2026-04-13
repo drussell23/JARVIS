@@ -172,10 +172,27 @@ class DoublewordProvider:
         self._max_tokens = max_tokens
         self._repo_root = repo_root or Path(".")
         self._repo_roots = repo_roots or {}
-        self._stats = DoublewordStats()
-        self._session: Optional[Any] = None  # aiohttp.ClientSession (lazy)
+        # Phase 1 Step 3B — state hoist. aiohttp session, cumulative
+        # stats, spend tracking, last-error-status, and stream activity
+        # timestamps all live on a ``DoubleWordProviderState`` routed
+        # through the process-lifetime singleton under
+        # ``JARVIS_UNQUARANTINE_PROVIDERS=true``. The legacy path mints
+        # a fresh state per instance — behavior is bit-for-bit
+        # identical to the pre-hoist version.
+        from ._governance_state import (
+            DoubleWordProviderState,
+            get_doubleword_provider_state,
+            unquarantine_providers_enabled,
+        )
+        if unquarantine_providers_enabled():
+            self._state = get_doubleword_provider_state()
+        else:
+            self._state = DoubleWordProviderState.fresh()
+        # ``_stats`` is mutated in place (``self._stats.total_batches += 1``)
+        # and never rebound, so an alias onto the state dataclass is
+        # alias-safe — no property indirection needed.
+        self._stats = self._state.stats
         self._rate_limiter = rate_limiter
-        self._last_error_status: int = 0  # HTTP status from last failure (0 = non-HTTP)
         self._tool_loop = tool_loop
         self._batch_registry = batch_registry
         # Real-time mode uses /v1/chat/completions with SSE streaming —
@@ -191,10 +208,56 @@ class DoublewordProvider:
         # Cost gating (matches ClaudeProvider pattern)
         self._max_cost_per_op = max_cost_per_op
         self._daily_budget = daily_budget
-        self._daily_spend: float = 0.0
-        self._budget_reset_date = time.strftime("%Y-%m-%d", time.gmtime())
         self._mcp_client: Optional[Any] = None  # Injected by GLS for MCP tool forwarding (Gap #7)
-        self._last_chunk_at: float = 0.0  # monotonic timestamp of last SSE chunk (stream activity tracking)
+
+    # ------------------------------------------------------------------
+    # Hoisted state accessors (Phase 1 Step 3B)
+    # ------------------------------------------------------------------
+    # Every rebound field on ``DoubleWordProviderState`` gets paired
+    # getter/setter descriptors so assignments like
+    # ``self._session = aiohttp.ClientSession(...)`` on reload-surviving
+    # instances can't plant a real instance attribute and drift from
+    # ``self._state.session``.
+
+    @property
+    def _session(self) -> Any:
+        return self._state.session
+
+    @_session.setter
+    def _session(self, value: Any) -> None:
+        self._state.session = value
+
+    @property
+    def _daily_spend(self) -> float:
+        return self._state.counters.daily_spend
+
+    @_daily_spend.setter
+    def _daily_spend(self, value: float) -> None:
+        self._state.counters.daily_spend = value
+
+    @property
+    def _budget_reset_date(self) -> str:
+        return self._state.counters.budget_reset_date
+
+    @_budget_reset_date.setter
+    def _budget_reset_date(self, value: str) -> None:
+        self._state.counters.budget_reset_date = value
+
+    @property
+    def _last_error_status(self) -> int:
+        return self._state.counters.last_error_status
+
+    @_last_error_status.setter
+    def _last_error_status(self, value: int) -> None:
+        self._state.counters.last_error_status = value
+
+    @property
+    def _last_chunk_at(self) -> float:
+        return self._state.counters.last_chunk_at
+
+    @_last_chunk_at.setter
+    def _last_chunk_at(self, value: float) -> None:
+        self._state.counters.last_chunk_at = value
 
     @property
     def provider_name(self) -> str:

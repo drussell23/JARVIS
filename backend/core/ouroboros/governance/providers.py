@@ -2924,13 +2924,40 @@ class PrimeProvider:
         tool_loop: Optional[Any] = None,  # Optional[ToolLoopCoordinator]
         mcp_client: Optional[Any] = None,  # Optional[GovernanceMCPClient]
     ) -> None:
-        self._client = prime_client
+        # Phase 1 Step 3B — state hoist. PrimeProvider is nearly
+        # stateless today (only the injected ``PrimeClient`` reference
+        # matters), but we route it through the singleton for symmetry
+        # with Claude/DW so a future recycle or counter addition lands
+        # on an already-hoisted state root without a migration.
+        from ._governance_state import (
+            PrimeProviderState,
+            get_prime_provider_state,
+            unquarantine_providers_enabled,
+        )
+        if unquarantine_providers_enabled():
+            self._state = get_prime_provider_state()
+        else:
+            self._state = PrimeProviderState.fresh()
+        # First-wins semantics on the singleton path — a post-reload
+        # construction inherits the already-hoisted PrimeClient so any
+        # in-flight connection state is preserved. The legacy path
+        # always sets (``fresh()`` returns client=None).
+        if self._state.client is None:
+            self._state.client = prime_client
         self._max_tokens = max_tokens
         self._repo_root = repo_root
         self._repo_roots = repo_roots
         self._tools_enabled = tools_enabled or (tool_loop is not None)
         self._tool_loop = tool_loop
         self._mcp_client = mcp_client
+
+    @property
+    def _client(self) -> Any:
+        return self._state.client
+
+    @_client.setter
+    def _client(self, value: Any) -> None:
+        self._state.client = value
 
     @property
     def provider_name(self) -> str:
@@ -3570,21 +3597,23 @@ class ClaudeProvider:
         self._max_tokens = min(max_tokens, self._output_ceiling)
         self._max_cost_per_op = max_cost_per_op
         self._daily_budget = daily_budget
-        self._daily_spend: float = 0.0
-        self._budget_reset_date = datetime.now(tz=timezone.utc).date()
-        self._client: Any = None  # Lazy init
-        # Client recycling state (Task #4 — cascade hardening).
-        # ``_client_generation`` increments every time the client is
-        # recycled; included in all cascade log lines so operators can
-        # correlate "new pool started" with downstream latency shifts.
-        self._client_generation: int = 0
-        # Ring buffer of (ts_mono, reason, generation_before, generation_after)
-        # tuples; capped at _CLAUDE_CASCADE_TELEMETRY_CAP.
-        self._recycle_events: List[Dict[str, Any]] = []
-        # Ring buffer of per-attempt cascade events (label, attempt, elapsed_ms,
-        # remaining_ms, exc_class, outcome, client_generation). Surfaced via
-        # get_cascade_telemetry() for postmortem analysis.
-        self._cascade_attempts: List[Dict[str, Any]] = []
+        # Phase 1 Step 3B — state hoist. Every reload-hostile field
+        # (client, cascade ring buffers, daily spend, client generation,
+        # budget reset date) lives on a ``ClaudeProviderState`` instance
+        # that is either the process-lifetime singleton (when
+        # ``JARVIS_UNQUARANTINE_PROVIDERS=true``) or a freshly minted per-
+        # instance blob (legacy path). Rebound attribute reads/writes go
+        # through the property/setter pairs defined below so
+        # ``self._client = None`` can't shadow the descriptor.
+        from ._governance_state import (
+            ClaudeProviderState,
+            get_claude_provider_state,
+            unquarantine_providers_enabled,
+        )
+        if unquarantine_providers_enabled():
+            self._state = get_claude_provider_state()
+        else:
+            self._state = ClaudeProviderState.fresh()
         self._repo_root = repo_root
         self._repo_roots = repo_roots
         self._tools_enabled = tools_enabled or (tool_loop is not None)
@@ -3631,17 +3660,86 @@ class ClaudeProvider:
 
         # Cumulative cache telemetry — surfaced via get_cache_stats() and
         # logged periodically so operators can verify the savings path is
-        # actually firing.
-        self._cache_stats: Dict[str, Any] = {
-            "hits": 0,                # calls where cached_tokens > 0
-            "misses": 0,              # calls where cached_tokens == 0
-            "total_calls": 0,         # total Claude API calls observed
-            "cached_tokens": 0,       # cumulative cached input tokens
-            "uncached_tokens": 0,     # cumulative uncached input tokens
-            "usd_saved": 0.0,         # cumulative USD saved vs. no-cache
-            "enabled": self._prompt_cache_enabled,
-            "min_chars": self._prompt_cache_min_chars,
-        }
+        # actually firing. Mutated via subscript only (``["hits"] += 1``),
+        # never rebound — so ``setdefault`` populates the state dict once
+        # and every instance shares the same reference through the alias
+        # pulled off ``self._state.cache_stats`` below.
+        _stats = self._state.cache_stats
+        _stats.setdefault("hits", 0)
+        _stats.setdefault("misses", 0)
+        _stats.setdefault("total_calls", 0)
+        _stats.setdefault("cached_tokens", 0)
+        _stats.setdefault("uncached_tokens", 0)
+        _stats.setdefault("usd_saved", 0.0)
+        # These two reflect *this instance's* env config. First instance
+        # wins under the singleton path — downstream instances with
+        # differing env are logged under the originator's settings, which
+        # matches the "env doesn't change mid-process" assumption.
+        _stats["enabled"] = self._prompt_cache_enabled
+        _stats["min_chars"] = self._prompt_cache_min_chars
+
+    # ------------------------------------------------------------------
+    # Hoisted state accessors (Phase 1 Step 3B)
+    # ------------------------------------------------------------------
+    # Each rebound field gets a ``@property`` *and* a matching setter so
+    # ``self._client = None`` in ``_recycle_client`` can't plant a real
+    # instance attribute and shadow the descriptor.
+
+    @property
+    def _client(self) -> Any:
+        return self._state.client
+
+    @_client.setter
+    def _client(self, value: Any) -> None:
+        self._state.client = value
+
+    @property
+    def _daily_spend(self) -> float:
+        return self._state.counters.daily_spend
+
+    @_daily_spend.setter
+    def _daily_spend(self, value: float) -> None:
+        self._state.counters.daily_spend = value
+
+    @property
+    def _budget_reset_date(self) -> Any:
+        return self._state.counters.budget_reset_date
+
+    @_budget_reset_date.setter
+    def _budget_reset_date(self, value: Any) -> None:
+        self._state.counters.budget_reset_date = value
+
+    @property
+    def _client_generation(self) -> int:
+        return self._state.counters.client_generation
+
+    @_client_generation.setter
+    def _client_generation(self, value: int) -> None:
+        self._state.counters.client_generation = value
+
+    @property
+    def _recycle_events(self) -> List[Dict[str, Any]]:
+        return self._state.recycle_events
+
+    @_recycle_events.setter
+    def _recycle_events(self, value: List[Dict[str, Any]]) -> None:
+        self._state.recycle_events = value
+
+    @property
+    def _cascade_attempts(self) -> List[Dict[str, Any]]:
+        return self._state.cascade_attempts
+
+    @_cascade_attempts.setter
+    def _cascade_attempts(self, value: List[Dict[str, Any]]) -> None:
+        self._state.cascade_attempts = value
+
+    @property
+    def _cache_stats(self) -> Dict[str, Any]:
+        return self._state.cache_stats
+
+    @_cache_stats.setter
+    def _cache_stats(self, value: Dict[str, Any]) -> None:
+        self._state.cache_stats = value
 
     @property
     def provider_name(self) -> str:

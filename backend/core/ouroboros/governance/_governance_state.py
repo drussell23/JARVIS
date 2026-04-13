@@ -43,8 +43,10 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from datetime import date, datetime, timezone
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from .candidate_generator import FailbackStateMachine
@@ -52,6 +54,11 @@ if TYPE_CHECKING:
 
 
 UNQUARANTINE_GENERATOR_ENV = "JARVIS_UNQUARANTINE_GENERATOR"
+UNQUARANTINE_PROVIDERS_ENV = "JARVIS_UNQUARANTINE_PROVIDERS"
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "false").strip().lower() in ("true", "1", "yes", "on")
 
 
 def unquarantine_generator_enabled() -> bool:
@@ -61,8 +68,22 @@ def unquarantine_generator_enabled() -> bool:
     through the process-lifetime singleton so the generator can survive
     ``importlib.reload(candidate_generator)``.
     """
-    raw = os.environ.get(UNQUARANTINE_GENERATOR_ENV, "false").strip().lower()
-    return raw in ("true", "1", "yes", "on")
+    return _env_truthy(UNQUARANTINE_GENERATOR_ENV)
+
+
+def unquarantine_providers_enabled() -> bool:
+    """Return True when ``JARVIS_UNQUARANTINE_PROVIDERS`` is truthy.
+
+    Default false. Flipping to true routes ``ClaudeProvider``,
+    ``PrimeProvider``, and ``DoubleWordProvider`` state through
+    process-lifetime singletons so providers can survive
+    ``importlib.reload(providers)`` and
+    ``importlib.reload(doubleword_provider)``.
+
+    Independent of ``JARVIS_UNQUARANTINE_GENERATOR`` — operators opt in
+    to each hoist phase separately during rollout.
+    """
+    return _env_truthy(UNQUARANTINE_PROVIDERS_ENV)
 
 
 @dataclass
@@ -132,8 +153,141 @@ class GeneratorState:
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 1 Step 3B — Provider state hoist
+# ---------------------------------------------------------------------------
+#
+# The three provider classes (``ClaudeProvider``, ``PrimeProvider``,
+# ``DoubleWordProvider``) each get their own dedicated state container and
+# singleton. Keeping the split — instead of one fat ``ProviderState`` — lets
+# tests reset one provider's state without disturbing siblings, and makes
+# future divergence (e.g. DW batch handles vs Claude httpx pools) cheap.
+#
+# Rebound fields on the provider classes (``_client``, ``_session``,
+# ``_recycle_events``, ``_cascade_attempts``, counter ints, etc.) are the
+# whole reason this hoist exists — ``self._client = None`` on a stale
+# instance post-reload would drift away from the live client if we aliased
+# instead of indirecting. The consumers route every read/write through a
+# ``@property``/``@setter`` pair on the provider class, so there is no
+# instance attribute to shadow the descriptor.
+#
+# Append-only containers (``cache_stats`` dict mutated via subscript,
+# ``DoublewordStats`` dataclass mutated via attribute) are alias-safe —
+# the container identity stays put, so binding ``self._cache_stats =
+# self._state.cache_stats`` once in ``__init__`` is enough.
+
+
+@dataclass
+class ClaudeProviderCounters:
+    """Monotonic counters for ClaudeProvider that must cross reloads.
+
+    Same rationale as :class:`GeneratorCounters` — wrapping the ints in a
+    dataclass gives us reference-stable attribute mutation.
+    ``budget_reset_date`` uses a default factory so each ``fresh()`` picks
+    up the current UTC date at call time (not module-import time).
+    """
+
+    daily_spend: float = 0.0
+    budget_reset_date: date = field(
+        default_factory=lambda: datetime.now(tz=timezone.utc).date()
+    )
+    client_generation: int = 0
+
+
+@dataclass
+class ClaudeProviderState:
+    """Persistent state container for ``ClaudeProvider``.
+
+    ``client`` holds the live ``anthropic.AsyncAnthropic`` — an
+    ``httpx.AsyncClient`` under the hood with a live connection pool that
+    ``importlib.reload()`` of ``providers`` would otherwise drop on the
+    floor mid-flight. ``recycle_events`` and ``cascade_attempts`` are ring
+    buffers the consumer truncates via slice-rebind (``xs = xs[-CAP:]``),
+    so both need setter indirection to the state object.
+    """
+
+    client: Optional[Any] = None  # anthropic.AsyncAnthropic
+    recycle_events: List[Dict[str, Any]] = field(default_factory=list)
+    cascade_attempts: List[Dict[str, Any]] = field(default_factory=list)
+    cache_stats: Dict[str, Any] = field(default_factory=dict)
+    counters: ClaudeProviderCounters = field(default_factory=ClaudeProviderCounters)
+
+    @classmethod
+    def fresh(cls) -> "ClaudeProviderState":
+        return cls()
+
+
+@dataclass
+class PrimeProviderState:
+    """Persistent state container for ``PrimeProvider``.
+
+    Minimal today — PrimeProvider is nearly stateless; only the injected
+    ``PrimeClient`` reference needs to outlive an ``importlib.reload()``.
+    When future work adds cost tracking or recycle logic to Prime, fields
+    belong here, not back on the provider instance.
+    """
+
+    client: Any = None  # PrimeClient
+
+    @classmethod
+    def fresh(cls) -> "PrimeProviderState":
+        return cls()
+
+
+@dataclass
+class DoubleWordProviderCounters:
+    """Monotonic counters for DoubleWordProvider that must cross reloads.
+
+    ``last_error_status`` and ``last_chunk_at`` look like transient fields
+    but they are read across retry boundaries — rebinding to zero on
+    reload would drop diagnostic context that drives the retry cascade.
+    """
+
+    daily_spend: float = 0.0
+    budget_reset_date: str = field(
+        default_factory=lambda: time.strftime("%Y-%m-%d", time.gmtime())
+    )
+    last_error_status: int = 0
+    last_chunk_at: float = 0.0
+
+
+@dataclass
+class DoubleWordProviderState:
+    """Persistent state container for ``DoubleWordProvider``.
+
+    ``session`` is an ``aiohttp.ClientSession`` with a live TCP connector
+    — exactly the kind of object you must not recreate casually, because
+    connector teardown is async and reload doesn't wait. ``stats`` is a
+    ``DoublewordStats`` dataclass mutated in place across requests and
+    carried across reloads so operators can still see cumulative totals
+    after a code hot-swap.
+    """
+
+    session: Optional[Any] = None  # aiohttp.ClientSession
+    stats: Optional[Any] = None  # DoublewordStats (deferred, avoids cycle)
+    counters: DoubleWordProviderCounters = field(
+        default_factory=DoubleWordProviderCounters
+    )
+
+    @classmethod
+    def fresh(cls) -> "DoubleWordProviderState":
+        """Mint a fresh state. Defers the ``DoublewordStats`` import to
+        sidestep the circular edge between ``_governance_state`` and
+        ``doubleword_provider`` (consumer imports us at module import
+        time; we can only reach back at call time).
+        """
+        from .doubleword_provider import DoublewordStats
+
+        state = cls()
+        state.stats = DoublewordStats()
+        return state
+
+
 _lock = threading.Lock()
 _generator_state: Optional[GeneratorState] = None
+_claude_provider_state: Optional[ClaudeProviderState] = None
+_prime_provider_state: Optional[PrimeProviderState] = None
+_doubleword_provider_state: Optional[DoubleWordProviderState] = None
 
 
 def get_generator_state(
@@ -163,6 +317,45 @@ def get_generator_state(
         return _generator_state
 
 
+def get_claude_provider_state() -> ClaudeProviderState:
+    """Return the process-wide ``ClaudeProviderState`` singleton.
+
+    First call wins. Live anthropic client, cascade ring buffers, and
+    daily spend all survive ``importlib.reload(providers)``.
+    """
+    global _claude_provider_state
+    with _lock:
+        if _claude_provider_state is None:
+            _claude_provider_state = ClaudeProviderState.fresh()
+        return _claude_provider_state
+
+
+def get_prime_provider_state() -> PrimeProviderState:
+    """Return the process-wide ``PrimeProviderState`` singleton.
+
+    First call wins. The injected ``PrimeClient`` survives module
+    reloads so in-flight Prime sessions are not reset.
+    """
+    global _prime_provider_state
+    with _lock:
+        if _prime_provider_state is None:
+            _prime_provider_state = PrimeProviderState.fresh()
+        return _prime_provider_state
+
+
+def get_doubleword_provider_state() -> DoubleWordProviderState:
+    """Return the process-wide ``DoubleWordProviderState`` singleton.
+
+    First call wins. aiohttp session, cumulative stats, and spend
+    tracking all survive ``importlib.reload(doubleword_provider)``.
+    """
+    global _doubleword_provider_state
+    with _lock:
+        if _doubleword_provider_state is None:
+            _doubleword_provider_state = DoubleWordProviderState.fresh()
+        return _doubleword_provider_state
+
+
 def _is_test_mode() -> bool:
     """True under ``JARVIS_TEST_MODE=true`` or an active pytest session.
 
@@ -179,10 +372,9 @@ def reset_for_tests() -> None:
     """Test-only: clear every hoisted state root.
 
     Must stay in lockstep with the set of state singletons above — when
-    Phase 1 lands ``OrchestratorState`` and ``ProviderState``, extend
-    this to clear them too. Leaving a singleton un-reset here causes
-    semaphores, FSM state, or client pools to bleed across unrelated
-    test cases.
+    Phase 1 lands ``OrchestratorState``, extend this to clear it too.
+    Leaving a singleton un-reset here causes semaphores, FSM state, or
+    client pools to bleed across unrelated test cases.
 
     Raises ``RuntimeError`` when called outside test mode so a
     production caller cannot accidentally wipe live state.
@@ -193,5 +385,11 @@ def reset_for_tests() -> None:
             "Set JARVIS_TEST_MODE=true or run under pytest."
         )
     global _generator_state
+    global _claude_provider_state
+    global _prime_provider_state
+    global _doubleword_provider_state
     with _lock:
         _generator_state = None
+        _claude_provider_state = None
+        _prime_provider_state = None
+        _doubleword_provider_state = None
