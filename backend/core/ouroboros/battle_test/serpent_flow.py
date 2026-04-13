@@ -2098,6 +2098,29 @@ class SerpentTransport:
                         op_id=op_id,
                     )
 
+                # Diff preview before auto-apply (NOTIFY_APPLY Yellow or
+                # SAFE_AUTO Green when human is watching).  Renders the
+                # diff inline so the operator can /reject during the delay.
+                elif phase in ("notify_apply_diff", "safe_auto_diff_preview"):
+                    _diff = payload.get("diff_preview", "")
+                    _files = payload.get("target_files", [])
+                    _delay = payload.get("delay_s", 0)
+                    _tier_label = (
+                        "Yellow" if phase == "notify_apply_diff" else "Green"
+                    )
+                    if _diff:
+                        self._flow.show_diff_preview(
+                            diff_text=_diff,
+                            target_files=_files,
+                            op_id=op_id,
+                        )
+                    self._flow._op_line(
+                        op_id,
+                        f"[{_C['dim']}]⎿  {_tier_label} diff preview — "
+                        f"auto-applying in {_delay:.0f}s "
+                        f"(/reject to cancel)[/{_C['dim']}]",
+                    )
+
                 # Streaming — dedup: show synthesizing once per op
                 elif payload.get("streaming") == "start":
                     if op_id not in self._synthesizing_shown:

@@ -2599,6 +2599,7 @@ class GovernedLoopService:
                     result_preview=kwargs.get("result_preview", "") or "",
                     duration_ms=float(kwargs.get("duration_ms", 0.0) or 0.0),
                     status=kwargs.get("status", "") or "",
+                    preamble=kwargs.get("preamble", "") or "",
                 )
 
             _tool_coordinator = _TLC(

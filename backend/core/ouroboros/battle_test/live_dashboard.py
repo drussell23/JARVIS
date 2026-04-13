@@ -78,6 +78,44 @@ _PROVIDER_SHORT: Dict[str, str] = {
     "gcp-jprime": "J-Prime",
 }
 
+_TOOL_ICONS: Dict[str, str] = {
+    "read_file": "📄",
+    "search_code": "🔍",
+    "run_tests": "🧪",
+    "bash": "💻",
+    "web_search": "🌐",
+    "web_fetch": "🌐",
+    "get_callers": "🔗",
+    "list_symbols": "📋",
+    "glob_files": "📁",
+    "list_dir": "📂",
+    "git_log": "📜",
+    "git_diff": "📊",
+    "git_blame": "🔎",
+    "edit_file": "✏️",
+    "write_file": "📝",
+    "code_explore": "🧪",
+}
+
+_TOOL_START_VERBS: Dict[str, str] = {
+    "read_file": "reading",
+    "search_code": "searching",
+    "run_tests": "testing",
+    "bash": "running",
+    "web_search": "searching web",
+    "web_fetch": "fetching",
+    "get_callers": "finding callers",
+    "list_symbols": "listing symbols",
+    "glob_files": "globbing",
+    "list_dir": "listing",
+    "git_log": "checking git log",
+    "git_diff": "diffing",
+    "git_blame": "blaming",
+    "edit_file": "editing",
+    "write_file": "writing",
+    "code_explore": "exploring",
+}
+
 
 @dataclass
 class ActiveOp:
@@ -158,6 +196,7 @@ class LiveDashboard:
         self._organism = OrganismStats()
         self._events: deque = deque(maxlen=30)
         self._stop_reason: str = ""
+        self._rendered_preamble_keys: set[tuple[str, int]] = set()
 
         # Display toggles
         self._show_diffs = True
@@ -325,6 +364,40 @@ class LiveDashboard:
             op.provider = _PROVIDER_SHORT.get(provider, provider[:10])
             op.tool_count = tool_count
 
+    def op_tool_start(
+        self,
+        op_id: str,
+        tool_name: str,
+        args_summary: str = "",
+        round_index: int = 0,
+        preamble: str = "",
+    ) -> None:
+        """Record a per-tool-round heartbeat before the tool completes."""
+        op = self._active_ops.get(op_id)
+        short = op.short_id if op else op_id[:6]
+        icon = _TOOL_ICONS.get(tool_name, "🔧")
+        verb = _TOOL_START_VERBS.get(tool_name, tool_name.replace("_", " "))
+        summary = " ".join((args_summary or "").split())[:60]
+
+        if op:
+            op.phase = "GENERATE"
+
+        if preamble:
+            key = (op_id, round_index)
+            if key not in self._rendered_preamble_keys:
+                self._rendered_preamble_keys.add(key)
+                if len(self._rendered_preamble_keys) > 512:
+                    victims = list(self._rendered_preamble_keys)[:256]
+                    for victim in victims:
+                        self._rendered_preamble_keys.discard(victim)
+                self.add_event("🗣", f"[dim]{preamble[:100]}[/dim]  op:{short}")
+
+        detail = f"  [dim]{summary}[/dim]" if summary else ""
+        self.add_event(
+            icon,
+            f"[cyan]T{round_index + 1}[/cyan] {verb}{detail}  op:{short}",
+        )
+
     def op_tool_call(
         self, op_id: str, tool_name: str, args_summary: str = "",
         round_index: int = 0, result_preview: str = "",
@@ -336,17 +409,15 @@ class LiveDashboard:
         if op:
             op.tool_count += 1
 
-        icon = {
-            "read_file": "📄", "search_code": "🔍", "run_tests": "🧪",
-            "bash": "💻", "web_search": "🌐", "get_callers": "🔗",
-        }.get(tool_name, "🔧")
+        icon = _TOOL_ICONS.get(tool_name, "🔧")
 
         dur_str = ""
         if duration_ms > 0:
             dur_str = f" ({duration_ms:.0f}ms)" if duration_ms < 1000 else f" ({duration_ms/1000:.1f}s)"
 
-        # Only log to event feed if expanded or it's a significant tool
-        if self._expand_mode or tool_name in ("run_tests", "bash"):
+        # Show compact completion entries for expanded mode, significant tools,
+        # or anything that did not succeed cleanly.
+        if self._expand_mode or tool_name in ("run_tests", "bash") or status != "success":
             self.add_event(
                 icon,
                 f"[cyan]T{round_index+1}[/cyan] {tool_name}"
@@ -1045,15 +1116,24 @@ class DashboardTransport:
 
                 # Tool call
                 elif payload.get("tool_name"):
-                    self._db.op_tool_call(
-                        op_id=op_id,
-                        tool_name=payload["tool_name"],
-                        args_summary=payload.get("tool_args_summary", ""),
-                        round_index=payload.get("round_index", 0),
-                        result_preview=payload.get("result_preview", ""),
-                        duration_ms=payload.get("duration_ms", 0.0),
-                        status=payload.get("status", "success"),
-                    )
+                    if payload.get("tool_starting"):
+                        self._db.op_tool_start(
+                            op_id=op_id,
+                            tool_name=payload["tool_name"],
+                            args_summary=payload.get("tool_args_summary", ""),
+                            round_index=payload.get("round_index", 0),
+                            preamble=payload.get("preamble", ""),
+                        )
+                    else:
+                        self._db.op_tool_call(
+                            op_id=op_id,
+                            tool_name=payload["tool_name"],
+                            args_summary=payload.get("tool_args_summary", ""),
+                            round_index=payload.get("round_index", 0),
+                            result_preview=payload.get("result_preview", ""),
+                            duration_ms=payload.get("duration_ms", 0.0),
+                            status=payload.get("status", "success"),
+                        )
 
                 # Generation result
                 elif payload.get("candidates_count") is not None:

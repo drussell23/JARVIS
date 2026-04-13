@@ -134,6 +134,20 @@ class TestEmitHappyPath:
         assert m.msg_type.value == "HEARTBEAT"
 
     @pytest.mark.asyncio
+    async def test_start_event_carries_preamble(self):
+        coll = _CollectingTransport()
+        ch = ToolNarrationChannel(_DuckComm([coll]))
+        ch.emit(
+            op_id="op-1",
+            tool_name="read_file",
+            round_index=0,
+            args_summary="foo.py",
+            preamble="Inspecting the current implementation before editing.",
+        )
+        await asyncio.sleep(0)
+        assert coll.sent[0].payload["preamble"] == "Inspecting the current implementation before editing."
+
+    @pytest.mark.asyncio
     async def test_success_event_carries_result_preview(self):
         coll = _CollectingTransport()
         ch = ToolNarrationChannel(_DuckComm([coll]))
@@ -148,6 +162,7 @@ class TestEmitHappyPath:
         assert m.payload["tool_starting"] is False
         assert m.payload["duration_ms"] == 123.4
         assert m.payload["result_preview"].startswith("total 42")
+        assert m.payload["preamble"] == ""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", sorted(LIFECYCLE_STATUSES))

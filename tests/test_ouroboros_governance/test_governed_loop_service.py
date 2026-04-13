@@ -347,6 +347,59 @@ class TestGovernedLoopRegistryWiring:
         finally:
             await svc.stop()
 
+    async def test_tool_narration_forwards_round_preamble(self, tmp_path, monkeypatch):
+        """Round WHY text must survive GLS callback wiring into ToolNarrationChannel."""
+        from backend.core.ouroboros.governance import tool_executor, tool_narration
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+
+        captured: Dict[str, object] = {}
+
+        class _FakeNarrationChannel:
+            def __init__(self, _comm) -> None:
+                self.calls = []
+                captured["channel"] = self
+
+            def emit(self, **kwargs) -> None:
+                self.calls.append(kwargs)
+
+        class _FakeToolLoopCoordinator:
+            def __init__(self, *args, on_tool_call=None, **kwargs) -> None:
+                captured["on_tool_call"] = on_tool_call
+                self.on_token = None
+
+        monkeypatch.setattr(tool_narration, "ToolNarrationChannel", _FakeNarrationChannel)
+        monkeypatch.setattr(tool_executor, "ToolLoopCoordinator", _FakeToolLoopCoordinator)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("DOUBLEWORD_API_KEY", raising=False)
+        monkeypatch.setenv("JARVIS_REPO_PATH", str(tmp_path))
+
+        stack = _mock_stack()
+        config = GovernedLoopConfig(project_root=tmp_path, claude_api_key=None)
+        service = GovernedLoopService(stack=stack, prime_client=None, config=config)
+
+        try:
+            await service._build_components()
+        except Exception:
+            pass
+
+        on_tool_call = captured.get("on_tool_call")
+        assert callable(on_tool_call)
+
+        on_tool_call(
+            op_id="op-pre",
+            tool_name="read_file",
+            round_index=2,
+            args_summary="backend/core/foo.py",
+            preamble="Inspecting the current file before editing.",
+        )
+
+        channel = captured.get("channel")
+        assert channel is not None
+        assert channel.calls[-1]["preamble"] == "Inspecting the current file before editing."
+
     def test_reactor_canonical_wins_over_legacy(self, tmp_path, monkeypatch):
         """JARVIS_REACTOR_REPO_PATH takes priority over REACTOR_CORE_REPO_PATH."""
         from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry

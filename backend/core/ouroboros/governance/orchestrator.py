@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import sys
 import tempfile
 import time
 import dataclasses
@@ -110,6 +111,29 @@ _CONSOLIDATION_THRESHOLD: int = 10
 # by the 125s outer gate (bt-2026-04-12-061609).  15s accommodates Tier 0
 # overhead + asyncio cancellation propagation delay on streaming responses.
 _OUTER_GATE_GRACE_S = float(os.environ.get("JARVIS_OUTER_GATE_GRACE_S", "15"))
+
+
+def _human_is_watching() -> bool:
+    """Detect whether a human is likely watching the terminal.
+
+    Returns ``True`` when any of:
+    - ``sys.stdout`` is attached to an interactive TTY.
+    - ``JARVIS_DIFF_PREVIEW_ALL`` env var is set to a truthy value.
+      (Explicit flag for CI / headless modes where TTY is absent but the
+      human is tailing logs.)
+
+    Used to decide whether SAFE_AUTO (Green) operations should show a
+    diff preview before auto-applying.
+    """
+    explicit = os.environ.get("JARVIS_DIFF_PREVIEW_ALL", "").lower() in (
+        "true", "1", "yes",
+    )
+    if explicit:
+        return True
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -3472,6 +3496,57 @@ class GovernedOrchestrator:
                     _risk_floor_str, risk_tier.name, _floor.name, ctx.op_id,
                 )
                 risk_tier = _floor
+
+        # ---- Phase 5a-green: SAFE_AUTO diff preview (Green — when human is watching) ----
+        # Mythos §7.4 UX: when a human is watching (TTY or explicit flag),
+        # show a brief diff preview even for Green ops so the operator can
+        # /reject if they spot something wrong. The delay is shorter than
+        # NOTIFY_APPLY because Green is inherently lower risk.
+        if risk_tier is RiskTier.SAFE_AUTO and _human_is_watching():
+            _green_delay_s = float(
+                os.environ.get("JARVIS_SAFE_AUTO_PREVIEW_DELAY_S", "2")
+            )
+            if best_candidate is not None and _green_delay_s > 0:
+                _diff_preview = (
+                    best_candidate.get("unified_diff")
+                    or best_candidate.get("full_content", "")
+                )
+                if _diff_preview:
+                    try:
+                        for _t in getattr(self._stack.comm, "_transports", []):
+                            try:
+                                _preview_msg = type("_Msg", (), {
+                                    "payload": {
+                                        "phase": "safe_auto_diff_preview",
+                                        "diff_preview": str(_diff_preview)[:4000],
+                                        "delay_s": _green_delay_s,
+                                        "target_files": list(ctx.target_files),
+                                    },
+                                    "op_id": ctx.op_id,
+                                    "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                                })()
+                                await _t.send(_preview_msg)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    logger.info(
+                        "[Orchestrator] SAFE_AUTO diff preview shown (human watching), "
+                        "waiting %.0fs for /reject; op=%s",
+                        _green_delay_s, ctx.op_id,
+                    )
+                    await asyncio.sleep(_green_delay_s)
+                    # Check if user cancelled during the preview window
+                    if self._is_cancel_requested(ctx.op_id):
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="user_rejected_safe_auto_preview",
+                        )
+                        await self._record_ledger(
+                            ctx, OperationState.FAILED,
+                            {"reason": "user_rejected_safe_auto_preview"},
+                        )
+                        return ctx
 
         # ---- Phase 5b: NOTIFY_APPLY (Yellow — auto-apply with prominent CLI notice + diff preview) ----
         if risk_tier is RiskTier.NOTIFY_APPLY:
