@@ -92,6 +92,7 @@ DEFAULT_QUARANTINE: FrozenSet[str] = frozenset({
     "backend.core.ouroboros.governance.auto_committer",
     "backend.core.ouroboros.governance.comm_protocol",
     "backend.core.ouroboros.governance._process_singletons",
+    "backend.core.ouroboros.governance._governance_state",
     "backend.core.ouroboros.battle_test.harness",
     "backend.core.ouroboros.battle_test.serpent_flow",
     "backend.core.ouroboros.battle_test.live_dashboard",

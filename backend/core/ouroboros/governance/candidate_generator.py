@@ -64,7 +64,6 @@ from backend.core.ouroboros.governance.op_context import (
 )
 from backend.core.ouroboros.governance.dw_latency_tracker import (
     DwLatencyTracker,
-    get_default_tracker,
 )
 
 logger = logging.getLogger(__name__)
@@ -778,46 +777,84 @@ class CandidateGenerator:
         self._fallback = fallback
         self._tier0 = tier0
         self._ledger = ledger
-        self._primary_sem = asyncio.Semaphore(primary_concurrency)
         self._fallback_concurrency = fallback_concurrency
-        self._fallback_sem = asyncio.Semaphore(fallback_concurrency)
-        self.fsm = FailbackStateMachine()
         # HIBERNATION_MODE step 5: optional watcher that counts
         # consecutive all_providers_exhausted raises and transitions
         # the SupervisorOuroborosController into HIBERNATION at the
         # configured threshold. Kept structural/optional so unit tests
         # of CandidateGenerator don't need to build a controller.
         self._exhaustion_watcher = exhaustion_watcher
-        # Manifesto §5: rolling p95 DW RT latency → dynamic Tier 0 budget.
-        # Cold endpoints get full ceiling, hot endpoints dial down aggressively.
-        self._latency_tracker = latency_tracker or get_default_tracker()
-        # Async Tier 0 tracking: op_id → CompletedBatch
-        self._completed_batches: dict[str, Any] = {}
-        # Background polling tasks (kept to prevent GC)
-        self._background_polls: dict[str, asyncio.Task[Any]] = {}
         # Cap concurrent background polls to avoid connector exhaustion
         self._max_background_polls: int = 3
-        # Per-op tier rotation: belt-and-suspenders for the FSM ETA-based skip.
-        # When the classifier mis-routes (e.g. an unfamiliar wrapper exception
-        # falls through to TIMEOUT instead of TRANSIENT_TRANSPORT) the FSM's
-        # `should_attempt_primary()` keeps returning True and consecutive ops
-        # all hit the same dead Tier 0. Once N failures land within W seconds,
-        # we hard-skip Tier 0 for the next op regardless of FSM mode — buying
-        # the human one cheap Claude success while DW recovers underneath.
-        self._consecutive_tier0_failures: int = 0
-        self._last_tier0_failure_at: float = 0.0
+        # Per-op tier rotation config: belt-and-suspenders for the FSM
+        # ETA-based skip. When the classifier mis-routes (e.g. an
+        # unfamiliar wrapper exception falls through to TIMEOUT instead
+        # of TRANSIENT_TRANSPORT) the FSM's `should_attempt_primary()`
+        # keeps returning True and consecutive ops all hit the same
+        # dead Tier 0. Once N failures land within W seconds, we
+        # hard-skip Tier 0 for the next op regardless of FSM mode —
+        # buying the human one cheap Claude success while DW recovers.
         self._tier0_skip_threshold: int = int(
             os.environ.get("OUROBOROS_TIER0_SKIP_THRESHOLD", "2")
         )
         self._tier0_skip_window_s: float = float(
             os.environ.get("OUROBOROS_TIER0_SKIP_WINDOW_S", "30")
         )
-        # Structured exhaustion instrumentation — incremented on every
-        # raise through `_raise_exhausted`. Lets the log-line audit
-        # sequence exhaustion events across a session without scraping
-        # the aggregate `summary.json` counters (which have the known
-        # `attempted` bug — use debug.log as the authoritative source).
-        self._exhaustion_events: int = 0
+
+        # ── Phase 1 Step 3A: state hoist (un-quarantine blueprint) ──
+        # Invariant: every mutable field that must survive
+        # `importlib.reload(candidate_generator)` lives on `self._state`
+        # (a ``GeneratorState``), not on ``self`` directly. The aliases
+        # below are bound once in __init__ and share reference identity
+        # with the state container — for dicts/FSM/sem that is enough;
+        # the ``int``/``float`` counters live on ``self._counters`` (a
+        # ``GeneratorCounters`` dataclass) so mutation-via-attribute
+        # does not re-bind a local copy. Do NOT add new mutable fields
+        # as ``self._*`` — extend ``GeneratorState`` instead.
+        #
+        # When ``JARVIS_UNQUARANTINE_GENERATOR`` is false (default), the
+        # state is minted fresh per instance so today's tests and
+        # production behavior stay bit-identical. Flipping the env to
+        # true routes every new ``CandidateGenerator`` to the shared
+        # singleton and retires the quarantine (follow-up PR).
+        from ._governance_state import (
+            GeneratorState,
+            get_generator_state,
+            unquarantine_generator_enabled,
+        )
+        if unquarantine_generator_enabled():
+            self._state = get_generator_state(
+                primary_concurrency=primary_concurrency,
+                fallback_concurrency=fallback_concurrency,
+                latency_tracker=latency_tracker,
+            )
+        else:
+            self._state = GeneratorState.fresh(
+                primary_concurrency=primary_concurrency,
+                fallback_concurrency=fallback_concurrency,
+                latency_tracker=latency_tracker,
+            )
+        # Aliases: all share reference identity with self._state so
+        # reads AND writes via either name land on the same object.
+        # Safe for Semaphores, FSM, dicts, trackers (objects / mutable
+        # containers).
+        self._primary_sem = self._state.primary_sem
+        self._fallback_sem = self._state.fallback_sem
+        self.fsm = self._state.fsm
+        # Manifesto §5: rolling p95 DW RT latency → dynamic Tier 0 budget.
+        # Cold endpoints get full ceiling, hot endpoints dial down aggressively.
+        self._latency_tracker = self._state.latency_tracker
+        # Async Tier 0 tracking: op_id → CompletedBatch (dict aliased).
+        self._completed_batches: dict[str, Any] = self._state.completed_batches
+        # Background polling tasks (kept to prevent GC; dict aliased).
+        self._background_polls: dict[str, asyncio.Task[Any]] = (
+            self._state.background_polls
+        )
+        # Counters container: lets ``self._counters.exhaustion_events +=
+        # 1`` mutate the same dataclass instance stored on the state,
+        # which a plain ``int`` alias could not. Do not rebind
+        # ``self._counters`` — only mutate its fields.
+        self._counters = self._state.counters
 
     def _raise_exhausted(
         self,
@@ -854,16 +891,16 @@ class CandidateGenerator:
         ``pytest.raises(RuntimeError, match="all_providers_exhausted")``,
         and the orchestrator ``_INFRA_PATTERNS`` set) keeps working.
         """
-        self._exhaustion_events += 1
+        self._counters.exhaustion_events += 1
 
         fm = self.fsm._failure_mode
         report: Dict[str, Any] = {
-            "event_n": self._exhaustion_events,
+            "event_n": self._counters.exhaustion_events,
             "cause": cause,
             "fsm_state": self.fsm.state.name,
             "fsm_failure_mode": fm.name if fm is not None else "NONE",
             "fsm_consecutive_failures": self.fsm._consecutive_failures,
-            "tier0_consecutive_failures": self._consecutive_tier0_failures,
+            "tier0_consecutive_failures": self._counters.consecutive_tier0_failures,
             "primary_name": getattr(self._primary, "provider_name", "?"),
             "fallback_name": (
                 getattr(self._fallback, "provider_name", "?")
@@ -1035,7 +1072,7 @@ class CandidateGenerator:
                 logger.info(
                     "[CandidateGenerator] Tier 0 skipped: per-op rotation "
                     "(consecutive_failures=%d threshold=%d window=%.0fs)",
-                    self._consecutive_tier0_failures,
+                    self._counters.consecutive_tier0_failures,
                     self._tier0_skip_threshold,
                     self._tier0_skip_window_s,
                 )
@@ -1959,26 +1996,26 @@ class CandidateGenerator:
         classifier mis-routes a transport flap to TIMEOUT (default), this
         guard still kicks in after N back-to-back failures.
         """
-        if self._consecutive_tier0_failures < self._tier0_skip_threshold:
+        if self._counters.consecutive_tier0_failures < self._tier0_skip_threshold:
             return False
-        elapsed = time.monotonic() - self._last_tier0_failure_at
+        elapsed = time.monotonic() - self._counters.last_tier0_failure_at
         return elapsed < self._tier0_skip_window_s
 
     def _record_tier0_failure(self) -> None:
         """Increment the per-op rotation counter and stamp the timestamp."""
-        self._consecutive_tier0_failures += 1
-        self._last_tier0_failure_at = time.monotonic()
+        self._counters.consecutive_tier0_failures += 1
+        self._counters.last_tier0_failure_at = time.monotonic()
 
     def _record_tier0_success(self) -> None:
         """Reset the per-op rotation counter on Tier 0 success."""
-        if self._consecutive_tier0_failures > 0:
+        if self._counters.consecutive_tier0_failures > 0:
             logger.info(
                 "[CandidateGenerator] Tier 0 rotation reset after %d "
                 "consecutive failures",
-                self._consecutive_tier0_failures,
+                self._counters.consecutive_tier0_failures,
             )
-        self._consecutive_tier0_failures = 0
-        self._last_tier0_failure_at = 0.0
+        self._counters.consecutive_tier0_failures = 0
+        self._counters.last_tier0_failure_at = 0.0
 
     # ------------------------------------------------------------------
     # Deadline budget allocation (deterministic — Manifesto §5)

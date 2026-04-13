@@ -1477,7 +1477,7 @@ class TestExhaustionInstrumentation:
         assert getattr(e1.value, "exhaustion_report")["event_n"] == 1
         assert getattr(e2.value, "exhaustion_report")["event_n"] == 2
         assert getattr(e3.value, "exhaustion_report")["event_n"] == 3
-        assert gen._exhaustion_events == 3
+        assert gen._counters.exhaustion_events == 3
 
     def test_raise_exhausted_message_keeps_substring_contract(self) -> None:
         """``str(exc)`` must still contain ``all_providers_exhausted`` so
