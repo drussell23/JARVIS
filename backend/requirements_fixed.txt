@@ -33,7 +33,7 @@ icalendar==5.0.11
 pytz==2025.2
 apscheduler==3.10.4
 aiohttp==3.9.1
-requests==2.31.0
+requests==2.33.1
 
 # RAG dependencies
 sentence-transformers==2.2.2
