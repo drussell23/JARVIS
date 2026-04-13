@@ -259,6 +259,20 @@ class IntakeLayerService:
             except Exception as exc:
                 logger.warning("[IntakeLayer] Router stop error: %s", exc)
 
+        # Stop FS bridge (was only stopped in the failed-start _teardown
+        # path, leaving watchdog Observer threads alive on graceful
+        # budget-exhausted shutdowns — those threads then spammed "Main
+        # event loop not running" every 20s for the lifetime of the
+        # process). Idempotent and logs-only on failure.
+        if hasattr(self, "_fs_bridge") and self._fs_bridge is not None:
+            try:
+                await self._fs_bridge.stop()
+            except Exception as exc:
+                logger.warning(
+                    "[IntakeLayer] FS bridge stop error: %s", exc,
+                )
+            self._fs_bridge = None
+
         self._sensors = []
         self._router = None
         self._narrator = None

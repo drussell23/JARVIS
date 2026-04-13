@@ -22,7 +22,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope, IntentEnvelope
 
@@ -78,6 +78,7 @@ class BacklogSensor:
         self._router = router
         self._poll_interval_s = poll_interval_s
         self._running = False
+        self._poll_task: Optional[asyncio.Task] = None
         self._seen_task_ids: set[str] = set()
 
     async def scan_once(self) -> List[IntentEnvelope]:
@@ -133,10 +134,23 @@ class BacklogSensor:
     async def start(self) -> None:
         """Start background polling loop."""
         self._running = True
-        asyncio.create_task(self._poll_loop(), name="backlog_sensor_poll")
+        if self._poll_task is not None and not self._poll_task.done():
+            return
+        self._poll_task = asyncio.create_task(
+            self._poll_loop(), name="backlog_sensor_poll",
+        )
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self._running = False
+        task = self._poll_task
+        self._poll_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # ------------------------------------------------------------------
     # Event-driven path (Manifesto §3: zero polling, pure reflex)

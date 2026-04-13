@@ -357,6 +357,7 @@ class OpportunityMinerSensor:
         self._repo = repo
         self._poll_interval_s = poll_interval_s
         self._running = False
+        self._poll_task: Optional[asyncio.Task] = None
         self._seen_file_paths: set[str] = set()
         # Graph coalescer: when >=2 candidates are selected in a scan, they
         # are merged into a single ExecutionGraph envelope instead of N
@@ -975,10 +976,23 @@ class OpportunityMinerSensor:
     async def start(self) -> None:
         """Start background scanning loop."""
         self._running = True
-        asyncio.create_task(self._poll_loop(), name="opportunity_miner_poll")
+        if self._poll_task is not None and not self._poll_task.done():
+            return
+        self._poll_task = asyncio.create_task(
+            self._poll_loop(), name="opportunity_miner_poll",
+        )
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self._running = False
+        task = self._poll_task
+        self._poll_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # ------------------------------------------------------------------
     # Event-driven path (Manifesto §3: zero polling, pure reflex)
