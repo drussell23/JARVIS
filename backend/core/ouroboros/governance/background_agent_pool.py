@@ -601,7 +601,21 @@ class BackgroundAgentPool:
                 )
 
                 try:
-                    result = await self._orchestrator.run(op.context)
+                    # Phase 1 Step 3C: § 4 bind contract dispatch. Read
+                    # the live orchestrator from the process-wide bind
+                    # (set at ``GovernedLoopService._attach_to_stack``
+                    # time via ``stack.bind_orchestrator``) so an
+                    # ``importlib.reload(orchestrator)`` that swapped
+                    # the class out from under this long-lived worker
+                    # flips to the new instance on its very next
+                    # dispatch. Fallback chain: live bind → captured
+                    # constructor ref (for tests and pre-3C
+                    # deployments that never engaged the bind).
+                    from backend.core.ouroboros.governance._governance_state import (
+                        get_bound_orchestrator as _get_bound_orch,
+                    )
+                    _orch = _get_bound_orch() or self._orchestrator
+                    result = await _orch.run(op.context)
                     op.result = result
                     op.status = "completed"
                     self._completed_count += 1

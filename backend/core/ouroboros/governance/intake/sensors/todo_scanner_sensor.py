@@ -299,7 +299,7 @@ class TodoScannerSensor:
 
             try:
                 envelope = make_envelope(
-                    source="runtime_health",
+                    source="todo_scanner",
                     description=(
                         f"{item.marker} at {item.file_path}:{item.line_number}: "
                         f"{item.text}"

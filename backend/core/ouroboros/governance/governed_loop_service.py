@@ -1730,9 +1730,23 @@ class GovernedLoopService:
             try:
                 # GAP 6: race orchestrator against user stop signal when bus is present.
                 # The no-bus path uses shielded_wait_for so ledger writes survive timeout.
+                #
+                # Phase 1 Step 3C: read the live orchestrator from the § 4
+                # bind contract on every dispatch so ``importlib.reload``
+                # of ``orchestrator.py`` flips over atomically. The
+                # ``orchestrator_ref`` fallback chain returns the
+                # currently-bound instance, or falls back to the legacy
+                # ``stack.orchestrator`` slot if the bind contract has
+                # not been engaged.
+                _orch = (
+                    self._stack.orchestrator_ref
+                    if self._stack is not None
+                    and hasattr(self._stack, "orchestrator_ref")
+                    else self._orchestrator
+                )
                 if self._user_signal_bus is not None:
                     _op_task = asyncio.create_task(
-                        self._orchestrator.run(ctx),
+                        _orch.run(ctx),
                         name=f"orchestrator/{ctx.op_id}",
                     )
                     _stop_task = asyncio.create_task(
@@ -1846,9 +1860,12 @@ class GovernedLoopService:
 
                 else:
                     # No signal bus: existing shielded path (ledger writes survive timeout).
+                    # Phase 1 Step 3C: reuse the rebind-safe ``_orch`` captured
+                    # at the top of the try-block so both dispatch paths
+                    # read through the § 4 bind contract.
                     from backend.core.async_safety import shielded_wait_for as _shielded_wf
                     terminal_ctx = await _shielded_wf(
-                        self._orchestrator.run(ctx),
+                        _orch.run(ctx),
                         timeout=_pipeline_timeout,
                         name=f"orchestrator.run/{ctx.op_id}",
                     )
@@ -2837,6 +2854,19 @@ class GovernedLoopService:
                         _watcher_exc,
                     )
 
+            # Phase 3 Scope α — wire the PrimeProvider handle through
+            # explicitly so BACKGROUND/SPECULATIVE primacy works even
+            # when DoubleWord is promoted to ``primary`` (the handle we
+            # captured before demotion is still usable for the primacy
+            # path because the cost-optimized routes don't care about
+            # J-Prime's first-token latency — they care about the
+            # $0.002 vs $0.005 delta). ``primary`` here refers to the
+            # local PrimeProvider variable built earlier, which survives
+            # the "Doubleword becomes primary" promotion because the
+            # demoted reference is reassigned to ``fallback``, not
+            # ``primary``. If PrimeProvider was never built (None), the
+            # generator simply has no primacy path and the flag is a
+            # no-op.
             self._generator = CandidateGenerator(
                 primary=effective_primary,
                 fallback=effective_fallback,
@@ -2844,6 +2874,7 @@ class GovernedLoopService:
                 tier0=tier0,
                 ledger=self._ledger,
                 exhaustion_watcher=_exhaustion_watcher,
+                jprime=primary,
             )
             self._exhaustion_watcher = _exhaustion_watcher
 
@@ -3770,10 +3801,22 @@ class GovernedLoopService:
         )
 
     def _attach_to_stack(self) -> None:
-        """Attach governed loop components to GovernanceStack."""
+        """Attach governed loop components to GovernanceStack.
+
+        Phase 1 Step 3C: routes the orchestrator assignment through
+        :meth:`GovernanceStack.bind_orchestrator`, which writes both
+        the legacy dataclass slot and the process-lifetime bind under
+        ``_governance_state._bind_lock``. This makes the rebind atomic
+        with respect to hot-path readers that use the new
+        ``stack.orchestrator_ref`` property.
+        """
         if self._stack is None:
             return
-        self._stack.orchestrator = self._orchestrator
+        if hasattr(self._stack, "bind_orchestrator"):
+            self._stack.bind_orchestrator(self._orchestrator)
+        else:
+            # Legacy fallback for stacks that predate the bind contract.
+            self._stack.orchestrator = self._orchestrator
         self._stack.generator = self._generator
         self._stack.approval_provider = self._approval_provider
 
@@ -3781,7 +3824,10 @@ class GovernedLoopService:
         """Detach governed loop components from GovernanceStack."""
         if self._stack is None:
             return
-        self._stack.orchestrator = None
+        if hasattr(self._stack, "bind_orchestrator"):
+            self._stack.bind_orchestrator(None)
+        else:
+            self._stack.orchestrator = None
         self._stack.generator = None
         self._stack.approval_provider = None
 

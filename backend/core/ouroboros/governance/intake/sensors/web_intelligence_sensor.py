@@ -175,7 +175,7 @@ class WebIntelligenceSensor:
             try:
                 severity = finding.severity
                 envelope = make_envelope(
-                    source="runtime_health",  # Reuse existing source
+                    source="security_advisory",
                     description=(
                         f"Security advisory {finding.advisory_id} for "
                         f"{finding.package}=={finding.installed_version}: "

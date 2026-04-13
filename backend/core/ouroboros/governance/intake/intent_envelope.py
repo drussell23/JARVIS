@@ -17,7 +17,30 @@ from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
 SCHEMA_VERSION = "2c.1"
 
-_VALID_SOURCES = frozenset({"architecture", "backlog", "test_failure", "voice_human", "ai_miner", "capability_gap", "runtime_health", "exploration", "roadmap", "cu_execution", "intent_discovery"})
+_VALID_SOURCES = frozenset({
+    "architecture",
+    "backlog",
+    "test_failure",
+    "voice_human",
+    "ai_miner",
+    "capability_gap",
+    "runtime_health",
+    "exploration",
+    "roadmap",
+    "cu_execution",
+    "intent_discovery",
+    # Added 2026-04-12 to stop sensors from lying about their source as
+    # "runtime_health" just to satisfy this whitelist. UrgencyRouter then
+    # IMMEDIATE-stamped every TODO / doc / issue scan, which burned the
+    # Claude budget in bt-2026-04-13-011909 ($0.53 Claude vs $0.002 DW).
+    "todo_scanner",
+    "doc_staleness",
+    "github_issue",
+    "performance_regression",
+    "cross_repo_drift",
+    "security_advisory",
+    "web_intelligence",
+})
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 
 

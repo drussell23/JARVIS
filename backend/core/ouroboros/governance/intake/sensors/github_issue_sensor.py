@@ -168,7 +168,7 @@ class GitHubIssueSensor:
 
             try:
                 envelope = make_envelope(
-                    source="runtime_health",
+                    source="github_issue",
                     description=(
                         f"GitHub Issue #{finding.issue_number} in "
                         f"{finding.repo_full}: {finding.title}"

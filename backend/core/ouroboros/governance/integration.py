@@ -358,6 +358,19 @@ class GovernanceStack:
     - health(): structured report for TUI/dashboard
     - replay_decision(): forensic audit of prior decisions
     - drain(): graceful shutdown of in-flight operations
+
+    Phase 1 Step 3C — § 4 bind contract
+    -----------------------------------
+    The ``orchestrator`` dataclass field remains for backwards
+    compatibility (any call site still reading ``stack.orchestrator``
+    gets the last-bound instance), but the process-lifetime indirection
+    lives in ``_governance_state.{bind_orchestrator,
+    get_bound_orchestrator}`` under a dedicated ``RLock``. Hot-path
+    consumers should call :meth:`bind_orchestrator` at construction /
+    teardown time and read :attr:`orchestrator_ref` on every dispatch,
+    so ``importlib.reload(orchestrator)`` can swap the class without
+    leaving stale captured references inside ``GovernedLoopService`` or
+    ``BackgroundAgentPool``.
     """
 
     # Core (always present)
@@ -470,6 +483,69 @@ class GovernanceStack:
             logger.warning("[GovernanceStack] can_write BLOCKED: contract_incompatible")
             return False, "contract_incompatible"
         return True, "ok"
+
+    # ─────────────────────────────────────────────────────────────────
+    # Phase 1 Step 3C — § 4 bind contract
+    # ─────────────────────────────────────────────────────────────────
+
+    def bind_orchestrator(self, orch: Optional[Any]) -> None:
+        """Atomically bind the governed orchestrator to this stack.
+
+        Writes both the legacy dataclass slot ``self.orchestrator``
+        (for any caller still reading the plain field) and the
+        process-lifetime indirection in
+        ``_governance_state._bound_orchestrator`` (for hot paths that
+        have migrated to :attr:`orchestrator_ref`). Both writes happen
+        under the dedicated ``_bind_lock`` in ``_governance_state`` so
+        there is no window in which one caller sees the old instance
+        via ``stack.orchestrator`` while another sees the new instance
+        via ``stack.orchestrator_ref``.
+
+        Passing ``None`` clears the bind — used at
+        ``GovernedLoopService._detach_from_stack`` time so a shut-down
+        loop doesn't leak a dead orchestrator.
+
+        This is the exact operation that ``importlib.reload`` must be
+        followed by: after reloading the ``orchestrator`` module and
+        re-constructing an ``Orchestrator`` instance, the harness (or
+        the reloader itself) calls ``stack.bind_orchestrator(new)``
+        and every captured reference in
+        :class:`GovernedLoopService` and
+        :class:`BackgroundAgentPool` flips to the new instance on
+        its next dispatch without needing to re-wire the harness.
+        """
+        from backend.core.ouroboros.governance._governance_state import (
+            bind_orchestrator as _bind,
+        )
+
+        _bind(orch)
+        # Legacy slot kept in sync so pre-3C readers keep working.
+        self.orchestrator = orch
+
+    @property
+    def orchestrator_ref(self) -> Optional[Any]:
+        """Return the live orchestrator binding for § 4 dispatch paths.
+
+        Reads through :func:`_governance_state.get_bound_orchestrator`
+        when the bind contract has been engaged (Phase 1 Step 3C
+        rollout); otherwise falls back to the legacy
+        ``self.orchestrator`` dataclass field so pre-3C deployments
+        continue to work without any migration.
+
+        Hot-path consumers should prefer this property over
+        ``stack.orchestrator`` so post-reload dispatches flip to the
+        new instance atomically — see the
+        ``_governance_state`` module-level docstring on why captured
+        references go stale after ``importlib.reload(orchestrator)``.
+        """
+        from backend.core.ouroboros.governance._governance_state import (
+            get_bound_orchestrator,
+        )
+
+        bound = get_bound_orchestrator()
+        if bound is not None:
+            return bound
+        return self.orchestrator
 
     async def replay_decision(
         self, op_id: str

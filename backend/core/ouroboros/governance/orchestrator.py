@@ -258,128 +258,255 @@ class GovernedOrchestrator:
         self._approval_provider = approval_provider
         self._config = config
         self._validation_runner = validation_runner
-        self._oracle_update_lock: asyncio.Lock = asyncio.Lock()
-        self._reasoning_bridge: Optional[Any] = None  # set via set_reasoning_bridge()
-        self._infra_applicator: Optional[Any] = None  # set via set_infra_applicator()
-        self._reasoning_narrator: Optional[Any] = None  # set via set_reasoning_narrator()
-        self._dialogue_store: Optional[Any] = None  # set via set_dialogue_store()
-        self._pre_action_narrator: Optional[Any] = None  # set via set_pre_action_narrator()
-        self._exploration_fleet: Optional[Any] = None  # set via set_exploration_fleet()
-        self._critique_engine: Optional[Any] = None  # set via set_critique_engine()
 
-        # ── Per-op cost governor ──
-        # Enforces a dynamic cumulative cost ceiling per op, derived from
-        # route + complexity. Prevents cost-runaway cascades (e.g. DW→Claude
-        # fallback + 3 retries + 5 L2 iterations collectively spending >$2
-        # while each individual call stays under its own per-provider cap).
-        # Cap formula and factor table are fully env-var driven — see
-        # cost_governor.py::CostGovernorConfig. Disable via
-        # ``JARVIS_OP_COST_GOVERNOR_ENABLED=false``.
-        self._cost_governor: CostGovernor = CostGovernor(CostGovernorConfig())
-
-        # ── Forward-progress detector ──
-        # Detects when the GENERATE retry loop is stuck producing the same
-        # candidate repeatedly (content-hash identity). Trips after
-        # ``JARVIS_FORWARD_PROGRESS_MAX_REPEATS`` consecutive identical
-        # candidates and aborts the op via the phase-aware terminal picker.
-        # Disable via ``JARVIS_FORWARD_PROGRESS_ENABLED=false``.
-        self._forward_progress: ForwardProgressDetector = ForwardProgressDetector(
-            ForwardProgressConfig(),
+        # ── Phase 1 Step 3C: reload-hostile state hoisted to _governance_state ──
+        # Every field that would otherwise get re-allocated on
+        # ``importlib.reload(orchestrator)`` now lives on an
+        # :class:`OrchestratorState` dataclass in the quarantined
+        # ``_governance_state`` module. When
+        # ``JARVIS_UNQUARANTINE_ORCHESTRATOR=true``, the state is a
+        # process-wide singleton — the second-generation orchestrator
+        # instance rebinds into the already-populated state without
+        # losing the oracle update lock, cost governor, forward-
+        # progress detector, session lessons, RSI trackers, hot-reload
+        # subscription, or any of the seven harness-attached refs.
+        # When the flag is false (default during rollout), each call
+        # mints a fresh state via ``OrchestratorState.fresh(...)`` so
+        # behavior is bit-for-bit identical to the pre-hoist code.
+        from backend.core.ouroboros.governance._governance_state import (
+            OrchestratorState,
+            get_orchestrator_state,
+            unquarantine_orchestrator_enabled,
         )
 
-        # ── Productivity-ratio detector (EC9) ──
-        # Catches the silent-burn failure mode: model produces semantically
-        # identical candidates with cosmetic differences (whitespace, import
-        # order, docstring tweaks) that slip past EC8's byte-identical hash
-        # while burning real money on each retry. EC9 normalizes each
-        # candidate (AST dump for Python, canonical JSON, whitespace fallback
-        # for everything else) and trips when cost accumulated since the last
-        # *semantic* change crosses a USD threshold. Disable via
-        # ``JARVIS_EC9_ENABLED=false``.
-        self._productivity_detector: ProductivityDetector = ProductivityDetector(
-            ProductivityDetectorConfig(),
-        )
+        if unquarantine_orchestrator_enabled():
+            self._state = get_orchestrator_state(
+                project_root=self._config.project_root,
+            )
+            logger.info(
+                "[Orchestrator] Unquarantined state path engaged — "
+                "reload-hostile roots sourced from process-wide "
+                "OrchestratorState singleton",
+            )
+        else:
+            self._state = OrchestratorState.fresh(
+                project_root=self._config.project_root,
+            )
 
-        # ── Session Intelligence: ephemeral lessons buffer ──
-        # Accumulates compact lessons from completed/failed ops within this
-        # session.  Injected into subsequent generation prompts so the model
-        # avoids repeating mistakes and builds on successes.
-        # Thread-safety: safe under asyncio single-threaded event loop.
-        # If the orchestrator ever moves to multi-threaded execution,
-        # wrap accesses in an asyncio.Lock.
-        self._session_lessons: list = []  # List[Tuple[str, str]] — (lesson_type, lesson_text)
+        # Bind-once aliases for container-stable roots. These fields are
+        # never reassigned after __init__ — the dataclass attribute
+        # identity stays put, so an instance-level alias is safe and
+        # minimizes call-site churn. Compare with the property/setter
+        # pattern below, which is required for *rebindable* fields.
+        self._oracle_update_lock: asyncio.Lock = self._state.oracle_update_lock
+        self._cost_governor: CostGovernor = self._state.cost_governor
+        self._forward_progress: ForwardProgressDetector = self._state.forward_progress
+        self._productivity_detector: ProductivityDetector = (
+            self._state.productivity_detector
+        )
+        # Counter dataclass alias — see class-level note on why the
+        # candidate_generator pattern (bind once, mutate attributes on
+        # the stable dataclass) is safer than property/setter for int
+        # read-modify-write patterns like ``x += 1``.
+        self._counters = self._state.counters
+
+        # Config-only ints. Not reload-hostile because they're derived
+        # from env vars and re-read on construction — the post-reload
+        # instance gets the same value without indirection.
         _max = int(os.environ.get("JARVIS_SESSION_LESSONS_MAX", "20"))
         self._session_lessons_max: int = max(5, _max)
-
-        # ── Session intelligence convergence metric ──
-        # Tracks success rate before/after first lesson to detect poisoned lessons.
-        self._ops_before_lesson: int = 0  # ops completed before first lesson recorded
-        self._ops_before_lesson_success: int = 0
-        self._ops_after_lesson: int = 0  # ops completed after first lesson recorded
-        self._ops_after_lesson_success: int = 0
         self._convergence_check_interval: int = int(
             os.environ.get("JARVIS_LESSON_CONVERGENCE_CHECK_INTERVAL", "10")
         )
 
-        # RSI Convergence Framework — lazy initialization
-        self._rsi_score_function = None
-        self._rsi_score_history = None
-        self._rsi_convergence_tracker = None
-        self._rsi_transition_tracker = None
-        try:
-            from backend.core.ouroboros.governance.composite_score import (
-                CompositeScoreFunction, ScoreHistory,
+        # Log whichever trackers are live on the bound state. Preserves
+        # the legacy debug-level visibility without re-running the
+        # optional-module try/except chain (that happens once inside
+        # ``OrchestratorState.fresh()``).
+        if self._state.rsi_score_function is None:
+            logger.debug("RSI: CompositeScoreFunction not available")
+        if self._state.rsi_convergence_tracker is None:
+            logger.debug("RSI: ConvergenceTracker not available")
+        if self._state.rsi_transition_tracker is None:
+            logger.debug("RSI: TransitionProbabilityTracker not available")
+        _hr = self._state.hot_reloader
+        if _hr is not None:
+            logger.info(
+                "[Orchestrator] ModuleHotReloader armed (%d safe modules)",
+                len(_hr.safe_modules),
             )
-            self._rsi_score_function = CompositeScoreFunction()
-            _rsi_dir = Path(os.environ.get(
-                "JARVIS_SELF_EVOLUTION_DIR",
-                str(Path.home() / ".jarvis" / "ouroboros" / "evolution"),
-            ))
-            self._rsi_score_history = ScoreHistory(persistence_dir=_rsi_dir)
-        except Exception:
-            logger.debug("RSI: CompositeScoreFunction not available", exc_info=True)
 
-        try:
-            from backend.core.ouroboros.governance.convergence_tracker import ConvergenceTracker
-            self._rsi_convergence_tracker = ConvergenceTracker()
-        except Exception:
-            logger.debug("RSI: ConvergenceTracker not available", exc_info=True)
+    # ─────────────────────────────────────────────────────────────────
+    # Phase 1 Step 3C: property/setter pairs for rebindable state
+    # ─────────────────────────────────────────────────────────────────
+    #
+    # Every field below is either slice-rebound (``xs = xs[-CAP:]``)
+    # or set to ``None`` at construction and later reassigned via a
+    # harness ``set_*()`` method. Both patterns would plant a *real*
+    # instance attribute that shadows any plain descriptor on the
+    # class, so the rebind would silently drift away from the
+    # :class:`OrchestratorState` singleton on the next reload.
+    #
+    # The property/setter pair fixes this by routing every read *and*
+    # write through ``self._state.<field>``. The instance never grows
+    # an attribute that could shadow the class descriptor, so the
+    # post-reload instance sees the already-populated state.
+    #
+    # In-place mutations (``session_lessons.append(x)``,
+    # ``session_lessons.clear()``) are alias-safe — they operate on
+    # the list identity held inside ``self._state``, not on a local
+    # copy — so the existing call sites keep working unchanged.
 
-        try:
-            from backend.core.ouroboros.governance.transition_tracker import TransitionProbabilityTracker
-            self._rsi_transition_tracker = TransitionProbabilityTracker()
-        except Exception:
-            logger.debug("RSI: TransitionProbabilityTracker not available", exc_info=True)
+    @property
+    def _session_lessons(self) -> list:
+        return self._state.session_lessons
 
-        # ── Module hot-reloader (Manifesto §6 RSI loop closer) ──
-        # When O+V successfully self-modifies a hot-reloadable governance
-        # module (verify_gate, patch_benchmarker, semantic_triage,
-        # plan_generator, strategic_direction), reload the new code in-process
-        # so the very next op picks it up — no process restart required.
-        # Disable via JARVIS_HOT_RELOAD_ENABLED=false. Quarantined modules
-        # (orchestrator, providers, sensors) still require a restart, which
-        # the harness handles via the restart_pending flag.
-        self._hot_reloader: Optional[Any] = None
-        if os.environ.get("JARVIS_HOT_RELOAD_ENABLED", "true").lower() != "false":
-            try:
-                from backend.core.ouroboros.governance.module_hot_reloader import (
-                    ModuleHotReloader,
-                )
-                self._hot_reloader = ModuleHotReloader(
-                    project_root=self._config.project_root,
-                )
-                logger.info(
-                    "[Orchestrator] ModuleHotReloader armed (%d safe modules)",
-                    len(self._hot_reloader.safe_modules),
-                )
-            except Exception:
-                logger.debug(
-                    "[Orchestrator] ModuleHotReloader unavailable",
-                    exc_info=True,
-                )
+    @_session_lessons.setter
+    def _session_lessons(self, value: list) -> None:
+        self._state.session_lessons = value
+
+    @property
+    def _ops_before_lesson(self) -> int:
+        return self._state.counters.ops_before_lesson
+
+    @_ops_before_lesson.setter
+    def _ops_before_lesson(self, value: int) -> None:
+        self._state.counters.ops_before_lesson = value
+
+    @property
+    def _ops_before_lesson_success(self) -> int:
+        return self._state.counters.ops_before_lesson_success
+
+    @_ops_before_lesson_success.setter
+    def _ops_before_lesson_success(self, value: int) -> None:
+        self._state.counters.ops_before_lesson_success = value
+
+    @property
+    def _ops_after_lesson(self) -> int:
+        return self._state.counters.ops_after_lesson
+
+    @_ops_after_lesson.setter
+    def _ops_after_lesson(self, value: int) -> None:
+        self._state.counters.ops_after_lesson = value
+
+    @property
+    def _ops_after_lesson_success(self) -> int:
+        return self._state.counters.ops_after_lesson_success
+
+    @_ops_after_lesson_success.setter
+    def _ops_after_lesson_success(self, value: int) -> None:
+        self._state.counters.ops_after_lesson_success = value
+
+    @property
+    def _rsi_score_function(self) -> Optional[Any]:
+        return self._state.rsi_score_function
+
+    @_rsi_score_function.setter
+    def _rsi_score_function(self, value: Optional[Any]) -> None:
+        self._state.rsi_score_function = value
+
+    @property
+    def _rsi_score_history(self) -> Optional[Any]:
+        return self._state.rsi_score_history
+
+    @_rsi_score_history.setter
+    def _rsi_score_history(self, value: Optional[Any]) -> None:
+        self._state.rsi_score_history = value
+
+    @property
+    def _rsi_convergence_tracker(self) -> Optional[Any]:
+        return self._state.rsi_convergence_tracker
+
+    @_rsi_convergence_tracker.setter
+    def _rsi_convergence_tracker(self, value: Optional[Any]) -> None:
+        self._state.rsi_convergence_tracker = value
+
+    @property
+    def _rsi_transition_tracker(self) -> Optional[Any]:
+        return self._state.rsi_transition_tracker
+
+    @_rsi_transition_tracker.setter
+    def _rsi_transition_tracker(self, value: Optional[Any]) -> None:
+        self._state.rsi_transition_tracker = value
+
+    @property
+    def _hot_reloader(self) -> Optional[Any]:
+        return self._state.hot_reloader
+
+    @_hot_reloader.setter
+    def _hot_reloader(self, value: Optional[Any]) -> None:
+        self._state.hot_reloader = value
+
+    # § 4 attached refs — all seven flow through ``self._state``.
+    # Harness ``set_*()`` methods below assign through these setters,
+    # so rebinding the orchestrator class does not require re-running
+    # the harness wiring pass.
+
+    @property
+    def _reasoning_bridge(self) -> Optional[Any]:
+        return self._state.reasoning_bridge
+
+    @_reasoning_bridge.setter
+    def _reasoning_bridge(self, value: Optional[Any]) -> None:
+        self._state.reasoning_bridge = value
+
+    @property
+    def _infra_applicator(self) -> Optional[Any]:
+        return self._state.infra_applicator
+
+    @_infra_applicator.setter
+    def _infra_applicator(self, value: Optional[Any]) -> None:
+        self._state.infra_applicator = value
+
+    @property
+    def _reasoning_narrator(self) -> Optional[Any]:
+        return self._state.reasoning_narrator
+
+    @_reasoning_narrator.setter
+    def _reasoning_narrator(self, value: Optional[Any]) -> None:
+        self._state.reasoning_narrator = value
+
+    @property
+    def _dialogue_store(self) -> Optional[Any]:
+        return self._state.dialogue_store
+
+    @_dialogue_store.setter
+    def _dialogue_store(self, value: Optional[Any]) -> None:
+        self._state.dialogue_store = value
+
+    @property
+    def _pre_action_narrator(self) -> Optional[Any]:
+        return self._state.pre_action_narrator
+
+    @_pre_action_narrator.setter
+    def _pre_action_narrator(self, value: Optional[Any]) -> None:
+        self._state.pre_action_narrator = value
+
+    @property
+    def _exploration_fleet(self) -> Optional[Any]:
+        return self._state.exploration_fleet
+
+    @_exploration_fleet.setter
+    def _exploration_fleet(self, value: Optional[Any]) -> None:
+        self._state.exploration_fleet = value
+
+    @property
+    def _critique_engine(self) -> Optional[Any]:
+        return self._state.critique_engine
+
+    @_critique_engine.setter
+    def _critique_engine(self, value: Optional[Any]) -> None:
+        self._state.critique_engine = value
 
     def set_reasoning_bridge(self, bridge: Any) -> None:
-        """Attach a ReasoningChainBridge for pre-CLASSIFY reasoning."""
+        """Attach a ReasoningChainBridge for pre-CLASSIFY reasoning.
+
+        Writes through the :attr:`_reasoning_bridge` setter, which
+        routes into ``self._state.reasoning_bridge``. When the
+        orchestrator class reloads, the new instance inherits the
+        already-populated state and the harness does *not* need to
+        re-run this setter.
+        """
         self._reasoning_bridge = bridge
 
     def set_infra_applicator(self, applicator: Any) -> None:

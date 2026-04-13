@@ -772,10 +772,24 @@ class CandidateGenerator:
         ledger: Optional[Any] = None,  # OperationLedger for batch traceability
         latency_tracker: Optional[DwLatencyTracker] = None,
         exhaustion_watcher: Optional[Any] = None,  # ProviderExhaustionWatcher
+        jprime: Optional[Any] = None,  # PrimeProvider (Phase 3 Scope α primacy)
     ) -> None:
         self._primary = primary
         self._fallback = fallback
         self._tier0 = tier0
+        # Phase 3 Scope α — J-Prime primacy handle. Only consulted from
+        # the BACKGROUND and SPECULATIVE dispatch paths, and only when
+        # ``JARVIS_JPRIME_PRIMACY=true``. Can be ``None`` — primacy is
+        # opt-in and test fixtures often don't build a PrimeProvider.
+        # When the caller doesn't hand one in but ``self._primary`` is
+        # already a PrimeProvider (the usual production wiring), we
+        # detect and reuse it below to keep the API minimal for
+        # existing call sites that don't know about Scope α yet.
+        self._jprime = jprime
+        if self._jprime is None and primary is not None and getattr(
+            primary, "provider_name", ""
+        ) == "gcp-jprime":
+            self._jprime = primary
         self._ledger = ledger
         self._fallback_concurrency = fallback_concurrency
         # HIBERNATION_MODE step 5: optional watcher that counts
@@ -855,6 +869,27 @@ class CandidateGenerator:
         # which a plain ``int`` alias could not. Do not rebind
         # ``self._counters`` — only mutate its fields.
         self._counters = self._state.counters
+
+        # ── Phase 3 Scope α: J-Prime primacy state (process-lifetime) ──
+        # The ``jprime_sem`` (Semaphore(1)) and ``model_stickiness``
+        # placeholder MUST live on the hoisted ``JPrimeState`` even when
+        # ``JARVIS_JPRIME_PRIMACY`` is off today — same binding
+        # discipline as 3A/3B. Per Derek-locked middle path: never place
+        # these roots on a hot ``CandidateGenerator`` instance, because
+        # ``importlib.reload(candidate_generator)`` would silently reset
+        # the client-side concurrency ceiling and let a burst hit the
+        # 50-slot swap-transient queue at the server edge.
+        #
+        # ``get_jprime_state()`` is first-call-wins, so every generator
+        # post-reload sees the same sem token and the same stickiness
+        # dict. The alias here is reference-stable: the sem identity
+        # never changes, so binding once is enough. The counters
+        # container mutates in place for the same reason as
+        # ``self._counters`` above.
+        from ._governance_state import get_jprime_state
+        self._jprime_state = get_jprime_state()
+        self._jprime_sem = self._jprime_state.jprime_sem
+        self._jprime_counters = self._jprime_state.counters
 
     def _raise_exhausted(
         self,
@@ -1445,6 +1480,125 @@ class CandidateGenerator:
         # Otherwise try primary (Claude/J-Prime), then fallback.
         return await self._try_primary_then_fallback(context, deadline)
 
+    async def _try_jprime_primacy(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+        *,
+        route_label: str,
+    ) -> Optional[GenerationResult]:
+        """Phase 3 Scope α: try J-Prime first for BACKGROUND/SPECULATIVE.
+
+        Returns the ``GenerationResult`` on success, or ``None`` to
+        signal "fall through to DW". Never raises — all failure modes
+        (flag off, no handle, sem saturated, generate error, empty
+        result) are translated into a ``None`` return plus a counter
+        bump so the caller can take the DW-only path unchanged.
+
+        Parameters
+        ----------
+        context, deadline:
+            The usual generation args, forwarded to J-Prime unchanged.
+        route_label:
+            ``"BACKGROUND"`` or ``"SPECULATIVE"``. Used only in log
+            messages so operators can tell which route took which
+            branch of the primacy path.
+
+        Why a pre-check on ``self._jprime_sem.locked()``:
+            ``asyncio.Semaphore(1)`` with overflow-fall-through has no
+            clean primitive. We want "try to grab it right now, and if
+            already held, don't queue — go to DW instead." The
+            ``locked()`` check is a tiny race (a sibling op could take
+            the token in the gap between the check and the acquire),
+            but the worst case is that we serialize two ops for one
+            J-Prime call, which is harmless. Using
+            ``wait_for(acquire, timeout=0)`` would raise
+            ``CancelledError`` on some asyncio versions and obscure
+            the intent; ``locked()`` is clearer.
+        """
+        # Deferred import — ``jprime_primacy_enabled`` is a module-level
+        # function in ``_governance_state``, and fetching it at call
+        # time keeps the hot-path branch cheap when the flag is off.
+        from ._governance_state import jprime_primacy_enabled
+
+        if not jprime_primacy_enabled():
+            return None
+        if self._jprime is None or not getattr(
+            self._jprime, "provider_name", ""
+        ):
+            return None
+
+        # Sem saturation — a sibling op is already using the single
+        # client-side slot. Don't queue; fall through to DW so the
+        # background workload doesn't serialize behind one J-Prime call.
+        if self._jprime_sem.locked():
+            self._jprime_counters.jprime_sem_overflows += 1
+            self._jprime_counters.fallthrough_to_dw += 1
+            logger.info(
+                "[CandidateGenerator] %s: J-Prime sem saturated (overflows=%d) "
+                "— falling through to DW",
+                route_label,
+                self._jprime_counters.jprime_sem_overflows,
+            )
+            return None
+
+        remaining = self._remaining_seconds(deadline)
+        if remaining <= 0.0:
+            # No budget left — fall through silently so the DW path
+            # can emit its own deadline-exceeded diagnostic.
+            return None
+
+        async with self._jprime_sem:
+            try:
+                result = await asyncio.wait_for(
+                    self._jprime.generate(context, deadline),
+                    timeout=min(remaining, 180.0),
+                )
+            except asyncio.TimeoutError:
+                self._jprime_counters.jprime_failures += 1
+                self._jprime_counters.fallthrough_to_dw += 1
+                logger.info(
+                    "[CandidateGenerator] %s: J-Prime primacy timeout after "
+                    "%.1fs — falling through to DW",
+                    route_label,
+                    remaining,
+                )
+                return None
+            except Exception as exc:
+                self._jprime_counters.jprime_failures += 1
+                self._jprime_counters.fallthrough_to_dw += 1
+                logger.info(
+                    "[CandidateGenerator] %s: J-Prime primacy error "
+                    "%s(%s) — falling through to DW",
+                    route_label,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None
+
+        if result is None or len(getattr(result, "candidates", ()) or ()) == 0:
+            self._jprime_counters.jprime_failures += 1
+            self._jprime_counters.fallthrough_to_dw += 1
+            logger.info(
+                "[CandidateGenerator] %s: J-Prime primacy returned no "
+                "candidates — falling through to DW",
+                route_label,
+            )
+            return None
+
+        self._jprime_counters.jprime_hits += 1
+        logger.info(
+            "[CandidateGenerator] %s: J-Prime primacy hit — %d candidates "
+            "in %.1fs (hits=%d, overflows=%d, failures=%d)",
+            route_label,
+            len(result.candidates),
+            getattr(result, "generation_duration_s", 0.0) or 0.0,
+            self._jprime_counters.jprime_hits,
+            self._jprime_counters.jprime_sem_overflows,
+            self._jprime_counters.jprime_failures,
+        )
+        return result
+
     async def _generate_background(
         self,
         context: OperationContext,
@@ -1460,6 +1614,12 @@ class CandidateGenerator:
 
         Raises RuntimeError("background_dw_*") on failure — orchestrator
         should re-queue or accept failure, NOT cascade to Claude.
+
+        Phase 3 Scope α (``JARVIS_JPRIME_PRIMACY``): when enabled and a
+        PrimeProvider handle is wired, :meth:`_try_jprime_primacy` is
+        consulted first. Sem saturation or any failure falls through to
+        the DW-only path below unchanged — Claude is still never
+        consulted on this route.
         """
         _urgency = getattr(context, "signal_urgency", "?")
         _source = getattr(context, "signal_source", "?")
@@ -1470,6 +1630,16 @@ class CandidateGenerator:
             "(urgency=%s, source=%s) [%.1fs budget]",
             _urgency, _source, remaining,
         )
+
+        # Phase 3 Scope α — J-Prime primacy pre-check. Returns
+        # ``None`` when the flag is off, no handle is wired, the sem is
+        # saturated, or the J-Prime call failed. On ``None``, drop into
+        # the existing DW-only path below.
+        _primacy_result = await self._try_jprime_primacy(
+            context, deadline, route_label="BACKGROUND",
+        )
+        if _primacy_result is not None:
+            return _primacy_result
 
         if self._tier0 is None or not getattr(self._tier0, "is_available", False):
             raise RuntimeError(
@@ -1544,8 +1714,19 @@ class CandidateGenerator:
         Cost: ~$0.001/op (DW batch, tolerate high discard)
         Latency: N/A (async, result consumed later)
 
-        Always raises RuntimeError("speculative_deferred") — the
-        orchestrator should mark this as a deferred operation, not a failure.
+        Normally raises ``RuntimeError("speculative_deferred")`` — the
+        orchestrator should mark this as a deferred operation, not a
+        failure.
+
+        Phase 3 Scope α (``JARVIS_JPRIME_PRIMACY``): when enabled and a
+        PrimeProvider handle is wired, :meth:`_try_jprime_primacy` is
+        consulted first. Because J-Prime on primacy runs synchronously
+        inside the sem, a successful primacy hit *returns the result
+        directly* instead of raising ``speculative_deferred`` — the
+        caller gets a real synchronous result that can be used
+        immediately, which is strictly better than a deferred batch.
+        Sem saturation or any failure falls through to the existing
+        DW fire-and-forget path below unchanged.
         """
         _source = getattr(context, "signal_source", "?")
         _op_id = getattr(context, "op_id", "unknown")
@@ -1555,6 +1736,15 @@ class CandidateGenerator:
             "(source=%s, op=%s)",
             _source, _op_id,
         )
+
+        # Phase 3 Scope α — J-Prime primacy pre-check. Synchronous hit
+        # upgrades the op from deferred to completed; any miss falls
+        # through to the legacy DW fire-and-forget path below.
+        _primacy_result = await self._try_jprime_primacy(
+            context, deadline, route_label="SPECULATIVE",
+        )
+        if _primacy_result is not None:
+            return _primacy_result
 
         if self._tier0 is not None and getattr(self._tier0, "is_available", False):
             if getattr(self._tier0, "_realtime_enabled", False):

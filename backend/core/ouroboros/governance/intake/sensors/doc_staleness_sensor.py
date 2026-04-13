@@ -162,7 +162,7 @@ class DocStalenessSensor:
 
             try:
                 envelope = make_envelope(
-                    source="runtime_health",
+                    source="doc_staleness",
                     description=finding.summary,
                     target_files=(finding.file_path,),
                     repo=self._repo,

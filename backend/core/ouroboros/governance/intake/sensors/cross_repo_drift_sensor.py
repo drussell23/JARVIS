@@ -245,7 +245,7 @@ class CrossRepoDriftSensor:
 
             try:
                 envelope = make_envelope(
-                    source="runtime_health",
+                    source="cross_repo_drift",
                     description=finding.summary,
                     target_files=("docs/cross-repo-contract.md",),
                     repo=self._repo,

@@ -77,19 +77,29 @@ class ProviderRoute(str, Enum):
 # Source → urgency affinity tables (deterministic, no LLM calls)
 # ---------------------------------------------------------------------------
 
-# Sources that always produce IMMEDIATE-eligible signals when urgent
+# Sources that always produce IMMEDIATE-eligible signals when urgent.
+# Keep this set TIGHT — adding a source here means every high-urgency
+# signal from that sensor will skip DW and go straight to Claude, which
+# is the exact regression that burned $0.53 in bt-2026-04-13-011909 when
+# seven sensors were copy-paste labeling themselves as `runtime_health`.
 _IMMEDIATE_SOURCES = frozenset({
     "test_failure",
     "voice_human",
     "runtime_health",
 })
 
-# Sources that produce BACKGROUND-eligible signals when not urgent
+# Sources that produce BACKGROUND-eligible signals.
+# Per CLAUDE.md §"Urgency-Aware Provider Routing": "BACKGROUND route —
+# DW only, no Claude fallback. When: OpportunityMiner, DocStaleness,
+# TODOs, backlog." Any sensor whose work is cost-optimization-first
+# belongs here so its ops stay off the Claude tier entirely.
 _BACKGROUND_SOURCES = frozenset({
     "ai_miner",
     "exploration",
     "backlog",
     "architecture",
+    "todo_scanner",
+    "doc_staleness",
 })
 
 # Sources that produce SPECULATIVE-eligible signals

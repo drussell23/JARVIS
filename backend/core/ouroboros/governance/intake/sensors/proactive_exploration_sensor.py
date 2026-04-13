@@ -116,7 +116,7 @@ class ProactiveExplorationSensor:
                 top_rule = max(failure_rules, key=lambda r: r.confidence)
                 try:
                     envelope = make_envelope(
-                        source="runtime_health",
+                        source="exploration",
                         description=(
                             f"Proactive exploration: domain '{domain_key}' has "
                             f"persistent uncertainty (confidence={top_rule.confidence:.0%}, "

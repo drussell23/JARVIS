@@ -171,7 +171,7 @@ class PerformanceRegressionSensor:
 
             try:
                 envelope = make_envelope(
-                    source="runtime_health",
+                    source="performance_regression",
                     description=finding.summary,
                     target_files=("backend/core/ouroboros/governance/orchestrator.py",),
                     repo=self._repo,
