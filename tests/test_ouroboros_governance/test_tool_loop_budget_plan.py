@@ -584,3 +584,219 @@ class TestToolLoopIntegratedBudget:
         plan = coordinator._build_budget_plan(time.monotonic() + 60.0)
         assert plan.min_per_round_s == 4.0
         assert plan.final_write_reserve_s == 15.0
+
+
+# ── Phase 2: pre-round viability gate (bt-2026-04-12-054855) ────────────
+#
+# Root cause: after a Tier-0 (DW) timeout, the fallback provider received
+# only ``parent_remaining`` seconds. Round 0 of the tool loop spent most of
+# that on a legitimate stream, leaving round 1+ with a sub-floor remainder
+# (observed: 6.7s). The Claude call then died at ``first_token=NEVER,
+# bytes_received=0`` and the whole op was dispatched as ``fallback_failed``.
+#
+# The fix is an absolute-floor gate at the top of every round > 0: if
+# ``remaining < plan.min_per_round_s`` we raise
+# ``tool_loop_round_budget_starved`` before the doomed API call, and
+# ``CandidateGenerator._call_fallback`` promotes the breadcrumb cause from
+# ``fallback_failed`` to ``fallback_round_starved``.
+
+
+class TestBudgetPlanViabilityMath:
+    """Pure math for ``unclamped_fair_share_s`` + ``is_next_round_viable``."""
+
+    def test_unclamped_fair_share_divides_usable_by_rounds_left(self):
+        plan = BudgetPlan.build(
+            total_budget_s=60.0,
+            hard_max_rounds=15,
+            max_per_round_s=30.0,
+            final_write_reserve_s=10.0,
+            min_per_round_s=3.0,
+        )
+        # usable = 60 - 10 = 50; 50 / 10 = 5.0s per round
+        assert plan.unclamped_fair_share_s(60.0, 10) == pytest.approx(5.0)
+
+    def test_unclamped_fair_share_returns_zero_when_only_reserve_left(self):
+        plan = BudgetPlan.build(60.0, 15, 30.0, final_write_reserve_s=10.0)
+        # remaining==reserve → usable==0 → fair share 0.0
+        assert plan.unclamped_fair_share_s(10.0, 5) == 0.0
+
+    def test_unclamped_fair_share_differs_from_clamped_when_starved(self):
+        """The whole point of the unclamped helper: surface structural
+        starvation that ``per_round_timeout``'s clamp hides."""
+        plan = BudgetPlan.build(
+            total_budget_s=60.0,
+            hard_max_rounds=15,
+            max_per_round_s=30.0,
+            final_write_reserve_s=10.0,
+            min_per_round_s=3.0,
+        )
+        # remaining = 11s, 10 rounds left → usable=1s, fair=0.1s
+        # per_round_timeout clamps up to min=3.0, hiding the starvation.
+        clamped = plan.per_round_timeout(11.0, 10)
+        raw = plan.unclamped_fair_share_s(11.0, 10)
+        assert clamped == pytest.approx(3.0)
+        assert raw == pytest.approx(0.1)
+        assert raw < plan.min_per_round_s
+
+    def test_is_next_round_viable_true_above_floor(self):
+        plan = BudgetPlan.build(60.0, 15, 30.0, min_per_round_s=3.0)
+        assert plan.is_next_round_viable(60.0, 10) is True
+
+    def test_is_next_round_viable_false_when_starved(self):
+        plan = BudgetPlan.build(60.0, 15, 30.0, min_per_round_s=3.0)
+        # remaining = 11s, 10 rounds → fair=0.1 < min=3.0 → not viable
+        assert plan.is_next_round_viable(11.0, 10) is False
+
+    def test_is_next_round_viable_zero_remaining_is_not_viable(self):
+        plan = BudgetPlan.build(60.0, 15, 30.0)
+        assert plan.is_next_round_viable(0.0, 5) is False
+
+
+class TestToolLoopRoundStarvationGate:
+    """Integrated coverage for the Phase 2 gate in ``run()``."""
+
+    @pytest.mark.asyncio
+    async def test_round_zero_runs_even_on_tight_budget(self, tmp_path):
+        """Round 0 is *never* gated — the caller's fresh budget deserves
+        one shot, otherwise legitimate small ops would starve themselves."""
+        backend = _TrackingBackend()
+        coordinator = ToolLoopCoordinator(
+            backend=backend,
+            policy=_allow_policy(tmp_path),
+            max_rounds=5,
+            tool_timeout_s=30.0,
+            min_per_round_s=3.0,
+            final_write_reserve_s=1.0,
+        )
+
+        async def generate_fn(_prompt: str) -> str:
+            return _final_resp()  # Immediately final, no tool rounds.
+
+        raw, records = await coordinator.run(
+            prompt="x",
+            generate_fn=generate_fn,
+            parse_fn=_parse_fn,
+            repo="jarvis",
+            op_id="op-round0",
+            deadline=time.monotonic() + 5.0,  # tight but valid
+        )
+        assert "candidates" in raw
+        assert records == []
+
+    @pytest.mark.asyncio
+    async def test_round_one_bails_when_remaining_below_min_per_round(
+        self, tmp_path
+    ):
+        """The bt-2026-04-12-054855 reproduction: round 0 consumes most of
+        the budget, round 1 inherits a sub-floor remainder, gate fires."""
+        backend = _TrackingBackend()
+        coordinator = ToolLoopCoordinator(
+            backend=backend,
+            policy=_allow_policy(tmp_path),
+            max_rounds=10,
+            tool_timeout_s=30.0,
+            min_per_round_s=3.0,
+            final_write_reserve_s=1.0,
+        )
+
+        # Round 0: asks for a tool, burns ~4.5s of a 5s budget.
+        # Round 1: only ~0.5s remain — below min_per_round_s=3.0 → bail.
+        async def generate_fn(prompt: str) -> str:
+            if "Observation" not in prompt:
+                await asyncio.sleep(4.5)
+                return _tool_resp()
+            # Should never reach here — the gate must fire first.
+            return _final_resp()
+
+        with pytest.raises(
+            RuntimeError, match="tool_loop_round_budget_starved"
+        ):
+            await coordinator.run(
+                prompt="x",
+                generate_fn=generate_fn,
+                parse_fn=_parse_fn,
+                repo="jarvis",
+                op_id="op-starved",
+                deadline=time.monotonic() + 5.0,
+            )
+
+        # Round 0's tool call executed; round 1 never reached generate_fn.
+        assert backend.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_round_starved_error_message_carries_breadcrumbs(
+        self, tmp_path
+    ):
+        """The RuntimeError string must include ``round=``, ``remaining=``
+        and ``min_per_round=`` so ``_call_fallback``'s substring match and
+        the breadcrumb audit have the fields they need."""
+        backend = _TrackingBackend()
+        coordinator = ToolLoopCoordinator(
+            backend=backend,
+            policy=_allow_policy(tmp_path),
+            max_rounds=10,
+            tool_timeout_s=30.0,
+            min_per_round_s=3.0,
+            final_write_reserve_s=1.0,
+        )
+
+        async def generate_fn(prompt: str) -> str:
+            if "Observation" not in prompt:
+                await asyncio.sleep(4.5)
+                return _tool_resp()
+            return _final_resp()
+
+        with pytest.raises(RuntimeError) as ei:
+            await coordinator.run(
+                prompt="x",
+                generate_fn=generate_fn,
+                parse_fn=_parse_fn,
+                repo="jarvis",
+                op_id="op-crumbs",
+                deadline=time.monotonic() + 5.0,
+            )
+
+        msg = str(ei.value)
+        assert "tool_loop_round_budget_starved" in msg
+        assert "round=" in msg
+        assert "remaining=" in msg
+        assert "min_per_round=" in msg
+
+    @pytest.mark.asyncio
+    async def test_reserve_nudge_path_still_wins_when_not_starved(
+        self, tmp_path
+    ):
+        """The reserve-based graceful wind-down must still own the
+        normal-tempo exit. The absolute-floor gate is a safety net and
+        must not supersede ``should_stop_for_final_write``."""
+        backend = _TrackingBackend()
+        coordinator = ToolLoopCoordinator(
+            backend=backend,
+            policy=_allow_policy(tmp_path),
+            max_rounds=15,
+            tool_timeout_s=30.0,
+            # Reserve > min_per_round so the reserve check fires first.
+            final_write_reserve_s=5.0,
+            min_per_round_s=0.5,
+        )
+
+        prompts_seen: List[str] = []
+
+        async def generate_fn(prompt: str) -> str:
+            prompts_seen.append(prompt)
+            await asyncio.sleep(1.5)
+            if "Budget reserve reached" in prompt:
+                return _final_resp()
+            return _tool_resp()
+
+        await coordinator.run(
+            prompt="x",
+            generate_fn=generate_fn,
+            parse_fn=_parse_fn,
+            repo="jarvis",
+            op_id="op-reserve-wins",
+            deadline=time.monotonic() + 8.0,
+        )
+
+        # Reserve nudge fired → graceful wind-down won.
+        assert any("Budget reserve reached" in p for p in prompts_seen)

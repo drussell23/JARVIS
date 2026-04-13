@@ -1912,8 +1912,17 @@ class CandidateGenerator:
                 raise
             mode = FailbackStateMachine.classify_exception(exc)
             self.fsm.record_fallback_failure(mode=mode)
+            # Distinct cause tag when the tool-loop pre-round viability
+            # gate fired. This is NOT a transport/API failure — it's a
+            # round-level budget exhaustion that the ToolLoopCoordinator
+            # caught before a doomed sub-floor call. Keeping the cause
+            # distinct in breadcrumbs lets grep audits see "round_starved"
+            # vs generic "fallback_failed" without reading full messages.
+            _cause = "fallback_failed"
+            if "tool_loop_round_budget_starved" in str(exc):
+                _cause = "fallback_round_starved"
             self._raise_exhausted(
-                "fallback_failed",
+                _cause,
                 context=context,
                 deadline=deadline,
                 fallback_exc=exc,

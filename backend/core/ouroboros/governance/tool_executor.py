@@ -2688,6 +2688,39 @@ class BudgetPlan:
         """
         return float(remaining_s) <= self.final_write_reserve_s
 
+    def unclamped_fair_share_s(
+        self, remaining_s: float, remaining_rounds: int
+    ) -> float:
+        """Return the UNCLAMPED per-round fair share in seconds.
+
+        Unlike :meth:`per_round_timeout`, this does NOT apply the
+        ``[min_per_round_s, max_per_round_s]`` clamp — it returns the raw
+        fair share so callers can detect structural starvation: when the
+        clamped value reports ``min_per_round_s`` but the unclamped share
+        is 0.3s, the next round would start with less than its floor.
+        """
+        usable = max(0.0, float(remaining_s) - self.final_write_reserve_s)
+        rounds_left = max(1, int(remaining_rounds))
+        return usable / rounds_left
+
+    def is_next_round_viable(
+        self, remaining_s: float, remaining_rounds: int
+    ) -> bool:
+        """Return True when the next tool round has structural fair share.
+
+        A round is viable when the unclamped fair share of the remaining
+        budget is at least ``min_per_round_s``. Rounds below that floor
+        are guaranteed to burn a doomed sub-floor API call (first_token
+        NEVER, bytes_received 0), and should be failed fast before they
+        poison the rest of the operation sequence (Manifesto §3 —
+        disciplined concurrency; diagnosed in bt-2026-04-12-054855 where
+        a 6.7s tool round died at 0.0s elapsed).
+        """
+        return (
+            self.unclamped_fair_share_s(remaining_s, remaining_rounds)
+            >= self.min_per_round_s
+        )
+
     def describe(self) -> str:
         """Human-readable one-liner for telemetry logs."""
         return (
@@ -3087,6 +3120,45 @@ class ToolLoopCoordinator:
                 self._last_records = list(records)
                 self._finalize_run(op_id)
                 raise RuntimeError("tool_loop_max_rounds_exceeded")
+
+            # ── Pre-round hard-floor viability gate (Manifesto §3) ──
+            # Round 0 always runs — the caller's refreshed fallback budget
+            # gets its first shot. Rounds 1+ need at least one
+            # ``min_per_round_s`` worth of wall-clock to have any chance
+            # of producing work; below that, the call is doomed to die
+            # with ``first_token=NEVER, bytes_received=0`` (see
+            # bt-2026-04-12-054855 L865). Bail cleanly with a distinct
+            # reason so breadcrumbs can tag this separately from generic
+            # timeouts.
+            #
+            # This is an ABSOLUTE floor, not a fair-share check — the
+            # reserve-based ``should_stop_for_final_write`` path below
+            # still owns graceful wind-down, and stays the primary exit
+            # for normal-tempo ops. This gate is the safety net for
+            # catastrophic cases where even the reserve can't save us.
+            if round_index > 0:
+                _remaining_pre = deadline - time.monotonic()
+                if _remaining_pre <= 0:
+                    self._last_records = list(records)
+                    self._finalize_run(op_id)
+                    raise RuntimeError("tool_loop_deadline_exceeded")
+                if _remaining_pre < plan.min_per_round_s:
+                    logger.warning(
+                        "[ToolLoop] op=%s round=%d budget_starved "
+                        "remaining=%.2fs min_per_round=%.2fs reserve=%.2fs "
+                        "— bailing pre-call",
+                        op_id[:12] if op_id else "?",
+                        round_index, _remaining_pre, plan.min_per_round_s,
+                        plan.final_write_reserve_s,
+                    )
+                    self._last_records = list(records)
+                    self._finalize_run(op_id)
+                    raise RuntimeError(
+                        "tool_loop_round_budget_starved:"
+                        f"round={round_index},"
+                        f"remaining={_remaining_pre:.2f}s,"
+                        f"min_per_round={plan.min_per_round_s:.2f}s"
+                    )
 
             # Signal to provider: use lower max_tokens for tool rounds
             self.is_tool_round = (round_index > 0)
