@@ -1844,15 +1844,22 @@ class BattleTestHarness:
     async def _monitor_provider_costs(self) -> None:
         """Background task: polls provider stats and feeds costs into CostTracker.
 
-        Runs every 5 seconds. Computes *incremental* cost since the last poll
-        and calls CostTracker.record() so the battle test's --cost-cap flag
-        actually triggers budget_event when real API spend is reached.
+        Poll cadence is env-driven. Default 1.0s (was 5.0s — Task #95 hard-cap
+        fix). The old 5s gap allowed a full Claude call to land between polls
+        and bill *after* the budget was already crossed, causing ~$0.036
+        overshoot on a $0.50 cap. Env: ``JARVIS_COST_POLL_INTERVAL_S``.
         """
+        try:
+            interval = float(os.environ.get("JARVIS_COST_POLL_INTERVAL_S", "1.0"))
+            if interval <= 0.0:
+                interval = 1.0
+        except (TypeError, ValueError):
+            interval = 1.0
         _last_dw_cost: float = 0.0
         _last_claude_cost: float = 0.0
         try:
             while True:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(interval)
                 gls = self._governed_loop_service
                 if gls is None:
                     continue

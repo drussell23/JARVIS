@@ -1248,13 +1248,32 @@ class GovernedLoopService:
                 except asyncio.CancelledError:
                     pass
 
-        # Drain in-flight ops (wait up to 30s)
+        # Hard-cancel in-flight pool ops. Task #95: budget-exhaust shutdown
+        # must not let background workers keep issuing Claude/DW calls that
+        # bill *after* CostTracker.budget_event fires. The previous
+        # ``asyncio.sleep(0)`` was a no-op drain — workers survived, calls
+        # completed, spend overshot the --cost-cap. Manifesto §6 hard stop.
+        _bg_pool = getattr(self, "_bg_pool", None)
+        if _bg_pool is not None:
+            try:
+                active = _bg_pool.list_active()
+            except Exception:
+                active = []
+            if active:
+                logger.info(
+                    "[GovernedLoop] Cancelling %d in-flight pool ops via _bg_pool.stop()",
+                    len(active),
+                )
+            try:
+                await _bg_pool.stop()
+            except Exception as exc:
+                logger.warning("[GovernedLoop] _bg_pool.stop() error: %s", exc)
+
         if self._active_ops:
             logger.info(
-                "[GovernedLoop] Draining %d active ops...",
+                "[GovernedLoop] %d FSM contexts remained at stop",
                 len(self._active_ops),
             )
-            await asyncio.sleep(0)  # Yield for any pending completions
 
         # Stop EventChannelServer (DW 3-tier webhook receiver)
         _evt_ch = getattr(self, "_event_channel", None)

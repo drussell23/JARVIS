@@ -161,6 +161,66 @@ class TestGovernedLoopServiceLifecycle:
         await service.stop()
         assert service.state is ServiceState.INACTIVE
 
+    async def test_stop_cancels_background_agent_pool(self) -> None:
+        """Regression for Task #95 (budget cap overshoot).
+
+        GovernedLoopService.stop() must invoke BackgroundAgentPool.stop()
+        so that in-flight workers (which are issuing paid Claude/DW calls)
+        are cancelled when the harness hits --cost-cap. Prior behaviour
+        was a fake ``await asyncio.sleep(0)`` drain that let workers keep
+        billing after ``budget_event`` fired — session bt-2026-04-13-011909
+        overshot $0.50 → $0.5364 (+7.3%).
+        """
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+
+        stack = _mock_stack()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        service = GovernedLoopService(stack=stack, prime_client=None, config=config)
+        await service.start()
+
+        fake_pool = MagicMock()
+        fake_pool.stop = AsyncMock()
+        fake_pool.list_active = MagicMock(return_value=[
+            MagicMock(op_id="bgop-abc123"),
+            MagicMock(op_id="bgop-def456"),
+        ])
+        service._bg_pool = fake_pool
+
+        await service.stop()
+
+        fake_pool.stop.assert_awaited_once()
+        fake_pool.list_active.assert_called()
+
+    async def test_stop_tolerates_bg_pool_stop_exception(self) -> None:
+        """GLS.stop() must not raise if _bg_pool.stop() itself fails.
+
+        Exception is logged and swallowed so the rest of the teardown
+        (EventChannel, stack detach) still runs. Hard cap > clean drain.
+        """
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+            ServiceState,
+        )
+
+        stack = _mock_stack()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        service = GovernedLoopService(stack=stack, prime_client=None, config=config)
+        await service.start()
+
+        failing_pool = MagicMock()
+        failing_pool.list_active = MagicMock(side_effect=RuntimeError("pool inspect boom"))
+        failing_pool.stop = AsyncMock(side_effect=RuntimeError("pool stop boom"))
+        service._bg_pool = failing_pool
+
+        await service.stop()
+
+        failing_pool.stop.assert_awaited_once()
+        assert service.state is ServiceState.INACTIVE
+
     async def test_registers_initial_canary_slices(self) -> None:
         from backend.core.ouroboros.governance.governed_loop_service import (
             GovernedLoopConfig,

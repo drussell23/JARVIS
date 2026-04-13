@@ -238,3 +238,110 @@ class TestHarnessLifecycle:
         await harness.run()
 
         assert harness._stop_reason == "idle_timeout"
+
+
+class TestHarnessCostPollInterval:
+    """Regression for Task #95 (budget cap overshoot).
+
+    ``_monitor_provider_costs()`` must use an env-driven poll interval.
+    The default dropped from 5.0s → 1.0s so the budget_event fires soon
+    enough after spend crosses --cost-cap that the in-flight shutdown
+    catches the next paid call. Env: ``JARVIS_COST_POLL_INTERVAL_S``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cost_monitor_default_interval_is_tight(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("JARVIS_COST_POLL_INTERVAL_S", raising=False)
+        cfg = HarnessConfig(
+            repo_path=tmp_path,
+            session_dir=tmp_path / "session",
+            notebook_output_dir=tmp_path / "notebooks",
+        )
+        harness = BattleTestHarness(cfg)
+        harness._governed_loop_service = None
+
+        observed: list = []
+
+        async def fake_sleep(seconds: float) -> None:
+            observed.append(seconds)
+            raise asyncio.CancelledError
+
+        with patch("asyncio.sleep", side_effect=fake_sleep):
+            task = asyncio.create_task(harness._monitor_provider_costs())
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        assert observed, "cost monitor never slept"
+        assert observed[0] == 1.0, f"default should be 1.0s, got {observed[0]}"
+
+    @pytest.mark.asyncio
+    async def test_cost_monitor_respects_env_var(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_COST_POLL_INTERVAL_S", "0.25")
+        cfg = HarnessConfig(
+            repo_path=tmp_path,
+            session_dir=tmp_path / "session",
+            notebook_output_dir=tmp_path / "notebooks",
+        )
+        harness = BattleTestHarness(cfg)
+        harness._governed_loop_service = None
+
+        observed: list = []
+
+        async def fake_sleep(seconds: float) -> None:
+            observed.append(seconds)
+            raise asyncio.CancelledError
+
+        with patch("asyncio.sleep", side_effect=fake_sleep):
+            task = asyncio.create_task(harness._monitor_provider_costs())
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        assert observed[0] == 0.25, f"env var override ignored, got {observed[0]}"
+
+    @pytest.mark.asyncio
+    async def test_cost_monitor_rejects_non_positive_interval(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_COST_POLL_INTERVAL_S", "0")
+        cfg = HarnessConfig(repo_path=tmp_path, session_dir=tmp_path / "session")
+        harness = BattleTestHarness(cfg)
+        harness._governed_loop_service = None
+
+        observed: list = []
+
+        async def fake_sleep(seconds: float) -> None:
+            observed.append(seconds)
+            raise asyncio.CancelledError
+
+        with patch("asyncio.sleep", side_effect=fake_sleep):
+            task = asyncio.create_task(harness._monitor_provider_costs())
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        assert observed[0] == 1.0, f"non-positive should fall back to 1.0, got {observed[0]}"
+
+    @pytest.mark.asyncio
+    async def test_cost_monitor_rejects_malformed_interval(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_COST_POLL_INTERVAL_S", "not-a-number")
+        cfg = HarnessConfig(repo_path=tmp_path, session_dir=tmp_path / "session")
+        harness = BattleTestHarness(cfg)
+        harness._governed_loop_service = None
+
+        observed: list = []
+
+        async def fake_sleep(seconds: float) -> None:
+            observed.append(seconds)
+            raise asyncio.CancelledError
+
+        with patch("asyncio.sleep", side_effect=fake_sleep):
+            task = asyncio.create_task(harness._monitor_provider_costs())
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        assert observed[0] == 1.0, f"malformed should fall back to 1.0, got {observed[0]}"

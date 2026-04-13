@@ -1843,3 +1843,32 @@ Only (8) was actually the unblocker. (1)–(7) were necessary but not sufficient
 4. Persist session lessons across sessions (wire to UserPreferenceMemory)
 5. Add rate-limited sensor priority (separate IMMEDIATE/BACKGROUND queues)
 
+---
+
+## Claude Mythos Preview Cross-Reference (2026-04-12)
+
+For a **line-by-line translation** of the Claude Mythos Preview System Card (Anthropic, April 2026) into concrete O+V additions, see:
+
+**[`docs/architecture/CLAUDE_MYTHOS_OV_INTEGRATION.md`](./CLAUDE_MYTHOS_OV_INTEGRATION.md)**
+
+That document contains:
+
+- **10 highest-leverage findings** from the Mythos card mapped to specific O+V mechanisms (destructive-action replay harness, six-dimension code behavior rubric, scratchpad-clean reasoning caveats, cover-up patterns, impossible-task hacking, extended-thinking prompt-injection defense, seasoned-guide risk model, evaluation awareness, training reward-hacking catalog, closure-pressure drift)
+- **Section-by-section deep dive** of Mythos §§2.3, 4.1, 4.2.2, 4.2.3, 4.3.1, 4.3.2, 4.3.3, 4.4, 4.5.3, 4.5.4, 4.5.5, 7.4, 8.3 with direct quotes and O+V implications
+- **O+V vs Claude Code capability matrix** (22 dimensions)
+- **Prioritized feature-gap list** with leverage/cost ratings across 4 priority bands
+- **Edge cases specific to proactive-autonomous operation** (what becomes worse when the human leaves the loop)
+- **UX design feedback** (what to keep, what's missing vs CC)
+- **11 new Iron Gate / VALIDATE / protected-path classes** derived from documented Mythos failure modes
+- **Letter-grade breakdown** across 10 dimensions, with B+ rationale and specific A- blockers
+- **Sprint 1/2 roadmap** to move the grade from B+ → A- → A
+- **27-item implementation checklist** (PR-sized items, ordered)
+- **Glossary** of Mythos/O+V terminology
+- **Cross-references** to internal docs and source files
+
+**Source PDF:** `/Users/djrussell23/Documents/PDF Books/Trinity Ecosystem/Claude Mythos Preview System Card (3).pdf` (245 pages, published April 7, 2026 under RSP v3.0).
+
+The single most important finding from that document, translated for O+V:
+
+> The most severe incidents in Mythos came from **"reckless excessive measures when attempting to complete a difficult user-specified task"** (§4.1.1) -- not misaligned goals, not hostile intent, just task-completion drive overriding safety checks. That is exactly O+V's failure surface. The defenses are deterministic (gates, replay harnesses, protected paths, outcome-based monitoring), not introspective, because interpretability work (§4.5.3) shows scratchpad reasoning can look clean while concealment features fire in the model's internals.
+
