@@ -33,6 +33,7 @@ from backend.core.ouroboros.governance.op_context import (
     OperationPhase,
     ValidationResult,
 )
+from backend.core.ouroboros.governance.plan_generator import PlanResult
 from backend.core.ouroboros.governance.orchestrator import (
     GovernedOrchestrator,
     OrchestratorConfig,
@@ -310,6 +311,106 @@ class TestApprovalFlow:
 
         # No approval provider when approval is required -> CANCELLED
         assert result.phase is OperationPhase.CANCELLED
+
+
+@pytest.mark.asyncio
+class TestPlanReviewMode:
+    """Session-level /plan mode should force plan review before execution."""
+
+    async def test_plan_review_mode_gates_even_trivial_ops(self) -> None:
+        stack = _mock_stack()
+        generator = _mock_generator()
+        approval = _mock_approval_provider(status=ApprovalStatus.APPROVED)
+        approval.request_plan = AsyncMock(return_value="op-test-001::plan")
+        config = OrchestratorConfig(
+            project_root=Path("/tmp/test-project"),
+            generation_timeout_s=5.0,
+            validation_timeout_s=5.0,
+            approval_timeout_s=5.0,
+            max_generate_retries=1,
+            max_validate_retries=2,
+            context_expansion_enabled=False,
+        )
+        ctx = _make_context(description="Fix typo")
+        plan_result = PlanResult(
+            plan_json='{"schema_version":"plan.1"}',
+            approach="Make the small change directly and verify it.",
+            complexity="trivial",
+            ordered_changes=[
+                {
+                    "file_path": "backend/core/utils.py",
+                    "change_type": "modify",
+                    "description": "Update the utility implementation.",
+                    "dependencies": [],
+                    "estimated_scope": "small",
+                }
+            ],
+            test_strategy="Run focused unit tests.",
+        )
+
+        with patch.dict("os.environ", {"JARVIS_SHOW_PLAN_BEFORE_EXECUTE": "1"}, clear=False):
+            with patch("backend.core.ouroboros.governance.plan_generator.PlanGenerator") as mock_plan_gen:
+                mock_plan_gen.return_value.generate_plan = AsyncMock(return_value=plan_result)
+                orch = GovernedOrchestrator(
+                    stack=stack,
+                    generator=generator,
+                    approval_provider=approval,
+                    config=config,
+                )
+                result = await orch.run(ctx)
+
+        approval.request_plan.assert_awaited_once()
+        approval.await_decision.assert_awaited_once()
+        assert result.terminal_reason_code not in {
+            "plan_required_unavailable",
+            "plan_review_unavailable",
+            "plan_rejected",
+            "plan_approval_expired",
+        }
+
+    async def test_plan_review_mode_fails_closed_without_provider(self) -> None:
+        stack = _mock_stack()
+        generator = _mock_generator()
+        config = OrchestratorConfig(
+            project_root=Path("/tmp/test-project"),
+            generation_timeout_s=5.0,
+            validation_timeout_s=5.0,
+            approval_timeout_s=5.0,
+            max_generate_retries=1,
+            max_validate_retries=2,
+            context_expansion_enabled=False,
+        )
+        ctx = _make_context(description="Fix typo")
+        plan_result = PlanResult(
+            plan_json='{"schema_version":"plan.1"}',
+            approach="Make the small change directly and verify it.",
+            complexity="trivial",
+            ordered_changes=[
+                {
+                    "file_path": "backend/core/utils.py",
+                    "change_type": "modify",
+                    "description": "Update the utility implementation.",
+                    "dependencies": [],
+                    "estimated_scope": "small",
+                }
+            ],
+            test_strategy="Run focused unit tests.",
+        )
+
+        with patch.dict("os.environ", {"JARVIS_SHOW_PLAN_BEFORE_EXECUTE": "1"}, clear=False):
+            with patch("backend.core.ouroboros.governance.plan_generator.PlanGenerator") as mock_plan_gen:
+                mock_plan_gen.return_value.generate_plan = AsyncMock(return_value=plan_result)
+                orch = GovernedOrchestrator(
+                    stack=stack,
+                    generator=generator,
+                    approval_provider=None,
+                    config=config,
+                )
+                result = await orch.run(ctx)
+
+        assert result.phase is OperationPhase.CANCELLED
+        assert result.terminal_reason_code == "plan_review_unavailable"
+        generator.generate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

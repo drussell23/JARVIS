@@ -111,6 +111,15 @@ _CONSOLIDATION_THRESHOLD: int = 10
 # by the 125s outer gate (bt-2026-04-12-061609).  15s accommodates Tier 0
 # overhead + asyncio cancellation propagation delay on streaming responses.
 _OUTER_GATE_GRACE_S = float(os.environ.get("JARVIS_OUTER_GATE_GRACE_S", "15"))
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _plan_review_required() -> bool:
+    """Return True when the session requires pre-execution plan review."""
+    return (
+        os.environ.get("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", "").strip().lower()
+        in _TRUTHY
+    )
 
 
 def _human_is_watching() -> bool:
@@ -568,6 +577,92 @@ class GovernedOrchestrator:
         if _gls is not None and hasattr(_gls, "is_cancel_requested"):
             return _gls.is_cancel_requested(op_id)
         return False
+
+    def _add_session_lesson(
+        self,
+        lesson_type: str,
+        lesson_text: str,
+        op_id: str = "",
+    ) -> None:
+        """Append a lesson, cap the buffer, and emit a heartbeat.
+
+        Centralises the 4+ scattered ``_session_lessons.append((...))``
+        + ``if len(...) > max: rebind`` blocks and adds the SerpentFlow
+        heartbeat so the operator sees "📖 applying N lessons".
+
+        Parameters
+        ----------
+        lesson_type:
+            ``"code"`` or ``"infra"``.
+        lesson_text:
+            Human-readable lesson text (will be truncated to ~200 chars
+            by the heartbeat for transport safety).
+        op_id:
+            Originating operation — passed to SerpentFlow for block scoping.
+        """
+        self._session_lessons.append((lesson_type, lesson_text))
+        if len(self._session_lessons) > self._session_lessons_max:
+            self._session_lessons = self._session_lessons[-self._session_lessons_max:]
+
+        # Emit heartbeat to SerpentFlow / transports
+        try:
+            _payload = {
+                "phase": "session_lessons",
+                "lesson_count": len(self._session_lessons),
+                "latest_lesson": lesson_text[:200],
+                "lessons": list(self._session_lessons),
+            }
+            for _t in getattr(self._stack.comm, "_transports", []):
+                try:
+                    _msg = type("_Msg", (), {
+                        "payload": _payload,
+                        "op_id": op_id,
+                        "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                    })()
+                    # Transport.send() is async but we are in sync context here;
+                    # schedule it without awaiting (fire-and-forget for non-critical UX).
+                    import asyncio as _aio
+                    try:
+                        _loop = _aio.get_running_loop()
+                        _loop.create_task(_t.send(_msg))
+                    except RuntimeError:
+                        pass  # No running loop — skip heartbeat
+                except Exception:
+                    pass
+        except Exception:
+            pass  # Heartbeat is non-critical UX
+
+    async def _emit_route_cost_heartbeat(
+        self,
+        ctx: OperationContext,
+        *,
+        cost_usd: float,
+        provider: str,
+        route: str,
+        cost_event: str,
+    ) -> None:
+        """Emit route-aware cost telemetry for dashboard transports."""
+        delta = float(cost_usd or 0.0)
+        if delta <= 0.0:
+            return
+        comm = getattr(self._stack, "comm", None)
+        if comm is None:
+            return
+        try:
+            await comm.emit_heartbeat(
+                op_id=ctx.op_id,
+                phase="cost",
+                progress_pct=0.0,
+                route=route or "unknown",
+                provider=provider or "",
+                cost_usd=delta,
+                cost_event=cost_event,
+                task_complexity=getattr(ctx, "task_complexity", "") or "",
+            )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] Route cost heartbeat failed", exc_info=True,
+            )
 
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
@@ -1145,6 +1240,9 @@ class GovernedOrchestrator:
                         op_id=ctx.op_id,
                         outcome=_provider_route.value,
                         reason_code=f"urgency_route:{_route_reason}",
+                        route=_provider_route.value,
+                        route_reason=_route_reason,
+                        budget_profile=_UR.route_budget_profile(_provider_route),
                         details={
                             "route": _provider_route.value,
                             "route_description": _UR.describe_route(_provider_route),
@@ -1316,6 +1414,7 @@ class GovernedOrchestrator:
             pass
 
         _plan_result: Optional[Any] = None
+        _plan_review_required_now = _plan_review_required()
         try:
             from backend.core.ouroboros.governance.plan_generator import (
                 PlanGenerator, PLAN_TIMEOUT_S,
@@ -1369,6 +1468,30 @@ class GovernedOrchestrator:
                 ctx.op_id, exc,
             )
 
+        if _plan_review_required_now and (
+            _plan_result is None or getattr(_plan_result, "skipped", True)
+        ):
+            _skip_reason = getattr(_plan_result, "skip_reason", "") or "plan_not_available"
+            logger.info(
+                "[Orchestrator] Plan review required for op=%s but no plan is "
+                "available: %s",
+                ctx.op_id,
+                _skip_reason,
+            )
+            ctx = ctx.advance(
+                OperationPhase.CANCELLED,
+                terminal_reason_code="plan_required_unavailable",
+            )
+            await self._record_ledger(
+                ctx,
+                OperationState.FAILED,
+                {
+                    "reason": "plan_required_unavailable",
+                    "detail": _skip_reason,
+                },
+            )
+            return ctx
+
         # ---- Phase 2d: Plan Approval Hard Gate (Phase 1b) ----
         # For COMPLEX / ARCHITECTURAL ops, pause BEFORE burning generation
         # tokens and get human sign-off on the approach. Rejection aborts
@@ -1381,16 +1504,15 @@ class GovernedOrchestrator:
         #   JARVIS_PLAN_APPROVAL_COMPLEXITIES    (default "complex,heavy_code,architectural")
         #   JARVIS_PLAN_APPROVAL_TIMEOUT_S       (default 600.0)
         #   JARVIS_PLAN_APPROVAL_EXPIRE_GRACE    (default false — strict)
-        _plan_gate_enabled = os.environ.get(
-            "JARVIS_PLAN_APPROVAL_ENABLED", "true"
-        ).lower() not in ("false", "0", "no", "off")
+        _plan_gate_enabled = _plan_review_required_now or (
+            os.environ.get("JARVIS_PLAN_APPROVAL_ENABLED", "true").lower()
+            not in ("false", "0", "no", "off")
+        )
         _plan_gate_applied = False
         if (
             _plan_gate_enabled
             and _plan_result is not None
             and not getattr(_plan_result, "skipped", True)
-            and self._approval_provider is not None
-            and hasattr(self._approval_provider, "request_plan")
         ):
             _gate_routes = {
                 r.strip().lower()
@@ -1414,11 +1536,48 @@ class GovernedOrchestrator:
             # task_complexity, plan_result.complexity) matches the filters.
             # plan_result.complexity takes precedence because the model
             # has just reasoned about the actual scope during PLAN phase.
-            if (
-                _route in _gate_routes
+            _should_gate = (
+                _plan_review_required_now
+                or _route in _gate_routes
                 or _task_cx in _gate_complexities
                 or _plan_cx in _gate_complexities
-            ):
+            )
+            _provider_supports_plan = (
+                self._approval_provider is not None
+                and hasattr(self._approval_provider, "request_plan")
+            )
+            if _should_gate and not _provider_supports_plan:
+                logger_msg = (
+                    "[Orchestrator] Plan review required for op=%s but no "
+                    "plan approval provider is available"
+                    if _plan_review_required_now
+                    else "[Orchestrator] Plan Gate skipped for op=%s: "
+                    "provider=%s has_request_plan=%s"
+                )
+                if _plan_review_required_now:
+                    logger.info(logger_msg, ctx.op_id)
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="plan_review_unavailable",
+                    )
+                    await self._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {
+                            "reason": "plan_review_unavailable",
+                            "detail": "approval_provider_missing",
+                        },
+                    )
+                    return ctx
+                logger.debug(
+                    logger_msg,
+                    ctx.op_id,
+                    type(self._approval_provider).__name__
+                    if self._approval_provider
+                    else "None",
+                    hasattr(self._approval_provider, "request_plan"),
+                )
+            elif _should_gate:
                 _plan_gate_applied = True
                 _plan_gate_timeout = float(os.environ.get(
                     "JARVIS_PLAN_APPROVAL_TIMEOUT_S", "600.0"
@@ -1457,6 +1616,26 @@ class GovernedOrchestrator:
                         )
                     )
                 except Exception as _gate_exc:
+                    if _plan_review_required_now:
+                        logger.info(
+                            "[Orchestrator] Plan review required for op=%s but "
+                            "the plan gate failed: %s",
+                            ctx.op_id,
+                            _gate_exc,
+                        )
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="plan_review_unavailable",
+                        )
+                        await self._record_ledger(
+                            ctx,
+                            OperationState.FAILED,
+                            {
+                                "reason": "plan_review_unavailable",
+                                "detail": str(_gate_exc)[:200],
+                            },
+                        )
+                        return ctx
                     # Gate infrastructure failure — log and continue without
                     # gating rather than blocking the pipeline forever.
                     logger.warning(
@@ -1511,21 +1690,18 @@ class GovernedOrchestrator:
                         _files_short = ", ".join(
                             p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
                         )
-                        self._session_lessons.append((
+                        self._add_session_lesson(
                             "code",
                             f"[PLAN REJECTED] {ctx.description[:60]} "
                             f"({_files_short}) — human rejected the approach: "
                             f"{_reject_reason[:80] or 'no reason given'}. "
                             f"Reconsider strategy before retry.",
-                        ))
-                        if len(self._session_lessons) > self._session_lessons_max:
-                            self._session_lessons = (
-                                self._session_lessons[-self._session_lessons_max:]
-                            )
+                            op_id=ctx.op_id,
+                        )
                         return ctx
 
                     if _plan_decision.status is ApprovalStatus.EXPIRED:
-                        if _expire_grace:
+                        if _expire_grace and not _plan_review_required_now:
                             logger.warning(
                                 "[Orchestrator] Plan Gate expired for op=%s; "
                                 "grace mode — continuing to GENERATE",
@@ -1554,19 +1730,6 @@ class GovernedOrchestrator:
                             "[Orchestrator] Plan APPROVED for op=%s by %s",
                             ctx.op_id, _plan_decision.approver,
                         )
-        elif _plan_gate_enabled and _plan_result is not None and not getattr(
-            _plan_result, "skipped", True
-        ):
-            logger.debug(
-                "[Orchestrator] Plan Gate skipped for op=%s: "
-                "provider=%s has_request_plan=%s",
-                ctx.op_id,
-                type(self._approval_provider).__name__
-                if self._approval_provider
-                else "None",
-                hasattr(self._approval_provider, "request_plan"),
-            )
-
         ctx = ctx.advance(OperationPhase.GENERATE)
 
         # ── PreActionNarrator: voice WHAT before GENERATE ──
@@ -2033,6 +2196,13 @@ class GovernedOrchestrator:
                         self._cost_governor.charge(
                             ctx.op_id, _cost_this_call, _prov_name,
                         )
+                        await self._emit_route_cost_heartbeat(
+                            ctx,
+                            cost_usd=_cost_this_call,
+                            provider=_prov_name,
+                            route=getattr(ctx, "provider_route", "") or "standard",
+                            cost_event="generation_attempt",
+                        )
                 except Exception:
                     logger.debug(
                         "[Orchestrator] CostGovernor.charge failed", exc_info=True,
@@ -2497,6 +2667,21 @@ class GovernedOrchestrator:
                             ctx, "provider_route_reason",
                             f"demotion:immediate_exhausted:{_err_msg[:60]}",
                         )
+                        try:
+                            await self._stack.comm.emit_decision(
+                                op_id=ctx.op_id,
+                                outcome="standard",
+                                reason_code="route_demoted:immediate_exhausted",
+                                details={
+                                    "route": "standard",
+                                    "previous_route": "immediate",
+                                    "route_description": "Demoted to STANDARD after IMMEDIATE exhaustion",
+                                    "budget_profile": "220s fallback budget",
+                                    "route_reason": getattr(ctx, "provider_route_reason", ""),
+                                },
+                            )
+                        except Exception:
+                            pass
                         _route = "standard"  # update local for timeout calc
                         # Refresh the cost-governor cap for the new route so
                         # the demotion gets a proportional budget headroom.
@@ -2530,6 +2715,13 @@ class GovernedOrchestrator:
                                     if _dem_cost > 0.0:
                                         self._cost_governor.charge(
                                             ctx.op_id, _dem_cost, _dem_prov,
+                                        )
+                                        await self._emit_route_cost_heartbeat(
+                                            ctx,
+                                            cost_usd=_dem_cost,
+                                            provider=_dem_prov,
+                                            route="standard",
+                                            cost_event="demotion_attempt",
                                         )
                                 except Exception:
                                     pass
@@ -3747,14 +3939,13 @@ class GovernedOrchestrator:
                     p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
                 )
                 _reason_tag = _reject_reason[:80] if _reject_reason else "no reason given"
-                self._session_lessons.append((
+                self._add_session_lesson(
                     "code",
                     f"[REJECTED] {ctx.description[:60]} ({_files_short}) "
                     f"— human rejected: {_reason_tag}. "
                     f"Avoid this approach in future operations.",
-                ))
-                if len(self._session_lessons) > self._session_lessons_max:
-                    self._session_lessons = self._session_lessons[-self._session_lessons_max:]
+                    op_id=ctx.op_id,
+                )
 
                 # P2.2: Feed rejection into NegativeConstraintStore for
                 # cross-session learning (prompt adaptation on similar ops).
@@ -4474,16 +4665,13 @@ class GovernedOrchestrator:
                     _files_short = ", ".join(
                         p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
                     )
-                    self._session_lessons.append((
+                    self._add_session_lesson(
                         "code",
                         f"[CRITIQUE POOR {getattr(_critique_result, 'rating', '?')}/5] "
                         f"{ctx.description[:60]} ({_files_short}): "
                         f"{str(getattr(_critique_result, 'rationale', ''))[:120]}",
-                    ))
-                    if len(self._session_lessons) > self._session_lessons_max:
-                        self._session_lessons = (
-                            self._session_lessons[-self._session_lessons_max:]
-                        )
+                        op_id=ctx.op_id,
+                    )
             except asyncio.TimeoutError:
                 logger.info(
                     "[Orchestrator] Self-critique timed out for op=%s — "
@@ -4813,10 +5001,7 @@ class GovernedOrchestrator:
                     f"[FAIL:{_err or 'unknown'}] {ctx.description[:60]} "
                     f"({_files_short}) — {_causal}"
                 )
-            self._session_lessons.append((_lesson_type, _lesson_text))
-            # Cap to prevent unbounded growth
-            if len(self._session_lessons) > self._session_lessons_max:
-                self._session_lessons = self._session_lessons[-self._session_lessons_max:]
+            self._add_session_lesson(_lesson_type, _lesson_text, op_id=ctx.op_id)
 
             # ── Convergence metric: track success rate before/after first lesson ──
             _has_lessons = len(self._session_lessons) > 1  # >1 = lessons exist from prior ops

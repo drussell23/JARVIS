@@ -345,3 +345,43 @@ class TestHarnessCostPollInterval:
                 pass
 
         assert observed[0] == 1.0, f"malformed should fall back to 1.0, got {observed[0]}"
+
+
+class TestPlanReviewToggle:
+    """REPL plan toggle wiring for pre-execution plan review."""
+
+    @pytest.mark.asyncio
+    async def test_plan_on_updates_env_and_flow(self, tmp_path):
+        cfg = HarnessConfig(repo_path=tmp_path, session_dir=tmp_path / "session")
+        harness = BattleTestHarness(cfg)
+        harness._serpent_flow = MagicMock()
+        printed: list[str] = []
+        harness._repl_print = printed.append  # type: ignore[method-assign]
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", None)
+            await harness._handle_repl_command("/plan on")
+
+            assert harness._plan_before_execute is True
+            assert os.environ["JARVIS_SHOW_PLAN_BEFORE_EXECUTE"] == "1"
+
+        harness._serpent_flow.set_plan_review_mode.assert_called_once_with(True)
+        assert any("Plan review enabled" in line for line in printed)
+
+    @pytest.mark.asyncio
+    async def test_plan_off_updates_env_and_flow(self, tmp_path):
+        cfg = HarnessConfig(repo_path=tmp_path, session_dir=tmp_path / "session")
+        harness = BattleTestHarness(cfg)
+        harness._serpent_flow = MagicMock()
+        printed: list[str] = []
+        harness._repl_print = printed.append  # type: ignore[method-assign]
+        harness._plan_before_execute = True
+
+        with patch.dict(os.environ, {"JARVIS_SHOW_PLAN_BEFORE_EXECUTE": "1"}, clear=False):
+            await harness._handle_repl_command("/plan off")
+
+            assert harness._plan_before_execute is False
+            assert os.environ["JARVIS_SHOW_PLAN_BEFORE_EXECUTE"] == "0"
+
+        harness._serpent_flow.set_plan_review_mode.assert_called_once_with(False)
+        assert any("Plan review disabled" in line for line in printed)

@@ -125,6 +125,30 @@ class TestMessageEmission:
             MessageType.POSTMORTEM,
         ]
 
+    @pytest.mark.asyncio
+    async def test_emit_decision_preserves_extra_metadata(self):
+        """DECISION payload should retain extra route-aware telemetry fields."""
+        transport = LogTransport()
+        proto = CommProtocol(transports=[transport])
+        op_id = generate_operation_id()
+
+        await proto.emit_decision(
+            op_id=op_id,
+            outcome="immediate",
+            reason_code="urgency_route:test_failure",
+            route="immediate",
+            route_reason="critical_urgency:test_failure",
+            budget_profile="120s fast path",
+            details={"route": "immediate", "route_description": "Claude direct"},
+        )
+
+        msg = transport.messages[0]
+        assert msg.msg_type is MessageType.DECISION
+        assert msg.payload["route"] == "immediate"
+        assert msg.payload["route_reason"] == "critical_urgency:test_failure"
+        assert msg.payload["budget_profile"] == "120s fast path"
+        assert msg.payload["details"]["route_description"] == "Claude direct"
+
 
 # ---------------------------------------------------------------------------
 # TestTransportFaultIsolation

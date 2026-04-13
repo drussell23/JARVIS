@@ -60,6 +60,8 @@ from backend.core.ouroboros.governance.op_context import OperationContext
 
 logger = logging.getLogger("Ouroboros.PlanGenerator")
 
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
 # ---------------------------------------------------------------------------
 # Governor limits (hardcoded — Manifesto §6 Iron Gate)
 # ---------------------------------------------------------------------------
@@ -76,6 +78,14 @@ _PLAN_SCHEMA_VERSION = "plan.1"
 # Complexity thresholds for skip decision
 _TRIVIAL_MAX_FILES = int(os.environ.get("JARVIS_PLAN_TRIVIAL_MAX_FILES", "1"))
 _TRIVIAL_MAX_DESCRIPTION_LEN = 200
+
+
+def _plan_review_required() -> bool:
+    """Return True when the session requires a pre-execution plan review."""
+    return (
+        os.environ.get("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", "").strip().lower()
+        in _TRUTHY
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -227,14 +237,23 @@ class PlanGenerator:
         This method never raises; planning failures are logged and return a
         skipped result so the pipeline can fall through to GENERATE.
         """
-        # ── Fast-path: skip planning for trivial ops ──
-        skip_reason = self._should_skip(ctx)
+        # ── Fast-path: skip planning for trivial ops unless the user has
+        # explicitly asked to review a plan before any execution. ──
+        forced_plan_review = _plan_review_required()
+        skip_reason = "" if forced_plan_review else self._should_skip(ctx)
         if skip_reason:
             logger.info(
                 "[PlanGenerator] Skipping plan for op=%s: %s",
                 ctx.op_id, skip_reason,
             )
             return PlanResult.skipped_result(skip_reason)
+        if forced_plan_review:
+            skipped_without_override = self._should_skip(ctx)
+            if skipped_without_override:
+                logger.info(
+                    "[PlanGenerator] Plan review required for op=%s; bypassing skip: %s",
+                    ctx.op_id, skipped_without_override,
+                )
 
         t0 = time.monotonic()
 

@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -61,6 +62,26 @@ _PROV = {
     "claude-api": "Claude", "claude": "Claude",
     "gcp-jprime": "J-Prime",
 }
+
+_ROUTE_SHORT = {
+    "immediate": "IMM",
+    "standard": "STD",
+    "complex": "CPX",
+    "background": "BG",
+    "speculative": "SPC",
+    "unknown": "UNK",
+}
+
+_ROUTE_COLOR = {
+    "immediate": "red",
+    "standard": "yellow",
+    "complex": "magenta",
+    "background": "cyan",
+    "speculative": "blue",
+    "unknown": "dim",
+}
+
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 # Language detection for syntax highlighting
 _LANG_MAP = {
@@ -173,6 +194,22 @@ def _visible_len(text: str) -> int:
     return len(_MARKUP_RE.sub("", text))
 
 
+def _sparkline(values: List[float]) -> str:
+    """Compact unicode sparkline for recent spend deltas."""
+    if not values:
+        return "—"
+    vmax = max(values)
+    if vmax <= 0:
+        return _SPARK_CHARS[0] * len(values)
+    scale = len(_SPARK_CHARS) - 1
+    chars: List[str] = []
+    for value in values:
+        idx = int(round((max(0.0, value) / vmax) * scale))
+        idx = max(0, min(scale, idx))
+        chars.append(_SPARK_CHARS[idx])
+    return "".join(chars)
+
+
 def _parse_unified_diff(diff_text: str) -> tuple:
     """Parse a unified diff into (added, removed, hunks).
 
@@ -271,6 +308,8 @@ class SerpentFlow:
         # Session lessons — stored for /lessons expand-on-demand
         self._session_lessons: List[Tuple[str, str]] = []  # (type, text)
         self._op_providers: Dict[str, str] = {}
+        self._op_routes: Dict[str, str] = {}
+        self._route_costs: Dict[str, Dict[str, Any]] = {}
         self._op_starts: Dict[str, float] = {}
         self._streaming_active: bool = False
 
@@ -1469,6 +1508,95 @@ class SerpentFlow:
         """Cost tick — shown periodically between operations."""
         self._cost_total = total
 
+    def set_op_route(
+        self,
+        op_id: str,
+        route: str,
+        reason: str = "",
+        budget_profile: Any = None,
+    ) -> None:
+        """Track and render the active provider route for an operation."""
+        route_norm = (route or "").strip().lower()
+        if not route_norm:
+            return
+        previous = self._op_routes.get(op_id)
+        self._op_routes[op_id] = route_norm
+        if previous == route_norm:
+            return
+
+        color = _ROUTE_COLOR.get(route_norm, _C["neural"])
+        label = _ROUTE_SHORT.get(route_norm, route_norm[:3].upper())
+        meta_bits: List[str] = []
+        if isinstance(budget_profile, dict):
+            max_wait = budget_profile.get("max_dw_wait_s")
+            reserve = budget_profile.get("tier1_reserve_s")
+            if max_wait is not None:
+                meta_bits.append(f"dw≤{float(max_wait):.0f}s")
+            if reserve:
+                meta_bits.append(f"cld+{float(reserve):.0f}s")
+        elif budget_profile:
+            meta_bits.append(str(budget_profile)[:24])
+        if reason:
+            meta_bits.append(str(reason)[:48])
+        meta = f"  [{_C['dim']}]{' │ '.join(meta_bits)}[/{_C['dim']}]" if meta_bits else ""
+        prefix = "↘" if previous and previous != route_norm else "🧭"
+        self._op_line(
+            op_id,
+            f"[{_C['neural']}]{prefix} route[/{_C['neural']}]    "
+            f"[{color}]{label}[/{color}]{meta}",
+        )
+
+    def record_route_cost(
+        self,
+        op_id: str,
+        route: str,
+        cost_usd: float,
+        provider: str = "",
+        event: str = "",
+    ) -> None:
+        """Accumulate per-route spend and render a compact inline pulse."""
+        delta = float(cost_usd or 0.0)
+        if delta <= 0.0:
+            return
+        route_norm = (route or self._op_routes.get(op_id, "unknown") or "unknown").strip().lower()
+        self._op_routes.setdefault(op_id, route_norm)
+        stats = self._route_costs.setdefault(
+            route_norm,
+            {"total": 0.0, "samples": deque(maxlen=10), "ops": set(), "providers": {}},
+        )
+        stats["total"] += delta
+        stats["samples"].append(delta)
+        stats["ops"].add(op_id)
+        prov = _prov(provider) if provider else ""
+        if prov:
+            stats["providers"][prov] = stats["providers"].get(prov, 0.0) + delta
+
+        label = _ROUTE_SHORT.get(route_norm, route_norm[:3].upper())
+        color = _ROUTE_COLOR.get(route_norm, _C["dim"])
+        prov_str = f" via {prov}" if prov else ""
+        evt_str = f"  [{_C['dim']}]{event}[/{_C['dim']}]" if event else ""
+        self._op_line(
+            op_id,
+            f"[{_C['dim']}]💸 route spend[/{_C['dim']}]  "
+            f"[{color}]{label}[/{color}] +${delta:.4f}{prov_str}{evt_str}",
+        )
+
+    def _route_cost_toolbar_summary(self, limit: int = 2) -> str:
+        """Compact per-route spend summary for the persistent toolbar."""
+        if not self._route_costs:
+            return ""
+        ranked = sorted(
+            self._route_costs.items(),
+            key=lambda item: item[1].get("total", 0.0),
+            reverse=True,
+        )[:limit]
+        parts: List[str] = []
+        for route, stats in ranked:
+            label = _ROUTE_SHORT.get(route, route[:3].upper())
+            spark = _sparkline(list(stats.get("samples", [])))
+            parts.append(f"{label} ${stats.get('total', 0.0):.3f} {spark}")
+        return "  ".join(parts)
+
     def set_plan_review_mode(self, enabled: bool) -> None:
         """Update whether the session requires a pre-run plan review."""
         self._plan_review_mode = enabled
@@ -2000,6 +2128,19 @@ class SerpentTransport:
         self._validation_shown: set = set()
         self._synthesizing_shown: set = set()
 
+    @staticmethod
+    def _extract_route_payload(payload: Dict[str, Any]) -> tuple[str, str, Any]:
+        details = payload.get("details", {}) or {}
+        route = payload.get("route") or details.get("route") or ""
+        reason = (
+            payload.get("route_reason")
+            or details.get("route_reason")
+            or details.get("route_description")
+            or payload.get("reason_code", "")
+        )
+        budget_profile = payload.get("budget_profile") or details.get("budget_profile") or ""
+        return str(route), str(reason), budget_profile
+
     async def send(self, msg: Any) -> None:
         """Handle a CommMessage and render via SerpentFlow."""
         try:
@@ -2041,6 +2182,14 @@ class SerpentTransport:
 
             elif msg_type == "HEARTBEAT":
                 phase = payload.get("phase", "")
+
+                if payload.get("route"):
+                    self._flow.set_op_route(
+                        op_id=op_id,
+                        route=payload.get("route", ""),
+                        reason=payload.get("route_reason", ""),
+                        budget_profile=payload.get("budget_profile", ""),
+                    )
 
                 # P3.1: Intent chain — full reasoning chain visibility
                 if phase == "intent_chain":
@@ -2085,6 +2234,16 @@ class SerpentTransport:
                             duration_ms=payload.get("duration_ms", 0.0),
                             status=payload.get("status", "success"),
                         )
+
+                # Route-aware cost telemetry
+                elif phase == "cost" and payload.get("cost_usd", 0.0):
+                    self._flow.record_route_cost(
+                        op_id=op_id,
+                        route=payload.get("route", ""),
+                        cost_usd=payload.get("cost_usd", 0.0),
+                        provider=payload.get("provider", ""),
+                        event=payload.get("cost_event", ""),
+                    )
 
                 # Generation result
                 elif payload.get("candidates_count") is not None:
@@ -2257,6 +2416,7 @@ class SerpentTransport:
             elif msg_type == "DECISION":
                 outcome = payload.get("outcome", "")
                 reason_code = payload.get("reason_code", "")
+                route, route_reason, budget_profile = self._extract_route_payload(payload)
 
                 # Suppress boot_recovery spam
                 if reason_code.startswith("boot_recovery_"):
@@ -2268,6 +2428,14 @@ class SerpentTransport:
                             highlight=False,
                         )
                     return
+
+                if route:
+                    self._flow.set_op_route(
+                        op_id=op_id,
+                        route=route,
+                        reason=route_reason,
+                        budget_profile=budget_profile,
+                    )
 
                 # NOTIFY_APPLY (Yellow) — auto-apply with prominent CLI notice
                 if outcome == "notify_apply":
@@ -2301,9 +2469,8 @@ class SerpentTransport:
                     return
 
                 files = payload.get("files_changed", payload.get("affected_files", []))
-                provider = self._op_providers.pop(op_id, "unknown")
-
                 if outcome in ("completed", "applied", "auto_approved"):
+                    provider = self._op_providers.pop(op_id, "unknown")
                     self._flow.op_completed(
                         op_id=op_id,
                         files_changed=files,
@@ -2311,6 +2478,7 @@ class SerpentTransport:
                         cost_usd=payload.get("cost_usd", 0.0),
                     )
                 elif outcome in ("failed", "postmortem"):
+                    self._op_providers.pop(op_id, None)
                     self._flow.op_failed(
                         op_id=op_id,
                         reason=reason_code or outcome,
@@ -2533,6 +2701,8 @@ class SerpentREPL:
             active = len(f._active_ops)
 
             active_str = f"{active} active" if active else "idle"
+            plan_str = "🗺 plan │ " if f._plan_review_mode else ""
+            route_str = f"🧭 {f._route_cost_toolbar_summary()} │ " if f._route_costs else ""
             return HTML(
                 f" <b>🐍</b> │ "
                 f"<style fg='ansigreen'>✅ {f._completed}</style>  "
@@ -2540,6 +2710,8 @@ class SerpentREPL:
                 f"💰 ${f._cost_total:.3f}/${f._cost_cap:.2f} │ "
                 f"📡 {f._sensors_active} sensors │ "
                 f"{active_str} │ "
+                f"{plan_str}"
+                f"{route_str}"
                 f"⏱ {m}m {s:02d}s"
             )
 
@@ -2635,12 +2807,29 @@ class SerpentREPL:
             f"[bold]Active Ops[/bold]  {len(f._active_ops)}",
             f"[bold]Sensors[/bold]     {f._sensors_active}",
             f"[bold]Lessons[/bold]     {len(f._session_lessons)}",
+            (
+                f"[bold]Plan Review[/bold] "
+                f"{'[green]ON[/green]' if f._plan_review_mode else '[dim]OFF[/dim]'}"
+            ),
         ]
+        if f._route_costs:
+            lines.append("[bold]Route Spend[/bold]")
+            for route, stats in sorted(
+                f._route_costs.items(),
+                key=lambda item: item[1].get("total", 0.0),
+                reverse=True,
+            ):
+                label = _ROUTE_SHORT.get(route, route[:3].upper())
+                spark = _sparkline(list(stats.get("samples", [])))
+                lines.append(
+                    f"  {label}  ${stats.get('total', 0.0):.4f}  "
+                    f"{len(stats.get('ops', set()))} op  {spark}"
+                )
         panel = Panel(
             "\n".join(lines),
             title="[cyan]🐍 Organism Status[/cyan]",
             border_style="cyan",
-            width=min(f.console.width, 50),
+            width=min(f.console.width, 64),
             padding=(0, 2),
         )
         f.console.print()
@@ -2656,6 +2845,7 @@ class SerpentREPL:
             f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]       cancel an in-flight operation",
             f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]      set risk ceiling",
             f"  [{_C['dim']}]/budget <usd>[/{_C['dim']}]     adjust session budget",
+            f"  [{_C['dim']}]/plan [on|off][/{_C['dim']}]   show plan before execution",
             f"  [{_C['dim']}]/goal [add|rm][/{_C['dim']}]    manage active goals",
             f"  [{_C['dim']}]/memory [...][/{_C['dim']}]     list/add/rm/forbid user-pref memories",
             f"  [{_C['dim']}]/remember <text>[/{_C['dim']}]  shortcut: add a USER memory",

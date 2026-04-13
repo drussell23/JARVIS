@@ -78,6 +78,44 @@ _PROVIDER_SHORT: Dict[str, str] = {
     "gcp-jprime": "J-Prime",
 }
 
+_ROUTE_LABELS: Dict[str, str] = {
+    "immediate": "IMMEDIATE",
+    "standard": "STANDARD",
+    "complex": "COMPLEX",
+    "background": "BACKGROUND",
+    "speculative": "SPECULATIVE",
+    "unknown": "UNKNOWN",
+}
+
+_ROUTE_SHORT: Dict[str, str] = {
+    "immediate": "IMM",
+    "standard": "STD",
+    "complex": "CPX",
+    "background": "BG",
+    "speculative": "SPC",
+    "unknown": "UNK",
+}
+
+_ROUTE_COLORS: Dict[str, str] = {
+    "immediate": "red",
+    "standard": "yellow",
+    "complex": "magenta",
+    "background": "cyan",
+    "speculative": "blue",
+    "unknown": "dim",
+}
+
+_ROUTE_ORDER = (
+    "immediate",
+    "standard",
+    "complex",
+    "background",
+    "speculative",
+    "unknown",
+)
+
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
 _TOOL_ICONS: Dict[str, str] = {
     "read_file": "📄",
     "search_code": "🔍",
@@ -125,6 +163,7 @@ class ActiveOp:
     phase: str = "CLASSIFY"
     progress_pct: float = 0.0
     provider: str = ""
+    route: str = ""
     target_file: str = ""
     goal: str = ""
     risk_tier: str = ""
@@ -157,6 +196,16 @@ class OrganismStats:
     self_evo_ops: int = 0
     self_evo_success_rate: float = 0.0
     sensors_active: int = 0
+
+
+@dataclass
+class RouteCostStats:
+    """Per-route spend summary for dashboard rendering."""
+    total_usd: float = 0.0
+    charge_count: int = 0
+    op_ids: set[str] = field(default_factory=set)
+    samples: deque = field(default_factory=lambda: deque(maxlen=12))
+    provider_totals: Dict[str, float] = field(default_factory=dict)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -193,6 +242,8 @@ class LiveDashboard:
         self._cost_total: float = 0.0
         self._cost_breakdown: Dict[str, float] = {}
         self._cost_remaining: float = cost_cap_usd
+        self._op_routes: Dict[str, str] = {}
+        self._route_costs: Dict[str, RouteCostStats] = {}
         self._organism = OrganismStats()
         self._events: deque = deque(maxlen=30)
         self._stop_reason: str = ""
@@ -329,6 +380,30 @@ class LiveDashboard:
         self._events.appendleft(f"[dim]{ts}[/dim] {icon} {text}")
         self._refresh()
 
+    @staticmethod
+    def _normalize_route(route: str) -> str:
+        route_norm = (route or "").strip().lower()
+        return route_norm if route_norm else "unknown"
+
+    @staticmethod
+    def _route_label(route: str) -> str:
+        return _ROUTE_LABELS.get(route, route.upper() if route else "UNKNOWN")
+
+    @staticmethod
+    def _sparkline(values: List[float]) -> str:
+        if not values:
+            return "—"
+        vmax = max(values)
+        if vmax <= 0:
+            return _SPARK_CHARS[0] * len(values)
+        scale = len(_SPARK_CHARS) - 1
+        chars: List[str] = []
+        for value in values:
+            idx = int(round((max(0.0, value) / vmax) * scale))
+            idx = max(0, min(scale, idx))
+            chars.append(_SPARK_CHARS[idx])
+        return "".join(chars)
+
     def op_started(
         self, op_id: str, goal: str, target_files: List[str], risk_tier: str,
     ) -> None:
@@ -363,6 +438,88 @@ class LiveDashboard:
         if op:
             op.provider = _PROVIDER_SHORT.get(provider, provider[:10])
             op.tool_count = tool_count
+
+    def op_route(
+        self,
+        op_id: str,
+        route: str,
+        reason: str = "",
+        budget_profile: str = "",
+    ) -> None:
+        """Track the selected provider route for an operation."""
+        route_norm = self._normalize_route(route)
+        previous = self._op_routes.get(op_id)
+        self._op_routes[op_id] = route_norm
+
+        op = self._active_ops.get(op_id)
+        short = op.short_id if op else op_id[:6]
+        if op:
+            op.route = route_norm
+
+        if previous == route_norm:
+            return
+
+        color = _ROUTE_COLORS.get(route_norm, "white")
+        route_label = self._route_label(route_norm)
+        meta_bits = []
+        if budget_profile:
+            if isinstance(budget_profile, dict):
+                max_wait = budget_profile.get("max_dw_wait_s")
+                reserve = budget_profile.get("tier1_reserve_s")
+                if max_wait is not None:
+                    meta_bits.append(f"dw≤{float(max_wait):.0f}s")
+                if reserve:
+                    meta_bits.append(f"cld+{float(reserve):.0f}s")
+            else:
+                meta_bits.append(str(budget_profile)[:32])
+        if reason:
+            meta_bits.append(str(reason)[:48])
+        meta = f"  [dim]{' │ '.join(meta_bits)}[/dim]" if meta_bits else ""
+        icon = "↘️" if previous and previous != route_norm else "🧭"
+        self.add_event(
+            icon,
+            f"[{color}]{route_label}[/{color}]  op:{short}{meta}",
+        )
+
+    def route_cost(
+        self,
+        op_id: str,
+        cost_usd: float,
+        provider: str = "",
+        route: str = "",
+        event: str = "",
+    ) -> None:
+        """Record a per-route cost charge for the dashboard."""
+        delta = float(cost_usd or 0.0)
+        if delta <= 0.0:
+            return
+
+        route_norm = self._normalize_route(route or self._op_routes.get(op_id, ""))
+        self._op_routes.setdefault(op_id, route_norm)
+        stats = self._route_costs.setdefault(route_norm, RouteCostStats())
+        stats.total_usd += delta
+        stats.charge_count += 1
+        if op_id:
+            stats.op_ids.add(op_id)
+        stats.samples.append(delta)
+
+        provider_norm = _PROVIDER_SHORT.get(provider, provider) if provider else ""
+        if provider_norm:
+            stats.provider_totals[provider_norm] = (
+                stats.provider_totals.get(provider_norm, 0.0) + delta
+            )
+
+        op = self._active_ops.get(op_id)
+        short = op.short_id if op else op_id[:6]
+        route_label = self._route_label(route_norm)
+        route_color = _ROUTE_COLORS.get(route_norm, "white")
+        provider_str = f" via {provider_norm}" if provider_norm else ""
+        event_str = f"  [dim]{event}[/dim]" if event else ""
+        self.add_event(
+            "💸",
+            f"[{route_color}]{route_label}[/{route_color}] +${delta:.4f}{provider_str}"
+            f"{event_str}  op:{short}",
+        )
 
     def op_tool_start(
         self,
@@ -857,10 +1014,15 @@ class LiveDashboard:
             Layout(name="ops", ratio=3),
             Layout(name="intel", ratio=2),
         )
+        layout["intel"].split_column(
+            Layout(name="intel_summary", ratio=3),
+            Layout(name="route_costs", size=8),
+        )
 
         layout["header"].update(self._build_header())
         layout["ops"].update(self._build_ops_panel())
-        layout["intel"].update(self._build_intel_panel())
+        layout["intel_summary"].update(self._build_intel_panel())
+        layout["route_costs"].update(self._build_route_cost_panel())
         layout["log"].update(self._build_log_panel())
         layout["footer"].update(self._build_footer())
 
@@ -1036,6 +1198,48 @@ class LiveDashboard:
             padding=(0, 1),
         )
 
+    def _build_route_cost_panel(self) -> Panel:
+        """Build a compact route-spend panel with per-route sparklines."""
+        lines: List[str] = []
+
+        for route in _ROUTE_ORDER:
+            stats = self._route_costs.get(route)
+            if stats is None or stats.total_usd <= 0.0:
+                continue
+
+            color = _ROUTE_COLORS.get(route, "white")
+            label = _ROUTE_SHORT.get(route, route[:3].upper())
+            spark = self._sparkline(list(stats.samples))
+            top_provider = ""
+            if stats.provider_totals:
+                top_provider = max(
+                    stats.provider_totals.items(),
+                    key=lambda item: item[1],
+                )[0]
+
+            provider_part = f" [dim]{top_provider}[/dim]" if top_provider else ""
+            lines.append(
+                f"[{color}]{label:<3}[/{color}]  "
+                f"${stats.total_usd:.4f}  "
+                f"[dim]{len(stats.op_ids)} op/{stats.charge_count}x[/dim]"
+                f"{provider_part}  "
+                f"[{color}]{spark}[/{color}]"
+            )
+
+        if not lines:
+            lines = [
+                "[dim]Waiting for route spend...[/dim]",
+                "[dim]Cost pulses appear after generation attempts.[/dim]",
+            ]
+
+        content = Text.from_markup("\n".join(lines))
+        return Panel(
+            content,
+            title="[bold]Route Spend[/bold]",
+            border_style="yellow",
+            padding=(0, 1),
+        )
+
     def _build_log_panel(self) -> Panel:
         """Build the scrolling event log."""
         if not self._events:
@@ -1085,6 +1289,27 @@ class DashboardTransport:
         self._db = dashboard
         self._op_providers: Dict[str, str] = {}
 
+    @staticmethod
+    def _extract_route_payload(payload: Dict[str, Any]) -> tuple[str, str, str]:
+        details = payload.get("details", {}) or {}
+        route = (
+            payload.get("route")
+            or details.get("route")
+            or ""
+        )
+        reason = (
+            payload.get("route_reason")
+            or details.get("route_reason")
+            or details.get("route_description")
+            or payload.get("reason_code", "")
+        )
+        budget_profile = (
+            payload.get("budget_profile")
+            or details.get("budget_profile")
+            or ""
+        )
+        return str(route), str(reason), str(budget_profile)
+
     async def send(self, msg: Any) -> None:
         """Handle a CommMessage and update the dashboard."""
         try:
@@ -1103,6 +1328,14 @@ class DashboardTransport:
 
             elif msg_type == "HEARTBEAT":
                 phase = payload.get("phase", "")
+
+                if payload.get("route"):
+                    self._db.op_route(
+                        op_id=op_id,
+                        route=payload.get("route", ""),
+                        reason=payload.get("route_reason", ""),
+                        budget_profile=payload.get("budget_profile", ""),
+                    )
 
                 # Triage decision
                 if phase == "semantic_triage" and payload.get("triage_decision"):
@@ -1134,6 +1367,16 @@ class DashboardTransport:
                             duration_ms=payload.get("duration_ms", 0.0),
                             status=payload.get("status", "success"),
                         )
+
+                # Explicit route-cost telemetry
+                elif phase == "cost" and payload.get("cost_usd", 0.0):
+                    self._db.route_cost(
+                        op_id=op_id,
+                        cost_usd=payload.get("cost_usd", 0.0),
+                        provider=payload.get("provider", ""),
+                        route=payload.get("route", ""),
+                        event=payload.get("cost_event", ""),
+                    )
 
                 # Generation result
                 elif payload.get("candidates_count") is not None:
@@ -1220,9 +1463,18 @@ class DashboardTransport:
             elif msg_type == "DECISION":
                 outcome = payload.get("outcome", "")
                 files = payload.get("files_changed", payload.get("affected_files", []))
-                provider = self._op_providers.pop(op_id, "unknown")
+                route, route_reason, budget_profile = self._extract_route_payload(payload)
+
+                if route:
+                    self._db.op_route(
+                        op_id=op_id,
+                        route=route,
+                        reason=route_reason,
+                        budget_profile=budget_profile,
+                    )
 
                 if outcome in ("completed", "applied", "auto_approved"):
+                    provider = self._op_providers.pop(op_id, "unknown")
                     self._db.op_completed(
                         op_id=op_id,
                         files_changed=files,
@@ -1230,6 +1482,7 @@ class DashboardTransport:
                         cost_usd=payload.get("cost_usd", 0.0),
                     )
                 elif outcome in ("failed", "postmortem"):
+                    self._op_providers.pop(op_id, None)
                     self._db.op_failed(
                         op_id=op_id,
                         reason=payload.get("reason_code", outcome),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -179,6 +180,53 @@ class TestToolPromptInjection:
         ctx = self._make_ctx()
         prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
         assert "Available Tools" not in prompt
+
+    def test_voice_origin_tools_prompt_uses_plain_language_mode(self, tmp_path) -> None:
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=("backend/core/utils.py",),
+            description="Explain the routing fix",
+            signal_source="voice_human",
+        )
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path, tools_enabled=True)
+        assert "Mode: plain-language, no shared context" in prompt
+        assert "Voice-First Prompt Mode" in prompt
+        assert "Assume the listener cannot see the screen" in prompt
+
+    def test_lean_prompt_immediate_route_uses_voice_first_guidance(self, tmp_path) -> None:
+        from backend.core.ouroboros.governance.providers import _build_lean_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        (tmp_path / "backend").mkdir()
+        (tmp_path / "backend" / "core.py").write_text("def route():\n    return 'ok'\n")
+        ctx = OperationContext.create(
+            target_files=("backend/core.py",),
+            description="Inspect the immediate route",
+        )
+        ctx = dataclasses.replace(
+            ctx,
+            provider_route="immediate",
+            provider_route_reason="voice_command:human_waiting",
+        )
+        prompt = _build_lean_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "Mode: plain-language, no shared context" in prompt
+        assert "Voice-First Prompt Mode" in prompt
+        assert "name the file, subsystem, or action explicitly" in prompt.lower()
+
+    def test_standard_route_tools_prompt_omits_voice_first_guidance(self, tmp_path) -> None:
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=("backend/core/utils.py",),
+            description="Explain the routing fix",
+            signal_source="backlog",
+        )
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path, tools_enabled=True)
+        assert "Mode: plain-language, no shared context" not in prompt
+        assert "Voice-First Prompt Mode" not in prompt
 
 
 from backend.core.ouroboros.governance.op_context import (

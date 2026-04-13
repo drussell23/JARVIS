@@ -619,7 +619,47 @@ def _build_system_context_block(ctx: "OperationContext") -> Optional[str]:
     return "\n".join(lines)
 
 
-def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str:
+_VOICE_PROMPT_SOURCES = frozenset({"voice_human", "voice_command"})
+_VOICE_PROMPT_ROUTES = frozenset({"immediate"})
+
+
+def _is_voice_plain_language_mode(ctx: "OperationContext") -> bool:
+    """Return True when prompt text must assume spoken, zero-shared context."""
+    source = (getattr(ctx, "signal_source", "") or "").strip().lower()
+    route = (getattr(ctx, "provider_route", "") or "").strip().lower()
+    return (
+        route in _VOICE_PROMPT_ROUTES
+        or source in _VOICE_PROMPT_SOURCES
+        or source.startswith("voice_")
+    )
+
+
+def _build_communication_mode_block(ctx: "OperationContext") -> Optional[str]:
+    """Return a voice-first communication contract block when required."""
+    if not _is_voice_plain_language_mode(ctx):
+        return None
+
+    source = (getattr(ctx, "signal_source", "") or "").strip() or "unknown"
+    route = (getattr(ctx, "provider_route", "") or "").strip() or "unknown"
+    return "\n".join(
+        [
+            "## Communication Mode",
+            "Mode: plain-language, no shared context",
+            "This operation is voice-first or latency-critical.",
+            "Assume the human cannot see the screen, code, spinner, or prior text.",
+            "Any human-facing text must be self-contained and easy to say aloud.",
+            "Name the file, subsystem, or action explicitly instead of saying this, that, here, or above.",
+            "Prefer plain language over dense shorthand or jargon.",
+            f"Trigger: source={source} | route={route}",
+        ]
+    )
+
+
+def _build_tool_section(
+    mcp_tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    voice_plain_language: bool = False,
+) -> str:
     """Return the 'Available Tools' block injected into the generation prompt.
 
     Parameters
@@ -627,11 +667,32 @@ def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str
     mcp_tools:
         Optional list of MCP tool descriptors from ``GovernanceMCPClient.discover_tools()``.
         Each descriptor has ``name``, ``description``, and ``input_schema``.
+    voice_plain_language:
+        When True, emit stronger spoken-language guidance for tool preambles.
     """
+    voice_block = ""
+    if voice_plain_language:
+        voice_block = (
+            "### Voice-First Prompt Mode (REQUIRED for this op)\n"
+            "This op is on the IMMEDIATE or voice route, and the preamble will be spoken aloud.\n"
+            "Use plain-language, no shared context phrasing.\n"
+            "Assume the listener cannot see the screen, code, spinner, or previous messages.\n"
+            "Each preamble must stand on its own: name the file, subsystem, or action explicitly.\n"
+            "Avoid terse shorthand, dense jargon, and references like `this`, `that`, `here`, or `above`.\n"
+            "- GOOD: `\"I'm reading orchestrator.py to see how voice commands reach the immediate route.\"`\n"
+            "- GOOD: `\"I'm checking the route spend panel to see which provider ran out first.\"`\n"
+            "- BAD: `\"Tracing routing.\"` (too terse, missing the object)\n"
+            "- BAD: `\"Looking there now.\"` (assumes shared context)\n"
+            "- BAD: `\"Inspecting the exhaustion cascade.\"` (too dense for voice)\n\n"
+        )
     base = (
         "## Available Tools\n\n"
         "If you need more information before writing the patch, respond with ONLY a\n"
         "tool call JSON (no other text).\n\n"
+    )
+    if voice_block:
+        base += voice_block
+    base += (
         "### Preamble (REQUIRED)\n"
         "Every tool-call JSON MUST include a top-level `preamble` field: one short\n"
         "sentence (<=120 chars) of WHY you are making this call, in plain English,\n"
@@ -891,6 +952,7 @@ def _build_lean_codegen_prompt(
     if repo_root is None:
         repo_root = Path.cwd()
     effective_root = _resolve_effective_repo_root(ctx, repo_root, repo_roots)
+    voice_plain_language = _is_voice_plain_language_mode(ctx)
 
     parts: List[str] = []
 
@@ -901,6 +963,9 @@ def _build_lean_codegen_prompt(
 
     # ── 2. Task description ─────────────────────────────────────────────
     parts.append(f"## Task\nOp-ID: {ctx.op_id}\nGoal: {ctx.description}")
+    _comm_mode_block = _build_communication_mode_block(ctx)
+    if _comm_mode_block is not None:
+        parts.append(_comm_mode_block)
 
     # ── 3. Compressed strategic context (~150 tokens vs ~2000) ──────────
     parts.append(_build_lean_strategic_context())
@@ -995,7 +1060,12 @@ def _build_lean_codegen_prompt(
             preloaded_out.append(str(raw_path))
 
     # ── 7. Tool instructions (always included in lean mode) ─────────────
-    parts.append(_build_tool_section(mcp_tools=mcp_tools))
+    parts.append(
+        _build_tool_section(
+            mcp_tools=mcp_tools,
+            voice_plain_language=voice_plain_language,
+        )
+    )
 
     # ── 8. Output schema ────────────────────────────────────────────────
     # Lean mode always uses full_content schema — simpler for the model
@@ -1112,6 +1182,7 @@ def _build_codegen_prompt(
     if repo_root is None:
         repo_root = Path.cwd()
     effective_single_repo_root = _resolve_effective_repo_root(ctx, repo_root, repo_roots)
+    voice_plain_language = _is_voice_plain_language_mode(ctx)
 
     # ── 1. Build source snapshot for each target file ──────────────────
     file_sections: List[str] = []
@@ -1427,6 +1498,9 @@ Rules:
             + "\n\n---"
         )
     parts.append(f"## Task\nOp-ID: {ctx.op_id}\nGoal: {ctx.description}")
+    _comm_mode_block = _build_communication_mode_block(ctx)
+    if _comm_mode_block is not None:
+        parts.append(_comm_mode_block)
     sys_ctx_block = _build_system_context_block(ctx)
     if sys_ctx_block is not None:
         parts.append(sys_ctx_block)
@@ -1502,7 +1576,12 @@ Rules:
     if expanded_context_block:
         parts.append(expanded_context_block)
     if tools_enabled:
-        parts.append(_build_tool_section(mcp_tools=mcp_tools))
+        parts.append(
+            _build_tool_section(
+                mcp_tools=mcp_tools,
+                voice_plain_language=voice_plain_language,
+            )
+        )
     # ── Repair context injection (L2 correction mode) ────────────────────────
     if repair_context is not None:
         _rc = repair_context

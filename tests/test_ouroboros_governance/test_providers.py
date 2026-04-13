@@ -245,6 +245,32 @@ class TestBuildCodegenPrompt:
         assert "file" in prompt_multi
         assert "full_content" in prompt_multi
 
+    def test_voice_origin_adds_plain_language_communication_mode(self, tmp_path) -> None:
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+
+        ctx = OperationContext.create(
+            target_files=("voice_route.py",),
+            description="Inspect the voice route",
+            signal_source="voice_human",
+            _timestamp=_FIXED_TS,
+        )
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "## Communication Mode" in prompt
+        assert "Mode: plain-language, no shared context" in prompt
+        assert "cannot see the screen" in prompt
+
+    def test_non_voice_prompt_omits_communication_mode(self, tmp_path) -> None:
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+
+        ctx = OperationContext.create(
+            target_files=("queue_job.py",),
+            description="Inspect the backlog route",
+            signal_source="backlog",
+            _timestamp=_FIXED_TS,
+        )
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "## Communication Mode" not in prompt
+
 
 # ---------------------------------------------------------------------------
 # Helpers for PrimeProvider tests

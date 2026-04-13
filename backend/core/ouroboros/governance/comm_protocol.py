@@ -294,6 +294,7 @@ class CommProtocol:
         reason_code: str,
         diff_summary: Optional[str] = None,
         target_files: Optional[List[str]] = None,
+        **extra: Any,
     ) -> None:
         """Emit a DECISION message (phase 4).  Causal parent links to previous."""
         causal_parent = self._prev_seq(op_id)
@@ -306,6 +307,8 @@ class CommProtocol:
             payload["diff_summary"] = diff_summary
         if target_files is not None:
             payload["target_files"] = target_files
+        if extra:
+            payload.update(extra)
         msg = CommMessage(
             msg_type=MessageType.DECISION,
             op_id=op_id,
