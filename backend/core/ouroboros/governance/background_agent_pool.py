@@ -615,7 +615,22 @@ class BackgroundAgentPool:
                         get_bound_orchestrator as _get_bound_orch,
                     )
                     _orch = _get_bound_orch() or self._orchestrator
-                    result = await _orch.run(op.context)
+                    # Per-op watchdog: battle test bt-2026-04-13-031119
+                    # showed two workers wedged for 424s/451s on single
+                    # ops (workspace_checkpoint hang) while new intents
+                    # piled up. The orchestrator has its own phase
+                    # timers but an inner-loop hang (subprocess,
+                    # blocking I/O, deadlock) escapes them. This is the
+                    # last-resort pool-level ceiling so the worker
+                    # doesn't monopolize a slot indefinitely. Default
+                    # 240s = max(IMMEDIATE 60 + STANDARD 120 + verify
+                    # 60) with headroom. Env-tunable, no hardcoding.
+                    _op_timeout_s = float(
+                        os.environ.get("JARVIS_BG_WORKER_OP_TIMEOUT_S", "240")
+                    )
+                    result = await asyncio.wait_for(
+                        _orch.run(op.context), timeout=_op_timeout_s,
+                    )
                     op.result = result
                     op.status = "completed"
                     self._completed_count += 1
@@ -624,6 +639,15 @@ class BackgroundAgentPool:
                         worker_id,
                         op.op_id,
                         op.elapsed_s or 0.0,
+                    )
+                except asyncio.TimeoutError:
+                    op.error = f"pool_worker_timeout:{_op_timeout_s:.0f}s"
+                    op.status = "failed"
+                    self._failed_count += 1
+                    logger.warning(
+                        "Worker %d: operation %s exceeded pool ceiling "
+                        "(%.0fs) — freeing slot",
+                        worker_id, op.op_id, _op_timeout_s,
                     )
                 except asyncio.CancelledError:
                     op.status = "cancelled"

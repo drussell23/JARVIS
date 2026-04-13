@@ -52,10 +52,35 @@ class CapabilityGapSensor:
         self._repo = repo
         self._gap_bus: GapSignalBus = bus if bus is not None else get_gap_signal_bus()
         self._protocol = GapResolutionProtocol()
+        self._poll_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """Schedule the background poll loop as an asyncio task."""
-        asyncio.create_task(self._poll_loop(), name="capability_gap_sensor_poll")
+        if self._poll_task is not None and not self._poll_task.done():
+            return
+        self._poll_task = asyncio.create_task(
+            self._poll_loop(), name="capability_gap_sensor_poll",
+        )
+
+    async def stop(self) -> None:
+        """Cancel the poll task and await its cleanup.
+
+        Battle test bt-2026-04-13-031119 surfaced an AttributeError
+        at session teardown because this sensor shipped without a
+        ``stop()`` and ``SensorRegistry.stop_all`` attempted to call
+        it like every other sensor. Tracking the task handle lets
+        teardown deterministically drain instead of leaking a
+        `Task was destroyed but pending` warning.
+        """
+        task = self._poll_task
+        self._poll_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def _poll_loop(self) -> None:
         """Continuously consume events from the bus and forward them as envelopes."""

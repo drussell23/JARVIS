@@ -863,6 +863,7 @@ def _build_lean_codegen_prompt(
     repo_roots: Optional[Dict[str, Path]] = None,
     force_full_content: bool = False,
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
+    preloaded_out: Optional[List[str]] = None,
 ) -> str:
     """Build a lean, tool-first generation prompt (~3-6K tokens).
 
@@ -984,6 +985,14 @@ def _build_lean_codegen_prompt(
             f"### Target Region (use `read_file(\"{raw_path}\")` for full content)\n"
             f"```\n{region}\n```"
         )
+        # Report to caller that this target file's content has been
+        # in-lined into the prompt — the Iron Gate uses this list to
+        # credit the model with one unit of exploration per preloaded
+        # file, since the semantic act of "reading the file" has
+        # already occurred at the prompt layer. (P1 fix for
+        # bt-2026-04-13-031119 DW exploration_insufficient cascade.)
+        if preloaded_out is not None:
+            preloaded_out.append(str(raw_path))
 
     # ── 7. Tool instructions (always included in lean mode) ─────────────
     parts.append(_build_tool_section(mcp_tools=mcp_tools))
@@ -3011,6 +3020,7 @@ class PrimeProvider:
             except Exception:
                 pass
         # P0.1: Lean prompt when tool loop is available and not repairing
+        _preloaded_files: List[str] = []
         if (
             repair_context is None
             and _should_use_lean_prompt(context, tools_enabled=self._tools_enabled)
@@ -3021,10 +3031,11 @@ class PrimeProvider:
                 repo_roots=self._repo_roots,
                 force_full_content=True,
                 mcp_tools=_mcp_tools,
+                preloaded_out=_preloaded_files,
             )
             logger.info(
-                "[ClaudeProvider] Using lean prompt (%d chars, ~%d tokens)",
-                len(prompt), len(prompt) // 4,
+                "[ClaudeProvider] Using lean prompt (%d chars, ~%d tokens, preloaded=%d)",
+                len(prompt), len(prompt) // 4, len(_preloaded_files),
             )
         else:
             prompt = _build_codegen_prompt(
@@ -3203,6 +3214,10 @@ class PrimeProvider:
             repo_roots=self._repo_roots,
             repo_root=repo_root,
         )
+        if _preloaded_files:
+            result = dataclasses.replace(
+                result, prompt_preloaded_files=tuple(_preloaded_files),
+            )
 
         logger.info(
             "[PrimeProvider] Generated %d candidates in %.1fs (tool_rounds=%d), "
@@ -4405,6 +4420,7 @@ class ClaudeProvider:
             except Exception:
                 pass
         # P0.1: Lean prompt when tool loop is available and not repairing
+        _preloaded_files: List[str] = []
         if (
             repair_context is None
             and _should_use_lean_prompt(context, tools_enabled=self._tools_enabled)
@@ -4415,10 +4431,11 @@ class ClaudeProvider:
                 repo_roots=self._repo_roots,
                 force_full_content=True,
                 mcp_tools=_mcp_tools,
+                preloaded_out=_preloaded_files,
             )
             logger.info(
-                "[ClaudeAPI] Using lean prompt (%d chars, ~%d tokens)",
-                len(prompt_text), len(prompt_text) // 4,
+                "[ClaudeAPI] Using lean prompt (%d chars, ~%d tokens, preloaded=%d)",
+                len(prompt_text), len(prompt_text) // 4, len(_preloaded_files),
             )
         else:
             prompt_text = _build_codegen_prompt(
@@ -5041,6 +5058,10 @@ class ClaudeProvider:
             repo_roots=self._repo_roots,
             repo_root=repo_root,
         )
+        if _preloaded_files:
+            result = dataclasses.replace(
+                result, prompt_preloaded_files=tuple(_preloaded_files),
+            )
 
         # Attach token usage and cost
         if _token_usage["input"] or _token_usage["output"] or total_cost > 0:

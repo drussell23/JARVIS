@@ -757,6 +757,7 @@ class DoublewordProvider:
         _complexity = getattr(context, "task_complexity", "")
         _will_skip_tools = _complexity in ("trivial", "simple")
         _tools_available = self._tool_loop is not None and not _will_skip_tools
+        _preloaded_files: List[str] = []
         if prompt_override:
             prompt = prompt_override
         elif _should_use_lean_prompt(context, tools_enabled=_tools_available):
@@ -766,10 +767,11 @@ class DoublewordProvider:
                 repo_roots=self._repo_roots or None,
                 force_full_content=True,
                 mcp_tools=_mcp_tools,
+                preloaded_out=_preloaded_files,
             )
             logger.info(
-                "[DoublewordProvider] RT: using lean prompt (%d chars, ~%d tokens)",
-                len(prompt), len(prompt) // 4,
+                "[DoublewordProvider] RT: using lean prompt (%d chars, ~%d tokens, preloaded=%d)",
+                len(prompt), len(prompt) // 4, len(_preloaded_files),
             )
         else:
             prompt = _build_codegen_prompt(
@@ -1108,6 +1110,10 @@ class DoublewordProvider:
             repo_roots=self._repo_roots or None,
             repo_root=self._repo_root,
         )
+        if _preloaded_files:
+            result = dataclasses.replace(
+                result, prompt_preloaded_files=tuple(_preloaded_files),
+            )
 
         # Attach token usage and cost from _generate_raw
         if _token_usage["input"] or _token_usage["output"] or total_cost > 0:

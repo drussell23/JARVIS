@@ -54,6 +54,7 @@ class TestFailureSensor:
         self._router = router
         self._watcher = test_watcher
         self._running = False
+        self._poll_task: Optional[asyncio.Task] = None
 
     async def _signal_to_envelope_and_ingest(
         self, signal: IntentSignal
@@ -105,12 +106,37 @@ class TestFailureSensor:
         if self._watcher is None:
             return
         self._running = True
-        asyncio.create_task(self._poll_loop(), name="test_failure_sensor_poll")
+        if self._poll_task is not None and not self._poll_task.done():
+            return
+        self._poll_task = asyncio.create_task(
+            self._poll_loop(), name="test_failure_sensor_poll",
+        )
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
+        """Cancel the poll task and stop the underlying watcher.
+
+        Previously this method was sync and only set ``_running=False``
+        + stopped the watcher — the poll task reference was never
+        captured, so asyncio emitted "Task was destroyed but pending"
+        on every teardown (battle test bt-2026-04-13-031119). Now
+        async so callers can ``await`` clean drain; task handle is
+        tracked from ``start()`` and cancelled deterministically.
+        """
         self._running = False
         if self._watcher is not None:
-            self._watcher.stop()
+            try:
+                self._watcher.stop()
+            except Exception:
+                logger.debug("TestFailureSensor: watcher.stop() raised", exc_info=True)
+        task = self._poll_task
+        self._poll_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # ------------------------------------------------------------------
     # Event-driven path (Manifesto §3: zero polling, pure reflex)

@@ -336,8 +336,27 @@ class LongTermMemoryManager:
 
     async def initialize(self) -> None:
         """Initialize all memory systems."""
-        # Ensure directories exist
-        Path(self.CHROMADB_PATH).mkdir(parents=True, exist_ok=True)
+        # Route the ChromaDB directory through sandbox_fallback so that
+        # sandboxed executors (battle test harness running under a
+        # read-only host FS) degrade gracefully to
+        # ``.ouroboros/state/sandbox_fallback/chromadb/`` instead of
+        # crashing with ``readonly database``. When the primary path
+        # is writable this is a no-op. Iron Gate stays hot.
+        try:
+            from backend.core.ouroboros.governance.sandbox_paths import (
+                sandbox_fallback,
+            )
+            self.CHROMADB_PATH = str(sandbox_fallback(Path(self.CHROMADB_PATH)))
+        except Exception:
+            pass
+        try:
+            Path(self.CHROMADB_PATH).mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError):
+            logger.warning(
+                "[LONG-TERM-MEMORY] ChromaDB path %s not writable; "
+                "semantic memory will run in degraded mode",
+                self.CHROMADB_PATH,
+            )
 
         # Initialize ChromaDB
         await self._init_chromadb()

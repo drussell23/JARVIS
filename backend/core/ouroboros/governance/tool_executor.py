@@ -2507,9 +2507,27 @@ class AsyncProcessToolBackend:
 # L1 Tool-Use: ToolLoopCoordinator
 # ---------------------------------------------------------------------------
 
-_MAX_PROMPT_CHARS = 131_072  # CC-parity: was 32768, raised to accommodate larger tool outputs
+_MAX_PROMPT_CHARS = int(
+    os.environ.get("JARVIS_TOOL_LOOP_MAX_PROMPT_CHARS", "131072")
+)  # CC-parity: was 32768, raised to accommodate larger tool outputs
+# Hard overflow → FailureMode.TOOL_CONTEXT_OVERFLOW (force-truncate + classify).
+# Soft overflow → proactive compact when the accumulated prompt crosses
+# ``soft_pct`` of the hard ceiling. Lower than the compaction threshold on
+# purpose: compaction is lossy, but "context bloat warning → squeeze next
+# round's fetch" is cheap and lossless. Soft threshold is the trigger for
+# the pre-emptive "keep the tool loop alive" path; the compaction
+# threshold remains the catch-all.
+_SOFT_OVERFLOW_PCT = float(
+    os.environ.get("JARVIS_TOOL_LOOP_SOFT_OVERFLOW_PCT", "0.80")
+)
+if not 0.1 < _SOFT_OVERFLOW_PCT < 1.0:
+    _SOFT_OVERFLOW_PCT = 0.80
+_SOFT_OVERFLOW_CHARS = int(_MAX_PROMPT_CHARS * _SOFT_OVERFLOW_PCT)
 _COMPACT_THRESHOLD_CHARS = int(
-    os.environ.get("JARVIS_TOOL_LOOP_COMPACT_THRESHOLD", str(int(_MAX_PROMPT_CHARS * 0.75)))
+    os.environ.get(
+        "JARVIS_TOOL_LOOP_COMPACT_THRESHOLD",
+        str(int(_MAX_PROMPT_CHARS * 0.75)),
+    )
 )  # Trigger compaction at 75% of max to avoid hard crash
 
 
@@ -3096,6 +3114,7 @@ class ToolLoopCoordinator:
         # generation deadline.
         round_index = -1
         _explore_only_rounds = 0
+        _soft_overflow_warned = False
         raw: str = ""
         while True:
             round_index += 1
@@ -3416,6 +3435,31 @@ class ToolLoopCoordinator:
                         "[ToolLoop] Exploration budget reached (%d rounds) for %s, nudging generation",
                         _explore_only_rounds, op_id[:12],
                     )
+
+            # ── Soft overflow (pre-compaction) watermark ──
+            # When the accumulated prompt crosses the soft threshold but is
+            # still below the compaction ceiling, emit a single-line
+            # telemetry warning and stash a structured hint on the next
+            # round's instruction footer so the model knows to stop
+            # fetching new context and write the patch. Lossless signal
+            # that rides one round ahead of the lossy compactor.
+            if (
+                not _soft_overflow_warned
+                and len(current_prompt) >= _SOFT_OVERFLOW_CHARS
+                and len(current_prompt) < _COMPACT_THRESHOLD_CHARS
+            ):
+                _soft_overflow_warned = True
+                _pct = 100.0 * len(current_prompt) / max(1, _MAX_PROMPT_CHARS)
+                logger.warning(
+                    "[ToolLoop] Soft overflow watermark for %s: %d/%d chars "
+                    "(%.1f%%) — advising model to finalize",
+                    op_id[:12], len(current_prompt), _MAX_PROMPT_CHARS, _pct,
+                )
+                current_prompt += (
+                    "\n\n[SYSTEM] Context budget at "
+                    f"{_pct:.0f}% of cap. Stop fetching new files; "
+                    "write your final answer with what you already have.\n"
+                )
 
             # ── Live context auto-compaction (Gap #8) ──
             # When the accumulated prompt exceeds the compaction threshold,

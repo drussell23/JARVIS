@@ -240,6 +240,15 @@ class GenerationResult:
     # after_hash/timestamp (see ToolExecutor._record_edit). Empty when no
     # mutating tool calls were issued.
     venom_edit_history: Tuple[Dict[str, Any], ...] = ()
+    # Target files that the prompt builder embedded as file-content
+    # regions *before* the tool loop ran. The lean prompt builder
+    # in-lines ~100 lines of each target file into the initial prompt,
+    # which is the semantic equivalent of the model having called
+    # ``read_file`` on that path — the Iron Gate treats one entry here
+    # as one unit of exploration credit so BACKGROUND-route DW ops
+    # (which tend to emit patches directly without a tool round) are
+    # not falsely tripped by ``exploration_insufficient``.
+    prompt_preloaded_files: Tuple[str, ...] = ()
     # Token usage (0 = not reported by provider)
     total_input_tokens: int = 0
     total_output_tokens: int = 0

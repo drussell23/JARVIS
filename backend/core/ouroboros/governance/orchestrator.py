@@ -2157,11 +2157,20 @@ class GovernedOrchestrator:
                         1 for _rec in (generation.tool_execution_records or ())
                         if getattr(_rec, "tool_name", "") in _EXPLORATION_TOOLS
                     )
+                    # Preloaded-prompt credit: when the lean prompt builder
+                    # inlines target regions directly into the generation
+                    # prompt, the model has already "seen" those files without
+                    # needing a read_file tool call — semantically equivalent
+                    # exploration. Gives DW BACKGROUND route (no tool loop)
+                    # and simple/trivial ops a fair path through the gate.
+                    _preloaded_credit = len(
+                        getattr(generation, "prompt_preloaded_files", ()) or ()
+                    )
                     # Roll the per-attempt count into the per-op credit BEFORE
                     # comparing — a prior attempt that already satisfied the
                     # floor lets a no-tool retry pass (the rejected file is
                     # already in the retry-feedback prompt).
-                    _op_explore_credit += _explore_count
+                    _op_explore_credit += _explore_count + _preloaded_credit
                     if _op_explore_credit < _min_explore:
                         _explore_err = (
                             f"exploration_insufficient: {_op_explore_credit}/{_min_explore} "
@@ -2173,8 +2182,9 @@ class GovernedOrchestrator:
                         )
                         logger.warning(
                             "[Orchestrator] Iron Gate — exploration_insufficient: "
-                            "%d/%d (attempt=%d cumulative) for op=%s",
-                            _op_explore_credit, _min_explore, attempt + 1, ctx.op_id[:12],
+                            "%d/%d (attempt=%d cumulative, preloaded=%d) for op=%s",
+                            _op_explore_credit, _min_explore, attempt + 1,
+                            _preloaded_credit, ctx.op_id[:12],
                         )
                         generation = None
                         raise RuntimeError(_explore_err)

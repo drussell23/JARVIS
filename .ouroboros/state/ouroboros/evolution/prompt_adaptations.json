@@ -30,7 +30,7 @@
   "stats": {
     "test_fix::.py": {
       "success": 0,
-      "failure": 21
+      "failure": 22
     }
   }
 }

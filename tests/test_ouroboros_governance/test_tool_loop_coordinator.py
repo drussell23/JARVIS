@@ -6,6 +6,11 @@ import pytest
 from backend.core.ouroboros.governance.tool_executor import (
     AsyncProcessToolBackend, GoverningToolPolicy, PolicyContext, PolicyDecision,
     ToolCall, ToolExecStatus, ToolLoopCoordinator, ToolResult, _format_tool_result,
+    _MAX_PROMPT_CHARS,
+)
+from backend.core.ouroboros.governance.candidate_generator import (
+    FailbackStateMachine,
+    FailureMode,
 )
 
 _SCHEMA = "2b.2-tool"
@@ -60,20 +65,73 @@ async def test_max_rounds_exceeded(tmp_path):
     assert call_count[0] == 3
 
 @pytest.mark.asyncio
-async def test_budget_exceeded(tmp_path):
-    # _MAX_PROMPT_CHARS was raised from 32_768 → 131_072 for CC parity;
-    # numbers below sized so the appended tool result definitely blows the
-    # new ceiling on the first round (no auto-compaction before round 2).
+async def test_context_overflow_raises_and_classifies_as_context_overflow(tmp_path):
+    """Task #96 regression fence: force the actual raise and verify the
+    full wiring from ToolLoopCoordinator.run() → FailbackStateMachine.
+
+    Previously this test was named ``test_budget_exceeded`` and used a
+    120K base prompt. After commit ff3d2f841b added a force-truncate
+    fallback, that configuration no longer hit the raise path — it was
+    silently saved by truncation, and the test passed vacuously on
+    `DID NOT RAISE`. This version sizes the base prompt at
+    ``_MAX_PROMPT_CHARS - 72`` so ``appendix ≤ overflow`` holds, which
+    is the only condition that actually reaches line 3452 in
+    tool_executor.py (``raise RuntimeError("tool_loop_context_overflow:...")``).
+
+    Without this, a battle test that reports "0 CONTEXT_OVERFLOW hits"
+    leaves the question open: is the path dead, or just unexercised?
+    This test answers it — the raise path IS wired, and classification
+    lands on CONTEXT_OVERFLOW (not TIMEOUT, which would trigger the
+    wrong backoff policy).
+    """
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "foo.py").write_text("x" * 80_000)
+    (tmp_path / "src" / "foo.py").write_text("y" * 80_000)
+
+    base_prompt = "x" * (_MAX_PROMPT_CHARS - 72)
+    assert len(base_prompt) == _MAX_PROMPT_CHARS - 72
+
     coordinator = _coordinator(tmp_path)
     responses = [_tool_resp(), _patch_resp()]
     idx = [0]
+
     async def generate_fn(prompt):
-        i = min(idx[0], len(responses)-1); idx[0] += 1; return responses[i]
-    with pytest.raises(RuntimeError, match="tool_loop_budget_exceeded"):
-        await coordinator.run(prompt="x" * 120_000, generate_fn=generate_fn,
-            parse_fn=_parse_fn, repo="jarvis", op_id="op-budget", deadline=time.monotonic()+30)
+        i = min(idx[0], len(responses) - 1)
+        idx[0] += 1
+        return responses[i]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await coordinator.run(
+            prompt=base_prompt,
+            generate_fn=generate_fn,
+            parse_fn=_parse_fn,
+            repo="jarvis",
+            op_id="op-context-overflow",
+            deadline=time.monotonic() + 30,
+        )
+
+    # 1. The raise path is wired and uses the post-ff3d2f841b message.
+    assert "tool_loop_context_overflow" in str(exc_info.value), (
+        f"expected 'tool_loop_context_overflow' in error, got {exc_info.value!r}"
+    )
+    assert "tool_loop_budget_exceeded" not in str(exc_info.value), (
+        "old error name must not appear — commit ff3d2f841b renamed it"
+    )
+
+    # 2. Classification lands on CONTEXT_OVERFLOW, not TIMEOUT.
+    mode = FailbackStateMachine.classify_exception(exc_info.value)
+    assert mode is FailureMode.CONTEXT_OVERFLOW, (
+        f"expected CONTEXT_OVERFLOW, got {mode} — string classifier drift "
+        f"would silently reroute overflows to TIMEOUT backoff"
+    )
+    assert mode is not FailureMode.TIMEOUT
+
+    # 3. The FSM must NOT apply any backoff for this mode (zero-eta policy).
+    fsm = FailbackStateMachine()
+    fsm.record_primary_failure(mode=FailureMode.CONTEXT_OVERFLOW)
+    assert fsm.recovery_eta() <= time.monotonic(), (
+        "CONTEXT_OVERFLOW must have zero backoff — otherwise a single "
+        "huge tool result stalls the provider for seconds"
+    )
 
 @pytest.mark.asyncio
 async def test_deadline_exceeded(tmp_path):

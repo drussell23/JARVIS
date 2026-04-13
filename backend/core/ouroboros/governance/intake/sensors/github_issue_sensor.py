@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,6 +37,23 @@ _POLL_INTERVAL_S = float(
 )
 _MAX_ISSUES_PER_SCAN = int(
     os.environ.get("JARVIS_GITHUB_ISSUE_MAX_PER_SCAN", "10")
+)
+# Circuit breaker: skip scans for N seconds after consecutive failures.
+# Battle test bt-2026-04-13-031119 hit GraphQL TLS cert failures on every
+# scan and burned log volume without any payoff. Tripping at 3 failures
+# gives transient network hiccups two free retries, then cools off.
+_BREAKER_THRESHOLD = int(
+    os.environ.get("JARVIS_GITHUB_BREAKER_THRESHOLD", "3")
+)
+_BREAKER_COOLDOWN_S = float(
+    os.environ.get("JARVIS_GITHUB_BREAKER_COOLDOWN_S", "600")
+)
+# Error substrings that trip the breaker (TLS/DNS/network, not "issue
+# not found"). Case-insensitive match on stderr/exception message.
+_BREAKER_TRIGGERS: Tuple[str, ...] = (
+    "certificate", "tls", "ssl", "x509",
+    "network is unreachable", "temporary failure in name resolution",
+    "getaddrinfo", "connection refused", "connection reset",
 )
 
 # Trinity repository mapping
@@ -111,6 +129,49 @@ class GitHubIssueSensor:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._seen_issues: set[str] = set()
+        # Per-repo circuit breaker state.
+        self._breaker_failures: Dict[str, int] = {}
+        self._breaker_open_until: Dict[str, float] = {}
+
+    def _breaker_tripped(self, repo_full: str) -> bool:
+        deadline = self._breaker_open_until.get(repo_full, 0.0)
+        if deadline == 0.0:
+            return False
+        if time.monotonic() >= deadline:
+            self._breaker_open_until.pop(repo_full, None)
+            self._breaker_failures[repo_full] = 0
+            logger.info(
+                "[GitHubIssueSensor] Breaker reset for %s — resuming scans",
+                repo_full,
+            )
+            return False
+        return True
+
+    def _breaker_trip(self, repo_full: str, reason: str) -> None:
+        self._breaker_failures[repo_full] = (
+            self._breaker_failures.get(repo_full, 0) + 1
+        )
+        if self._breaker_failures[repo_full] >= _BREAKER_THRESHOLD:
+            self._breaker_open_until[repo_full] = (
+                time.monotonic() + _BREAKER_COOLDOWN_S
+            )
+            logger.warning(
+                "[GitHubIssueSensor] Breaker OPEN for %s (%.0fs cooldown) — "
+                "%d consecutive failures, last=%s",
+                repo_full,
+                _BREAKER_COOLDOWN_S,
+                self._breaker_failures[repo_full],
+                reason[:120],
+            )
+
+    def _breaker_clear(self, repo_full: str) -> None:
+        if self._breaker_failures.get(repo_full, 0) > 0:
+            self._breaker_failures[repo_full] = 0
+
+    @staticmethod
+    def _is_breaker_trigger(text: str) -> bool:
+        low = text.lower()
+        return any(trig in low for trig in _BREAKER_TRIGGERS)
 
     async def start(self) -> None:
         self._running = True
@@ -225,6 +286,9 @@ class GitHubIssueSensor:
         """Scan one repo for open issues via gh CLI."""
         findings = []
 
+        if self._breaker_tripped(repo_full):
+            return []
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 "gh", "issue", "list",
@@ -240,16 +304,21 @@ class GitHubIssueSensor:
             )
 
             if proc.returncode != 0:
+                err_text = stderr.decode(errors="replace")
                 logger.warning(
                     "[GitHubIssueSensor] gh error for %s: %s",
-                    repo_full, stderr.decode()[:200],
+                    repo_full, err_text[:200],
                 )
+                if self._is_breaker_trigger(err_text):
+                    self._breaker_trip(repo_full, err_text)
                 return []
 
             issues = json.loads(stdout.decode())
+            self._breaker_clear(repo_full)
 
         except asyncio.TimeoutError:
             logger.warning("[GitHubIssueSensor] gh timeout for %s", repo_full)
+            self._breaker_trip(repo_full, "timeout")
             return []
         except json.JSONDecodeError:
             return []
