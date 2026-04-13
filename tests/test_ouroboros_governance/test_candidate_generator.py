@@ -969,7 +969,7 @@ class TestPerOpTier0Rotation:
         gen._record_tier0_failure()
         gen._record_tier0_failure()
         # Force the most-recent failure timestamp into the past
-        gen._last_tier0_failure_at = time.monotonic() - 60.0
+        gen._counters.last_tier0_failure_at = time.monotonic() - 60.0
         assert gen._should_skip_tier0_for_op() is False
 
     def test_success_resets_counter(self):
@@ -978,7 +978,7 @@ class TestPerOpTier0Rotation:
         gen._record_tier0_failure()
         assert gen._should_skip_tier0_for_op() is True
         gen._record_tier0_success()
-        assert gen._consecutive_tier0_failures == 0
+        assert gen._counters.consecutive_tier0_failures == 0
         assert gen._should_skip_tier0_for_op() is False
 
     def test_threshold_env_override_respected(self):
@@ -995,7 +995,7 @@ class TestPerOpTier0Rotation:
         gen._record_tier0_failure()
         assert gen._should_skip_tier0_for_op() is True
         # 6 seconds elapsed → past the 5s window
-        gen._last_tier0_failure_at = time.monotonic() - 6.0
+        gen._counters.last_tier0_failure_at = time.monotonic() - 6.0
         assert gen._should_skip_tier0_for_op() is False
 
     def test_independence_from_fsm_mode(self):
@@ -1114,7 +1114,7 @@ class TestProductionFailureScenario:
 
         gen._record_tier0_success()
         assert gen._should_skip_tier0_for_op() is False
-        assert gen._consecutive_tier0_failures == 0
+        assert gen._counters.consecutive_tier0_failures == 0
 
 
 class TestExceptionChainHelper:
@@ -1561,3 +1561,144 @@ class TestExhaustionInstrumentation:
         report = getattr(ei.value, "exhaustion_report")
         assert report["cause"] == "fallback_failed"
         assert report["fallback_err_class"] == "TimeoutError"
+
+
+class TestGeneratorStateUnquarantine:
+    """Phase 1 Step 3A: ``CandidateGenerator`` state hoist to ``_governance_state``.
+
+    Verifies the un-quarantine flag wiring — with ``JARVIS_UNQUARANTINE_GENERATOR``
+    enabled, the semaphore/FSM/counters backing a generator instance are read
+    from a process-lifetime singleton, so ``importlib.reload(candidate_generator)``
+    (the operation that drove Phase 1) leaves live asyncio primitives intact.
+
+    Without the flag, each ``CandidateGenerator.__init__`` mints a fresh
+    ``GeneratorState`` so pre-hoist behavior is preserved bit-for-bit —
+    tests in this class lock down both paths.
+    """
+
+    def _reset_singleton(self) -> None:
+        """Clear the module-level ``_generator_state`` singleton.
+
+        Every test in this class must start from a clean slate because the
+        singleton is process-global; otherwise a prior test's semaphore would
+        leak through ``get_generator_state()`` and break counter assertions.
+        """
+        from backend.core.ouroboros.governance import _governance_state
+        _governance_state.reset_for_tests()
+
+    def test_flag_off_mints_fresh_state_per_instance(self, monkeypatch):
+        """Default path: two generators get independent semaphores + counters.
+
+        Asserts the legacy per-instance behavior is preserved when the
+        un-quarantine flag is off — incrementing ``exhaustion_events`` on
+        one generator must not bleed into a sibling instance.
+        """
+        monkeypatch.delenv("JARVIS_UNQUARANTINE_GENERATOR", raising=False)
+        self._reset_singleton()
+
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+
+        gen_a = CandidateGenerator(primary=primary, fallback=fallback)
+        gen_b = CandidateGenerator(primary=primary, fallback=fallback)
+
+        assert gen_a._primary_sem is not gen_b._primary_sem
+        assert gen_a._fallback_sem is not gen_b._fallback_sem
+        assert gen_a.fsm is not gen_b.fsm
+        assert gen_a._counters is not gen_b._counters
+
+        gen_a._counters.exhaustion_events += 1
+        assert gen_b._counters.exhaustion_events == 0
+
+    def test_flag_on_shares_singleton_state(self, monkeypatch):
+        """Un-quarantine path: two generators share the same singleton roots.
+
+        With ``JARVIS_UNQUARANTINE_GENERATOR=true`` the semaphores, FSM, and
+        counters are resolved from ``get_generator_state()`` — mutations on
+        one instance are immediately visible to the next ``__init__``.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_GENERATOR", "true")
+        self._reset_singleton()
+
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+
+        gen_a = CandidateGenerator(primary=primary, fallback=fallback)
+        gen_a._counters.exhaustion_events = 7
+        gen_a._counters.consecutive_tier0_failures = 2
+
+        gen_b = CandidateGenerator(primary=primary, fallback=fallback)
+
+        assert gen_b._primary_sem is gen_a._primary_sem
+        assert gen_b._fallback_sem is gen_a._fallback_sem
+        assert gen_b.fsm is gen_a.fsm
+        assert gen_b._counters is gen_a._counters
+        assert gen_b._counters.exhaustion_events == 7
+        assert gen_b._counters.consecutive_tier0_failures == 2
+
+    @pytest.mark.asyncio
+    async def test_importlib_reload_preserves_semaphore_slot(self, monkeypatch):
+        """The acceptance test for Phase 1 Step 3A.
+
+        Acquire a slot on the primary semaphore, reload the
+        ``candidate_generator`` module with ``importlib.reload()``, then
+        build a fresh ``CandidateGenerator`` instance. Because the flag
+        routes ``self._primary_sem`` through the singleton, the new
+        instance must observe ``_value == 0`` (still locked) until the
+        original slot is released — proving the reload did not discard
+        live asyncio state.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_GENERATOR", "true")
+        self._reset_singleton()
+
+        import importlib
+        from backend.core.ouroboros.governance import candidate_generator
+
+        primary = _make_mock_provider(name="primary")
+        fallback = _make_mock_provider(name="fallback")
+
+        gen_before = candidate_generator.CandidateGenerator(
+            primary=primary,
+            fallback=fallback,
+            primary_concurrency=1,
+        )
+        # Drain the single slot on the primary semaphore — any new holder
+        # must queue behind us until we release.
+        await gen_before._primary_sem.acquire()
+        assert gen_before._primary_sem.locked() is True
+        gen_before._counters.exhaustion_events = 42
+
+        # The reload operation the whole hoist exists to support. Must not
+        # mint a new semaphore or zero the counters.
+        reloaded = importlib.reload(candidate_generator)
+
+        gen_after = reloaded.CandidateGenerator(
+            primary=primary,
+            fallback=fallback,
+            primary_concurrency=1,
+        )
+        assert gen_after._primary_sem is gen_before._primary_sem
+        assert gen_after._primary_sem.locked() is True
+        assert gen_after._counters.exhaustion_events == 42
+
+        # Release and confirm both handles see the unlock — proves the
+        # post-reload instance is operating on the original primitive, not
+        # a lookalike.
+        gen_before._primary_sem.release()
+        assert gen_after._primary_sem.locked() is False
+
+    def test_reset_for_tests_requires_test_mode(self, monkeypatch):
+        """``reset_for_tests()`` must refuse to run in production mode.
+
+        Leaving the door open would let a misbehaving autonomous loop
+        accidentally wipe semaphore state mid-battle-test. The guard
+        trips on both env-var and pytest signals — we unset both and
+        confirm the raise.
+        """
+        from backend.core.ouroboros.governance import _governance_state
+
+        monkeypatch.delenv("JARVIS_TEST_MODE", raising=False)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+        with pytest.raises(RuntimeError, match="outside test mode"):
+            _governance_state.reset_for_tests()
