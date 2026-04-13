@@ -29,7 +29,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.live import Live
@@ -267,6 +267,9 @@ class SerpentFlow:
         self._failed: int = 0
         self._cost_total: float = 0.0
         self._sensors_active: int = 0
+        self._plan_review_mode: bool = False
+        # Session lessons — stored for /lessons expand-on-demand
+        self._session_lessons: List[Tuple[str, str]] = []  # (type, text)
         self._op_providers: Dict[str, str] = {}
         self._op_starts: Dict[str, float] = {}
         self._streaming_active: bool = False
@@ -332,7 +335,10 @@ class SerpentFlow:
             f"[bold]Budget[/bold]     ${self._cost_cap:.2f}  [dim]│[/dim]  "
             f"Idle {self._idle_timeout_s:.0f}s"
         )
-        lines.append("[bold]Mode[/bold]       Governed (SAFE_AUTO auto-apply)")
+        if self._plan_review_mode:
+            lines.append("[bold]Mode[/bold]       Governed + plan review before execute")
+        else:
+            lines.append("[bold]Mode[/bold]       Governed (SAFE_AUTO auto-apply)")
         lines.append("")
 
         # Layer status
@@ -1401,11 +1407,71 @@ class SerpentFlow:
             highlight=False,
         )
 
+    def update_session_lessons(
+        self,
+        count: int,
+        latest: str = "",
+        lessons: Optional[List[Tuple[str, str]]] = None,
+        op_id: str = "",
+    ) -> None:
+        """Session lesson buffer updated — show inline count + latest.
+
+        The full list is stored for ``/lessons`` expand-on-demand.
+
+        Parameters
+        ----------
+        count:
+            Total number of lessons in the buffer.
+        latest:
+            Text of the most recently added lesson.
+        lessons:
+            Full lesson list ``[(type, text), ...]`` for ``/lessons``.
+        op_id:
+            Originating operation (used for block scoping).
+        """
+        if lessons is not None:
+            self._session_lessons = list(lessons)
+
+        # Inline notification
+        lesson_word = "lesson" if count == 1 else "lessons"
+        # Truncate and escape latest for Rich markup safety
+        safe_latest = (latest[:80] + "…") if len(latest) > 80 else latest
+        safe_latest = safe_latest.replace("[", "\\[")
+
+        if op_id and op_id in self._active_ops:
+            # Render inside the op block
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]📖 lessons[/{_C['neural']}]    "
+                f"applying {count} {lesson_word} from this session",
+            )
+            if safe_latest:
+                self._op_line(
+                    op_id,
+                    f"[{_C['dim']}]⎿  latest: {safe_latest}[/{_C['dim']}]",
+                )
+        else:
+            # Between ops
+            self.console.print(
+                f"  [{_C['neural']}]📖 lessons[/{_C['neural']}]    "
+                f"applying {count} {lesson_word} from this session",
+                highlight=False,
+            )
+            if safe_latest:
+                self.console.print(
+                    f"  [{_C['dim']}]⎿  latest: {safe_latest}[/{_C['dim']}]",
+                    highlight=False,
+                )
+
     def update_cost(
         self, total: float, remaining: float, breakdown: Dict[str, float],
     ) -> None:
         """Cost tick — shown periodically between operations."""
         self._cost_total = total
+
+    def set_plan_review_mode(self, enabled: bool) -> None:
+        """Update whether the session requires a pre-run plan review."""
+        self._plan_review_mode = enabled
 
     def update_sensors(self, count: int) -> None:
         """Update active sensor count (tracked for status bar)."""
@@ -2149,6 +2215,22 @@ class SerpentTransport:
                         title=payload.get("dream_title", ""),
                     )
 
+                # Session lessons buffer updated
+                elif phase == "session_lessons":
+                    _raw_lessons = payload.get("lessons", [])
+                    # Convert from list-of-lists (JSON) to list-of-tuples
+                    _lessons = [
+                        (e[0], e[1]) if isinstance(e, (list, tuple)) and len(e) >= 2
+                        else ("code", str(e))
+                        for e in _raw_lessons
+                    ]
+                    self._flow.update_session_lessons(
+                        count=payload.get("lesson_count", len(_lessons)),
+                        latest=payload.get("latest_lesson", ""),
+                        lessons=_lessons,
+                        op_id=op_id,
+                    )
+
                 # Proactive alert
                 elif payload.get("proactive_alert"):
                     self._flow.emit_proactive_alert(
@@ -2515,6 +2597,9 @@ class SerpentREPL:
                     if line.startswith("/forget") or line.startswith("forget "):
                         await self._handle_forget(line)
                         continue
+                    if line in ("/lessons", "lessons"):
+                        self._print_lessons()
+                        continue
 
                     # Delegate to external handler
                     if self._on_command is not None:
@@ -2549,6 +2634,7 @@ class SerpentREPL:
             f"[bold]Cost[/bold]        ${f._cost_total:.4f} / ${f._cost_cap:.2f}",
             f"[bold]Active Ops[/bold]  {len(f._active_ops)}",
             f"[bold]Sensors[/bold]     {f._sensors_active}",
+            f"[bold]Lessons[/bold]     {len(f._session_lessons)}",
         ]
         panel = Panel(
             "\n".join(lines),
@@ -2566,6 +2652,7 @@ class SerpentREPL:
         lines = [
             f"  [{_C['dim']}]status[/{_C['dim']}]            organism status panel",
             f"  [{_C['dim']}]cost[/{_C['dim']}]              cost breakdown",
+            f"  [{_C['dim']}]/lessons[/{_C['dim']}]          show session lesson buffer",
             f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]       cancel an in-flight operation",
             f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]      set risk ceiling",
             f"  [{_C['dim']}]/budget <usd>[/{_C['dim']}]     adjust session budget",
@@ -2580,12 +2667,45 @@ class SerpentREPL:
             "\n".join(lines),
             title="[cyan]🐍 Commands[/cyan]",
             border_style="dim",
-            width=min(self._flow.console.width, 52),
+            width=min(self._flow.console.width, 54),
             padding=(0, 1),
         )
         self._flow.console.print()
         self._flow.console.print(panel)
         self._flow.console.print()
+
+    def _print_lessons(self) -> None:
+        """Print the full session lesson buffer (expand-on-demand)."""
+        f = self._flow
+        lessons = f._session_lessons
+
+        if not lessons:
+            f.console.print(
+                f"  [{_C['dim']}]📖 No session lessons yet.[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+
+        # Type icons: code lessons get 🔧, infra lessons get 🌐
+        _icons = {"code": "🔧", "infra": "🌐"}
+
+        lines: List[str] = []
+        for i, (ltype, text) in enumerate(lessons, 1):
+            icon = _icons.get(ltype, "📝")
+            # Escape Rich markup in model-generated text
+            safe = text.replace("[", "\\[")[:120]
+            lines.append(f"  {icon} [{_C['dim']}]{i:>2}.[/{_C['dim']}] {safe}")
+
+        panel = Panel(
+            "\n".join(lines),
+            title=f"[{_C['neural']}]📖 Session Lessons ({len(lessons)})[/{_C['neural']}]",
+            border_style=_C["neural"],
+            width=min(f.console.width, 80),
+            padding=(0, 1),
+        )
+        f.console.print()
+        f.console.print(panel)
+        f.console.print()
 
     async def _handle_cancel(self, op_id: str) -> None:
         """Request cancellation of an in-flight operation."""

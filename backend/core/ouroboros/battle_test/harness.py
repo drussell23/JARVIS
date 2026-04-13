@@ -29,6 +29,8 @@ from backend.core.ouroboros.battle_test.session_recorder import SessionRecorder
 
 logger = logging.getLogger(__name__)
 
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
 
 # ---------------------------------------------------------------------------
 # HarnessConfig
@@ -128,6 +130,10 @@ class BattleTestHarness:
         self._intake_service: Any = None
         self._intake_paused: bool = False
         self._graduation_orchestrator: Any = None
+        self._plan_before_execute: bool = (
+            os.environ.get("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", "").strip().lower()
+            in _TRUTHY
+        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -489,6 +495,7 @@ class BattleTestHarness:
                     idle_timeout_s=self._config.idle_timeout_s,
                     repo_path=self._config.repo_path,
                 )
+                self._serpent_flow.set_plan_review_mode(self._plan_before_execute)
                 _serpent_transport = SerpentTransport(flow=self._serpent_flow)
                 if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
                     self._governance_stack.comm._transports.append(_serpent_transport)
@@ -826,7 +833,7 @@ class BattleTestHarness:
         """Process a user command from the SerpentREPL.
 
         Supports: stop, shutdown, cost, pause, resume, status, ops,
-        /risk, /budget, /goal.
+        /risk, /budget, /goal, /plan.
         """
         cmd = command.strip().lower()
         if cmd in ("stop", "shutdown"):
@@ -841,6 +848,8 @@ class BattleTestHarness:
             self._repl_cmd_status()
         elif cmd == "ops":
             self._repl_cmd_ops()
+        elif cmd == "plan" or cmd.startswith("/plan") or cmd.startswith("plan "):
+            self._repl_cmd_plan(command.strip())
         elif cmd.startswith("/goal") or cmd.startswith("goal "):
             self._repl_cmd_goal(command.strip())
         elif cmd.startswith("/budget") or cmd.startswith("budget "):
@@ -914,9 +923,13 @@ class BattleTestHarness:
         cost = self._cost_tracker.total_spent
         cap = self._config.cost_cap_usd
         paused_tag = "  [yellow](intake paused)[/yellow]" if self._intake_paused else ""
+        plan_tag = (
+            "  [cyan](plan review on)[/cyan]"
+            if self._plan_before_execute else ""
+        )
         self._repl_print(
             f"[bold]Status:[/bold]  active={active}  completed={completed}  "
-            f"failed={failed}  cost=${cost:.4f}/${cap:.2f}{paused_tag}"
+            f"failed={failed}  cost=${cost:.4f}/${cap:.2f}{paused_tag}{plan_tag}"
         )
 
     def _repl_cmd_ops(self) -> None:
@@ -982,6 +995,46 @@ class BattleTestHarness:
         self._config.cost_cap_usd = amount
         self._cost_tracker._budget_usd = amount
         self._repl_print(f"[green]Budget updated to ${amount:.2f}[/green]")
+
+    def _set_plan_review_mode(self, enabled: bool) -> None:
+        """Toggle session-scoped plan review before execution."""
+        self._plan_before_execute = enabled
+        os.environ["JARVIS_SHOW_PLAN_BEFORE_EXECUTE"] = "1" if enabled else "0"
+        sf = getattr(self, "_serpent_flow", None)
+        if sf is not None and hasattr(sf, "set_plan_review_mode"):
+            sf.set_plan_review_mode(enabled)
+
+    def _repl_cmd_plan(self, line: str) -> None:
+        """Show or toggle plan review mode for the current session."""
+        normalized = line[1:] if line.startswith("/") else line
+        parts = normalized.split(None, 1)
+
+        if len(parts) < 2:
+            state = "[green]ON[/green]" if self._plan_before_execute else "[dim]OFF[/dim]"
+            self._repl_print(
+                "[bold]Plan Review:[/bold] "
+                f"{state}  [dim]show the plan before executing anything in this session[/dim]"
+            )
+            self._repl_print("[dim]Usage: /plan on | off[/dim]")
+            return
+
+        raw = parts[1].strip().lower()
+        if raw in {"on", "enable", "enabled", "true", "1"}:
+            self._set_plan_review_mode(True)
+            self._repl_print(
+                "[green]🗺 Plan review enabled — the next operation will show a plan "
+                "and wait for approval before GENERATE.[/green]"
+            )
+            return
+        if raw in {"off", "disable", "disabled", "false", "0"}:
+            self._set_plan_review_mode(False)
+            self._repl_print(
+                "[yellow]🗺 Plan review disabled — the next operation can execute "
+                "without a mandatory pre-run plan gate.[/yellow]"
+            )
+            return
+
+        self._repl_print("[red]Usage: /plan on | off[/red]")
 
     def _repl_cmd_goal(self, line: str) -> None:
         """Manage active goals at runtime.
