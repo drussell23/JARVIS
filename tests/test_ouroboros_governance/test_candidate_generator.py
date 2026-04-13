@@ -1491,3 +1491,73 @@ class TestExhaustionInstrumentation:
             gen._raise_exhausted("queue_only_dispatch")
         assert "all_providers_exhausted" in str(ei.value)
         assert ":queue_only_dispatch" in str(ei.value)
+
+    @pytest.mark.asyncio
+    async def test_fallback_round_starved_cause_tag_on_tool_loop_gate(
+        self,
+    ) -> None:
+        """``ToolLoopCoordinator``'s pre-round viability gate raises with a
+        ``tool_loop_round_budget_starved`` marker. ``_call_fallback`` must
+        detect that marker in ``str(exc)`` and promote the exhaustion
+        breadcrumb cause from the generic ``fallback_failed`` to the more
+        specific ``fallback_round_starved``, so battle-test grep audits
+        can distinguish structural round starvation from transport
+        failures without reading full exception traces.
+        """
+        primary = _make_mock_provider(
+            name="primary",
+            generate_side_effect=RuntimeError("primary down"),
+        )
+        fallback = _make_mock_provider(
+            name="fallback",
+            generate_side_effect=RuntimeError(
+                "tool_loop_round_budget_starved:round=1,"
+                "remaining=0.37s,min_per_round=3.00s"
+            ),
+        )
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+
+        ctx = _make_context(op_id="op-round-starved-005")
+        deadline = _make_deadline(5.0)
+
+        with pytest.raises(RuntimeError, match="all_providers_exhausted") as ei:
+            await gen.generate(ctx, deadline)
+
+        report = getattr(ei.value, "exhaustion_report")
+        assert report["cause"] == "fallback_round_starved", (
+            f"expected fallback_round_starved, got {report['cause']!r}"
+        )
+        # The generic transport fields still populate (we did not skip the
+        # exception handler) — only the cause tag changes.
+        assert "fallback_err_class" in report
+        assert "tool_loop_round_budget_starved" in report["fallback_err_msg"]
+
+    @pytest.mark.asyncio
+    async def test_fallback_failed_cause_tag_on_plain_transport_error(
+        self,
+    ) -> None:
+        """Counterpart to the round-starved test: verify that a non-gate
+        transport failure (e.g. ``TimeoutError``) still tags as the plain
+        ``fallback_failed`` cause, proving the tag promotion is scoped to
+        the marker substring and not accidentally triggered by unrelated
+        errors.
+        """
+        primary = _make_mock_provider(
+            name="primary",
+            generate_side_effect=RuntimeError("primary down"),
+        )
+        fallback = _make_mock_provider(
+            name="fallback",
+            generate_side_effect=TimeoutError("tcp read timeout"),
+        )
+        gen = CandidateGenerator(primary=primary, fallback=fallback)
+
+        ctx = _make_context(op_id="op-plain-fail-006")
+        deadline = _make_deadline(5.0)
+
+        with pytest.raises(RuntimeError, match="all_providers_exhausted") as ei:
+            await gen.generate(ctx, deadline)
+
+        report = getattr(ei.value, "exhaustion_report")
+        assert report["cause"] == "fallback_failed"
+        assert report["fallback_err_class"] == "TimeoutError"

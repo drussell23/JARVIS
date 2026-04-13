@@ -688,7 +688,14 @@ class TestToolLoopRoundStarvationGate:
         self, tmp_path
     ):
         """The bt-2026-04-12-054855 reproduction: round 0 consumes most of
-        the budget, round 1 inherits a sub-floor remainder, gate fires."""
+        the budget, round 1 inherits a sub-floor remainder, gate fires.
+
+        Budget math (matters for effective_max_rounds):
+            total=10s, reserve=1s, min=3s → usable=9s, by_time=3
+            effective_max_rounds = min(10, 3) = 3  (room for rounds 0, 1, 2)
+        Round 0 burns ~8s of that 10s; round 1 sees remaining≈2s, which is
+        strictly below min_per_round_s=3s → gate fires.
+        """
         backend = _TrackingBackend()
         coordinator = ToolLoopCoordinator(
             backend=backend,
@@ -699,11 +706,11 @@ class TestToolLoopRoundStarvationGate:
             final_write_reserve_s=1.0,
         )
 
-        # Round 0: asks for a tool, burns ~4.5s of a 5s budget.
-        # Round 1: only ~0.5s remain — below min_per_round_s=3.0 → bail.
+        # Round 0: asks for a tool, burns ~8s of a 10s budget.
+        # Round 1: only ~2s remain — below min_per_round_s=3 → bail.
         async def generate_fn(prompt: str) -> str:
             if "Observation" not in prompt:
-                await asyncio.sleep(4.5)
+                await asyncio.sleep(8.0)
                 return _tool_resp()
             # Should never reach here — the gate must fire first.
             return _final_resp()
@@ -717,7 +724,7 @@ class TestToolLoopRoundStarvationGate:
                 parse_fn=_parse_fn,
                 repo="jarvis",
                 op_id="op-starved",
-                deadline=time.monotonic() + 5.0,
+                deadline=time.monotonic() + 10.0,
             )
 
         # Round 0's tool call executed; round 1 never reached generate_fn.
@@ -742,7 +749,7 @@ class TestToolLoopRoundStarvationGate:
 
         async def generate_fn(prompt: str) -> str:
             if "Observation" not in prompt:
-                await asyncio.sleep(4.5)
+                await asyncio.sleep(8.0)
                 return _tool_resp()
             return _final_resp()
 
@@ -753,7 +760,7 @@ class TestToolLoopRoundStarvationGate:
                 parse_fn=_parse_fn,
                 repo="jarvis",
                 op_id="op-crumbs",
-                deadline=time.monotonic() + 5.0,
+                deadline=time.monotonic() + 10.0,
             )
 
         msg = str(ei.value)
