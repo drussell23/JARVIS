@@ -4256,6 +4256,11 @@ class GovernedOrchestrator:
                     risk_tier=ctx.risk_tier,
                     provider_name=_provider,
                     generation_cost=_cost,
+                    # Mythos §7.4: originating signal + rationale for
+                    # zero-context reviewers.
+                    signal_source=getattr(ctx, "signal_source", ""),
+                    signal_urgency=getattr(ctx, "signal_urgency", ""),
+                    rationale=ctx.description,
                 ),
                 timeout=30.0,
             )

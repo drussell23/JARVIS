@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-019d8535-) at 2026-04-13 05:01 UTC
+# Reason: IntentEnvelope schema version 2c.1 not found in cross-repo contract doc. Contract may be outdated.
+
 # Cross-Repository Contract
 
 This document defines the contract between JARVIS, JARVIS-Prime, and Reactor-Core.
@@ -7,7 +10,7 @@ This document defines the contract between JARVIS, JARVIS-Prime, and Reactor-Cor
 All three repositories MUST respect these environment variables:
 
 | Variable | Purpose | Default |
-|----------|---------|---------|
+|----------|---------|----------|
 | `JARVIS_PRIME_PATH` | Path to JARVIS-Prime repository | Auto-discovered |
 | `REACTOR_CORE_PATH` | Path to Reactor-Core repository | Auto-discovered |
 | `JARVIS_PRIME_PORT` | Port for JARVIS-Prime | 8000 |
@@ -36,6 +39,53 @@ Each repository SHOULD write heartbeat files to:
 - `~/.jarvis/trinity/components/{component_name}.json`
 - Updated every 10-30 seconds
 - Contains: timestamp, status, version, pid
+
+## IntentEnvelope Schema (version 2c.1)
+
+All cross-repo intent messages MUST conform to this envelope schema.
+
+### Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `schema_version` | string | Yes | Must be `"2c.1"` |
+| `intent_id` | string (UUID) | Yes | Unique identifier for this intent |
+| `op_id` | string | Yes | Operation ID linking related intents |
+| `source` | string | Yes | Originating component (e.g. `"jarvis"`, `"jarvis-prime"`, `"reactor-core"`) |
+| `target` | string | Yes | Destination component |
+| `intent_type` | string | Yes | Semantic action label (e.g. `"execute_task"`, `"status_query"`) |
+| `payload` | object | Yes | Intent-specific data (schema varies by `intent_type`) |
+| `timestamp` | string (ISO-8601) | Yes | UTC creation time |
+| `ttl_seconds` | number | No | Seconds until this intent expires; omit for no expiry |
+| `reply_to` | string | No | Component that should receive the response |
+| `trace_context` | object | No | Distributed tracing metadata (e.g. W3C traceparent) |
+
+### Example
+
+```json
+{
+  "schema_version": "2c.1",
+  "intent_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "op_id": "op-019d8535-fb8e-7315-ab15-71820119e5c9",
+  "source": "jarvis",
+  "target": "reactor-core",
+  "intent_type": "execute_task",
+  "payload": {
+    "task": "run_preflight",
+    "args": {}
+  },
+  "timestamp": "2025-01-01T00:00:00Z",
+  "ttl_seconds": 30
+}
+```
+
+### Validation Rules
+
+- `schema_version` MUST be exactly `"2c.1"`; receivers MUST reject unknown versions.
+- `intent_id` MUST be a valid UUID v4.
+- `timestamp` MUST be UTC ISO-8601 (e.g. `2025-01-01T00:00:00Z`).
+- Receivers MUST discard intents whose `ttl_seconds` has elapsed relative to `timestamp`.
+- Unknown top-level fields MUST be ignored (forward-compatibility).
 
 ## Status Semantics
 
@@ -96,7 +146,7 @@ Components are classified as:
 Readiness behavior can be configured via environment variables:
 
 | Variable | Default | Purpose |
-|----------|---------|---------|
+|----------|---------|----------|
 | `JARVIS_VERIFICATION_TIMEOUT` | 60.0 | Seconds to wait for service verification |
 | `JARVIS_UNHEALTHY_THRESHOLD_FAILURES` | 3 | Consecutive failures before unhealthy |
 | `JARVIS_UNHEALTHY_THRESHOLD_SECONDS` | 30.0 | Seconds unhealthy before revocation |

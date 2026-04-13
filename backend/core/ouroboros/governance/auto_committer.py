@@ -7,11 +7,31 @@ tests, the AutoCommitter creates a structured git commit with the O+V
 signature. Without this, applied changes sit on disk as uncommitted
 modifications, breaking the self-development cycle.
 
+Design Principle: Zero-Context Readability (Mythos §7.4)
+-------------------------------------------------------
+Every commit message MUST be written for a reviewer who has:
+
+- Zero session context — they were not watching the daemon run.
+- No knowledge of the sensor signal — they don't know what triggered this op.
+- No prior ops in the loop — they can't infer intent from neighboring commits.
+
+The body always includes:
+
+1. **Signal** — what triggered the operation (test_failure, ai_miner, etc.)
+2. **Urgency** — why this was prioritized over other work.
+3. **Rationale** — a self-contained explanation of WHY this change was needed,
+   written so a cold reader can understand it without grepping internal logs.
+
 Commit Message Format
 ---------------------
 .. code-block:: text
 
     <type>(<scope>): <description>
+
+    Signal: <signal_source> | Urgency: <urgency>
+
+    Why: <rationale — self-contained explanation of what triggered this
+    operation, what was wrong, and why this change fixes it>
 
     Op-ID: <op_id>
     Risk: <risk_tier>
@@ -40,6 +60,8 @@ Manifesto Alignment
   never shell strings. Push is gated to non-protected branches only.
 - Section 7 (Absolute Observability): Commit hash emitted via heartbeat for
   SerpentFlow rendering.
+- Mythos §7.4 (Zero-Context Readability): Signal + rationale always present
+  in commit body so reviewers never need to cross-reference session logs.
 """
 
 from __future__ import annotations
@@ -113,8 +135,24 @@ class AutoCommitter:
         risk_tier: Optional[Any] = None,
         provider_name: str = "",
         generation_cost: float = 0.0,
+        signal_source: str = "",
+        signal_urgency: str = "",
+        rationale: str = "",
     ) -> CommitResult:
         """Create a structured git commit for the applied operation.
+
+        Parameters
+        ----------
+        signal_source:
+            What triggered the operation (e.g. ``"test_failure"``,
+            ``"ai_miner"``, ``"voice_human"``).  Written into the commit
+            body so a cold reviewer knows the originating signal.
+        signal_urgency:
+            Priority classification (``"critical"``/``"high"``/``"normal"``/
+            ``"low"``).  Explains why this change was prioritized.
+        rationale:
+            Self-contained explanation of WHY this change was needed.
+            Must be readable by someone with zero session context.
 
         Returns a :class:`CommitResult`. Never raises.
         """
@@ -147,6 +185,9 @@ class AutoCommitter:
                 risk_tier=risk_tier,
                 provider_name=provider_name,
                 generation_cost=generation_cost,
+                signal_source=signal_source,
+                signal_urgency=signal_urgency,
+                rationale=rationale,
             )
 
             # Commit
@@ -195,8 +236,20 @@ class AutoCommitter:
         risk_tier: Optional[Any] = None,
         provider_name: str = "",
         generation_cost: float = 0.0,
+        signal_source: str = "",
+        signal_urgency: str = "",
+        rationale: str = "",
     ) -> str:
-        """Build a structured commit message with O+V signature."""
+        """Build a structured commit message with O+V signature.
+
+        Zero-Context Rule (Mythos §7.4)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Every commit body must be self-contained: a reviewer who has never
+        seen the daemon's session logs, has no knowledge of the originating
+        sensor signal, and has read no neighboring commits should still
+        understand *what triggered* this change, *why* it was needed, and
+        *what* it does.
+        """
         commit_type = self._infer_commit_type(description)
         scope = self._infer_scope(target_files)
 
@@ -207,9 +260,32 @@ class AutoCommitter:
 
         subject = f"{commit_type}({scope}): {subject_desc}"
 
-        # Body
+        # Body — ordered for cold-reader comprehension:
+        #   1. Signal provenance (what triggered this)
+        #   2. Rationale (why this change is needed)
+        #   3. Operational metadata (op-id, risk, provider, files)
+        #   4. Signature
         body_parts: List[str] = []
 
+        # --- Signal provenance block (Mythos §7.4) ---
+        _sig = signal_source or "unknown"
+        _urg = signal_urgency or "normal"
+        body_parts.append(f"Signal: {_sig} | Urgency: {_urg}")
+
+        # --- Rationale block (Mythos §7.4) ---
+        # The rationale must be readable by someone with zero session context.
+        # If no explicit rationale is provided, fall back to the description
+        # (which at least tells the reader WHAT was done, even if not WHY).
+        _rationale = (rationale or description).strip()
+        if _rationale:
+            # Wrap rationale to ~72 chars for git log readability
+            _wrapped = self._wrap_rationale(_rationale)
+            body_parts.append("")
+            body_parts.append(f"Why: {_wrapped}")
+
+        body_parts.append("")
+
+        # --- Operational metadata ---
         body_parts.append(f"Op-ID: {op_id}")
 
         risk_str = self._format_risk_tier(risk_tier)
@@ -273,6 +349,20 @@ class AutoCommitter:
         if common:
             return common[-1]
         return "ouroboros"
+
+    @staticmethod
+    def _wrap_rationale(text: str, width: int = 68) -> str:
+        """Wrap rationale text to fit within git log column width.
+
+        The first line follows "Why: " (5 chars), subsequent lines are
+        indented 5 spaces to align under the first word after "Why: ".
+        """
+        import textwrap
+        lines = textwrap.wrap(text, width=width)
+        if not lines:
+            return text
+        # First line is inline with "Why: "; subsequent lines indent to align
+        return "\n     ".join(lines)
 
     @staticmethod
     def _format_risk_tier(risk_tier: Optional[Any]) -> str:
