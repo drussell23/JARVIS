@@ -2399,53 +2399,149 @@ class GovernedOrchestrator:
                     # already in the retry-feedback prompt).
                     _op_explore_credit += _explore_count + _preloaded_credit
 
-                    # Shadow log — ledger-based exploration scoring (Task #102).
-                    # Runs alongside the legacy counter without changing
-                    # behavior so we can compare distributions before flipping
-                    # JARVIS_EXPLORATION_LEDGER_ENABLED in a later patch.
-                    # Gated on JARVIS_EXPLORATION_SHADOW_LOG OR is_ledger_enabled
-                    # so operators can observe without enforcing.
-                    _shadow_on = (
-                        os.environ.get(
-                            "JARVIS_EXPLORATION_SHADOW_LOG", "",
-                        ).strip().lower() in {"1", "true", "yes", "on"}
+                    # Accumulate ledger records across retry attempts (#103).
+                    # Cumulative semantics mirror _op_explore_credit — the
+                    # ledger sees every tool call the model has made for this
+                    # op, then dedup-by-(tool, arguments_hash) happens inside
+                    # diversity_score(). Preloaded files become synthetic
+                    # read_file records so the ledger grants comprehension
+                    # credit matching the legacy counter's preload behavior.
+                    _op_explore_records.extend(
+                        generation.tool_execution_records or ()
                     )
-                    if _shadow_on:
+                    for _pf in (
+                        getattr(generation, "prompt_preloaded_files", ()) or ()
+                    ):
+                        _op_explore_records.append(
+                            _PreloadedExplorationRecord(str(_pf))
+                        )
+
+                    from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+                        ExplorationFloors,
+                        ExplorationInsufficientError,
+                        ExplorationLedger,
+                        evaluate_exploration,
+                        is_ledger_enabled,
+                    )
+
+                    if is_ledger_enabled():
+                        # ── DECISION path (#103) ──
+                        # Ledger is authoritative. Legacy int-counter gate is
+                        # skipped entirely. Emit ``(decision)`` log tag — kept
+                        # distinct from ``(shadow)`` so ops can grep either
+                        # mode without ambiguity.
                         try:
-                            from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
-                                ExplorationFloors,
-                                ExplorationLedger,
-                                evaluate_exploration,
-                            )
                             _ledger = ExplorationLedger.from_records(
-                                generation.tool_execution_records or (),
+                                _op_explore_records
                             )
                             _floors = ExplorationFloors.from_env(_task_complexity)
                             _verdict = evaluate_exploration(_ledger, _floors)
+                        except Exception:
+                            # If the ledger itself blows up, fall through to
+                            # the legacy counter gate so we never leave the op
+                            # ungated. Log once so the failure is visible.
+                            logger.exception(
+                                "[Orchestrator] ExplorationLedger(decision) "
+                                "evaluation failed — falling back to counter"
+                            )
+                            _verdict = None
+                        if _verdict is not None:
                             _covered_names = sorted(
                                 c.value for c in _verdict.categories_covered
                             )
                             logger.info(
-                                "[Orchestrator] ExplorationLedger(shadow) "
-                                "op=%s complexity=%s legacy_credit=%d "
-                                "score=%.2f min_score=%.2f unique=%d "
-                                "categories=%s would_pass=%s",
+                                "[Orchestrator] ExplorationLedger(decision) "
+                                "op=%s complexity=%s score=%.2f min_score=%.2f "
+                                "unique=%d categories=%s would_pass=%s",
                                 ctx.op_id[:12],
                                 _task_complexity or "unknown",
-                                _op_explore_credit,
                                 _verdict.score,
                                 _floors.min_score,
                                 _ledger.unique_call_count(),
                                 ",".join(_covered_names) or "-",
                                 _verdict.sufficient,
                             )
-                        except Exception:
-                            logger.debug(
-                                "[Orchestrator] ExplorationLedger shadow log error",
-                                exc_info=True,
-                            )
+                            if _verdict.insufficient:
+                                _missing = sorted(
+                                    c.value for c in _verdict.missing_categories
+                                )
+                                _decision_msg = (
+                                    f"exploration_insufficient: "
+                                    f"score={_verdict.score:.1f}/"
+                                    f"{_floors.min_score:.1f} "
+                                    f"categories={len(_verdict.categories_covered)}/"
+                                    f"{_floors.min_categories} "
+                                    f"missing={','.join(_missing) or '-'}"
+                                )
+                                logger.warning(
+                                    "[Orchestrator] Iron Gate — "
+                                    "ExplorationLedger(decision) insufficient "
+                                    "op=%s %s (attempt=%d)",
+                                    ctx.op_id[:12],
+                                    _decision_msg,
+                                    attempt + 1,
+                                )
+                                generation = None
+                                raise ExplorationInsufficientError(
+                                    _decision_msg,
+                                    verdict=_verdict,
+                                    floors=_floors,
+                                )
+                            # Ledger PASSED — skip legacy counter gate
+                            # entirely. Jump to the ASCII gate below.
+                        else:
+                            # Ledger eval crashed → fall through to legacy gate
+                            pass
 
-                    if _op_explore_credit < _min_explore:
+                    # ── LEGACY path (flag off) or ledger-eval fallback ──
+                    # Shadow log + int-counter gate. Shadow log is suppressed
+                    # when enforcement is on (the decision log above covers
+                    # that path) so operators don't see duplicate lines.
+                    if not is_ledger_enabled():
+                        _shadow_on = (
+                            os.environ.get(
+                                "JARVIS_EXPLORATION_SHADOW_LOG", "",
+                            ).strip().lower() in _TRUTHY
+                        )
+                        if _shadow_on:
+                            try:
+                                _sledger = ExplorationLedger.from_records(
+                                    _op_explore_records
+                                )
+                                _sfloors = ExplorationFloors.from_env(
+                                    _task_complexity
+                                )
+                                _sverdict = evaluate_exploration(
+                                    _sledger, _sfloors
+                                )
+                                _scovered = sorted(
+                                    c.value for c in _sverdict.categories_covered
+                                )
+                                logger.info(
+                                    "[Orchestrator] ExplorationLedger(shadow) "
+                                    "op=%s complexity=%s legacy_credit=%d "
+                                    "score=%.2f min_score=%.2f unique=%d "
+                                    "categories=%s would_pass=%s",
+                                    ctx.op_id[:12],
+                                    _task_complexity or "unknown",
+                                    _op_explore_credit,
+                                    _sverdict.score,
+                                    _sfloors.min_score,
+                                    _sledger.unique_call_count(),
+                                    ",".join(_scovered) or "-",
+                                    _sverdict.sufficient,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "[Orchestrator] ExplorationLedger shadow "
+                                    "log error",
+                                    exc_info=True,
+                                )
+
+                    if (
+                        not is_ledger_enabled()
+                        and _op_explore_credit < _min_explore
+                    ):
                         _explore_err = (
                             f"exploration_insufficient: {_op_explore_credit}/{_min_explore} "
                             f"exploration tool calls (expected >= {_min_explore}). "
@@ -2919,17 +3015,52 @@ class GovernedOrchestrator:
 
                 # ── Iron Gate failures get targeted, in-flight instructions ──
                 if _err_str.startswith("exploration_insufficient"):
-                    _error_feedback = (
-                        "## PREVIOUS GENERATION REJECTED — NO EXPLORATION\n\n"
-                        f"{_err_str[:400]}\n\n"
-                        "INSTRUCTIONS FOR RETRY:\n"
-                        "- BEFORE writing any patch, call read_file on the target file(s).\n"
-                        "- Call search_code or get_callers for any function/symbol you are\n"
-                        "  about to modify so you understand its callers and tests.\n"
-                        "- Only after you have at least 2 exploration tool calls in your\n"
-                        "  tool_execution_records may you emit the final patch.\n"
-                        "- Exploration is NOT optional. Patches without context corrupt code.\n"
-                    )
+                    # Ledger path (#103): when the exception carries a
+                    # verdict + floors, render a category-aware feedback
+                    # block so the model sees *which* categories are missing
+                    # rather than the generic "call more tools" boilerplate.
+                    # Legacy counter path has neither attribute and falls
+                    # through to the hand-written block below.
+                    _exc_verdict = getattr(exc, "verdict", None)
+                    _exc_floors = getattr(exc, "floors", None)
+                    if _exc_verdict is not None and _exc_floors is not None:
+                        try:
+                            from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+                                render_retry_feedback,
+                            )
+                            _ledger_feedback = render_retry_feedback(
+                                _exc_verdict, _exc_floors,
+                            )
+                        except Exception:
+                            _ledger_feedback = ""
+                    else:
+                        _ledger_feedback = ""
+                    if _ledger_feedback:
+                        _error_feedback = (
+                            "## PREVIOUS GENERATION REJECTED — EXPLORATION GATE\n\n"
+                            f"{_ledger_feedback}\n\n"
+                            "INSTRUCTIONS FOR RETRY:\n"
+                            "- Call the missing-category tools listed above BEFORE\n"
+                            "  emitting any patch. The ledger dedups by (tool,\n"
+                            "  arguments_hash) so repeating the same read_file on\n"
+                            "  the same path adds no credit.\n"
+                            "- Prefer get_callers, list_symbols, and git_blame over\n"
+                            "  repeated read_file calls — diversity beats volume.\n"
+                            "- Exploration is NOT optional. Patches without context\n"
+                            "  corrupt code.\n"
+                        )
+                    else:
+                        _error_feedback = (
+                            "## PREVIOUS GENERATION REJECTED — NO EXPLORATION\n\n"
+                            f"{_err_str[:400]}\n\n"
+                            "INSTRUCTIONS FOR RETRY:\n"
+                            "- BEFORE writing any patch, call read_file on the target file(s).\n"
+                            "- Call search_code or get_callers for any function/symbol you are\n"
+                            "  about to modify so you understand its callers and tests.\n"
+                            "- Only after you have at least 2 exploration tool calls in your\n"
+                            "  tool_execution_records may you emit the final patch.\n"
+                            "- Exploration is NOT optional. Patches without context corrupt code.\n"
+                        )
                 elif _err_str.startswith("ascii_corruption"):
                     # Extract the specific offending lines from the rejected
                     # candidate so the model sees its own bad code in context

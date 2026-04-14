@@ -1184,6 +1184,12 @@ class TestExplorationShadowLogPrimaryPath:
         # is the single test in the file that wants the gate on.
         monkeypatch.setenv("JARVIS_EXPLORATION_GATE", "true")
         monkeypatch.setenv("JARVIS_EXPLORATION_SHADOW_LOG", "true")
+        # Explicitly disable the ledger enforcement flag so this test
+        # exercises the (shadow) tag specifically — even if some ambient
+        # env or a later test's leakage set it on, the shadow-path assertion
+        # below still holds. Keeps TestExplorationShadowLogPrimaryPath and
+        # TestExplorationLedgerEnforcement independent.
+        monkeypatch.delenv("JARVIS_EXPLORATION_LEDGER_ENABLED", raising=False)
 
         records = (
             _StubToolRecord("read_file",   arguments_hash="h1"),
@@ -1256,6 +1262,401 @@ class TestExplorationShadowLogPrimaryPath:
         # and discovery (search_code).
         assert "comprehension" in msg, msg
         assert "discovery"     in msg, msg
+
+
+# ---------------------------------------------------------------------------
+# TestExplorationLedgerEnforcement (#103)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestExplorationLedgerEnforcement:
+    """Flag-gated Iron Gate enforcement via ``ExplorationLedger``.
+
+    These tests exercise the **decision** path where
+    ``JARVIS_EXPLORATION_LEDGER_ENABLED`` is on and the ledger is
+    authoritative — the legacy int-counter gate is skipped entirely and a
+    ledger-insufficient verdict raises ``ExplorationInsufficientError``
+    carrying ``verdict`` + ``floors`` so the retry feedback can name the
+    missing categories.
+
+    Scoring math is owned by ``test_exploration_engine``; these tests cover
+    the **orchestrator wiring**: flag branching, log tag, exception
+    contract, retry-feedback hook, and the synthetic preloaded-file
+    comprehension credit. Complexity stays at ``simple`` throughout so env
+    floors are addressable via the two knobs
+    ``JARVIS_EXPLORATION_MIN_SCORE_SIMPLE`` and
+    ``JARVIS_EXPLORATION_MIN_CATEGORIES_SIMPLE``.
+    """
+
+    @staticmethod
+    def _enable_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Turn the Iron Gate on for this test (overrides file fixture)."""
+        monkeypatch.setenv("JARVIS_EXPLORATION_GATE", "true")
+        monkeypatch.setenv("JARVIS_EXPLORATION_LEDGER_ENABLED", "true")
+        # Make the simple-complexity floor trivially attainable with one
+        # comprehension call — the wiring, not the scoring, is under test.
+        monkeypatch.setenv("JARVIS_EXPLORATION_MIN_SCORE_SIMPLE", "1.0")
+        monkeypatch.setenv("JARVIS_EXPLORATION_MIN_CATEGORIES_SIMPLE", "1")
+
+    async def test_flag_off_keeps_legacy_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """With flag off, the (decision) log MUST NOT fire; legacy path runs.
+
+        Guards against accidentally making the ledger path the default. The
+        legacy int-counter gate still runs and (with empty records + no
+        preloaded credit + a non-zero floor) still raises — but the log tag
+        must stay ``(shadow)`` / legacy ``exploration_insufficient``, never
+        ``(decision)``.
+        """
+        monkeypatch.setenv("JARVIS_EXPLORATION_GATE", "true")
+        monkeypatch.delenv("JARVIS_EXPLORATION_LEDGER_ENABLED", raising=False)
+        monkeypatch.setenv("JARVIS_EXPLORATION_SHADOW_LOG", "true")
+
+        # Two exploration records -> legacy int counter is satisfied and
+        # the pipeline reaches COMPLETE. The assertion is on the log tag,
+        # not the terminal state.
+        records = (
+            _StubToolRecord("read_file",   arguments_hash="h1"),
+            _StubToolRecord("search_code", arguments_hash="h2"),
+        )
+        result = GenerationResult(
+            candidates=(
+                {
+                    "candidate_id": "c1",
+                    "file_path":    "backend/core/utils.py",
+                    "full_content": "def hello():\n    pass\n",
+                    "rationale":    "stub",
+                },
+            ),
+            provider_name="mock-provider",
+            generation_duration_s=1.5,
+            tool_execution_records=records,
+        )
+        gen = MagicMock()
+        gen.generate = AsyncMock(return_value=result)
+
+        orch = GovernedOrchestrator(
+            stack=_mock_stack(),
+            generator=gen,
+            approval_provider=None,
+            config=_default_config(),
+        )
+        with caplog.at_level("INFO", logger="Ouroboros.Orchestrator"):
+            out = await orch.run(_make_context())
+
+        assert out.phase is OperationPhase.COMPLETE
+        decision_lines = [
+            r.message for r in caplog.records
+            if "ExplorationLedger(decision)" in r.message
+        ]
+        assert decision_lines == [], (
+            f"flag off must not emit (decision) line; got: {decision_lines}"
+        )
+        shadow_lines = [
+            r.message for r in caplog.records
+            if "ExplorationLedger(shadow)" in r.message
+            and "ExplorationLedger(shadow,partial)" not in r.message
+        ]
+        assert len(shadow_lines) >= 1, (
+            "legacy path with shadow on must still emit (shadow) line"
+        )
+
+    async def test_flag_on_sufficient_ledger_completes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Flag on + records satisfying floors -> (decision) line + COMPLETE."""
+        self._enable_gate(monkeypatch)
+
+        records = (
+            _StubToolRecord("read_file",   arguments_hash="h1"),
+            _StubToolRecord("search_code", arguments_hash="h2"),
+        )
+        result = GenerationResult(
+            candidates=(
+                {
+                    "candidate_id": "c1",
+                    "file_path":    "backend/core/utils.py",
+                    "full_content": "def hello():\n    pass\n",
+                    "rationale":    "stub",
+                },
+            ),
+            provider_name="mock-provider",
+            generation_duration_s=1.5,
+            tool_execution_records=records,
+        )
+        gen = MagicMock()
+        gen.generate = AsyncMock(return_value=result)
+
+        orch = GovernedOrchestrator(
+            stack=_mock_stack(),
+            generator=gen,
+            approval_provider=None,
+            config=_default_config(),
+        )
+        with caplog.at_level("INFO", logger="Ouroboros.Orchestrator"):
+            out = await orch.run(_make_context())
+
+        assert out.phase is OperationPhase.COMPLETE, (
+            f"expected COMPLETE on sufficient ledger, got {out.phase}"
+        )
+        decision_lines = [
+            r.message for r in caplog.records
+            if "ExplorationLedger(decision)" in r.message
+        ]
+        assert len(decision_lines) == 1, (
+            f"expected exactly one (decision) line, got {decision_lines}"
+        )
+        msg = decision_lines[0]
+        assert "would_pass=True" in msg, msg
+        # Shadow line must NOT fire when enforcement is on — the decision
+        # line is authoritative and duplicate lines are noise for ops.
+        shadow_lines = [
+            r.message for r in caplog.records
+            if "ExplorationLedger(shadow)" in r.message
+            and "ExplorationLedger(shadow,partial)" not in r.message
+        ]
+        assert shadow_lines == [], (
+            f"(shadow) line must be suppressed when enforcement is on; "
+            f"got: {shadow_lines}"
+        )
+
+    async def test_flag_on_insufficient_raises_with_verdict_and_renders_feedback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Flag on + empty records -> ExplorationInsufficientError carries
+        verdict/floors; retry branch calls render_retry_feedback(exc.verdict,
+        exc.floors).
+
+        Spies on ``render_retry_feedback`` in the orchestrator module
+        namespace so we can assert the retry branch passed the exception's
+        attrs through instead of silently falling back to the hardcoded
+        legacy block.
+        """
+        self._enable_gate(monkeypatch)
+
+        # Empty tool_execution_records -> ledger score 0 -> insufficient.
+        result = GenerationResult(
+            candidates=(
+                {
+                    "candidate_id": "c1",
+                    "file_path":    "backend/core/utils.py",
+                    "full_content": "def hello():\n    pass\n",
+                    "rationale":    "stub",
+                },
+            ),
+            provider_name="mock-provider",
+            generation_duration_s=1.5,
+            tool_execution_records=(),
+        )
+        gen = MagicMock()
+        gen.generate = AsyncMock(return_value=result)
+
+        # Spy on render_retry_feedback at the import site inside orchestrator
+        # retry-handler (the function is imported lazily inside the except
+        # branch, so we patch its canonical home in exploration_engine and
+        # the orchestrator picks up the patched symbol).
+        from backend.core.ouroboros.governance import exploration_engine as _ee
+
+        calls: list = []
+        original = _ee.render_retry_feedback
+
+        def _spy(verdict, floors):  # type: ignore[no-untyped-def]
+            calls.append((verdict, floors))
+            return original(verdict, floors)
+
+        monkeypatch.setattr(_ee, "render_retry_feedback", _spy)
+
+        orch = GovernedOrchestrator(
+            stack=_mock_stack(),
+            generator=gen,
+            approval_provider=None,
+            config=_default_config(),
+        )
+        with caplog.at_level("INFO", logger="Ouroboros.Orchestrator"):
+            out = await orch.run(_make_context())
+
+        # Pipeline doesn't reach COMPLETE — retries exhaust on the same
+        # empty-record generator mock. Terminal state is one of the
+        # retry-exhausted states (POSTMORTEM / CANCELLED / GENERATE failure
+        # phase) — we only assert it's NOT COMPLETE, since the exact
+        # terminal phase is owned by the retry-exhaustion branch which is
+        # covered by other tests.
+        assert out.phase is not OperationPhase.COMPLETE
+
+        # (decision) INFO line must have fired with would_pass=False.
+        # Filter on ``would_pass=`` to exclude the WARNING summary line
+        # (``Iron Gate — ExplorationLedger(decision) insufficient ...``)
+        # which also contains ``ExplorationLedger(decision)`` but is
+        # emitted from a different logger.warning() call and has a
+        # different field layout.
+        decision_info_lines = [
+            r.message for r in caplog.records
+            if "ExplorationLedger(decision)" in r.message
+            and "would_pass=" in r.message
+        ]
+        assert len(decision_info_lines) >= 1, (
+            "expected at least one (decision) INFO line on insufficient "
+            f"ledger; got messages: {[r.message for r in caplog.records]}"
+        )
+        assert all("would_pass=False" in m for m in decision_info_lines), (
+            f"every decision INFO line on insufficient ledger must report "
+            f"would_pass=False; got: {decision_info_lines}"
+        )
+        # And the WARNING summary line must ALSO have fired at least once.
+        warning_lines = [
+            r.message for r in caplog.records
+            if "Iron Gate — ExplorationLedger(decision) insufficient" in r.message
+        ]
+        assert len(warning_lines) >= 1, (
+            "expected the Iron Gate WARNING summary line on insufficient "
+            "ledger"
+        )
+
+        # The retry handler must have called render_retry_feedback with the
+        # exception's verdict + floors — proves the ExplorationInsufficientError
+        # attrs flowed through to the category-aware feedback builder.
+        assert len(calls) >= 1, (
+            "render_retry_feedback must be called on the ledger retry path"
+        )
+        _verdict, _floors = calls[0]
+        assert _verdict.insufficient
+        assert _floors.complexity == "simple"
+
+    async def test_flag_on_preloaded_file_grants_comprehension_credit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Flag on + empty records + prompt_preloaded_files -> synthetic
+        read_file record feeds the ledger and passes the comprehension floor.
+
+        Guards the ``_PreloadedExplorationRecord`` translation. Without the
+        synthetic record the ledger would see score=0 and raise; with it,
+        the preloaded file counts as one comprehension call and the floor
+        is cleared.
+        """
+        self._enable_gate(monkeypatch)
+        # Harder floor: require score >= 1.0 (comprehension weight is 1.0)
+        # so the preloaded file alone must satisfy the threshold — a zero
+        # record bag would fail deterministically.
+        monkeypatch.setenv("JARVIS_EXPLORATION_MIN_SCORE_SIMPLE", "1.0")
+        monkeypatch.setenv("JARVIS_EXPLORATION_MIN_CATEGORIES_SIMPLE", "1")
+
+        result = GenerationResult(
+            candidates=(
+                {
+                    "candidate_id": "c1",
+                    "file_path":    "backend/core/utils.py",
+                    "full_content": "def hello():\n    pass\n",
+                    "rationale":    "stub",
+                },
+            ),
+            provider_name="mock-provider",
+            generation_duration_s=1.5,
+            tool_execution_records=(),
+            prompt_preloaded_files=("backend/core/utils.py",),
+        )
+        gen = MagicMock()
+        gen.generate = AsyncMock(return_value=result)
+
+        orch = GovernedOrchestrator(
+            stack=_mock_stack(),
+            generator=gen,
+            approval_provider=None,
+            config=_default_config(),
+        )
+        with caplog.at_level("INFO", logger="Ouroboros.Orchestrator"):
+            out = await orch.run(_make_context())
+
+        assert out.phase is OperationPhase.COMPLETE, (
+            f"preloaded comprehension credit must clear the floor; "
+            f"got {out.phase}"
+        )
+        decision_lines = [
+            r.message for r in caplog.records
+            if "ExplorationLedger(decision)" in r.message
+        ]
+        assert len(decision_lines) == 1, decision_lines
+        msg = decision_lines[0]
+        assert "would_pass=True" in msg, msg
+        assert "comprehension" in msg, msg
+
+
+# ---------------------------------------------------------------------------
+# TestPartialShadowCauseClassification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPartialShadowCauseClassification:
+    """Wire check for the widened partial-shadow predicate's ``cause`` classifier.
+
+    The partial-shadow log line emits a ``cause=`` field computed by cheap
+    substring matching against the exception message (see orchestrator
+    ``_pcause`` ladder). The battle-test run on 2026-04-13 validated the
+    ``generic_gen_failure`` and ``bg_dw_failure`` paths organically, but
+    ``dw_schema_invalid`` was not exercised in the wild because DW timed out
+    before returning a parseable body. This test injects a synthetic
+    ``doubleword_schema_invalid:...`` ``RuntimeError`` into the generator
+    mock so the classifier branch is covered without needing a live DW.
+    """
+
+    async def test_dw_schema_invalid_classified_in_partial_shadow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A ``doubleword_schema_invalid:`` RuntimeError must classify as
+        ``cause=dw_schema_invalid`` in the partial-shadow log line, proving
+        the widened predicate covers the bad-JSON branch.
+        """
+        monkeypatch.setenv("JARVIS_EXPLORATION_GATE", "true")
+        monkeypatch.setenv("JARVIS_EXPLORATION_SHADOW_LOG", "true")
+        monkeypatch.delenv("JARVIS_EXPLORATION_LEDGER_ENABLED", raising=False)
+
+        # Mirror the exact message shape providers.py raises for DW bad JSON:
+        # ``{pfx}_schema_invalid:json_parse_error`` where pfx == "doubleword".
+        injected_exc = RuntimeError(
+            "doubleword_schema_invalid:json_parse_error"
+        )
+        gen = MagicMock()
+        gen.generate = AsyncMock(side_effect=injected_exc)
+
+        orch = GovernedOrchestrator(
+            stack=_mock_stack(),
+            generator=gen,
+            approval_provider=None,
+            config=_default_config(),
+        )
+        with caplog.at_level("INFO", logger="Ouroboros.Orchestrator"):
+            out = await orch.run(_make_context())
+
+        # Pipeline can't complete — generator raises on every attempt.
+        assert out.phase is not OperationPhase.COMPLETE
+
+        partial_lines = [
+            r.message for r in caplog.records
+            if "ExplorationLedger(shadow,partial)" in r.message
+        ]
+        assert len(partial_lines) >= 1, (
+            "expected at least one (shadow,partial) line for "
+            "doubleword_schema_invalid injection; got: "
+            f"{[r.message for r in caplog.records]}"
+        )
+        assert any(
+            "cause=dw_schema_invalid" in m for m in partial_lines
+        ), (
+            f"expected cause=dw_schema_invalid in at least one partial "
+            f"shadow line; got: {partial_lines}"
+        )
 
 
 # ---------------------------------------------------------------------------
