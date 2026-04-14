@@ -1060,14 +1060,25 @@ class CandidateGenerator:
         _provider_route = getattr(context, "provider_route", "") or "standard"
 
         # Brain Selection Topology — hard segmentation (Manifesto §5).
-        # When ``doubleword_topology`` marks a route as DW-forbidden
-        # (IMMEDIATE + COMPLEX by default), route straight to Claude via
-        # the existing ``_generate_immediate`` path so the cascade never
-        # touches Tier 0. Live-fire bbpst3ebf (2026-04-14) proved BOTH
-        # DW 397B and Gemma 4 31B time out on the 120s Tier 0 RT budget
-        # for architectural COMPLEX GENERATE — extending the timeout
-        # would violate pipeline temporal physics, so we exclude DW from
-        # the Prefrontal Cortex entirely.
+        # When ``doubleword_topology`` marks a route as DW-forbidden,
+        # the ``block_mode`` field decides what to do next:
+        #
+        #   cascade_to_claude — IMMEDIATE/COMPLEX: route straight to
+        #     Claude via ``_generate_immediate``. Live-fire bbpst3ebf
+        #     (2026-04-14) proved BOTH DW 397B and Gemma 4 31B time out
+        #     on the 120s Tier 0 RT budget for architectural COMPLEX
+        #     GENERATE; Claude is the intended brain for these routes.
+        #
+        #   skip_and_queue — BACKGROUND/SPECULATIVE: raise a sentinel
+        #     RuntimeError the orchestrator already handles gracefully
+        #     (background_dw_* / speculative_deferred). Do NOT cascade
+        #     to Claude. Alignment test bt-2026-04-14-182446 produced
+        #     0/13 Gemma BG successes with a right-sized 2.8K-token
+        #     envelope — root cause is provider-side SSE stream stall,
+        #     not prompt size. Routing continuous background daemons
+        #     to Claude violates the unit economics of scalable
+        #     autonomy. The queue stays dormant until a viable,
+        #     cost-effective inference endpoint is secured.
         from backend.core.ouroboros.governance.provider_topology import (
             get_topology as _get_topology,
         )
@@ -1075,11 +1086,32 @@ class CandidateGenerator:
         if _topology.enabled and not _topology.dw_allowed_for_route(
             _provider_route,
         ):
+            _block_reason = _topology.reason_for_route(_provider_route)
+            _block_mode = _topology.block_mode_for_route(_provider_route)
+            if _block_mode == "skip_and_queue":
+                logger.info(
+                    "[CandidateGenerator] Topology block: route=%s "
+                    "block_mode=skip_and_queue reason=%s — skipping "
+                    "generation (no Claude cascade)",
+                    _provider_route, _block_reason,
+                )
+                if _provider_route == "speculative":
+                    raise RuntimeError(
+                        f"speculative_deferred:blocked_by_topology:"
+                        f"{_block_reason[:120]}"
+                    )
+                # BACKGROUND (and any future skip_and_queue route)
+                # routes through the orchestrator's
+                # "background_dw_*" graceful-accept branch.
+                raise RuntimeError(
+                    f"background_dw_blocked_by_topology:"
+                    f"{_block_reason[:120]}"
+                )
             logger.info(
-                "[CandidateGenerator] Topology block: route=%s dw_allowed=false "
-                "reason=%s — routing direct to Claude",
-                _provider_route,
-                _topology.reason_for_route(_provider_route),
+                "[CandidateGenerator] Topology block: route=%s "
+                "block_mode=cascade_to_claude reason=%s — routing "
+                "direct to Claude",
+                _provider_route, _block_reason,
             )
             return await self._generate_immediate(context, deadline)
 

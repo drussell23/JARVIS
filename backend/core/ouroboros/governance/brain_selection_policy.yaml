@@ -316,33 +316,42 @@ gates:
 #   - COMPLEX    — architectural generation, Venom tool loops
 # Midbrain (DW 397B primary → Claude fallback):
 #   - STANDARD   — moderate ops, 120s window survivable
-# Basal Ganglia (Gemma 4 31B, structured JSON, native function-calling):
-#   - BACKGROUND      — cost-optimized opportunity mining
-#   - SPECULATIVE     — fire-and-forget pre-computation
+# Basal Ganglia (Gemma 4 31B, strictly confined to structured-JSON callers):
 #   - semantic_triage — pre-generation file intelligence
 #   - ouroboros_plan  — plan-phase structured JSON output
+#
+# BACKGROUND + SPECULATIVE are SEALED. Alignment test bt-2026-04-14-182446
+# produced 0/13 Gemma BG successes (12× 180s timeout, 1× schema_invalid)
+# even with a right-sized 2,836-token envelope — the root cause is
+# provider-side SSE stream stalling, not prompt size. We will NOT cascade
+# these routes to Claude: routing continuous background daemons to a
+# $3/$15 per M-token provider violates the unit economics of scalable
+# autonomy. Until a viable, cost-effective inference endpoint is secured,
+# BG/SPEC generation is paused via skip-and-queue.
 doubleword_topology:
   schema_version: "topology.1"
   enabled: true
   routes:
     immediate:
       dw_allowed: false
+      block_mode: "cascade_to_claude"
       reason: "Prefrontal cortex — Claude only. 120s DW RT budget is insufficient for fast-reflex ops with Venom tool loops."
     complex:
       dw_allowed: false
+      block_mode: "cascade_to_claude"
       reason: "Prefrontal cortex — Claude only. Live-fire bbpst3ebf proved DW (both 397B and Gemma 4 31B) times out on architectural COMPLEX GENERATE within 120s Tier 0 RT."
     standard:
       dw_allowed: true
       dw_model: "Qwen/Qwen3.5-397B-A17B-FP8"
       reason: "Midbrain — DW 397B primary with Claude fallback. Moderate ops survive the 120s window."
     background:
-      dw_allowed: true
-      dw_model: "google/gemma-4-31B-it"
-      reason: "Basal ganglia — Gemma 4 31B. Cost-optimized, high-volume, structured JSON output, native function-calling."
+      dw_allowed: false
+      block_mode: "skip_and_queue"
+      reason: "Gemma 4 31B stream-stalls on DW endpoint even at <2K tokens. Background generation paused to preserve Claude compute runway."
     speculative:
-      dw_allowed: true
-      dw_model: "google/gemma-4-31B-it"
-      reason: "Basal ganglia — Gemma 4 31B. Fire-and-forget pre-computation, fault-tolerant."
+      dw_allowed: false
+      block_mode: "skip_and_queue"
+      reason: "Gemma 4 31B stream-stalls on DW endpoint even at <2K tokens. Background generation paused to preserve Claude compute runway."
   callers:
     semantic_triage:
       dw_model: "google/gemma-4-31B-it"

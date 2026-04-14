@@ -55,11 +55,26 @@ class RouteTopology:
     ``dw_allowed=False`` is a hard block — callers MUST NOT attempt any
     DoubleWord call for operations on this route. ``dw_model`` is the
     model identifier passed to the DoubleWord API when DW is allowed.
+
+    ``block_mode`` controls what happens when DW is disallowed:
+
+    * ``"cascade_to_claude"`` — route the op straight to Claude via the
+      Prefrontal Cortex path. Used for IMMEDIATE and COMPLEX where Claude
+      is the intended brain.
+    * ``"skip_and_queue"`` — do NOT cascade. Raise a skip-and-queue
+      sentinel the orchestrator already knows how to accept gracefully
+      (background_dw_blocked_by_topology / speculative_deferred). Used
+      for BACKGROUND and SPECULATIVE where routing to Claude would
+      violate the unit economics of scalable autonomy.
+
+    Default is ``"cascade_to_claude"`` so existing Prefrontal Cortex
+    blocks keep working when the yaml is from before this field existed.
     """
 
     dw_allowed: bool
     dw_model: Optional[str]
     reason: str
+    block_mode: str = "cascade_to_claude"
 
 
 @dataclass(frozen=True)
@@ -124,6 +139,22 @@ class ProviderTopology:
             return "route_unmapped"
         return entry.reason
 
+    def block_mode_for_route(self, route: str) -> str:
+        """Return the block behavior for a DW-disallowed route.
+
+        Only meaningful when :meth:`dw_allowed_for_route` is False.
+        Returns ``"cascade_to_claude"`` by default so legacy IMMEDIATE/
+        COMPLEX blocks keep routing to Claude. BACKGROUND/SPECULATIVE
+        entries in the yaml declare ``block_mode: skip_and_queue`` to
+        opt out of the cascade.
+        """
+        if not self.enabled:
+            return "cascade_to_claude"
+        entry = self.routes.get((route or "").strip().lower())
+        if entry is None:
+            return "cascade_to_claude"
+        return entry.block_mode or "cascade_to_claude"
+
     def model_for_caller(self, caller: str) -> Optional[str]:
         """Return the DW model override for a named caller, or None.
 
@@ -181,10 +212,16 @@ def _parse_topology(raw: Mapping[str, Any]) -> ProviderTopology:
             allowed = bool(body.get("dw_allowed", True))
             model = body.get("dw_model") if allowed else None
             reason = str(body.get("reason", "") or "")
+            block_mode_raw = str(
+                body.get("block_mode", "cascade_to_claude") or "cascade_to_claude"
+            ).strip().lower()
+            if block_mode_raw not in {"cascade_to_claude", "skip_and_queue"}:
+                block_mode_raw = "cascade_to_claude"
             routes[str(name).strip().lower()] = RouteTopology(
                 dw_allowed=allowed,
                 dw_model=str(model) if model else None,
                 reason=reason,
+                block_mode=block_mode_raw,
             )
 
     callers: Dict[str, CallerTopology] = {}
