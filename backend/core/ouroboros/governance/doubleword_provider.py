@@ -210,6 +210,33 @@ class DoublewordProvider:
         self._daily_budget = daily_budget
         self._mcp_client: Optional[Any] = None  # Injected by GLS for MCP tool forwarding (Gap #7)
 
+    def _resolve_effective_model(self, ctx: Any) -> str:
+        """Resolve the DW model for this call from the Brain Selection Topology.
+
+        The topology (``brain_selection_policy.yaml`` →
+        ``doubleword_topology``) maps each :class:`ProviderRoute` to a
+        specific DW model. When enabled, STANDARD routes to 397B while
+        BACKGROUND / SPECULATIVE route to Gemma 4 31B. IMMEDIATE and
+        COMPLEX are hard-blocked by ``candidate_generator`` before this
+        method is ever called, so any hit here means the route allows
+        DW by design.
+
+        Falls back to ``self._model`` when the topology is disabled,
+        the route is unmapped, or the ctx lacks a ``provider_route``
+        attribute — identical to the pre-topology behavior.
+        """
+        route = getattr(ctx, "provider_route", "") or ""
+        if not route:
+            return self._model
+        try:
+            from backend.core.ouroboros.governance.provider_topology import (
+                get_topology,
+            )
+        except Exception:
+            return self._model
+        override = get_topology().model_for_route(route)
+        return override or self._model
+
     # ------------------------------------------------------------------
     # Hoisted state accessors (Phase 1 Step 3B)
     # ------------------------------------------------------------------
@@ -376,13 +403,14 @@ class DoublewordProvider:
             force_full_content=True,
         )
         operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
+        _effective_model = self._resolve_effective_model(ctx)
 
         jsonl_line = json.dumps({
             "custom_id": operation_id,
             "method": "POST",
             "url": "/v1/chat/completions",
             "body": {
-                "model": self._model,
+                "model": _effective_model,
                 "messages": [
                     {"role": "system", "content": (
                         "You are a code generation assistant. RESPOND WITH ONLY A SINGLE VALID JSON OBJECT. "
@@ -418,7 +446,7 @@ class DoublewordProvider:
 
             logger.info(
                 "[DoublewordProvider] Batch %s submitted async (model=%s, op=%s)",
-                batch_id, self._model, operation_id,
+                batch_id, _effective_model, operation_id,
             )
             return PendingBatch(
                 op_id=operation_id,
@@ -802,6 +830,20 @@ class DoublewordProvider:
         # Mutable container to capture token usage from _generate_raw
         _token_usage: Dict[str, int] = {"input": 0, "output": 0}
 
+        # Resolve effective model once via topology — routes map to
+        # distinct DW models under the Brain Selection Topology
+        # (STANDARD→397B, BACKGROUND/SPECULATIVE→Gemma 4 31B). The lookup
+        # is pure yaml-driven, no env overrides. Hard-blocked routes
+        # (IMMEDIATE + COMPLEX) never reach this method.
+        _effective_model = self._resolve_effective_model(context)
+        if _effective_model != self._model:
+            logger.info(
+                "[DoublewordProvider] RT: topology override model=%s "
+                "(default=%s, route=%s)",
+                _effective_model, self._model,
+                getattr(context, "provider_route", "?"),
+            )
+
         async def _generate_raw(p: str) -> str:
             """Single chat completion call (used by tool_loop.run())."""
             nonlocal total_cost
@@ -826,7 +868,7 @@ class DoublewordProvider:
                 _stream_callback = getattr(self._tool_loop, "on_token", None)
 
             body = {
-                "model": self._model,
+                "model": _effective_model,
                 "messages": [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": p},

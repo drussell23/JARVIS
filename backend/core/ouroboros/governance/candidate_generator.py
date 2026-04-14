@@ -1059,14 +1059,39 @@ class CandidateGenerator:
         # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
         _provider_route = getattr(context, "provider_route", "") or "standard"
 
+        # Brain Selection Topology — hard segmentation (Manifesto §5).
+        # When ``doubleword_topology`` marks a route as DW-forbidden
+        # (IMMEDIATE + COMPLEX by default), route straight to Claude via
+        # the existing ``_generate_immediate`` path so the cascade never
+        # touches Tier 0. Live-fire bbpst3ebf (2026-04-14) proved BOTH
+        # DW 397B and Gemma 4 31B time out on the 120s Tier 0 RT budget
+        # for architectural COMPLEX GENERATE — extending the timeout
+        # would violate pipeline temporal physics, so we exclude DW from
+        # the Prefrontal Cortex entirely.
+        from backend.core.ouroboros.governance.provider_topology import (
+            get_topology as _get_topology,
+        )
+        _topology = _get_topology()
+        if _topology.enabled and not _topology.dw_allowed_for_route(
+            _provider_route,
+        ):
+            logger.info(
+                "[CandidateGenerator] Topology block: route=%s dw_allowed=false "
+                "reason=%s — routing direct to Claude",
+                _provider_route,
+                _topology.reason_for_route(_provider_route),
+            )
+            return await self._generate_immediate(context, deadline)
+
         if _provider_route == "immediate":
             return await self._generate_immediate(context, deadline)
         if _provider_route == "background":
             return await self._generate_background(context, deadline)
         if _provider_route == "speculative":
             return await self._generate_speculative(context, deadline)
-        # "complex" and "standard" both use the full DW→Claude cascade,
-        # but "complex" gets more DW budget via route_budget_profile.
+        # "standard" uses the full DW→Claude cascade. "complex" is
+        # intercepted above by the topology hard-block unless operators
+        # explicitly disable the topology (not recommended).
         # Fall through to unified cascade below.
 
         # ── Tier 0: DoubleWord 397B ──────────────────────────────

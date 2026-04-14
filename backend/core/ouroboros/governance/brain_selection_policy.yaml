@@ -296,6 +296,61 @@ gates:
     budget_exceeded_action: "queue"
     persist_path: "~/.jarvis/ouroboros/cost_state.json"
 
+# ---------------------------------------------------------------------------
+# Provider Topology — Hard-segmented DW model mapping (Manifesto §5)
+# ---------------------------------------------------------------------------
+#
+# Strict Cognitive Segmentation. Enforced by `provider_topology.py` and
+# consumed by `candidate_generator.py`, `doubleword_provider.py`, and
+# `semantic_triage.py`. Do not mutate at runtime — any change here is a
+# deliberate architectural decision.
+#
+# Calibration: bbpst3ebf live-fire (2026-04-14) proved DW models time out
+# on 120s Tier 0 RT for COMPLEX architectural GENERATE, regardless of
+# whether the backing model is Qwen 3.5 397B or Gemma 4 31B. The response
+# is not to extend timeouts but to harden the topology: DW is excluded
+# from the Prefrontal Cortex entirely.
+#
+# Prefrontal Cortex (Claude only):
+#   - IMMEDIATE  — fast reflex, deep context, strict deadlines
+#   - COMPLEX    — architectural generation, Venom tool loops
+# Midbrain (DW 397B primary → Claude fallback):
+#   - STANDARD   — moderate ops, 120s window survivable
+# Basal Ganglia (Gemma 4 31B, structured JSON, native function-calling):
+#   - BACKGROUND      — cost-optimized opportunity mining
+#   - SPECULATIVE     — fire-and-forget pre-computation
+#   - semantic_triage — pre-generation file intelligence
+#   - ouroboros_plan  — plan-phase structured JSON output
+doubleword_topology:
+  schema_version: "topology.1"
+  enabled: true
+  routes:
+    immediate:
+      dw_allowed: false
+      reason: "Prefrontal cortex — Claude only. 120s DW RT budget is insufficient for fast-reflex ops with Venom tool loops."
+    complex:
+      dw_allowed: false
+      reason: "Prefrontal cortex — Claude only. Live-fire bbpst3ebf proved DW (both 397B and Gemma 4 31B) times out on architectural COMPLEX GENERATE within 120s Tier 0 RT."
+    standard:
+      dw_allowed: true
+      dw_model: "Qwen/Qwen3.5-397B-A17B-FP8"
+      reason: "Midbrain — DW 397B primary with Claude fallback. Moderate ops survive the 120s window."
+    background:
+      dw_allowed: true
+      dw_model: "google/gemma-4-31B-it"
+      reason: "Basal ganglia — Gemma 4 31B. Cost-optimized, high-volume, structured JSON output, native function-calling."
+    speculative:
+      dw_allowed: true
+      dw_model: "google/gemma-4-31B-it"
+      reason: "Basal ganglia — Gemma 4 31B. Fire-and-forget pre-computation, fault-tolerant."
+  callers:
+    semantic_triage:
+      dw_model: "google/gemma-4-31B-it"
+      reason: "Basal ganglia — native function-calling for triage JSON. Replaces Qwen 3.5 35B."
+    ouroboros_plan:
+      dw_model: "google/gemma-4-31B-it"
+      reason: "Basal ganglia — structured JSON plan generation during PLAN phase."
+
 error_codes:
   - "CONTRACT_SCHEMA_INVALID"
   - "CONTRACT_VERSION_INCOMPATIBLE"

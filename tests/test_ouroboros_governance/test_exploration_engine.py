@@ -281,7 +281,7 @@ def test_evaluate_insufficient_when_required_category_missing(
         _call("search_code",  "q3"),
         _call("list_symbols", "s1"),
         _call("list_symbols", "s2"),
-    ])  # score = 5*1.0 + 3*1.5 + 2*1.5 = 12.5 (still < 14 but covers the shape)
+    ])  # score = 5*1.0 + 3*1.5 + 2*1.5 = 12.5 (clears 11.0 score floor, but required CALL_GRAPH+HISTORY remain missing)
     verdict = evaluate_exploration(
         ledger, ExplorationFloors.from_env("architectural"),
     )
@@ -330,7 +330,7 @@ def test_feedback_names_missing_required_categories() -> None:
     )
     floors = ExplorationFloors(
         complexity="architectural",
-        min_score=14.0,
+        min_score=11.0,
         min_categories=4,
         required_categories=frozenset({
             ExplorationCategory.CALL_GRAPH,

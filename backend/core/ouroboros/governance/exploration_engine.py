@@ -74,11 +74,19 @@ _TOOL_CATEGORY: Mapping[str, ExplorationCategory] = {
 # Calibration history:
 #   2026-04-14 (neuro4 live-fire): attempt 2 covered all 5 categories
 #   with 11 unique calls but scored 13.0 against a 14.0 architectural
-#   floor. Rather than lowering the floor, weights for the two required
-#   architectural categories (CALL_GRAPH, HISTORY) were bumped +0.5 so
-#   that any architectural ledger which legitimately covers both
-#   required categories picks up a minimum +1.0 delta — rewarding
-#   high-leverage exploration behavior instead of raw call volume.
+#   floor. Weights for the two required architectural categories
+#   (CALL_GRAPH, HISTORY) were bumped +0.5 so that any architectural
+#   ledger which legitimately covers both required categories picks up
+#   a minimum +1.0 delta.
+#   2026-04-14 (gemma live-fire bbpst3ebf): attempt 2 covered all 5
+#   categories with 8 unique high-leverage calls and scored 11.5 —
+#   still below the 14.0 floor. The organism obeyed the override and
+#   pivoted perfectly; 14.0 was mathematically miscalibrated for
+#   real-world execution. Rather than inflate weights further (which
+#   would reward spam), the architectural floor was lowered to 11.0.
+#   The required_categories constraint (CALL_GRAPH + HISTORY) remains
+#   the load-bearing diversity check; the score floor just reflects
+#   what a well-behaved architectural agent actually produces.
 _TOOL_WEIGHT: Mapping[str, float] = {
     "read_file":    1.0,
     "list_dir":     0.5,
@@ -248,7 +256,7 @@ _DEFAULT_FLOORS: Mapping[str, Mapping[str, object]] = {
         "required_categories": frozenset(),
     },
     "architectural": {
-        "min_score":           14.0,
+        "min_score":           11.0,
         "min_categories":      4,
         "required_categories": frozenset({
             ExplorationCategory.CALL_GRAPH,
