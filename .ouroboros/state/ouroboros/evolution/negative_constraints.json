@@ -6,54 +6,6 @@
       "reason": "Operation op-001 failed: saga_stuck",
       "source_op_id": "op-001",
       "severity": "soft",
-      "created_at": 1775939730.763371
-    },
-    {
-      "domain_key": "test_fix::.py",
-      "constraint": "Avoid pattern that caused \"saga_stuck\"",
-      "reason": "Operation op-001 failed: saga_stuck",
-      "source_op_id": "op-001",
-      "severity": "soft",
-      "created_at": 1775939828.874651
-    },
-    {
-      "domain_key": "test_fix::.py",
-      "constraint": "Avoid pattern that caused \"saga_stuck\"",
-      "reason": "Operation op-001 failed: saga_stuck",
-      "source_op_id": "op-001",
-      "severity": "soft",
-      "created_at": 1775959559.5421891
-    },
-    {
-      "domain_key": "test_fix::.py",
-      "constraint": "Avoid pattern that caused \"saga_stuck\"",
-      "reason": "Operation op-001 failed: saga_stuck",
-      "source_op_id": "op-001",
-      "severity": "soft",
-      "created_at": 1776040006.857291
-    },
-    {
-      "domain_key": "test_fix::.py",
-      "constraint": "Avoid pattern that caused \"saga_stuck\"",
-      "reason": "Operation op-001 failed: saga_stuck",
-      "source_op_id": "op-001",
-      "severity": "soft",
-      "created_at": 1776045703.814367
-    },
-    {
-      "domain_key": "test_fix::.py",
-      "constraint": "Avoid pattern that caused \"saga_stuck\"",
-      "reason": "Operation op-001 failed: saga_stuck",
-      "source_op_id": "op-001",
-      "severity": "soft",
-      "created_at": 1776046112.2767859
-    },
-    {
-      "domain_key": "test_fix::.py",
-      "constraint": "Avoid pattern that caused \"saga_stuck\"",
-      "reason": "Operation op-001 failed: saga_stuck",
-      "source_op_id": "op-001",
-      "severity": "soft",
       "created_at": 1776053440.7971368
     },
     {
@@ -159,81 +111,57 @@
       "source_op_id": "op-001",
       "severity": "soft",
       "created_at": 1776138290.413148
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
+      "reason": "Operation op-001 failed: change_engine_failed",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1776140094.658968
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"saga_stuck\"",
+      "reason": "Operation op-001 failed: saga_stuck",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1776140095.436523
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
+      "reason": "Operation op-001 failed: change_engine_failed",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1776140125.1286871
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"saga_stuck\"",
+      "reason": "Operation op-001 failed: saga_stuck",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1776140125.8275971
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
+      "reason": "Operation op-001 failed: change_engine_failed",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1776140231.379741
+    },
+    {
+      "domain_key": "test_fix::.py",
+      "constraint": "Avoid pattern that caused \"saga_stuck\"",
+      "reason": "Operation op-001 failed: saga_stuck",
+      "source_op_id": "op-001",
+      "severity": "soft",
+      "created_at": 1776140232.0988271
     }
   ],
   "code_gen::.py": [
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"verify_regression\"",
-      "reason": "Operation op-test-001 failed: verify_regression",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137633.673673
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"verify_regression\"",
-      "reason": "Operation op-test-001 failed: verify_regression",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137635.1283588
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"change_engine_error\"",
-      "reason": "Operation op-test-001 failed: change_engine_error",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137635.599951
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
-      "reason": "Operation op-test-001 failed: change_engine_failed",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137636.010123
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"verify_regression\"",
-      "reason": "Operation op-test-001 failed: verify_regression",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137636.73689
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"verify_regression\"",
-      "reason": "Operation op-test-001 failed: verify_regression",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137637.1237519
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"verify_regression\"",
-      "reason": "Operation op-test-001 failed: verify_regression",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137637.5959628
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"verify_regression\"",
-      "reason": "Operation op-test-001 failed: verify_regression",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137656.213472
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"verify_regression\"",
-      "reason": "Operation op-test-001 failed: verify_regression",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137750.051569
-    },
     {
       "domain_key": "code_gen::.py",
       "constraint": "Avoid pattern that caused \"change_engine_error\"",
@@ -321,6 +249,78 @@
       "source_op_id": "op-test-001",
       "severity": "soft",
       "created_at": 1776138279.949049
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"verify_regression\"",
+      "reason": "Operation op-test-001 failed: verify_regression",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140082.4445739
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_error\"",
+      "reason": "Operation op-test-001 failed: change_engine_error",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140083.5264351
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
+      "reason": "Operation op-test-001 failed: change_engine_failed",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140084.360041
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"verify_regression\"",
+      "reason": "Operation op-test-001 failed: verify_regression",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140113.175689
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_error\"",
+      "reason": "Operation op-test-001 failed: change_engine_error",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140113.956804
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
+      "reason": "Operation op-test-001 failed: change_engine_failed",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140114.586744
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"verify_regression\"",
+      "reason": "Operation op-test-001 failed: verify_regression",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140218.887403
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_error\"",
+      "reason": "Operation op-test-001 failed: change_engine_error",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140219.80227
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
+      "reason": "Operation op-test-001 failed: change_engine_failed",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776140220.4652421
     }
   ]
 }
