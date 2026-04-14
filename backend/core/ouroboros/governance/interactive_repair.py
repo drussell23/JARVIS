@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 _MAX_MICRO_ITERATIONS = int(os.environ.get("JARVIS_INTERACTIVE_REPAIR_MAX_ITERS", "3"))
 _MICRO_TIMEOUT_S = float(os.environ.get("JARVIS_INTERACTIVE_REPAIR_TIMEOUT_S", "30"))
+# Default OFF: this path writes to disk outside the Iron Gate / ChangeEngine
+# immune system. Manifesto §6 keeps model-driven mutations behind the gates
+# until this loop is re-homed through ChangeEngine/APPLY.
+_ENABLED = os.environ.get("JARVIS_INTERACTIVE_REPAIR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -86,6 +90,18 @@ class InteractiveRepairLoop:
         fixes: List[MicroFix] = []
         current = file_content
 
+        if not _ENABLED:
+            logger.info(
+                "[InteractiveRepair] disabled via JARVIS_INTERACTIVE_REPAIR_ENABLED=false (op=%s) — falling through to VALIDATE_RETRY/L2",
+                op_id,
+            )
+            return InteractiveRepairResult(
+                fixed=False, iterations_used=0,
+                errors_encountered=[], fixes_applied=[],
+                total_duration_s=0.0,
+                final_output="InteractiveRepair disabled (JARVIS_INTERACTIVE_REPAIR_ENABLED=false)",
+            )
+
         for iteration in range(_MAX_MICRO_ITERATIONS):
             err = await self._run_and_capture(file_path, current, test_argv)
             if err is None:
@@ -95,6 +111,21 @@ class InteractiveRepairLoop:
                     total_duration_s=time.monotonic() - t0, final_output="Tests passed",
                 )
             errors.append(err)
+
+            # Hard guard: refuse to call the model or touch disk when we have
+            # no parseable traceback / no located line. Without this, pytest
+            # assertion failures (which don't emit a stdlib traceback) fall
+            # through to UnknownError at line 0, which _build_micro_prompt
+            # translates to a blind "patch lines 1-5" request — the exact
+            # pathway that corrupted tests/test_reflex_provocation/test_one.py
+            # during bt-2026-04-14-234236.
+            if err.error_type in {"UnknownError", "TimeoutError"} or err.line_number <= 0:
+                logger.warning(
+                    "[InteractiveRepair] Refusing to patch: error_type=%s line=%d file=%s (op=%s) — "
+                    "traceback unparseable or location unknown, falling through to VALIDATE_RETRY/L2",
+                    err.error_type, err.line_number, file_path, op_id,
+                )
+                break
 
             prompt = self._build_micro_prompt(file_path, current, err)
             try:

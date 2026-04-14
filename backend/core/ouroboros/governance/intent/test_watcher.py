@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Regex for parsing pytest FAILED lines (--tb=short -q --no-header format)
 # ---------------------------------------------------------------------------
-_FAILED_RE = re.compile(r"^FAILED\s+(\S+)\s+-\s+(.+)$", re.MULTILINE)
+_FAILED_RE = re.compile(
+    r"^FAILED\s+(\S+)(?:\s+-\s+(.+))?$", re.MULTILINE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +102,7 @@ class TestWatcher:
         pytest_timeout_s: float = 30.0,
     ) -> None:
         self.repo = repo
-        self.test_dir = test_dir
+        self.test_dir = os.environ.get("JARVIS_INTENT_TEST_DIR", test_dir)
         self.repo_path = repo_path or os.environ.get("JARVIS_REPO_PATH", ".")
         self.poll_interval_s = (
             poll_interval_s
@@ -136,6 +138,7 @@ class TestWatcher:
                 "--tb=short",
                 "-q",
                 "--no-header",
+                "--color=no",
                 cwd=self.repo_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -183,7 +186,7 @@ class TestWatcher:
         failures: List[TestFailure] = []
         for match in _FAILED_RE.finditer(output):
             test_id = match.group(1)
-            error_text = match.group(2)
+            error_text = match.group(2) or ""
             file_path = self.extract_file(test_id)
             failures.append(
                 TestFailure(
