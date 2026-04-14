@@ -7,6 +7,35 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _disable_iron_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable post-GENERATE Iron Gates for this file's connective-tissue tests.
+
+    **Intentional and scoped to this suite — do not copy blindly.**
+
+    Mock generators here return ``GenerationResult`` objects with an **empty**
+    ``tool_execution_records`` tuple — the mock path does not exercise the
+    Venom tool loop at all. With ``JARVIS_EXPLORATION_GATE`` enabled, the
+    Iron Gate fires ``exploration_insufficient: 0/N`` on every attempt, the
+    retry loop trips forward-progress on the second identical failure, and
+    the pipeline cancels before APPLY — so every canary / learning-bridge /
+    saga-apply assertion below fires against a ``CANCELLED`` terminal state
+    instead of the success path it's trying to exercise.
+    ``JARVIS_ASCII_GATE`` is disabled for the same "no candidate content"
+    reason.
+
+    **Do not re-enable these gates here.** Gate behaviour has dedicated
+    integration tests that drive real tool records; these tests only care
+    about the connective wiring (canary, learning_bridge, saga pause).
+    Re-enabling gates in this file would turn the suite red again for
+    reasons unrelated to the wiring under test.
+    """
+    monkeypatch.setenv("JARVIS_EXPLORATION_GATE", "false")
+    monkeypatch.setenv("JARVIS_ASCII_GATE", "false")
+
 from backend.core.ouroboros.governance.approval_provider import (
     ApprovalResult,  # used in Task 2/3 tests below
     ApprovalStatus,  # used in Task 2/3 tests below
@@ -47,6 +76,10 @@ def _config(tmp_path: Path) -> OrchestratorConfig:
         approval_timeout_s=5.0,
         max_generate_retries=1,
         max_validate_retries=2,
+        # PatchBenchmarker has nothing to measure in tmp_path and returns a
+        # zero-metric result; the VERIFY regression gate would then route
+        # every happy-path op to POSTMORTEM.
+        benchmark_enabled=False,
     )
 
 
@@ -90,6 +123,12 @@ def _mock_stack() -> MagicMock:
         return_value=MagicMock(success=True, rolled_back=False, op_id="op-001")
     )
     stack.learning_bridge = None  # Task 3: default None so existing tests are unaffected
+    # _is_cancel_requested() reads stack.governed_loop_service.is_cancel_requested;
+    # naked MagicMock is truthy → every pipeline cancels at the first check.
+    stack.governed_loop_service.is_cancel_requested.return_value = False
+    # SecurityReviewer awaits stack.security_reviewer.review; MagicMock isn't awaitable.
+    stack.security_reviewer = MagicMock()
+    stack.security_reviewer.review = AsyncMock(return_value=None)
     return stack
 
 

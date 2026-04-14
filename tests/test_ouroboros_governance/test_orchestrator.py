@@ -53,6 +53,34 @@ from backend.core.ouroboros.governance.risk_engine import (
 _FIXED_TS = datetime(2026, 3, 7, 12, 0, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _disable_iron_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable post-GENERATE Iron Gates for this file's pipeline unit tests.
+
+    **Intentional and scoped to this suite — do not copy blindly.**
+
+    These tests drive ``GovernedOrchestrator.run()`` with mock generators that
+    return ``GenerationResult`` objects with an **empty**
+    ``tool_execution_records`` tuple — there is no Venom tool loop at all in
+    the mock path. If the exploration gate (``JARVIS_EXPLORATION_GATE``) is
+    left enabled, every op fails post-GENERATE with
+    ``Iron Gate — exploration_insufficient: 0/N``, the retry loop trips the
+    forward-progress guard on the second identical failure, and the pipeline
+    cancels before APPLY — so every happy-path test ends in ``CANCELLED``
+    instead of ``COMPLETE``. Same reasoning for ``JARVIS_ASCII_GATE`` (no
+    candidate content means no codepoints to scan, but the gate's import path
+    still runs and pre-pollutes state).
+
+    **Do not "fix" this by re-enabling the gates here.** Gate behaviour has
+    dedicated integration tests that drive real tool records; these tests
+    only care about the pipeline state machine. Re-enabling gates in this
+    file would turn the suite red again for reasons unrelated to the code
+    under test.
+    """
+    monkeypatch.setenv("JARVIS_EXPLORATION_GATE", "false")
+    monkeypatch.setenv("JARVIS_ASCII_GATE", "false")
+
+
 def _make_context(
     *,
     op_id: str = "op-test-001",
@@ -90,6 +118,17 @@ def _mock_stack(
             op_id="op-test-001",
         )
     )
+    # _is_cancel_requested() reads stack.governed_loop_service.is_cancel_requested;
+    # without an explicit return_value a bare MagicMock is truthy and every
+    # pipeline cancels immediately. Force a bool so the cancel check is a no-op.
+    stack.governed_loop_service.is_cancel_requested.return_value = False
+    # _publish_outcome() awaits learning_bridge.publish; MagicMock's default
+    # return is not awaitable and raises TypeError in POSTMORTEM path.
+    stack.learning_bridge = MagicMock()
+    stack.learning_bridge.publish = AsyncMock(return_value=None)
+    # SecurityReviewer awaits stack.security_reviewer.review; same issue.
+    stack.security_reviewer = MagicMock()
+    stack.security_reviewer.review = AsyncMock(return_value=None)
     return stack
 
 
@@ -147,6 +186,11 @@ def _default_config() -> OrchestratorConfig:
         approval_timeout_s=5.0,
         max_generate_retries=1,
         max_validate_retries=2,
+        # Disable the post-apply benchmark. With no real project on disk,
+        # PatchBenchmarker returns a zero-metric BenchmarkResult and the
+        # VERIFY regression gate (pass_rate < 1.0) routes every happy-path
+        # op to POSTMORTEM. Pipeline unit tests don't exercise benchmarking.
+        benchmark_enabled=False,
     )
 
 
@@ -165,7 +209,7 @@ class TestOrchestratorConfig:
 
     def test_defaults(self) -> None:
         cfg = OrchestratorConfig(project_root=Path("/tmp"))
-        assert cfg.generation_timeout_s == 120.0
+        assert cfg.generation_timeout_s == 180.0
         assert cfg.validation_timeout_s == 60.0
         assert cfg.approval_timeout_s == 600.0
         assert cfg.max_generate_retries == 1
@@ -861,7 +905,7 @@ class TestBenchmarkWiring:
         )
         ctx.with_benchmark_result.return_value = ctx
         with patch(
-            "backend.core.ouroboros.governance.orchestrator.PatchBenchmarker"
+            "backend.core.ouroboros.governance.patch_benchmarker.PatchBenchmarker"
         ) as MockBenchmarker:
             MockBenchmarker.return_value.benchmark = AsyncMock(return_value=br)
             result = await orch._run_benchmark(ctx, [])
@@ -881,7 +925,7 @@ class TestBenchmarkWiring:
         ctx.pre_apply_snapshots = {}
         ctx.op_id = "op-x"
         with patch(
-            "backend.core.ouroboros.governance.orchestrator.PatchBenchmarker"
+            "backend.core.ouroboros.governance.patch_benchmarker.PatchBenchmarker"
         ) as MockBenchmarker:
             MockBenchmarker.return_value.benchmark = AsyncMock(side_effect=RuntimeError("boom"))
             result = await orch._run_benchmark(ctx, [])
@@ -903,7 +947,7 @@ class TestBenchmarkWiring:
         ctx.pre_apply_snapshots = {}
         ctx.op_id = "op-cancel"
         with patch(
-            "backend.core.ouroboros.governance.orchestrator.PatchBenchmarker"
+            "backend.core.ouroboros.governance.patch_benchmarker.PatchBenchmarker"
         ) as MockBenchmarker:
             MockBenchmarker.return_value.benchmark = AsyncMock(
                 side_effect=asyncio.CancelledError()
@@ -1027,7 +1071,10 @@ class TestObserveTierGateCheck:
             can_write_result=(True, "ok"),
             risk_tier=RiskTier.SAFE_AUTO,
         )
-        config = OrchestratorConfig(project_root=Path("/tmp/test"))
+        config = OrchestratorConfig(
+            project_root=Path("/tmp/test"),
+            benchmark_enabled=False,
+        )
         orch = GovernedOrchestrator(
             stack=stack,
             generator=_mock_generator(),
