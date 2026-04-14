@@ -2844,6 +2844,25 @@ class ToolLoopCoordinator:
         self._SPOKEN_KEY_CAP: int = max(
             16, int(os.environ.get("JARVIS_TOOL_SPOKEN_KEY_CAP", "256"))
         )
+        # Phase 0 (Functions-not-Agents): optional ContextCompactor injection
+        # for delegated, hook-fired, semantic-strategy-capable compaction. When
+        # None, _compact_prompt falls back to the legacy char-based splitter.
+        # Late-bindable via set_compactor() because GovernedLoopService builds
+        # the compactor after the ToolLoopCoordinator (see
+        # governed_loop_service._build_components).
+        self._compactor: Optional[Any] = None
+
+    def set_compactor(self, compactor: Optional[Any]) -> None:
+        """Attach a :class:`ContextCompactor` for delegated prompt compaction.
+
+        Late-bindable because GovernedLoopService constructs the compactor
+        after the coordinator. When attached, :meth:`_compact_prompt`
+        delegates to the compactor's ``compact()`` method, which fires
+        ``PRE_COMPACT`` / ``POST_COMPACT`` hooks and drives any injected
+        ``semantic_strategy`` (e.g. Gemma ``CompactionCaller``). Pass
+        ``None`` to detach and fall back to the legacy char-based splitter.
+        """
+        self._compactor = compactor
 
     # ------------------------------------------------------------------
     # Narration helpers
@@ -3463,11 +3482,15 @@ class ToolLoopCoordinator:
 
             # ── Live context auto-compaction (Gap #8) ──
             # When the accumulated prompt exceeds the compaction threshold,
-            # compact older tool results into a deterministic summary.
+            # compact older tool results. When a ContextCompactor is
+            # attached (set_compactor, wired from GovernedLoopService),
+            # this delegates through the compactor's hook-fired,
+            # semantic-strategy-capable path (Phase 0 Functions-not-Agents);
+            # otherwise it falls back to the legacy char-based summarizer.
             # Runs on ANY round (including 0-1) to defend against single
             # large tool results that would otherwise blow past the hard cap.
             if len(current_prompt) > _COMPACT_THRESHOLD_CHARS:
-                current_prompt = self._compact_prompt(
+                current_prompt = await self._compact_prompt(
                     base_prompt=prompt,
                     current_prompt=current_prompt,
                     op_id=op_id,
@@ -3501,8 +3524,8 @@ class ToolLoopCoordinator:
         # raises ``tool_loop_context_overflow`` on prompt overflow.
 
     # ── Live context auto-compaction (Gap #8) ────────────────────────
-    @staticmethod
-    def _compact_prompt(
+    async def _compact_prompt(
+        self,
         base_prompt: str,
         current_prompt: str,
         op_id: str,
@@ -3510,8 +3533,15 @@ class ToolLoopCoordinator:
         """Compact older tool results in the accumulated prompt.
 
         Splits the prompt at ``[TOOL RESULT]`` / ``[TOOL ERROR]`` boundaries,
-        keeps the base prompt + a summary of old rounds + the most recent 3
-        round blocks. No model inference — deterministic counting.
+        keeps the base prompt + a summary of old rounds + the most recent N
+        round blocks.
+
+        When ``self._compactor`` is attached (Phase 0 Functions-not-Agents
+        wire — see :meth:`set_compactor`), the summary is produced by
+        delegating to :class:`ContextCompactor.compact`, which fires
+        lifecycle hooks and drives any injected ``semantic_strategy``
+        (e.g. Gemma :class:`CompactionCallerStrategy`). When not attached,
+        falls back to a deterministic char-based summary.
 
         Returns the compacted prompt string.
         """
@@ -3535,26 +3565,22 @@ class ToolLoopCoordinator:
         if len(chunks) <= _PRESERVE_RECENT:
             return current_prompt  # Not enough to compact
 
-        # Older chunks → summary
+        # Older chunks → summary. Recent N chunks are always kept verbatim.
         old_chunks = chunks[:-_PRESERVE_RECENT]
         recent_chunks = chunks[-_PRESERVE_RECENT:]
 
-        # Build deterministic summary of compacted chunks
-        tool_counts: dict = {}
-        total_chars = 0
-        for chunk in old_chunks:
-            total_chars += len(chunk)
-            # Extract tool name from [TOOL RESULT]\ntool: <name>
-            _m = _re.search(r"\ntool:\s*(\S+)", chunk)
-            if _m:
-                tool_counts[_m.group(1)] = tool_counts.get(_m.group(1), 0) + 1
+        total_chars = sum(len(c) for c in old_chunks)
 
-        summary_parts = [f"{count} {name}" for name, count in sorted(tool_counts.items())]
+        summary_body = await self._summarize_old_chunks(
+            old_chunks=old_chunks,
+            op_id=op_id,
+            total_chars=total_chars,
+        )
+
         summary = (
             f"\n[CONTEXT COMPACTED]\n"
-            f"Compacted {len(old_chunks)} earlier tool results "
-            f"({total_chars:,} chars): {', '.join(summary_parts) if summary_parts else 'mixed'}. "
-            f"Recent results preserved below.\n"
+            f"{summary_body}"
+            f" Recent results preserved below.\n"
             f"[END CONTEXT COMPACTED]\n"
         )
 
@@ -3565,3 +3591,91 @@ class ToolLoopCoordinator:
             op_id[:12], len(current_prompt), len(compacted), _saved, len(old_chunks),
         )
         return compacted
+
+    async def _summarize_old_chunks(
+        self,
+        old_chunks: List[str],
+        op_id: str,
+        total_chars: int,
+    ) -> str:
+        """Produce the summary body for compacted tool-result chunks.
+
+        Two paths:
+
+        1. **Delegated** (``self._compactor is not None``): convert chunks
+           to synthetic dialogue entries and call
+           :meth:`ContextCompactor.compact`. The compactor fires
+           ``PRE_COMPACT`` / ``POST_COMPACT`` hooks and exercises any
+           injected semantic strategy (Gemma ``CompactionCallerStrategy``
+           shadow/live telemetry). On any strategy failure the compactor
+           itself falls back to its deterministic summarizer, so this
+           branch is safe even when the Gemma provider is degraded.
+
+        2. **Legacy** (``self._compactor is None``): char-based counter
+           summary identical to the pre-refactor behavior.
+
+        The two paths emit slightly different wording; downstream
+        consumers only use the summary as human-readable context, never
+        for machine parsing.
+        """
+        import re as _re
+
+        if self._compactor is not None:
+            # Build synthetic dialogue entries. Use the parsed tool name as
+            # the ``type`` field so ContextCompactor._build_summary's
+            # type-histogram surfaces useful per-tool counts in the output
+            # (e.g. "3 read_file, 2 search_code") instead of "N tool_result".
+            import time as _time
+            _ts_base = _time.time()
+            entries: List[Dict[str, Any]] = []
+            for idx, chunk in enumerate(old_chunks):
+                _m = _re.search(r"\ntool:\s*(\S+)", chunk)
+                _tool_name = _m.group(1) if _m else "unknown"
+                entries.append({
+                    "type": _tool_name,
+                    "phase": "TOOL_ROUND",
+                    "op_id": op_id,
+                    "timestamp": _ts_base + float(idx),
+                    "content": chunk,
+                })
+
+            try:
+                from backend.core.ouroboros.governance.context_compaction import (
+                    CompactionConfig,
+                )
+                # preserve_count=0 because recent-chunk preservation is
+                # handled outside this call. preserve_patterns=() because
+                # tool-result chunks never match the safety regexes that
+                # matter for orchestrator dialogue (errors in tool output
+                # are already truncated by _format_tool_result).
+                _cfg = CompactionConfig(
+                    max_context_entries=0,
+                    preserve_count=0,
+                    preserve_patterns=(),
+                )
+                _result = await self._compactor.compact(entries, _cfg)
+                _summary_text = _result.summary or f"Compacted {len(old_chunks)} tool results"
+                return (
+                    f"{_summary_text} ({total_chars:,} chars)."
+                )
+            except Exception:
+                logger.warning(
+                    "[ToolLoop] ContextCompactor delegation failed for %s — "
+                    "falling back to char-based summary",
+                    op_id[:12], exc_info=True,
+                )
+                # fall through to legacy path
+
+        # Legacy char-based summary.
+        tool_counts: Dict[str, int] = {}
+        for chunk in old_chunks:
+            _m = _re.search(r"\ntool:\s*(\S+)", chunk)
+            if _m:
+                tool_counts[_m.group(1)] = tool_counts.get(_m.group(1), 0) + 1
+
+        summary_parts = [f"{count} {name}" for name, count in sorted(tool_counts.items())]
+        return (
+            f"Compacted {len(old_chunks)} earlier tool results "
+            f"({total_chars:,} chars): "
+            f"{', '.join(summary_parts) if summary_parts else 'mixed'}."
+        )

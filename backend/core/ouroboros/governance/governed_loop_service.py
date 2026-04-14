@@ -3569,6 +3569,28 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] ContextCompactor skipped: %s", exc)
 
+        # Phase 0 Functions-not-Agents: inject the compactor into the
+        # ToolLoopCoordinator so Venom's live context auto-compaction
+        # (tool_executor._compact_prompt) delegates through the hook-fired,
+        # semantic-strategy-capable path. Without this injection, the
+        # compactor is an inert singleton and the Phase 0 shadow telemetry
+        # never exercises real production tool-loop prompts.
+        if (
+            self._compactor is not None
+            and _tool_coordinator is not None
+            and hasattr(_tool_coordinator, "set_compactor")
+        ):
+            try:
+                _tool_coordinator.set_compactor(self._compactor)
+                logger.info(
+                    "[GLS] ContextCompactor attached to ToolLoopCoordinator (Phase 0 wire)",
+                )
+            except Exception as _attach_exc:
+                logger.debug(
+                    "[GLS] ToolLoopCoordinator compactor attach failed: %s",
+                    _attach_exc,
+                )
+
         # ---- Functions-not-Agents Phase 0: Gemma CompactionCaller ----
         # Wires a non-streaming Gemma semantic strategy into the
         # ContextCompactor above when JARVIS_COMPACTION_CALLER_ENABLED is
