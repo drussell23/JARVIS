@@ -85,6 +85,13 @@ _CODEGEN_SYSTEM_PROMPT = (
 _MAX_TARGET_FILE_CHARS = int(os.environ.get("JARVIS_CODEGEN_MAX_FILE_CHARS", "20000"))
 _TARGET_FILE_HEAD_CHARS = int(os.environ.get("JARVIS_CODEGEN_HEAD_CHARS", "16000"))
 _TARGET_FILE_TAIL_CHARS = int(os.environ.get("JARVIS_CODEGEN_TAIL_CHARS", "4000"))
+# Basal-ganglia budget: Gemma 4 31B runs BACKGROUND/SPECULATIVE ops and
+# can't survive the default 5K-token envelope. BG truncates target files
+# to ~10K chars (~2.5K tokens) so the full prompt fits under the 4K
+# target while preserving enough source context for a single small edit.
+_BG_MAX_TARGET_FILE_CHARS = int(os.environ.get("JARVIS_CODEGEN_BG_MAX_FILE_CHARS", "10000"))
+_BG_TARGET_FILE_HEAD_CHARS = int(os.environ.get("JARVIS_CODEGEN_BG_HEAD_CHARS", "8000"))
+_BG_TARGET_FILE_TAIL_CHARS = int(os.environ.get("JARVIS_CODEGEN_BG_TAIL_CHARS", "2000"))
 _MAX_IMPORT_CONTEXT_CHARS = 1500   # total across all discovered import files
 _MAX_TEST_CONTEXT_CHARS = 1500     # total across all discovered test files
 _MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
@@ -140,7 +147,12 @@ def _safe_context_path(repo_root: Path, target: Path) -> Path:
     return resolved
 
 
-def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -> str:
+def _read_with_truncation(
+    path: Path,
+    max_chars: int = _MAX_TARGET_FILE_CHARS,
+    head_chars: Optional[int] = None,
+    tail_chars: Optional[int] = None,
+) -> str:
     """Read file content, applying truncation with an explicit marker if needed."""
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -151,8 +163,10 @@ def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -
     # Clamp: head_len uses configured HEAD but cannot exceed content-1 or 80% of budget.
     # tail_len uses configured TAIL but cannot exceed remaining content after head.
     # This prevents overlap when max_chars is tuned down while HEAD/TAIL stay large.
-    head_len = min(_TARGET_FILE_HEAD_CHARS, max_chars * 4 // 5, len(content) - 1)
-    tail_len = min(_TARGET_FILE_TAIL_CHARS, len(content) - head_len)
+    _head_budget = head_chars if head_chars is not None else _TARGET_FILE_HEAD_CHARS
+    _tail_budget = tail_chars if tail_chars is not None else _TARGET_FILE_TAIL_CHARS
+    head_len = min(_head_budget, max_chars * 4 // 5, len(content) - 1)
+    tail_len = min(_tail_budget, len(content) - head_len)
     head = content[:head_len]
     tail = content[-tail_len:] if tail_len > 0 else ""
     omitted_bytes = len(content.encode()) - len(head.encode()) - len(tail.encode())
@@ -1291,7 +1305,15 @@ def _build_codegen_prompt(
         source_hash = _file_source_hash(content)
         size_bytes = len(content.encode())
         line_count = content.count("\n")
-        truncated = _read_with_truncation(abs_path)
+        if _is_bg_route:
+            truncated = _read_with_truncation(
+                abs_path,
+                max_chars=_BG_MAX_TARGET_FILE_CHARS,
+                head_chars=_BG_TARGET_FILE_HEAD_CHARS,
+                tail_chars=_BG_TARGET_FILE_TAIL_CHARS,
+            )
+        else:
+            truncated = _read_with_truncation(abs_path)
 
         # Build the section header — include [repo_name] label for cross-repo ops
         if repo_label is not None:
@@ -3236,6 +3258,7 @@ class PrimeProvider:
                 force_full_content=True,
                 repair_context=repair_context,
                 mcp_tools=_mcp_tools,
+                provider_route=getattr(context, "provider_route", "") or "",
             )
         accumulated_chars = len(prompt)
         tool_rounds = 0
@@ -4636,6 +4659,7 @@ class ClaudeProvider:
                 force_full_content=True,
                 repair_context=repair_context,
                 mcp_tools=_mcp_tools,
+                provider_route=getattr(context, "provider_route", "") or "",
             )
         # Build messages array for multi-turn conversation
         messages: List[Dict[str, Any]] = [{"role": "user", "content": prompt_text}]

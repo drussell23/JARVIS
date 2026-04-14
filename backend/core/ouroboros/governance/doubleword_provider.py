@@ -401,6 +401,7 @@ class DoublewordProvider:
             repo_root=self._repo_root,
             repo_roots=self._repo_roots or None,
             force_full_content=True,
+            provider_route=getattr(ctx, "provider_route", "") or "",
         )
         operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
         _effective_model = self._resolve_effective_model(ctx)
@@ -420,7 +421,9 @@ class DoublewordProvider:
                         "3. All string values must use double quotes. Escape special characters: use \\n for newlines, \\t for tabs, \\\\ for backslashes. "
                         "4. No trailing commas before } or ]. "
                         "5. Use schema_version '2b.1' with full_content containing the COMPLETE file. "
-                        "6. NEVER return unified diffs, patches, or partial file content."
+                        "6. NEVER return unified diffs, patches, or partial file content. "
+                        "7. CRITICAL: Every candidate MUST include a non-empty 'rationale' field "
+                        "(1 sentence, max 200 chars). Missing rationale will be rejected."
                     )},
                     {"role": "user", "content": prompt},
                 ],
@@ -808,10 +811,12 @@ class DoublewordProvider:
                 repo_roots=self._repo_roots or None,
                 force_full_content=True,
                 mcp_tools=_mcp_tools,
+                provider_route=getattr(context, "provider_route", "") or "",
             )
             logger.info(
-                "[DoublewordProvider] RT: using full prompt (%d chars, ~%d tokens)",
+                "[DoublewordProvider] RT: using full prompt (%d chars, ~%d tokens, route=%s)",
                 len(prompt), len(prompt) // 4,
+                getattr(context, "provider_route", "") or "unknown",
             )
 
         _SYSTEM_PROMPT = (
@@ -824,7 +829,10 @@ class DoublewordProvider:
             "use \\n for newlines, \\t for tabs, \\\\ for backslashes. "
             "4. No trailing commas before } or ]. "
             "5. Use schema_version '2b.1' with full_content containing the COMPLETE file. "
-            "6. NEVER return unified diffs, patches, or partial file content."
+            "6. NEVER return unified diffs, patches, or partial file content. "
+            "7. CRITICAL: Every candidate MUST include a non-empty 'rationale' field "
+            "(1 sentence, max 200 chars) explaining WHY the change is being made. "
+            "Missing or empty rationale will cause the response to be rejected."
         )
 
         # Mutable container to capture token usage from _generate_raw
