@@ -1956,3 +1956,95 @@ The single most important finding from that document, translated for O+V:
 
 > The most severe incidents in Mythos came from **"reckless excessive measures when attempting to complete a difficult user-specified task"** (§4.1.1) -- not misaligned goals, not hostile intent, just task-completion drive overriding safety checks. That is exactly O+V's failure surface. The defenses are deterministic (gates, replay harnesses, protected paths, outcome-based monitoring), not introspective, because interpretability work (§4.5.3) shows scratchpad reasoning can look clean while concealment features fire in the model's internals.
 
+---
+
+## Functions, Not Agents: DoubleWord Reseating Roadmap (2026-04-14)
+
+### Calibration
+
+Two battle tests established the DW envelope with prejudice:
+
+- **`bt-2026-04-14-182446`** — Gemma 4 31B BACKGROUND route: **0/13 successes** (12× 180s timeout, 1× schema_invalid) even at a right-sized 2,836-token envelope. Root cause: provider-side SSE stream stalling post-accept, not prompt size.
+- **`bt-2026-04-14-203740`** — Qwen 3.5 397B STANDARD isolation benchmark (Claude fallback severed): **0 valid candidates across the run.** Tier 0 RT streams opened, then went silent mid-generation (``SSE stream stalled (no data for 30s)``), budget exhausted at 71.5s, FSM hit ``TIMEOUT`` on every attempt. Same failure signature as Gemma on BG — provider-side stream stall.
+
+Verdict: the DoubleWord **streaming** endpoint cannot sustain agent-shaped workloads across any tested model. STANDARD, COMPLEX, and IMMEDIATE now cascade_to_claude; BACKGROUND and SPECULATIVE now skip_and_queue. Only the `callers` mapping (semantic_triage, ouroboros_plan) remains on DW — and only because those are tiny-payload structured-JSON calls.
+
+### The Architectural Reframe
+
+DoubleWord is not a broken agent provider. It is an **untested function provider.** The streaming endpoint fails; the non-streaming `/v1/chat/completions` endpoint with `stream=false` has never been exercised by O+V. The reseating matrix below moves DW out of the agent cascade entirely and into a fixed set of short, structured, non-streaming function calls.
+
+**Design invariants for every DW caller:**
+
+1. **Non-streaming only.** Request body carries `stream=false`. The client awaits a single JSON response; there is no SSE loop, no partial-delta reassembly, no mid-stream stall surface. `DoublewordProvider.complete_sync()` is the single code path.
+2. **Short structured output.** Callers request JSON schemas with bounded token budgets (≤512 output tokens typical). No free-form prose, no tool loops, no multi-turn refinement.
+3. **Caller-supplied timeout.** Each call site picks a timeout appropriate to its criticality (200ms for semantic_triage, 2s for compaction, 30s for heavy analysts). The provider enforces via `asyncio.wait_for()` — not the streaming budget curves.
+4. **Anti-hallucination gate (Manifesto §6).** Every caller that names codebase artifacts (symbols, file paths) validates the model output against the provided context. Any hallucinated reference → autonomous rejection, deterministic fallback, telemetry log. We do not trust fluid intelligence with ground truth.
+5. **Circuit breaker.** Per-call, per-op, and global-rolling breakers. Sustained failures at any layer demote the caller to its deterministic fallback for the remainder of the session.
+6. **Shadow mode first.** Every new caller ships disabled-by-default in SHADOW mode: runs in parallel with the deterministic baseline, writes telemetry to `.ouroboros/sessions/<id>/<caller>_shadow.jsonl`, emits a single-line SerpentFlow event, but **never affects pipeline state.** Promoted to LIVE only after offline analysis of the shadow JSONL.
+
+### Phase 0: Gemma Compaction Caller (SHIPPING)
+
+**Model:** `google/gemma-4-31B-it`
+**Call site:** `ContextCompactor._build_summary()` in `context_compaction.py`
+**Deterministic fallback:** existing type-counting + phase-histogram summarizer
+**Rationale:** Compaction is a structured summarization task with a fully-bounded input (entries already in memory), a short output (<1KB summary text), and a trivial anti-hallucination check (summary must reference only entry-keys and phase-names already in the preserved list). Ideal Gemma test bed.
+**Strategy injection:** `ContextCompactor.__init__(semantic_strategy: Optional[CompactionCallerStrategy])`. When present, `_build_summary` delegates; on any failure (timeout, schema_invalid, hallucinated ref, circuit-open), falls back to the deterministic path and logs the rejection reason.
+**Master switch:** `JARVIS_COMPACTION_CALLER_ENABLED` (default `false`). Enabled explicitly per battle test during shadow-mode validation.
+
+### Phase 3: Qwen 397B Heavy Analyst Roadmap
+
+Once Phase 0 (Gemma compaction) has 24h+ of clean shadow telemetry and a LIVE promotion decision, Phase 3 mounts Qwen 3.5 397B as the **heavy analyst** for three cognitive callers. All three share the same `complete_sync()` non-streaming code path; none ever touch the streaming endpoint.
+
+#### 3.1 — BlastRadius Scoring (`OperationAdvisor`)
+
+**What it does today:** Deterministic heuristic — counts transitively-dependent files via import graph, weights by test coverage, emits a 0.0–1.0 score consumed by the 4-tier risk escalator (SAFE_AUTO / NOTIFY_APPLY / APPROVAL_REQUIRED / BLOCKED).
+
+**Gap:** The import-graph heuristic is structural only. It cannot reason about *semantic* blast radius — e.g., a one-line change to a retry-backoff constant may have higher real-world impact than a 500-line refactor of a leaf module.
+
+**Qwen 397B role:** Non-streaming structured-JSON analyst. Input: candidate diff + import-graph evidence pack + historical failure episodes touching the same path. Output: strict JSON schema `blast_radius.1` — `{score: float, structural_score: float, semantic_score: float, reasoning: str, risk_factors: [str], invariants_touched: [str]}`. Deterministic score stays as the floor; 397B score can *only* escalate risk tier, never de-escalate. This preserves the "fluid intelligence never lowers a hard gate" invariant.
+
+**Anti-hallucination gate:** `invariants_touched` must be a subset of symbol names extracted from the actual diff. Any hallucinated invariant → rejection, fall back to deterministic.
+
+**Timeout:** 10s per call (bounded by single-op approval latency budget).
+
+#### 3.2 — Episodic Failure Clustering
+
+**What it does today:** Nothing. Session lessons (`_session_lessons`, 20 max) reset each session. Failed ops are logged but never clustered across sessions.
+
+**Gap:** The Strategic Direction / Consciousness Bridge stack has the storage substrate (UserPreferenceMemory, ProphecyEngine) but no component that looks across historical failures and says "these three rejections are the same problem wearing different hats."
+
+**Qwen 397B role:** Periodic batch analyst (runs once per session boot, and once per hour during long battle tests). Input: last N postmortem JSON records (where N is bounded by prompt budget, ~50 records). Output: strict JSON schema `failure_clusters.1` — `{clusters: [{cluster_id: str, signature: str, episode_ids: [str], confidence: float, suggested_guardrail: str}], novel_modes: [str]}`. Clusters are written to UserPreferenceMemory as `FEEDBACK` type, tagged `("episodic", "cluster")`.
+
+**Anti-hallucination gate:** Every `episode_ids` entry must exist in the input postmortem set. Any hallucinated episode_id → rejection, log, no memory written.
+
+**Timeout:** 30s per call (runs out-of-band; no live op blocked on it).
+
+#### 3.3 — DreamEngine Seed Generation
+
+**What it does today:** `dream_engine.py` runs during idle-GPU windows and generates speculative improvement blueprints, but its seed selection is a naive round-robin across the file reputation ledger.
+
+**Gap:** DreamEngine picks *what* to dream about via a heuristic. It should be picking via heavy-model reasoning over the codebase, recent commit velocity, and open postmortem clusters — the exact inputs Qwen 397B is well-suited to reason across.
+
+**Qwen 397B role:** Seed generator for each dream cycle. Input: top-10 files by reputation decay + recent commit scope histogram + open failure clusters from §3.2. Output: strict JSON schema `dream_seed.1` — `{seeds: [{seed_id: str, target_path: str, hypothesis: str, expected_value: str, preconditions: [str]}], rejected: [{path: str, reason: str}]}`. DreamEngine consumes the seed list and runs its existing blueprint pipeline per seed.
+
+**Anti-hallucination gate:** Every `target_path` must be a real file (on-disk check, not just reputation-ledger lookup). Any missing path → rejection, log, DreamEngine falls back to the round-robin heuristic.
+
+**Timeout:** 30s per call (runs during idle windows; no user-facing deadline).
+
+### Promotion Gate from Phase 0 to Phase 3
+
+Phase 3 is blocked on Phase 0 proving the non-streaming endpoint is viable. Explicit criteria:
+
+1. **≥24h of Phase 0 shadow telemetry** with <5% timeout rate on the Gemma compaction caller.
+2. **Zero hallucinated references** that slipped past the anti-hallucination gate and reached the pipeline (i.e., the gate caught all of them, or better yet, the model didn't hallucinate in the first place).
+3. **Circuit breaker never opened globally** during shadow — opened-per-call is acceptable and expected.
+4. **Manual LIVE promotion decision** by the architect (Derek). No automatic promotion.
+
+Only then does Task #13+ begin wiring Qwen 397B to OperationAdvisor. Phase 3 is a **strategic mandate**, not an imminent ship.
+
+### Why This Matters
+
+The streaming endpoint failures did not invalidate DoubleWord as an inference provider. They invalidated the **agent-shaped usage pattern** against the DoubleWord streaming endpoint. By reframing every DW call site as a non-streaming, short, structured, schema-validated, anti-hallucination-gated function call, O+V recovers a genuinely useful provider tier without compromising Manifesto §6 (Execution Validation). The cost math stays favorable: every op Gemma absorbs from Claude at the compaction layer, and every operation Qwen absorbs at the heavy-analyst layer, extends the session's Claude budget for the prefrontal-cortex work that only Claude can do.
+
+Manifesto §5 (Intelligence-Driven Routing): *"semantic, not regex; DAGs, not scripts."* The reseated DW topology is the operational embodiment — DW lives where the task is genuinely structured-function-shaped, Claude lives where the task is genuinely agent-shaped, and the seam between them is deterministic, observable, and reversible.
+

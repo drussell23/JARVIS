@@ -370,6 +370,9 @@ doubleword_topology:
     ouroboros_plan:
       dw_model: "google/gemma-4-31B-it"
       reason: "Basal ganglia — structured JSON plan generation during PLAN phase."
+    compaction:
+      dw_model: "google/gemma-4-31B-it"
+      reason: "Functions-not-Agents Phase 0. Structured summary over ToolLoop memory entries — fully-bounded input, short output (<1KB), trivial anti-hallucination check (subset of entry-keys). First non-streaming complete_sync() caller. SHADOW mode by default (JARVIS_COMPACTION_CALLER_ENABLED)."
 
 error_codes:
   - "CONTRACT_SCHEMA_INVALID"

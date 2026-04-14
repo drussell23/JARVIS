@@ -137,6 +137,23 @@ class CompletedBatch:
     wall_completed_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class CompleteSyncResult:
+    """Result of a non-streaming complete_sync() call.
+
+    Functions-not-Agents path: structured return for short, bounded,
+    schema-validated function callers (CompactionCaller, BlastRadius,
+    FailureClustering, DreamSeed). Never used by the agent cascade —
+    agent-shaped workloads go through generate()/Venom/SSE.
+    """
+    content: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    latency_s: float
+    model: str
+
+
 class DoublewordProvider:
     """Tier 0 CandidateProvider using Doubleword batch API with 397B MoE model.
 
@@ -1635,6 +1652,185 @@ class DoublewordProvider:
                 "[DoublewordProvider] prompt_only unexpected error (caller=%s)", caller_id
             )
             return ""
+
+    # ------------------------------------------------------------------
+    # Functions-not-Agents path: complete_sync()
+    # ------------------------------------------------------------------
+
+    async def complete_sync(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str,
+        caller_id: str,
+        model: Optional[str] = None,
+        max_tokens: int = 512,
+        timeout_s: float = 10.0,
+        response_format: Optional[Dict[str, Any]] = None,
+        temperature: Optional[float] = None,
+    ) -> CompleteSyncResult:
+        """Non-streaming, short-output, caller-timed synchronous completion.
+
+        This is the **Functions-not-Agents** code path. It bypasses the SSE
+        streaming endpoint entirely and instead hits ``/v1/chat/completions``
+        with ``stream=false``, awaiting a single JSON body. It is the single
+        entry point for structured-function callers (CompactionCaller,
+        BlastRadius, FailureClustering, DreamSeed) that need short, bounded,
+        schema-validated output without the agent cascade's tool loops.
+
+        Calibration context: bt-2026-04-14-182446 and bt-2026-04-14-203740
+        established that DW's SSE streaming endpoint stalls post-accept
+        across Qwen 397B and Gemma 4 31B. This method avoids the stall
+        surface by never opening an SSE stream. It is the load-bearing
+        primitive of the reseated DW topology (Manifesto §5).
+
+        The caller enforces the timeout via ``asyncio.wait_for()``. If the
+        request exceeds ``timeout_s``, ``asyncio.TimeoutError`` propagates
+        to the caller, which is expected to handle circuit-breaker logic
+        and fall back to its deterministic path.
+
+        Parameters
+        ----------
+        prompt:
+            User prompt text. Passed verbatim as the user message.
+        system_prompt:
+            Caller-specific system prompt. Required — no default. Every
+            caller is expected to own its system prompt so the Functions
+            path has no implicit shared instructions.
+        caller_id:
+            Identifier used in log messages and telemetry. Short string
+            like ``"compaction"``, ``"blast_radius"``, ``"dream_seed"``.
+        model:
+            Override the model slug. Defaults to ``self._model``. The
+            reseated topology expects callers to pass the model from
+            ``provider_topology.get_topology().model_for_caller(caller_id)``
+            so the yaml remains the single source of truth.
+        max_tokens:
+            Output token ceiling. Defaults to 512 — the Functions path is
+            for short structured output, not long-form generation.
+        timeout_s:
+            Hard caller-supplied timeout enforced via ``asyncio.wait_for``.
+            Raises ``asyncio.TimeoutError`` on expiry.
+        response_format:
+            Optional OpenAI-style response_format dict. Typical usage:
+            ``{"type": "json_object"}`` for JSON-mode output.
+        temperature:
+            Override sampling temperature. Defaults to ``_DW_TEMPERATURE``.
+
+        Returns
+        -------
+        CompleteSyncResult
+            Structured result with content, token usage, cost, latency.
+
+        Raises
+        ------
+        ValueError
+            If DOUBLEWORD_API_KEY is not configured.
+        asyncio.TimeoutError
+            If the request exceeds ``timeout_s``.
+        DoublewordInfraError
+            On HTTP errors, empty choices, or cost-budget violations.
+        """
+        if not self._api_key:
+            raise ValueError(
+                "DOUBLEWORD_API_KEY is not set — cannot call complete_sync()"
+            )
+        self._check_budget()
+
+        effective_model = model or self._model
+        effective_temperature = (
+            temperature if temperature is not None else _DW_TEMPERATURE
+        )
+
+        body: Dict[str, Any] = {
+            "model": effective_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": effective_temperature,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if response_format is not None:
+            body["response_format"] = response_format
+
+        session = await self._get_session()
+        t0 = time.monotonic()
+
+        async def _do_request() -> Tuple[str, int, int]:
+            async with session.post(
+                f"{self._base_url}/chat/completions",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=self._request_timeout(),
+            ) as resp:
+                if resp.status >= 300:
+                    self._last_error_status = resp.status
+                    err_body = await resp.text()
+                    raise DoublewordInfraError(
+                        f"complete_sync[{caller_id}] HTTP {resp.status}: {err_body[:200]}",
+                        status_code=resp.status,
+                    )
+                data = await resp.json()
+                choices = data.get("choices", [])
+                if not choices:
+                    raise DoublewordInfraError(
+                        f"complete_sync[{caller_id}] no choices in response",
+                        status_code=0,
+                    )
+                message = choices[0].get("message", {}) or {}
+                _content = message.get("content", "") or ""
+                usage = data.get("usage", {}) or {}
+                _input_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                _output_tokens = int(usage.get("completion_tokens", 0) or 0)
+                return _content, _input_tokens, _output_tokens
+
+        try:
+            content, input_tokens, output_tokens = await asyncio.wait_for(
+                _do_request(), timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            self._stats.failed_batches += 1
+            logger.warning(
+                "[DoublewordProvider] complete_sync[%s] timeout after %.1fs (model=%s)",
+                caller_id, timeout_s, effective_model,
+            )
+            raise
+
+        elapsed = time.monotonic() - t0
+        cost = (
+            input_tokens * _DW_INPUT_COST_PER_M / 1_000_000
+            + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
+        )
+        self._stats.total_batches += 1
+        self._stats.total_latency_s += elapsed
+        self._stats.total_input_tokens += input_tokens
+        self._stats.total_output_tokens += output_tokens
+        self._stats.total_cost_usd += cost
+        self._record_cost(cost)
+
+        if not content:
+            self._stats.empty_content_retries += 1
+            logger.warning(
+                "[DoublewordProvider] complete_sync[%s] empty content (model=%s, %.2fs)",
+                caller_id, effective_model, elapsed,
+            )
+
+        logger.info(
+            "[DoublewordProvider] complete_sync[%s] ok: %.2fs, %d chars, $%.5f (model=%s)",
+            caller_id, elapsed, len(content), cost, effective_model,
+        )
+
+        return CompleteSyncResult(
+            content=content,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost,
+            latency_s=elapsed,
+            model=effective_model,
+        )
 
     # ------------------------------------------------------------------
     # Utility
