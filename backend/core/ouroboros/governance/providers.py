@@ -1201,6 +1201,7 @@ def _build_codegen_prompt(
     force_full_content: bool = False,
     repair_context: Optional[Any] = None,
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
+    provider_route: str = "",
 ) -> str:
     """Build an enriched codegen prompt with file contents, context, and schema.
 
@@ -1226,7 +1227,24 @@ def _build_codegen_prompt(
         smaller models (≤13B) that lack the precision to generate verbatim
         context lines in unified diffs — they reconstruct from parametric
         memory instead of copying from the in-context source snapshot.
+    provider_route:
+        One of "immediate", "standard", "complex", "background", "speculative".
+        When the route is "background" (and "speculative" by extension),
+        the prompt is aggressively pruned to fit a small basal-ganglia model
+        (Gemma 4 31B) within its 180s RT budget — auxiliary sections such
+        as Session Lessons, Dependency Summary, Function Index, File
+        History, Expanded Context, Strategic Memory, and Implementation
+        Plan are dropped. Target file content is truncated to a small
+        envelope. The schema instruction switches to a BG variant that
+        explicitly marks the ``rationale`` field as mandatory — Gemma
+        drops it otherwise, failing schema validation downstream.
     """
+    # Route-specific pruning: BACKGROUND / SPECULATIVE run on Gemma 4 31B,
+    # which can't survive 11K-token prompts within a 180s budget. We strip
+    # non-essential context and leave the model with the goal, the target
+    # file, and the output schema.
+    _route_norm = (provider_route or "").strip().lower()
+    _is_bg_route = _route_norm in ("background", "speculative")
     from backend.core.ouroboros.governance.test_runner import BlockedPathError
 
     if repo_root is None:
@@ -1505,8 +1523,13 @@ Rules:
 - The diff must apply cleanly to the source file shown above.
 - Python changes must result in syntactically valid code.
 - No extra keys at any level. Return ONLY the JSON object (or the no_op object)."""
-    else:
-        schema_instruction = f"""## Output Schema
+    elif _is_bg_route:
+        # BACKGROUND variant — minimal, single-candidate, explicit rationale
+        # enforcement. Gemma 4 31B drops the rationale field unless we
+        # tell it unambiguously that the field is mandatory. The prose
+        # rules list below is deliberately tight: small models respect
+        # short imperative rule lists better than long schema explanations.
+        schema_instruction = f"""## Output Schema (BACKGROUND route — strict)
 
 Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION}"):
 
@@ -1528,9 +1551,43 @@ Return a JSON object matching **exactly** this structure (schema_version: "{_SCH
 }}
 ```
 
+CRITICAL Rules — every single one is mandatory:
+- Return EXACTLY ONE candidate (c1). Do not return alternatives.
+- `full_content` must be the COMPLETE file (not a diff, not a patch).
+- **`rationale` is REQUIRED** — a non-empty string, 1 sentence,
+  max 200 chars, explaining WHY the change is being made. A missing
+  or empty rationale will cause the response to be rejected.
+- Python files must be syntactically valid (`ast.parse()`-clean).
+- No extra keys at any level. Return ONLY the JSON object."""
+    else:
+        schema_instruction = f"""## Output Schema
+
+Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION}"):
+
+```json
+{{
+  "schema_version": "{_SCHEMA_VERSION}",
+  "candidates": [
+    {{
+      "candidate_id": "c1",
+      "file_path": "<repo-relative path matching the target file>",
+      "full_content": "<complete modified file content — not a diff>",
+      "rationale": "<one sentence, max 200 chars — MANDATORY, non-empty>"
+    }}
+  ],
+  "provider_metadata": {{
+    "model_id": "<your model identifier>",
+    "reasoning_summary": "<max 200 chars>"
+  }}
+}}
+```
+
 Rules:
 - Return 1–3 candidates. c1 = primary approach, c2 = alternative, c3 = minimal-change fallback.
 - `full_content` must be the **complete** file (not a diff or patch).
+- `rationale` is REQUIRED on every candidate — a non-empty string
+  explaining the change. Missing rationale causes the response to
+  be rejected by the downstream schema validator.
 - Python files must be syntactically valid (`ast.parse()`-clean).
 - No extra keys at any level. Return ONLY the JSON object."""
 
@@ -1554,77 +1611,81 @@ Rules:
     sys_ctx_block = _build_system_context_block(ctx)
     if sys_ctx_block is not None:
         parts.append(sys_ctx_block)
-    strategic_memory_prompt = getattr(ctx, "strategic_memory_prompt", "")
-    if not isinstance(strategic_memory_prompt, str):
-        strategic_memory_prompt = ""
-    if strategic_memory_prompt.strip():
-        parts.append(strategic_memory_prompt)
+    # BACKGROUND route: skip auxiliary enrichment sections entirely. The
+    # basal-ganglia model (Gemma 4 31B) cannot survive their token weight
+    # within its 180s budget. Everything below until the Source Snapshot
+    # is gated on `not _is_bg_route`.
+    if not _is_bg_route:
+        strategic_memory_prompt = getattr(ctx, "strategic_memory_prompt", "")
+        if not isinstance(strategic_memory_prompt, str):
+            strategic_memory_prompt = ""
+        if strategic_memory_prompt.strip():
+            parts.append(strategic_memory_prompt)
 
-    # ── 4b. Implementation plan (model-reasoned strategy from PLAN phase) ──
-    _impl_plan = getattr(ctx, "implementation_plan", "")
-    if isinstance(_impl_plan, str) and _impl_plan.strip():
-        try:
-            from backend.core.ouroboros.governance.plan_generator import PlanResult
-            _plan_data = json.loads(_impl_plan)
-            _pr = PlanResult(
-                plan_json=_impl_plan,
-                approach=_plan_data.get("approach", ""),
-                complexity=_plan_data.get("complexity", "moderate"),
-                ordered_changes=_plan_data.get("ordered_changes", []),
-                risk_factors=_plan_data.get("risk_factors", []),
-                test_strategy=_plan_data.get("test_strategy", ""),
-                architectural_notes=_plan_data.get("architectural_notes", ""),
-            )
-            _plan_section = _pr.to_prompt_section()
-            if _plan_section:
-                parts.append(_plan_section)
-        except Exception:
-            # Fallback: inject raw plan JSON if parsing fails
-            parts.append(
-                "## Implementation Plan\n\n"
-                "Follow this plan when generating code:\n\n"
-                f"```json\n{_impl_plan}\n```"
-            )
-
-    # ── 4c. Session intelligence — lessons from prior ops this session ──
-    _session_lessons = getattr(ctx, "session_lessons", "")
-    if isinstance(_session_lessons, str) and _session_lessons.strip():
-        parts.append(
-            "## Session Lessons (from prior operations this session)\n\n"
-            "Use these to avoid repeating mistakes and build on successes:\n\n"
-            + _session_lessons.strip()
-        )
-
-    # ── 4d. Dependency impact from Oracle graph ──────────────────────────
-    _dep_summary = getattr(ctx, "dependency_summary", "")
-    if isinstance(_dep_summary, str) and _dep_summary.strip():
-        parts.append(_dep_summary.strip())
-
-    # ── 4a. Structural index + recent history (Sub-project B: The Eyes) ──
-    if ctx.target_files:
-        _primary_target = ctx.target_files[0]
-        _primary_abs = (
-            Path(_primary_target) if Path(_primary_target).is_absolute()
-            else (effective_single_repo_root / _primary_target)
-        )
-        if _primary_abs.exists() and _primary_abs.suffix == ".py":
+        # ── 4b. Implementation plan (model-reasoned strategy from PLAN phase) ──
+        _impl_plan = getattr(ctx, "implementation_plan", "")
+        if isinstance(_impl_plan, str) and _impl_plan.strip():
             try:
-                _primary_content = _primary_abs.read_text(encoding="utf-8", errors="replace")
-                _func_idx = _build_function_index(_primary_content, str(_primary_abs))
-                if _func_idx:
-                    parts.append(_func_idx)
-            except OSError:
-                pass
-        _history = _build_recent_file_history(_primary_abs, effective_single_repo_root)
-        if _history:
-            parts.append(_history)
+                from backend.core.ouroboros.governance.plan_generator import PlanResult
+                _plan_data = json.loads(_impl_plan)
+                _pr = PlanResult(
+                    plan_json=_impl_plan,
+                    approach=_plan_data.get("approach", ""),
+                    complexity=_plan_data.get("complexity", "moderate"),
+                    ordered_changes=_plan_data.get("ordered_changes", []),
+                    risk_factors=_plan_data.get("risk_factors", []),
+                    test_strategy=_plan_data.get("test_strategy", ""),
+                    architectural_notes=_plan_data.get("architectural_notes", ""),
+                )
+                _plan_section = _pr.to_prompt_section()
+                if _plan_section:
+                    parts.append(_plan_section)
+            except Exception:
+                # Fallback: inject raw plan JSON if parsing fails
+                parts.append(
+                    "## Implementation Plan\n\n"
+                    "Follow this plan when generating code:\n\n"
+                    f"```json\n{_impl_plan}\n```"
+                )
 
-    parts += [
-        f"## Source Snapshot\n\n{file_block}",
-        context_block,
-    ]
-    if expanded_context_block:
-        parts.append(expanded_context_block)
+        # ── 4c. Session intelligence — lessons from prior ops this session ──
+        _session_lessons = getattr(ctx, "session_lessons", "")
+        if isinstance(_session_lessons, str) and _session_lessons.strip():
+            parts.append(
+                "## Session Lessons (from prior operations this session)\n\n"
+                "Use these to avoid repeating mistakes and build on successes:\n\n"
+                + _session_lessons.strip()
+            )
+
+        # ── 4d. Dependency impact from Oracle graph ──────────────────────────
+        _dep_summary = getattr(ctx, "dependency_summary", "")
+        if isinstance(_dep_summary, str) and _dep_summary.strip():
+            parts.append(_dep_summary.strip())
+
+        # ── 4a. Structural index + recent history (Sub-project B: The Eyes) ──
+        if ctx.target_files:
+            _primary_target = ctx.target_files[0]
+            _primary_abs = (
+                Path(_primary_target) if Path(_primary_target).is_absolute()
+                else (effective_single_repo_root / _primary_target)
+            )
+            if _primary_abs.exists() and _primary_abs.suffix == ".py":
+                try:
+                    _primary_content = _primary_abs.read_text(encoding="utf-8", errors="replace")
+                    _func_idx = _build_function_index(_primary_content, str(_primary_abs))
+                    if _func_idx:
+                        parts.append(_func_idx)
+                except OSError:
+                    pass
+            _history = _build_recent_file_history(_primary_abs, effective_single_repo_root)
+            if _history:
+                parts.append(_history)
+
+    parts.append(f"## Source Snapshot\n\n{file_block}")
+    if not _is_bg_route:
+        parts.append(context_block)
+        if expanded_context_block:
+            parts.append(expanded_context_block)
     if tools_enabled:
         parts.append(
             _build_tool_section(
