@@ -61,7 +61,7 @@ def _call(
 def test_call_known_tool_maps_to_category_and_weight() -> None:
     c = _call("get_callers")
     assert c.category is ExplorationCategory.CALL_GRAPH
-    assert c.base_weight == 2.0
+    assert c.base_weight == 2.5
 
 
 def test_call_unknown_tool_maps_to_uncategorized_and_zero_weight() -> None:
@@ -79,9 +79,9 @@ def test_score_sums_distinct_calls_by_base_weight() -> None:
     ledger = ExplorationLedger.from_calls([
         _call("read_file",    "f1"),   # 1.0
         _call("search_code",  "q1"),   # 1.5
-        _call("get_callers",  "s1"),   # 2.0
+        _call("get_callers",  "s1"),   # 2.5
     ])
-    assert ledger.diversity_score() == pytest.approx(4.5)
+    assert ledger.diversity_score() == pytest.approx(5.0)
 
 
 def test_duplicate_call_contributes_zero() -> None:
@@ -144,7 +144,7 @@ def test_from_records_filters_non_exploration_tools() -> None:
         FakeRecord("get_callers", "d"),
     ])
     assert len(ledger.calls) == 2
-    assert ledger.diversity_score() == pytest.approx(3.0)
+    assert ledger.diversity_score() == pytest.approx(3.5)
 
 
 def test_from_records_respects_failure_status() -> None:

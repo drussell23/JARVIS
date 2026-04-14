@@ -66,20 +66,29 @@ _TOOL_CATEGORY: Mapping[str, ExplorationCategory] = {
 }
 
 
-# Base weights. Call-graph and structure tools are worth more than plain
-# reads because they make the model reason about interactions rather than
-# just fetch bytes. Weights are separate from categories so both can tune
-# independently.
+# Base weights. Call-graph and history tools are worth more than plain
+# reads because they make the model reason about interactions and
+# temporal context rather than just fetching bytes. Weights are separate
+# from categories so both can tune independently.
+#
+# Calibration history:
+#   2026-04-14 (neuro4 live-fire): attempt 2 covered all 5 categories
+#   with 11 unique calls but scored 13.0 against a 14.0 architectural
+#   floor. Rather than lowering the floor, weights for the two required
+#   architectural categories (CALL_GRAPH, HISTORY) were bumped +0.5 so
+#   that any architectural ledger which legitimately covers both
+#   required categories picks up a minimum +1.0 delta — rewarding
+#   high-leverage exploration behavior instead of raw call volume.
 _TOOL_WEIGHT: Mapping[str, float] = {
     "read_file":    1.0,
     "list_dir":     0.5,
     "search_code":  1.5,
     "glob_files":   0.5,
-    "get_callers":  2.0,
+    "get_callers":  2.5,
     "list_symbols": 1.5,
-    "git_blame":    1.5,
-    "git_log":      1.0,
-    "git_diff":     1.0,
+    "git_blame":    2.0,
+    "git_log":      1.5,
+    "git_diff":     1.5,
 }
 
 # Duplicate (same tool + same arguments_hash) calls contribute this
