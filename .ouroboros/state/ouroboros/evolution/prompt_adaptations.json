@@ -24,13 +24,73 @@
         "adapted_instruction": "WARNING: This domain has a 100% failure rate over 20 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
         "reason": "High failure rate (100%)",
         "created_at": 1776045703.811778
+      },
+      {
+        "domain_key": "test_fix::.py",
+        "adapted_instruction": "WARNING: This domain has a 100% failure rate over 25 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (100%)",
+        "created_at": 1776137638.74316
+      },
+      {
+        "domain_key": "test_fix::.py",
+        "adapted_instruction": "WARNING: This domain has a 97% failure rate over 30 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (97%)",
+        "created_at": 1776137878.249892
+      },
+      {
+        "domain_key": "test_fix::.py",
+        "adapted_instruction": "WARNING: This domain has a 89% failure rate over 35 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (89%)",
+        "created_at": 1776138072.912113
+      }
+    ],
+    "code_gen::.py": [
+      {
+        "domain_key": "code_gen::.py",
+        "adapted_instruction": "WARNING: This domain has a 100% failure rate over 5 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (100%)",
+        "created_at": 1776137635.572219
+      },
+      {
+        "domain_key": "code_gen::.py",
+        "adapted_instruction": "WARNING: This domain has a 100% failure rate over 10 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (100%)",
+        "created_at": 1776137656.209313
+      },
+      {
+        "domain_key": "code_gen::.py",
+        "adapted_instruction": "WARNING: This domain has a 87% failure rate over 15 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (87%)",
+        "created_at": 1776137751.852788
+      },
+      {
+        "domain_key": "code_gen::.py",
+        "adapted_instruction": "WARNING: This domain has a 65% failure rate over 20 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (65%)",
+        "created_at": 1776137868.151814
+      },
+      {
+        "domain_key": "code_gen::.py",
+        "adapted_instruction": "WARNING: This domain has a 64% failure rate over 25 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (64%)",
+        "created_at": 1776137875.165629
+      },
+      {
+        "domain_key": "code_gen::.py",
+        "adapted_instruction": "WARNING: This domain has a 60% failure rate over 30 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (60%)",
+        "created_at": 1776138064.9616551
       }
     ]
   },
   "stats": {
     "test_fix::.py": {
-      "success": 0,
-      "failure": 22
+      "success": 4,
+      "failure": 33
+    },
+    "code_gen::.py": {
+      "success": 15,
+      "failure": 19
     }
   }
 }
