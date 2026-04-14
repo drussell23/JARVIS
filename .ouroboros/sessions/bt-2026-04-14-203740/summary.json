@@ -1,0 +1,95 @@
+{
+  "session_id": "bt-2026-04-14-203740",
+  "stop_reason": "shutdown_signal",
+  "duration_s": 330.41864490509033,
+  "stats": {
+    "attempted": 3,
+    "completed": 0,
+    "failed": 3,
+    "cancelled": 0,
+    "queued": 0
+  },
+  "cost_total": 0.004208,
+  "cost_breakdown": {
+    "doubleword": 0.004208
+  },
+  "branch_stats": {
+    "commits": 0,
+    "files_changed": 0,
+    "insertions": 0,
+    "deletions": 0
+  },
+  "convergence_state": "INSUFFICIENT_DATA",
+  "convergence_slope": 0.0,
+  "convergence_r2": 0.0,
+  "top_sensors": [
+    [
+      "governed_loop",
+      3
+    ]
+  ],
+  "top_techniques": [
+    [
+      "",
+      3
+    ]
+  ],
+  "operations": [
+    {
+      "op_id": "op-019d8db7-6906-7694-9f3e-1dd6c9060192-jarvis",
+      "status": "failed",
+      "sensor": "governed_loop",
+      "technique": "",
+      "composite_score": 0.0,
+      "elapsed_s": 0.0,
+      "recorded_at": 1776199101.798775,
+      "provider": "",
+      "cost_usd": 0.0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "tool_calls": 0,
+      "files_changed": 1
+    },
+    {
+      "op_id": "op-019d8db7-68ca-7973-9666-05bde101bb04-jarvis",
+      "status": "failed",
+      "sensor": "governed_loop",
+      "technique": "",
+      "composite_score": 0.0,
+      "elapsed_s": 100.48722079200002,
+      "recorded_at": 1776199201.116009,
+      "provider": "",
+      "cost_usd": 0.0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "tool_calls": 0,
+      "files_changed": 1
+    },
+    {
+      "op_id": "op-019d8db7-68ed-7945-b889-1f77686cc77c-jarvis",
+      "status": "failed",
+      "sensor": "governed_loop",
+      "technique": "",
+      "composite_score": 0.0,
+      "elapsed_s": 267.69469733299997,
+      "recorded_at": 1776199368.349634,
+      "provider": "",
+      "cost_usd": 0.0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "tool_calls": 0,
+      "files_changed": 1
+    }
+  ],
+  "strategic_drift": {
+    "total_ops": 6,
+    "drifted_ops": 1,
+    "ratio": 0.1667,
+    "threshold_met": true,
+    "warning": false,
+    "status": "ok"
+  }
+}

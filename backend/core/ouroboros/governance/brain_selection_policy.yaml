@@ -314,8 +314,7 @@ gates:
 # Prefrontal Cortex (Claude only):
 #   - IMMEDIATE  — fast reflex, deep context, strict deadlines
 #   - COMPLEX    — architectural generation, Venom tool loops
-# Midbrain (DW 397B primary → Claude fallback):
-#   - STANDARD   — moderate ops, 120s window survivable
+#   - STANDARD   — midbrain sealed, cascades to Claude (see below)
 # Basal Ganglia (Gemma 4 31B, strictly confined to structured-JSON callers):
 #   - semantic_triage — pre-generation file intelligence
 #   - ouroboros_plan  — plan-phase structured JSON output
@@ -328,6 +327,18 @@ gates:
 # $3/$15 per M-token provider violates the unit economics of scalable
 # autonomy. Until a viable, cost-effective inference endpoint is secured,
 # BG/SPEC generation is paused via skip-and-queue.
+#
+# STANDARD is also SEALED as of bt-2026-04-14-203740 (Qwen 397B isolation
+# benchmark). With the Claude fallback severed, Qwen 3.5 397B produced
+# ZERO valid candidates across the run: Tier 0 RT streams started, then
+# stalled mid-generation (``SSE stream stalled (no data for 30s)``), budget
+# exhausted at 71.5s, and the FSM hit ``TIMEOUT`` on every attempt. Same
+# failure signature as Gemma on BACKGROUND — provider-side stream stall,
+# not prompt size. Unlike BG/SPEC, STANDARD DOES cascade to Claude: it
+# carries bounded-volume mid-tier ops where Claude's unit economics are
+# acceptable and speed matters. DW is confined to tiny-payload named
+# callers (semantic_triage, ouroboros_plan) until DoubleWord repairs
+# their SSE generation endpoint.
 doubleword_topology:
   schema_version: "topology.1"
   enabled: true
@@ -341,9 +352,9 @@ doubleword_topology:
       block_mode: "cascade_to_claude"
       reason: "Prefrontal cortex — Claude only. Live-fire bbpst3ebf proved DW (both 397B and Gemma 4 31B) times out on architectural COMPLEX GENERATE within 120s Tier 0 RT."
     standard:
-      dw_allowed: true
-      dw_model: "Qwen/Qwen3.5-397B-A17B-FP8"
-      reason: "Midbrain — DW 397B primary with Claude fallback. Moderate ops survive the 120s window."
+      dw_allowed: false
+      block_mode: "cascade_to_claude"
+      reason: "Qwen 397B verified stream-stalling without candidate generation in bt-2026-04-14-203740. DW Tier 0 sealed to prevent latency debt."
     background:
       dw_allowed: false
       block_mode: "skip_and_queue"
