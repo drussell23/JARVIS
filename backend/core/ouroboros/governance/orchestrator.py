@@ -114,6 +114,32 @@ _OUTER_GATE_GRACE_S = float(os.environ.get("JARVIS_OUTER_GATE_GRACE_S", "15"))
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
+class _PreloadedExplorationRecord:
+    """Synthetic exploration record for files the lean prompt builder inlined.
+
+    ``ExplorationLedger.from_records`` duck-types on ``tool_name`` /
+    ``arguments_hash`` / ``output_bytes`` / ``status``. When the lean prompt
+    builder inlines a target file region directly into the generation
+    prompt, the model has effectively "read" that file — we synthesize a
+    fake ``read_file`` record so the ledger grants comprehension credit
+    matching the legacy counter's ``_preloaded_credit`` behavior.
+
+    Keeping this class in ``orchestrator.py`` preserves
+    ``exploration_engine``'s pure-module contract (no orchestrator-side
+    concepts leak into it). The ``preloaded:`` prefix on
+    ``arguments_hash`` guarantees stable dedup per normalized path and
+    no collision with a real ``read_file`` tool call.
+    """
+
+    __slots__ = ("tool_name", "arguments_hash", "output_bytes", "status")
+
+    def __init__(self, path: str) -> None:
+        self.tool_name = "read_file"
+        self.arguments_hash = f"preloaded:{path}"
+        self.output_bytes = 0
+        self.status = "success"
+
+
 def _plan_review_required() -> bool:
     """Return True when the session requires pre-execution plan review."""
     return (
@@ -2094,6 +2120,13 @@ class GovernedOrchestrator:
         # carries forward instead of forcing the model to spend tool rounds on
         # the same file twice (bt-2026-04-11-204228 / op-019d7e4c).
         _op_explore_credit = 0
+        # Ledger-path counterpart to _op_explore_credit (#103).
+        # When JARVIS_EXPLORATION_LEDGER_ENABLED is true the Iron Gate consults
+        # ExplorationLedger.from_records(_op_explore_records) instead of the
+        # int counter. Records accumulate across retries so the ledger sees
+        # the union of every tool call the model has made for this op, then
+        # dedup-by-(tool, arguments_hash) happens inside diversity_score().
+        _op_explore_records: List[Any] = []
 
         for attempt in range(1 + self._config.max_generate_retries):
             # ── Per-op cost cap check (Manifesto §5/§7) ──

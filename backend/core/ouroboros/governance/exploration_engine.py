@@ -333,6 +333,31 @@ class ExplorationVerdict:
         return not self.sufficient
 
 
+class ExplorationInsufficientError(RuntimeError):
+    """Raised by the Iron Gate when ledger-enforced exploration is insufficient.
+
+    Carries the ``verdict`` and ``floors`` so the GENERATE_RETRY feedback
+    builder can call :func:`render_retry_feedback` and produce a category-
+    aware prompt without re-running the scoring pass.
+
+    Subclasses :class:`RuntimeError` to preserve the existing
+    ``_err_str.startswith("exploration_insufficient")`` retry branches in
+    ``orchestrator.py`` — the string message keeps the same prefix, and
+    ``except Exception`` / ``except RuntimeError`` handlers catch it
+    identically to the legacy gate raise.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        verdict: "ExplorationVerdict",
+        floors: "ExplorationFloors",
+    ) -> None:
+        super().__init__(message)
+        self.verdict = verdict
+        self.floors = floors
+
+
 def evaluate_exploration(
     ledger: ExplorationLedger,
     floors: ExplorationFloors,
@@ -420,6 +445,7 @@ __all__ = [
     "ExplorationCall",
     "ExplorationCategory",
     "ExplorationFloors",
+    "ExplorationInsufficientError",
     "ExplorationLedger",
     "ExplorationVerdict",
     "evaluate_exploration",
