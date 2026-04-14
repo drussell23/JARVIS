@@ -133,12 +133,22 @@ class ContextCompactor:
     """Deterministic context compaction engine.
 
     Compresses older dialogue entries into a summary while preserving
-    recent entries and safety-critical matches. No model inference.
+    recent entries and safety-critical matches. No model inference by
+    default.
+
+    An optional ``semantic_strategy`` may be injected at construction. When
+    present and enabled, the strategy is invoked *in parallel with* the
+    deterministic summarizer in shadow mode (result discarded, telemetry
+    written), and *in place of* the deterministic summarizer in live mode.
+    On any strategy failure — timeout, anti-hallucination rejection, circuit
+    open — :meth:`_build_summary` falls back to the deterministic path. This
+    is the Phase 0 hook for the Functions-not-Agents reseating (Manifesto §5).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, semantic_strategy: Optional[Any] = None) -> None:
         # Compiled patterns cache: pattern string -> compiled regex
         self._pattern_cache: Dict[str, re.Pattern[str]] = {}
+        self._semantic_strategy = semantic_strategy
 
     # -- Public API ---------------------------------------------------------
 
@@ -219,7 +229,10 @@ class ContextCompactor:
             )
 
         # --- Build summary ---
-        summary = self._build_summary(compactable)
+        deterministic_summary = self._build_summary(compactable)
+        summary = await self._build_semantic_or_fallback(
+            compactable, deterministic_summary,
+        )
         entries_compacted = len(compactable)
         entries_after = len(preserved) + 1  # +1 for the summary entry
 
@@ -348,6 +361,37 @@ class ContextCompactor:
                 parts.append(f". Time span: {span_s:.1f}s")
 
         return "".join(parts)
+
+    async def _build_semantic_or_fallback(
+        self,
+        entries: List[Dict[str, Any]],
+        deterministic_summary: str,
+    ) -> str:
+        """Delegate to ``semantic_strategy`` if injected and enabled.
+
+        Behavior contract:
+          * No strategy → return ``deterministic_summary`` unchanged.
+          * Shadow mode → always return ``deterministic_summary`` (strategy
+            still runs for telemetry).
+          * Live mode, strategy accepts → return strategy summary.
+          * Live mode, strategy rejects/errors → return
+            ``deterministic_summary`` (the caller is expected to swallow all
+            exceptions and return a result with ``accepted=False``).
+        """
+        strategy = self._semantic_strategy
+        if strategy is None or not getattr(strategy, "enabled", False):
+            return deterministic_summary
+        try:
+            result = await strategy.summarize(entries, deterministic_summary)
+        except Exception:
+            logger.exception(
+                "[ContextCompaction] semantic strategy raised — falling back to deterministic",
+            )
+            return deterministic_summary
+        semantic = getattr(result, "summary", None)
+        if semantic:
+            return semantic
+        return deterministic_summary
 
     def _compile_patterns(
         self, patterns: Tuple[str, ...],

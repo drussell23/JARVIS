@@ -107,6 +107,10 @@ class BattleTestHarness:
         self._session_dir = config.session_dir or Path(f".ouroboros/sessions/{self._session_id}")
         self._notebook_output_dir = config.notebook_output_dir or Path("notebooks")
 
+        # Publish session dir for downstream non-streaming callers
+        # (e.g. CompactionCallerStrategy writes compaction_shadow.jsonl here).
+        os.environ.setdefault("JARVIS_OUROBOROS_SESSION_DIR", str(self._session_dir))
+
         # Battle-test utilities
         self._cost_tracker = CostTracker(
             budget_usd=config.cost_cap_usd,
