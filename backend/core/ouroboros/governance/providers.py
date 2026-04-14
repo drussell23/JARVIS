@@ -3570,7 +3570,7 @@ _CLAUDE_HARD_POOL_EXC_NAMES = frozenset(
     _raw.strip()
     for _raw in os.environ.get(
         "JARVIS_CLAUDE_HARD_POOL_EXC_NAMES",
-        "PoolTimeout,ConnectError,RemoteProtocolError,ReadError",
+        "PoolTimeout,ConnectError,ConnectTimeout,RemoteProtocolError,ReadError",
     ).split(",")
     if _raw.strip()
 )

@@ -897,6 +897,65 @@ class TestProviderStateUnquarantine:
         assert p._state.counters.client_generation == 1
         assert p._state.recycle_events[-1]["reason"] == "unit_test_trigger"
 
+    def test_claude_connect_timeout_cause_triggers_hard_pool_recycle(
+        self, monkeypatch,
+    ):
+        """Regression (bt-2026-04-14-215907): ``APITimeoutError`` wrapping a
+        ``ConnectTimeout`` must fire an immediate hard-pool recycle.
+
+        Observed failure: 5 consecutive ``APITimeoutError(cause=ConnectTimeout:)``
+        across 6 minutes never recycled the httpx pool, so every retry
+        inherited the same half-open TCP state. Root cause was that
+        ``ConnectTimeout`` was classified as a *retryable* transient but not
+        as a *hard pool signal* — the one-hop cause walk set
+        ``cause_cls_bare="ConnectTimeout"`` correctly, but that name was
+        missing from ``_CLAUDE_HARD_POOL_EXC_NAMES``.
+
+        This test pins the fix: after the first raise, ``_recycle_events``
+        must contain a ``hard_pool_signal:*:ConnectTimeout`` entry and the
+        client generation must have advanced.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+        from datetime import datetime, timedelta, timezone
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+
+        p = ClaudeProvider(api_key="test")
+        p._client = "sentinel-client-v0"
+        start_gen = p._client_generation
+
+        class _FakeConnectTimeout(Exception):
+            pass
+        _FakeConnectTimeout.__name__ = "ConnectTimeout"
+
+        class _FakeAPITimeoutError(Exception):
+            pass
+        _FakeAPITimeoutError.__name__ = "APITimeoutError"
+
+        async def _failing_call():
+            _cause = _FakeConnectTimeout("tcp connect timed out")
+            _wrap = _FakeAPITimeoutError("api timeout")
+            _wrap.__cause__ = _cause
+            raise _wrap
+
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=60)
+        with pytest.raises(_FakeAPITimeoutError):
+            asyncio.get_event_loop().run_until_complete(
+                p._call_with_backoff(
+                    _failing_call,
+                    label="claude_stream_test",
+                    max_attempts=1,
+                    deadline=deadline,
+                )
+            )
+
+        recycle_reasons = [ev["reason"] for ev in p._recycle_events]
+        assert any(
+            r.startswith("hard_pool_signal:") and "ConnectTimeout" in r
+            for r in recycle_reasons
+        ), f"expected hard_pool_signal:*:ConnectTimeout, got {recycle_reasons!r}"
+        assert p._client_generation > start_gen
+
     # ------------------------------------------------------------------
     # PrimeProvider
     # ------------------------------------------------------------------
