@@ -1142,10 +1142,13 @@ class CandidateGenerator:
             return await self._generate_background(context, deadline)
         if _provider_route == "speculative":
             return await self._generate_speculative(context, deadline)
-        # "standard" uses the full DW→Claude cascade. "complex" is
-        # intercepted above by the topology hard-block unless operators
-        # explicitly disable the topology (not recommended).
-        # Fall through to unified cascade below.
+        # "standard" and "complex" are both intercepted above by the
+        # topology hard-block in the default yaml (standard sealed as of
+        # bt-2026-04-14-203740, complex sealed per bbpst3ebf). They reach
+        # this fall-through only if operators explicitly unseal them in
+        # brain_selection_policy.yaml — at which point the full DW→Claude
+        # cascade below applies. Not recommended without fresh empirical
+        # evidence that DW's SSE endpoint has recovered.
 
         # ── Tier 0: DoubleWord 397B ──────────────────────────────
         #

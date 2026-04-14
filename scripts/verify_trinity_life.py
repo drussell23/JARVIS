@@ -59,6 +59,41 @@ from typing import Dict, List, Optional, Tuple, Any
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+# API keys that .env must force-override. Stale shell exports of
+# ANTHROPIC_API_KEY caused silent 401s in bt-2026-04-14-203740; every
+# entry-point script in scripts/ now shares identical force-override
+# semantics so .env is the single source of truth for credentials.
+_FORCE_OVERRIDE_KEYS = frozenset({
+    "ANTHROPIC_API_KEY",
+    "DOUBLEWORD_API_KEY",
+})
+
+
+def _load_env_files() -> None:
+    """Load .env files from project root and backend/ before any provider init.
+
+    API keys are force-overridden from .env; all other variables use
+    setdefault so shell-level config overrides still work. Mirrors
+    ``scripts/ouroboros_battle_test.py::_load_env_files``.
+    """
+    for env_path in (project_root / ".env", project_root / "backend" / ".env"):
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key in _FORCE_OVERRIDE_KEYS:
+                os.environ[key] = value
+            else:
+                os.environ.setdefault(key, value)
+
+
+_load_env_files()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
