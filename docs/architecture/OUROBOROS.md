@@ -506,6 +506,52 @@ at least 2 exploration tools:
 This prevents patches generated from stale weights. The model reads first,
 then writes -- like a senior engineer.
 
+#### 4a. Ledger-Based Exploration Scoring (Task #102 — Shadow-Log Phase)
+
+**Source**: `exploration_engine.py` (pure module), `orchestrator.py` (Iron Gate call site)
+
+The raw counter floor (`_op_explore_credit >= _min_explore`) is being
+phased out in favor of **diversity-weighted scoring** that rewards
+structured understanding over repeated reads. An `ExplorationLedger`
+lifts every exploration tool call out of `generation.tool_execution_records`,
+classifies it into one of five categories (COMPREHENSION, DISCOVERY,
+CALL_GRAPH, STRUCTURE, HISTORY), and scores it with per-tool base weights.
+Duplicate calls (same tool + same `arguments_hash`) get **zero credit** —
+forward progress is measured as new files/queries, not repeated fetches.
+
+The gate passes when all three conditions hold:
+
+    diversity_score >= min_score
+    |categories_covered| >= min_categories
+    required_categories ⊆ categories_covered
+
+Floors are env-driven (`JARVIS_EXPLORATION_MIN_SCORE_<C>`,
+`JARVIS_EXPLORATION_MIN_CATEGORIES_<C>`). Default thresholds: trivial=0/0
+(bypass), simple=4.0/2, moderate=8.0/3, architectural=14.0/4 with
+required `{call_graph, history}` — architectural ops MUST read call
+graphs and git history.
+
+**Anti-gaming invariant**: failed tool calls accrue *score* (a failed
+grep is still signal) but **not category coverage** — the AND-gate
+prevents score-only inflation via failing-call floods.
+
+**Rollout (phased)**:
+
+1. **Shadow log** (current) — set `JARVIS_EXPLORATION_SHADOW_LOG=true`
+   to log `ExplorationLedger(shadow)` lines alongside the legacy
+   counter decision. No behavior change; used to compare
+   distributions on STANDARD-heavy sessions before enforcement.
+2. **Enforce** — set `JARVIS_EXPLORATION_LEDGER_ENABLED=true` to flip
+   the Iron Gate to ledger-based evaluation. `render_retry_feedback`
+   emits deterministic missing-category hints to GENERATE_RETRY.
+3. **Deprecate legacy counter** — after one release of clean enforce
+   metrics, remove `_op_explore_credit` and `_min_explore`.
+
+**Deferred to later patches**: dedicated EXPLORE FSM phase between
+CONTEXT_EXPANSION and PLAN; `plan_exploration()` model step;
+`emit_hypothesis` meta-tool; per-route exploration timeboxes; Oracle
+graph credit.
+
 ### 5. Post-Apply Verification Loop
 
 **Source**: `orchestrator.py` (Phase 8a), `serpent_flow.py` (`op_verify_start`, `op_verify_result`)

@@ -2365,6 +2365,53 @@ class GovernedOrchestrator:
                     # floor lets a no-tool retry pass (the rejected file is
                     # already in the retry-feedback prompt).
                     _op_explore_credit += _explore_count + _preloaded_credit
+
+                    # Shadow log — ledger-based exploration scoring (Task #102).
+                    # Runs alongside the legacy counter without changing
+                    # behavior so we can compare distributions before flipping
+                    # JARVIS_EXPLORATION_LEDGER_ENABLED in a later patch.
+                    # Gated on JARVIS_EXPLORATION_SHADOW_LOG OR is_ledger_enabled
+                    # so operators can observe without enforcing.
+                    _shadow_on = (
+                        os.environ.get(
+                            "JARVIS_EXPLORATION_SHADOW_LOG", "",
+                        ).strip().lower() in {"1", "true", "yes", "on"}
+                    )
+                    if _shadow_on:
+                        try:
+                            from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+                                ExplorationFloors,
+                                ExplorationLedger,
+                                evaluate_exploration,
+                            )
+                            _ledger = ExplorationLedger.from_records(
+                                generation.tool_execution_records or (),
+                            )
+                            _floors = ExplorationFloors.from_env(_task_complexity)
+                            _verdict = evaluate_exploration(_ledger, _floors)
+                            _covered_names = sorted(
+                                c.value for c in _verdict.categories_covered
+                            )
+                            logger.info(
+                                "[Orchestrator] ExplorationLedger(shadow) "
+                                "op=%s complexity=%s legacy_credit=%d "
+                                "score=%.2f min_score=%.2f unique=%d "
+                                "categories=%s would_pass=%s",
+                                ctx.op_id[:12],
+                                _task_complexity or "unknown",
+                                _op_explore_credit,
+                                _verdict.score,
+                                _floors.min_score,
+                                _ledger.unique_call_count(),
+                                ",".join(_covered_names) or "-",
+                                _verdict.sufficient,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[Orchestrator] ExplorationLedger shadow log error",
+                                exc_info=True,
+                            )
+
                     if _op_explore_credit < _min_explore:
                         _explore_err = (
                             f"exploration_insufficient: {_op_explore_credit}/{_min_explore} "
