@@ -20,13 +20,13 @@
 # [Ouroboros] Modified by Ouroboros (op=op-019d8314-) at 2026-04-12 19:06 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019d8979-98f5-786a-a4cf-e9f3500b416f-cau) at 2026-04-12 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019d8979-) at 2026-04-14 00:53 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019d89a5-b6c0-7abe-94c4-2463a38256a6-cau) at 2026-04-14 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019d89a5-) at 2026-04-14 01:42 UTC
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
 
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
-
-# Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
-# Python 3.11+ is now the minimum supported interpreter version.
-# Requires-Python: >=3.11
+# Python 3.12 is now the minimum supported interpreter version (3.11 also supported).
+# Requires-Python: >=3.12
 
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.2
@@ -197,6 +197,6 @@ google-cloud-compute>=1.40.0
 # GCP Monitoring API (for real VM CPU metrics -- hypervisor-level, no agent needed)
 google-cloud-monitoring>=2.0.0
 
-# Python 3.9.x is EOL (2025-10). Minimum supported version is now 3.11.
-# Upgrade your interpreter to Python 3.11 or 3.12 before installing.
-# Requires-Python: >=3.11
+# Python 3.9.x is EOL (2025-10). Python 3.11.x is EOL (2026-10). Minimum supported version is now 3.12.
+# Upgrade your interpreter to Python 3.12 or 3.13 before installing.
+# Requires-Python: >=3.12
