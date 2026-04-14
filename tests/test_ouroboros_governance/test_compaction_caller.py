@@ -28,6 +28,10 @@ from backend.core.ouroboros.governance.compaction_caller import (
     reset_session_state,
     _SESSION_STATE,
 )
+from backend.core.ouroboros.governance.context_compaction import (
+    CompactionConfig,
+    ContextCompactor,
+)
 from backend.core.ouroboros.governance.doubleword_provider import CompleteSyncResult
 
 
@@ -360,3 +364,175 @@ async def test_strategy_timeout_reason(_live_env, monkeypatch):
     result = await strategy.summarize(_ENTRIES, "det")
     assert not result.accepted
     assert result.rejection_reason == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# 8. End-to-end Phase 0 wire — ContextCompactor → CompactionCallerStrategy
+# ---------------------------------------------------------------------------
+#
+# Fix 2(c): These tests cover the architectural gap identified post bt-2026-04-14-215907.
+# Until nothing in the runtime calls ``ContextCompactor.compact()``, the Phase 0
+# shadow wire in ``governed_loop_service.py`` is architecturally inert — env
+# vars can't make it fire because the wire point itself is never invoked.
+#
+# These tests prove the wire works end-to-end when ``compact()`` IS called:
+#   - Shadow mode: strategy is invoked, JSONL is written, but the returned
+#     summary is the DETERMINISTIC one (pipeline state unchanged).
+#   - Live mode: strategy summary is returned in place of the deterministic
+#     one when the anti-hallucination gate passes.
+#   - Hallucination reject: falls back to deterministic + records rejection.
+#
+# When a follow-up PR wires ``ContextCompactor.compact()`` into a real call
+# site (tool_executor._compact_prompt refactor, or orchestrator dialogue
+# retention), these tests remain the contract the new call site must honor.
+
+
+def _make_dialogue(n: int) -> List[Dict[str, Any]]:
+    """Build *n* synthetic dialogue entries covering GENERATE/VALIDATE/APPLY."""
+    phases = ("GENERATE", "VALIDATE", "APPLY")
+    return [
+        {
+            "op_id": f"op-{i:03d}",
+            "phase": phases[i % len(phases)],
+            "type": "model_call" if i % 2 == 0 else "iron_gate",
+            "timestamp": 1000.0 + float(i),
+        }
+        for i in range(n)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_e2e_shadow_mode_compact_call_keeps_deterministic(
+    _shadow_env, monkeypatch, tmp_path: Path,
+):
+    """Calling ``ContextCompactor.compact()`` with a shadow-mode strategy
+    attached must invoke the strategy AND return the deterministic summary.
+
+    This is the core shadow-mode invariant: observation without mutation.
+    The JSONL row proves the strategy fired; the summary content proves
+    the pipeline is still driven by deterministic counting.
+    """
+    valid = json.dumps(
+        {
+            "summary": "semantic summary that SHOULD NOT be returned in shadow",
+            "referenced_keys": ["op_id=op-000"],
+            "referenced_phases": ["GENERATE"],
+        }
+    )
+    monkeypatch.setattr(
+        CompactionCallerStrategy,
+        "_resolve_model",
+        lambda self: "google/gemma-4-31B-it",
+    )
+    provider = FakeProvider(response_content=valid)
+    strategy = CompactionCallerStrategy(provider=provider, session_dir=tmp_path)
+    compactor = ContextCompactor(semantic_strategy=strategy)
+
+    entries = _make_dialogue(15)
+    cfg = CompactionConfig(
+        max_context_entries=5,
+        preserve_count=3,
+        preserve_patterns=(),
+    )
+    result = await compactor.compact(entries, config=cfg)
+
+    assert result.entries_before == 15
+    assert result.entries_compacted == 12  # 15 - 3 preserved recent
+    assert result.summary.startswith("Compacted 12 entries")
+    assert "semantic summary" not in result.summary
+
+    assert len(provider.calls) == 1
+    jsonl = tmp_path / "compaction_shadow.jsonl"
+    assert jsonl.exists()
+    rec = json.loads(jsonl.read_text(encoding="utf-8").strip())
+    assert rec["accepted"] is True
+    assert rec["caller"] == "compaction"
+    assert rec["mode"] == "shadow"
+
+
+@pytest.mark.asyncio
+async def test_e2e_live_mode_compact_call_uses_semantic_summary(
+    _live_env, monkeypatch, tmp_path: Path,
+):
+    """In live mode, a successful strategy call replaces the deterministic
+    summary inside the :class:`CompactionResult`.
+
+    This covers the eventual promotion path: once shadow telemetry shows
+    Gemma is trustworthy, flipping ``JARVIS_COMPACTION_CALLER_MODE=live``
+    must surface the semantic summary through ``compact()`` without any
+    additional code changes at the call site.
+    """
+    semantic = "SEMANTIC: 12 model_calls spanning GENERATE→VALIDATE→APPLY"
+    valid = json.dumps(
+        {
+            "summary": semantic,
+            "referenced_keys": ["op_id=op-000", "op_id=op-001"],
+            "referenced_phases": ["GENERATE", "VALIDATE"],
+        }
+    )
+    monkeypatch.setattr(
+        CompactionCallerStrategy,
+        "_resolve_model",
+        lambda self: "google/gemma-4-31B-it",
+    )
+    provider = FakeProvider(response_content=valid)
+    strategy = CompactionCallerStrategy(provider=provider, session_dir=tmp_path)
+    compactor = ContextCompactor(semantic_strategy=strategy)
+
+    entries = _make_dialogue(15)
+    cfg = CompactionConfig(
+        max_context_entries=5,
+        preserve_count=3,
+        preserve_patterns=(),
+    )
+    result = await compactor.compact(entries, config=cfg)
+
+    assert result.summary == semantic
+    assert "Compacted 12 entries" not in result.summary
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_e2e_hallucination_reject_falls_back_to_deterministic(
+    _live_env, monkeypatch, tmp_path: Path,
+):
+    """When the strategy rejects a hallucinated key, ``compact()`` must
+    fall back to the deterministic summary AND record the rejection in
+    the shadow JSONL.
+
+    This is the anti-hallucination contract: a rogue model output can
+    never corrupt the summary. The deterministic path is the fallback
+    safety net even in live mode.
+    """
+    bad = json.dumps(
+        {
+            "summary": "would overwrite deterministic if accepted",
+            "referenced_keys": ["op_id=op-999"],  # hallucinated — not in input
+            "referenced_phases": [],
+        }
+    )
+    monkeypatch.setattr(
+        CompactionCallerStrategy,
+        "_resolve_model",
+        lambda self: "google/gemma-4-31B-it",
+    )
+    provider = FakeProvider(response_content=bad)
+    strategy = CompactionCallerStrategy(provider=provider, session_dir=tmp_path)
+    compactor = ContextCompactor(semantic_strategy=strategy)
+
+    entries = _make_dialogue(15)
+    cfg = CompactionConfig(
+        max_context_entries=5,
+        preserve_count=3,
+        preserve_patterns=(),
+    )
+    result = await compactor.compact(entries, config=cfg)
+
+    assert result.summary.startswith("Compacted 12 entries")
+    assert "would overwrite" not in result.summary
+
+    jsonl = tmp_path / "compaction_shadow.jsonl"
+    assert jsonl.exists()
+    rec = json.loads(jsonl.read_text(encoding="utf-8").strip())
+    assert rec["accepted"] is False
+    assert rec["rejection_reason"].startswith("hallucinated_key")

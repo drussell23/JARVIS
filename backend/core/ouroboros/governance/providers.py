@@ -3603,6 +3603,36 @@ _CLAUDE_RETRYABLE_EXC_NAMES = frozenset({
 })
 
 
+def _walk_cause_chain(exc: BaseException, max_depth: int = 8) -> Tuple[BaseException, ...]:
+    """Walk ``__cause__``/``__context__`` chain returning a tuple of exceptions.
+
+    Anthropic SDK wraps httpx exceptions in APIConnectionError / APITimeoutError;
+    occasionally the inner httpx exception is itself nested under another
+    wrapper (APITimeoutError → APIConnectionError → ConnectTimeout). A
+    single-hop ``__cause__`` probe catches the common 2-layer case but misses
+    deeper wraps. This walker — mirroring
+    ``candidate_generator._walk_exception_chain`` — traverses every layer up
+    to ``max_depth`` with cycle protection.
+
+    Returns the chain ordered outermost-first.
+    """
+    chain: List[BaseException] = []
+    seen: set = set()
+    current: Optional[BaseException] = exc
+    depth = 0
+    while current is not None and depth < max_depth:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        chain.append(current)
+        nxt = getattr(current, "__cause__", None)
+        if nxt is None:
+            nxt = getattr(current, "__context__", None)
+        current = nxt
+        depth += 1
+    return tuple(chain)
+
+
 def _is_retryable_transient_error(exc: BaseException) -> bool:
     """Return True if *exc* is a transient network/server error worth retrying.
 
@@ -4342,15 +4372,19 @@ class ClaudeProvider:
                 # stopped firing and attempt 2 reused the degraded pool,
                 # producing first_token=NEVER hangs. Keep lookup + display
                 # separate.
-                _cause = exc.__cause__ if exc.__cause__ is not None else exc.__context__
-                # Unwrap to the bare name of the innermost cause for lookup
-                # purposes too — ReadError nested inside APIConnectionError
-                # should still trigger the ReadError-keyed recycle.
-                if _cause is not None:
-                    cause_cls_bare = type(_cause).__name__
-                    exc_class_display = f"{exc_class_bare}(cause={cause_cls_bare}:{_cause})"
+                # Walk the full __cause__/__context__ chain (up to 8 layers,
+                # cycle-protected). Single-hop catches APITimeoutError →
+                # ConnectTimeout; multi-hop catches APITimeoutError →
+                # APIConnectionError → ConnectTimeout and deeper. The whole
+                # chain is inspected for hard-pool classification below.
+                _chain = _walk_cause_chain(exc)
+                _chain_names = [type(e).__name__ for e in _chain]
+                if len(_chain) > 1:
+                    _innermost = _chain[-1]
+                    exc_class_display = (
+                        f"{exc_class_bare}(chain={'->'.join(_chain_names)}:{_innermost})"
+                    )
                 else:
-                    cause_cls_bare = ""
                     exc_class_display = exc_class_bare
                 attempt_elapsed_ms = int((time.monotonic() - attempt_start_mono) * 1000)
 
@@ -4366,13 +4400,12 @@ class ClaudeProvider:
                 # Hard-pool signal → recycle the client NOW, not at end-of-cycle.
                 # The current pool is degraded; continuing to use it wastes
                 # retries. The next attempt builds a fresh connection pool.
-                # Check BOTH the wrapper class and the unwrapped cause — the
-                # Anthropic SDK wraps httpx.ReadError as APIConnectionError,
-                # so the ReadError-triggered recycle only fires if we look
-                # through the wrapper.
-                _hard_pool_hit = (
-                    exc_class_bare in _CLAUDE_HARD_POOL_EXC_NAMES
-                    or (cause_cls_bare and cause_cls_bare in _CLAUDE_HARD_POOL_EXC_NAMES)
+                # Iterate every layer of the cause/context chain so a deeply
+                # nested httpx exception (APITimeoutError → APIConnectionError
+                # → ConnectTimeout) still fires the ConnectTimeout-keyed
+                # recycle — not just the innermost or outermost.
+                _hard_pool_hit = any(
+                    name in _CLAUDE_HARD_POOL_EXC_NAMES for name in _chain_names
                 )
                 if _CLAUDE_RECYCLE_ON_POOL_TIMEOUT and _hard_pool_hit:
                     self._recycle_client(

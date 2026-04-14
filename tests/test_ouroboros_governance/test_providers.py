@@ -956,6 +956,82 @@ class TestProviderStateUnquarantine:
         ), f"expected hard_pool_signal:*:ConnectTimeout, got {recycle_reasons!r}"
         assert p._client_generation > start_gen
 
+    def test_claude_multi_hop_cause_chain_triggers_hard_pool_recycle(
+        self, monkeypatch,
+    ):
+        """Deeper wrap coverage: ``APITimeoutError -> APIConnectionError ->
+        ConnectTimeout`` must still recycle the client.
+
+        The one-hop cause walk only looked at ``exc.__cause__``, so a 3-layer
+        wrap (which can happen when a retry helper re-raises with its own
+        context) would fall through to the retryable-but-not-hard-pool path
+        and reuse the degraded pool. The multi-hop
+        :func:`_walk_cause_chain` catches every layer with cycle protection.
+        This test pins the fix by constructing the exact 3-layer chain and
+        asserting the ConnectTimeout-keyed recycle still fires.
+        """
+        monkeypatch.setenv("JARVIS_UNQUARANTINE_PROVIDERS", "true")
+        self._reset_singletons()
+        from datetime import datetime, timedelta, timezone
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+
+        p = ClaudeProvider(api_key="test")
+        p._client = "sentinel-client-v0"
+        start_gen = p._client_generation
+
+        class _FakeConnectTimeout(Exception):
+            pass
+        _FakeConnectTimeout.__name__ = "ConnectTimeout"
+
+        class _FakeAPIConnectionError(Exception):
+            pass
+        _FakeAPIConnectionError.__name__ = "APIConnectionError"
+
+        class _FakeAPITimeoutError(Exception):
+            pass
+        _FakeAPITimeoutError.__name__ = "APITimeoutError"
+
+        async def _failing_call():
+            _inner = _FakeConnectTimeout("tcp connect timed out")
+            _mid = _FakeAPIConnectionError("connection error wrapper")
+            _mid.__cause__ = _inner
+            _outer = _FakeAPITimeoutError("api timeout outer")
+            _outer.__cause__ = _mid
+            raise _outer
+
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=60)
+        with pytest.raises(_FakeAPITimeoutError):
+            asyncio.get_event_loop().run_until_complete(
+                p._call_with_backoff(
+                    _failing_call,
+                    label="claude_stream_test_multihop",
+                    max_attempts=1,
+                    deadline=deadline,
+                )
+            )
+
+        recycle_reasons = [ev["reason"] for ev in p._recycle_events]
+        assert any(
+            r.startswith("hard_pool_signal:") and "ConnectTimeout" in r
+            for r in recycle_reasons
+        ), f"expected hard_pool_signal:*:ConnectTimeout, got {recycle_reasons!r}"
+        assert p._client_generation > start_gen
+
+    def test_walk_cause_chain_cycle_protection(self):
+        """Cycle-protected chain walk must not loop forever on self-referential
+        ``__cause__`` or ``__context__`` (seen in some wrapping patterns)."""
+        from backend.core.ouroboros.governance.providers import _walk_cause_chain
+
+        a = RuntimeError("a")
+        b = RuntimeError("b")
+        a.__cause__ = b
+        b.__cause__ = a
+
+        chain = _walk_cause_chain(a, max_depth=8)
+        assert len(chain) == 2
+        assert chain[0] is a
+        assert chain[1] is b
+
     # ------------------------------------------------------------------
     # PrimeProvider
     # ------------------------------------------------------------------
