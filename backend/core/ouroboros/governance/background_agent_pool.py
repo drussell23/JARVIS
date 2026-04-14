@@ -615,18 +615,38 @@ class BackgroundAgentPool:
                         get_bound_orchestrator as _get_bound_orch,
                     )
                     _orch = _get_bound_orch() or self._orchestrator
-                    # Per-op watchdog: battle test bt-2026-04-13-031119
-                    # showed two workers wedged for 424s/451s on single
-                    # ops (workspace_checkpoint hang) while new intents
-                    # piled up. The orchestrator has its own phase
-                    # timers but an inner-loop hang (subprocess,
-                    # blocking I/O, deadlock) escapes them. This is the
-                    # last-resort pool-level ceiling so the worker
-                    # doesn't monopolize a slot indefinitely. Default
-                    # 240s = max(IMMEDIATE 60 + STANDARD 120 + verify
-                    # 60) with headroom. Env-tunable, no hardcoding.
+                    # Per-op watchdog: last-resort pool-level ceiling so
+                    # a wedged worker (subprocess hang, blocking I/O,
+                    # deadlock that escapes orchestrator phase timers)
+                    # doesn't monopolize a slot indefinitely. First
+                    # surfaced by bt-2026-04-13-031119 (two workers
+                    # wedged 424s/451s on workspace_checkpoint hang).
+                    #
+                    # Invariant this ceiling MUST respect:
+                    #
+                    #   worker_op_timeout
+                    #       >= max(route_generation_budget)
+                    #        +  tool_loop_overhead
+                    #        +  candidate_assembly
+                    #        +  verify_phase
+                    #        +  slack
+                    #
+                    # Concretely, with current route budgets:
+                    #   BACKGROUND DW:  180s generation + 15s tool-loop
+                    #                   overhead + 30s assembly + 60s
+                    #                   verify + 75s slack ~= 360s.
+                    # A 240s ceiling force-reaps every BACKGROUND op
+                    # before generation returns (witnessed in session
+                    # bt-2026-04-14-005028: 3 simple/BACKGROUND ops
+                    # killed at 240s, cost=$0, tool_execution_records=0,
+                    # shadow-log gate unreached). Raising the default
+                    # to 360s keeps the watchdog's anti-hang purpose
+                    # while letting the slowest legitimate path — DW
+                    # Venom on BACKGROUND sensor traffic — complete.
+                    # Env-tunable so battle tests can go higher without
+                    # a code change.
                     _op_timeout_s = float(
-                        os.environ.get("JARVIS_BG_WORKER_OP_TIMEOUT_S", "240")
+                        os.environ.get("JARVIS_BG_WORKER_OP_TIMEOUT_S", "360")
                     )
                     result = await asyncio.wait_for(
                         _orch.run(op.context), timeout=_op_timeout_s,

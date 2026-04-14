@@ -552,6 +552,44 @@ CONTEXT_EXPANSION and PLAN; `plan_exploration()` model step;
 `emit_hypothesis` meta-tool; per-route exploration timeboxes; Oracle
 graph credit.
 
+#### 4b. Background Worker Ceiling Invariant (Task #104)
+
+**Source**: `background_agent_pool.py` (~line 618), `candidate_generator.py` (route budgets)
+
+The `BackgroundAgentPool` per-op watchdog
+(`JARVIS_BG_WORKER_OP_TIMEOUT_S`) is a last-resort ceiling that
+prevents a wedged worker from monopolizing a slot. It MUST remain
+**larger than the slowest legitimate generation path plus slack**, or
+healthy ops get force-reaped before `generation` exists.
+
+Invariant:
+
+    worker_op_timeout
+        >= max(route_generation_budget)
+         +  tool_loop_overhead
+         +  candidate_assembly
+         +  verify_phase
+         +  slack
+
+Current budgets (BACKGROUND is the slowest legitimate path):
+
+| Component                | Budget |
+|--------------------------|--------|
+| BACKGROUND DW generation | 180s   |
+| Tool-loop overhead       | 15s    |
+| Candidate assembly       | 30s    |
+| Post-apply verify        | 60s    |
+| Slack                    | 75s    |
+| **Total**                | **360s** |
+
+Default raised from 240s → 360s in Task #104 after session
+`bt-2026-04-14-005028` showed **3 simple/BACKGROUND ops force-killed
+at the 240s ceiling** (cost=$0, tool_execution_records=0), masking
+shadow-log validation of Task #102. Battle tests exercising slow
+BACKGROUND paths should either accept the 360s default or raise
+further via env override; never lower below the slowest route's
+generation budget plus assembly.
+
 ### 5. Post-Apply Verification Loop
 
 **Source**: `orchestrator.py` (Phase 8a), `serpent_flow.py` (`op_verify_start`, `op_verify_result`)
