@@ -153,7 +153,16 @@ class SemanticTriageEngine:
         self._project_root = project_root
         # Model verification state
         self._model_verified: bool | None = None  # None = not checked yet
-        self._effective_model: str = _TRIAGE_MODEL  # May change after verify_model()
+        # Topology override: Basal Ganglia assigns Gemma 4 31B to semantic_triage.
+        # Falls back to _TRIAGE_MODEL (env-driven) if topology is disabled.
+        try:
+            from backend.core.ouroboros.governance.provider_topology import (
+                get_topology as _get_topology,
+            )
+            _topology_model = _get_topology().model_for_caller("semantic_triage")
+        except Exception:
+            _topology_model = None
+        self._effective_model: str = _topology_model or _TRIAGE_MODEL
         # Stats
         self._total_triages: int = 0
         self._no_ops_caught: int = 0
@@ -227,30 +236,38 @@ class SemanticTriageEngine:
                 elif isinstance(m, dict):
                     available_ids.add(m.get("id", ""))
 
-            if _TRIAGE_MODEL in available_ids:
+            if self._effective_model in available_ids:
                 logger.info(
                     "[SemanticTriage] Model verified: %s is available "
                     "(%d models on endpoint)",
-                    _TRIAGE_MODEL, len(available_ids),
+                    self._effective_model, len(available_ids),
                 )
                 self._model_verified = True
                 return True
 
-            # Triage model not found — try to find a suitable alternative
-            # Look for any smaller Qwen model (prefer 35B, then any non-397B)
+            # Triage model not found — try to find a suitable alternative.
+            # Prefer Gemma (topology basal ganglia), then smaller Qwen models.
             _fallback_candidates = sorted(
-                (mid for mid in available_ids if "qwen" in mid.lower()),
-                key=lambda x: ("397" not in x, "35" in x, x),
+                (
+                    mid for mid in available_ids
+                    if "gemma" in mid.lower() or "qwen" in mid.lower()
+                ),
+                key=lambda x: (
+                    "gemma" in x.lower(),
+                    "397" not in x,
+                    "35" in x,
+                    x,
+                ),
                 reverse=True,
             )
 
             if _fallback_candidates:
                 _fallback = _fallback_candidates[0]
-                if _fallback != _TRIAGE_MODEL:
+                if _fallback != self._effective_model:
                     logger.warning(
                         "[SemanticTriage] Configured model %s NOT found. "
                         "Falling back to %s. Available models: %s",
-                        _TRIAGE_MODEL, _fallback,
+                        self._effective_model, _fallback,
                         ", ".join(sorted(available_ids)),
                     )
                     self._effective_model = _fallback
@@ -274,7 +291,7 @@ class SemanticTriageEngine:
             logger.error(
                 "[SemanticTriage] No usable model found on DW API. "
                 "Triage disabled. Configured: %s, Available: %s",
-                _TRIAGE_MODEL,
+                self._effective_model,
                 ", ".join(sorted(available_ids)) if available_ids else "(empty)",
             )
             self._model_verified = False
@@ -284,7 +301,7 @@ class SemanticTriageEngine:
             logger.warning(
                 "[SemanticTriage] /v1/models timed out — "
                 "proceeding with configured model %s (unverified)",
-                _TRIAGE_MODEL,
+                self._effective_model,
             )
             self._model_verified = True  # Optimistic — let it try
             return True
@@ -292,7 +309,7 @@ class SemanticTriageEngine:
             logger.warning(
                 "[SemanticTriage] Model verification failed: %s — "
                 "proceeding with configured model %s (unverified)",
-                exc, _TRIAGE_MODEL,
+                exc, self._effective_model,
             )
             self._model_verified = True  # Optimistic
             return True

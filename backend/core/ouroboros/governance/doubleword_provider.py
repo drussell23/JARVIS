@@ -1188,9 +1188,22 @@ class DoublewordProvider:
         Used by ContextExpander for context expansion rounds. Returns
         raw string response. On failure, raises so the caller can skip
         the expansion round gracefully (ContextExpander expects this).
+
+        The ``ouroboros_plan`` caller is mapped by the Brain Selection
+        Topology to Gemma 4 31B (basal ganglia). If topology is disabled
+        or the caller is unmapped, falls back to the provider default.
         """
+        del deadline  # reserved for future budget-aware planning
+        try:
+            from backend.core.ouroboros.governance.provider_topology import (
+                get_topology,
+            )
+            _caller_model = get_topology().model_for_caller("ouroboros_plan")
+        except Exception:
+            _caller_model = None
         result = await self.prompt_only(
             prompt=prompt,
+            model=_caller_model,
             caller_id="ouroboros_plan",
             max_tokens=4000,
         )
