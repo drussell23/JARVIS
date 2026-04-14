@@ -2649,11 +2649,80 @@ class GovernedOrchestrator:
 
             except Exception as exc:
                 _err_msg = str(exc)
+                _route = getattr(ctx, "provider_route", "")
+
+                # ── Partial shadow log (widened) ──
+                # Fire the ExplorationLedger shadow pass for EVERY
+                # generation failure, regardless of route/cause. The
+                # original BG-DW-only branch missed failure modes like
+                # doubleword_schema_invalid, all_providers_exhausted,
+                # APITimeout. We classify the cause from _err_msg so the
+                # log line still tells you what killed the attempt, and
+                # we pull whatever tool_execution_records are reachable
+                # off the exception (may be empty). No-op when shadow
+                # logging is off so this stays free in production.
+                _shadow_on_partial = (
+                    os.environ.get(
+                        "JARVIS_EXPLORATION_SHADOW_LOG", "",
+                    ).strip().lower() in {"1", "true", "yes", "on"}
+                )
+                if _shadow_on_partial:
+                    try:
+                        from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+                            ExplorationFloors,
+                            ExplorationLedger,
+                            evaluate_exploration,
+                        )
+                        _partial_records = getattr(
+                            exc, "tool_execution_records", ()
+                        ) or ()
+                        _pledger = ExplorationLedger.from_records(_partial_records)
+                        _ptask_complexity = getattr(
+                            ctx, "task_complexity", "",
+                        ) or ""
+                        _pfloors = ExplorationFloors.from_env(_ptask_complexity)
+                        _pverdict = evaluate_exploration(_pledger, _pfloors)
+                        _pcovered = sorted(
+                            c.value for c in _pverdict.categories_covered
+                        )
+                        # Classify cause from error string — cheap
+                        # substring match, no regex. Order matters:
+                        # most specific first.
+                        if "background_dw_" in _err_msg:
+                            _pcause = "bg_dw_failure"
+                        elif "doubleword_schema_invalid" in _err_msg:
+                            _pcause = "dw_schema_invalid"
+                        elif "all_providers_exhausted" in _err_msg:
+                            _pcause = "all_providers_exhausted"
+                        elif "APITimeout" in _err_msg or "timeout" in _err_msg.lower():
+                            _pcause = "provider_timeout"
+                        else:
+                            _pcause = "generic_gen_failure"
+                        logger.info(
+                            "[Orchestrator] ExplorationLedger(shadow,partial) "
+                            "op=%s complexity=%s route=%s cause=%s "
+                            "records=%d score=%.2f min_score=%.2f unique=%d "
+                            "categories=%s would_pass=%s",
+                            ctx.op_id[:12],
+                            _ptask_complexity or "unknown",
+                            _route or "unknown",
+                            _pcause,
+                            len(_partial_records),
+                            _pverdict.score,
+                            _pfloors.min_score,
+                            _pledger.unique_call_count(),
+                            ",".join(_pcovered) or "-",
+                            _pverdict.sufficient,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "[Orchestrator] ExplorationLedger partial shadow log error",
+                            exc_info=True,
+                        )
 
                 # ── BACKGROUND / SPECULATIVE route failures ──
                 # These routes intentionally avoid Claude. Don't retry
                 # with expensive providers — accept failure gracefully.
-                _route = getattr(ctx, "provider_route", "")
                 if _route == "speculative" and "speculative_deferred" in _err_msg:
                     # Speculative ops are fire-and-forget — not a failure.
                     logger.info(
