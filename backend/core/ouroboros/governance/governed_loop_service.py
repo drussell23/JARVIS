@@ -2810,38 +2810,6 @@ class GovernedLoopService:
                         _triage_boot_exc,
                     )
 
-                # ---- Functions-not-Agents Phase 0: Gemma CompactionCaller ----
-                # Wires a non-streaming Gemma semantic strategy into the
-                # existing ContextCompactor when JARVIS_COMPACTION_CALLER_ENABLED
-                # is truthy. Defaults OFF — shadow-mode first, live-mode only
-                # after offline analysis of compaction_shadow.jsonl.
-                try:
-                    if os.environ.get("JARVIS_COMPACTION_CALLER_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
-                        from backend.core.ouroboros.governance.compaction_caller import (
-                            CompactionCallerStrategy,
-                        )
-                        _session_dir_env = os.environ.get("JARVIS_OUROBOROS_SESSION_DIR", "").strip()
-                        _session_dir_path = Path(_session_dir_env) if _session_dir_env else None
-                        _strategy = CompactionCallerStrategy(
-                            provider=tier0,
-                            session_dir=_session_dir_path,
-                        )
-                        _existing_compactor = getattr(self, "_compactor", None)
-                        if _existing_compactor is not None:
-                            setattr(_existing_compactor, "_semantic_strategy", _strategy)
-                            logger.info(
-                                "[GovernedLoop] CompactionCaller wired (mode=%s, model=%s)",
-                                _strategy.mode, _strategy._model or "<unresolved>",
-                            )
-                        else:
-                            logger.debug(
-                                "[GovernedLoop] CompactionCaller built but no compactor to attach",
-                            )
-                except Exception as _compaction_boot_exc:
-                    logger.debug(
-                        "[GovernedLoop] CompactionCaller boot failed (non-fatal): %s",
-                        _compaction_boot_exc,
-                    )
             except Exception as exc:
                 logger.warning(
                     "[GovernedLoop] DoublewordProvider build failed: %s", exc
@@ -3600,6 +3568,39 @@ class GovernedLoopService:
             logger.info("[GLS] ContextCompactor wired (auto-compact at threshold)")
         except Exception as exc:
             logger.debug("[GLS] ContextCompactor skipped: %s", exc)
+
+        # ---- Functions-not-Agents Phase 0: Gemma CompactionCaller ----
+        # Wires a non-streaming Gemma semantic strategy into the
+        # ContextCompactor above when JARVIS_COMPACTION_CALLER_ENABLED is
+        # truthy. MUST run strictly after ContextCompactor is instantiated —
+        # DAG boot-order dependency. Defaults OFF; shadow-mode first, live-mode
+        # only after offline analysis of compaction_shadow.jsonl.
+        try:
+            if (
+                self._compactor is not None
+                and tier0 is not None
+                and os.environ.get("JARVIS_COMPACTION_CALLER_ENABLED", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                from backend.core.ouroboros.governance.compaction_caller import (
+                    CompactionCallerStrategy,
+                )
+                _session_dir_env = os.environ.get("JARVIS_OUROBOROS_SESSION_DIR", "").strip()
+                _session_dir_path = Path(_session_dir_env) if _session_dir_env else None
+                _strategy = CompactionCallerStrategy(
+                    provider=tier0,
+                    session_dir=_session_dir_path,
+                )
+                setattr(self._compactor, "_semantic_strategy", _strategy)
+                logger.info(
+                    "[GovernedLoop] CompactionCaller successfully attached to ContextCompactor (mode=%s, model=%s)",
+                    _strategy.mode, _strategy._model or "<unresolved>",
+                )
+        except Exception as _compaction_boot_exc:
+            logger.debug(
+                "[GovernedLoop] CompactionCaller boot failed (non-fatal): %s",
+                _compaction_boot_exc,
+            )
 
         # ---- Wire AgentMemoryStore (P1: persistent per-agent memory) ----
         self._agent_memory_factory = None
