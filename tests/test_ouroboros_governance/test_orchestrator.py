@@ -1124,6 +1124,141 @@ class TestObserveTierGateCheck:
 
 
 # ---------------------------------------------------------------------------
+# TestExplorationShadowLogPrimaryPath
+# ---------------------------------------------------------------------------
+
+
+class _StubToolRecord:
+    """Duck-typed replacement for ToolExecutor.ToolExecutionRecord.
+
+    ``ExplorationLedger.from_records`` only reads ``tool_name``,
+    ``arguments_hash``, ``output_bytes``, and ``status`` — this stub gives
+    the test deterministic control over all four without importing the
+    production dataclass.
+    """
+
+    def __init__(
+        self,
+        tool_name: str,
+        arguments_hash: str = "h",
+        output_bytes: int = 100,
+        status: str = "success",
+    ) -> None:
+        self.tool_name = tool_name
+        self.arguments_hash = arguments_hash
+        self.output_bytes = output_bytes
+        self.status = status
+
+
+@pytest.mark.asyncio
+class TestExplorationShadowLogPrimaryPath:
+    """Regression harness for the primary-path ``ExplorationLedger(shadow)``
+    emission inside the Iron Gate branch.
+
+    The partial-shadow path (from the except-handler on generation failure)
+    has organic coverage from battle-test sessions — every generation
+    failure fires it. The **primary** path is much harder to exercise
+    organically: it requires a successful GENERATE with non-empty
+    ``tool_execution_records`` *and* a non-trivial complexity, which DW's
+    BACKGROUND route rarely produces. This stub gives the wiring a
+    deterministic, DW-free regression test so the primary emission can't
+    silently regress the way the partial path did when the predicate was
+    first added.
+
+    **Scope:** wire check, not scoring check. ``test_exploration_engine``
+    owns the scoring math; this test owns the "log line actually lands at
+    INFO on ``Ouroboros.Orchestrator`` with the agreed field layout."
+    """
+
+    async def test_primary_path_shadow_log_emitted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Primary-path ``ExplorationLedger(shadow)`` line fires at GENERATE
+        completion when the shadow log env flag is on and the gate is on.
+        """
+        # Override the file-level autouse fixture: the primary-path shadow
+        # log is nested inside the ``if _explore_gate_enabled:`` block, so
+        # the gate must be enabled for the branch to execute at all. This
+        # is the single test in the file that wants the gate on.
+        monkeypatch.setenv("JARVIS_EXPLORATION_GATE", "true")
+        monkeypatch.setenv("JARVIS_EXPLORATION_SHADOW_LOG", "true")
+
+        records = (
+            _StubToolRecord("read_file",   arguments_hash="h1"),
+            _StubToolRecord("search_code", arguments_hash="h2"),
+        )
+        result_with_records = GenerationResult(
+            candidates=(
+                {
+                    "candidate_id": "c1",
+                    "file_path":    "backend/core/utils.py",
+                    "full_content": "def hello():\n    pass\n",
+                    "rationale":    "stub",
+                },
+            ),
+            provider_name="mock-provider",
+            generation_duration_s=1.5,
+            tool_execution_records=records,
+        )
+        gen = MagicMock()
+        gen.generate = AsyncMock(return_value=result_with_records)
+
+        stack = _mock_stack()
+        config = _default_config()
+        ctx = _make_context()
+
+        orch = GovernedOrchestrator(
+            stack=stack,
+            generator=gen,
+            approval_provider=None,
+            config=config,
+        )
+
+        with caplog.at_level("INFO", logger="Ouroboros.Orchestrator"):
+            ctx_out = await orch.run(ctx)
+
+        # Pipeline must still complete — 2 records × exploration tools >= the
+        # simple-complexity min_explore floor of 1, so the gate passes.
+        assert ctx_out.phase is OperationPhase.COMPLETE, (
+            f"expected COMPLETE, got {ctx_out.phase}"
+        )
+
+        # Isolate the primary-path line (reject any partial-shadow emission
+        # from the except-handler — different wiring, different contract).
+        shadow_lines = [
+            r.message for r in caplog.records
+            if "ExplorationLedger(shadow)" in r.message
+            and "ExplorationLedger(shadow,partial)" not in r.message
+        ]
+        assert len(shadow_lines) >= 1, (
+            "expected at least one primary-path ExplorationLedger(shadow) "
+            "line, got none. Captured messages: "
+            f"{[r.message for r in caplog.records]}"
+        )
+
+        msg = shadow_lines[0]
+        # Field layout contract — operators grep for these tokens. Any
+        # rename is a breaking change for the shadow-log consumer.
+        for token in (
+            "complexity=simple",
+            "legacy_credit=",
+            "score=",
+            "min_score=",
+            "unique=",
+            "categories=",
+            "would_pass=",
+        ):
+            assert token in msg, f"missing token {token!r} in shadow line: {msg}"
+
+        # Both stub categories should be covered — comprehension (read_file)
+        # and discovery (search_code).
+        assert "comprehension" in msg, msg
+        assert "discovery"     in msg, msg
+
+
+# ---------------------------------------------------------------------------
 # TestOracleUpdateLock
 # ---------------------------------------------------------------------------
 
