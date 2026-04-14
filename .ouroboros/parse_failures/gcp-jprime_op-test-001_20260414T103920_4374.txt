@@ -1,0 +1,15 @@
+# provider=gcp-jprime
+# op_id=op-test-001
+# exception_type=JSONDecodeError
+# exception_message=Expecting value: line 1 column 1 (char 0)
+# raw_len=14
+# extracted_len=14
+# ============================================================
+# RAW (pre-extraction):
+# ============================================================
+not valid json
+
+# ============================================================
+# EXTRACTED (post _extract_json_block):
+# ============================================================
+not valid json
