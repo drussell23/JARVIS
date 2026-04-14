@@ -168,30 +168,6 @@
       "reason": "Operation op-test-001 failed: change_engine_error",
       "source_op_id": "op-test-001",
       "severity": "soft",
-      "created_at": 1776137750.8089
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
-      "reason": "Operation op-test-001 failed: change_engine_failed",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137751.854094
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"verify_regression\"",
-      "reason": "Operation op-test-001 failed: verify_regression",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
-      "created_at": 1776137871.0632331
-    },
-    {
-      "domain_key": "code_gen::.py",
-      "constraint": "Avoid pattern that caused \"change_engine_error\"",
-      "reason": "Operation op-test-001 failed: change_engine_error",
-      "source_op_id": "op-test-001",
-      "severity": "soft",
       "created_at": 1776137871.870362
     },
     {
@@ -321,6 +297,30 @@
       "source_op_id": "op-test-001",
       "severity": "soft",
       "created_at": 1776140220.4652421
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"verify_regression\"",
+      "reason": "Operation op-test-001 failed: verify_regression",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776153195.3939059
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_error\"",
+      "reason": "Operation op-test-001 failed: change_engine_error",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776153196.23087
+    },
+    {
+      "domain_key": "code_gen::.py",
+      "constraint": "Avoid pattern that caused \"change_engine_failed\"",
+      "reason": "Operation op-test-001 failed: change_engine_failed",
+      "source_op_id": "op-test-001",
+      "severity": "soft",
+      "created_at": 1776153197.016912
     }
   ]
 }

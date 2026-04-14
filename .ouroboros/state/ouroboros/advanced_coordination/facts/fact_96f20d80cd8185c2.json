@@ -1,0 +1,21 @@
+{
+  "checksum": "515379137c270586",
+  "confidence": 1.0,
+  "content": "Design a new capability for the Ouroboros governance architecture: a\nprotocol-level event-bus fan-out module that publishes per-phase\ndecisions to downstream consumers. This is a deliberately\narchitectural change \u2014 you must understand the current orchestrator\ncall graph, the CommProtocol schema, and recent refactors before\nproposing any patch.\n\n[LIVE-FIRE TEST INSTRUMENTATION \u2014 READ CAREFULLY]\nOn your FIRST generation attempt, restrict yourself to read_file\ncalls ONLY. Do NOT call search_code, get_callers, list_symbols,\ngit_blame, git_log, or git_diff on the first attempt. Read a handful\nof files and then emit your patch. This restriction is lifted on\nsubsequent attempts \u2014 if the system rejects your first attempt, you\nare expected to follow whatever exploration instructions come back\nin the retry feedback.\n\nThe target_files entry is a throwaway sandbox path; write your\nproposed module there. Explore the real repository at\nbackend/core/ouroboros/governance/orchestrator.py and related files\nto ground your design.",
+  "created_at_ns": 8272145750,
+  "expires_at_ns": null,
+  "fact_id": "96f20d80cd8185c2",
+  "provenance": "user:live-fire-exploration-gate",
+  "schema_version": "fact.v1",
+  "status": "active",
+  "superseded_at_ns": null,
+  "superseded_reason": "",
+  "tags": [
+    "/",
+    "claude-501",
+    "goal",
+    "jarvis",
+    "tmp",
+    "user"
+  ]
+}

@@ -2191,12 +2191,21 @@ class GovernedOrchestrator:
                 #   COMPLEX:   240s — Claude planning + DW execution serial
                 #   BACKGROUND/SPECULATIVE: 180s — no urgency
                 _route = getattr(ctx, "provider_route", "") or "standard"
+                # Per-route generation window — env-tunable so battle-test
+                # harnesses (e.g. live_fire_exploration_gate.py) can widen
+                # the architectural COMPLEX window without patching code.
+                # Defaults preserve the 2026-04-12 calibration.
                 _route_timeouts = {
-                    "immediate": 120.0,
-                    "standard": 220.0,
-                    "complex": 240.0,
-                    "background": 180.0,
-                    "speculative": 180.0,
+                    "immediate": float(os.environ.get(
+                        "JARVIS_GEN_TIMEOUT_IMMEDIATE_S", "120")),
+                    "standard": float(os.environ.get(
+                        "JARVIS_GEN_TIMEOUT_STANDARD_S", "220")),
+                    "complex": float(os.environ.get(
+                        "JARVIS_GEN_TIMEOUT_COMPLEX_S", "240")),
+                    "background": float(os.environ.get(
+                        "JARVIS_GEN_TIMEOUT_BACKGROUND_S", "180")),
+                    "speculative": float(os.environ.get(
+                        "JARVIS_GEN_TIMEOUT_SPECULATIVE_S", "180")),
                 }
                 _gen_timeout = _route_timeouts.get(
                     _route, self._config.generation_timeout_s
@@ -2868,13 +2877,25 @@ class GovernedOrchestrator:
                     )
                     return ctx
 
-                if _route == "background" and "background_dw_" in _err_msg:
-                    # Background DW failure — don't cascade to Claude.
-                    # Accept failure; sensor will re-detect if still relevant.
+                if _route == "background" and (
+                    "background_dw_" in _err_msg
+                    or "background_fallback_failed" in _err_msg
+                ):
+                    # Background failure — accept gracefully, don't
+                    # hammer the retry loop. Covers both the legacy
+                    # DW-only failure mode ("background_dw_*") and the
+                    # new cascade failure mode
+                    # ("background_fallback_failed:...") introduced when
+                    # JARVIS_BACKGROUND_ALLOW_FALLBACK=true and the
+                    # Claude cascade itself also fails. In either case,
+                    # the sensor will re-detect if the underlying work
+                    # is still relevant.
+                    _is_cascade_failure = "background_fallback_failed" in _err_msg
                     logger.info(
-                        "[Orchestrator] BACKGROUND route: DW failed (%s), "
-                        "accepting without Claude cascade [%s]",
-                        _err_msg[:100], ctx.op_id,
+                        "[Orchestrator] BACKGROUND route: %s failed (%s), "
+                        "accepting [%s]",
+                        "DW+Claude cascade" if _is_cascade_failure else "DW",
+                        _err_msg[:120], ctx.op_id,
                     )
                     ctx = ctx.advance(
                         OperationPhase.CANCELLED,
@@ -2882,8 +2903,14 @@ class GovernedOrchestrator:
                     )
                     await self._record_ledger(
                         ctx, OperationState.FAILED,
-                        {"reason": "background_dw_failure", "error": _err_msg[:200],
-                         "route": "background"},
+                        {
+                            "reason": (
+                                "background_cascade_failure"
+                                if _is_cascade_failure else "background_dw_failure"
+                            ),
+                            "error": _err_msg[:200],
+                            "route": "background",
+                        },
                     )
                     return ctx
 
@@ -3216,8 +3243,13 @@ class GovernedOrchestrator:
                 if _episodic_memory is not None and _episodic_memory.has_failures():
                     _failure_context = _episodic_memory.format_for_prompt()
                     if _failure_context:
-                        # Inject into strategic_memory_prompt so the generator sees it
-                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        # Preserve iron-gate feedback already staged for retry
+                        # (ExplorationInsufficientError etc). Reading from ctx
+                        # here would silently drop _error_feedback — the
+                        # severed nervous system bug that hid category-aware
+                        # retry instructions from the model on every
+                        # post-Iron-Gate retry.
+                        _existing = _retry_ctx_kwargs.get("strategic_memory_prompt", "") or ""
                         _retry_ctx_kwargs["strategic_memory_prompt"] = (
                             f"{_existing}\n\n{_failure_context}" if _existing else _failure_context
                         )

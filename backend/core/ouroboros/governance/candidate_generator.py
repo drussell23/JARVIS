@@ -1604,37 +1604,86 @@ class CandidateGenerator:
         context: OperationContext,
         deadline: datetime,
     ) -> GenerationResult:
-        """BACKGROUND route: DW only. No Claude fallback.
+        """BACKGROUND route: DW primary, optional Claude safety-net cascade.
 
         For low-urgency background sensors: opportunity mining,
         doc staleness, TODO scanning, backlog items.
 
-        Cost: ~$0.002/op (DW batch only)
-        Latency: relaxed (no deadline pressure)
+        Default behavior (``JARVIS_BACKGROUND_ALLOW_FALLBACK`` unset): DW
+        only, no Claude cascade. Cost ~$0.002/op. Raises
+        ``RuntimeError("background_dw_*")`` on failure — the orchestrator
+        accepts it gracefully and the sensor re-detects if still relevant.
 
-        Raises RuntimeError("background_dw_*") on failure — orchestrator
-        should re-queue or accept failure, NOT cascade to Claude.
+        Nervous-system reflex (``JARVIS_BACKGROUND_ALLOW_FALLBACK=true``):
+        when DW times out, is empty, or errors, cascade to Claude via
+        :meth:`_call_fallback`. Diagnosed after bt-2026-04-14-041952
+        showed **11/11 BACKGROUND ops dying on `background_dw_timeout:180s`**
+        — every op exhausted its DW window, nothing reached the Iron
+        Gate, and the cost-optimization invariant of the route became a
+        100% failure mode. Staking survival of background cognition on a
+        single latency-bound provider without a safety net violates
+        Manifesto §5 (intelligence-driven routing) and §6
+        (threshold-triggered neuroplasticity). On fallback failure, we
+        raise ``RuntimeError("background_fallback_failed:...")`` so the
+        orchestrator's existing BACKGROUND accept-failure branch still
+        fires (no retry loop thrash).
+
+        Bypass (``FORCE_CLAUDE_BACKGROUND=true``): skip DW entirely and
+        call Claude directly. Used by the live-fire harness to unblock
+        parity validation when DW 397B is degraded — hands BACKGROUND
+        cognition straight to Claude so the generation actually reaches
+        the tool loop and the Iron Gate can be exercised.
 
         Phase 3 Scope α (``JARVIS_JPRIME_PRIMACY``): when enabled and a
         PrimeProvider handle is wired, :meth:`_try_jprime_primacy` is
         consulted first. Sem saturation or any failure falls through to
-        the DW-only path below unchanged — Claude is still never
-        consulted on this route.
+        the DW path below unchanged.
         """
         _urgency = getattr(context, "signal_urgency", "?")
         _source = getattr(context, "signal_source", "?")
         remaining = self._remaining_seconds(deadline)
 
+        _force_claude = os.environ.get(
+            "FORCE_CLAUDE_BACKGROUND", "",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        _allow_fallback = os.environ.get(
+            "JARVIS_BACKGROUND_ALLOW_FALLBACK", "",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        # ── FORCE_CLAUDE_BACKGROUND bypass ─────────────────────────────
+        # Skip DW entirely and route straight to Claude. No DW attempt,
+        # no timeout, no cascade — used when DW is known-degraded and
+        # we need BACKGROUND ops to actually reach the tool loop.
+        if _force_claude:
+            if self._fallback is None:
+                raise RuntimeError(
+                    "background_dw_unavailable:force_claude_set_but_no_fallback"
+                )
+            logger.info(
+                "[CandidateGenerator] BACKGROUND: FORCE_CLAUDE_BACKGROUND=true "
+                "— bypassing DW, calling Claude directly "
+                "(urgency=%s, source=%s) [%.1fs budget]",
+                _urgency, _source, remaining,
+            )
+            try:
+                return await self._call_fallback(context, deadline)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"background_fallback_failed:forced:"
+                    f"{type(exc).__name__}:{str(exc)[:100]}"
+                ) from exc
+
         logger.info(
-            "[CandidateGenerator] BACKGROUND route: DW only, no Claude "
+            "[CandidateGenerator] BACKGROUND route: DW primary%s "
             "(urgency=%s, source=%s) [%.1fs budget]",
+            " + Claude cascade" if _allow_fallback else " (no Claude cascade)",
             _urgency, _source, remaining,
         )
 
         # Phase 3 Scope α — J-Prime primacy pre-check. Returns
         # ``None`` when the flag is off, no handle is wired, the sem is
         # saturated, or the J-Prime call failed. On ``None``, drop into
-        # the existing DW-only path below.
+        # the existing DW path below.
         _primacy_result = await self._try_jprime_primacy(
             context, deadline, route_label="BACKGROUND",
         )
@@ -1642,17 +1691,39 @@ class CandidateGenerator:
             return _primacy_result
 
         if self._tier0 is None or not getattr(self._tier0, "is_available", False):
+            # DW not configured — cascade to Claude if allowed, else raise.
+            if _allow_fallback and self._fallback is not None:
+                logger.info(
+                    "[CandidateGenerator] BACKGROUND: DW unavailable — "
+                    "cascading to Claude fallback [%s]",
+                    getattr(context, "op_id", "?")[:16],
+                )
+                try:
+                    return await self._call_fallback(context, deadline)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"background_fallback_failed:dw_unavailable:"
+                        f"{type(exc).__name__}:{str(exc)[:100]}"
+                    ) from exc
             raise RuntimeError(
                 "background_dw_unavailable:tier0_not_configured"
             )
 
-        # DW gets the full budget — no Claude reserve needed.
-        # Use RT SSE if available, else batch.
+        # Reserve a slice of the BACKGROUND budget for Claude when
+        # cascade is enabled so DW can't burn the entire window. The
+        # DW cap here and the urgency_router's max_dw_wait_s for
+        # BACKGROUND must agree — both tightened to 150s when fallback
+        # is enabled.
+        _dw_cap = 150.0 if _allow_fallback else 180.0
+        _dw_timeout = min(remaining, _dw_cap)
+        _dw_error: Optional[str] = None
+
+        # DW attempt — RT SSE preferred, batch fallback.
         if getattr(self._tier0, "_realtime_enabled", False):
             try:
                 result = await asyncio.wait_for(
                     self._tier0.generate(context, deadline),
-                    timeout=min(remaining, 180.0),
+                    timeout=_dw_timeout,
                 )
                 if result is not None and len(result.candidates) > 0:
                     logger.info(
@@ -1663,43 +1734,56 @@ class CandidateGenerator:
                         getattr(result, "cost_usd", 0.0),
                     )
                     return result
-                raise RuntimeError("background_dw_empty_result")
+                _dw_error = "background_dw_empty_result"
             except asyncio.TimeoutError:
-                raise RuntimeError(
-                    f"background_dw_timeout:{remaining:.0f}s"
-                )
-            except RuntimeError:
-                raise  # Re-raise our own errors
+                _dw_error = f"background_dw_timeout:{_dw_timeout:.0f}s"
             except Exception as exc:
-                raise RuntimeError(
+                _dw_error = (
                     f"background_dw_error:{type(exc).__name__}:{exc}"
-                ) from exc
+                )
         else:
             # Legacy batch path
             try:
                 pending = await self._tier0.submit_batch(context)
                 if pending is None:
-                    raise RuntimeError("background_dw_batch_submit_failed")
-                result = await asyncio.wait_for(
-                    self._tier0.poll_and_retrieve(pending, context),
-                    timeout=min(remaining, 180.0),
-                )
-                if result is not None and len(result.candidates) > 0:
-                    logger.info(
-                        "[CandidateGenerator] BACKGROUND batch: DW produced %d "
-                        "candidates",
-                        len(result.candidates),
+                    _dw_error = "background_dw_batch_submit_failed"
+                else:
+                    result = await asyncio.wait_for(
+                        self._tier0.poll_and_retrieve(pending, context),
+                        timeout=_dw_timeout,
                     )
-                    return result
-                raise RuntimeError("background_dw_batch_empty")
+                    if result is not None and len(result.candidates) > 0:
+                        logger.info(
+                            "[CandidateGenerator] BACKGROUND batch: DW produced "
+                            "%d candidates",
+                            len(result.candidates),
+                        )
+                        return result
+                    _dw_error = "background_dw_batch_empty"
             except asyncio.TimeoutError:
-                raise RuntimeError("background_dw_batch_timeout")
-            except RuntimeError:
-                raise
+                _dw_error = "background_dw_batch_timeout"
+            except Exception as exc:
+                _dw_error = (
+                    f"background_dw_batch_error:{type(exc).__name__}"
+                )
+
+        # DW exhausted. Either cascade to Claude or raise.
+        if _allow_fallback and self._fallback is not None:
+            _post_dw_remaining = self._remaining_seconds(deadline)
+            logger.info(
+                "[CandidateGenerator] BACKGROUND: DW failed (%s) — "
+                "cascading to Claude fallback, %.1fs parent remaining [%s]",
+                _dw_error, _post_dw_remaining, getattr(context, "op_id", "?")[:16],
+            )
+            try:
+                return await self._call_fallback(context, deadline)
             except Exception as exc:
                 raise RuntimeError(
-                    f"background_dw_batch_error:{type(exc).__name__}"
+                    f"background_fallback_failed:dw={_dw_error[:80]}:"
+                    f"{type(exc).__name__}:{str(exc)[:80]}"
                 ) from exc
+
+        raise RuntimeError(_dw_error)
 
     async def _generate_speculative(
         self,

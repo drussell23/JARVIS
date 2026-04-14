@@ -100,6 +100,59 @@ _os.environ.setdefault("JARVIS_GOVERNED_L3_ENABLED", "false")
 # executing mode from the start.
 _os.environ.setdefault("JARVIS_GOVERNANCE_MODE", "governed")
 
+# --- Force-overrides (ignore prior setdefaults / .env values) -----------
+# Two pipeline-timeout lines exist in .env ("150" for local Qwen2-7B,
+# then "1200" as the intended override). Our setdefault() loader picks
+# the first occurrence, so 150 won and our first run died at the 210s
+# hard cap (150 + 60s grace). This test calls Claude/DW, not the local
+# LLM, so override to 900s unconditionally.
+#
+# Routing strategy for this op (confirmed via urgency_router.py fix):
+#   - complexity=architectural → ProviderRoute.COMPLEX
+#   - COMPLEX = "Claude plans → DW executes" (CLAUDE.md §Urgency-Aware
+#     Provider Routing). Plays to each provider's strength:
+#       * Claude (expensive, smart): PLAN phase with extended thinking
+#       * DW 397B (cheap, streaming): GENERATE phase via RT SSE
+#   - Semantic Triage (DW 35B batch) still runs pre-CLASSIFY but is
+#     a single short prompt (~$0.0001) and informative — leave it on.
+_os.environ["JARVIS_PIPELINE_TIMEOUT_S"] = "900"
+
+# --- Per-attempt GENERATE window (route-aware) --------------------------
+# Raised from the default 240s to 400s for the COMPLEX route after
+# bt third-run diagnosis: with the default, DW RT burns 120s then
+# Claude fallback has only 100s left — not enough for an architectural
+# Venom loop (extended thinking 20s + tool round 0 40s + tool round 1
+# 60s + patch stream 40s ≈ 160s minimum). 400s gives DW 150s and
+# Claude ~240s of headroom, both comfortable for tool-loop ops.
+#
+# Exposed as per-route env vars (added in orchestrator.py after the
+# bt-2026-04-14-041952 100%-BACKGROUND-timeout diagnosis). Harness
+# only raises COMPLEX; the others keep their calibrated defaults.
+_os.environ["JARVIS_GEN_TIMEOUT_COMPLEX_S"] = "400"
+
+# --- Nervous-system reflex: BACKGROUND → Claude safety net --------------
+# bt-2026-04-14-041952 showed 11/11 BACKGROUND ops dying on
+# background_dw_timeout:180s — zero survivors, zero Iron Gate hits.
+# Enabling this flag tells CandidateGenerator._generate_background to
+# cascade to Claude via _call_fallback when DW times out/errors/empty,
+# and widens the BACKGROUND budget profile in urgency_router.py to
+# reserve 25s for Claude (instead of 0s).
+#
+# The live-fire test itself runs on the COMPLEX route, so this flag is
+# defensive hygiene here — it rescues any BACKGROUND sensor ops the
+# governance stack fires concurrently (intake, opportunity miner, etc.)
+# so they don't count as real regressions while we're validating #103.
+_os.environ["JARVIS_BACKGROUND_ALLOW_FALLBACK"] = "true"
+
+# Fallback minimum guaranteed window. Default 90s is too tight when
+# DW has already burned 120s+ of the parent deadline — Claude's
+# _call_fallback refreshes its own internal deadline using
+# max(parent_remaining, _FALLBACK_MIN_GUARANTEED_S). Raising to 200s
+# guarantees Claude a useful runway even after DW saturates. The
+# orchestrator's outer wait_for is still the Iron Gate, so this
+# cannot exceed the route's outer window.
+_os.environ.setdefault("OUROBOROS_FALLBACK_MIN_GUARANTEED_S", "200")
+
 import argparse
 import asyncio
 import gc
@@ -325,6 +378,30 @@ async def _boot_service(stack: Any, project_root: Path) -> Any:
         GovernedLoopConfig,
         GovernedLoopService,
     )
+
+    # --- Test-harness monkey-patches (applied BEFORE service.start() so
+    #     the GLS._build_components() pass picks up the new values) ------
+    #
+    # CandidateGenerator hard-caps the fallback provider (Claude) budget
+    # via ``_FALLBACK_MAX_TIMEOUT_S = 120.0`` — a class-level constant
+    # with no env override. 120s was tuned for STANDARD-route single-turn
+    # generation; it is not enough for an architectural op with the
+    # Venom multi-round tool loop and extended thinking.
+    #
+    # Evidence from bt run bcz8i0vg0:
+    #   attempt 1: DW RT 120s + Claude fallback 120s  → both TIMEOUT
+    #   attempt 2: Claude only, 31529 bytes received, mid tool_round=1
+    #              when the 120s wait_for fired at elapsed=123s
+    #              (sem_wait_total_s=122.91)
+    # Both Claude runs look like they would have finished with ~60s more.
+    # Raising to 300s gives the architectural tool loop room to breathe
+    # (extended thinking 20s + tool round 0 40s + tool round 1 60s + ...)
+    # without exceeding the 900s pipeline budget. DW tier0 budget is
+    # route-computed from remaining deadline so it gets its share too.
+    from backend.core.ouroboros.governance.candidate_generator import (
+        CandidateGenerator,
+    )
+    CandidateGenerator._FALLBACK_MAX_TIMEOUT_S = 300.0
 
     gls_config = GovernedLoopConfig.from_env(project_root=project_root)
     # Widen the canary to match the battle-test harness — production
@@ -667,6 +744,11 @@ async def _run() -> int:
             except Exception:
                 pass
         root.removeHandler(handler)
+        # Force finalization of dangling aiohttp ClientSessions (Langfuse /
+        # DoubleWord / Prime transports don't close on stack.stop()) so their
+        # cosmetic "Unclosed client session" warnings hit the installed
+        # filter BEFORE the verdict prints instead of trailing after it.
+        gc.collect()
 
     # -----------------------------------------------------------------
     # Report

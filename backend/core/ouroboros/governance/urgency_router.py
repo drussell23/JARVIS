@@ -27,6 +27,7 @@ Cost impact:
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Tuple
 
@@ -107,10 +108,17 @@ _SPECULATIVE_SOURCES = frozenset({
     "intent_discovery",
 })
 
-# Complexity levels that qualify for COMPLEX routing
+# Complexity levels that qualify for COMPLEX routing.
+# Architectural ops are the *most* complex class ComplexityClassifier
+# emits ("new capability", "design", "protocol", "schema", "migration")
+# — they need Claude's planning strength paired with DW's cheap
+# streaming execution. Missing this entry caused every architectural
+# single-file op to fall through to STANDARD (DW primary, no Claude
+# plan), contradicting CLAUDE.md §"Urgency-Aware Provider Routing".
 _COMPLEX_COMPLEXITIES = frozenset({
     "heavy_code",
     "complex",
+    "architectural",
 })
 
 # Urgency levels that qualify for IMMEDIATE routing
@@ -262,6 +270,21 @@ class UrgencyRouter:
                 "max_dw_wait_s": 120.0,
             }
         if route is ProviderRoute.BACKGROUND:
+            # Nervous-system reflex: when JARVIS_BACKGROUND_ALLOW_FALLBACK
+            # is on, BACKGROUND must leave headroom for Claude so
+            # CandidateGenerator._generate_background can cascade on DW
+            # failure instead of raising. The DW cap here (150s) MUST
+            # match the cap inside _generate_background — keep them in
+            # sync. Default (flag off): legacy DW-only profile.
+            _allow_fb = os.environ.get(
+                "JARVIS_BACKGROUND_ALLOW_FALLBACK", "",
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if _allow_fb:
+                return {
+                    "tier0_fraction": 0.65,
+                    "tier1_reserve_s": 25.0,
+                    "max_dw_wait_s": 150.0,
+                }
             return {
                 "tier0_fraction": 1.0,   # DW only
                 "tier1_reserve_s": 0.0,   # No Claude fallback
