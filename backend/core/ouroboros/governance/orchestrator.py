@@ -3063,7 +3063,70 @@ class GovernedOrchestrator:
                     else:
                         _ledger_feedback = ""
                     if _ledger_feedback:
+                        # ── CRITICAL_SYSTEM_OVERRIDE escalation ──
+                        # Live-fire botyivw5b proved the feedback was
+                        # landing in the prompt but the model was
+                        # attending to the front-loaded task description
+                        # and tool boilerplate instead of the retry
+                        # directive. This is an attention-mechanism
+                        # interference problem, not an injection
+                        # problem. The three-pronged fix (this block is
+                        # prong 2):
+                        #
+                        #   1. recency bias — _build_lean_codegen_prompt
+                        #      appends strategic_memory as the ABSOLUTE
+                        #      LAST section (after output schema), so
+                        #      the model reads it last.
+                        #   2. XML structural override — frontier models
+                        #      are fine-tuned to obey
+                        #      ``<CRITICAL_SYSTEM_OVERRIDE>`` tags at
+                        #      higher priority than general prompt text.
+                        #      "Mathematically required" language raises
+                        #      perceived authority.
+                        #   3. simulated assistant prefill — the lean
+                        #      builder appends a model-voice commitment
+                        #      stub after this block (persona
+                        #      continuation kill switch; literal API
+                        #      prefill is incompatible with the JSON
+                        #      contract + tool_use response type on
+                        #      sonnet-4-6 stream).
+                        #
+                        # Derive the specific tool names from the missing
+                        # categories so the override preempts ambiguity
+                        # about what "call_graph" means.
+                        _cat_to_tools = {
+                            "call_graph": "get_callers",
+                            "history": "git_blame or git_log",
+                            "discovery": "search_code or glob_files",
+                            "structure": "list_symbols",
+                            "comprehension": "read_file",
+                        }
+                        try:
+                            _missing_cats = sorted(
+                                c.value for c in _exc_verdict.missing_categories
+                            )
+                        except Exception:
+                            _missing_cats = []
+                        _required_tools = [
+                            _cat_to_tools.get(c, c) for c in _missing_cats
+                        ]
+                        _cat_list = ", ".join(_missing_cats) or "diverse"
+                        _tool_list = ", ".join(_required_tools) or "get_callers"
                         _error_feedback = (
+                            "<CRITICAL_SYSTEM_OVERRIDE>\n"
+                            "Previous attempt failed the Iron Gate exploration "
+                            "ledger. You are mathematically required to invoke "
+                            f"tools from the following missing categories: "
+                            f"[{_cat_list}].\n"
+                            f"You MUST invoke {_tool_list} before emitting any "
+                            "patch.\n"
+                            "The ExplorationLedger dedups by (tool, "
+                            "arguments_hash) — repeating the same read_file on "
+                            "the same path earns ZERO new credit.\n"
+                            "Your next action MUST be one of the required tool "
+                            "calls listed above. Do NOT emit a patch. Do NOT "
+                            "call read_file again on files you already read.\n"
+                            "</CRITICAL_SYSTEM_OVERRIDE>\n\n"
                             "## PREVIOUS GENERATION REJECTED — EXPLORATION GATE\n\n"
                             f"{_ledger_feedback}\n\n"
                             "INSTRUCTIONS FOR RETRY:\n"

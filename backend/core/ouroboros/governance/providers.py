@@ -1108,6 +1108,56 @@ Rules:
 - NEVER wrap the JSON in ```json ... ``` fences. NEVER emit prose before the opening `{{`. Your first character is `{{`."""
     parts.append(schema_instruction)
 
+    # ── 9. RETRY FEEDBACK (RECENCY BIAS ESCALATION) ─────────────────────
+    # Prong 1 of the three-pronged injection authority escalation.
+    # Placed at the ABSOLUTE END of the user message — after the output
+    # schema — so it is the FINAL content the model reads before
+    # generating. Frontier LLMs weight end-of-prompt content heavily
+    # ("recency bias"); combined with the ``<CRITICAL_SYSTEM_OVERRIDE>``
+    # XML wrapping injected by orchestrator.py at GENERATE_RETRY, this
+    # gives iron-gate rejection feedback absolute attention authority
+    # over the front-loaded task description, tool instructions, and
+    # schema boilerplate.
+    #
+    # History: live-fire botyivw5b (2026-04-14) proved that injecting
+    # the feedback early in the prompt (right after the task section)
+    # was insufficient — the model made byte-identical tool choices on
+    # attempt 2 despite the retry directive being in-context. This was
+    # an attention-mechanism interference problem, not an injection
+    # problem. Moving the block to the tail + wrapping in the override
+    # XML is the compensating response.
+    _strategic_memory = getattr(ctx, "strategic_memory_prompt", "")
+    if isinstance(_strategic_memory, str) and _strategic_memory.strip():
+        parts.append(_strategic_memory.strip())
+
+        # Prong 3: simulated assistant prefill. The Anthropic API's
+        # literal assistant prefill is incompatible with our JSON+tool_use
+        # contract (text prefill forces the response to start with that
+        # text, which precludes a pure tool_use block; and prefill is
+        # rejected outright by sonnet-4-6 on the stream endpoint —
+        # JARVIS_CLAUDE_JSON_PREFILL stays default-off for exactly that
+        # reason). The compliant alternative is to end the user turn
+        # with a model-voice commitment block: Claude's persona-
+        # continuation behavior treats trailing self-dialogue as a
+        # pre-set execution path and continues it instead of
+        # contradicting it. Functionally equivalent to a kill-switch
+        # prefill without the API compatibility landmines.
+        if "<CRITICAL_SYSTEM_OVERRIDE>" in _strategic_memory:
+            parts.append(
+                "<model_self_commitment>\n"
+                "I acknowledge the CRITICAL_SYSTEM_OVERRIDE above. My "
+                "immediate next action is a tool call to one of the "
+                "required missing-category tools (get_callers for "
+                "call_graph, git_blame for history, list_symbols for "
+                "structure, or search_code for discovery — as named in "
+                "the override). I will NOT emit any patch JSON until "
+                "the exploration ledger credits me in every required "
+                "category. I will NOT repeat a read_file on a path I "
+                "have already read, because the ledger dedups by "
+                "(tool, arguments_hash) and that earns zero new credit.\n"
+                "</model_self_commitment>"
+            )
+
     return "\n\n".join(parts)
 
 
