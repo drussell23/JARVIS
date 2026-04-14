@@ -1,0 +1,1 @@
+{"data": {"error": "background_dw_blocked_by_topology:Gemma 4 31B stream-stalls on DW endpoint even at <2K tokens. Background generation paused to preserve Claude compute run", "reason": "background_dw_failure", "route": "background"}, "op_id": "op-019d8ddc-b336-7aa9-a102-cdaea50c7b81-cau", "state": "failed", "timestamp": 709.796562916, "wall_time": 1776201810.5110521}
