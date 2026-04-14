@@ -115,6 +115,27 @@ _FALLBACK_MIN_GUARANTEED_S = float(
 )
 
 # ---------------------------------------------------------------------------
+# Route-scoped Claude fallback disable (isolation harnesses)
+# ---------------------------------------------------------------------------
+#
+# ``JARVIS_DISABLE_CLAUDE_FALLBACK_ROUTES`` accepts a comma-separated list of
+# route names. Any op whose ``provider_route`` matches will skip the Claude
+# fallback entirely when Tier 0 fails, raising a clean
+# ``fallback_disabled_by_env:{route}`` sentinel through the existing
+# exhaustion path. Used by the Qwen 397B isolation benchmark to collect raw
+# DW completion telemetry without Claude masking failures or burning tokens.
+# Default unset → normal cascade behavior.
+_DISABLE_FALLBACK_ROUTES_ENV = "JARVIS_DISABLE_CLAUDE_FALLBACK_ROUTES"
+
+
+def _fallback_disabled_for_route(route: str) -> bool:
+    raw = os.environ.get(_DISABLE_FALLBACK_ROUTES_ENV, "").strip()
+    if not raw:
+        return False
+    disabled = {r.strip().lower() for r in raw.split(",") if r.strip()}
+    return (route or "").strip().lower() in disabled
+
+# ---------------------------------------------------------------------------
 # Content failure classification
 # ---------------------------------------------------------------------------
 
@@ -2205,6 +2226,24 @@ class CandidateGenerator:
         is still the absolute Iron Gate — grace raised from 5s to 15s after
         bt-2026-04-12-061609 diagnosed 129s Claude streams cut by 125s gate.
         """
+        # Isolation override: if the op's route is listed in
+        # JARVIS_DISABLE_CLAUDE_FALLBACK_ROUTES, skip the fallback entirely
+        # and raise through the existing exhaustion path. Used by the Qwen
+        # 397B benchmark to collect raw DW telemetry without Claude masking.
+        _op_route = (getattr(context, "provider_route", "") or "").strip().lower()
+        if _fallback_disabled_for_route(_op_route):
+            logger.info(
+                "[CandidateGenerator] Fallback disabled by env for route=%s "
+                "(%s) — raising fallback_disabled_by_env sentinel",
+                _op_route, _DISABLE_FALLBACK_ROUTES_ENV,
+            )
+            self._raise_exhausted(
+                f"fallback_disabled_by_env:{_op_route}",
+                context=context,
+                deadline=deadline,
+                disabled_routes=os.environ.get(_DISABLE_FALLBACK_ROUTES_ENV, ""),
+            )
+
         _pre_sem_remaining = self._remaining_seconds(deadline)
         _sem_t0 = time.monotonic()
         logger.debug(

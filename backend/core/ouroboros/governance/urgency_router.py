@@ -132,6 +132,24 @@ _BACKGROUND_URGENCIES = frozenset({
 })
 
 
+# Enumerated route values used by the pre-stamp override path below.
+_VALID_ROUTE_VALUES = frozenset(r.value for r in ProviderRoute)
+
+
+def _respect_pre_stamped_route() -> bool:
+    """Return True when the classifier should honor a pre-stamped route.
+
+    Opt-in via ``JARVIS_URGENCY_ROUTER_RESPECT_PRE_STAMPED``. Default OFF so
+    production routing stays fully deterministic; the switch exists for
+    isolation harnesses (e.g. the Qwen 397B benchmark) that need to force
+    a specific route without monkey-patching the classifier.
+    """
+    raw = os.environ.get(
+        "JARVIS_URGENCY_ROUTER_RESPECT_PRE_STAMPED", "",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # UrgencyRouter — the deterministic classifier
 # ---------------------------------------------------------------------------
@@ -177,6 +195,16 @@ class UrgencyRouter:
         Tuple[ProviderRoute, str]
             The route and a human-readable reason string for telemetry.
         """
+        # ── Priority 0: pre-stamped route override (opt-in, tests only) ──
+        # When JARVIS_URGENCY_ROUTER_RESPECT_PRE_STAMPED is on, an op that
+        # already carries a valid ``provider_route`` skips classification
+        # entirely. This is the supported hook for isolation harnesses to
+        # force a specific route without monkey-patching the router.
+        if _respect_pre_stamped_route():
+            forced = (getattr(ctx, "provider_route", "") or "").strip().lower()
+            if forced and forced in _VALID_ROUTE_VALUES:
+                return ProviderRoute(forced), f"forced_pre_stamped:{forced}"
+
         urgency = getattr(ctx, "signal_urgency", "") or "normal"
         source = getattr(ctx, "signal_source", "") or ""
         complexity = getattr(ctx, "task_complexity", "") or "moderate"
