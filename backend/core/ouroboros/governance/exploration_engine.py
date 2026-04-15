@@ -42,8 +42,8 @@ class ExplorationCategory(str, Enum):
     the score.
     """
 
-    COMPREHENSION = "comprehension"   # read_file, list_dir
-    DISCOVERY     = "discovery"       # search_code, glob_files
+    COMPREHENSION = "comprehension"   # read_file (reading file content)
+    DISCOVERY     = "discovery"       # search_code, glob_files, list_dir
     CALL_GRAPH    = "call_graph"      # get_callers
     STRUCTURE     = "structure"       # list_symbols
     HISTORY       = "history"         # git_blame, git_log, git_diff
@@ -55,7 +55,16 @@ class ExplorationCategory(str, Enum):
 # they are not exploration and must not accrue credit.
 _TOOL_CATEGORY: Mapping[str, ExplorationCategory] = {
     "read_file":    ExplorationCategory.COMPREHENSION,
-    "list_dir":     ExplorationCategory.COMPREHENSION,
+    # list_dir answers "what exists here?" (structure of the filesystem)
+    # — semantically discovery, not comprehension. Remapped 2026-04-14
+    # after Session bt-2026-04-15-054552 showed a retry adding list_dir
+    # to read_file×2 dropping the score (2× read_file = 2.0 beats
+    # 2× read_file + 1× list_dir = 2.5 once you factor in the diversity
+    # multiplier being 1.0 on both sides pre-remap). The agent was
+    # punished for diversifying. Moving list_dir to DISCOVERY lets the
+    # diversity multiplier kick in when the agent legitimately widens
+    # its exploration.
+    "list_dir":     ExplorationCategory.DISCOVERY,
     "search_code":  ExplorationCategory.DISCOVERY,
     "glob_files":   ExplorationCategory.DISCOVERY,
     "get_callers":  ExplorationCategory.CALL_GRAPH,
