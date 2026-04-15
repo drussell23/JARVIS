@@ -5900,12 +5900,79 @@ class GovernedOrchestrator:
             return ("fatal", ctx)
 
         if l2_result.terminal == "L2_CONVERGED" and l2_result.candidate is not None:
+            # Post-L2 canonical validation is architecturally broken for
+            # Python candidates: test_runner.PythonAdapter.run hard-codes
+            # sandbox_dir=None (see its docstring at run() line 228-237) so
+            # pytest always executes against the LIVE repo_root regardless
+            # of the temp sandbox _run_validation wrote the candidate to.
+            # For an L2-converged candidate that signal is always stale-
+            # false, and the op escapes via l2_canonical_validate_failed
+            # despite L2 having actually proven the fix in a real git
+            # worktree with the candidate overlaid (RepairSandbox path).
+            #
+            # Skip the re-run: trust L2's full-repo sandbox convergence and
+            # proceed straight to GATE → APPLY. Synthesize a passing
+            # ValidationResult explicitly — do NOT reuse ``best_validation``
+            # (that is the FAILED L1 validation which triggered L2 in the
+            # first place).
+            #
+            # The architectural follow-up is teaching PythonAdapter to
+            # honor sandbox_dir (via a full worktree overlay or
+            # PYTHONPATH=repo_root + pytest paths under sandbox), which
+            # also fixes the pre-L2 blind spot. Until then this skip is
+            # gated by JARVIS_L2_SKIP_CANONICAL_AFTER_CONVERGE (default on)
+            # so CI / operators can force the old double-validate path.
+            _skip_canonical = os.environ.get(
+                "JARVIS_L2_SKIP_CANONICAL_AFTER_CONVERGE", "true"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+
+            if _skip_canonical:
+                logger.info(
+                    "[Orchestrator] L2_CONVERGED op=%s — skipping canonical "
+                    "re-validation (PythonAdapter ignores sandbox_dir, L2 "
+                    "already validated in git-worktree sandbox). Proceeding "
+                    "to GATE → APPLY with L2's proven candidate.",
+                    ctx.op_id,
+                )
+                canonical_val = ValidationResult(
+                    passed=True,
+                    best_candidate=l2_result.candidate,
+                    validation_duration_s=0.0,
+                    error=None,
+                    failure_class=None,
+                    short_summary=(
+                        "L2 converged in sandbox; canonical re-run skipped "
+                        "(PythonAdapter drops sandbox_dir, see "
+                        "test_runner.py:227-237)"
+                    ),
+                    adapter_names_run=("l2-sandbox",),
+                )
+                await self._record_ledger(ctx, OperationState.SANDBOXING, {
+                    "event": "l2_converged",
+                    "iterations": len(l2_result.iterations),
+                    "canonical_revalidation": "skipped",
+                    "skip_reason": (
+                        "PythonAdapter.run hard-codes sandbox_dir=None; "
+                        "pytest cwd is always repo_root, ignoring the "
+                        "temp sandbox _run_validation wrote the candidate "
+                        "to. L2 used RepairSandbox (git worktree) which "
+                        "honors the overlay — that signal is trusted."
+                    ),
+                    **l2_result.summary,
+                })
+                return ("break", l2_result.candidate, canonical_val)
+
+            # Legacy path — run canonical validation anyway. Retained so
+            # operators can force the old behavior via the env flag; will
+            # almost always escape to CANCELLED for Python candidates
+            # until PythonAdapter is fixed.
             _remaining_s = (deadline - datetime.now(timezone.utc)).total_seconds()
             canonical_val = await self._run_validation(ctx, l2_result.candidate, _remaining_s)
             if canonical_val.passed:
                 await self._record_ledger(ctx, OperationState.SANDBOXING, {
                     "event": "l2_converged",
                     "iterations": len(l2_result.iterations),
+                    "canonical_revalidation": "passed",
                     **l2_result.summary,
                 })
                 return ("break", l2_result.candidate, canonical_val)
