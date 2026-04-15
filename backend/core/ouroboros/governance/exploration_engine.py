@@ -552,67 +552,56 @@ def render_retry_feedback(
             "before emitting any edit_file / write_file / delete_file call."
         )
 
-    # Session E (2026-04-14) branch: categories satisfied but score below
-    # floor. This is the "model picked cheap tools per category" failure
-    # mode. The generic "Widen your exploration" hint from the pre-Session-E
-    # version was too soft — the model took it as "add more low-leverage
-    # calls to different categories" and produced a 9.0/10.0 near-miss.
-    # Here we spell out the actual weight hierarchy and warn against
-    # repeating the list_dir-style padding.
-    categories_satisfied = (
-        len(verdict.categories_covered) >= floors.min_categories
-        and not verdict.missing_categories
-    )
-
+    # Session F (bt-2026-04-15-065523, 2026-04-14) proved the previous
+    # ``categories_satisfied`` gate was architecturally unreachable in
+    # the 2-attempt retry loop: the sharpened high-leverage warning
+    # could only fire on a retry whose previous attempt had already
+    # covered all categories, but attempt 1 typically covers 2/3 and
+    # there is no attempt 3 to apply the sharpened feedback to.
+    #
+    # Fix: fire the high-leverage block UNCONDITIONALLY on any score
+    # deficit, additively after the missing-category guidance above.
+    # The model now sees BOTH messages when both gates are failing —
+    # "fill missing categories" (above) AND "use high-leverage tools
+    # for the fill" (below) — in the right order. Trivial tier has
+    # ``min_score=0.0`` so ``score_deficit`` is always 0 and this
+    # block never fires there.
     if verdict.score_deficit > 0:
-        if categories_satisfied:
-            hl = ", ".join(f"`{t}`" for t in _HIGH_LEVERAGE_TOOLS)
-            ml = ", ".join(f"`{t}`" for t in _MEDIUM_LEVERAGE_TOOLS)
-            ll = ", ".join(f"`{t}`" for t in _LOW_LEVERAGE_TOOLS)
-            lines.extend([
-                (
-                    f"- SCORE GATE: you cover "
-                    f"{len(verdict.categories_covered)} categories "
-                    f"(required {floors.min_categories}) but your score "
-                    f"is {verdict.score:.1f}/{floors.min_score:.1f} — "
-                    f"deficit {verdict.score_deficit:.1f} points."
-                ),
-                (
-                    "- CATEGORY BREADTH ALONE IS NOT ENOUGH. Your previous "
-                    f"attempt likely used LOW-LEVERAGE tools ({ll}, each "
-                    "worth 0.5 weight) to cover categories. Calling MORE "
-                    "of those tools will NOT raise the score — they "
-                    "contribute minimally to the weighted sum."
-                ),
-                (
-                    f"- Widen your exploration with HIGH-LEVERAGE tools: "
-                    f"{hl} (worth 2.0–2.5 weight each). A single "
-                    "`get_callers` call on the primary target symbol, or a "
-                    "`git_blame` on the target file, will push you past "
-                    "the floor by itself."
-                ),
-                (
-                    f"- Alternatively, use MEDIUM-LEVERAGE tools: {ml} "
-                    "(worth 1.5 weight each). Prefer `search_code` for "
-                    "cross-file references, `list_symbols` for target-"
-                    "file structure, or `git_log` / `git_diff` for "
-                    "temporal context."
-                ),
-                (
-                    "- DO NOT pad with additional `list_dir` or `glob_files` "
-                    "calls — they will not close the score deficit. Call "
-                    "get_callers / git_blame / search_code instead."
-                ),
-            ])
-        else:
-            # Original "widen your exploration" hint — fires when score is
-            # low AND categories are still missing (both gates unsatisfied).
-            # Preserved verbatim so the legacy test case keeps passing.
-            lines.append(
-                "- Widen your exploration: call get_callers on the target symbols, "
-                "list_symbols on the target file, search_code for related usages, "
-                "or git_blame on hot regions."
-            )
+        hl = ", ".join(f"`{t}`" for t in _HIGH_LEVERAGE_TOOLS)
+        ml = ", ".join(f"`{t}`" for t in _MEDIUM_LEVERAGE_TOOLS)
+        ll = ", ".join(f"`{t}`" for t in _LOW_LEVERAGE_TOOLS)
+        lines.extend([
+            (
+                f"- SCORE GATE: your current score is "
+                f"{verdict.score:.1f}/{floors.min_score:.1f} — "
+                f"deficit {verdict.score_deficit:.1f} points."
+            ),
+            (
+                "- CRITICAL: category breadth alone will not close "
+                f"this gap. LOW-LEVERAGE tools ({ll}, each worth 0.5 "
+                "weight) contribute minimally to the weighted sum — "
+                "padding with more of them will NOT raise the score."
+            ),
+            (
+                f"- Widen your exploration with HIGH-LEVERAGE tools: "
+                f"{hl} (worth 2.0–2.5 weight each). A single "
+                "`get_callers` call on the primary target symbol, or "
+                "a `git_blame` on the target file, will push you past "
+                "the floor by itself."
+            ),
+            (
+                f"- Alternatively, use MEDIUM-LEVERAGE tools: {ml} "
+                "(worth 1.5 weight each). Prefer `search_code` for "
+                "cross-file references, `list_symbols` for target-"
+                "file structure, or `git_log` / `git_diff` for "
+                "temporal context."
+            ),
+            (
+                "- DO NOT pad with additional `list_dir` or `glob_files` "
+                "calls — they will not close the score deficit. Call "
+                "get_callers / git_blame / search_code instead."
+            ),
+        ])
     lines.append(
         "Run more exploration tools now; do not attempt to patch until the "
         "gate passes."

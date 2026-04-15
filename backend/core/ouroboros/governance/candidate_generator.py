@@ -2271,7 +2271,25 @@ class CandidateGenerator:
     # full_content patches legitimately needing 60-90s of stream time. IMMEDIATE
     # route also funnels through this cap, and a 60s cap was cutting mid-stream
     # healthy generation (23KB received at 365 bytes/s — normal Claude rate).
-    _FALLBACK_MAX_TIMEOUT_S: float = 120.0
+    _FALLBACK_MAX_TIMEOUT_S: float = float(
+        os.environ.get("JARVIS_FALLBACK_MAX_TIMEOUT_S", "120.0")
+    )
+
+    # Route-aware ceiling for complex-route generate. Session
+    # bt-2026-04-15-065523 (Session F, 2026-04-14) diagnosed a
+    # complex-route retry synthesis hitting the 120s cap by exactly 2
+    # seconds: elapsed=122.1s, fallback_err_class=CancelledError,
+    # all_providers_exhausted with 131s of nominal generation budget
+    # still remaining. Complex ops under ledger enforcement legitimately
+    # need wider synthesis windows because their tool-result prompts
+    # exceed 40KB (44104 chars observed in Session F attempt 2) and
+    # Claude needs 150-180s to produce a coherent multi-file patch.
+    # 120s remains the default for all other routes; complex gets 180s.
+    # Env-tunable so ops can tune without a code change — the default
+    # 180.0 is the post-Session-F calibration.
+    _FALLBACK_MAX_TIMEOUT_COMPLEX_S: float = float(
+        os.environ.get("JARVIS_FALLBACK_MAX_TIMEOUT_COMPLEX_S", "180.0")
+    )
 
     async def _call_fallback(
         self,
@@ -2310,19 +2328,35 @@ class CandidateGenerator:
         _pre_sem_remaining = self._remaining_seconds(deadline)
         _sem_t0 = time.monotonic()
         _phase_hint = getattr(getattr(context, "phase", None), "name", "?")
+
+        # Route-aware fallback ceiling: complex routes get a wider
+        # synthesis window (180s) because their tool-result prompts are
+        # legitimately larger and their multi-file patches take longer
+        # to generate coherently. Non-complex routes keep the 120s cap.
+        # _op_route was already computed earlier in this method for the
+        # fallback-disabled-by-env check, so we reuse the lowercased value.
+        _max_cap = (
+            self._FALLBACK_MAX_TIMEOUT_COMPLEX_S
+            if _op_route == "complex"
+            else self._FALLBACK_MAX_TIMEOUT_S
+        )
+
         # Promoted to INFO with phase label so traces distinguish first
         # GENERATE from GENERATE_RETRY contention on the shared fallback
         # semaphore — Session bt-2026-04-15-041413 (2026-04-14) saw a
         # retry wait 121.5s behind cohort ops with no visibility into
-        # which acquisition phase was queuing.
+        # which acquisition phase was queuing. max_cap added after
+        # Session F (bt-2026-04-15-065523) so the route-aware ceiling
+        # that was actually applied is visible at acquire time.
         logger.info(
             "[CandidateGenerator] Fallback sem acquire: slots_free=%d/%d "
-            "remaining=%.1fs route=%s phase=%s op=%s",
+            "remaining=%.1fs route=%s phase=%s op=%s max_cap=%.0fs",
             self._fallback_sem._value, self._fallback_concurrency,
             _pre_sem_remaining,
             getattr(context, "provider_route", "?"),
             _phase_hint,
             getattr(context, "op_id", "?")[:16],
+            _max_cap,
         )
 
         try:
@@ -2340,9 +2374,11 @@ class CandidateGenerator:
                 # Post-acquire refresh: guarantee _FALLBACK_MIN_GUARANTEED_S
                 # even when the parent deadline burned during sem wait or
                 # Tier 0 consumed most of the window.  The orchestrator's
-                # outer wait_for is the absolute Iron Gate.
+                # outer wait_for is the absolute Iron Gate. ``_max_cap`` is
+                # the route-aware ceiling computed at acquire time (180s
+                # for complex, 120s otherwise).
                 _budget_target = max(_parent_remaining, _FALLBACK_MIN_GUARANTEED_S)
-                remaining = min(_budget_target, self._FALLBACK_MAX_TIMEOUT_S)
+                remaining = min(_budget_target, _max_cap)
                 _refreshed = remaining > _parent_remaining + 1.0
 
                 if remaining < _MIN_VIABLE_FALLBACK_S:
@@ -2363,7 +2399,7 @@ class CandidateGenerator:
                         "(parent=%.1fs, guaranteed_min=%.0fs, cap=%.0fs, "
                         "sem_wait=%.1fs)",
                         remaining, _parent_remaining,
-                        _FALLBACK_MIN_GUARANTEED_S, self._FALLBACK_MAX_TIMEOUT_S,
+                        _FALLBACK_MIN_GUARANTEED_S, _max_cap,
                         _sem_wait_s,
                     )
                     deadline = datetime.now(tz=timezone.utc) + timedelta(
@@ -2373,7 +2409,7 @@ class CandidateGenerator:
                     logger.info(
                         "[CandidateGenerator] Fallback: budget=%.1fs "
                         "(cap=%.0fs, sem_wait=%.1fs)",
-                        remaining, self._FALLBACK_MAX_TIMEOUT_S, _sem_wait_s,
+                        remaining, _max_cap, _sem_wait_s,
                     )
 
                 _fb_result = await asyncio.wait_for(

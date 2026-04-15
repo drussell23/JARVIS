@@ -378,22 +378,24 @@ def test_feedback_mentions_score_widening_hint_when_deficit_positive() -> None:
     assert "get_callers" in body  # at least one concrete tool suggestion
 
 
-def test_feedback_sharpens_when_categories_satisfied_but_score_low() -> None:
+def test_feedback_sharpens_on_score_deficit_with_cats_satisfied() -> None:
     """Session E (bt-2026-04-15-063108) failure mode: model covered 3
     categories but picked low-leverage tools, scoring 9.0 / 10.0.
 
-    When categories are satisfied but score is below floor, the feedback
-    must explicitly:
-      1. Name the HIGH-leverage tools the model should prefer
-         (get_callers, git_blame)
-      2. Name the MEDIUM-leverage tools as a fallback
-         (search_code, list_symbols, git_log, git_diff)
-      3. WARN against padding with low-leverage tools
+    When score is below floor, the sharpened feedback must fire
+    unconditionally (not gated on cats-satisfied, per Session F fix)
+    and must name:
+      1. The HIGH-leverage tools (get_callers, git_blame)
+      2. The MEDIUM-leverage fallback tools (search_code, list_symbols,
+         git_log, git_diff)
+      3. An explicit warning against padding with low-leverage tools
          (list_dir, glob_files)
 
-    This is the branch added by the Session E sharpening pass — the
-    generic "Widen your exploration" hint from the pre-sharpening
-    version was too soft for this failure mode.
+    This test covers the "cats satisfied, score deficit" case — the
+    first of two unconditional-fire scenarios. The second case (cats
+    NOT satisfied, score deficit) is covered by
+    ``test_feedback_sharpens_even_when_categories_not_yet_satisfied``
+    below, which is the direct regression for Session F.
     """
     verdict = ExplorationVerdict(
         sufficient=False,
@@ -414,7 +416,7 @@ def test_feedback_sharpens_when_categories_satisfied_but_score_low() -> None:
     )
     body = render_retry_feedback(verdict, floors)
 
-    # The sharpened score-gate branch must fire
+    # The sharpened score-gate block must fire
     assert "SCORE GATE" in body
     assert "deficit 1.0" in body
 
@@ -433,9 +435,77 @@ def test_feedback_sharpens_when_categories_satisfied_but_score_low() -> None:
     assert "glob_files" in body
     assert "DO NOT" in body  # the explicit don't-pad directive
 
-    # Category count still reported so the model knows it's on the right
-    # track for breadth
-    assert "3 categories" in body or "categories covered: 3" in body.lower()
+
+def test_feedback_sharpens_even_when_categories_not_yet_satisfied() -> None:
+    """Session F (bt-2026-04-15-065523) direct regression test.
+
+    Failure mode: attempt 1 had ``categories=2/3`` (comprehension +
+    discovery) and ``score=4.5/10.0``. The pre-Session-F sharpened
+    branch was gated on ``categories_satisfied``, so it DID NOT fire
+    for this state — the model received only the soft "Widen your
+    exploration" legacy hint and responded by adding another
+    low-leverage tool (list_symbols) plus another list_dir, still
+    falling short of the score floor and dying on the retry synthesis.
+
+    Post-fix: the sharpened high-leverage block fires
+    UNCONDITIONALLY on any score deficit, so this verdict state
+    (Session F attempt 1 exactly) now receives the full warning
+    including the explicit ``get_callers`` / ``git_blame`` /
+    ``search_code`` tool names and the "DO NOT pad with list_dir"
+    directive.
+
+    If this test ever regresses, it means the 2-attempt retry loop
+    has again become a dead zone for sharpened feedback — the bug
+    Session F existed to diagnose.
+    """
+    verdict = ExplorationVerdict(
+        sufficient=False,
+        score=4.5,
+        score_deficit=5.5,
+        categories_covered=frozenset({
+            ExplorationCategory.COMPREHENSION,
+            ExplorationCategory.DISCOVERY,
+        }),  # 2 categories — NOT satisfied against min_categories=3
+        missing_categories=frozenset(),
+        category_deficit=1,
+    )
+    floors = ExplorationFloors(
+        complexity="complex",
+        min_score=10.0,
+        min_categories=3,
+    )
+    body = render_retry_feedback(verdict, floors)
+
+    # The sharpened score-gate block MUST fire even though cats are
+    # not yet at the floor. This is the Session F regression guard.
+    assert "SCORE GATE" in body
+    assert "deficit 5.5" in body
+
+    # All three leverage tiers explicitly named
+    assert "get_callers" in body
+    assert "git_blame" in body
+    assert "search_code" in body
+    assert "list_symbols" in body
+
+    # Warning against low-leverage padding — the specific behavior that
+    # tanked Session F's retry
+    assert "LOW-LEVERAGE" in body or "low-leverage" in body.lower()
+    assert "list_dir" in body
+    assert "glob_files" in body
+    assert "DO NOT" in body
+
+    # And — critically — the category-gate guidance is ALSO present
+    # (category_deficit=1 means one category is still missing). Both
+    # messages must coexist in the right order: cats-guidance above,
+    # score-gate guidance below.
+    _cat_gate_marker = "Categories covered: 2"
+    _score_gate_marker = "SCORE GATE"
+    assert _cat_gate_marker in body
+    assert _score_gate_marker in body
+    assert body.index(_cat_gate_marker) < body.index(_score_gate_marker), (
+        "Cats-guidance must render ABOVE score-gate guidance so the model "
+        "sees 'fill gaps' before 'use high-leverage tools to fill them'"
+    )
 
 
 # ---------------------------------------------------------------------------
