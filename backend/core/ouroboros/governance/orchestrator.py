@@ -3790,11 +3790,86 @@ class GovernedOrchestrator:
             if validate_retries_remaining < 0:
                 # ── L2 self-repair dispatch ───────────────────────────────────
                 if self._config.repair_engine is not None and best_validation is not None:
-                    _pl_deadline = ctx.pipeline_deadline or (
-                        datetime.now(timezone.utc) + timedelta(seconds=self._config.generation_timeout_s)
+                    # ── L2 deadline reconciliation (Session V fix) ─────────
+                    # Manifesto §8 (Absolute Observability): an env var named
+                    # ``JARVIS_L2_TIMEBOX_S`` must mean **the wall time
+                    # reserved for L2 from the moment of dispatch** — not
+                    # "silently clamped to whatever the pipeline clock has
+                    # left." The prior behavior passed ``ctx.pipeline_
+                    # deadline`` through as L2's effective deadline, so the
+                    # hidden ``min(L2 timebox, pipeline_deadline - now)``
+                    # won silently whenever the pipeline clock was depleted
+                    # by CLASSIFY → PLAN → GENERATE → VALIDATE.
+                    #
+                    # Session V (``bt-2026-04-15-223631``, ``op-019d934a``)
+                    # proved it live: ``JARVIS_L2_TIMEBOX_S=600`` was set,
+                    # but L2 reported ``Iteration 1/8 starting (0s elapsed,
+                    # 120s remaining)`` because VALIDATE drained the
+                    # pipeline clock over ~5 minutes before L2 saw it. One
+                    # L2 iteration ran, returned ``directive='cancel'``,
+                    # the op died. The env var name lied.
+                    #
+                    # Fix: compute L2's deadline fresh at dispatch as
+                    # ``now + JARVIS_L2_TIMEBOX_S`` and reconcile
+                    # ``ctx.pipeline_deadline`` via
+                    # ``with_pipeline_deadline()`` so downstream phases
+                    # (GATE, APPLY, VERIFY, POSTMORTEM) see a consistent
+                    # op-level clock — preserving the "one notion of 'op
+                    # must end by'" invariant without masking the L2 budget
+                    # decision. If the pipeline_deadline is already LARGER
+                    # than the L2 fresh budget (operator set a generous
+                    # global cap), we keep the larger value: L2 must never
+                    # shrink an op's envelope. Either way, both clocks
+                    # and the winning cap are logged at INFO so operators
+                    # can audit the decision without reading source.
+                    _l2_timebox_s = float(
+                        os.environ.get("JARVIS_L2_TIMEBOX_S", "120.0")
                     )
-                    _fsm_log("l2_dispatch_pre")
-                    directive = await self._l2_hook(ctx, best_validation, _pl_deadline)
+                    _now_dt = datetime.now(timezone.utc)
+                    _l2_fresh_deadline = _now_dt + timedelta(
+                        seconds=_l2_timebox_s
+                    )
+                    _orig_pl_deadline = ctx.pipeline_deadline
+                    _orig_remaining_s = (
+                        (_orig_pl_deadline - _now_dt).total_seconds()
+                        if _orig_pl_deadline is not None else 0.0
+                    )
+                    if (
+                        _orig_pl_deadline is None
+                        or _orig_pl_deadline < _l2_fresh_deadline
+                    ):
+                        _l2_deadline = _l2_fresh_deadline
+                        _winning_cap = "l2_timebox_fresh"
+                        # Reconcile the op-level clock. `pipeline_deadline`
+                        # is a cooperative budget; `cost_governor` and the
+                        # harness idle watcher maintain their own wall
+                        # clocks, so extending here does not violate any
+                        # global safety invariant — it merely tells
+                        # downstream phases that L2 has legitimately
+                        # reserved additional time beyond the original
+                        # envelope.
+                        ctx = ctx.with_pipeline_deadline(_l2_fresh_deadline)
+                    else:
+                        _l2_deadline = _orig_pl_deadline
+                        _winning_cap = "pipeline_deadline_inherited"
+                    logger.info(
+                        "[Orchestrator] L2 deadline reconciliation: "
+                        "pipeline_remaining=%.1fs l2_timebox_env=%.1fs "
+                        "effective=%.1fs winning_cap=%s op=%s",
+                        _orig_remaining_s,
+                        _l2_timebox_s,
+                        (_l2_deadline - _now_dt).total_seconds(),
+                        _winning_cap,
+                        ctx.op_id[:16],
+                    )
+                    _fsm_log(
+                        "l2_dispatch_pre",
+                        f"effective_s={(_l2_deadline - _now_dt).total_seconds():.0f} "
+                        f"cap={_winning_cap} l2_timebox_env={_l2_timebox_s:.0f}",
+                    )
+                    directive = await self._l2_hook(
+                        ctx, best_validation, _l2_deadline,
+                    )
                     _fsm_log("l2_dispatch_post", f"directive={directive[0]!r}")
                     if directive[0] == "break":
                         best_candidate, best_validation = directive[1], directive[2]
