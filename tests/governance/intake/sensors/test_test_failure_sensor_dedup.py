@@ -1,4 +1,7 @@
-# [Ouroboros] Modified by Ouroboros (op=op-019d9249-) at 2026-04-15 18:13 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019d9368-) at 2026-04-15 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019d9368-) at 2026-04-15 23:26 UTC
+# Reason: Write four focused sensor-level test modules for the TestFailureSensor in-flight dedup mechanism shipped in commit 20baa
+
 # Reason: Write four focused sensor-level test modules for the TestFailureSensor in-flight dedup mechanism shipped in commit 20baa
 
 """Module A: In-flight dedup - second signal for the same target within
@@ -48,7 +51,8 @@ def _make_router(return_value: str = "enqueued") -> MagicMock:
     return router
 
 
-async def test_second_signal_same_target_is_suppressed():
+@pytest.mark.asyncio
+async def test_second_signal_same_target_is_suppressed() -> None:
     """Canonical v5 repro: second signal for the same target file within
     the TTL window must never reach router.ingest.
     """
@@ -69,7 +73,8 @@ async def test_second_signal_same_target_is_suppressed():
     )
 
 
-async def test_suppression_logged_as_already_in_flight(caplog: pytest.LogCaptureFixture):
+@pytest.mark.asyncio
+async def test_suppression_logged_as_already_in_flight(caplog: pytest.LogCaptureFixture) -> None:
     """The suppression decision must be visible in the log at INFO level
     with the 'already in-flight' phrase so operators can trace it.
     """
@@ -89,7 +94,8 @@ async def test_suppression_logged_as_already_in_flight(caplog: pytest.LogCapture
     ), "expected 'already in-flight' log line when suppressing a duplicate signal"
 
 
-async def test_third_signal_also_suppressed():
+@pytest.mark.asyncio
+async def test_third_signal_also_suppressed() -> None:
     """Suppression is not a one-shot: every subsequent signal for the
     same in-flight target is rejected until TTL expiry or explicit release.
     """
@@ -106,7 +112,8 @@ async def test_third_signal_also_suppressed():
     assert router.ingest.await_count == 1
 
 
-async def test_suppression_requires_enqueued_status():
+@pytest.mark.asyncio
+async def test_suppression_requires_enqueued_status() -> None:
     """If the first ingest returns 'queued_behind' the target is NOT
     marked in-flight, so the next signal for the same target is NOT
     suppressed - the router will handle the queued re-ingest.
@@ -125,7 +132,8 @@ async def test_suppression_requires_enqueued_status():
     assert router.ingest.await_count == 2
 
 
-async def test_dedup_enabled_by_default(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.asyncio
+async def test_dedup_enabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no env override the module-level TTL must be positive,
     confirming dedup is active out of the box.
     """
