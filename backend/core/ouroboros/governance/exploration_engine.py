@@ -114,6 +114,17 @@ _TOOL_WEIGHT: Mapping[str, float] = {
 _DUPLICATE_WEIGHT_FACTOR: float = 0.0
 
 
+# Hard cap on the base-weight sum. Prevents an adversarial "read every
+# file in the repo" strategy from out-scoring diverse exploration through
+# sheer volume. Calibrated so a thorough 4-file COMPLEX exploration stays
+# under the cap: e.g. read_file × 4 + search_code × 2 + list_symbols × 2
+# = 10.0 base (well under 15.0), while read_file × 50 = 50.0 base gets
+# clipped to 15.0. Paired with the diversity multiplier, capped base
+# still cannot dominate a diverse ledger because spam stays at 1.0
+# multiplier (1 category) while diverse patterns climb to 2.0–3.0×.
+_BASE_SCORE_CAP: float = 15.0
+
+
 # ---------------------------------------------------------------------------
 # Ledger
 # ---------------------------------------------------------------------------
@@ -190,23 +201,56 @@ class ExplorationLedger:
     # ----- scoring --------------------------------------------------------
 
     def diversity_score(self) -> float:
-        """Weighted sum of unique-argument exploration calls.
+        """Category-multiplier weighted sum of exploration calls.
 
-        Duplicate calls (same tool, same ``arguments_hash``) contribute
-        ``base_weight * _DUPLICATE_WEIGHT_FACTOR`` (currently 0). Failed
-        calls still accrue full weight — a failed grep still tells the
-        model something useful ("X is not used anywhere").
+        Formula::
+
+            base_score = min(sum(base_weight for unique call), _BASE_SCORE_CAP)
+            n_cats     = len(self.categories_covered())
+            multiplier = 1.0 + 0.5 * (n_cats - 1)    if n_cats >= 1 else 0.0
+            score      = round(base_score * multiplier, 3)
+
+        The category multiplier is the load-bearing anti-shallow-spam
+        mechanism: a ledger that spams ``read_file × 4`` (1 category)
+        scores ``4.0 × 1.0 = 4.0``, while a ledger that reads two files,
+        runs one ``search_code``, and one ``list_symbols`` (3 categories)
+        scores ``5.0 × 2.0 = 10.0`` — the diverse ledger dominates even
+        with fewer calls, which is the whole point of the Iron Gate.
+
+        Pre-2026-04-14 (Session bt-2026-04-15-054552) the scorer was a
+        plain linear sum, which *punished* diversification whenever the
+        diverse tool had a lower base weight than the one it replaced.
+        The empirical failure mode: a retry that added ``list_dir`` to
+        ``read_file × 2`` scored 2.5, LOWER than four read_file calls at
+        4.0, and was rejected by the Iron Gate — despite being
+        structurally more diverse. The multiplier fixes that.
+
+        Duplicate calls (same ``(tool_name, arguments_hash)``) contribute
+        ``base_weight * _DUPLICATE_WEIGHT_FACTOR`` (hard 0). Failed calls
+        still accrue base weight (a failed grep is still signal) but
+        don't add to category coverage — an all-failed ledger therefore
+        has ``n_cats == 0`` and multiplies to zero, a STRONGER anti-
+        gaming property than the pre-multiplier formula provided.
         """
         seen: set = set()
-        total = 0.0
+        base = 0.0
         for call in self.calls:
             key = (call.tool_name, call.arguments_hash)
             if key in seen:
-                total += call.base_weight * _DUPLICATE_WEIGHT_FACTOR
+                base += call.base_weight * _DUPLICATE_WEIGHT_FACTOR
             else:
                 seen.add(key)
-                total += call.base_weight
-        return round(total, 3)
+                base += call.base_weight
+
+        base = min(base, _BASE_SCORE_CAP)
+        n_cats = len(self.categories_covered())
+
+        if n_cats == 0:
+            multiplier = 0.0
+        else:
+            multiplier = 1.0 + 0.5 * (n_cats - 1)
+
+        return round(base * multiplier, 3)
 
     def categories_covered(self) -> FrozenSet[ExplorationCategory]:
         """Categories with at least one successful, unique call.
@@ -255,16 +299,49 @@ _DEFAULT_FLOORS: Mapping[str, Mapping[str, object]] = {
         "required_categories": frozenset(),
     },
     "simple": {
-        "min_score":           4.0,
+        # Calibrated 2026-04-14 for the diversity-multiplier formula.
+        # The minimum acceptable simple-op exploration is "read the target
+        # file + do one breadth action" — read_file + search_code scores
+        # 2.5 * 1.5 = 3.75 under the new math. Floor set to 3.5 so that
+        # pattern passes while read_file + list_dir (1.5 * 1.5 = 2.25)
+        # does not — list_dir alone is too light to count as real breadth.
+        "min_score":           3.5,
         "min_categories":      2,
         "required_categories": frozenset(),
     },
     "moderate": {
+        # Unchanged floor; much easier to hit under the new multiplier
+        # math because a 3-category exploration gets ×2.0. A minimal
+        # acceptable pattern (read_file + search_code + list_symbols =
+        # 4.0 base × 2.0 = 8.0) sits exactly at the floor.
         "min_score":           8.0,
         "min_categories":      3,
         "required_categories": frozenset(),
     },
+    "complex": {
+        # NEW entry (2026-04-14) — was silently falling through to
+        # `moderate` defaults because `complex` had no dedicated row.
+        # Session bt-2026-04-15-044627 made that fall-through visible:
+        # a 4-file COMPLEX probe was being enforced against a MODERATE
+        # score floor. Calibrated to sit JUST BELOW the "minimum reasonable
+        # 4-file exploration" pattern (read_file × 2 + search_code +
+        # list_symbols = 5.0 base × 2.0 mult = 10.0). A model that clears
+        # this floor has demonstrably touched comprehension + discovery +
+        # structure; a model that doesn't is still in single-category spam.
+        "min_score":           10.0,
+        "min_categories":      3,
+        "required_categories": frozenset(),
+    },
     "architectural": {
+        # TODO(2026-04-14): Recalibrate for the new diversity-multiplier
+        # formula. Under the new math, any 4-category exploration at base
+        # >=5.5 passes 11.0 trivially, so this floor is effectively a
+        # no-op — the load-bearing gates are `min_categories=4` and the
+        # `required_categories={CALL_GRAPH, HISTORY}` conjunct. Revisit
+        # after one or two ARCHITECTURAL-tier battle tests land under
+        # the new formula to pick a floor that reflects "true
+        # architectural-grade exploration" rather than the pre-
+        # multiplier calibration this number was fitted to.
         "min_score":           11.0,
         "min_categories":      4,
         "required_categories": frozenset({

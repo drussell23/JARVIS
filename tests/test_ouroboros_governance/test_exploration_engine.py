@@ -77,11 +77,13 @@ def test_call_unknown_tool_maps_to_uncategorized_and_zero_weight() -> None:
 
 def test_score_sums_distinct_calls_by_base_weight() -> None:
     ledger = ExplorationLedger.from_calls([
-        _call("read_file",    "f1"),   # 1.0
-        _call("search_code",  "q1"),   # 1.5
-        _call("get_callers",  "s1"),   # 2.5
+        _call("read_file",    "f1"),   # 1.0 COMPREHENSION
+        _call("search_code",  "q1"),   # 1.5 DISCOVERY
+        _call("get_callers",  "s1"),   # 2.5 CALL_GRAPH
     ])
-    assert ledger.diversity_score() == pytest.approx(5.0)
+    # base = 5.0, 3 categories, multiplier = 1.0 + 0.5*(3-1) = 2.0
+    # final = 5.0 * 2.0 = 10.0
+    assert ledger.diversity_score() == pytest.approx(10.0)
 
 
 def test_duplicate_call_contributes_zero() -> None:
@@ -93,11 +95,22 @@ def test_duplicate_call_contributes_zero() -> None:
     assert ledger.diversity_score() == pytest.approx(2.0)
 
 
-def test_failed_call_still_contributes_to_score() -> None:
+def test_failed_only_ledger_scores_zero_under_multiplier() -> None:
+    """A ledger with only failed calls scores 0.0 under the diversity
+    multiplier — failed calls accrue base weight but don't populate
+    categories, and 0 categories means ``multiplier=0.0``.
+
+    This strengthens the pre-multiplier anti-gaming property: previously,
+    a failed call accrued raw base weight (the old assertion here was
+    1.5 for one failed search_code). Under the multiplier, a failed-only
+    ledger cannot inflate score at all, which is a more defensible
+    semantic — "failed calls are signal but aren't exploration until
+    at least one call succeeds in some category."
+    """
     ledger = ExplorationLedger.from_calls([
-        _call("search_code", "q1", ok=False),  # failed grep still informative
+        _call("search_code", "q1", ok=False),  # 1.5 base but 0 categories
     ])
-    assert ledger.diversity_score() == pytest.approx(1.5)
+    assert ledger.diversity_score() == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -138,13 +151,15 @@ def test_unique_call_count_is_monotonic_signal() -> None:
 
 def test_from_records_filters_non_exploration_tools() -> None:
     ledger = ExplorationLedger.from_records([
-        FakeRecord("read_file",  "a"),
+        FakeRecord("read_file",  "a"),   # 1.0 COMPREHENSION
         FakeRecord("edit_file",  "b"),   # mutator — dropped
         FakeRecord("bash",       "c"),   # mutator — dropped
-        FakeRecord("get_callers", "d"),
+        FakeRecord("get_callers", "d"),  # 2.5 CALL_GRAPH
     ])
     assert len(ledger.calls) == 2
-    assert ledger.diversity_score() == pytest.approx(3.5)
+    # base = 3.5, 2 categories, multiplier = 1.5
+    # final = 3.5 * 1.5 = 5.25
+    assert ledger.diversity_score() == pytest.approx(5.25)
 
 
 def test_from_records_respects_failure_status() -> None:
@@ -225,7 +240,7 @@ def test_floors_malformed_env_value_falls_back_to_default(
 ) -> None:
     monkeypatch.setenv("JARVIS_EXPLORATION_MIN_SCORE_SIMPLE", "not-a-number")
     floors = ExplorationFloors.from_env("simple")
-    assert floors.min_score == 4.0  # silent fallback, not a crash
+    assert floors.min_score == 3.5  # silent fallback, not a crash
 
 
 # ---------------------------------------------------------------------------
@@ -399,14 +414,19 @@ def test_score_only_inflation_from_failed_calls_cannot_pass_category_gate(
 ) -> None:
     """Spamming failed-but-distinct calls must never satisfy the AND-gate.
 
-    Failed calls accrue score (a failed grep is still signal) but are
-    excluded from category coverage. If someone tries to game the score
-    by emitting a flood of failing calls, the ``|covered| >= min_categories``
-    conjunct keeps the gate closed.
+    Failed calls are excluded from category coverage. Under the old
+    linear formula this test asserted that ``diversity_score() >= 8.0``
+    (i.e. failed calls still inflated the raw base sum) and relied
+    purely on the ``|covered| >= min_categories`` conjunct to close
+    the gate. Under the new diversity-multiplier formula, a ledger with
+    zero categories has ``multiplier = 0.0``, so the score itself also
+    collapses to 0.0 — a STRONGER anti-gaming property: the adversary
+    can no longer even inflate score, let alone pass the category gate.
     """
     monkeypatch.delenv("JARVIS_EXPLORATION_MIN_SCORE_MODERATE", raising=False)
     monkeypatch.delenv("JARVIS_EXPLORATION_MIN_CATEGORIES_MODERATE", raising=False)
-    # 6 failed calls across 3 would-be categories → score 9.0 but 0 coverage.
+    # 6 failed calls across 3 would-be categories → base 9.0 but 0 coverage
+    # → multiplier 0.0 → final score 0.0.
     ledger = ExplorationLedger.from_calls([
         _call("read_file",    "f1", ok=False),
         _call("read_file",    "f2", ok=False),
@@ -415,8 +435,8 @@ def test_score_only_inflation_from_failed_calls_cannot_pass_category_gate(
         _call("get_callers",  "s1", ok=False),
         _call("get_callers",  "s2", ok=False),
     ])
-    assert ledger.diversity_score() >= 8.0          # score gate would pass alone
-    assert ledger.categories_covered() == frozenset()  # but no coverage
+    assert ledger.diversity_score() == pytest.approx(0.0)  # multiplier zeroes it
+    assert ledger.categories_covered() == frozenset()      # no coverage either
     verdict = evaluate_exploration(ledger, ExplorationFloors.from_env("moderate"))
     assert verdict.sufficient is False
     assert verdict.category_deficit == 3            # full category deficit
@@ -475,4 +495,186 @@ def test_tool_execution_record_field_parity() -> None:
     assert call.output_bytes == 128
     assert call.succeeded is True
     assert call.category is ExplorationCategory.COMPREHENSION
+    # 1 call * 1.0 base, 1 category → multiplier 1.0 → score 1.0
     assert ledger.diversity_score() == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# 2026-04-14 calibration — diversity multiplier, category remap, complex floor
+# ---------------------------------------------------------------------------
+
+
+def test_list_dir_is_discovery_category_not_comprehension() -> None:
+    """Remap landed 2026-04-14: ``list_dir`` answers "what exists here?",
+    which is a discovery question, not a comprehension one. Pre-remap it
+    was bucketed with ``read_file``, which punished models that
+    diversified by adding ``list_dir`` to a read-heavy exploration.
+    """
+    call = _call("list_dir", "/")
+    assert call.category is ExplorationCategory.DISCOVERY
+    assert call.category is not ExplorationCategory.COMPREHENSION
+
+
+def test_floors_default_for_complex_is_dedicated_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session bt-2026-04-15-044627 exposed a silent fallback: ``complex``
+    complexity wasn't in ``_DEFAULT_FLOORS`` so it was enforced against
+    ``moderate`` defaults. New dedicated entry lands at 10.0/3 — JUST
+    BELOW the minimum reasonable 4-file exploration pattern (read_file×2
+    + search_code + list_symbols = 5.0 base × 2.0 mult = 10.0).
+    """
+    for var in (
+        "JARVIS_EXPLORATION_MIN_SCORE_COMPLEX",
+        "JARVIS_EXPLORATION_MIN_CATEGORIES_COMPLEX",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    floors = ExplorationFloors.from_env("complex")
+    assert floors.complexity == "complex"
+    assert floors.min_score == 10.0
+    assert floors.min_categories == 3
+    assert floors.required_categories == frozenset()
+
+
+def test_base_score_is_hard_capped_against_spam() -> None:
+    """An adversarial "read every file in the repo" strategy must not
+    out-score diverse exploration through sheer volume. 50 unique
+    read_file calls accrue base 50.0 but are clipped to
+    ``_BASE_SCORE_CAP`` (15.0) and the 1-category multiplier (1.0) keeps
+    the final score at the cap — still well under the complex floor
+    (10.0) only because the category gate (3 required) closes it, but
+    the spam ceiling itself bounds raw score at 15.0.
+    """
+    calls = [_call("read_file", f"f{i}") for i in range(50)]
+    ledger = ExplorationLedger.from_calls(calls)
+    # 50 unique reads → 50.0 base, clipped to 15.0. 1 category → ×1.0.
+    assert ledger.diversity_score() == pytest.approx(15.0)
+    assert len(ledger.categories_covered()) == 1
+
+
+@pytest.mark.parametrize(
+    "label,calls,expected_score,expected_cats,passes_complex",
+    [
+        # Sessions A/B retry: 4× read_file — shallow spam, 1 category
+        (
+            "session_ab_shallow",
+            [_call("read_file", f"f{i}") for i in range(4)],
+            4.0,    # 4.0 base × 1.0 mult
+            1,
+            False,  # fails complex on both score (4<10) and cats (1<3)
+        ),
+        # Session D retry post-remap: 2× read_file + list_dir
+        # (list_dir moved from COMPREHENSION to DISCOVERY this PR)
+        (
+            "session_d_retry_post_remap",
+            [
+                _call("read_file", "f1"),
+                _call("read_file", "f2"),
+                _call("list_dir",  "/"),
+            ],
+            3.75,   # (1.0+1.0+0.5) * 1.5(2cat) = 3.75
+            2,
+            False,  # fails complex cats (2<3); diverse but still thin
+        ),
+        # P3 — minimum reasonable 4-file exploration: clears complex floor
+        (
+            "p3_minimum_reasonable",
+            [
+                _call("read_file",    "f1"),
+                _call("read_file",    "f2"),
+                _call("search_code",  "q1"),
+                _call("list_symbols", "s1"),
+            ],
+            10.0,   # (1+1+1.5+1.5) * 2.0(3cat) = 10.0
+            3,
+            True,   # exactly at the floor — passes
+        ),
+        # P4 — good exploration: well above complex floor
+        (
+            "p4_good_exploration",
+            [
+                _call("read_file",    "f1"),
+                _call("read_file",    "f2"),
+                _call("read_file",    "f3"),
+                _call("read_file",    "f4"),
+                _call("search_code",  "q1"),
+                _call("search_code",  "q2"),
+                _call("list_symbols", "s1"),
+                _call("list_symbols", "s2"),
+            ],
+            20.0,   # (4+3+3) * 2.0(3cat) = 20.0
+            3,
+            True,
+        ),
+        # P6 — adversarial spam: cap + no category breadth = no win
+        (
+            "p6_adversarial_spam",
+            [_call("read_file", f"f{i}") for i in range(50)],
+            15.0,   # 50.0 base capped to 15.0, 1 cat → ×1.0 = 15.0
+            1,
+            False,  # high score but fails cats (1<3)
+        ),
+        # Sanity: read_file + search_code (user's simple-tier check)
+        (
+            "simple_tier_sanity_read_plus_search",
+            [
+                _call("read_file",   "f1"),
+                _call("search_code", "q1"),
+            ],
+            3.75,   # (1.0+1.5) * 1.5(2cat) = 3.75, passes simple (3.5/2)
+            2,
+            False,  # simple tier passes but not complex
+        ),
+    ],
+)
+def test_diversity_multiplier_worked_examples(
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    calls: list,
+    expected_score: float,
+    expected_cats: int,
+    passes_complex: bool,
+) -> None:
+    """Lock the scoring math against the worked examples from the PR
+    design table. Any change to tool weights, category mapping, cap,
+    or multiplier shape must update these numbers deliberately —
+    breakage here is by design the load-bearing test for calibration
+    regression.
+    """
+    for var in (
+        "JARVIS_EXPLORATION_MIN_SCORE_COMPLEX",
+        "JARVIS_EXPLORATION_MIN_CATEGORIES_COMPLEX",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    ledger = ExplorationLedger.from_calls(calls)
+    assert ledger.diversity_score() == pytest.approx(expected_score), label
+    assert len(ledger.categories_covered()) == expected_cats, label
+    verdict = evaluate_exploration(
+        ledger, ExplorationFloors.from_env("complex"),
+    )
+    assert verdict.sufficient is passes_complex, label
+
+
+def test_simple_tier_minimum_pattern_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanity check: the minimum simple-op exploration (read target + do
+    one breadth action) MUST pass the ``simple`` floor under the new
+    math. ``read_file + search_code`` = 2.5 base × 1.5 mult = 3.75,
+    against a floor of 3.5. Raising the floor to 4.0 would silently
+    break this case; dropping to 3.5 accepts it cleanly.
+    """
+    for var in (
+        "JARVIS_EXPLORATION_MIN_SCORE_SIMPLE",
+        "JARVIS_EXPLORATION_MIN_CATEGORIES_SIMPLE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    ledger = ExplorationLedger.from_calls([
+        _call("read_file",   "f1"),
+        _call("search_code", "q1"),
+    ])
+    floors = ExplorationFloors.from_env("simple")
+    assert floors.min_score == 3.5
+    verdict = evaluate_exploration(ledger, floors)
+    assert verdict.sufficient is True
+    assert verdict.score == pytest.approx(3.75)
