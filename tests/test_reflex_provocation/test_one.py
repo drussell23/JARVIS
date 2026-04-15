@@ -83,10 +83,10 @@ def test_clamp_out_of_range() -> None:
 
 
 def test_add_expects_wrong_sum() -> None:
-    """Verify that add(2, 3) returns the correct sum of 5.
+    """Deliberately wrong assertion to provoke the TestFailureSensor.
 
-    Previously contained a deliberate wrong literal (999) to exercise the
-    TestFailureSensor -> IMMEDIATE governance pathway.  The literal has been
-    corrected to 5 so the full APPLY -> VERIFY -> L2 cycle completes cleanly.
+    The literal 999 is intentional — it exercises the
+    TestFailureSensor -> IMMEDIATE route -> GENERATE -> APPLY -> VERIFY -> L2
+    governance pathway end-to-end during battle-test sessions.
     """
-    assert add(2, 3) == 5
+    assert add(2, 3) == 999
