@@ -12,8 +12,9 @@ filesystem, or trust tiers directly.
 from __future__ import annotations
 
 import logging
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from backend.core.ouroboros.governance.autonomy.autonomy_types import (
@@ -48,10 +49,29 @@ class SafetyNetConfig:
     """Configuration for ProductionSafetyNet.
 
     All thresholds are configurable; no hardcoded magic numbers.
+
+    The two probe-failure thresholds are env-tunable so battle-test
+    harnesses can raise them above the ambient background noise rate.
+    Session bt-2026-04-15-085222 (Session J, 2026-04-15) showed that
+    the 13-minute complex-route arc accumulates ~5 probe failures
+    from unrelated sandbox_fallback readonly-database retries during
+    the run, which trips L3 READ_ONLY_PLANNING mid-L2-repair and
+    cancels the in-flight op. Raising
+    JARVIS_SAFETY_NET_SEVERE_THRESHOLD to 50+ for battle tests
+    keeps L3 escalation reserved for genuinely unhealthy conditions.
+    Defaults preserve the pre-patch behavior when env vars are unset.
     """
 
-    probe_failure_escalation_threshold: int = 3
-    probe_failure_severe_threshold: int = 5
+    probe_failure_escalation_threshold: int = field(
+        default_factory=lambda: int(
+            os.environ.get("JARVIS_SAFETY_NET_ESCALATION_THRESHOLD", "3")
+        )
+    )
+    probe_failure_severe_threshold: int = field(
+        default_factory=lambda: int(
+            os.environ.get("JARVIS_SAFETY_NET_SEVERE_THRESHOLD", "5")
+        )
+    )
     rollback_pattern_threshold: int = 2
     rollback_pattern_window_s: float = 3600.0
     human_presence_defer_s: float = 300.0
