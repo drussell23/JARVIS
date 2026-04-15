@@ -78,6 +78,12 @@
         "adapted_instruction": "WARNING: This domain has a 69% failure rate over 65 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
         "reason": "High failure rate (69%)",
         "created_at": 1776237591.589378
+      },
+      {
+        "domain_key": "test_fix::.py",
+        "adapted_instruction": "WARNING: This domain has a 67% failure rate over 70 attempts. Be extra careful with: import statements, type annotations, and edge cases.",
+        "reason": "High failure rate (67%)",
+        "created_at": 1776285102.6048799
       }
     ],
     "code_gen::.py": [
@@ -133,12 +139,12 @@
   },
   "stats": {
     "test_fix::.py": {
-      "success": 20,
-      "failure": 45
+      "success": 24,
+      "failure": 49
     },
     "code_gen::.py": {
-      "success": 112,
-      "failure": 49
+      "success": 130,
+      "failure": 55
     }
   }
 }

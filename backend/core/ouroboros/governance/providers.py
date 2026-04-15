@@ -3020,12 +3020,53 @@ def _parse_generation_response(
         if not isinstance(cand, dict):
             raise RuntimeError(f"{pfx}_schema_invalid:candidate_{i}_not_object")
 
+        # Multi-file shape detection: if `files` is a populated list,
+        # it's the authoritative payload for APPLY (matching
+        # ``_iter_candidate_files``) — top-level ``file_path`` and
+        # ``full_content`` are optional and get synthesized from
+        # ``files[0]`` so downstream single-file consumers that read
+        # ``cand["file_path"]`` / ``cand["full_content"]`` directly
+        # (length check, AST preflight, APPLY single-path branch)
+        # keep working unchanged. Without this, the
+        # ``_build_multi_file_contract_block`` prompt hint told the
+        # model to emit ``files: [...]`` without top-level
+        # ``file_path``, and the parser rejected every resulting
+        # multi-file candidate with ``missing_file_path`` (Session Q
+        # bt-2026-04-15-201035, fix in flight for Session R).
+        _has_multi_shape = (
+            isinstance(cand.get("files"), list) and bool(cand["files"])
+        )
+        if _has_multi_shape:
+            _required_top_fields: Tuple[str, ...] = ("candidate_id", "rationale")
+        else:
+            _required_top_fields = (
+                "candidate_id", "file_path", "full_content", "rationale",
+            )
+
         # Required fields
-        for field in ("candidate_id", "file_path", "full_content", "rationale"):
+        for field in _required_top_fields:
             if field not in cand:
                 raise RuntimeError(
                     f"{pfx}_schema_invalid:candidate_{i}_missing_{field}"
                 )
+
+        # Synthesize primary file_path/full_content from files[0] for
+        # multi-file candidates so the length check, placeholder scan,
+        # and AST preflight below can run against the first entry. If
+        # files[0] is structurally malformed, Step 6b will raise a
+        # precise error when it re-walks the list.
+        if _has_multi_shape:
+            _first_entry = cand["files"][0]
+            if isinstance(_first_entry, dict):
+                if "file_path" not in cand:
+                    cand["file_path"] = _first_entry.get("file_path", "") or ""
+                if "full_content" not in cand:
+                    cand["full_content"] = (
+                        _first_entry.get("full_content", "") or ""
+                    )
+            else:
+                cand.setdefault("file_path", "")
+                cand.setdefault("full_content", "")
 
         # Extra fields — strip instead of rejecting.
         # Models (especially Doubleword 397B) sometimes add metadata fields
