@@ -1,5 +1,43 @@
 # Ouroboros: Self-Development Governance Pipeline
 
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Pipeline Phases](#pipeline-phases)
+3. [Key Components](#key-components)
+4. [Venom: Agentic Execution Layer](#venom-agentic-execution-layer)
+5. [Autonomous Developer Intelligence (7 Capabilities)](#autonomous-developer-intelligence-7-capabilities)
+6. [Session Lessons (from prior operations this session)](#session-lessons-from-prior-operations-this-session)
+7. [Cognitive Depth: Extended Thinking](#cognitive-depth-extended-thinking)
+8. [Tool Defaults: Unshackled Under Governance](#tool-defaults-unshackled-under-governance)
+9. [Model-Reasoned PLAN Phase (Gap #3)](#model-reasoned-plan-phase-gap-3)
+10. [Mid-Operation Clarification: ask_human Tool (Gap #4)](#mid-operation-clarification-ask_human-tool-gap-4)
+11. [L3 Worktree Isolation (Gap #5)](#l3-worktree-isolation-gap-5)
+12. [Auto-Commit Post-APPLY (Gap #6)](#auto-commit-post-apply-gap-6)
+13. [MCP Tool Forwarding (Gap #7)](#mcp-tool-forwarding-gap-7)
+14. [Live Context Auto-Compaction (Gap #8)](#live-context-auto-compaction-gap-8)
+15. [DW 3-Tier Event-Driven Architecture](#dw-3-tier-event-driven-architecture)
+16. [Edge Case Hardening (12 Refinements)](#edge-case-hardening-12-refinements)
+17. [SerpentFlow CLI](#serpentflow-cli)
+18. [Trinity Consciousness: The Metacognition Layer](#trinity-consciousness-the-metacognition-layer)
+19. [Strategic Direction (Manifesto v4)](#strategic-direction-manifesto-v4)
+20. [Multi-Repo Support](#multi-repo-support)
+21. [Intake Layer: Unified Event Spine](#intake-layer-unified-event-spine)
+22. [Operation Ledger](#operation-ledger)
+23. [Branch Isolation](#branch-isolation)
+24. [Observability](#observability)
+25. [Battle Test Runner](#battle-test-runner)
+26. [Environment Variables](#environment-variables)
+27. [File Reference](#file-reference)
+28. [Battle Test Breakthrough Log](#battle-test-breakthrough-log)
+29. [O+V Capability Assessment (2026-04-12)](#ov-capability-assessment-2026-04-12)
+30. [Claude Mythos Preview Cross-Reference (2026-04-12)](#claude-mythos-preview-cross-reference-2026-04-12)
+31. [Functions, Not Agents: DoubleWord Reseating Roadmap (2026-04-14)](#functions-not-agents-doubleword-reseating-roadmap-2026-04-14)
+
+---
+
 ## Overview
 
 Ouroboros is the autonomous self-development system that allows JARVIS to
