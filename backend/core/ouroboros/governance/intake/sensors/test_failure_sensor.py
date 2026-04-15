@@ -16,9 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from backend.core.ouroboros.governance.intent.signals import IntentSignal
 from backend.core.ouroboros.governance.intent.test_watcher import TestFailure
@@ -28,6 +29,45 @@ from backend.core.ouroboros.governance.intake.intent_envelope import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# In-flight dedup (bt-2026-04-15-010727 findings)
+# ---------------------------------------------------------------------------
+#
+# TestFailureSensor polls every ``poll_interval_s`` (default 30s via
+# JARVIS_INTENT_TEST_INTERVAL_S). When an op for a broken test file is
+# already in flight, subsequent polls at t+30s / t+60s / … continue to
+# observe the same broken test (the in-flight op hasn't APPLIED yet) and
+# re-emit signals. Each re-emission is accepted by the router because:
+#
+#   (a) The router's ``register_active_op`` hook — which would populate
+#       ``_active_file_ops`` and trigger ``_find_file_conflict`` → queued_behind
+#       — is defined but NEVER called from any caller. Dead code as of this
+#       fix. That path would require wiring in GLS and an orchestration
+#       ordering guarantee (register before the next ingest arrives), which
+#       has its own race window.
+#   (b) GLS's *separate* ``_active_file_ops`` set (line 966 in
+#       governed_loop_service.py) IS populated at dispatch time and rejects
+#       duplicates with ``reason_code="file_in_flight"`` — but only *after*
+#       the router has already accepted the envelope, burned a WAL entry,
+#       created an op_id, and handed it to GLS. In v5 the test_failure
+#       concurrency storm (3 ops × same file × 88s under 85s Claude first-
+#       token) bypassed GLS's check entirely, probably because the three
+#       workers raced past the check window.
+#
+# Sensor-side dedup is the narrow, race-free fix: reject the re-emission at
+# the earliest possible point (before even calling ``router.ingest``) using
+# an in-process dict keyed by target_file. TTL-based cleanup means a stuck
+# op eventually releases the slot automatically — we don't need a completion
+# callback from the orchestrator.
+#
+# Env gate: ``JARVIS_TEST_FAILURE_INFLIGHT_TTL_S`` (default 300s). Set to 0
+# or negative to disable the dedup entirely.
+
+_INFLIGHT_TTL_S: float = float(
+    os.environ.get("JARVIS_TEST_FAILURE_INFLIGHT_TTL_S", "300")
+)
 
 
 class TestFailureSensor:
@@ -55,6 +95,62 @@ class TestFailureSensor:
         self._watcher = test_watcher
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
+        # In-flight dedup: target_file_path -> monotonic submitted_at
+        # See module docstring above ``_INFLIGHT_TTL_S`` for the rationale.
+        self._pending_target_keys: Dict[str, float] = {}
+
+    def _prune_stale_pending(self) -> None:
+        """Drop pending target entries that have exceeded their TTL.
+
+        Bounds the dict size and ensures a stuck op (orchestrator crash,
+        hibernation, forgotten release callback) eventually releases the
+        slot so the next legitimate signal for the same file can flow.
+        """
+        if _INFLIGHT_TTL_S <= 0 or not self._pending_target_keys:
+            return
+        now = time.monotonic()
+        stale = [
+            k for k, ts in self._pending_target_keys.items()
+            if now - ts > _INFLIGHT_TTL_S
+        ]
+        for k in stale:
+            del self._pending_target_keys[k]
+
+    def _in_flight_target(self, signal: IntentSignal) -> Optional[str]:
+        """Return the first target_file from *signal* that is already
+        marked in-flight (within TTL), or None if all targets are free.
+
+        Called before ``router.ingest`` to short-circuit re-emission of
+        a signal whose target file already has an op working on it.
+        """
+        if _INFLIGHT_TTL_S <= 0:
+            return None
+        self._prune_stale_pending()
+        for target in (signal.target_files or ()):
+            if target in self._pending_target_keys:
+                return target
+        return None
+
+    def _mark_targets_in_flight(self, signal: IntentSignal) -> None:
+        """Record the signal's target files as in-flight. Called only
+        after a successful ``router.ingest`` with status ``"enqueued"`` —
+        dropped / deduplicated / queued signals do NOT mark targets,
+        because the router is going to re-ingest them later and that
+        re-ingest should not be self-suppressed by sensor-side dedup.
+        """
+        if _INFLIGHT_TTL_S <= 0:
+            return
+        now = time.monotonic()
+        for target in (signal.target_files or ()):
+            self._pending_target_keys[target] = now
+
+    def release_target(self, target_file: str) -> None:
+        """Manually release an in-flight target slot. Public API for
+        orchestrator / GLS completion hooks that want to unblock the
+        next signal immediately instead of waiting for TTL expiry.
+        Idempotent — no-op if the target was not tracked.
+        """
+        self._pending_target_keys.pop(target_file, None)
 
     async def _signal_to_envelope_and_ingest(
         self, signal: IntentSignal
@@ -64,6 +160,21 @@ class TestFailureSensor:
         Returns the envelope if ingested, None if skipped.
         """
         if not signal.stable:
+            return None
+
+        # In-flight dedup: reject re-emission while an op is already
+        # working on any of the signal's target files. This is the
+        # earliest-possible short-circuit — before envelope creation,
+        # before router.ingest, before any WAL / queue / op_id burn.
+        in_flight_target = self._in_flight_target(signal)
+        if in_flight_target is not None:
+            logger.info(
+                "TestFailureSensor: suppressing re-emission — target "
+                "%s already in-flight (%.0fs ago): %s",
+                in_flight_target,
+                time.monotonic() - self._pending_target_keys[in_flight_target],
+                signal.description[:80],
+            )
             return None
 
         confidence = min(1.0, signal.confidence)
@@ -82,6 +193,7 @@ class TestFailureSensor:
         try:
             result = await self._router.ingest(envelope)
             if result == "enqueued":
+                self._mark_targets_in_flight(signal)
                 logger.info(
                     "TestFailureSensor: enqueued test failure: %s",
                     signal.description,
