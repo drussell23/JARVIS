@@ -198,6 +198,31 @@ class OrchestratorConfig:
         Number of additional generation attempts after the first failure.
     max_validate_retries:
         Number of additional validation attempts after the first failure.
+        Env-tunable via ``JARVIS_MAX_VALIDATE_RETRIES`` (default ``2``).
+
+        Set to ``0`` to bypass retries and dispatch failures straight to
+        L2 Repair on the first critique. The original justification was
+        latency: for a complex multi-file op, each validation pass costs
+        ~7 minutes, so 2 retries consume ~21 minutes before L2 can
+        dispatch — exceeding a typical 20-minute idle budget.
+
+        Session U (``bt-2026-04-15-215858``, FSM-instrumented) revealed
+        a stronger second justification: re-validation is **non-
+        deterministic across iterations**. Same candidate, same test
+        targets — iter=0 returned ``failure_class='test'`` (the real LSP
+        defect that L2 should repair) but iter=1 returned
+        ``failure_class='infra'`` (a sandbox/pytest transient). The
+        ``'infra'`` class is non-retryable by design: it triggers the
+        early-return branch at ``_early_return_ctx`` and advances ctx
+        straight to POSTMORTEM, killing the op on a flake instead of
+        giving L2 a chance to repair the legitimate critique iter=0
+        identified. Setting ``max_validate_retries=0`` takes the loop
+        out of this race entirely — iter=0 runs once, the
+        ``validate_retries_remaining`` counter decrements to ``-1``, and
+        the L2 dispatch branch at ``validate_retries_remaining < 0``
+        fires on the real ``'test'`` critique.
+
+        Battle-test override: ``JARVIS_MAX_VALIDATE_RETRIES=0``.
     """
 
     project_root: Path
@@ -206,7 +231,11 @@ class OrchestratorConfig:
     validation_timeout_s: float = 60.0
     approval_timeout_s: float = 600.0
     max_generate_retries: int = 1
-    max_validate_retries: int = 2
+    max_validate_retries: int = field(
+        default_factory=lambda: int(
+            os.environ.get("JARVIS_MAX_VALIDATE_RETRIES", "2")
+        )
+    )
     context_expansion_enabled: bool = True
     context_expansion_timeout_s: float = 30.0
 
