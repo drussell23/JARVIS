@@ -378,6 +378,66 @@ def test_feedback_mentions_score_widening_hint_when_deficit_positive() -> None:
     assert "get_callers" in body  # at least one concrete tool suggestion
 
 
+def test_feedback_sharpens_when_categories_satisfied_but_score_low() -> None:
+    """Session E (bt-2026-04-15-063108) failure mode: model covered 3
+    categories but picked low-leverage tools, scoring 9.0 / 10.0.
+
+    When categories are satisfied but score is below floor, the feedback
+    must explicitly:
+      1. Name the HIGH-leverage tools the model should prefer
+         (get_callers, git_blame)
+      2. Name the MEDIUM-leverage tools as a fallback
+         (search_code, list_symbols, git_log, git_diff)
+      3. WARN against padding with low-leverage tools
+         (list_dir, glob_files)
+
+    This is the branch added by the Session E sharpening pass — the
+    generic "Widen your exploration" hint from the pre-sharpening
+    version was too soft for this failure mode.
+    """
+    verdict = ExplorationVerdict(
+        sufficient=False,
+        score=9.0,
+        score_deficit=1.0,
+        categories_covered=frozenset({
+            ExplorationCategory.COMPREHENSION,
+            ExplorationCategory.DISCOVERY,
+            ExplorationCategory.STRUCTURE,
+        }),  # 3 categories — matches min_categories exactly
+        missing_categories=frozenset(),
+        category_deficit=0,
+    )
+    floors = ExplorationFloors(
+        complexity="complex",
+        min_score=10.0,
+        min_categories=3,
+    )
+    body = render_retry_feedback(verdict, floors)
+
+    # The sharpened score-gate branch must fire
+    assert "SCORE GATE" in body
+    assert "deficit 1.0" in body
+
+    # High-leverage tools explicitly named
+    assert "get_callers" in body
+    assert "git_blame" in body
+
+    # Medium-leverage tools as fallback
+    assert "search_code" in body
+    assert "list_symbols" in body
+    assert "git_log" in body
+
+    # Explicit warning against low-leverage padding
+    assert "LOW-LEVERAGE" in body or "low-leverage" in body.lower()
+    assert "list_dir" in body
+    assert "glob_files" in body
+    assert "DO NOT" in body  # the explicit don't-pad directive
+
+    # Category count still reported so the model knows it's on the right
+    # track for breadth
+    assert "3 categories" in body or "categories covered: 3" in body.lower()
+
+
 # ---------------------------------------------------------------------------
 # is_ledger_enabled
 # ---------------------------------------------------------------------------

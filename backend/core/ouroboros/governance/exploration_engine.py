@@ -484,6 +484,27 @@ def evaluate_exploration(
     )
 
 
+# Tool leverage tiers for retry feedback. Kept in sync with _TOOL_WEIGHT
+# above — if weights are rebalanced, update these lists so the feedback
+# doesn't send the model after tools that have lost their edge.
+#
+# The three tiers reflect the multiplier-era reality: a ledger that
+# covers 3 categories using only 0.5-weight tools scores
+# ``3 * 0.5 * 2.0 = 3.0`` and fails every non-trivial floor, while the
+# same 3 categories covered with one 2.5-weight tool and two 1.5-weight
+# tools scores ``5.5 * 2.0 = 11.0`` and passes complex (10.0) cleanly.
+# Naming the tools explicitly in the feedback closes the behavioral
+# gap Session bt-2026-04-15-063108 exposed: the model diversified
+# correctly but picked the cheapest tool per category (list_dir 0.5
+# for discovery, list_symbols 1.5 for structure), coming up 1.0 short
+# of the complex floor at 9.0/10.0.
+_HIGH_LEVERAGE_TOOLS: Tuple[str, ...] = ("get_callers", "git_blame")
+_MEDIUM_LEVERAGE_TOOLS: Tuple[str, ...] = (
+    "search_code", "list_symbols", "git_log", "git_diff",
+)
+_LOW_LEVERAGE_TOOLS: Tuple[str, ...] = ("list_dir", "glob_files")
+
+
 def render_retry_feedback(
     verdict: ExplorationVerdict,
     floors: ExplorationFloors,
@@ -495,6 +516,21 @@ def render_retry_feedback(
     verdicts name the **missing categories** rather than emitting a generic
     "need more reads" message — that's the whole point of the diversity
     floor.
+
+    Two distinct failure modes get dedicated feedback branches:
+
+    1. **Missing required or unsatisfied category count** — tell the
+       model which categories are still absent and demand at least one
+       tool per missing category.
+    2. **Score-only deficit with categories satisfied** (Session E,
+       2026-04-14) — the model has the right breadth but picked
+       lightweight tools (``list_dir``, ``glob_files``) to hit category
+       count. Padding with more of those will never raise the score.
+       This branch explicitly names the HIGH-leverage tools
+       (``get_callers``, ``git_blame``) and MEDIUM-leverage tools
+       (``search_code``, ``list_symbols``, ``git_log``, ``git_diff``)
+       that move the score, and warns the model against repeating the
+       low-leverage pattern.
     """
     if verdict.sufficient:
         return ""
@@ -515,12 +551,68 @@ def render_retry_feedback(
             "You MUST call at least one tool from each of these categories "
             "before emitting any edit_file / write_file / delete_file call."
         )
+
+    # Session E (2026-04-14) branch: categories satisfied but score below
+    # floor. This is the "model picked cheap tools per category" failure
+    # mode. The generic "Widen your exploration" hint from the pre-Session-E
+    # version was too soft — the model took it as "add more low-leverage
+    # calls to different categories" and produced a 9.0/10.0 near-miss.
+    # Here we spell out the actual weight hierarchy and warn against
+    # repeating the list_dir-style padding.
+    categories_satisfied = (
+        len(verdict.categories_covered) >= floors.min_categories
+        and not verdict.missing_categories
+    )
+
     if verdict.score_deficit > 0:
-        lines.append(
-            "- Widen your exploration: call get_callers on the target symbols, "
-            "list_symbols on the target file, search_code for related usages, "
-            "or git_blame on hot regions."
-        )
+        if categories_satisfied:
+            hl = ", ".join(f"`{t}`" for t in _HIGH_LEVERAGE_TOOLS)
+            ml = ", ".join(f"`{t}`" for t in _MEDIUM_LEVERAGE_TOOLS)
+            ll = ", ".join(f"`{t}`" for t in _LOW_LEVERAGE_TOOLS)
+            lines.extend([
+                (
+                    f"- SCORE GATE: you cover "
+                    f"{len(verdict.categories_covered)} categories "
+                    f"(required {floors.min_categories}) but your score "
+                    f"is {verdict.score:.1f}/{floors.min_score:.1f} — "
+                    f"deficit {verdict.score_deficit:.1f} points."
+                ),
+                (
+                    "- CATEGORY BREADTH ALONE IS NOT ENOUGH. Your previous "
+                    f"attempt likely used LOW-LEVERAGE tools ({ll}, each "
+                    "worth 0.5 weight) to cover categories. Calling MORE "
+                    "of those tools will NOT raise the score — they "
+                    "contribute minimally to the weighted sum."
+                ),
+                (
+                    f"- Widen your exploration with HIGH-LEVERAGE tools: "
+                    f"{hl} (worth 2.0–2.5 weight each). A single "
+                    "`get_callers` call on the primary target symbol, or a "
+                    "`git_blame` on the target file, will push you past "
+                    "the floor by itself."
+                ),
+                (
+                    f"- Alternatively, use MEDIUM-LEVERAGE tools: {ml} "
+                    "(worth 1.5 weight each). Prefer `search_code` for "
+                    "cross-file references, `list_symbols` for target-"
+                    "file structure, or `git_log` / `git_diff` for "
+                    "temporal context."
+                ),
+                (
+                    "- DO NOT pad with additional `list_dir` or `glob_files` "
+                    "calls — they will not close the score deficit. Call "
+                    "get_callers / git_blame / search_code instead."
+                ),
+            ])
+        else:
+            # Original "widen your exploration" hint — fires when score is
+            # low AND categories are still missing (both gates unsatisfied).
+            # Preserved verbatim so the legacy test case keeps passing.
+            lines.append(
+                "- Widen your exploration: call get_callers on the target symbols, "
+                "list_symbols on the target file, search_code for related usages, "
+                "or git_blame on hot regions."
+            )
     lines.append(
         "Run more exploration tools now; do not attempt to patch until the "
         "gate passes."
