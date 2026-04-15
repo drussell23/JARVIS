@@ -56,6 +56,84 @@ _BREAKER_TRIGGERS: Tuple[str, ...] = (
     "getaddrinfo", "connection refused", "connection reset",
 )
 
+# ---------------------------------------------------------------------------
+# Per-issue exhaustion cooldown registry (bt-2026-04-15 findings)
+# ---------------------------------------------------------------------------
+#
+# When an op sourced from a github_issue exhausts its providers, we mark the
+# issue as "recently exhausted" and suppress emission on subsequent scans
+# until the cooldown window closes. Prevents a chronic unresolvable issue
+# (e.g. #16501 "Unlock Test Suite Failed" in bt-2026-04-15-012736 and
+# bt-2026-04-15-013455) from single-handedly driving the organism toward
+# hibernation — 3 chronic-noise exhaustions trip ProviderExhaustionWatcher's
+# global counter even when the reflex path is healthy.
+#
+# State is module-level (not instance-level) so any caller — CandidateGenerator
+# on exhaustion, orchestrator POSTMORTEM handler, tests — can register a
+# cooldown without needing a handle to the sensor instance. Process-scoped:
+# cleared on restart. Env-gated for full reversibility.
+#
+# Env gate: ``JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S`` (default 900s).
+# Set to 0 or a negative value to disable the registry entirely.
+
+_ISSUE_EXHAUSTION_COOLDOWN_S: float = float(
+    os.environ.get("JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S", "900")
+)
+
+# issue_key -> monotonic deadline after which the cooldown is released
+_issue_exhaustion_cooldowns: Dict[str, float] = {}
+
+
+def register_issue_exhaustion(issue_key: str, reason: str = "") -> None:
+    """Record that an op sourced from ``issue_key`` exhausted its providers.
+
+    Next scan will suppress emission of ``issue_key`` until the cooldown
+    window closes. No-op when ``JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S``
+    is 0 or negative.
+
+    Parameters
+    ----------
+    issue_key:
+        The dedup key used by the sensor, format ``"{repo}:{issue_number}"``.
+        Must match exactly what ``scan_once`` computes on line
+        ``dedup_key = f"{finding.repo}:{finding.issue_number}"``.
+    reason:
+        Short free-text explanation for logs (e.g. the exhaustion cause).
+        Not used for matching — diagnostic only.
+    """
+    if _ISSUE_EXHAUSTION_COOLDOWN_S <= 0:
+        return  # disabled
+    if not issue_key:
+        return
+    cooldown_until = time.monotonic() + _ISSUE_EXHAUSTION_COOLDOWN_S
+    _issue_exhaustion_cooldowns[issue_key] = cooldown_until
+    logger.info(
+        "[GitHubIssueSensor] Cooldown set for %s (%.0fs): %s",
+        issue_key,
+        _ISSUE_EXHAUSTION_COOLDOWN_S,
+        reason[:120],
+    )
+
+
+def _issue_cooldown_active(issue_key: str) -> bool:
+    """Return True when ``issue_key`` is currently within its cooldown window.
+
+    Transparently expires stale entries — if the deadline has passed, the
+    entry is removed and the function returns False. Runs in O(1).
+    """
+    deadline = _issue_exhaustion_cooldowns.get(issue_key)
+    if deadline is None:
+        return False
+    if time.monotonic() >= deadline:
+        _issue_exhaustion_cooldowns.pop(issue_key, None)
+        return False
+    return True
+
+
+def clear_issue_cooldowns() -> None:
+    """Clear the entire cooldown registry. Intended for tests only."""
+    _issue_exhaustion_cooldowns.clear()
+
 # Trinity repository mapping
 _TRINITY_REPOS: Tuple[Tuple[str, str, str], ...] = (
     ("jarvis", "drussell23/JARVIS", "backend/"),
@@ -221,9 +299,23 @@ class GitHubIssueSensor:
 
         # Emit envelopes
         emitted = 0
+        cooldown_suppressed = 0
         for finding in deduplicated:
             dedup_key = f"{finding.repo}:{finding.issue_number}"
             if dedup_key in self._seen_issues:
+                continue
+            # Suppress issues currently inside their exhaustion cooldown
+            # window. A chronic unresolvable issue would otherwise re-emit
+            # on every scan, re-enter generation, re-exhaust, and single-
+            # handedly drive ProviderExhaustionWatcher's global counter
+            # toward hibernation even when the reflex path is healthy.
+            if _issue_cooldown_active(dedup_key):
+                cooldown_suppressed += 1
+                logger.info(
+                    "[GitHubIssueSensor] #%d (%s): suppressed — "
+                    "exhaustion cooldown still active",
+                    finding.issue_number, finding.repo,
+                )
                 continue
             self._seen_issues.add(dedup_key)
 
@@ -269,9 +361,11 @@ class GitHubIssueSensor:
 
         if all_findings:
             logger.info(
-                "[GitHubIssueSensor] Scan: %d issues, %d deduplicated, %d emitted",
+                "[GitHubIssueSensor] Scan: %d issues, %d deduplicated, "
+                "%d cooldown-suppressed, %d emitted",
                 len(all_findings),
                 len(all_findings) - len(deduplicated),
+                cooldown_suppressed,
                 emitted,
             )
         return deduplicated
