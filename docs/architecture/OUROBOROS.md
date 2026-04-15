@@ -1841,6 +1841,73 @@ Only (8) was actually the unblocker. (1)–(7) were necessary but not sufficient
 
 **Remaining blocker (now resolved):** `resolve_affected_tests()` walked temp sandbox path instead of repo-relative path, resulting in 0/0 test results. Fixed in commit 22f297d — `original_paths` mapping + multi-strategy test discovery. This was the single gate between current state and full APPLY → VERIFY → COMPLETE progression.
 
+### 2026-04-14 — First end-to-end reflex heal on disk (session `bt-2026-04-15-013455`)
+
+**Headline:** The autonomous loop closed the Ouroboros cycle end-to-end for the first time. A deliberate failing test was detected, routed, generated, L2-repaired, APPLIED to the real filesystem, VERIFIED, and held as the authoritative state. `TestFailureSensor → IMMEDIATE → Claude direct → L2 CONVERGED → skip canonical → GATE → APPLY → VERIFY → COMPLETE → file stayed fixed.`
+
+**Operation that closed the cycle:**
+- Op ID: `op-019d8ec8-1f8e-786c-9671-8697de49a4fb-sig`
+- Source sensor: `TestFailureSensor` (stable failure streak on `tests/test_reflex_provocation/test_one.py::test_add_expects_wrong_sum`)
+- Target: `tests/test_reflex_provocation/test_one.py` (deliberate provocation file, 2675 bytes, 8 tests, 1 broken assert)
+- Route: `IMMEDIATE` (high_urgency_immediate_source:test_failure) → 120s Claude-direct budget
+- L2 converged in iter 1/5 (~21s, git-worktree sandbox + scoped pytest)
+- APPLY landed at 18:39:08, VERIFY passed, `[COMPLETE] Applied successfully`
+- Post-apply disk state: 2515 bytes, md5 `b81451282aaa522293d900e9eba6dd6b`, **8 passed / 0 failed**
+
+**The seven-commit fix chain (all shipped 2026-04-14):**
+
+Each commit unblocked a layer that was silently eating candidates. Every one was in the critical path of every APPLY the organism had ever attempted. None of them were findable without running the reflex loop end-to-end — the bugs were hiding each other.
+
+| Commit | Layer unblocked |
+|---|---|
+| `d9e5beae7e` | **InteractiveRepair gate + TestWatcher parsing.** `interactive_repair.py` was blind-patching `L1-5` of pytest-failing files with `error_type="UnknownError", line_number=0` (pytest assertion output has no stdlib traceback). Default-OFF via `JARVIS_INTERACTIVE_REPAIR_ENABLED` + hard guard inside the loop. Stopped multi-op stacking corruption of target files outside the Iron Gate stack. Also added `JARVIS_INTENT_TEST_DIR` env override + `--color=no` pytest flag + loosened `_FAILED_RE` regex so the sensor actually parses scoped-dir failures. |
+| `010a1bbc6a` | **L2 full_content materialization + BSD patch stdout.** `repair_engine.py` read `candidate["unified_diff"]` unconditionally, but providers are `force_full_content=True` (schema 2b.1) so the field was always empty → headers-only synthetic patch → `patch -p0` exited 2 with `"I can't seem to find a patch in there anywhere."` **on stdout (not stderr)**, which `RepairSandbox.apply_patch` discarded. Added explicit candidate-shape branching: real diff → `apply_patch`, full_content → new `apply_full_content` (verbatim write), neither → fail fast with `candidate_unusable:no_diff_or_full_content`. Error message now aggregates stdout+stderr. |
+| `a8d359f28e` | **L2 scoped pytest + worktree remove diagnostics.** `repair_engine.py` passed `sb.run_tests((), per_iteration_test_timeout_s)` — empty test_targets → pytest full-repo discovery → ~90-100s per iteration → L2 got 1 usable iter per op instead of 5. Scoped to `(file_path,) if file_path else ()`. Same stdout/stderr aggregation applied to git worktree teardown. |
+| `3dc63fef94` | **Post-L2 canonical skip.** `PythonAdapter.run` (`test_runner.py:227-237`) hard-codes `sandbox_dir=None` with docstring rationale "Always runs pytest from repo_root so Python imports resolve." After APPLY writes the candidate to a temp sandbox, the canonical validator ran pytest against `cwd=repo_root` and saw the **live** (still-broken) file — `pass_rate=0.0` → `l2_canonical_validate_failed` → escape to CANCELLED. Introduced `JARVIS_L2_SKIP_CANONICAL_AFTER_CONVERGE` (default ON) to synthesize a passing `ValidationResult` with explicit skip reason. Trusts L2's git-worktree sandbox convergence. |
+| `79cc35335d` | **Benchmarker scoped pytest.** `PatchBenchmarker._coverage_sync` built pytest args as `[f"--cov={f}" ...]` with no positional test paths. `--cov=...` is a coverage-scope option, not a test selector → pytest fell back to full-repo discovery → coverage budget timeout → `pass_rate=0.0`. Scoped to `cov_args + test_paths`. Correct fix, but masked by the next bug. |
+| `5e026ff01d` | **Post-L2 GATE→APPLY diagnostic logging.** After session v5 showed ops silently dying between L2_CONVERGED and phase=APPLY, added INFO logs at `L2 broke VALIDATE_RETRY`, source-drift check pass/fail, GATE entry, and can_write decision. Pure observability; confirmed in v7 that the GATE→APPLY path is structurally fine — v5 was timing-fragile under Claude API latency. |
+| `27226dbba7` | **PatchBenchmarker pytest-cov tolerance** — *the real unblocker.* `pytest_cov` was not installed in the interpreter. Every `--cov` flag the benchmarker passed errored out pytest at usage-parse time with `unrecognized arguments: --cov=...` (exit 4) **before** running any tests → no "X passed" in stdout → regex parser fell through to `pass_rate=0.0` → `verify_gate.enforce_verify_thresholds` tripped `pass_rate<1.0` → `rollback_files` restored the pre-apply snapshot. Every L2-healed reflex op was silently reverted at this step. Added `_pytest_cov_available()` probe; when `pytest-cov` is missing, omit `--cov` args but still run pytest — `pass_rate` is computed correctly from regular pytest output, `coverage_pct` stays 0.0 (harmless without `baseline_coverage`). |
+
+**Trace (condensed, from `bt-2026-04-15-013455/debug.log`):**
+
+```
+18:36:13  TestFailureSensor  streak=2 tests/test_reflex_provocation/test_one.py
+18:38:45  L2 Repair          Iteration 1/5 starting (scoped pytest + git worktree sandbox)
+18:39:06  L2 Repair          ✅ Iteration 1/5 tests: PASSED → ✅ CONVERGED
+18:39:06  Orchestrator       L2_CONVERGED — skipping canonical re-validation (PythonAdapter
+                             ignores sandbox_dir, trusting L2's git-worktree sandbox)
+18:39:06  Orchestrator       Source-drift check passed → Entered GATE phase
+18:39:06  Orchestrator       GATE can_write decision: allowed=True reason=ok
+18:39:07  CommProtocol       phase=APPLY target=tests/test_reflex_provocation/test_one.py
+18:39:08  CommProtocol       DECISION outcome=applied reason_code=safe_auto_passed
+                             diff_summary="Applied change to tests/test_reflex_provocation/test_one.py"
+18:39:13  CommProtocol       (benchmarker scoped pytest via _pytest_cov_available() probe)
+18:39:13  CommProtocol       VERIFY passed (pass_rate=1.0, 8/8)
+18:39:13  Orchestrator       [COMPLETE] Applied successfully
+```
+
+**What this session did NOT yet validate (debt for the clean-test streak):**
+
+- **Zero `all_providers_exhausted`**: bt-2026-04-15-013455 saw two exhaustion events on `-cau` background ops (`op-019d8eca-3a08`) post-COMPLETE, fallback class `CancelledError`/`TimeoutError` under Claude API pressure. This session does NOT yet count toward the 3-consecutive-clean-sessions gate for `DeepAnalysisSensor`. Next engineering target: cascade-to-claude topology for BG/SPECULATIVE ops under provider latency.
+- **`PatchBenchmarker.coverage_pct`**: stays 0.0 whenever `pytest-cov` is missing. Follow-up: either declare `pytest-cov` in `requirements.txt` or teach the benchmarker to use `coverage run -m pytest` as a native fallback. Not blocking the reflex path.
+- **PythonAdapter `sandbox_dir=None` structural bug**: commit `3dc63fef94` is a skip, not a repair. Non-L2 canonical validation paths still have the blind spot (pre-L2 validation silently accepts any candidate whose bug matches the live file's bug). Option B (worktree-based canonical validation) remains the architectural fix.
+- **`TestFailureSensor` in-flight dedup**: sensor keeps re-enqueuing the same signal every 30s while an op is already generating for the same file. Queue bloat under sustained failure. Cheap fix, scheduled after the clean-test streak.
+- **`InteractiveRepair`**: the micro-repair loop is default-OFF and will stay off until it is re-homed through `ChangeEngine.execute` + pytest assertion-diff parsing. That's a separate follow-up PR, not a blocker.
+
+**Session metadata:**
+- Session ID: `bt-2026-04-15-013455`
+- Runtime: ~12 min (stopped manually after COMPLETE + two post-COMPLETE exhaustions)
+- Provocation file: `tests/test_reflex_provocation/test_one.py` (2675 bytes → 2515 bytes after APPLY, 8 tests)
+- Total cost for the converged op: ~$0.033 (single Claude call, tool_rounds=0, immediate-reflex thinking=off)
+- Files changed end-to-end: 1 (the provocation test file, rewritten with Ouroboros provenance banner)
+- Commits: `d9e5beae7e`, `010a1bbc6a`, `a8d359f28e`, `3dc63fef94`, `79cc35335d`, `5e026ff01d`, `27226dbba7`
+
+**What this means for O+V going forward:**
+
+This is the first empirical proof that Manifesto §6 (threshold-triggered neuroplasticity) is not aspirational. The organism detected a broken test, reasoned a fix without human prompting, wrote it to the real filesystem through the full Iron Gate stack, verified it, and held the change. Every downstream subsystem that has been architecturally inert because nothing ever reached `COMPLETE` — `AutoCommitter`, `UserPreferenceMemory` FEEDBACK accumulation from rejections, `StrategicDirection` momentum from successful self-heals, `Oracle` incremental update on applied files — now has real signal to consume.
+
+The 3-consecutive-clean-sessions gate for `DeepAnalysisSensor` (see memory `project_deep_analysis_sensor.md`) can now start counting. Counter is still at **0/3** — the `-cau` exhaustion here breaks the streak — but the reflex path is proven capable of satisfying the "at least one full GENERATE → VALIDATE → GATE → APPLY → VERIFY per session" criterion. The remaining work is resilience-under-pressure, not correctness.
+
 ## O+V Capability Assessment (2026-04-12)
 
 ### Current Pipeline Maturity
