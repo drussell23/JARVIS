@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -912,6 +912,66 @@ def _extract_target_region(
     return f"{header}{numbered}{footer}"
 
 
+def _build_multi_file_contract_block(
+    target_files: Sequence[str],
+) -> Optional[str]:
+    """Emit a 'multi-file contract' schema addendum when a single op
+    targets more than one file.
+
+    Session O (bt-2026-04-15-175547) closed the governed APPLY arc but
+    only 1 of 4 target files landed on disk because the model returned
+    legacy ``{file_path, full_content}`` — the single-file schema was
+    the only shape the prompt had ever shown it. This helper injects a
+    sibling example demonstrating ``files: [...]`` with one entry per
+    target path. It is appended to the existing single-file schema
+    block rather than replacing it so the model still sees the legacy
+    shape as a valid option for single-file operations.
+
+    No-op when ``target_files`` has 0 or 1 entries — the ``files`` shape
+    buys us nothing there, and emitting it would just add noise to the
+    prompt budget.
+    """
+    files = [str(t) for t in (target_files or ()) if t]
+    if len(files) <= 1:
+        return None
+    entries_lines = []
+    for i, fp in enumerate(files, start=1):
+        entries_lines.append(
+            f'    {{"file_path": "{fp}", '
+            f'"full_content": "<complete content of file {i}>", '
+            f'"rationale": "<why file {i} changes>"}}'
+        )
+    entries_block = ",\n".join(entries_lines)
+    path_list = "\n".join(f"  - {fp}" for fp in files)
+    return (
+        "## CRITICAL MULTI-FILE CONTRACT\n\n"
+        f"This operation targets **{len(files)} files**. The single-file "
+        "schema shown above (`file_path` + `full_content` at the top "
+        "level of the candidate) can only express ONE file and WILL be "
+        "rejected by the Iron Gate's multi-file coverage check.\n\n"
+        "You MUST return the multi-file shape: every candidate carries a "
+        "`files` list with exactly one entry per target path. Example:\n\n"
+        "```json\n"
+        "{\n"
+        '  "candidate_id": "c1",\n'
+        '  "files": [\n'
+        f"{entries_block}\n"
+        "  ],\n"
+        '  "rationale": "<one-sentence summary of the change set>"\n'
+        "}\n"
+        "```\n\n"
+        f"TARGET FILES THAT MUST APPEAR IN `files`:\n{path_list}\n\n"
+        "Rules for multi-file candidates:\n"
+        "- Every target path above must appear as a `file_path` entry in "
+        "the `files` list. Do not omit any.\n"
+        "- Each `full_content` must be the COMPLETE file (not a diff, not "
+        "a patch, not just the changed lines).\n"
+        "- Python files must be syntactically valid per file.\n"
+        "- Do NOT put `file_path` + `full_content` at the top level of "
+        "the candidate. Use `files: [...]` only."
+    )
+
+
 def _build_lean_strategic_context() -> str:
     """Return a compressed Manifesto essence for lean prompts (~150 tokens).
 
@@ -1121,6 +1181,19 @@ Rules:
 - If the change is already implemented, return `{{"schema_version": "2b.1-noop", "reason": "<why>"}}`.
 - NEVER wrap the JSON in ```json ... ``` fences. NEVER emit prose before the opening `{{`. Your first character is `{{`."""
     parts.append(schema_instruction)
+
+    # ── 8b. Multi-file contract (Session O / Iron Gate 5) ───────────────
+    # When the op targets >1 file, the legacy single-file schema above
+    # cannot express the full change set. Iron Gate 5 (multi_file_
+    # coverage_gate.py) will reject any candidate that doesn't cover
+    # every target path via a populated ``files: [...]`` list. Show
+    # the model the required shape before it generates instead of
+    # relying on the retry loop to correct it post-hoc.
+    _mf_block = _build_multi_file_contract_block(
+        getattr(ctx, "target_files", ()) or ()
+    )
+    if _mf_block:
+        parts.append(_mf_block)
 
     # ── 9. RETRY FEEDBACK (RECENCY BIAS ESCALATION) ─────────────────────
     # Prong 1 of the three-pronged injection authority escalation.
@@ -1738,6 +1811,21 @@ Rules:
         parts.append(_repair_block)
 
     parts.append(schema_instruction)
+
+    # Multi-file contract (Session O / Iron Gate 5) — append AFTER the
+    # schema example so the model sees "here's the single-file schema"
+    # first, then "but this op actually targets N files, use the multi-
+    # file shape instead." The two cross_repo/execution_graph branches
+    # above have their own schemas and are not affected. BACKGROUND
+    # route also skipped because Gemma 31B is a single-candidate path
+    # and multi-file ops don't route through BG anyway.
+    if not _is_bg_route and not getattr(ctx, "cross_repo", False):
+        _mf_block = _build_multi_file_contract_block(
+            getattr(ctx, "target_files", ()) or ()
+        )
+        if _mf_block:
+            parts.append(_mf_block)
+
     prompt = "\n\n".join(parts)
 
     # N7: Prompt-size gate — prevent silent context-window truncation.

@@ -2717,6 +2717,48 @@ class GovernedOrchestrator:
                         _ds_exc._docstring_collapse_rejected_content = _rejected_content  # type: ignore[attr-defined]
                         raise _ds_exc
 
+                # Gate 5 — Multi-file coverage. Session O (bt-2026-04-15-
+                # 175547) closed the full governed APPLY arc but only 1
+                # of 4 target files landed on disk because the winning
+                # candidate returned legacy {file_path, full_content}
+                # instead of {files: [...]}, so _apply_multi_file_candidate
+                # was never invoked. This gate rejects any multi-target op
+                # whose candidate fails to cover every path in
+                # context.target_files via a populated files: [...] list.
+                # The retry-feedback builder names the missing paths and
+                # reiterates the multi-file contract. Master switch:
+                # JARVIS_MULTI_FILE_ENFORCEMENT (default true).
+                try:
+                    from backend.core.ouroboros.governance.multi_file_coverage_gate import (
+                        check_candidate as _mf_check,
+                    )
+                except ImportError:
+                    _mf_check = None  # type: ignore[assignment]
+                if _mf_check is not None:
+                    for _cand in generation.candidates:
+                        _mf_result = _mf_check(
+                            _cand,
+                            ctx.target_files,
+                            self._config.project_root,
+                        )
+                        if _mf_result is None:
+                            continue
+                        _mf_reason, _mf_missing = _mf_result
+                        logger.warning(
+                            "[Orchestrator] Iron Gate — multi_file_coverage: "
+                            "missing %d/%d [%s] op=%s",
+                            len(_mf_missing),
+                            len(ctx.target_files),
+                            ", ".join(_mf_missing[:5]),
+                            ctx.op_id[:12],
+                        )
+                        generation = None
+                        _mf_exc = RuntimeError(_mf_reason)
+                        # Private attributes — retry feedback builder reads these.
+                        _mf_exc._mf_missing_paths = _mf_missing  # type: ignore[attr-defined]
+                        _mf_exc._mf_target_files = tuple(ctx.target_files)  # type: ignore[attr-defined]
+                        raise _mf_exc
+
                 # Heartbeat: generation succeeded with candidates
                 try:
                     await self._stack.comm.emit_heartbeat(
@@ -3219,6 +3261,67 @@ class GovernedOrchestrator:
                         "- Sanity check: every single character in your output must\n"
                         "  be in the range 0x20–0x7E or \\n (0x0A). No exceptions.\n"
                     )
+                elif _err_str.startswith("multi_file_coverage_insufficient"):
+                    # Gate 5 rejection — name the missing target paths and
+                    # reiterate the files: [...] shape. The model saw the
+                    # single-file schema example in its prompt; here we
+                    # hand it the multi-file example plus the exact list
+                    # of paths it failed to cover.
+                    _mf_missing = getattr(exc, "_mf_missing_paths", None) or []
+                    _mf_targets = getattr(exc, "_mf_target_files", None) or tuple(
+                        ctx.target_files
+                    )
+                    try:
+                        from backend.core.ouroboros.governance.multi_file_coverage_gate import (
+                            render_missing_block as _mf_render,
+                        )
+                        _missing_block = _mf_render(_mf_missing, _mf_targets)
+                    except Exception:  # noqa: BLE001
+                        _missing_block = (
+                            "\nMISSING TARGET FILES:\n"
+                            + "\n".join(f"  - {p}" for p in list(_mf_missing)[:16])
+                            + "\n"
+                        )
+                    _target_count = len(_mf_targets)
+                    _error_feedback = (
+                        "## PREVIOUS GENERATION REJECTED — "
+                        "MULTI-FILE COVERAGE INSUFFICIENT\n\n"
+                        f"{_err_str[:400]}\n"
+                        f"{_missing_block}\n"
+                        "INSTRUCTIONS FOR RETRY:\n"
+                        f"- This operation targets {_target_count} files. "
+                        "You MUST return the multi-file shape: a `files` "
+                        "list with one entry per target file.\n"
+                        "- Do NOT use the legacy single-file schema "
+                        "(`file_path` + `full_content` at the top level of "
+                        "the candidate). That shape can only express ONE "
+                        "file and will be rejected again.\n"
+                        "- Use this structure for each candidate:\n\n"
+                        "    {\n"
+                        "      \"candidate_id\": \"c1\",\n"
+                        "      \"files\": [\n"
+                        "        {\n"
+                        "          \"file_path\": \"<target path 1>\",\n"
+                        "          \"full_content\": \"<complete file 1 content>\",\n"
+                        "          \"rationale\": \"<why file 1 changes>\"\n"
+                        "        },\n"
+                        "        {\n"
+                        "          \"file_path\": \"<target path 2>\",\n"
+                        "          \"full_content\": \"<complete file 2 content>\",\n"
+                        "          \"rationale\": \"<why file 2 changes>\"\n"
+                        "        }\n"
+                        "      ],\n"
+                        "      \"rationale\": \"<one-sentence summary of the change set>\"\n"
+                        "    }\n\n"
+                        f"- Every one of the {_target_count} target paths above "
+                        "must appear as a `file_path` entry in the `files` "
+                        "list. Do not omit any.\n"
+                        "- `full_content` in each entry must be the COMPLETE "
+                        "file (not a diff, not a patch, not just the changed "
+                        "lines).\n"
+                        "- Python files must be syntactically valid "
+                        "(`ast.parse()`-clean) per file.\n"
+                    )
                 elif _err_str.startswith("Dependency file rename/truncation suspected"):
                     # Gate 3 rejection — show the offender pairs and a clear
                     # rule: you are NOT allowed to rename/shorten an existing
@@ -3276,6 +3379,8 @@ class GovernedOrchestrator:
                         _gen_failure_class = "exploration"
                     elif "ascii_corruption" in _err_str:
                         _gen_failure_class = "ascii"
+                    elif _err_str.startswith("multi_file_coverage_insufficient"):
+                        _gen_failure_class = "multi_file_coverage"
                     elif _err_str.startswith("Dependency file rename/truncation"):
                         _gen_failure_class = "dep_file_rename"
                     elif "json_parse_error" in _err_str:
