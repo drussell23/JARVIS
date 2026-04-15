@@ -1908,6 +1908,93 @@ This is the first empirical proof that Manifesto §6 (threshold-triggered neurop
 
 The 3-consecutive-clean-sessions gate for `DeepAnalysisSensor` (see memory `project_deep_analysis_sensor.md`) can now start counting. Counter is still at **0/3** — the `-cau` exhaustion here breaks the streak — but the reflex path is proven capable of satisfying the "at least one full GENERATE → VALIDATE → GATE → APPLY → VERIFY per session" criterion. The remaining work is resilience-under-pressure, not correctness.
 
+### 2026-04-14 — Reflex heal reproducibility + dual-layer dedup validation (session `bt-2026-04-15-030359`)
+
+**Headline:** Reflex heal is no longer a one-shot. A second session — run from a clean slate against the same provocation file — reproduced the full `TestFailureSensor → IMMEDIATE → Claude direct → L2 CONVERGED → GATE → APPLY → VERIFY → COMPLETE` cycle, and this time the pipeline fielded a **duplicate op** correctly: the second op for the same target was cancelled by the stale-exploration source-drift guard milliseconds after the first op's APPLY landed. Two defensive layers — sensor-side in-flight dedup (new) + pre-apply source-hash check (existing) — worked in concert, neither redundant, each catching cases the other missed.
+
+**Operations this session:**
+
+| Op | Outcome | Why |
+|---|---|---|
+| `op-019d8f19-e72d-7aa0-ac3d-e1eb7ba59828-sig` | **APPLIED** | First signal (streak=2). L2 converged in iter 1/5, GATE passed, DECISION `applied`/`safe_auto_passed` at `20:10:39`. |
+| `op-019d8f1b-8f28-703f-9c2d-9d064c211b8d-sig` | **CANCELLED (source-drift)** | Second signal (streak=3, slipped through TTL window). L2 also converged in iter 1/5 at `20:10:44`. At GATE→APPLY, source-hash guard saw expected=`14e3cc501f4f`, actual=`aadcd7dee6f5` — the file was already healed by `op-019d8f19` 5 seconds earlier. **Correct cancel**, no redundant write. |
+| `op-019d8f1d-*` (2 variants, streak=6/7) | Reached GENERATE, post-heal stale signals; both hit `all_providers_exhausted:fallback_failed` before re-apply. `ExhaustionWatcher consecutive=2/3` — did not trip hibernation before `idle_timeout` fired. | |
+
+**Signal accounting — the sensor-side dedup fired where the TTL covered it:**
+
+```
+20:05:32  enqueue    streak=2  → op-019d8f19 (first, bgop-281d49ff857f)
+20:07:21  enqueue    streak=3  → op-019d8f1b (bgop-f3e0bc46a177)
+                                  TTL window: 109s after first enqueue — TTL=60s had expired.
+                                  Slipped through sensor dedup. Pre-apply guard caught it instead.
+20:07:57  SUPPRESS   36s ago   ✅ "target tests/test_reflex_provocation/test_one.py already in-flight"
+20:08:07  SUPPRESS   46s ago   ✅
+20:08:56  enqueue    streak=6  (new TTL window, prior marker expired again)
+20:09:56  enqueue    streak=7
+20:09:57  SUPPRESS    1s ago   ✅
+```
+
+**4 enqueued / 3 suppressed = 43% suppression rate at the sensor layer.** Exactly the log line the new fix (commit `20baa93a1d`) was written to produce, observed in live fire for the first time. Every suppression landed within a fraction of a second of the marker refresh.
+
+**Phase-by-phase trace (condensed, from `bt-2026-04-15-030359/debug.log`):**
+
+```
+20:04:54  TestFailureSensor  subscribed to fs.changed.* events
+20:05:32  TestFailureSensor  enqueued streak=2 → bgop-281d49ff857f
+20:07:13  Orchestrator       Route: immediate (high_urgency_immediate_source:test_failure)
+                              [op-019d8f19, 101s queue wait — worker pool contention]
+20:07:13  CandidateGenerator Topology block: route=immediate cascade_to_claude
+                              (DW RT budget insufficient for fast-reflex Venom)
+20:07:21  TestFailureSensor  enqueued streak=3 → bgop-f3e0bc46a177 [TTL expired]
+20:07:49  Orchestrator       Route: immediate [op-019d8f1b, worker 2]
+20:08:15  InteractiveRepair  disabled → falling through to VALIDATE_RETRY/L2
+20:08:27  L2 Repair          Iteration 1/5 starting (scoped pytest + git-worktree sandbox)
+20:09:56  L2 Repair          ✅ Iteration 1/5 tests: PASSED → ✅ CONVERGED (op-019d8f19)
+20:09:56  Orchestrator       L2_CONVERGED, skipping canonical re-validation, → GATE
+20:10:38  CommProtocol       op-019d8f19 phase=APPLY progress_pct=80
+20:10:39  CommProtocol       DECISION outcome=applied reason_code=safe_auto_passed
+20:10:40  CommProtocol       POSTMORTEM root_cause=none next_safe_action=none
+20:10:44  L2 Repair          ✅ CONVERGED (op-019d8f1b, second op)
+20:10:44  Orchestrator       L2_CONVERGED op-019d8f1b → GATE
+20:10:44  Orchestrator       Source drift detected (expected=14e3cc501f4f actual=aadcd7dee6f5)
+                              → advancing to CANCELLED
+20:15:27  Harness            Session stopping: idle_timeout
+```
+
+**What this session validates that 2026-04-14 could not:**
+
+1. **Reproducibility.** The first heal (`bt-2026-04-15-013455`) shipped with the 7-commit fix chain. This session ran against that same codebase from a clean slate and reproduced the heal without manual intervention. Reflex arc is now reliable, not a one-off.
+2. **Sensor-side in-flight dedup (commits `3a9fcc1aa9` / `83b210210f` / `163d2e7bee` / `20baa93a1d`).** First live-fire evidence of the "already in-flight" suppression log line. Catches the storm-after-reset pattern that burned the `bt-2026-04-15-010727` session.
+3. **Stale-exploration source-drift guard catches what sensor-side dedup misses.** The duplicate `op-019d8f1b` cancelled cleanly at APPLY boundary — no double-write, no file corruption, no rollback churn. The guard was known-correct in mechanism but had never been exercised against a real concurrent duplicate until now.
+4. **BG/SPECULATIVE topology block holds under pressure.** Every BG route this session honored `skip_and_queue` with the Gemma stream-stall reason. Zero cascade-to-Claude leaks on BG — the unit-economics defense from memory `project_bg_spec_sealed.md` is working.
+
+**Gaps this session revealed (ordered by impact):**
+
+- **Sensor TTL is too tight when worker queue wait exceeds it.** `JARVIS_TEST_FAILURE_INFLIGHT_TTL_S=60s` was shorter than the 101s `op-019d8f19` spent in the `BackgroundAgentPool` queue before the orchestrator picked it up. Signal `streak=3` enqueued at `20:07:21` — 109s after `streak=2` — squeezed through as a genuine duplicate (`bgop-f3e0bc46a177`). The pre-apply guard caught it at the next layer, but the sensor-side fire should have blocked it earlier and saved one Claude generate call (~$0.033). **Fix:** raise default TTL to 180s or make it adaptive to observed queue wait (P95 worker pickup latency + 2×safety margin).
+- **ExhaustionWatcher retry-counting pitfall, reconfirmed.** Two post-heal stale ops (`op-019d8f1d-*`) both hit `all_providers_exhausted:fallback_failed`, moving `consecutive=1/3` then `2/3`. Each failure was from the same root cause (single op exhausting Claude+DW retries against a post-heal stale signal). One more would have triggered hibernation — but `idle_timeout` fired first, masking the issue. The pitfall captured in memory `project_exhaustion_watcher_retry_counting.md` is load-bearing; single-op multi-retry scenarios still count each retry as a "consecutive exhaustion event".
+- **Post-heal stale signal churn.** `TestWatcher` polls every 30s. Between `op-019d8f19` enqueue (`20:05:32`) and actual APPLY (`20:10:39`), the sensor emitted signals at `20:07:21` / `20:08:56` / `20:09:56` — all fresh because the file was still broken on disk. These ops generated real Claude calls (~$0.10 of the session's $0.13 total) and then either got cancelled by source-drift (the good case) or hit exhaustion (the bad case). **Fix:** gate TestWatcher emission on "no op currently in-flight OR generating for this target file" — same predicate as the sensor dedup but checked at watch-loop level instead of sensor-subscribe level.
+- **Cost asymmetry on post-heal churn.** The productive op `op-019d8f19` cost $0.0335. The subsequent 3 stale/cancelled ops cost $0.1012 combined — **3× the cost of the actual heal** went to work that was either cancelled at pre-apply or exhausted providers. Sensor-side TTL tuning + TestWatcher gating above should recover most of this.
+
+**Session metadata:**
+- Session ID: `bt-2026-04-15-030359`
+- Runtime: 11 min 6 s (`20:04:21` → `20:15:27`)
+- Stop reason: `idle_timeout` (expected — harness watchdog at 600s)
+- Total cost: **$0.1347 / $0.50** (27% budget used)
+- Reflex heals: **1 APPLIED** (`op-019d8f19`), **1 correctly CANCELLED** by source-drift (`op-019d8f1b`)
+- Sensor signal outcomes: 4 enqueued / 3 suppressed (43% sensor-layer block rate)
+- ExhaustionWatcher: `consecutive=2/3` at session end (hibernation not triggered)
+- Iron Gate rejections: 0 (file was well-known shape; model generated clean fix both times)
+- Files changed on disk: 1 (`tests/test_reflex_provocation/test_one.py`, 2675 → 2515 bytes, md5 unchanged from `bt-2026-04-15-013455`)
+- Commits exercised: `3a9fcc1aa9`, `83b210210f`, `163d2e7bee`, `20baa93a1d`
+
+**What this means for O+V going forward:**
+
+The reflex arc has moved from "proven once" to "proven repeatable". Every O+V subsystem downstream of COMPLETE — `AutoCommitter`, `UserPreferenceMemory` FEEDBACK accumulation, `StrategicDirection` momentum from self-heals, `Oracle` incremental update — can now be exercised against a reliable upstream signal instead of a fragile one-shot. The dual-layer dedup defense (sensor-side TTL + pre-apply source-drift) is structurally sound: each layer catches cases the other misses, and when both engage, the organism degrades gracefully rather than compounding errors.
+
+The two remaining resilience gaps are both tactical, not architectural: **sensor TTL tuning** and **ExhaustionWatcher retry-counting semantics**. Neither requires new subsystems; both are ~single-file edits against existing code. Once those land, the next targets are (a) graduating off the `test_reflex_provocation` training wheels onto real-repository failures, and (b) starting the 3-consecutive-clean-sessions gate for `DeepAnalysisSensor` (still at **0/3** — post-heal exhaustion events break the streak).
+
+The organism is no longer stuck proving it can heal a broken test. It is now stuck proving it can do so **without burning 3× the productive cost on stale successors**. That is a much better problem to have.
+
 ## O+V Capability Assessment (2026-04-12)
 
 ### Current Pipeline Maturity
