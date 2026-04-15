@@ -426,13 +426,29 @@ class RepairEngine:
                 current_candidate = dict(ctx.generation.candidates[0])
 
             # ----------------------------------------------------------------
-            # Diff budget check
+            # Candidate shape detection (Bug B fix)
             # ----------------------------------------------------------------
-            diff = current_candidate.get("unified_diff", "")
-            if _count_diff_lines(diff) > budget.max_diff_lines:
-                return _stopped("diff_expansion_rejected")
-            if _count_diff_files(diff) > budget.max_files_changed:
-                return _stopped("diff_files_rejected")
+            # Providers are ``force_full_content=True``, so candidates ship
+            # with ``full_content`` rather than ``unified_diff``. The old L2
+            # path read ``unified_diff`` unconditionally, got an empty string,
+            # synthesized a headers-only patch, and BSD ``patch`` exited 2
+            # with "I can't seem to find a patch in there anywhere." in
+            # stdout — never surfaced in the error. Branch explicitly:
+            #   * real diff (contains @@ hunk header)  → apply_patch
+            #   * full_content present                  → apply_full_content
+            #   * neither usable                        → fail fast
+            diff = current_candidate.get("unified_diff", "") or ""
+            full_content = current_candidate.get("full_content", "") or ""
+            _has_real_diff = "@@" in diff and ("+" in diff or "-" in diff)
+            _has_full_content = bool(full_content)
+
+            if _has_real_diff:
+                if _count_diff_lines(diff) > budget.max_diff_lines:
+                    return _stopped("diff_expansion_rejected")
+                if _count_diff_files(diff) > budget.max_files_changed:
+                    return _stopped("diff_files_rejected")
+            elif not _has_full_content:
+                return _stopped("candidate_unusable:no_diff_or_full_content")
 
             # ----------------------------------------------------------------
             # RUN in sandbox
@@ -446,15 +462,24 @@ class RepairEngine:
                     self._repo_root, budget.per_iteration_test_timeout_s
                 ) as sb:
                     try:
-                        await sb.apply_patch(diff, file_path)
-                    except RuntimeError as patch_exc:
-                        # Patch application failure — the diff is malformed or
-                        # doesn't match the file.  This is a candidate quality
-                        # issue, not infra.  Treat as failed iteration so L2
+                        if _has_real_diff:
+                            await sb.apply_patch(diff, file_path)
+                        else:
+                            # full_content path: write the candidate verbatim.
+                            # NOTE: L2 is single-file; ``files: [...]`` multi-
+                            # file candidates are not yet handled inside the
+                            # sandbox apply path.
+                            await sb.apply_full_content(full_content, file_path)
+                    except RuntimeError as apply_exc:
+                        # Apply failure — the diff is malformed, doesn't match
+                        # the file, or full_content write failed. Candidate
+                        # quality issue, not infra. Fail this iteration so L2
                         # can retry with a new candidate.
                         _logger.info(
-                            "[L2 Repair] Iteration %d: patch failed: %s",
-                            iteration, patch_exc,
+                            "[L2 Repair] Iteration %d: apply failed (%s): %s",
+                            iteration,
+                            "diff" if _has_real_diff else "full_content",
+                            apply_exc,
                         )
                         _patch_failed = True
                     if not _patch_failed:
@@ -491,14 +516,23 @@ class RepairEngine:
                 "\U0001f527 [L2 Repair] Iteration %d/%d tests: %s",
                 iteration, budget.max_iterations, _test_status,
             )
+            # For telemetry, record *content* line count on the full_content
+            # path so dashboards don't read diff_lines=0 as "nothing changed".
+            _metric_lines = (
+                _count_diff_lines(diff)
+                if _has_real_diff
+                else len(full_content.splitlines())
+            )
+            _metric_files = _count_diff_files(diff) if _has_real_diff else 1
+
             if svr.passed:
                 rec = RepairIterationRecord(
                     op_id=ctx.op_id,
                     iteration=iteration,
                     repair_state=L2State.L2_CONVERGED.value,
                     outcome="converged",
-                    diff_lines=_count_diff_lines(diff),
-                    files_changed=_count_diff_files(diff),
+                    diff_lines=_metric_lines,
+                    files_changed=_metric_files,
                     validation_duration_s=svr.duration_s,
                     model_id=model_id,
                     provider_name=provider_name,
@@ -529,7 +563,11 @@ class RepairEngine:
 
             fail_class = classification.failure_class.value
             fail_sig = classification.failure_signature_hash
-            patch_sig = _patch_sig(diff)
+            # Sign the applied content — diff when present, full_content
+            # otherwise — so oscillation detection can tell distinct
+            # full_content candidates apart (empty-string patch_sig would
+            # collapse every full_content iter onto the same hash).
+            patch_sig = _patch_sig(diff if _has_real_diff else full_content)
 
             # ----------------------------------------------------------------
             # EVALUATE PROGRESS
@@ -600,8 +638,8 @@ class RepairEngine:
                 failure_class=fail_class,
                 failure_signature_hash=fail_sig,
                 patch_signature_hash=patch_sig,
-                diff_lines=_count_diff_lines(diff),
-                files_changed=_count_diff_files(diff),
+                diff_lines=_metric_lines,
+                files_changed=_metric_files,
                 validation_duration_s=svr.duration_s,
                 outcome=outcome,
                 model_id=model_id,

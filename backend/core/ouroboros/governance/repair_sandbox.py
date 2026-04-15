@@ -277,7 +277,7 @@ class RepairSandbox:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _stdout, stderr = await asyncio.wait_for(
+            stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=patch_text.encode()),
                 timeout=15.0,
             )
@@ -287,10 +287,58 @@ class RepairSandbox:
             raise RuntimeError(f"patch timed out for {file_path}")
 
         if proc.returncode:
+            # BSD patch (macOS) writes diagnostics like "I can't seem to find
+            # a patch in there anywhere." to stdout, not stderr — capture
+            # both so the failure is self-describing in every environment.
+            _out = stdout.decode(errors="replace").strip()
+            _err = stderr.decode(errors="replace").strip()
+            if _err and _out:
+                _details = f"{_err} | stdout: {_out}"
+            else:
+                _details = _err or _out
             raise RuntimeError(
-                f"patch failed (exit {proc.returncode}) for {file_path}: "
-                f"{stderr.decode(errors='replace').strip()}"
+                f"patch failed (exit {proc.returncode}) for {file_path}: {_details}"
             )
+
+    async def apply_full_content(self, content: str, file_path: str) -> None:
+        """Write ``content`` verbatim to ``file_path`` inside the sandbox.
+
+        Mirrors the main-pipeline APPLY path for ``schema_version=2b.1``
+        candidates (``full_content``), where the provider returns the whole
+        file instead of a unified diff. With ``force_full_content=True`` set
+        on every provider, this is the dominant candidate shape — so L2 must
+        be able to materialize these candidates inside the sandbox without
+        forging an empty unified diff and feeding it to ``patch``.
+
+        This is sandbox-only test validation, the same role ``apply_patch``
+        plays: the Iron Gate / ASCII / AST checks still run at real APPLY
+        time (``ChangeEngine.execute``). Convergence in sandbox is not a
+        guaranteed production apply.
+
+        Parameters
+        ----------
+        content:
+            The complete file content to write, verbatim.
+        file_path:
+            Repo-relative path to the file being materialized (e.g.
+            ``"backend/foo.py"``).
+
+        Raises
+        ------
+        RuntimeError
+            If the sandbox is not active or the write fails.
+        """
+        if self._sandbox_dir is None:
+            raise RuntimeError("RepairSandbox is not active (call __aenter__ first)")
+
+        target = self._sandbox_dir / file_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(
+                f"apply_full_content write failed for {file_path}: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Test execution
