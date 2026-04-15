@@ -2372,6 +2372,199 @@ The real blocker is **inside the orchestrator's `VALIDATE_RETRY` loop at `orches
 
 **What is still settled (do not re-litigate):** Multi-file `files: [...]` enforcement (parser + Gate 5 + prompt hint + post-gate visibility). Per-op exhaustion dedup. Three sessions (Q, R, S) verified the enforcement arc; Session T verifies it a fourth time. The enforcement path is **not** the blocker.
 
+### 2026-04-15 — Sessions U–W arc: first autonomous multi-file APPLY to disk (`bt-2026-04-15-230849`)
+
+**Headline:** Session W closed the full enforcement-to-persistence arc for the first time in the repo's history. Four autonomously-generated Python test modules (`test_test_failure_sensor_dedup.py`, `test_test_failure_sensor_ttl.py`, `test_test_failure_sensor_isolation.py`, `test_test_failure_sensor_marker_refresh.py`) traversed CLASSIFY → ROUTE → PLAN → GENERATE → VALIDATE → L2 Repair → GATE → APPLY `mode=multi` → four `::NN` sub-op DECISIONs (all `applied`) → four `::NN` POSTMORTEMs (all `root_cause=none`) → disk. Post-hoc verification: **`pytest tests/governance/intake/sensors/test_test_failure_sensor_*.py` → 20/20 passed in 2.28s.** The model-generated artifacts are not just pipeline-approved; they exercise the real `TestFailureSensor` correctly, with happy-path + edge-case + negative coverage across all 4 requested behaviors. First **end-to-end autonomous multi-file development loop** walked under Manifesto governance.
+
+**The arc is Sessions U → V → W, three sessions, two commits, one breakthrough.**
+
+**Session U (`bt-2026-04-15-215858`) — FSM trail kills the "silent exit" ghost.**
+
+The ValidateRetryFSM instrumentation from commit `d6aa78c8ba` produced a definitive empirical trail on op-019d9328:
+
+```
+15:06:17  iter_start iter=0 ctx=144a79eb0 VALIDATE   retries=2 fc=None
+15:13:40  micro_fix_pre                              retries=1 fc='test'
+15:13:40  micro_fix_returned fixed=False iterations=0
+15:13:40  retry_advance_pre ctx=144a79eb0
+15:13:40  retry_advance_post ctx=155938670 VALIDATE_RETRY       ← ctx rebound cleanly
+15:13:40  iter_start iter=1 ctx=155938670 VALIDATE_RETRY
+15:20:21  infra_early_return_set ctx=15d3651c0 POSTMORTEM fc='test'
+15:20:21  early_return fc='infra'                              ← op exits cleanly
+```
+
+Two findings. **First, Session T's "silent exit" hypothesis is dead**: the VALIDATE_RETRY loop advances correctly through every branch with proper ctx rebinding (`144a79eb0` → `155938670`), and the op exits through a documented branch (`early_return` via `infra_early_return_set`) rather than silently. The 1m40s of "dead air" in Session T was iter=1 validation starting, not a state-machine bug. **Second, re-validation is non-deterministic across iterations**: same unchanged candidate, same test targets — `iter=0` returned `failure_class='test'` (the real LSP defect on `dedup.py`) but `iter=1` returned `failure_class='infra'` (a sandbox/pytest transient). The `'infra'` class is non-retryable by design, so it triggered the `_early_return_ctx` escalation at `orchestrator.py:3642` and advanced ctx straight to POSTMORTEM — killing the op on a flake rather than giving L2 a chance to repair iter=0's legitimate critique.
+
+**Session V (`bt-2026-04-15-223631`) — env-tunable retries works, exposes the L2 budget contract bug.**
+
+Commit `58709f27de` made `max_validate_retries` env-tunable via a `field(default_factory=...)` pattern so battle tests can set `JARVIS_MAX_VALIDATE_RETRIES=0` and take the non-deterministic iter=1 out of the race. Session V launched with that override and produced the expected FSM trail for op-019d934a:
+
+```
+15:44:03  iter_start iter=0 ctx=156a7c280 VALIDATE  retries=0 fc=None
+15:49:14  l2_dispatch_pre                           retries=-1 fc='test'    ← first-ever L2 dispatch on a multi-file op
+15:49:14  L2 Repair Iteration 1/8 starting (0s elapsed, 120s remaining)      ← ??? env said 600
+15:52:25  l2_dispatch_post                                  directive='cancel'
+15:52:25  l2_escape_return                                  directive='cancel'
+```
+
+`retries_remaining=0` confirms the env factory landed. `l2_dispatch_pre` fired for the **first time ever on a multi-file op**, with `best_fc='test'` (the real LSP defect) — proving the flake bypass worked. Then the contract bug surfaced: `JARVIS_L2_TIMEBOX_S=600` was set in the launch env, but L2 reported `"0s elapsed, 120s remaining"` at Iteration 1 start. L2 ran for 3m11s, returned `directive='cancel'` (ran out of its effective budget), and the op died without converging.
+
+Root cause (`orchestrator.py:3727-3729` prior to this arc):
+
+```python
+_pl_deadline = ctx.pipeline_deadline or (
+    datetime.now(timezone.utc) + timedelta(seconds=self._config.generation_timeout_s)
+)
+directive = await self._l2_hook(ctx, best_validation, _pl_deadline)
+```
+
+`ctx.pipeline_deadline` is stamped **once** at `GovernedLoopService.submit()` and counts down from there. For a complex 4-file op, CLASSIFY → PLAN → GENERATE → VALIDATE drained the pipeline clock to the sliver that remained (~120s in Session V, `0.0s` in Session W). L2 then inherited that sliver and its own internal `min(passed_deadline, now + timebox_s)` clamp silently won. **`JARVIS_L2_TIMEBOX_S` did not mean what its name said** — it was effectively advisory, not enforceable. The env var documented a contract the code did not honor. Manifesto §8 (Absolute Observability) violated by silent semantic drift; §2 (DAG + concurrency as physics) violated by subphase budgets aliased to a depleted global clock.
+
+**Session W (`bt-2026-04-15-230849`) — L2 deadline reconciliation + the first APPLY walk.**
+
+Commit `53e6bd9f76` applied the rooted fix at the L2 dispatch site — Option B per the directive:
+
+1. Compute L2's deadline **fresh** at dispatch as `now + JARVIS_L2_TIMEBOX_S` instead of passing through the inherited (drained) `ctx.pipeline_deadline`.
+2. **Reconcile** the op-level clock via `OperationContext.with_pipeline_deadline()` when the fresh L2 deadline is larger than the inherited one, so downstream phases (GATE, APPLY, VERIFY, POSTMORTEM) see a consistent op-level deadline — preserving the "one notion of 'op must end by'" invariant without masking the L2 budget decision.
+3. Emit a **mandatory INFO log line** naming both clocks and which cap won (`l2_timebox_fresh` vs `pipeline_deadline_inherited`), so any future regression is auditable without reading source.
+4. If `ctx.pipeline_deadline` is **already larger** than the L2 fresh budget, keep the larger value. L2 must never shrink an op's envelope.
+
+Session W's exact terminal sequence (quoted from `bt-2026-04-15-230849/debug.log`), op `op-019d9368-654b`:
+
+```
+16:14:18  [ValidateRetryFSM] iter_start iter=0 ctx=153c309a0 VALIDATE retries_remaining=0 fc=None
+
+16:16:20  [Orchestrator] L2 deadline reconciliation:
+            pipeline_remaining=0.0s l2_timebox_env=600.0s
+            effective=600.0s winning_cap=l2_timebox_fresh
+            op=op-019d9368-654b
+16:16:20  [ValidateRetryFSM] l2_dispatch_pre ctx=151b65040 VALIDATE retries_remaining=-1 fc='test'
+            effective_s=600 cap=l2_timebox_fresh l2_timebox_env=600
+
+16:17:10  [ValidateRetryFSM] l2_dispatch_post directive='break'
+16:17:10  [Orchestrator] L2 broke VALIDATE_RETRY loop for op=op-019d9368-654b-7d3f-bcd7-5dd72368f2d5-cau —
+            proceeding to source-drift / shadow / entropy / GATE
+            (candidate_id=c1, file=tests/governance/intake/sensors/test_test_failure_sensor_dedup.py,
+             source_hash=84fac342fdda)
+16:17:10  [ValidateRetryFSM] l2_converged_break
+16:17:10  [ValidateRetryFSM] loop_exit_normal best_candidate_present=True
+
+16:17:44  [Orchestrator] APPLY mode=multi candidate_files=4 files_list_present=True multi_enabled=True
+            targets=[test_test_failure_sensor_dedup.py,
+                     test_test_failure_sensor_ttl.py,
+                     test_test_failure_sensor_isolation.py,
+                     test_test_failure_sensor_marker_refresh.py]
+            op=op-019d9368-654b
+
+16:19:59  DECISION op=...::00 outcome=applied reason_code=safe_auto_passed
+            diff_summary=Applied change to test_test_failure_sensor_dedup.py
+16:19:59  POSTMORTEM op=...::00 root_cause=none failed_phase=None
+16:22:39  DECISION op=...::01 outcome=applied reason_code=safe_auto_passed
+            diff_summary=Applied change to test_test_failure_sensor_ttl.py
+16:22:39  POSTMORTEM op=...::01 root_cause=none failed_phase=None
+16:23:02  DECISION op=...::02 outcome=applied reason_code=safe_auto_passed
+            diff_summary=Applied change to test_test_failure_sensor_isolation.py
+16:23:02  POSTMORTEM op=...::02 root_cause=none failed_phase=None
+16:23:02  DECISION op=...::03 outcome=applied reason_code=safe_auto_passed
+            diff_summary=Applied change to test_test_failure_sensor_marker_refresh.py
+16:23:02  POSTMORTEM op=...::03 root_cause=none failed_phase=None
+```
+
+**Critical value**: `pipeline_remaining=0.0s` at L2 dispatch. The pipeline clock was **fully drained**, not just "almost empty" as in Session V. Before the reconciliation fix, L2 would have been handed a 0s deadline and died instantly. After the fix, `winning_cap=l2_timebox_fresh` and `effective=600.0s` took precedence — L2 got its full wall-clock budget and converged in a single 50-second iteration on the first `LSP type error` critique.
+
+The multi-file fan-out then serialized through `_apply_multi_file_candidate`: four sub-ops (`::00`, `::01`, `::02`, `::03`), each with its own DECISION and POSTMORTEM, each with `root_cause=none`. Disk state verified:
+
+```
+5335  Apr 15 16:19  test_test_failure_sensor_dedup.py          (modified from Session O's 4986)
+5854  Apr 15 16:22  test_test_failure_sensor_ttl.py            (NEW)
+6009  Apr 15 16:23  test_test_failure_sensor_isolation.py      (NEW)
+6068  Apr 15 16:23  test_test_failure_sensor_marker_refresh.py (NEW)
+```
+
+Mtimes match the four DECISION log timestamps exactly. The AutoCommitter then autonomously committed all four files under its own O+V signature as commit `0890a7b6f0`:
+
+```
+fix(sensors): Write four focused sensor-level test modules for the Test...
+
+Signal: backlog | Urgency: normal
+Op-ID: op-019d9368-654b-7d3f-bcd7-5dd72368f2d5-cau
+Risk: NOTIFY_APPLY (Yellow)
+Provider: claude-api ($0.0059)
+Files: 4 sensor test modules
+Ouroboros+Venom [O+V] — Autonomous Self-Development Engine
+Co-Authored-By: Ouroboros+Venom <ouroboros@jarvis.trinity>
+[integrity-verified: 57d3fd202d18]
+```
+
+**Post-hoc artifact quality verification** (not part of Session W's own pipeline):
+
+```
+$ python3 -m pytest tests/governance/intake/sensors/test_test_failure_sensor_*.py -v
+...
+20 passed, 4 warnings in 2.28s
+```
+
+**All 20 tests pass** against the real `TestFailureSensor` code. Breakdown by file:
+
+| File | Tests | Coverage |
+|---|---|---|
+| `test_test_failure_sensor_dedup.py` | 5 | second-signal suppression, "already in-flight" log, multi-hit dedup, precondition checks, config default |
+| `test_test_failure_sensor_ttl.py` | 5 | post-TTL re-admission, stale-key pruning, fresh-entry preservation, env-var integration, zero-TTL edge case |
+| `test_test_failure_sensor_isolation.py` | 4 | cross-target non-suppression, mixed in-flight/new, N-concurrent-targets scale, single-release isolation |
+| `test_test_failure_sensor_marker_refresh.py` | 6 | marker set after enqueue, negative cases (queued_behind/deduplicated), release clears marker, monotonic timestamps, unstable-signal gate |
+
+The backlog task description specified exactly these 4 behaviors (A=dedup, B=ttl, C=isolation, D=marker_refresh). The model delivered all 4, with happy-path + edge-case + negative-path + env-integration coverage, and every test exercises the real sensor (not a mock of the sensor). **The pipeline's definition of "good" converged with runtime reality.**
+
+**The complete enforcement-to-persistence arc**, from Session O's 1-of-4 gap through Sessions Q→W:
+
+| Session | Key blocker isolated | Key code commit | Outcome |
+|---|---|---|---|
+| Q | Parser rejected multi-file shape (`schema_invalid:candidate_0_missing_file_path`) | — (isolation only) | First empirical proof of the parser contract mismatch |
+| R | Parser fix verified; Iron Gate 1 (exploration) rejected on 1/2 tool calls | parser fix bundled into `6c3cce92c6` | Parser works end-to-end for multi-file shape |
+| S | Exploration gate bypass; VALIDATE critique stalls pre-L2 | `31504a8f12` (Iron Gate 5) + `37a371e65d` (per-op dedup) | Iron Gate 5 passes silently on full coverage; 4 files visible to LSP post-gate |
+| T | "Silent exit" hypothesis | — (hypothesis only) | Hypothesis formed |
+| U | Silent exit falsified by FSM trail; **re-validation non-determinism** exposed | `d6aa78c8ba` (FSM instrumentation) | Ghost killed; real bug named (iter=1 `'infra'` flake) |
+| V | Env-tunable retries work; **L2 budget contract bug** exposed | `58709f27de` (env-tunable `max_validate_retries`) | First-ever L2 dispatch on a multi-file op; contract bug quantified at `120s vs 600s` |
+| **W** | **Contract bug fixed; L2 converges; APPLY fan-out lands all 4 files** | `53e6bd9f76` (L2 deadline reconciliation) | **First end-to-end autonomous multi-file APPLY. 20/20 tests pass.** |
+
+**Cost across the entire Q→W arc**: ~$2.50 total across seven sessions.
+
+**Commits this arc landed** (code-only, excluding session-artifact sweeps and the autonomous O+V commit of the generated files):
+
+1. `37a371e65d` — `fix(exhaustion-watcher)`: per-op dedup to prevent Session P cross-op hibernation
+2. `31504a8f12` — `feat(iron-gate)`: multi-file coverage enforcement (Iron Gate 5) + prompt hint + parser multi-file shape acceptance
+3. `d6aa78c8ba` — `feat(orchestrator)`: VALIDATE_RETRY FSM observability (24 log sites + mandatory micro-fix exception upgrade)
+4. `58709f27de` — (autonomous-bundled) `feat(orchestrator)`: env-tunable `max_validate_retries` to bypass non-deterministic sandbox flakes
+5. `53e6bd9f76` — `fix(orchestrator)`: L2 deadline reconciliation — `JARVIS_L2_TIMEBOX_S` is now actually respected
+6. `0890a7b6f0` — (AutoCommitter) `fix(sensors)`: Four sensor-level test modules for `TestFailureSensor`, autonomously generated and committed
+
+**What this arc proves (capability-level, not just single-op):**
+
+- **Deterministic governance across multi-file coordination** — parser, Iron Gate 5, per-op exhaustion dedup, multi-file contract prompt hint, FSM-traceable VALIDATE_RETRY, L2 deadline reconciliation, `_apply_multi_file_candidate` fan-out with per-file rollback. Every layer holds under five sessions of production traffic.
+- **§8 Absolute Observability as diagnostic loop** — Session T → U's silent-exit ghost was falsified by FSM instrumentation in a single session. Session V → W's L2 budget contract bug was named and quantified by one INFO log line, then fixed. The pattern (hypothesize → instrument → falsify/confirm → fix → verify-in-one-session) is now battle-tested meta-capability, not architectural aspiration.
+- **§6 Threshold-Triggered Neuroplasticity, enforcement half** — the organism detected the gap (4-file test suite missing from `TestFailureSensor`), synthesized the fix (4 complete test modules with happy/edge/negative coverage), validated it through the pipeline, and landed it on disk under governance. The "graduate" half (durable behavior across multiple consecutive successes) is still unproven — Session W is one data point.
+- **Model output quality converges with pipeline definition of "good"** — L2 approval, shadow harness, entropy, GATE, per-file POSTMORTEM all passed; independent `pytest` execution also passes 20/20. The governance layer is not papering over broken artifacts.
+
+**What this arc does NOT yet prove (honest caveats):**
+
+1. **Durability**. Manifesto §6 demands 3 consecutive successes before a capability graduates. Session W is 1. Sessions X, Y (or whatever the next attempts are) need to replicate the arc under comparable conditions before multi-file autonomy is a "capability" rather than a "data point."
+2. **Broader scope**. Session W's task was narrow: new-file creation, test modules, a detailed backlog description. Multi-file refactors across existing code, cross-file dependency-aware edits, schema migrations, breaking-change rollouts — those are the next frontiers, none yet proven.
+3. **Latent bugs are now load-bearing workarounds, not fixes**. Session W sits on top of three known deferred items:
+   - `JARVIS_MAX_VALIDATE_RETRIES=0` works around the re-validation non-determinism ('infra' flake on iter=1). See `memory: project_validation_infra_flakiness.md`. The underlying sandbox isolation issue is still there.
+   - `cost_governor.finish` logs stale `ctx.phase.name` (the `phase=CLASSIFY` mismatch noted in Session U). Display-only bug but a real ctx-reference inconsistency.
+   - `asyncio.wait_for(_repair.repair(), timeout=90.0)` at `orchestrator.py:3787` is still hardcoded, non-env. The `except Exception` swallow was upgraded to WARNING in `d6aa78c8ba` but the 90s timeout is latent.
+4. **L2 1-iteration convergence might be lucky**. The model produced a candidate L2 could fix in one shot. We don't know the distribution — when L2 needs 3, 5, 7 iterations, the 600s budget might be tight. Session W is one data point on that too.
+
+**Next-track candidates (future sprints, each scoped, not in Session W's scope):**
+
+1. **Replicate for durability**. 2+ more successful multi-file arcs under comparable conditions. Could use the same backlog task (re-enqueued) or different multi-file tasks. Success criterion: 3 consecutive `APPLY mode=multi + DECISION applied` sequences.
+2. **Fix the re-validation 'infra' flake**. Either require confirmation across ≥2 runs before non-retryable escalation, or audit the sandbox isolation so repeated validation on an unchanged candidate returns byte-identical classifications. Memory note `project_validation_infra_flakiness.md` has three candidate directions.
+3. **ctx-reference staleness in the outer `finally`**. `cost_governor.finish` should log `ctx.phase.name` from the advanced ctx, not the stale outer-scope reference. Small observability fix.
+4. **Env-tune the micro-fix timeout** (`orchestrator.py:3794`). `asyncio.wait_for(timeout=90.0)` → `default_factory` from `JARVIS_MICRO_FIX_TIMEOUT_S`.
+5. **Multi-file refactor scope expansion**. Identify a backlog task that's a coordinated refactor across 2-3 existing files rather than 4 new files. Different pressure on the pipeline — existing files mean real rollback semantics, real source-drift checks, real L2 repair against already-imported code. Proof of this would generalize the Session W arc.
+
+**The soundbite for Sessions U–W:** Before this arc, O+V was "architecturally A-grade with proven single-file autonomy." After this arc, O+V is a **proven end-to-end autonomous multi-file development loop** — walked under Manifesto governance, with every observability contract upheld, every phase firing correctly, every artifact functionally verified. The remaining work shifts from "does it work?" to "is it durable?" and "how broadly does it generalize?"
+
 ## O+V Capability Assessment (2026-04-12)
 
 ### Current Pipeline Maturity
