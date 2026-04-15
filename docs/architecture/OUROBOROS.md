@@ -1995,6 +1995,104 @@ The two remaining resilience gaps are both tactical, not architectural: **sensor
 
 The organism is no longer stuck proving it can heal a broken test. It is now stuck proving it can do so **without burning 3× the productive cost on stale successors**. That is a much better problem to have.
 
+### 2026-04-14 — Exploration-loop shadow calibration + ledger enforcement validated (sessions `bt-2026-04-15-040118` and `bt-2026-04-15-041413`)
+
+**Headline:** Two back-to-back sessions that answered — and didn't answer — the single most important behavioral question for O+V. Session A proved the `ExplorationLedger` shadow scorer can see what the legacy int-counter gate can't: **a model that calls `read_file` four times and calls it exploration**. Session B flipped the same ledger to enforcement mode, watched the Iron Gate hard-reject that same shallow behavior for the first time in production, confirmed the retry mechanism escalates the model (extended thinking + parallel tool execution), and then lost the retry's synthesis stream to a fallback-semaphore concurrency bug before a second ledger decision could be recorded. **Ledger enforcement is validated. Tool-diversity-under-retry remains unproven — but the reason it's unproven is a mechanical provider-fairness bug, not a model-capability limit.**
+
+**Session A (`bt-2026-04-15-040118`) — shadow telemetry:**
+
+- Probe: 4-file leaf-test task (`.jarvis/backlog.json → session-a-exploration-probe-v2-2026-04-14`) routed via `BacklogSensor → complex complexity → COMPLEX route`. Advisor cleared (`risk=0.00 blast=0 coverage=100%`). First production op ever to reach `PlanGenerator` on a non-trivial target in this branch.
+- Generation: `[ClaudeProvider] 3 candidates in 97.1s (tool_rounds=4), cost=$0.1791, 17937+8350 tokens, first_token=1519ms thinking=tool-round route=complex`.
+- **The gold line** (21:06:02, while `JARVIS_EXPLORATION_SHADOW_LOG=true` and ledger enforcement off):
+  ```
+  [Orchestrator] ExplorationLedger(shadow) op=op-019d8f4d- complexity=complex
+      legacy_credit=4 score=3.00 min_score=8.00 unique=4 categories=comprehension
+      would_pass=False
+  ```
+- Interpretation: legacy int-counter gate says `4 ≥ 2 → PASS`; the ledger's category-diversity scorer says `score=3.00 < min_score=8.00, one category, FAIL`. All four tool calls were `read_file` (the `comprehension` category). The shadow scorer can measure shallowness — the legacy gate can't. **This is the first empirical proof that "linear and shallow" is a detectable, named pathology in the exploration loop**, not a vibes-based complaint.
+- Additional unplanned findings:
+  - `PLAN phase failed for op=op-019d8f4d-...: ; continuing to GENERATE without plan` — empty-string error, first observation of a PlanGenerator failure on a non-trivial op. Separate bug ticket; not a blocker for the exploration-loop investigation.
+  - `Iron Gate — ascii_auto_repaired: 6 codepoint(s) healed` on the isolation test file — the ASCII-strictness gate's auto-repair path is working as designed under real multi-file generation.
+- Cost: $0.2694 session total (single-op generate call was $0.1791, session cap was $0.15, per-op governor cap was $3.60 — session-level tracker tripped after the first charge landed). Session stopped `budget_exhausted` at 21:06:03. **Zero files landed on disk** — the op never reached APPLY because the cost cap fired between VALIDATE and APPLY phases.
+
+**Session B (`bt-2026-04-15-041413`) — enforcement flipped, retry fired, synthesis died:**
+
+The only config change from A was `JARVIS_EXPLORATION_LEDGER_ENABLED=true` plus `--cost-cap 0.50` and `--idle-timeout 1200`. Same backlog probe; fresh process, so `_seen_task_ids` was empty and the task_id was re-picked-up on the first scan.
+
+**Attempt 1 (the enforcement proof):**
+```
+21:19:18  ExplorationLedger(decision) op=op-019d8f59- complexity=complex
+          score=3.00 min_score=8.00 unique=4 categories=comprehension would_pass=False
+21:19:18  WARNING Iron Gate — ExplorationLedger(decision) insufficient op=op-019d8f59-
+          exploration_insufficient: score=3.0/8.0 categories=1/3 missing=- (attempt=1)
+21:19:18  Generation attempt 1/2 failed for op-019d8f59-...: exploration_insufficient
+21:19:18  Injecting 1 episodic failure(s) into retry context
+```
+Identical shadow signature to Session A (`score=3.0 unique=4 categories=comprehension`) — the model's default strategy for a 4-file task is still "read each file once." The difference is the **log tag: `(decision)` not `(shadow)`**, and the verdict actually blocks GENERATE instead of whispering from the sideline. **First production proof that flipping one env var turns the scorer into a hard Iron Gate rejection.**
+
+**Attempt 2 (the adaptation signals):**
+```
+21:19:18  extended thinking ENABLED: reason=complex-force budget=16000 tok max_tokens=20096
+21:19:22  🧠 Extended thinking: ~56 thinking tokens — deep reasoning before generation
+21:19:22  [ToolLoop] Parallel execution: 4 tools in round 0
+21:19:22  → stream tool_round=yes prompt_chars=44633  ← ~33K chars of tool results
+```
+
+Every signal of an escalated strategy:
+- **Extended thinking engaged** (`complex-force`, 16K token budget) — absent from attempt 1.
+- **Parallel tool execution in round 0** — a qualitatively different orchestration than the sequential 4-call pattern of Session A.
+- **`prompt_chars` grew from 11,799 pre-tools to 44,633 post-tools** — ~33KB of tool results flowing into synthesis. Real content consumption, not padding.
+
+**Attempt 2 died before the second ledger decision could fire:**
+```
+21:21:19  [ClaudeProvider] stream terminated via CancelledError: elapsed=117.1s
+          budget=235.5s first_token=0.9s bytes_received=28780 tool_round=yes thinking=off
+21:21:19  [CandidateGenerator] EXHAUSTION event_n=1 cause=fallback_failed
+          fallback_err_class=TimeoutError fallback_failure_mode=TIMEOUT
+          sem_wait_total_s=121.53 pre_sem_remaining_s=240.0
+          primary_name=doubleword-397b fallback_name=claude-api
+          op_id=op-019d8f59- route=complex complexity=complex
+21:21:19  ExplorationLedger(shadow,partial) op=op-019d8f59- complexity=complex
+          route=complex cause=all_providers_exhausted records=0 score=0.00 would_pass=False
+21:21:19  Generation attempt 2/2 failed for op-019d8f59-...: all_providers_exhausted:fallback_failed
+```
+
+Unpacked: DW primary timed out → fallback (Claude) was invoked → fallback-semaphore wait consumed **121.53s** → once acquired, the Claude stream ran for 117.1s and received 28,780 bytes → then was cancelled externally with 118s of budget still nominally remaining. The post-exception shadow-partial log captures `records=0` because the tool execution records weren't persisted before the synthesis exception fired — so **we cannot even see which four tools round-0 actually called**, let alone whether they were category-diverse.
+
+**What this session validated:**
+
+1. **Ledger enforcement is real and stricter than the legacy gate.** `ExplorationLedger(decision) insufficient` is the production log line for a block that the legacy int-counter would have waved through. One env flag flips the behavior. This is the single result that tells us the exploration-loop scaffolding is load-bearing, not decorative.
+2. **The retry path engages under enforcement.** `Injecting 1 episodic failure(s) into retry context` fired; attempt 2 launched with escalated parameters; extended thinking engaged on a route that normally has it off.
+3. **The model's default response to an `exploration_insufficient` verdict is to escalate effort**, not to dismiss it — extended thinking on, parallel tool execution, larger synthesis prompt. That's the shape of Class A (adapt), not Class B (thrash with more read_file) or Class C (game the category counter with glob padding). It is **not yet proven** to be Class A, because we couldn't read the tool names, but the surrounding signals are consistent with adaptation and inconsistent with the other two.
+
+**What this session did NOT answer (and why that's not a ledger problem):**
+
+The tool-diversity-under-retry question is unproven — but the reason is mechanical, not behavioral. The synthesis call was **externally cancelled mid-stream during a fallback acquisition that waited 121 seconds**. This is a `providers.py` / semaphore / concurrency bug, not a model-capability limit. The exploration loop can't teach itself diversity if its retry attempts are being strangled in provider-fairness wait queues before the ledger gets a second look.
+
+**Follow-up work ordered by "which of these makes the next session conclusive":**
+
+1. **Fallback-semaphore tracing and fair-share policy.** Find the acquire/release points in `providers.py` and `candidate_generator.py`, log `{holder_count, wait_time, op_id, route}` at every acquire/release. Confirm whether BG + IMMEDIATE + GENERATE_RETRY stack on one global limit. **Candidate narrow fix: reserved slot for `GENERATE_RETRY` tier**, or **per-route semaphores**, or **shorter DW primary phase so Claude fallback gets budget sooner**, or **don't cancel an in-flight fallback stream unless a hard deadline is crossed**. Align with Manifesto §5 — reflex ops must not starve behind bulk BG, and retries of blocked ops must not starve behind their own cohort.
+2. **Single-worker repro.** Rerun Session B config with `JARVIS_BG_POOL_SIZE=1` (or pause OpportunityMiner / TodoScanner / DocStaleness for the duration). If retry 2 completes to a second `ExplorationLedger(decision)` line under single-worker isolation, we've proven concurrency is the bug — not model capability. This is the cheapest empirical answer.
+3. **Tool-execution-record persistence before synthesis.** `records=0` on the `(shadow,partial)` exception path is a diagnosis gap. Persist `tool_execution_records` as soon as the tool round completes (before the synthesis call) so a killed stream still leaves an audit trail of which four tools ran. Would have turned Session B's inconclusive outcome into a definitive "parallel 4× read_file" or "diverse mix" answer.
+4. **`_DEFAULT_FLOORS` needs a `complex` entry.** `exploration_engine.py:242` has only `trivial / simple / moderate / architectural`. A `complex`-complexity op falls through `from_env` to `moderate` defaults (`min_score=8.0 min_categories=3`). Session B's enforcement was therefore tuning `complex` ops against `moderate` thresholds. Adding a dedicated `complex` row with its own floors separates the investigations — "did it adapt?" from "is the floor calibrated right for 4-file ops?"
+5. **PLAN phase empty-error bug.** `PLAN phase failed for op=...: ; continuing to GENERATE without plan` observed in both sessions on the non-trivial op. Silent failure with empty error string. Separate ticket; not blocking the semaphore investigation.
+
+**Session metadata:**
+- Session A: `bt-2026-04-15-040118`, 5 min useful runtime, cost $0.2694 / $0.15 cap, stopped `budget_exhausted`. Probe reached `VALIDATE` phase; **0 files landed on disk**.
+- Session B: `bt-2026-04-15-041413`, ~7 min useful runtime, cost $0.2955 / $0.50 cap, terminated `SIGKILL` after the probe's cost governor finished at $0.1895 / $3.60. Single Claude call charged. **0 files landed on disk**.
+- Reflex path: disabled (`JARVIS_INTENT_TEST_DIR=tests/_does_not_exist`)
+- Auto-commit: disabled (`JARVIS_AUTO_COMMIT_ENABLED=false`)
+- Shadow-log: on in both sessions
+- Ledger enforcement: **off in A, on in B** — the only material config delta
+
+**What this means for O+V going forward:**
+
+The exploration-loop question has split into two questions with different answers. **"Is the scaffolding load-bearing?" — YES, proven.** The ledger scorer measures diversity, enforcement mode turns it into a hard gate, retry mechanism fires, model escalates strategy. **"Does the model actually produce diverse tool calls under retry feedback?" — unknown, and will stay unknown until we fix the provider-fairness bug that strangles retry syntheses.**
+
+That means the next engineering priority is **not more ledger tuning, not category floor adjustment, not prompt engineering for better retry feedback — it's the semaphore**. Ship one narrow fix in `providers.py` / `candidate_generator.py` that gives `GENERATE_RETRY` a reserved path through the fallback pool, rerun Session B, and the tool-diversity question resolves itself in one more session.
+
+The mindset shift: **Session B didn't fail, it pointed at the blocker**. Every sophisticated autonomous system has a version of this moment — the first time the high-level reasoning gate catches the low-level execution system failing. The log line `fallback_semaphore_wait=121.53s` is cheap to read, the fix is mechanical, and the exploration-loop work can resume the moment retries can reliably produce candidates. Manifesto §5 (reflex ops must not starve behind bulk BG) now has a direct empirical reason to extend to "retries of blocked ops must not starve behind their own cohort either."
+
 ## O+V Capability Assessment (2026-04-12)
 
 ### Current Pipeline Maturity
