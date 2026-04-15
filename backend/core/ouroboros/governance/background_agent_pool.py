@@ -645,9 +645,51 @@ class BackgroundAgentPool:
                     # Venom on BACKGROUND sensor traffic — complete.
                     # Env-tunable so battle tests can go higher without
                     # a code change.
-                    _op_timeout_s = float(
+                    _op_timeout_base_s = float(
                         os.environ.get("JARVIS_BG_WORKER_OP_TIMEOUT_S", "360")
                     )
+                    # Route-aware ceiling: COMPLEX ops (≥4 target files in
+                    # the intake envelope) need longer wall-time budget than
+                    # the 360s anti-hang watchdog provides, because their
+                    # full lifecycle (CLASSIFY + PLAN + attempt 1 GENERATE
+                    # + Iron Gate rejection + GENERATE_RETRY with tool-round
+                    # exploration + synthesis) can legitimately consume
+                    # 400–600s. Session `bt-2026-04-15-044627` (2026-04-14)
+                    # proved this empirically under `BG_POOL_SIZE=1`
+                    # isolation: a 4-file probe hit the 360s ceiling mid
+                    # retry-2 synthesis with 131s of nominal generation
+                    # budget still remaining, with zero semaphore contention.
+                    # The cancel propagated from this pool up through the
+                    # fallback `asyncio.wait_for` and surfaced as
+                    # `fallback_err_class=CancelledError`, which earlier
+                    # diagnosis had mistaken for semaphore starvation.
+                    #
+                    # We use target_files count (not task_complexity) because
+                    # CLASSIFY/ROUTE haven't run yet at worker pickup — but
+                    # the complexity classifier is deterministic on file
+                    # count (`complexity_classifier.py:161-165`): ≥4 files
+                    # → `complex`, which in turn routes to COMPLEX provider
+                    # path per `urgency_router.py:256-263`. File-count-based
+                    # prediction is therefore equivalent to complexity-
+                    # based without the phase-ordering hazard.
+                    try:
+                        _target_file_count = len(
+                            getattr(op.context, "target_files", None) or ()
+                        )
+                    except Exception:
+                        _target_file_count = 0
+                    if _target_file_count >= 4:
+                        _op_timeout_s = float(os.environ.get(
+                            "JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S", "900",
+                        ))
+                        logger.info(
+                            "Worker %d: %s complex-route ceiling %.0fs "
+                            "(file_count=%d, base=%.0fs)",
+                            worker_id, op.op_id, _op_timeout_s,
+                            _target_file_count, _op_timeout_base_s,
+                        )
+                    else:
+                        _op_timeout_s = _op_timeout_base_s
                     result = await asyncio.wait_for(
                         _orch.run(op.context), timeout=_op_timeout_s,
                     )

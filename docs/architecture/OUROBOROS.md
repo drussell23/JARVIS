@@ -2093,6 +2093,66 @@ That means the next engineering priority is **not more ledger tuning, not catego
 
 The mindset shift: **Session B didn't fail, it pointed at the blocker**. Every sophisticated autonomous system has a version of this moment — the first time the high-level reasoning gate catches the low-level execution system failing. The log line `fallback_semaphore_wait=121.53s` is cheap to read, the fix is mechanical, and the exploration-loop work can resume the moment retries can reliably produce candidates. Manifesto §5 (reflex ops must not starve behind bulk BG) now has a direct empirical reason to extend to "retries of blocked ops must not starve behind their own cohort either."
 
+### 2026-04-14 addendum — Session C instrumentation proof + true root cause (`bt-2026-04-15-044627`)
+
+**Headline:** The Session A/B framing was half-wrong in a specific, instructive way. The fallback-semaphore wait time in Session B (`sem_wait_total_s=121.53s`) looked like sem contention but was actually the last measurable symptom of a different problem: **the `BackgroundAgentPool` per-op wall-time ceiling (`JARVIS_BG_WORKER_OP_TIMEOUT_S`, default 360s) was force-reaping workers before retries under ledger enforcement could complete.** Session C, run with the sem-trace instrumentation from commit `614009ec05` under `JARVIS_BG_POOL_SIZE=1` isolation, produced the definitive evidence: zero semaphore contention, clean acquires and releases in both attempts, and the exact same CancelledError-during-synthesis failure mode — but this time with the pool-ceiling log line one line below it, showing the real mechanism.
+
+**The two answers Session C finally produced:**
+
+1. **Concurrency is NOT the root cause.** Under `BG_POOL_SIZE=1` with the single worker exclusively on the probe op (TodoScanner, runtime_health, doc_staleness all queued at depths `5/16` → `14/16`, not running), the fallback semaphore was never contested:
+   ```
+   21:50:26  Fallback sem acquire: slots_free=1/1 remaining=240.0s route=complex phase=GENERATE
+   21:52:15  Fallback sem release: hold=108.9s sem_wait=0.0s phase=GENERATE outcome=ok   ← attempt 1 CLEAN
+   21:52:15  Fallback sem acquire: slots_free=1/1 remaining=240.0s route=complex phase=GENERATE_RETRY
+   21:54:04  EXHAUSTION ... fallback_err_class=CancelledError remaining_s=131.46
+   21:54:04  Worker 0: operation bgop-6f83c8ced64d exceeded pool ceiling (360s) — freeing slot
+   ```
+   Attempt 2 was cancelled with **131.46 seconds of nominal generation budget still remaining**. The cancel came from above, not from within — the `BackgroundAgentPool`'s 360s `asyncio.wait_for` ceiling fired against the whole `_orch.run(op.context)` wall time. `CancelledError` propagated down through `_call_fallback`'s `wait_for` and surfaced as `fallback_err_class=CancelledError fallback_failure_mode=TIMEOUT`, which the Session B postmortem had mistaken for semaphore-side starvation. Session C, with zero sem wait (`sem_wait=0.0s` on both acquires), reproduced the exact same symptom — proving the cancel never came from the sem.
+2. **The model DOES adapt under retry feedback. Class A confirmed.** Session A/B's retry signature was `4× read_file` (single `comprehension` category, `score=3.00`). Session C attempt 1 was even shallower — **zero tool calls at all** (`ExplorationLedger(decision) score=0.00 unique=0 categories=-`), the model went `end_turn` on a pure-thinking direct patch attempt. The Iron Gate rejected at `0/8.0`, injected the `exploration_insufficient` episodic failure into retry context, and the retry's round 0 surfaced via the Track 2 `tool_round_complete` audit:
+   ```
+   21:52:22  [ToolLoop] tool_round_complete op=op-019d8f77- round=0 tools=4
+             names=read_file,read_file,list_dir,list_symbols total_records=4
+   ```
+   **Three distinct tool names spanning ≥2 categories** (`comprehension` from `read_file`, `structure` from `list_dir`, `structure`/`call_graph` from `list_symbols`). The model directly responded to the "you only touched one category" feedback by diversifying. **We now have empirical proof that (a) ledger enforcement steers behavior, and (b) retry feedback is more effective at producing diverse exploration than the initial prompt.**
+
+**Track 1 + Track 2 instrumentation (commit `614009ec05`) was the difference.** Without the `phase=GENERATE_RETRY` label on the second sem acquire and the `tool_round_complete` audit log, Session B's wrong diagnosis would have persisted and the first fix attempt would have tuned a semaphore that wasn't broken. With the instrumentation, the real mechanism became visible on first repro:
+
+- `Fallback sem release: hold=108.9s sem_wait=0.0s phase=GENERATE outcome=ok` — tells us the sem worked fine.
+- `Fallback sem acquire: ... phase=GENERATE_RETRY` — tells us we're in retry, not in a fresh op.
+- `tool_round_complete ... names=read_file,read_file,list_dir,list_symbols` — tells us the model adapted with diverse tools.
+- `exceeded pool ceiling (360s)` — tells us the pool killed it, not the provider.
+
+Four log lines, three wrong theories dismissed, one correct root cause surfaced. This is what instrumentation-first fixes look like.
+
+**The narrow fix, applied:**
+
+`background_agent_pool.py:648` now reads a route-aware ceiling: ops with `len(context.target_files) >= 4` get `JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S` (default `900s`, 2.5× base), everything else keeps the 360s anti-hang watchdog unchanged. File count is used instead of `task_complexity` because CLASSIFY/ROUTE haven't run yet at worker pickup — but the complexity classifier (`complexity_classifier.py:161-165`) is deterministic on file count, so `≥4 files` is equivalent to `complex` complexity without the phase-ordering hazard. Code comment in the patch explains the reasoning with a Session C reference for whoever reads it in 6 months.
+
+**What this session validates beyond the fix:**
+
+- **`ExplorationLedger(decision)` enforcement plus retry-feedback injection is a complete behavioral control loop.** We can measurably steer model exploration from "zero or shallow" to "diverse multi-category" via one env flag and a few lines of episodic-memory injection. This is the scaffolding *working*, not just existing.
+- **Track 2 audit logging (`tool_round_complete`) will survive the next 10 retry-related bugs.** It's additive, costs nothing at runtime, and turns every `records=0` exception path into a debuggable "tools were X, Y, Z, then cancel fired" trace. Keep it forever.
+- **Instrumentation-before-fix is the correct pattern for concurrency bugs.** Committing `614009ec05` before the Session C repro was the right call — without it we would have tuned the wrong knob. This is the "ship observability first" discipline that makes everything downstream cheaper.
+
+**Session metadata:**
+- Session ID: `bt-2026-04-15-044627`
+- Runtime: ~9 min (killed manually after diagnosis was clear)
+- Stop reason: SIGKILL (manual, after root cause confirmed)
+- Cost: op-019d8f77 — $0.1361 / $3.60 per-op cap; session total $0.3311 / $0.50 cap
+- Backlog probe: `session-c-semtrace-repro-2026-04-14` (fresh task_id)
+- Advisor: `recommend risk=0.00 blast=0 coverage=100%` (leaf-file probe shape clean)
+- Route: COMPLEX (`complex_task:complex:4_files`)
+- Attempts: 2/2, both failed — attempt 1 via `exploration_insufficient score=0.00`, attempt 2 via `exceeded pool ceiling (360s)` with 131s of nominal budget remaining
+- Files on disk: **0** (auto-commit off, APPLY never reached)
+
+**Follow-up priority shuffle (updated from the Session A/B entry):**
+
+1. **Pool ceiling fix — SHIPPED** this turn in `background_agent_pool.py`. Next repro should see `Worker 0: ... complex-route ceiling 900s (file_count=4, base=360s)` on the probe op, and attempt 2's `tool_round_complete` should now complete into a second `ExplorationLedger(decision)` line — either `would_pass=True` (gate clears, op proceeds to APPLY) or `would_pass=False` with a richer diagnosis than `categories=comprehension`.
+2. **Fallback semaphore work — DEPRIORITIZED.** Session C proved it wasn't the blocker. Revisit only if a future multi-worker run actually shows contention.
+3. **`records=0` exception-path gap — STILL RELEVANT** but mitigated by Track 2. The `ExplorationLedger(shadow,partial)` handler could still be taught to hydrate from `self._last_records` if the exception carries no records — a cheap follow-up but not blocking.
+4. **`_DEFAULT_FLOORS` missing `complex` entry** — still deferred, still non-blocking.
+5. **PLAN empty-error bug** — reproduced again this session on line 316. Separate ticket.
+
 ## O+V Capability Assessment (2026-04-12)
 
 ### Current Pipeline Maturity
