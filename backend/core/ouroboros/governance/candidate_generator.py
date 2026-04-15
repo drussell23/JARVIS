@@ -1044,6 +1044,7 @@ class CandidateGenerator:
                     try:
                         await self._exhaustion_watcher.record_exhaustion(
                             reason=str(exc),
+                            op_id=getattr(context, "op_id", None) or None,
                         )
                     except Exception:
                         logger.debug(

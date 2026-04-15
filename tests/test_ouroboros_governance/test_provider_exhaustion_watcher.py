@@ -18,6 +18,7 @@ import pytest
 
 from backend.core.ouroboros.governance.provider_exhaustion_watcher import (
     ProviderExhaustionWatcher,
+    _MAX_COUNTED_OPS,
     _resolve_threshold,
 )
 
@@ -334,3 +335,192 @@ class TestRealControllerIntegration:
         assert ctrl.mode is AutonomyMode.SANDBOX
         await watcher.record_success()
         assert watcher.consecutive == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-op dedup (Session P fix, 2026-04-15)
+# ---------------------------------------------------------------------------
+
+
+class TestPerOpDedup:
+    """One op — even if its internal retry exhausts twice — contributes
+    a single event to the consecutive counter. Different ops are counted
+    independently. See session bt-2026-04-15-192504 for the diagnosis.
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_op_id_counted_once(self):
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(controller=ctrl, threshold=5)
+
+        first = await watcher.record_exhaustion(
+            reason="dw fail", op_id="op-abc",
+        )
+        second = await watcher.record_exhaustion(
+            reason="claude fail", op_id="op-abc",
+        )
+        third = await watcher.record_exhaustion(
+            reason="claude fail retry", op_id="op-abc",
+        )
+
+        assert first is False
+        assert second is False
+        assert third is False
+        assert watcher.consecutive == 1
+        # total_exhaustions still reflects every raw event, even dedupes.
+        assert watcher.total_exhaustions == 3
+        snap = watcher.snapshot()
+        assert snap["deduped_events"] == 2
+        assert snap["unique_ops_counted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_different_op_ids_counted_separately(self):
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(controller=ctrl, threshold=3)
+
+        await watcher.record_exhaustion(reason="x", op_id="op-1")
+        await watcher.record_exhaustion(reason="x", op_id="op-2")
+        triggered = await watcher.record_exhaustion(
+            reason="x", op_id="op-3",
+        )
+
+        assert triggered is True
+        assert watcher.consecutive == 3
+        assert watcher.hibernations_triggered == 1
+        assert watcher.snapshot()["unique_ops_counted"] == 3
+
+    @pytest.mark.asyncio
+    async def test_session_p_scenario_does_not_hibernate(self):
+        """Reproduce Session P's failure mode and confirm it's fixed.
+
+        Probe op-019d929b exhausts once (internal retry already
+        exhausted both providers as a single watcher event), then
+        runtime_health op-019d929e exhausts twice (two attempts both
+        hit all_providers_exhausted). Pre-fix that was 3 events → hit
+        threshold=3 → hibernation. Post-fix: 2 distinct ops → 2 on
+        counter → stays below threshold.
+        """
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(controller=ctrl, threshold=3)
+
+        # Probe op, one exhaustion event.
+        await watcher.record_exhaustion(
+            reason="claude flake", op_id="op-019d929b",
+        )
+        # runtime_health op, two exhaustion events (both attempts).
+        await watcher.record_exhaustion(
+            reason="claude flake", op_id="op-019d929e",
+        )
+        triggered = await watcher.record_exhaustion(
+            reason="claude flake", op_id="op-019d929e",
+        )
+
+        assert triggered is False
+        assert watcher.consecutive == 2  # NOT 3
+        assert watcher.hibernations_triggered == 0
+        assert ctrl.calls == []
+
+    @pytest.mark.asyncio
+    async def test_success_clears_counted_op_ids(self):
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(controller=ctrl, threshold=5)
+
+        await watcher.record_exhaustion(reason="x", op_id="op-1")
+        await watcher.record_exhaustion(reason="x", op_id="op-2")
+        assert watcher.snapshot()["unique_ops_counted"] == 2
+
+        await watcher.record_success()
+        assert watcher.consecutive == 0
+        assert watcher.snapshot()["unique_ops_counted"] == 0
+
+        # After a success, the SAME op_id can contribute again to a
+        # fresh consecutive run — the dedup set is per-run, not
+        # per-process.
+        await watcher.record_exhaustion(reason="x", op_id="op-1")
+        assert watcher.consecutive == 1
+        assert watcher.snapshot()["unique_ops_counted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_reset_clears_counted_op_ids(self):
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(controller=ctrl, threshold=5)
+
+        await watcher.record_exhaustion(reason="x", op_id="op-1")
+        await watcher.record_exhaustion(reason="x", op_id="op-2")
+
+        await watcher.reset()
+        assert watcher.consecutive == 0
+        assert watcher.snapshot()["unique_ops_counted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_none_op_id_preserves_legacy_behavior(self):
+        """Callers that don't pass op_id still increment on every call."""
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(controller=ctrl, threshold=5)
+
+        # Three calls with no op_id — three increments, zero dedupe.
+        await watcher.record_exhaustion(reason="x")
+        await watcher.record_exhaustion(reason="x")
+        await watcher.record_exhaustion(reason="x")
+
+        assert watcher.consecutive == 3
+        assert watcher.total_exhaustions == 3
+        assert watcher.snapshot()["deduped_events"] == 0
+        assert watcher.snapshot()["unique_ops_counted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_string_op_id_preserves_legacy_behavior(self):
+        """Empty-string op_id is treated as None (falsy guard)."""
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(controller=ctrl, threshold=5)
+
+        await watcher.record_exhaustion(reason="x", op_id="")
+        await watcher.record_exhaustion(reason="x", op_id="")
+
+        assert watcher.consecutive == 2  # no dedupe on empty string
+        assert watcher.snapshot()["unique_ops_counted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_counted_op_ids_eviction_at_cap(self):
+        """Eviction kicks in past _MAX_COUNTED_OPS. Hibernation has
+        already fired by this point (threshold << cap), so eviction is
+        cosmetic — we just want to prove it doesn't unbound the set.
+        """
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(
+            # Very high threshold so we can push past the cap without
+            # the _maybe_hibernate loop short-circuiting our count.
+            controller=ctrl, threshold=_MAX_COUNTED_OPS * 10,
+        )
+
+        # Fill past the cap.
+        for i in range(_MAX_COUNTED_OPS + 5):
+            await watcher.record_exhaustion(
+                reason="x", op_id=f"op-{i}",
+            )
+
+        snap = watcher.snapshot()
+        # After eviction kicks in on overflow, the set holds the most
+        # recent _MAX_COUNTED_OPS // 2 entries. Consecutive climbed by
+        # one per distinct op (cap + 5 of them).
+        assert watcher.consecutive == _MAX_COUNTED_OPS + 5
+        assert snap["unique_ops_counted"] <= _MAX_COUNTED_OPS
+        assert snap["unique_ops_counted"] > 0
+
+    @pytest.mark.asyncio
+    async def test_mixed_legacy_and_op_id_callers(self):
+        """A mix of None and op_id callers in the same run — each
+        None increments, op_ids dedupe against prior op_ids."""
+        ctrl = _FakeController()
+        watcher = ProviderExhaustionWatcher(controller=ctrl, threshold=10)
+
+        await watcher.record_exhaustion(reason="x")                    # +1 (None)
+        await watcher.record_exhaustion(reason="x", op_id="op-A")      # +1
+        await watcher.record_exhaustion(reason="x", op_id="op-A")      # dedupe
+        await watcher.record_exhaustion(reason="x")                    # +1 (None)
+        await watcher.record_exhaustion(reason="x", op_id="op-B")      # +1
+
+        assert watcher.consecutive == 4
+        assert watcher.total_exhaustions == 5
+        assert watcher.snapshot()["deduped_events"] == 1
+        assert watcher.snapshot()["unique_ops_counted"] == 2

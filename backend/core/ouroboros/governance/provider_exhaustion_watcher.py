@@ -37,6 +37,31 @@ Environment
 controller to hibernate. Setting this to ``1`` makes hibernation fire
 on the first exhaustion (useful for tests); setting it to ``0`` is
 rejected at construction time.
+
+Per-op dedup (Session P fix, 2026-04-15)
+----------------------------------------
+
+Historically ``record_exhaustion`` was purely process-global: every
+``all_providers_exhausted`` event from :class:`CandidateGenerator`
+incremented the consecutive counter regardless of which op caused it.
+Session ``bt-2026-04-15-192504`` (Session P) diagnosed the failure
+mode: a single transient Claude API flake produced 3 exhaustion events
+across 2 ops (one complex-route probe's retry + one runtime_health
+reflex op's two attempts = 3 hits), tripping the threshold and
+hibernating the organism even though only 2 distinct ops actually
+failed.
+
+The fix: ``record_exhaustion(op_id=...)`` now dedupes by op_id within
+the current consecutive run. An op that exhausts both its attempts
+contributes **one** event to the counter, not two. The set of
+already-counted op_ids is cleared on every ``record_success()``,
+matching the reset-on-success semantics of the consecutive counter
+itself. Callers that don't pass ``op_id`` preserve the pre-patch
+behavior (every call increments) — the default is ``None`` so
+every existing test + call site is unchanged at the wire.
+
+See memory ``project_exhaustion_watcher_retry_counting.md`` for the
+full diagnosis history.
 """
 
 from __future__ import annotations
@@ -44,13 +69,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 logger = logging.getLogger("Ouroboros.ExhaustionWatcher")
 
 
 _DEFAULT_THRESHOLD = 3
 _ENV_THRESHOLD = "JARVIS_HIBERNATION_TRIGGER_THRESHOLD"
+
+# Cap on the size of ``_counted_op_ids`` to prevent unbounded growth
+# in pathological long-running sessions with no successful generations.
+# 256 ≈ 13 KB at 50-byte op_ids — trivially affordable, and well above
+# any realistic hibernation-threshold * op-density product. When the
+# cap is exceeded the oldest half is evicted FIFO-style; at that
+# point the consecutive counter itself has long since crossed the
+# threshold and hibernation has fired, so the eviction is cosmetic.
+_MAX_COUNTED_OPS: int = 256
 
 
 def _resolve_threshold(explicit: Optional[int]) -> int:
@@ -116,9 +150,13 @@ class ProviderExhaustionWatcher:
         self._total_exhaustions: int = 0
         self._total_successes: int = 0
         self._hibernations_triggered: int = 0
+        self._deduped_events: int = 0
         self._last_reason: Optional[str] = None
         self._lock: asyncio.Lock = asyncio.Lock()
         self._prober = prober
+        # Op-ids already credited toward the current consecutive run.
+        # Cleared on any successful generation. See Session P fix notes.
+        self._counted_op_ids: Set[str] = set()
         logger.info(
             "ProviderExhaustionWatcher initialised — threshold=%d prober=%s",
             self._threshold,
@@ -167,7 +205,12 @@ class ProviderExhaustionWatcher:
     # Public API
     # ------------------------------------------------------------------
 
-    async def record_exhaustion(self, *, reason: str = "") -> bool:
+    async def record_exhaustion(
+        self,
+        *,
+        reason: str = "",
+        op_id: Optional[str] = None,
+    ) -> bool:
         """Record an ``all_providers_exhausted`` event.
 
         Increments the consecutive counter. If the threshold is reached
@@ -177,18 +220,57 @@ class ProviderExhaustionWatcher:
         so a flapping provider that oscillates below the threshold
         does not keep thrashing the controller.
 
+        When ``op_id`` is supplied, this call dedupes within the current
+        consecutive run: repeat events for the same op (e.g. both
+        retries of a CandidateGenerator dispatch that both exhaust)
+        contribute **one** increment, not two. The set of counted
+        op_ids is cleared on every :meth:`record_success` and
+        :meth:`reset`. Callers that pass ``op_id=None`` retain the
+        pre-patch behavior and every call increments.
+
         Returns ``True`` iff this call actually transitioned the
         controller into HIBERNATION (controller may refuse if already
         hibernating / DISABLED / EMERGENCY_STOP).
         """
         async with self._lock:
+            if op_id and op_id in self._counted_op_ids:
+                self._deduped_events += 1
+                self._total_exhaustions += 1
+                logger.info(
+                    "[ExhaustionWatcher] record_exhaustion(op_id=%s) "
+                    "DEDUPED — consecutive stays at %d/%d total=%d "
+                    "deduped=%d",
+                    op_id,
+                    self._consecutive,
+                    self._threshold,
+                    self._total_exhaustions,
+                    self._deduped_events,
+                )
+                return False
             self._consecutive += 1
             self._total_exhaustions += 1
             self._last_reason = reason or "unspecified"
+            if op_id:
+                self._counted_op_ids.add(op_id)
+                if len(self._counted_op_ids) > _MAX_COUNTED_OPS:
+                    # FIFO-ish eviction: keep the most recent half.
+                    # Sets don't preserve insertion order strictly, but
+                    # this is cosmetic — by the time we're evicting the
+                    # consecutive counter has long since tripped the
+                    # threshold and hibernation has fired.
+                    keep = list(self._counted_op_ids)[-(_MAX_COUNTED_OPS // 2):]
+                    self._counted_op_ids = set(keep)
+                    logger.warning(
+                        "[ExhaustionWatcher] _counted_op_ids exceeded %d "
+                        "— evicted oldest half (now %d entries)",
+                        _MAX_COUNTED_OPS,
+                        len(self._counted_op_ids),
+                    )
             logger.warning(
-                "[ExhaustionWatcher] record_exhaustion(reason=%r) "
+                "[ExhaustionWatcher] record_exhaustion(reason=%r op_id=%s) "
                 "— consecutive=%d/%d total=%d",
                 self._last_reason,
+                op_id or "-",
                 self._consecutive,
                 self._threshold,
                 self._total_exhaustions,
@@ -201,22 +283,26 @@ class ProviderExhaustionWatcher:
     async def record_success(self) -> None:
         """Reset the consecutive counter on any successful generation.
 
-        Cheap path for the hot case: if the counter is already zero we
-        skip the lock. Otherwise we grab the lock and clear.
+        Cheap path for the hot case: if the counter is already zero and
+        there are no counted op_ids we skip the lock. Otherwise we grab
+        the lock, clear the counter, and clear the dedup set.
         """
         self._total_successes += 1
-        if self._consecutive == 0:
+        if self._consecutive == 0 and not self._counted_op_ids:
             return
         async with self._lock:
-            if self._consecutive == 0:
+            if self._consecutive == 0 and not self._counted_op_ids:
                 return
             previous = self._consecutive
+            previous_ops = len(self._counted_op_ids)
             self._consecutive = 0
             self._last_reason = None
+            self._counted_op_ids.clear()
             logger.info(
                 "[ExhaustionWatcher] record_success() — consecutive reset "
-                "(was %d)",
+                "(was %d, counted_ops=%d)",
                 previous,
+                previous_ops,
             )
 
     async def reset(self) -> None:
@@ -224,6 +310,7 @@ class ProviderExhaustionWatcher:
         async with self._lock:
             self._consecutive = 0
             self._last_reason = None
+            self._counted_op_ids.clear()
 
     def snapshot(self) -> Dict[str, Any]:
         """Lock-free observability snapshot for health()/TUI."""
@@ -233,6 +320,8 @@ class ProviderExhaustionWatcher:
             "total_exhaustions": self._total_exhaustions,
             "total_successes": self._total_successes,
             "hibernations_triggered": self._hibernations_triggered,
+            "deduped_events": self._deduped_events,
+            "unique_ops_counted": len(self._counted_op_ids),
             "last_reason": self._last_reason,
         }
 
