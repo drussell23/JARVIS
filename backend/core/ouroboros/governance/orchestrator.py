@@ -3625,6 +3625,15 @@ class GovernedOrchestrator:
                     directive = await self._l2_hook(ctx, best_validation, _pl_deadline)
                     if directive[0] == "break":
                         best_candidate, best_validation = directive[1], directive[2]
+                        logger.info(
+                            "[Orchestrator] L2 broke VALIDATE_RETRY loop for op=%s — "
+                            "proceeding to source-drift / shadow / entropy / GATE "
+                            "(candidate_id=%s, file=%s, source_hash=%s)",
+                            ctx.op_id,
+                            best_candidate.get("candidate_id", "?"),
+                            best_candidate.get("file_path", "?"),
+                            (best_candidate.get("source_hash") or "")[:12],
+                        )
                         break  # fall through to GATE
                     elif directive[0] in ("cancel", "fatal"):
                         return directive[1]  # ctx was advanced inside _l2_hook
@@ -3709,6 +3718,14 @@ class GovernedOrchestrator:
         # Source-drift check: file must not have changed since generation
         drift_hash = self._check_source_drift(best_candidate, self._config.project_root)
         if drift_hash is not None:
+            logger.info(
+                "[Orchestrator] Source drift detected for op=%s file=%s "
+                "(expected=%s, actual=%s) — advancing to CANCELLED",
+                ctx.op_id,
+                best_candidate.get("file_path", "?"),
+                (best_candidate.get("source_hash") or "")[:12],
+                (drift_hash or "")[:12],
+            )
             ctx = ctx.advance(
                 OperationPhase.CANCELLED,
                 terminal_reason_code="source_drift_detected",
@@ -3720,6 +3737,11 @@ class GovernedOrchestrator:
                 "actual_source_hash": drift_hash,
             })
             return ctx
+        logger.info(
+            "[Orchestrator] Source-drift check passed for op=%s — "
+            "proceeding to shadow harness + entropy + GATE",
+            ctx.op_id,
+        )
 
         # Winner traceability ledger entry
         await self._record_ledger(ctx, OperationState.GATING, {
@@ -3901,6 +3923,12 @@ class GovernedOrchestrator:
 
         # Store compact validation result in context; full output is in ledger
         ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
+        logger.info(
+            "[Orchestrator] Entered GATE phase for op=%s — invoking "
+            "can_write policy check on target_files=%s",
+            ctx.op_id,
+            list(ctx.target_files)[:3],
+        )
 
         # Heartbeat: GATE phase (Manifesto §7)
         try:
@@ -3914,6 +3942,11 @@ class GovernedOrchestrator:
         # ---- Phase 5: GATE ----
         allowed, reason = self._stack.can_write(
             {"files": list(ctx.target_files)}
+        )
+        logger.info(
+            "[Orchestrator] GATE can_write decision for op=%s: "
+            "allowed=%s reason=%s",
+            ctx.op_id, allowed, reason,
         )
         if not allowed:
             logger.warning(
