@@ -4559,6 +4559,43 @@ class GovernedOrchestrator:
         # all-or-nothing rollback semantics. Single-file candidates still
         # use the legacy single ChangeRequest path (zero change for them).
         _candidate_files = self._iter_candidate_files(best_candidate)
+
+        # Session O (bt-2026-04-15-175547) APPLY-path observability:
+        # log the multi-file decision at a single INFO line so logs
+        # prove single- vs multi-file flow without reading the raw
+        # candidate JSON. Session O's 4-file backlog probe wrote only
+        # dedup.py because the winning candidate returned a single
+        # (file_path, full_content) pair instead of a ``files`` list —
+        # the multi-file coordinated path (_apply_multi_file_candidate)
+        # is gated behind len(_candidate_files) > 1, which requires the
+        # candidate to include a populated ``files: [...]`` array.
+        # Without this log line, it took cross-referencing disk state
+        # against diff_summary text to confirm the single-file path
+        # was taken. This line makes that one grep.
+        _files_field = best_candidate.get("files") if isinstance(
+            best_candidate, dict
+        ) else None
+        _has_files_key = isinstance(_files_field, list) and len(_files_field) > 0
+        _multi_enabled = (
+            os.environ.get("JARVIS_MULTI_FILE_GEN_ENABLED", "true").lower()
+            not in ("false", "0", "no", "off")
+        )
+        _apply_mode = "multi" if len(_candidate_files) > 1 else "single"
+        _file_basenames = [
+            (fp.rsplit("/", 1)[-1] if "/" in fp else fp)
+            for fp, _ in _candidate_files
+        ]
+        logger.info(
+            "[Orchestrator] APPLY mode=%s candidate_files=%d "
+            "files_list_present=%s multi_enabled=%s targets=[%s] op=%s",
+            _apply_mode,
+            len(_candidate_files),
+            _has_files_key,
+            _multi_enabled,
+            ",".join(_file_basenames),
+            ctx.op_id[:16],
+        )
+
         if len(_candidate_files) > 1:
             _t_apply = time.monotonic()
             try:
