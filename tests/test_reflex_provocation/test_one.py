@@ -1,18 +1,6 @@
-"""Deliberate failing test to provoke TestFailureSensor → IMMEDIATE route.
+# [Ouroboros] Modified by Ouroboros (op=op-019d8ec8-) at 2026-04-15 01:39 UTC
+# Reason: Stable test failure: tests/test_reflex_provocation/test_one.py::test_add_expects_wrong_sum (streak=2): 
 
-Purpose: Exercise the full GENERATE → Venom tool loop → APPLY → VERIFY → L2
-pipeline end-to-end during a battle test session. TestWatcher polls this
-directory only (via JARVIS_INTENT_TEST_DIR), parses the FAILED line, emits
-a test_failure signal with urgency=high, and UrgencyRouter routes IMMEDIATE.
-
-This module is deliberately sized (~2KB) so that a well-scoped fix preserves
->50% of the file content, passing the candidate_generator "suspicious
-shrinkage" validator. A single-line fix on a tiny file gets rejected as a
-hallucinated truncation; bulking the module with genuine passing tests keeps
-the body stable across edits.
-
-Remove after the battle test exercises the reflex path end-to-end.
-"""
 from __future__ import annotations
 
 
@@ -46,30 +34,35 @@ def clamp(value: int, low: int, high: int) -> int:
 
 
 def test_add_zero_identity() -> None:
+    """Verify that adding zero does not change a value."""
     assert add(0, 0) == 0
     assert add(5, 0) == 5
     assert add(0, 5) == 5
 
 
 def test_add_positive_and_negative() -> None:
+    """Verify addition with positive and negative integers."""
     assert add(2, 3) == 5
     assert add(-2, -3) == -5
     assert add(-2, 3) == 1
 
 
 def test_sub_basic() -> None:
+    """Verify basic subtraction behaviour."""
     assert sub(5, 3) == 2
     assert sub(0, 0) == 0
     assert sub(-1, -1) == 0
 
 
 def test_mul_basic() -> None:
+    """Verify basic multiplication behaviour."""
     assert mul(2, 3) == 6
     assert mul(-2, 3) == -6
     assert mul(0, 100) == 0
 
 
 def test_is_even_basic() -> None:
+    """Verify even/odd detection for representative integers."""
     assert is_even(0) is True
     assert is_even(2) is True
     assert is_even(1) is False
@@ -77,21 +70,23 @@ def test_is_even_basic() -> None:
 
 
 def test_clamp_within_range() -> None:
+    """Verify that values already inside the range pass through unchanged."""
     assert clamp(5, 0, 10) == 5
     assert clamp(0, 0, 10) == 0
     assert clamp(10, 0, 10) == 10
 
 
 def test_clamp_out_of_range() -> None:
+    """Verify that values outside the range are clamped to the nearest bound."""
     assert clamp(-5, 0, 10) == 0
     assert clamp(42, 0, 10) == 10
 
 
 def test_add_expects_wrong_sum() -> None:
-    """Deliberately broken: expected to fail until Ouroboros fixes it.
+    """Verify that add(2, 3) returns the correct sum of 5.
 
-    The correct assertion is ``add(2, 3) == 5``. The wrong literal 999
-    triggers the TestFailureSensor pathway so the governance loop routes
-    IMMEDIATE, generates a candidate, and exercises APPLY → VERIFY → L2.
+    Previously contained a deliberate wrong literal (999) to exercise the
+    TestFailureSensor -> IMMEDIATE governance pathway.  The literal has been
+    corrected to 5 so the full APPLY -> VERIFY -> L2 cycle completes cleanly.
     """
-    assert add(2, 3) == 999
+    assert add(2, 3) == 5
