@@ -3547,7 +3547,37 @@ class GovernedOrchestrator:
         best_validation: Optional[ValidationResult] = None
         validate_retries_remaining = self._config.max_validate_retries
 
-        for _ in range(1 + self._config.max_validate_retries):
+        # ── [ValidateRetryFSM] instrumentation (Follow-up A, Session T aftermath) ──
+        # Session T (bt-2026-04-15-211616) showed the op producing 1m40s of dead
+        # air between `InteractiveRepair disabled — falling through to
+        # VALIDATE_RETRY/L2` and cost_governor.finish, with phase=CLASSIFY in
+        # the finalize line (ctx-reference mismatch). L2 never dispatched even
+        # once. The retry loop has ~15 entry/exit/transition points and none
+        # of them were logged at INFO level, so we couldn't tell which branch
+        # the op took. This helper + tagged log lines make every transition
+        # auditable so the next session's log pinpoints the silent-exit line.
+        # Manifesto §8 (Absolute Observability): a path that ends cost
+        # accounting without naming the terminal branch is a first-class bug.
+        def _fsm_log(state: str, extra: str = "") -> None:
+            _fc = (
+                getattr(best_validation, "failure_class", None)
+                if best_validation is not None else None
+            )
+            logger.info(
+                "[ValidateRetryFSM] %s op=%s ctx_id=%x phase=%s "
+                "retries_remaining=%d best_fc=%r n_cands=%d%s",
+                state,
+                ctx.op_id[:16],
+                id(ctx),
+                ctx.phase.name,
+                validate_retries_remaining,
+                _fc,
+                len(generation.candidates),
+                f" {extra}" if extra else "",
+            )
+
+        for _iter_idx in range(1 + self._config.max_validate_retries):
+            _fsm_log("iter_start", f"iter={_iter_idx}")
             # Compute remaining budget from pipeline_deadline
             if ctx.pipeline_deadline is not None:
                 remaining_s = (
@@ -3557,6 +3587,7 @@ class GovernedOrchestrator:
                 remaining_s = self._config.validation_timeout_s  # fallback
 
             if remaining_s <= 0.0:
+                _fsm_log("budget_exhausted_pre", f"remaining_s={remaining_s:.1f}")
                 ctx = ctx.advance(
                     OperationPhase.CANCELLED,
                     terminal_reason_code="validation_budget_exhausted",
@@ -3566,6 +3597,7 @@ class GovernedOrchestrator:
                     OperationState.FAILED,
                     {"reason": "validation_budget_exhausted"},
                 )
+                _fsm_log("budget_exhausted_return")
                 return ctx
 
             # Try all candidates in parallel; pick first that passes
@@ -3657,6 +3689,7 @@ class GovernedOrchestrator:
                         },
                     )
                     _early_return_ctx = ctx
+                    _fsm_log("infra_early_return_set")
 
                 # Budget failure: non-retryable
                 if validation.failure_class == "budget" and _early_return_ctx is None:
@@ -3671,6 +3704,7 @@ class GovernedOrchestrator:
                         {"reason": "validation_budget_exhausted"},
                     )
                     _early_return_ctx = ctx
+                    _fsm_log("budget_early_return_set")
 
                 if not validation.passed:
                     # test/build failure: track for ledger; try next candidate
@@ -3705,9 +3739,11 @@ class GovernedOrchestrator:
 
             # If a non-retryable failure was found and no candidate passed, return immediately
             if _early_return_ctx is not None and best_candidate is None:
+                _fsm_log("early_return")
                 return _early_return_ctx
 
             if best_candidate is not None:
+                _fsm_log("candidate_passed_break")
                 break  # at least one candidate passed
 
             # All candidates failed this attempt
@@ -3718,6 +3754,7 @@ class GovernedOrchestrator:
                     "[Orchestrator] Skipping retries — no tests discovered for op=%s",
                     ctx.op_id,
                 )
+                _fsm_log("no_tests_short_circuit")
                 validate_retries_remaining = -1  # fall through to L2 / cancel
 
             validate_retries_remaining -= 1
@@ -3727,7 +3764,9 @@ class GovernedOrchestrator:
                     _pl_deadline = ctx.pipeline_deadline or (
                         datetime.now(timezone.utc) + timedelta(seconds=self._config.generation_timeout_s)
                     )
+                    _fsm_log("l2_dispatch_pre")
                     directive = await self._l2_hook(ctx, best_validation, _pl_deadline)
+                    _fsm_log("l2_dispatch_post", f"directive={directive[0]!r}")
                     if directive[0] == "break":
                         best_candidate, best_validation = directive[1], directive[2]
                         logger.info(
@@ -3739,9 +3778,17 @@ class GovernedOrchestrator:
                             best_candidate.get("file_path", "?"),
                             (best_candidate.get("source_hash") or "")[:12],
                         )
+                        _fsm_log("l2_converged_break")
                         break  # fall through to GATE
                     elif directive[0] in ("cancel", "fatal"):
+                        _fsm_log("l2_escape_return", f"directive={directive[0]!r}")
                         return directive[1]  # ctx was advanced inside _l2_hook
+                else:
+                    _fsm_log(
+                        "l2_skipped",
+                        f"repair_engine={self._config.repair_engine is not None} "
+                        f"best_validation={best_validation is not None}",
+                    )
                 # ── end L2 dispatch ───────────────────────────────────────────
 
                 ctx = ctx.advance(
@@ -3762,9 +3809,11 @@ class GovernedOrchestrator:
                         "short_summary": best_validation.short_summary if best_validation else "",
                     },
                 )
+                _fsm_log("no_candidate_valid_return")
                 return ctx
 
             # ── Micro-Fix: try InteractiveRepair before expensive VALIDATE_RETRY ──
+            _fsm_log("micro_fix_pre")
             if self._pre_action_narrator is not None:
                 try:
                     await self._pre_action_narrator.narrate_phase(
@@ -3793,6 +3842,11 @@ class GovernedOrchestrator:
                             ),
                             timeout=90.0,
                         )
+                        _fsm_log(
+                            "micro_fix_returned",
+                            f"fixed={_repair_result.fixed} "
+                            f"iterations={_repair_result.iterations_used}",
+                        )
                         if _repair_result.fixed:
                             logger.info(
                                 "[Orchestrator] Micro-fix succeeded in %d iterations for op=%s",
@@ -3800,11 +3854,35 @@ class GovernedOrchestrator:
                             )
                             # Skip full regeneration — advance to GATE
                             ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
+                            _fsm_log("micro_fix_succeeded_break")
                             break
+                    else:
+                        _fsm_log(
+                            "micro_fix_skipped_new_file",
+                            f"target={_repair_target!r}",
+                        )
+                else:
+                    _fsm_log("micro_fix_skipped_no_target")
             except asyncio.CancelledError:
+                _fsm_log("micro_fix_cancelled")
                 raise
             except Exception as _repair_exc:
-                logger.debug("[Orchestrator] Micro-fix failed: %s", _repair_exc)
+                # §8 (Absolute Observability): a swallowed exception on this
+                # path is not acceptable. Upgrade from DEBUG to WARNING, stamp
+                # the exc class and message, keep exc_info for the traceback.
+                # The retry loop is designed to continue after this exception
+                # (the subsequent ctx.advance(VALIDATE_RETRY) runs below), so
+                # we do NOT re-raise — but we DO name the terminal branch.
+                logger.warning(
+                    "[Orchestrator] Micro-fix failed (exc_class=%s): %s",
+                    type(_repair_exc).__name__,
+                    _repair_exc,
+                    exc_info=True,
+                )
+                _fsm_log(
+                    "micro_fix_exception_swallowed",
+                    f"exc_class={type(_repair_exc).__name__}",
+                )
 
             # Retry: advance to VALIDATE_RETRY with episodic memory context
             _vr_kwargs = {}
@@ -3815,8 +3893,22 @@ class GovernedOrchestrator:
                     _vr_kwargs["strategic_memory_prompt"] = (
                         f"{_existing_vr}\n\n{_vr_context}" if _existing_vr else _vr_context
                     )
+            _fsm_log("retry_advance_pre")
+            _pre_ctx_id = id(ctx)
             ctx = ctx.advance(OperationPhase.VALIDATE_RETRY, **_vr_kwargs)
+            # After ctx.advance: log the NEW ctx identity so the next session's
+            # log lets us verify ctx actually rebound (Session T hypothesis:
+            # the outer finally saw a stale ctx, which is only possible if
+            # this rebind happened in a scope that didn't propagate).
+            _fsm_log(
+                "retry_advance_post",
+                f"old_ctx_id={_pre_ctx_id:x} new_ctx_id={id(ctx):x}",
+            )
 
+        _fsm_log(
+            "loop_exit_normal",
+            f"best_candidate_present={best_candidate is not None}",
+        )
         assert best_candidate is not None  # guaranteed by loop logic
         assert best_validation is not None
 
