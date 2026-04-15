@@ -1039,20 +1039,49 @@ class CandidateGenerator:
         try:
             result = await self._generate_dispatch(context, deadline)
         except RuntimeError as exc:
-            if (
-                self._exhaustion_watcher is not None
-                and "all_providers_exhausted" in str(exc)
-            ):
-                try:
-                    await self._exhaustion_watcher.record_exhaustion(
-                        reason=str(exc),
-                    )
-                except Exception:
-                    logger.debug(
-                        "[CandidateGenerator] exhaustion_watcher "
-                        "record_exhaustion failed",
-                        exc_info=True,
-                    )
+            if "all_providers_exhausted" in str(exc):
+                if self._exhaustion_watcher is not None:
+                    try:
+                        await self._exhaustion_watcher.record_exhaustion(
+                            reason=str(exc),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "[CandidateGenerator] exhaustion_watcher "
+                            "record_exhaustion failed",
+                            exc_info=True,
+                        )
+                # Feed github_issue-sourced exhaustions into the sensor-side
+                # cooldown registry so chronic unresolvable issues (e.g.
+                # #16501 "Unlock Test Suite Failed" observed re-exhausting
+                # across bt-2026-04-15-012736 and bt-2026-04-15-013455)
+                # don't re-emit on the next scan, re-enter generation, and
+                # re-exhaust — each such re-exhaustion currently counts
+                # toward ExhaustionWatcher's global hibernation threshold
+                # even when the reflex path is healthy. The registry is
+                # module-level in the sensor file; env gate
+                # JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S (default 900s,
+                # set to 0 to disable). issue_key parsing is delegated to
+                # issue_key_from_description so the returned key stays
+                # byte-identical to the sensor's own dedup_key.
+                if getattr(context, "signal_source", "") == "github_issue":
+                    try:
+                        from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                            issue_key_from_description,
+                            register_issue_exhaustion,
+                        )
+                        _desc = getattr(context, "description", "") or ""
+                        _issue_key = issue_key_from_description(_desc)
+                        if _issue_key is not None:
+                            register_issue_exhaustion(
+                                _issue_key, reason=str(exc)[:120]
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[CandidateGenerator] github_issue cooldown "
+                            "hook failed",
+                            exc_info=True,
+                        )
             raise
         else:
             if self._exhaustion_watcher is not None:

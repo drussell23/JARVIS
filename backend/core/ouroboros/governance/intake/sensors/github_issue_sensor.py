@@ -134,12 +134,64 @@ def clear_issue_cooldowns() -> None:
     """Clear the entire cooldown registry. Intended for tests only."""
     _issue_exhaustion_cooldowns.clear()
 
+
 # Trinity repository mapping
 _TRINITY_REPOS: Tuple[Tuple[str, str, str], ...] = (
     ("jarvis", "drussell23/JARVIS", "backend/"),
     ("jarvis-prime", "drussell23/JARVIS-Prime", "reasoning/"),
     ("reactor", "drussell23/JARVIS-Reactor", "backend/training/"),
 )
+
+
+# Regex for parsing the sensor's own emission format so external callers
+# (e.g. CandidateGenerator's exhaustion hook) can recover the sensor's
+# internal dedup_key from an op's ``description``. Must stay in lockstep
+# with the format string at the envelope construction site in scan_once:
+#     f"GitHub Issue #{finding.issue_number} in {finding.repo_full}: {finding.title}"
+_GITHUB_ISSUE_DESCRIPTION_RE = re.compile(r"^GitHub Issue #(\d+) in ([^:]+):")
+
+
+def issue_key_from_description(description: str) -> Optional[str]:
+    """Recover the sensor's dedup_key from a github_issue op description.
+
+    Parses the canonical emission format produced by ``scan_once`` and
+    maps the full repo slug (``drussell23/JARVIS``) back to the short
+    repo name (``jarvis``) via ``_TRINITY_REPOS`` so the returned key is
+    byte-identical to what ``scan_once`` computes on line::
+
+        dedup_key = f"{finding.repo}:{finding.issue_number}"
+
+    Required for the CandidateGenerator → ``register_issue_exhaustion``
+    hook: the caller has the op's ``description`` (via ``OperationContext``)
+    but NOT its ``evidence`` dict, and the sensor-side registry dedups
+    on the short-repo key, not the full slug. Parsing from the description
+    keeps evidence-threading out of OperationContext.
+
+    Parameters
+    ----------
+    description:
+        The op description, e.g.
+        ``"GitHub Issue #16501 in drussell23/JARVIS: 🚨 Critical: ..."``
+
+    Returns
+    -------
+    Optional[str]
+        The dedup key ``"{short_repo}:{issue_number}"`` when the description
+        matches the emission format AND the repo slug maps to a known
+        Trinity repo. Returns ``None`` on any mismatch — callers treat that
+        as "not a github_issue op" and skip the cooldown registration.
+    """
+    if not description:
+        return None
+    m = _GITHUB_ISSUE_DESCRIPTION_RE.match(description)
+    if m is None:
+        return None
+    issue_number = m.group(1)
+    repo_full = m.group(2).strip()
+    for repo_name, trinity_repo_full, _default_path in _TRINITY_REPOS:
+        if trinity_repo_full == repo_full:
+            return f"{repo_name}:{issue_number}"
+    return None
 
 # Label -> urgency mapping (deterministic)
 _LABEL_URGENCY: Dict[str, str] = {
