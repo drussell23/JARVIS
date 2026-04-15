@@ -37,6 +37,23 @@ _LINT_BUDGET = 15.0
 _COVERAGE_BUDGET = 35.0
 _COMPLEXITY_BUDGET = 10.0
 
+
+def _pytest_cov_available() -> bool:
+    """Return True when pytest-cov is importable in the current interpreter.
+
+    When False the benchmarker must omit ``--cov=...`` / ``--cov-report=...``
+    arguments. Passing them to pytest without the plugin yields "unrecognized
+    arguments" (exit 4), which produces no "X passed" in stdout, which makes
+    the regex parser fall through to ``pass_rate=0.0`` and trip verify_gate's
+    pass_rate<1.0 threshold, which rolls back an otherwise-correct APPLY.
+    This function is the one-shot probe the coverage step uses.
+    """
+    try:
+        import pytest_cov  # type: ignore[import-not-found]  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
 _TASK_TAXONOMY = [
     ("testing",         lambda d, fs: "test" in d.lower() or any("tests/" in f or Path(f).name.startswith("test_") for f in fs)),
     ("refactoring",     lambda d, fs: "refactor" in d.lower()),
@@ -293,16 +310,33 @@ class PatchBenchmarker:
                 # scoped-pytest fix (commit a8d359f28e): narrow the test
                 # scope to the same files we're measuring coverage for.
                 existing = [f for f in target_files if (self._root / f).exists()]
-                cov_args = [f"--cov={f}" for f in existing] or ["--cov=."]
                 # Test scope: prefer the target files themselves when they
                 # are under tests/, otherwise fall back to pytest discovery
                 # for that test's owning module. For reflex-style repairs
                 # the target IS a test module, so test_paths == target_files.
                 test_paths = existing if existing else []
+
+                # pytest-cov plugin check: without it, passing --cov=... makes
+                # pytest exit 4 with "unrecognized arguments" before running
+                # any tests → no "X passed" in stdout → pass_rate=0.0 →
+                # verify_regression → rollback. Observed in every APPLY on
+                # environments that never installed pytest-cov (commit added
+                # --cov args in an earlier revision without probing for the
+                # plugin). When the plugin is missing, still run pytest but
+                # omit the --cov args entirely — we get pass_rate for
+                # verify_gate, coverage_pct stays 0.0 which is harmless
+                # because the baseline_coverage comparison is optional.
+                cov_available = _pytest_cov_available()
+                if cov_available:
+                    cov_args = [f"--cov={f}" for f in existing] or ["--cov=."]
+                    cov_report_args = [f"--cov-report=json:{cov_json}"]
+                else:
+                    cov_args = []
+                    cov_report_args = []
                 r = subprocess.run(
                     ["python3", "-m", "pytest", "--tb=no", "--no-header", "-q",
-                     f"--cov-report=json:{cov_json}",
-                     "--ignore=docs", "--ignore=.worktrees"] + cov_args + test_paths,
+                     "--ignore=docs", "--ignore=.worktrees"]
+                    + cov_report_args + cov_args + test_paths,
                     capture_output=True, text=True, cwd=self._root, timeout=_COVERAGE_BUDGET,
                 )
                 cov_pct = 0.0
