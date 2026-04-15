@@ -2317,6 +2317,61 @@ Session O's winning candidate did NOT include a `files: [...]` list. The model p
 
 **Session count this arc:** **3 sessions (Q, R, S), 2 commits (`37a371e65d` per-op dedup, `31504a8f12` Iron Gate 5 + prompt hint), 1 parser fix bundled into the autonomous battle-test sweep commit `6c3cce92c6`, 58 unit tests across `test_multi_file_coverage_gate.py` + `test_provider_exhaustion_watcher.py` (all green).** The multi-file `files: [...]` enforcement path is **proven deterministic through every gate**; agentic persistence is the next track.
 
+#### Follow-up A — Session T outcome: hypothesis falsified, new stall isolated upstream of L2 (`bt-2026-04-15-211616`)
+
+**Hypothesis under test:** Raise `JARVIS_TEST_TIMEOUT_S=120`, `JARVIS_L2_ITER_TEST_TIMEOUT_S=120`, `JARVIS_L2_TIMEBOX_S=600`, `JARVIS_L2_MAX_ITERS=8`, `JARVIS_L2_MAX_FILES_CHANGED=10`, `JARVIS_L2_MAX_DIFF_LINES=3000`, `JARVIS_L2_MAX_VALIDATION_RUNS=24` so L2 repair has room to converge on the Session S `dedup.py` LSP type error. Keep `JARVIS_EXPLORATION_GATE=true` (default). `--idle-timeout 1200` (20 min), `--cost-cap 1.00`.
+
+**Result:** Hypothesis falsified. L2 Repair never ran. The word `L2 Repair` appears exactly once in the session debug log — the boot wiring line (`max_iterations=8, timebox=600.0s`, proving env vars landed). Zero `L2 Repair Iteration N/M starting` lines.
+
+**What actually happened (op-019d9301-14d1-7b02-8113-97a6df5fa47a-cau, the 4-file backlog task):**
+
+| Time | Event | Notes |
+|---|---|---|
+| 14:17:26 | Worker 0 picks up op | |
+| 14:18:59 | CLASSIFY done, Route=complex (4_files) | Cost cap $3.60 |
+| 14:19:49 | PLAN failed (JSON parse), continue to GENERATE | Known separate bug |
+| 14:19:49 | GENERATE starts, Claude direct route | |
+| 14:19:53 | Tool round 0: **3 parallel `read_file` calls** | Model self-exploration, no gate needed |
+| 14:21:44 | GENERATE complete | 1 call, `$0.2063`, `114.5s` hold, `stop_reason=end_turn`, stream end 49% progress |
+| 14:21:45 | VALIDATE start | |
+| 14:26:07 | **First critique**: 1 error on `test_test_failure_sensor_dedup.py` | 4m22s validate pass |
+| 14:26:07 | `InteractiveRepair disabled — falling through to VALIDATE_RETRY/L2` | Log line fires |
+| 14:27:47 | `cost_governor.finish op=op-019d9301 phase=CLASSIFY spent=$0.2063` | **Op terminates silently.** ~1m40s dead air, no second validation, no L2 iteration, no error log, no cancellation log. `phase=CLASSIFY` in the finalize line is a ctx-reference mismatch — the outer `finally` block at `orchestrator.py:748` captured a stale ctx reference, suggesting the retry loop exited via a code path that never bubbled the advanced ctx back to the outer scope. |
+| 14:36:58 | `Session bt-2026-04-15-211616 stopping: idle_timeout` | 20-min budget exhausted on nothing |
+
+**What this falsifies and what it proves:**
+
+- **Falsified:** The documented Follow-up A hypothesis that the Session S stall was an L2 timebox issue. L2 never even got a chance to run. All the L2 tuning env vars landed correctly (verified by the boot-wiring log at `max_iterations=8, timebox=600.0s`) but were irrelevant because the handoff to L2 never fired.
+- **Proven (again):** Multi-file enforcement (parser + prompt hint + Iron Gate 5) kept working identically to Session S. Claude returned a multi-file-shaped candidate, the parser accepted it, the prompt's contract hint held, Gate 5 silently passed (zero `multi_file_coverage` rejections in the log). Model made 3 parallel `read_file` calls unprompted in round 0 — exploration worked cleanly. One VALIDATE pass completed with a proper LSP critique on `dedup.py` (the same file Session S stalled on). The enforcement arc is **unambiguously unaffected** by Session T's stall.
+
+**Revised diagnosis (new — not in the original Follow-up A writeup):**
+
+The real blocker is **inside the orchestrator's `VALIDATE_RETRY` loop at `orchestrator.py:3550-3818`**, upstream of L2. Two candidate mechanisms, both consistent with the observed silent-exit pattern:
+
+1. **Silent-exit code path in the retry loop.** Between the `InteractiveRepair disabled` log (14:26:07) and the `cost_governor.finish` log (14:27:47), the op produces zero output for ~1m40s and then terminates. No `Skipping retries — no tests discovered`, no `no_candidate_valid`, no exception, no cancellation. The most suspicious surface area is the `try/except` block around `asyncio.wait_for(_repair.repair(...), timeout=90.0)` at `orchestrator.py:3787-3807` — `TimeoutError` and other exceptions are swallowed at `_repair_exc` with only a DEBUG log, but control flow then falls through to `ctx.advance(VALIDATE_RETRY)` at line 3818, which should loop back to the next validation iteration. Something is short-circuiting that expected path.
+
+2. **ctx-scope mismatch leaking advanced phase.** The `finally` block at line 743-748 logs `ctx.phase.name` which showed `CLASSIFY` despite the op having advanced through PLAN → GENERATE → VALIDATE → VALIDATE_RETRY. That's only possible if the outer scope's `ctx` reference never got rebound to the advanced ctx — i.e., the advances happened on a different ctx variable or a local-scope shadow. This points at the retry loop advancing `ctx` locally and then failing to return/hand-off the advanced ctx to the caller.
+
+**Hardcoded limits adjacent to the stall (noted during investigation, NOT fixed in this pass):**
+
+- `orchestrator.py:209  max_validate_retries: int = 2` — not env-tunable. Even if the retry loop worked correctly, 3 validate passes × 4m22s each = ~13 minutes before L2 dispatches, leaving little room in the 20-min idle budget for L2's own 10-min timebox.
+- `orchestrator.py:3794  timeout=90.0` — hardcoded `asyncio.wait_for` wrapper around `_repair.repair()`. With InteractiveRepair disabled the inner call returns in microseconds, so this specific timeout shouldn't be the culprit — but the fact that it exists without env control is a smell.
+- `interactive_repair.py:102  final_output="InteractiveRepair disabled..."` — InteractiveRepair's disabled-path return shape may not set fields the retry-loop caller expects. Worth verifying the `InteractiveRepairResult` dataclass has the same field set populated (even if with default values) in the disabled early-return vs. the enabled path.
+
+**Cost:** `$0.2063 / $1.00 cap`. One Claude call (the initial GENERATE). Zero retries, zero L2 calls.
+
+**Files on disk after Session T:** `test_test_failure_sensor_dedup.py` 4986 bytes mtime `Apr 15 11:13` — still the Session O file. None of Session T's generated content materialized.
+
+**Next-track candidates (not yet shipped, each scoped to one code change + one verification session):**
+
+1. **Instrument the VALIDATE_RETRY loop with INFO-level entry/exit markers** at `orchestrator.py:3550` (loop start), `3767` (InteractiveRepair entry), `3818` (`VALIDATE_RETRY` advance), and any return statements in between. One commit, one session. Success criterion: logs reveal exactly which line the op exits through between `14:26:07` and `14:27:47`-equivalent in the reproduction. This replaces the "tune timeboxes" track with a "find the silent exit" track.
+2. **Make `max_validate_retries` env-tunable** and set it to `0` for the verification session. Forces immediate L2 dispatch on first critique. Falsifiable: does L2 fire and reach APPLY? If yes, the blocker was the retry loop itself; if no, L2 has its own separate hang.
+3. **Verify `InteractiveRepairResult` shape parity** between the disabled early-return (`interactive_repair.py:98-103`) and the normal path. One commit. Low cost, low probability, but a reasonable defensive audit given the silent-exit signature.
+
+**Anti-goals preserved:** Do NOT raise idle_timeout beyond 1200s without diagnosis — that's "run longer until luck," not structural repair. Do NOT re-run Session T's exact tuning — it's been falsified; re-running it without changes proves nothing.
+
+**What is still settled (do not re-litigate):** Multi-file `files: [...]` enforcement (parser + Gate 5 + prompt hint + post-gate visibility). Per-op exhaustion dedup. Three sessions (Q, R, S) verified the enforcement arc; Session T verifies it a fourth time. The enforcement path is **not** the blocker.
+
 ## O+V Capability Assessment (2026-04-12)
 
 ### Current Pipeline Maturity
