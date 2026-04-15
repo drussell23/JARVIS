@@ -21,6 +21,7 @@ after the two-commit PR lands.
 from __future__ import annotations
 
 import importlib
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -37,8 +38,16 @@ from backend.core.ouroboros.governance.intake.sensors import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_registry():
-    """Make sure no test leaks cooldown state into another."""
+def _isolate_registry(tmp_path, monkeypatch):
+    """Isolate each test's disk-backed cooldown registry.
+
+    Every test gets its own ``JARVIS_GITHUB_ISSUE_COOLDOWN_PATH`` override
+    so parallel runs never collide on a shared file, and cross-test state
+    never leaks. Registry is wiped before and after each test (both
+    in-memory and the backing file under tmp_path).
+    """
+    cooldown_path = tmp_path / "github_issue_cooldowns.json"
+    monkeypatch.setenv("JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path))
     ghs.clear_issue_cooldowns()
     yield
     ghs.clear_issue_cooldowns()
@@ -74,12 +83,11 @@ class TestRegistryPrimitives:
         assert not ghs._issue_exhaustion_cooldowns
         assert ghs._issue_cooldown_active("jarvis:1") is False
 
-    def test_expiry_pops_stale_entry_on_read(self, monkeypatch):
-        # Set the cooldown to something long then rewind the monotonic clock
-        # past it to simulate expiry.
+    def test_expiry_pops_stale_entry_on_read(self):
+        """Expired entries (wall-clock past) are pruned on lookup."""
         ghs.register_issue_exhaustion("jarvis:16501", reason="pytest")
-        # Mutate the stored deadline to be in the past
-        ghs._issue_exhaustion_cooldowns["jarvis:16501"] = time.monotonic() - 1.0
+        # Mutate the stored deadline (wall-clock seconds) to be in the past
+        ghs._issue_exhaustion_cooldowns["jarvis:16501"] = time.time() - 1.0
         assert ghs._issue_cooldown_active("jarvis:16501") is False
         # Read should have popped the entry
         assert "jarvis:16501" not in ghs._issue_exhaustion_cooldowns
@@ -406,3 +414,154 @@ class TestCandidateGeneratorHook:
             await gen.generate(ctx, deadline=None)
 
         assert not ghs._issue_exhaustion_cooldowns
+
+
+# ---------------------------------------------------------------------------
+# 5. Disk persistence — survives process restart
+# ---------------------------------------------------------------------------
+
+
+class TestDiskPersistence:
+    """The cooldown registry MUST survive process restart. The in-memory-only
+    version shipped in 3a9fcc1aa9 was architecturally inert because the
+    sensor's session-scoped ``_seen_issues`` set already prevented
+    re-emission within a session, and both dedups reset on restart. The
+    disk-backed version is the real fix — it persists cooldowns across
+    restart so a chronic #16501 that exhausted in session N is suppressed
+    in session N+1 without needing the sensor to be reinstantiated mid-op.
+    """
+
+    def test_register_writes_file(self, tmp_path, monkeypatch):
+        cooldown_path = tmp_path / "subdir" / "cooldowns.json"
+        monkeypatch.setenv(
+            "JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path)
+        )
+        ghs._cooldown_registry_loaded = False
+        ghs._issue_exhaustion_cooldowns.clear()
+
+        ghs.register_issue_exhaustion("jarvis:16501", reason="disk test")
+
+        assert cooldown_path.parent.exists()
+        assert cooldown_path.exists(), "register_issue_exhaustion must persist"
+
+        data = json.loads(cooldown_path.read_text())
+        assert "jarvis:16501" in data
+        expires_at = data["jarvis:16501"]
+        assert isinstance(expires_at, float)
+        assert expires_at > time.time()
+        assert expires_at <= time.time() + ghs._ISSUE_EXHAUSTION_COOLDOWN_S + 5
+
+    def test_cross_restart_survival(self, tmp_path, monkeypatch):
+        """Simulate a process restart by clearing in-memory state but
+        leaving the on-disk file intact. The next ``_issue_cooldown_active``
+        call must re-hydrate the entry from disk and suppress correctly.
+        """
+        cooldown_path = tmp_path / "cooldowns.json"
+        monkeypatch.setenv(
+            "JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path)
+        )
+        ghs._cooldown_registry_loaded = False
+        ghs._issue_exhaustion_cooldowns.clear()
+
+        ghs.register_issue_exhaustion("jarvis:16501", reason="session 1")
+        assert cooldown_path.exists()
+
+        # Simulate restart: wipe in-memory dict AND reset the lazy-load
+        # guard so the next call reads the file fresh.
+        ghs._issue_exhaustion_cooldowns.clear()
+        ghs._cooldown_registry_loaded = False
+
+        assert ghs._issue_cooldown_active("jarvis:16501") is True
+        assert "jarvis:16501" in ghs._issue_exhaustion_cooldowns
+
+    def test_expired_entries_pruned_on_load(self, tmp_path, monkeypatch):
+        cooldown_path = tmp_path / "cooldowns.json"
+        monkeypatch.setenv(
+            "JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path)
+        )
+        payload = {
+            "jarvis:11111": time.time() - 100,  # expired
+            "jarvis:22222": time.time() + 600,  # fresh
+        }
+        cooldown_path.write_text(json.dumps(payload))
+
+        ghs._issue_exhaustion_cooldowns.clear()
+        ghs._cooldown_registry_loaded = False
+
+        assert ghs._issue_cooldown_active("jarvis:22222") is True
+        assert ghs._issue_cooldown_active("jarvis:11111") is False
+        assert "jarvis:11111" not in ghs._issue_exhaustion_cooldowns
+
+    def test_missing_file_treated_as_empty(self, tmp_path, monkeypatch):
+        cooldown_path = tmp_path / "does_not_exist.json"
+        monkeypatch.setenv(
+            "JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path)
+        )
+        assert not cooldown_path.exists()
+
+        ghs._issue_exhaustion_cooldowns.clear()
+        ghs._cooldown_registry_loaded = False
+
+        assert ghs._issue_cooldown_active("jarvis:16501") is False
+        assert not ghs._issue_exhaustion_cooldowns
+
+    def test_corrupt_file_treated_as_empty(self, tmp_path, monkeypatch):
+        cooldown_path = tmp_path / "cooldowns.json"
+        monkeypatch.setenv(
+            "JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path)
+        )
+        cooldown_path.write_text("{not valid json")
+
+        ghs._issue_exhaustion_cooldowns.clear()
+        ghs._cooldown_registry_loaded = False
+        ghs._cooldown_load_warned = False
+
+        assert ghs._issue_cooldown_active("jarvis:16501") is False
+
+    def test_non_dict_file_treated_as_empty(self, tmp_path, monkeypatch):
+        cooldown_path = tmp_path / "cooldowns.json"
+        monkeypatch.setenv(
+            "JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path)
+        )
+        cooldown_path.write_text("[1, 2, 3]")  # valid JSON, wrong shape
+
+        ghs._issue_exhaustion_cooldowns.clear()
+        ghs._cooldown_registry_loaded = False
+        ghs._cooldown_load_warned = False
+
+        assert ghs._issue_cooldown_active("jarvis:16501") is False
+        assert not ghs._issue_exhaustion_cooldowns
+
+    def test_clear_removes_file(self, tmp_path, monkeypatch):
+        cooldown_path = tmp_path / "cooldowns.json"
+        monkeypatch.setenv(
+            "JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path)
+        )
+        ghs.register_issue_exhaustion("jarvis:16501", reason="clear test")
+        assert cooldown_path.exists()
+
+        ghs.clear_issue_cooldowns()
+        assert not cooldown_path.exists()
+        assert not ghs._issue_exhaustion_cooldowns
+
+    def test_expiry_prune_rewrites_file(self, tmp_path, monkeypatch):
+        """When ``_issue_cooldown_active`` prunes an expired entry, the
+        on-disk registry is re-saved without that entry. Without this, a
+        subsequent fresh lookup would re-hydrate the already-pruned entry
+        from stale disk state.
+        """
+        cooldown_path = tmp_path / "cooldowns.json"
+        monkeypatch.setenv(
+            "JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", str(cooldown_path)
+        )
+        ghs._issue_exhaustion_cooldowns.clear()
+        ghs._cooldown_registry_loaded = False
+
+        ghs.register_issue_exhaustion("jarvis:16501", reason="expire")
+        # Force expiry via direct mutation
+        ghs._issue_exhaustion_cooldowns["jarvis:16501"] = time.time() - 1.0
+
+        assert ghs._issue_cooldown_active("jarvis:16501") is False
+
+        disk = json.loads(cooldown_path.read_text())
+        assert "jarvis:16501" not in disk

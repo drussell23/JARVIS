@@ -22,6 +22,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
@@ -57,7 +58,7 @@ _BREAKER_TRIGGERS: Tuple[str, ...] = (
 )
 
 # ---------------------------------------------------------------------------
-# Per-issue exhaustion cooldown registry (bt-2026-04-15 findings)
+# Per-issue exhaustion cooldown registry (bt-2026-04-15 findings, disk-backed)
 # ---------------------------------------------------------------------------
 #
 # When an op sourced from a github_issue exhausts its providers, we mark the
@@ -68,28 +69,157 @@ _BREAKER_TRIGGERS: Tuple[str, ...] = (
 # hibernation — 3 chronic-noise exhaustions trip ProviderExhaustionWatcher's
 # global counter even when the reflex path is healthy.
 #
-# State is module-level (not instance-level) so any caller — CandidateGenerator
-# on exhaustion, orchestrator POSTMORTEM handler, tests — can register a
-# cooldown without needing a handle to the sensor instance. Process-scoped:
-# cleared on restart. Env-gated for full reversibility.
+# Persistence requirement: the sensor already dedups within a single session
+# via ``_seen_issues`` (in-memory set cleared on sensor restart). To prevent
+# the SAME issue from being re-emitted and re-exhausted in a fresh session
+# (the cross-restart chronic pattern observed in the battle test log), the
+# cooldown registry must survive process restart. We persist to an atomic
+# JSON file under ``.jarvis/github_issue_cooldowns.json`` keyed by
+# ``"{repo}:{issue_number}"`` → ``expires_at_unix`` (wall-clock float).
 #
-# Env gate: ``JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S`` (default 900s).
-# Set to 0 or a negative value to disable the registry entirely.
+# Clock choice: wall-clock (``time.time()``) — NOT ``time.monotonic()``.
+# Monotonic timers reset across process restart, so persisted monotonic
+# values are garbage after reboot. Wall-clock is not monotonic inside a
+# process (NTP can skew it), but for a 15-minute cooldown that risk is
+# acceptable. The cost of a skew false-positive is "one extra suppression"
+# and the cost of a false-negative is "one extra emission" — both bounded
+# and non-destructive.
+#
+# Env gates (all reversible):
+#   ``JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S`` — default 900s. Set to 0
+#     or negative to disable the registry entirely. ``register_issue_exhaustion``
+#     becomes a no-op and the scan gate always returns False.
+#   ``JARVIS_GITHUB_ISSUE_COOLDOWN_PATH`` — override the on-disk registry
+#     path for tests. Default: ``{JARVIS_REPO_PATH or '.'}/.jarvis/github_issue_cooldowns.json``.
+#
+# State is module-level so any caller — CandidateGenerator on exhaustion,
+# orchestrator POSTMORTEM handler, tests — can register a cooldown without
+# needing a handle to the sensor instance. Disk I/O is lazy: loaded on
+# first registry access, written on every ``register_issue_exhaustion``.
 
 _ISSUE_EXHAUSTION_COOLDOWN_S: float = float(
     os.environ.get("JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S", "900")
 )
 
-# issue_key -> monotonic deadline after which the cooldown is released
+# issue_key -> ``expires_at_unix`` (wall-clock epoch float). Persisted
+# to disk between process lifetimes.
 _issue_exhaustion_cooldowns: Dict[str, float] = {}
+_cooldown_registry_loaded: bool = False
+_cooldown_load_warned: bool = False
+
+
+def _cooldown_registry_path() -> Path:
+    """Resolve the on-disk path for the cooldown registry.
+
+    Env overrides:
+      * ``JARVIS_GITHUB_ISSUE_COOLDOWN_PATH`` — full path override (tests).
+      * ``JARVIS_REPO_PATH`` — repo root, same convention as the rest
+        of the governance stack. Default: ``.``.
+    """
+    explicit = os.environ.get("JARVIS_GITHUB_ISSUE_COOLDOWN_PATH", "").strip()
+    if explicit:
+        return Path(explicit)
+    repo_root = Path(os.environ.get("JARVIS_REPO_PATH", "."))
+    return repo_root / ".jarvis" / "github_issue_cooldowns.json"
+
+
+def _load_cooldown_registry() -> None:
+    """Load the persisted cooldown registry from disk into the module dict.
+
+    Idempotent — uses ``_cooldown_registry_loaded`` as a one-shot guard so
+    repeated calls are O(1). Prunes entries whose ``expires_at_unix`` has
+    already passed at load time. Missing file is treated as an empty
+    registry. Corrupt file is logged once and treated as empty.
+    """
+    global _cooldown_registry_loaded, _cooldown_load_warned
+    if _cooldown_registry_loaded:
+        return
+    _cooldown_registry_loaded = True  # set before I/O so errors don't loop
+
+    path = _cooldown_registry_path()
+    if not path.exists():
+        return  # fresh start, empty registry
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        if not _cooldown_load_warned:
+            logger.warning(
+                "[GitHubIssueSensor] Cooldown registry at %s is unreadable "
+                "(%s); treating as empty", path, exc,
+            )
+            _cooldown_load_warned = True
+        return
+
+    if not isinstance(raw, dict):
+        if not _cooldown_load_warned:
+            logger.warning(
+                "[GitHubIssueSensor] Cooldown registry at %s is not a dict "
+                "(got %s); treating as empty", path, type(raw).__name__,
+            )
+            _cooldown_load_warned = True
+        return
+
+    now = time.time()
+    loaded = 0
+    pruned = 0
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        try:
+            expires_at = float(value)
+        except (TypeError, ValueError):
+            continue
+        if expires_at <= now:
+            pruned += 1
+            continue
+        _issue_exhaustion_cooldowns[key] = expires_at
+        loaded += 1
+
+    if loaded or pruned:
+        logger.info(
+            "[GitHubIssueSensor] Cooldown registry loaded from %s: "
+            "%d active, %d pruned", path, loaded, pruned,
+        )
+
+
+def _save_cooldown_registry() -> None:
+    """Atomically persist the in-memory registry to disk.
+
+    Uses tempfile → fsync → rename. Failure to write is logged at WARNING
+    and does NOT raise — the cooldown is still honored in-memory for the
+    current process lifetime, we only lose cross-restart persistence.
+    """
+    path = _cooldown_registry_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=str(path.parent),
+            delete=False,
+            suffix=".tmp",
+            prefix=".github_issue_cooldowns.",
+        ) as f:
+            json.dump(_issue_exhaustion_cooldowns, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+            tmp_path = f.name
+        os.replace(tmp_path, str(path))
+    except OSError as exc:
+        logger.warning(
+            "[GitHubIssueSensor] Failed to persist cooldown registry to %s: %s",
+            path, exc,
+        )
 
 
 def register_issue_exhaustion(issue_key: str, reason: str = "") -> None:
     """Record that an op sourced from ``issue_key`` exhausted its providers.
 
-    Next scan will suppress emission of ``issue_key`` until the cooldown
-    window closes. No-op when ``JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S``
-    is 0 or negative.
+    Writes the cooldown both to the in-memory dict AND to the on-disk
+    registry so the next process (battle test restart, hot reload, …)
+    inherits the state. No-op when
+    ``JARVIS_GITHUB_ISSUE_EXHAUSTION_COOLDOWN_S`` is 0 or negative.
 
     Parameters
     ----------
@@ -105,34 +235,57 @@ def register_issue_exhaustion(issue_key: str, reason: str = "") -> None:
         return  # disabled
     if not issue_key:
         return
-    cooldown_until = time.monotonic() + _ISSUE_EXHAUSTION_COOLDOWN_S
-    _issue_exhaustion_cooldowns[issue_key] = cooldown_until
+    _load_cooldown_registry()  # lazy one-shot init
+    expires_at = time.time() + _ISSUE_EXHAUSTION_COOLDOWN_S
+    _issue_exhaustion_cooldowns[issue_key] = expires_at
     logger.info(
-        "[GitHubIssueSensor] Cooldown set for %s (%.0fs): %s",
+        "[GitHubIssueSensor] Cooldown set for %s (%.0fs, expires_at=%.0f): %s",
         issue_key,
         _ISSUE_EXHAUSTION_COOLDOWN_S,
+        expires_at,
         reason[:120],
     )
+    _save_cooldown_registry()
 
 
 def _issue_cooldown_active(issue_key: str) -> bool:
     """Return True when ``issue_key`` is currently within its cooldown window.
 
-    Transparently expires stale entries — if the deadline has passed, the
-    entry is removed and the function returns False. Runs in O(1).
+    Transparently expires stale entries — if the wall-clock deadline has
+    passed, the entry is removed (both from memory and from the on-disk
+    registry via a deferred save) and the function returns False.
+    Loads the disk registry lazily on first access. Runs in O(1) amortized.
     """
-    deadline = _issue_exhaustion_cooldowns.get(issue_key)
-    if deadline is None:
+    _load_cooldown_registry()
+    expires_at = _issue_exhaustion_cooldowns.get(issue_key)
+    if expires_at is None:
         return False
-    if time.monotonic() >= deadline:
+    if time.time() >= expires_at:
         _issue_exhaustion_cooldowns.pop(issue_key, None)
+        _save_cooldown_registry()  # persist the prune
         return False
     return True
 
 
 def clear_issue_cooldowns() -> None:
-    """Clear the entire cooldown registry. Intended for tests only."""
+    """Clear the entire cooldown registry (in-memory AND on disk).
+
+    Intended for tests; also safe to call from operational tooling if a
+    human operator wants to manually re-arm the sensor for a specific
+    chronic issue. Resets the lazy-load guard so the next access will
+    re-read from disk (which will find the emptied file).
+    """
+    global _cooldown_registry_loaded
     _issue_exhaustion_cooldowns.clear()
+    _cooldown_registry_loaded = False
+    path = _cooldown_registry_path()
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError as exc:
+        logger.debug(
+            "[GitHubIssueSensor] clear_issue_cooldowns: unlink failed: %s", exc,
+        )
 
 
 # Trinity repository mapping
@@ -354,13 +507,18 @@ class GitHubIssueSensor:
         cooldown_suppressed = 0
         for finding in deduplicated:
             dedup_key = f"{finding.repo}:{finding.issue_number}"
-            if dedup_key in self._seen_issues:
-                continue
-            # Suppress issues currently inside their exhaustion cooldown
-            # window. A chronic unresolvable issue would otherwise re-emit
-            # on every scan, re-enter generation, re-exhaust, and single-
-            # handedly drive ProviderExhaustionWatcher's global counter
-            # toward hibernation even when the reflex path is healthy.
+            # Check the disk-backed cooldown registry FIRST, before the
+            # in-memory session dedup. ``_seen_issues`` is cleared on
+            # every sensor instance reset (process restart, hot reload,
+            # __init__ re-run), but the persisted cooldown survives all
+            # three — so the cooldown becomes the authoritative gate for
+            # "this issue was recently attempted and failed" regardless
+            # of whether this session has also seen it. Without this
+            # ordering, a fresh session with a cleared ``_seen_issues``
+            # would fall through to the emission path and ingest a chronic
+            # issue again, counting toward ExhaustionWatcher's global
+            # counter exactly like the bt-2026-04-15-012736 → 013455
+            # repeat pattern that motivated this fix.
             if _issue_cooldown_active(dedup_key):
                 cooldown_suppressed += 1
                 logger.info(
@@ -368,6 +526,8 @@ class GitHubIssueSensor:
                     "exhaustion cooldown still active",
                     finding.issue_number, finding.repo,
                 )
+                continue
+            if dedup_key in self._seen_issues:
                 continue
             self._seen_issues.add(dedup_key)
 
