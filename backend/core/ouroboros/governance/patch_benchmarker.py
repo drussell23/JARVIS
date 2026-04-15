@@ -284,13 +284,25 @@ class PatchBenchmarker:
             import re
             with tempfile.TemporaryDirectory() as tmp:
                 cov_json = str(Path(tmp) / "coverage.json")
-                cov_args = [f"--cov={f}" for f in target_files if (self._root / f).exists()]
-                if not cov_args:
-                    cov_args = ["--cov=."]
+                # --cov=... is a coverage-scope option, not a test selector.
+                # Without positional test paths pytest defaults to full-repo
+                # discovery, which on a large monorepo either times out under
+                # _COVERAGE_BUDGET or collects thousands of unrelated tests —
+                # both roads lead to pass_rate=0.0 → verify_regression →
+                # rollback of an otherwise-correct APPLY. Mirror the L2
+                # scoped-pytest fix (commit a8d359f28e): narrow the test
+                # scope to the same files we're measuring coverage for.
+                existing = [f for f in target_files if (self._root / f).exists()]
+                cov_args = [f"--cov={f}" for f in existing] or ["--cov=."]
+                # Test scope: prefer the target files themselves when they
+                # are under tests/, otherwise fall back to pytest discovery
+                # for that test's owning module. For reflex-style repairs
+                # the target IS a test module, so test_paths == target_files.
+                test_paths = existing if existing else []
                 r = subprocess.run(
                     ["python3", "-m", "pytest", "--tb=no", "--no-header", "-q",
                      f"--cov-report=json:{cov_json}",
-                     "--ignore=docs", "--ignore=.worktrees"] + cov_args,
+                     "--ignore=docs", "--ignore=.worktrees"] + cov_args + test_paths,
                     capture_output=True, text=True, cwd=self._root, timeout=_COVERAGE_BUDGET,
                 )
                 cov_pct = 0.0
