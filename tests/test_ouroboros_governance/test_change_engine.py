@@ -101,6 +101,73 @@ class TestRollbackArtifact:
         ).hexdigest()
         assert restored_hash == artifact.snapshot_hash
 
+    def test_capture_missing_file_returns_absent_artifact(
+        self, tmp_project_dir
+    ):
+        """New-file path: capture on a missing file returns an "absent"
+        artifact whose ``existed`` flag is False, without reading or
+        stat'ing the file in a way that raises.
+
+        Session bt-2026-04-15-091555 (Session K) regression guard:
+        the pre-patch ``capture()`` called ``read_text()``
+        unconditionally, which raised ``FileNotFoundError`` and
+        aborted the APPLY phase of every new-file creation op.
+        """
+        # Path that definitely does not exist — do not create it
+        target = tmp_project_dir / "src" / "does_not_exist_yet.py"
+        assert not target.exists()
+
+        # Must not raise
+        artifact = RollbackArtifact.capture(target)
+
+        assert artifact.existed is False
+        assert artifact.original_content == ""
+        # Sentinel hash for ledger clarity — distinguishable from any
+        # real sha256 hex digest.
+        assert artifact.snapshot_hash == "absent"
+
+    def test_apply_absent_artifact_unlinks_created_file(
+        self, tmp_project_dir
+    ):
+        """New-file rollback: apply() on an existed=False artifact
+        unlinks the file that was created between capture and apply,
+        restoring the original "file did not exist" state.
+
+        This is the rollback semantic for a new-file APPLY that
+        failed post-apply VERIFY.
+        """
+        target = tmp_project_dir / "src" / "new_file.py"
+        assert not target.exists()
+
+        # Capture BEFORE the file exists (new-file creation path)
+        artifact = RollbackArtifact.capture(target)
+        assert artifact.existed is False
+
+        # Simulate a successful write that we later want to roll back
+        target.write_text("def new_function():\n    return 42\n")
+        assert target.exists()
+
+        # Rollback must remove the file
+        artifact.apply(target)
+        assert not target.exists()
+
+    def test_apply_absent_artifact_noop_when_file_already_gone(
+        self, tmp_project_dir
+    ):
+        """apply() on an existed=False artifact MUST NOT raise when the
+        file is already absent. Double-rollback and "write-then-crash-
+        before-apply" paths both land here, and both are valid.
+        """
+        target = tmp_project_dir / "src" / "transient.py"
+        assert not target.exists()
+
+        artifact = RollbackArtifact.capture(target)
+        assert artifact.existed is False
+
+        # File never created — apply must not raise
+        artifact.apply(target)  # should be a silent no-op
+        assert not target.exists()
+
 
 class TestChangePhases:
     def test_all_eight_phases_exist(self):

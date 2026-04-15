@@ -169,20 +169,75 @@ class RollbackArtifact:
 
     Captures the exact content and hash of a file BEFORE modification,
     so rollback restores to a known-good state.
+
+    Two capture modes:
+
+    1. **existed=True** (default): the file was present at capture time.
+       ``original_content`` and ``snapshot_hash`` contain the pre-write
+       state, and ``apply()`` rolls back by writing that content back
+       and verifying the hash matches.
+    2. **existed=False**: the file did not exist at capture time (new-
+       file creation path). ``original_content`` is empty and
+       ``snapshot_hash`` is the sentinel ``"absent"`` for ledger
+       clarity. ``apply()`` rolls back by ``unlink()``-ing the created
+       file. No post-unlink hash check — there's nothing to hash.
+
+    Session bt-2026-04-15-091555 (Session K, 2026-04-15) diagnosed the
+    new-file case: ``capture()`` unconditionally called ``read_text()``
+    and raised ``FileNotFoundError: [Errno 2]`` on the first
+    autonomous multi-file generation attempt to reach APPLY phase,
+    aborting the entire 4-file batch at progress=70% even though every
+    upstream gate (ledger, L2, GATE, NOTIFY_APPLY) had already passed.
     """
 
     original_content: str
     snapshot_hash: str
+    existed: bool = True
 
     @classmethod
     def capture(cls, file_path: Path) -> "RollbackArtifact":
-        """Capture a rollback artifact from the current file state."""
+        """Capture a rollback artifact from the current file state.
+
+        For a **new file** (not yet on disk), returns an "absent"
+        artifact whose rollback action is to ``unlink()`` the created
+        file rather than restore content. The default ``existed=True``
+        preserves the pre-patch behavior for all existing callers that
+        construct ``RollbackArtifact`` directly.
+        """
+        if not file_path.exists():
+            return cls(
+                original_content="",
+                snapshot_hash="absent",
+                existed=False,
+            )
         content = file_path.read_text(encoding="utf-8")
         content_hash = hashlib.sha256(content.encode()).hexdigest()
-        return cls(original_content=content, snapshot_hash=content_hash)
+        return cls(
+            original_content=content,
+            snapshot_hash=content_hash,
+            existed=True,
+        )
 
     def apply(self, file_path: Path) -> None:
-        """Restore the file to the captured snapshot state."""
+        """Restore the file to the captured snapshot state.
+
+        For ``existed=False`` artifacts (new-file rollback), this
+        ``unlink()``-s the created file. There is no post-unlink hash
+        check — a deleted file has no content to verify, and a
+        missing file is the exact post-state the rollback is trying
+        to restore. ``FileNotFoundError`` is swallowed as a no-op:
+        the file is already gone, which is the desired end state.
+
+        For ``existed=True`` artifacts, writes back the captured
+        content and verifies the hash matches, raising ``RuntimeError``
+        on any discrepancy.
+        """
+        if not self.existed:
+            try:
+                file_path.unlink()
+            except FileNotFoundError:
+                pass  # Already absent — desired end state, not an error
+            return
         file_path.write_text(self.original_content, encoding="utf-8")
         # Verify the restoration
         restored = file_path.read_text(encoding="utf-8")
