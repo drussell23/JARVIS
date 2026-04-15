@@ -489,9 +489,27 @@ class RepairEngine:
                                 sandbox_content = target.read_text(encoding="utf-8", errors="replace")
                             except Exception:
                                 sandbox_content = ""
-                    svr = await sb.run_tests(
-                        (), budget.per_iteration_test_timeout_s
-                    ) if not _patch_failed else None
+                    # Scope pytest to the single target file when we know it.
+                    # The previous empty-target path forced pytest to discover
+                    # and run the ENTIRE repo test suite on every L2 iteration,
+                    # which consumed ~90-100s of the 120s timebox and left L2
+                    # with only 1 usable iteration per op. For the common case
+                    # where ``file_path`` IS the failing test module (test_failure
+                    # source) scoping to it runs in ~1s instead.
+                    #
+                    # Known limitation: for ops whose target is a source file
+                    # (e.g. fix ``src/foo.py`` from a failure in
+                    # ``tests/test_foo.py``), scoping to ``file_path`` alone
+                    # misses the real failing test. The right fix is to thread
+                    # an explicit test path / node id through via ``ctx`` or
+                    # ``best_validation`` metadata — tracked as a follow-up.
+                    if _patch_failed:
+                        svr = None
+                    else:
+                        test_targets: Tuple[str, ...] = (file_path,) if file_path else ()
+                        svr = await sb.run_tests(
+                            test_targets, budget.per_iteration_test_timeout_s
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

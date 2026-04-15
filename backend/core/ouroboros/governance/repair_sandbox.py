@@ -498,10 +498,31 @@ class RepairSandbox:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                await asyncio.wait_for(proc.communicate(), timeout=10.0)
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=10.0
+                )
+                if proc.returncode:
+                    # Aggregate both streams — git worktree, like BSD patch,
+                    # sometimes emits diagnostics only on stdout.
+                    _out = stdout_b.decode(errors="replace").strip()
+                    _err = stderr_b.decode(errors="replace").strip()
+                    if _err and _out:
+                        _details = f"{_err} | stdout: {_out}"
+                    else:
+                        _details = (
+                            _err
+                            or _out
+                            or f"exit {proc.returncode}, no diagnostic output"
+                        )
+                    _logger.debug(
+                        "repair_sandbox: git worktree remove failed "
+                        "(best-effort, exit %d): %s",
+                        proc.returncode, _details,
+                    )
             except Exception as exc:
                 _logger.debug(
-                    "repair_sandbox: git worktree remove failed (best-effort): %s", exc
+                    "repair_sandbox: git worktree remove failed (best-effort): %s",
+                    exc or type(exc).__name__,
                 )
 
         # Always remove the directory tree.
