@@ -2221,7 +2221,18 @@ class CandidateGenerator:
         remaining time, guaranteeing ``_FALLBACK_MIN_RESERVE_S`` for the
         fallback provider if the primary hangs until timeout.
         """
+        _primary_sem_t0 = time.monotonic()
+        _primary_phase_hint = getattr(getattr(context, "phase", None), "name", "?")
+        logger.info(
+            "[CandidateGenerator] Primary sem acquire: slots_free=%d "
+            "route=%s phase=%s op=%s",
+            self._primary_sem._value,
+            getattr(context, "provider_route", "?"),
+            _primary_phase_hint,
+            getattr(context, "op_id", "?")[:16],
+        )
         async with self._primary_sem:
+            _primary_sem_wait_s = time.monotonic() - _primary_sem_t0
             remaining = self._remaining_seconds(deadline)
             primary_budget = self._compute_primary_budget(remaining)
             logger.debug(
@@ -2229,10 +2240,30 @@ class CandidateGenerator:
                 "(fallback reserve: %.1fs)",
                 primary_budget, remaining, remaining - primary_budget,
             )
-            return await asyncio.wait_for(
-                self._primary.generate(context, deadline),
-                timeout=primary_budget,
-            )
+            try:
+                _pri_result = await asyncio.wait_for(
+                    self._primary.generate(context, deadline),
+                    timeout=primary_budget,
+                )
+                logger.info(
+                    "[CandidateGenerator] Primary sem release: "
+                    "hold=%.1fs sem_wait=%.1fs route=%s phase=%s op=%s outcome=ok",
+                    time.monotonic() - _primary_sem_t0, _primary_sem_wait_s,
+                    getattr(context, "provider_route", "?"),
+                    _primary_phase_hint,
+                    getattr(context, "op_id", "?")[:16],
+                )
+                return _pri_result
+            except (Exception, asyncio.CancelledError):
+                logger.info(
+                    "[CandidateGenerator] Primary sem release: "
+                    "hold=%.1fs sem_wait=%.1fs route=%s phase=%s op=%s outcome=fail",
+                    time.monotonic() - _primary_sem_t0, _primary_sem_wait_s,
+                    getattr(context, "provider_route", "?"),
+                    _primary_phase_hint,
+                    getattr(context, "op_id", "?")[:16],
+                )
+                raise
 
     # Hard ceiling for fallback provider — fail fast when unreachable
     # rather than burning the entire pipeline budget (Manifesto §6: Iron Gate).
@@ -2278,12 +2309,19 @@ class CandidateGenerator:
 
         _pre_sem_remaining = self._remaining_seconds(deadline)
         _sem_t0 = time.monotonic()
-        logger.debug(
+        _phase_hint = getattr(getattr(context, "phase", None), "name", "?")
+        # Promoted to INFO with phase label so traces distinguish first
+        # GENERATE from GENERATE_RETRY contention on the shared fallback
+        # semaphore — Session bt-2026-04-15-041413 (2026-04-14) saw a
+        # retry wait 121.5s behind cohort ops with no visibility into
+        # which acquisition phase was queuing.
+        logger.info(
             "[CandidateGenerator] Fallback sem acquire: slots_free=%d/%d "
-            "remaining=%.1fs route=%s op=%s",
+            "remaining=%.1fs route=%s phase=%s op=%s",
             self._fallback_sem._value, self._fallback_concurrency,
             _pre_sem_remaining,
             getattr(context, "provider_route", "?"),
+            _phase_hint,
             getattr(context, "op_id", "?")[:16],
         )
 
@@ -2338,10 +2376,19 @@ class CandidateGenerator:
                         remaining, self._FALLBACK_MAX_TIMEOUT_S, _sem_wait_s,
                     )
 
-                return await asyncio.wait_for(
+                _fb_result = await asyncio.wait_for(
                     self._fallback.generate(context, deadline),
                     timeout=remaining,
                 )
+                logger.info(
+                    "[CandidateGenerator] Fallback sem release: "
+                    "hold=%.1fs sem_wait=%.1fs route=%s phase=%s op=%s outcome=ok",
+                    time.monotonic() - _sem_t0, _sem_wait_s,
+                    getattr(context, "provider_route", "?"),
+                    _phase_hint,
+                    getattr(context, "op_id", "?")[:16],
+                )
+                return _fb_result
         except (Exception, asyncio.CancelledError) as exc:
             # If the exception is already instrumented (e.g. the inner
             # ``fallback_budget_starved`` raise), re-raise as-is so we

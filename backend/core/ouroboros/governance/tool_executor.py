@@ -3436,6 +3436,26 @@ class ToolLoopCoordinator:
                     prompt_appendix += _format_tool_result(tc, tool_result)
 
             self._last_records = list(records)
+            # Persist tool-round audit BEFORE the next synthesis stream.
+            # Without this, a cancelled fallback stream leaves the
+            # ExplorationLedger(shadow,partial) exception handler with
+            # records=0 (Session bt-2026-04-15-041413 2026-04-14): the
+            # tool_execution_records aren't attached to the raised exc,
+            # so postmortem can't see which tools the round called. This
+            # INFO line is the ground truth for round N, independent of
+            # whether the subsequent synthesis call survives.
+            _round_tool_names = [
+                r.tool_name for r in records if r.round_index == round_index
+            ]
+            logger.info(
+                "[ToolLoop] tool_round_complete op=%s round=%d tools=%d "
+                "names=%s total_records=%d",
+                op_id[:12] if op_id else "?",
+                round_index,
+                len(_round_tool_names),
+                ",".join(_round_tool_names) or "-",
+                len(records),
+            )
             current_prompt += prompt_appendix
 
             # ── Exploration budget enforcement ──
