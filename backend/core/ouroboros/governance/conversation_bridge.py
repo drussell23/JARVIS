@@ -182,7 +182,12 @@ _SECRET_PATTERNS: List[tuple] = [
 
 
 def _redact_secrets(text: str) -> tuple:
-    """Return (redacted_text, bytes_redacted_count). Pure function."""
+    """Return (redacted_text, bytes_redacted_count). Pure function.
+
+    Internal implementation. Consumers outside this module should use
+    :func:`redact_secrets` (public, stable) to avoid coupling to the
+    underscore-prefixed name.
+    """
     if not text:
         return text, 0
     redacted = text
@@ -194,6 +199,18 @@ def _redact_secrets(text: str) -> tuple:
             return f"[REDACTED:{label}]"
         redacted = pattern.sub(_sub, redacted)
     return redacted, total
+
+
+def redact_secrets(text: str) -> tuple:
+    """Public wrapper for the Tier -1 secret-shape redaction pass.
+
+    Returns ``(redacted_text, bytes_redacted_count)``. Stable contract —
+    other governance modules (``semantic_index``, ``last_session_summary``)
+    should import this rather than the private ``_redact_secrets`` so the
+    pattern set stays colocated with ConversationBridge without leaking
+    underscore-internal coupling into consumers.
+    """
+    return _redact_secrets(text)
 
 
 # ---------------------------------------------------------------------------

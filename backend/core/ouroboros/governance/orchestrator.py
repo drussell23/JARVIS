@@ -1133,6 +1133,59 @@ class GovernedOrchestrator:
                 exc_info=True,
             )
 
+        # ---- LastSessionSummary v0.1: session-to-session episodic continuity ----
+        # Read-only structured summary of past session(s), rendered as
+        # a dense untrusted block. Injected between SemanticIndex (above)
+        # and Goals (below) so the untrusted stack stays contiguous:
+        # Strategic → Bridge → Semantic → LastSession → Goals → UserPrefs.
+        #
+        # Authority invariant: this block has **zero** authority over
+        # Iron Gate, UrgencyRouter, risk tier, policy engine, FORBIDDEN_PATH,
+        # ToolExecutor protected-path checks, or approval gating. It
+        # affects ONLY the prompt surface the model reads at
+        # CONTEXT_EXPANSION. Read-only — no debug.log grep, no commit-hash
+        # scraping, no memory-file narrative (all parked for V1.1).
+        try:
+            from backend.core.ouroboros.governance.last_session_summary import (
+                get_default_summary,
+            )
+            _lss = get_default_summary(self._config.project_root)
+            _lss_enabled, _lss_n, _lss_sid, _lss_chars, _lss_hash8 = (
+                _lss.inject_metrics()
+            )
+            if _lss_enabled:
+                _lss_prompt = _lss.format_for_prompt()
+                if _lss_prompt:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=ctx.strategic_intent_id or "last-session-v1",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=(
+                            _existing + "\n\n" + _lss_prompt
+                            if _existing else _lss_prompt
+                        ),
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                # §8 one-line observability contract. Never emits the
+                # rendered paragraph — only counts, ids, and a hash8.
+                logger.info(
+                    "[LastSessionSummary] op=%s enabled=true n_sessions=%d "
+                    "latest_session_id=%s chars_out=%d "
+                    "inject_site=context_expansion hash8=%s source=summary_json",
+                    ctx.op_id, _lss_n, _lss_sid, _lss_chars, _lss_hash8,
+                )
+            else:
+                logger.debug(
+                    "[LastSessionSummary] op=%s enabled=false "
+                    "inject_site=context_expansion",
+                    ctx.op_id,
+                )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] LastSessionSummary injection skipped",
+                exc_info=True,
+            )
+
         # ---- P2.4 + Week 2: Goal-directed context injection ----
         # Append the *most relevant* active user goals to the strategic
         # memory prompt so the generation model aligns its decisions with

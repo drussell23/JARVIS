@@ -202,12 +202,14 @@ def _sanitize_corpus_text(text: str, max_len: int = 512) -> str:
         return ""
     # Apply the bridge's secret-shape redaction. Local import to respect
     # the dependency direction rule (beef #3): semantic_index imports
-    # from bridge, never the reverse.
+    # from bridge, never the reverse. Use the *public* redact_secrets
+    # symbol (not the underscore-prefixed internal) so we don't couple
+    # to bridge's private names.
     try:
         from backend.core.ouroboros.governance.conversation_bridge import (
-            _redact_secrets,
+            redact_secrets,
         )
-        cleaned, _ = _redact_secrets(cleaned)
+        cleaned, _ = redact_secrets(cleaned)
     except Exception:
         pass
     return cleaned
