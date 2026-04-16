@@ -5180,6 +5180,32 @@ class GovernedOrchestrator:
                 )
 
         if _serpent: _serpent.update_phase("APPLY")
+
+        # OpsDigestObserver v1.1a — APPLY milestone (best-effort telemetry).
+        # Reaching this point means ChangeEngine succeeded (failed paths
+        # returned early). Derive mode from target-files count so we
+        # don't rely on outer-scope local variables remaining in scope.
+        try:
+            from backend.core.ouroboros.governance.ops_digest_observer import (
+                APPLY_MODE_MULTI,
+                APPLY_MODE_SINGLE,
+                get_ops_digest_observer,
+            )
+            _apply_file_count = len(ctx.target_files or ())
+            _apply_mode_tag = (
+                APPLY_MODE_MULTI if _apply_file_count > 1 else APPLY_MODE_SINGLE
+            )
+            get_ops_digest_observer().on_apply_succeeded(
+                op_id=ctx.op_id,
+                mode=_apply_mode_tag,
+                files=_apply_file_count,
+            )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] on_apply_succeeded observer call failed",
+                exc_info=True,
+            )
+
         # ---- Phase 8: VERIFY ----
         if _serpent: _serpent.update_phase("VERIFY")
         ctx = ctx.advance(OperationPhase.VERIFY)
@@ -5268,6 +5294,29 @@ class GovernedOrchestrator:
                 )
             except Exception:
                 pass
+
+            # OpsDigestObserver v1.1a — VERIFY milestone. Plan tightening
+            # #1: ``scoped_to_applied_op=True`` because this branch only
+            # runs when ``ctx.target_files`` was applied (it's the scoped
+            # post-apply test run, not a repo-wide health check).
+            try:
+                from backend.core.ouroboros.governance.ops_digest_observer import (
+                    get_ops_digest_observer,
+                )
+                _verify_passed_count = max(
+                    0, _verify_test_total - _verify_test_failures,
+                )
+                get_ops_digest_observer().on_verify_completed(
+                    op_id=ctx.op_id,
+                    passed=_verify_passed_count,
+                    total=_verify_test_total,
+                    scoped_to_applied_op=True,
+                )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] on_verify_completed observer call failed",
+                    exc_info=True,
+                )
 
             # On failure: attempt L2 repair before rollback
             if not _verify_test_passed and self._config.repair_engine is not None:
@@ -5458,6 +5507,23 @@ class GovernedOrchestrator:
                     "[Orchestrator] Auto-committed %s for op=%s",
                     _commit_result.commit_hash, ctx.op_id,
                 )
+
+                # OpsDigestObserver v1.1a — commit milestone. Hash shape
+                # validation happens in the observer implementer; this
+                # call site just forwards AutoCommitter's reported value.
+                try:
+                    from backend.core.ouroboros.governance.ops_digest_observer import (
+                        get_ops_digest_observer,
+                    )
+                    get_ops_digest_observer().on_commit_succeeded(
+                        op_id=ctx.op_id,
+                        commit_hash=_commit_result.commit_hash or "",
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] on_commit_succeeded observer call failed",
+                        exc_info=True,
+                    )
             elif _commit_result.skipped_reason:
                 logger.debug(
                     "[Orchestrator] Auto-commit skipped: %s",

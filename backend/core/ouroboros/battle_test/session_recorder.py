@@ -8,15 +8,50 @@ Output files (written by :meth:`save_summary`):
   - ``{output_dir}/summary.json``       — full session statistics
   - ``{output_dir}/review_queue.jsonl`` — one JSON object per queued op
                                           (only created if queued ops exist)
+
+Schema versioning (v1.1a):
+  * ``schema_version: 2`` stamped at top level on every new write.
+  * v1 files (no ``schema_version``) still read cleanly via
+    :class:`backend.core.ouroboros.governance.last_session_summary.LastSessionSummary`.
+  * New optional ``ops_digest`` sub-dict carries
+    ``last_apply_mode``/``last_apply_files``/``last_apply_op_id``/
+    ``last_verify_tests_passed``/``last_verify_tests_total``/
+    ``last_commit_hash`` when the session's orchestrator / AutoCommitter
+    reported those milestones via the OpsDigestObserver protocol.
+  * Sessions that never had a successful APPLY **omit** ``ops_digest``
+    entirely (not written as empty / zero) so future prompts don't
+    render ``apply=none/0 verify=0/0`` noise.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from backend.core.ouroboros.governance.ops_digest_observer import (
+    APPLY_MODE_MULTI,
+    APPLY_MODE_NONE,
+    APPLY_MODE_SINGLE,
+    MAX_COMMIT_HASH_LEN,
+    MAX_OP_ID_LEN,
+)
+
+_VALID_APPLY_MODES = frozenset({
+    APPLY_MODE_NONE, APPLY_MODE_SINGLE, APPLY_MODE_MULTI,
+})
+
+# Commit hash pattern — SHA-1 hex chars, 7 to 40 length. Anything
+# outside this shape is silently dropped (observer may receive a
+# non-hash by mistake, e.g. from a broken tool).
+_COMMIT_HASH_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+# Schema stamp for every summary.json emitted by this module. Consumers
+# should check this before parsing ``ops_digest`` fields.
+SCHEMA_VERSION = 2
 
 
 class SessionRecorder:
@@ -50,6 +85,15 @@ class SessionRecorder:
         # Ops that need human review (status == "queued")
         self._review_queue: List[Dict[str, Any]] = []
 
+        # v1.1a: ops_digest — most-recent-wins snapshot of APPLY / VERIFY /
+        # commit milestones, populated via the OpsDigestObserver protocol.
+        # Kept as an internal dict of typed entries; ``write()`` emits only
+        # the non-empty sub-fields. ``_ops_digest_saw_apply`` gates whether
+        # ``ops_digest`` is serialized at all — sessions with no successful
+        # APPLY produce no digest key in summary.json.
+        self._ops_digest: Dict[str, Any] = {}
+        self._ops_digest_saw_apply: bool = False
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -64,6 +108,103 @@ class SessionRecorder:
             "cancelled": self._cancelled,
             "queued": self._queued,
         }
+
+    @property
+    def ops_digest(self) -> Dict[str, Any]:
+        """Snapshot of the v1.1a ``ops_digest`` sub-dict.
+
+        Keys present only when the corresponding milestone was observed
+        this session. Returns an empty dict when no APPLY event fired
+        (matches the ``write()`` omit-when-empty rule).
+        """
+        return dict(self._ops_digest) if self._ops_digest_saw_apply else {}
+
+    # ------------------------------------------------------------------
+    # OpsDigestObserver protocol — see ops_digest_observer.py
+    # ------------------------------------------------------------------
+
+    def on_apply_succeeded(
+        self, *, op_id: str, mode: str, files: int,
+    ) -> None:
+        """Record an APPLY success. Most-recent-wins overwrite.
+
+        Coerces unknown ``mode`` strings to :data:`APPLY_MODE_NONE`.
+        Truncates ``op_id`` to :data:`MAX_OP_ID_LEN`. Never raises.
+        """
+        try:
+            clean_mode = mode if mode in _VALID_APPLY_MODES else APPLY_MODE_NONE
+            clean_op_id = str(op_id or "")[:MAX_OP_ID_LEN]
+            try:
+                clean_files = max(0, int(files))
+            except (TypeError, ValueError):
+                clean_files = 0
+            self._ops_digest["last_apply_mode"] = clean_mode
+            self._ops_digest["last_apply_files"] = clean_files
+            self._ops_digest["last_apply_op_id"] = clean_op_id
+            # Only "real" APPLY events (not NONE) flip the digest-saw
+            # flag — a single explicit mode=NONE call shouldn't cause
+            # summary.json to emit an "attempted APPLY that did nothing".
+            if clean_mode in (APPLY_MODE_SINGLE, APPLY_MODE_MULTI):
+                self._ops_digest_saw_apply = True
+        except Exception:  # noqa: BLE001 — best-effort telemetry
+            pass
+
+    def on_verify_completed(
+        self,
+        *,
+        op_id: str,
+        passed: int,
+        total: int,
+        scoped_to_applied_op: bool = True,
+    ) -> None:
+        """Record VERIFY test counts tied to the last APPLY. Never raises.
+
+        Per plan tightening #1: only records when the caller asserts
+        the counts are scoped to the applied op (``scoped_to_applied_op``).
+        Unscoped (repo-wide health) calls are ignored to prevent
+        ``verify=20/20`` claims that mislead about scope.
+        """
+        try:
+            if not scoped_to_applied_op:
+                return
+            try:
+                clean_passed = max(0, int(passed))
+                clean_total = max(0, int(total))
+            except (TypeError, ValueError):
+                return
+            if clean_total <= 0:
+                # No meaningful test run — skip (also avoids div-by-zero
+                # in renderers that compute ratios).
+                return
+            self._ops_digest["last_verify_tests_passed"] = clean_passed
+            self._ops_digest["last_verify_tests_total"] = clean_total
+            # VERIFY observation also gets the op_id recorded for
+            # cross-reference — even if it differs from last APPLY
+            # (shouldn't in practice, but defensive).
+            clean_op_id = str(op_id or "")[:MAX_OP_ID_LEN]
+            if clean_op_id:
+                self._ops_digest.setdefault("last_apply_op_id", clean_op_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_commit_succeeded(
+        self, *, op_id: str, commit_hash: str,
+    ) -> None:
+        """Record a successful AutoCommitter commit hash. Never raises.
+
+        Validates hash shape against :data:`_COMMIT_HASH_RE`
+        (7-40 hex chars). Malformed hashes are silently dropped.
+        """
+        try:
+            h = str(commit_hash or "")[:MAX_COMMIT_HASH_LEN]
+            if not _COMMIT_HASH_RE.match(h):
+                return
+            self._ops_digest["last_commit_hash"] = h
+            clean_op_id = str(op_id or "")[:MAX_OP_ID_LEN]
+            if clean_op_id:
+                self._ops_digest.setdefault("last_apply_op_id", clean_op_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Recording
@@ -230,6 +371,7 @@ class SessionRecorder:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         summary: Dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,  # v1.1a — stamped at every new write
             "session_id": self._session_id,
             "stop_reason": stop_reason,
             "duration_s": duration_s,
@@ -246,6 +388,13 @@ class SessionRecorder:
         }
         if strategic_drift is not None:
             summary["strategic_drift"] = strategic_drift
+
+        # v1.1a: emit ``ops_digest`` only when at least one real APPLY
+        # was observed. Empty sessions produce no digest key at all so
+        # the next session's LastSessionSummary renders the v1 line
+        # shape unchanged (no ``apply=none/0 verify=0/0`` noise).
+        if self._ops_digest_saw_apply and self._ops_digest:
+            summary["ops_digest"] = dict(self._ops_digest)
 
         summary_path = output_dir / "summary.json"
         summary_path.write_text(json.dumps(summary, indent=2))

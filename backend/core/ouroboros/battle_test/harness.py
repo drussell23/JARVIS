@@ -193,6 +193,20 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             logger.debug("lss set_active_session_id(boot) failed", exc_info=True)
 
+        # LastSessionSummary v1.1a: register SessionRecorder as the process-
+        # wide OpsDigestObserver so orchestrator / AutoCommitter call sites
+        # reach the harness without importing the recorder directly. This
+        # is the only seam between governance code (hook consumer) and
+        # harness code (digest implementer) — keeps dependency direction
+        # clean (governance → observer protocol only).
+        try:
+            from backend.core.ouroboros.governance.ops_digest_observer import (
+                register_ops_digest_observer,
+            )
+            register_ops_digest_observer(self._session_recorder)
+        except Exception:  # noqa: BLE001
+            logger.debug("register_ops_digest_observer(boot) failed", exc_info=True)
+
         try:
             # Boot sequence
             await self.boot_oracle()
@@ -2311,3 +2325,14 @@ class BattleTestHarness:
             _lss_set_active(None)
         except Exception:
             logger.debug("lss set_active_session_id(clear) failed", exc_info=True)
+
+        # OpsDigestObserver: symmetric teardown — restore the default
+        # no-op so a subsequent in-process harness run doesn't leak
+        # digest events into a stale recorder.
+        try:
+            from backend.core.ouroboros.governance.ops_digest_observer import (
+                reset_ops_digest_observer,
+            )
+            reset_ops_digest_observer()
+        except Exception:
+            logger.debug("reset_ops_digest_observer(clear) failed", exc_info=True)

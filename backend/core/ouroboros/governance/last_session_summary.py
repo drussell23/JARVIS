@@ -34,7 +34,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.core.secure_logging import sanitize_for_log
 from backend.core.ouroboros.governance.conversation_bridge import redact_secrets
@@ -130,6 +130,13 @@ class SessionRecord:
     Every field is typed and renderable. Unknown / absent fields from
     newer or older ``summary.json`` schemas degrade to sensible defaults
     rather than raising — this module tolerates schema drift.
+
+    v1.1a schema additions (all optional, absent in v1 files):
+      * ``last_apply_mode`` — enum ``"none" | "single" | "multi"`` or None
+      * ``last_apply_files`` — int count of files applied, or None
+      * ``last_apply_op_id`` — str op id (truncated in render), or ""
+      * ``last_verify_tests_passed`` / ``last_verify_tests_total`` — ints or None
+      * ``last_commit_hash`` — AutoCommitter's hash (hex chars) or ""
     """
 
     session_id: str
@@ -159,6 +166,14 @@ class SessionRecord:
     drift_status: str = ""
 
     convergence_state: str = ""
+
+    # v1.1a additions — all optional, None / "" when absent in summary.json
+    last_apply_mode: Optional[str] = None          # "none" | "single" | "multi"
+    last_apply_files: Optional[int] = None
+    last_apply_op_id: str = ""
+    last_verify_tests_passed: Optional[int] = None
+    last_verify_tests_total: Optional[int] = None
+    last_commit_hash: str = ""
 
 
 @dataclass
@@ -261,6 +276,28 @@ def _parse_summary(path: Path) -> Tuple[Optional[SessionRecord], List[str]]:
     except (TypeError, ValueError):
         drift_ratio = None
 
+    # v1.1a: extract optional ops_digest sub-dict. Missing / malformed →
+    # all fields become None / "" (same graceful degradation as v1 fields).
+    ops_digest_raw = raw.get("ops_digest", {}) or {}
+    if not isinstance(ops_digest_raw, dict):
+        ops_digest_raw = {}
+
+    def _opt_int(source: Dict[str, Any], key: str) -> Optional[int]:
+        if key not in source:
+            return None
+        try:
+            v = int(source[key])
+            return v if v >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    _last_apply_mode_raw = ops_digest_raw.get("last_apply_mode")
+    _last_apply_mode: Optional[str] = None
+    if isinstance(_last_apply_mode_raw, str):
+        _mode_clean = _sanitize_field(_last_apply_mode_raw)
+        if _mode_clean in ("none", "single", "multi"):
+            _last_apply_mode = _mode_clean
+
     try:
         record = SessionRecord(
             session_id=_sanitize_field(_get("session_id", "")),
@@ -280,6 +317,21 @@ def _parse_summary(path: Path) -> Tuple[Optional[SessionRecord], List[str]]:
             drift_ratio=drift_ratio,
             drift_status=_sanitize_field(drift_raw.get("status", "")),
             convergence_state=_sanitize_field(raw.get("convergence_state", "")),
+            # v1.1a ops_digest extraction — each field safely coerced or None.
+            last_apply_mode=_last_apply_mode,
+            last_apply_files=_opt_int(ops_digest_raw, "last_apply_files"),
+            last_apply_op_id=_sanitize_field(
+                ops_digest_raw.get("last_apply_op_id", "")
+            ),
+            last_verify_tests_passed=_opt_int(
+                ops_digest_raw, "last_verify_tests_passed",
+            ),
+            last_verify_tests_total=_opt_int(
+                ops_digest_raw, "last_verify_tests_total",
+            ),
+            last_commit_hash=_sanitize_field(
+                ops_digest_raw.get("last_commit_hash", "")
+            ),
         )
     except (TypeError, ValueError):
         return None, missing + ["type_mismatch"]
@@ -323,10 +375,36 @@ def _render_session(record: SessionRecord) -> str:
     else:
         drift = record.drift_status or "n/a"
 
+    # v1.1a ops_digest tokens — optional, rendered between cost= and branch=
+    # per plan §6 ("what the session did" facts next to their cost).
+    # Each token rendered only when its data is meaningfully present.
+    digest_tokens: List[str] = []
+    if (
+        record.last_apply_mode
+        and record.last_apply_mode != "none"
+        and record.last_apply_files is not None
+    ):
+        digest_tokens.append(
+            f"apply={record.last_apply_mode}/{record.last_apply_files}"
+        )
+    if (
+        record.last_verify_tests_passed is not None
+        and record.last_verify_tests_total is not None
+        and record.last_verify_tests_total > 0
+    ):
+        digest_tokens.append(
+            f"verify={record.last_verify_tests_passed}/"
+            f"{record.last_verify_tests_total}"
+        )
+    if record.last_commit_hash:
+        # Truncate to 10 chars for readability — full hash kept on disk.
+        digest_tokens.append(f"commit={record.last_commit_hash[:10]}")
+    digest_str = (" " + " ".join(digest_tokens)) if digest_tokens else ""
+
     main = (
         f"{record.session_id} stop={record.stop_reason or 'unknown'} "
         f"dur={_fmt_duration(record.duration_s)} ops={ops} "
-        f"cost={cost_str} branch={branch} drift={drift} "
+        f"cost={cost_str}{digest_str} branch={branch} drift={drift} "
         f"conv={record.convergence_state or 'n/a'}"
     )
 
