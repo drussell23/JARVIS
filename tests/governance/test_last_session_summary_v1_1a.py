@@ -441,6 +441,62 @@ def test_register_and_reset_observer():
 # ---------------------------------------------------------------------------
 
 
+def test_orchestrator_has_three_observer_call_sites():
+    """Regression guard: orchestrator.py must invoke the OpsDigestObserver
+    at APPLY, VERIFY, and commit choke points.
+
+    Rationale: the 19 v1.1a tests prove the observer + SessionRecorder
+    chain works *when fired*. But if a future refactor of ``orchestrator.py``
+    silently removes one of the three call sites, ``ops_digest`` stops
+    populating while every existing test still passes — a genuine
+    silent-regression risk. This AST-level check is the canary.
+
+    The match is shape-specific:
+    ``get_ops_digest_observer().on_<method>(...)`` — any other call
+    chain (e.g. holding the observer in a local variable) would need
+    to update this test deliberately.
+    """
+    import ast
+    from pathlib import Path
+
+    orch_path = Path(__file__).resolve().parent.parent.parent / (
+        "backend/core/ouroboros/governance/orchestrator.py"
+    )
+    assert orch_path.is_file(), f"orchestrator.py not at expected path: {orch_path}"
+
+    tree = ast.parse(orch_path.read_text(encoding="utf-8"))
+    hook_methods: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # Shape: Call(Attribute(value=Call(Name("get_ops_digest_observer")), attr="on_XXX"))
+        if not isinstance(func, ast.Attribute):
+            continue
+        inner = func.value
+        if not isinstance(inner, ast.Call):
+            continue
+        inner_name = inner.func
+        if not isinstance(inner_name, ast.Name):
+            continue
+        if inner_name.id != "get_ops_digest_observer":
+            continue
+        hook_methods.add(func.attr)
+
+    required = {"on_apply_succeeded", "on_verify_completed", "on_commit_succeeded"}
+    missing = required - hook_methods
+    extra = hook_methods - required
+    assert not missing, (
+        f"orchestrator.py is missing observer call sites: {missing}. "
+        f"ops_digest will silently stop populating."
+    )
+    assert not extra, (
+        f"orchestrator.py has unexpected observer method calls: {extra}. "
+        f"Either the observer protocol grew or there's a typo — update this "
+        f"regression test deliberately if the protocol was extended."
+    )
+
+
 def test_integration_recorder_to_summary_round_trip(monkeypatch, tmp_path):
     """Full v1.1a loop: record → write summary.json → LSS parses → renders."""
     _enable(monkeypatch)

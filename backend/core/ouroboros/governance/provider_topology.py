@@ -38,6 +38,7 @@ missing or malformed ``doubleword_topology`` section is treated as
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -46,6 +47,56 @@ logger = logging.getLogger(__name__)
 
 
 _POLICY_FILENAME = "brain_selection_policy.yaml"
+
+
+# ---------------------------------------------------------------------------
+# Dev / verification env override (off by default)
+# ---------------------------------------------------------------------------
+#
+# ``JARVIS_TOPOLOGY_BG_CASCADE_ENABLED`` forces ``background`` and
+# ``speculative`` route ``block_mode`` from ``skip_and_queue`` to
+# ``cascade_to_claude`` — i.e. when DW stalls on those routes, the op
+# cascades to Claude instead of being skipped-and-queued.
+#
+# Purpose: verification-only escape hatch. The default topology
+# (skip_and_queue for BG/SPEC) exists to protect unit economics — don't
+# burn Claude compute on low-urgency background chores. But when DW
+# health is degraded for a sustained period, operators need a way to
+# drive a single verification session through to APPLY/VERIFY/commit so
+# v1.1a ``ops_digest`` can be observed live end-to-end.
+#
+# Enable with ``JARVIS_TOPOLOGY_BG_CASCADE_ENABLED=true`` for a single
+# session, collect the ``ops_digest`` artifact, then revert. The
+# override logs a WARN on first use per boot so the audit trail shows
+# exactly when unit-economics protection was suspended.
+#
+# This env does NOT disable ``dw_allowed`` — DW is still tried first on
+# BG/SPEC. The override only changes what happens when DW fails: skip
+# (default) vs cascade (override).
+
+
+def _bg_cascade_override_enabled() -> bool:
+    raw = os.environ.get("JARVIS_TOPOLOGY_BG_CASCADE_ENABLED")
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+_BG_OVERRIDE_WARNED = False
+
+
+def _warn_once_bg_override() -> None:
+    """One-time WARN when the BG cascade override fires, per process."""
+    global _BG_OVERRIDE_WARNED
+    if _BG_OVERRIDE_WARNED:
+        return
+    _BG_OVERRIDE_WARNED = True
+    logger.warning(
+        "[ProviderTopology] JARVIS_TOPOLOGY_BG_CASCADE_ENABLED=true — "
+        "BACKGROUND / SPECULATIVE routes will cascade to Claude when DW "
+        "fails (overrides skip_and_queue default). Unit-economics protection "
+        "suspended for this process. Disable the env once verification is done."
+    )
 
 
 @dataclass(frozen=True)
@@ -147,13 +198,23 @@ class ProviderTopology:
         COMPLEX blocks keep routing to Claude. BACKGROUND/SPECULATIVE
         entries in the yaml declare ``block_mode: skip_and_queue`` to
         opt out of the cascade.
+
+        Dev/verification override: when
+        ``JARVIS_TOPOLOGY_BG_CASCADE_ENABLED=true``, any route whose yaml
+        declared ``skip_and_queue`` is flipped to ``cascade_to_claude``
+        at read-time (YAML not modified). The override emits exactly one
+        WARN per process the first time it rewrites a decision.
         """
         if not self.enabled:
             return "cascade_to_claude"
         entry = self.routes.get((route or "").strip().lower())
         if entry is None:
             return "cascade_to_claude"
-        return entry.block_mode or "cascade_to_claude"
+        effective = entry.block_mode or "cascade_to_claude"
+        if effective == "skip_and_queue" and _bg_cascade_override_enabled():
+            _warn_once_bg_override()
+            return "cascade_to_claude"
+        return effective
 
     def model_for_caller(self, caller: str) -> Optional[str]:
         """Return the DW model override for a named caller, or None.
