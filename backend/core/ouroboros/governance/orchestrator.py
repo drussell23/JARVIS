@@ -1020,6 +1020,60 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] Strategic direction injection failed", exc_info=True)
 
+        # ---- ConversationBridge (v0.1): TUI dialogue as untrusted soft bias ----
+        # Injects the user's recent TUI turns BETWEEN the trusted manifesto
+        # block (above) and the trusted goals + user-preferences blocks
+        # (below). Untrusted-in-the-middle ordering preserves attention-
+        # mechanism dominance for FORBIDDEN_PATH / style prefs (which come
+        # last) while still surfacing conversational intent to the model.
+        #
+        # Authority invariant (plan v0.1 §9): this block has zero authority
+        # over Iron Gate, UrgencyRouter, risk tier, policy engine,
+        # FORBIDDEN_PATH, tool protected-path checks, or approval gating.
+        # Consumed ONLY by StrategicDirection at this injection site.
+        try:
+            from backend.core.ouroboros.governance.conversation_bridge import (
+                get_default_bridge,
+            )
+            _bridge = get_default_bridge()
+            _bridge_enabled, _n_turns, _chars_in, _redacted, _hash8 = (
+                _bridge.inject_metrics()
+            )
+            if _bridge_enabled:
+                _conv_prompt = _bridge.format_for_prompt()
+                if _conv_prompt:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=ctx.strategic_intent_id or "conv-bridge-v1",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=(
+                            _existing + "\n\n" + _conv_prompt
+                            if _existing else _conv_prompt
+                        ),
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                # §8 one-line observability contract. Logged whether or
+                # not there were turns to inject — operators need to see
+                # that the wiring fired.
+                logger.info(
+                    "[ConversationBridge] op=%s enabled=true n_turns=%d "
+                    "chars_in=%d inject_site=context_expansion redacted=%s hash8=%s",
+                    ctx.op_id, _n_turns, _chars_in, _redacted, _hash8,
+                )
+            else:
+                # §8 §7-tweak: DEBUG line at inject site when master switch
+                # is off so "is wiring live?" is answerable without content.
+                logger.debug(
+                    "[ConversationBridge] op=%s enabled=false "
+                    "inject_site=context_expansion",
+                    ctx.op_id,
+                )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] ConversationBridge injection skipped",
+                exc_info=True,
+            )
+
         # ---- P2.4 + Week 2: Goal-directed context injection ----
         # Append the *most relevant* active user goals to the strategic
         # memory prompt so the generation model aligns its decisions with

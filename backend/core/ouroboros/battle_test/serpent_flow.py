@@ -2862,6 +2862,26 @@ class SerpentREPL:
                         self._print_lessons()
                         continue
 
+                    # ConversationBridge capture (V1: user turns only).
+                    # Any line that fell through the built-in dispatch is
+                    # either free-text for the external handler or an
+                    # unknown slash command. We record only non-slash
+                    # lines so malformed `/foo` doesn't pollute the
+                    # untrusted context injected at CONTEXT_EXPANSION.
+                    # Assistant-side capture is deferred (the TUI emits
+                    # op telemetry and code diffs, not conversational
+                    # turns — wiring V1.1 pending a clear source).
+                    if not line.startswith("/"):
+                        try:
+                            from backend.core.ouroboros.governance.conversation_bridge import (
+                                get_default_bridge,
+                            )
+                            get_default_bridge().record_turn(
+                                "user", line, source="tui",
+                            )
+                        except Exception:
+                            pass  # best-effort; never break the REPL
+
                     # Delegate to external handler
                     if self._on_command is not None:
                         try:
