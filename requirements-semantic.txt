@@ -1,0 +1,19 @@
+# Optional: Semantic Goal Inference (v0.1)
+#
+# Install ONLY when JARVIS_SEMANTIC_INFERENCE_ENABLED will be used.
+# Without this dep installed, SemanticIndex auto-disables on first
+# embed attempt (one WARN log, then silent) — the rest of the
+# organism runs unaffected.
+#
+# Pulls in onnxruntime (~100MB) and downloads the bge-small-en-v1.5
+# ONNX model (~30MB) to ~/.cache/fastembed/ on first embed.
+#
+# Install:
+#   pip install -r requirements-semantic.txt
+#
+# Authority invariant: see CLAUDE.md SemanticIndex bullet. The vectors
+# never leave the local machine (§4 data sovereignty). The module has
+# zero authority over Iron Gate, UrgencyRouter, risk tier, policy, or
+# FORBIDDEN_PATH — soft priority bias + CONTEXT_EXPANSION prompt only.
+
+fastembed>=0.3.0

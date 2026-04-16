@@ -143,7 +143,40 @@ def _compute_priority(
                     _goal_alignment_failures, exc,
                 )
 
-    priority = base - urgency + cost_penalty - confidence_bonus - dep_bonus - goal_boost
+    # SemanticIndex v0.1: soft semantic prior capped at BOOST_MAX (default 1)
+    # so it remains strictly subordinate to goal_alignment_boost (=2).
+    # Master off → no import, no disk I/O, boost=0. Performance: one embed
+    # + one cosine against a precomputed centroid per signal (beef #4).
+    # Authority invariant: this boost ONLY affects priority ordering — it
+    # is NEVER fed into UrgencyRouter, Iron Gate, risk tier, policy engine,
+    # FORBIDDEN_PATH, or approval gating.
+    semantic_boost = 0
+    try:
+        from backend.core.ouroboros.governance.semantic_index import (
+            get_default_index,
+        )
+        _si = get_default_index()
+        # Lazy build on first use; subsequent signals hit the interval gate.
+        _si.build()
+        semantic_boost = _si.boost_for(envelope.description or "")
+        if semantic_boost > 0 or _si.stats().built_at > 0:
+            # Stash in envelope evidence for observability. Score itself
+            # (the raw cosine) is useful for operators inspecting "why
+            # did this signal get boosted?" without exposing raw vectors.
+            try:
+                _sim_raw = _si.score(envelope.description or "")
+                if isinstance(envelope.evidence, dict):
+                    envelope.evidence["semantic_alignment"] = round(float(_sim_raw), 4)
+                    envelope.evidence["semantic_boost"] = int(semantic_boost)
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.debug("[Router] semantic alignment scorer failed: %s", exc)
+
+    priority = (
+        base - urgency + cost_penalty - confidence_bonus
+        - dep_bonus - goal_boost - semantic_boost
+    )
     return priority, alignment
 
 

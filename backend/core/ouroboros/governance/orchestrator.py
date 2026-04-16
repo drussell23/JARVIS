@@ -1083,6 +1083,56 @@ class GovernedOrchestrator:
                 exc_info=True,
             )
 
+        # ---- SemanticIndex v0.1: recency-weighted focus + closures ----
+        # Soft semantic prior drawn from the recency-weighted centroid
+        # over recent commits + active goals + recent conversation.
+        # Injected BETWEEN the ConversationBridge block (above) and the
+        # Goals block (below) so the ordering reads top-to-bottom as:
+        # Strategic → Bridge (untrusted dialogue) → Semantic (untrusted
+        # prior) → Goals (trusted) → UserPreferences (highest trust).
+        #
+        # Authority invariant: this block has **zero** authority over
+        # Iron Gate, UrgencyRouter, risk tier, policy engine, FORBIDDEN_PATH,
+        # or approval gating. It affects ONLY the prompt surface the model
+        # reads at CONTEXT_EXPANSION — §4 (data sovereignty, local
+        # embedder) + §8 (hashes + counts, no raw vectors in logs).
+        try:
+            from backend.core.ouroboros.governance.semantic_index import (
+                get_default_index,
+            )
+            _semi = get_default_index(self._config.project_root)
+            # Lazy build (hits interval gate on repeat).
+            _semi.build()
+            _semi_prompt = _semi.format_prompt_sections()
+            if _semi_prompt:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=ctx.strategic_intent_id or "semantic-v1",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=(
+                        _existing + "\n\n" + _semi_prompt
+                        if _existing else _semi_prompt
+                    ),
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                _semi_stats = _semi.stats()
+                logger.info(
+                    "[SemanticIndex] op=%s corpus_n=%d centroid_hash8=%s "
+                    "inject_site=context_expansion prompt_chars=%d",
+                    ctx.op_id, _semi_stats.corpus_n,
+                    _semi_stats.centroid_hash8, len(_semi_prompt),
+                )
+            else:
+                logger.debug(
+                    "[SemanticIndex] op=%s no prompt section (disabled or empty)",
+                    ctx.op_id,
+                )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] SemanticIndex injection skipped",
+                exc_info=True,
+            )
+
         # ---- P2.4 + Week 2: Goal-directed context injection ----
         # Append the *most relevant* active user goals to the strategic
         # memory prompt so the generation model aligns its decisions with
