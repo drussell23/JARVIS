@@ -52,9 +52,13 @@ def test_disabled_path_record_turn_is_noop():
 
 def test_disabled_path_inject_metrics_reports_disabled():
     bridge = cb.ConversationBridge()
-    enabled, n_turns, chars_in, redacted_any, hash8 = bridge.inject_metrics()
+    (enabled, n_turns, n_user, n_assistant, n_postmortem,
+     chars_in, redacted_any, hash8) = bridge.inject_metrics()
     assert enabled is False
     assert n_turns == 0
+    assert n_user == 0
+    assert n_assistant == 0
+    assert n_postmortem == 0
     assert chars_in == 0
     assert redacted_any is False
     assert hash8 == ""
@@ -197,7 +201,10 @@ def test_format_for_prompt_fenced_block_shape(monkeypatch):
     _enable(monkeypatch)
     bridge = cb.ConversationBridge()
     bridge.record_turn("user", "focus on the auth module today")
-    bridge.record_turn("assistant", "acknowledged")
+    bridge.record_turn(
+        "assistant", "which provider?",
+        source="ask_human_q", op_id="op-abc",
+    )
     out = bridge.format_for_prompt()
     assert out is not None
     # Header names the content as untrusted.
@@ -205,9 +212,12 @@ def test_format_for_prompt_fenced_block_shape(monkeypatch):
     # Fenced block present with untrusted attribute.
     assert '<conversation untrusted="true">' in out
     assert "</conversation>" in out
-    # Per-turn role labels present.
-    assert "[user] focus on the auth module today" in out
-    assert "[assistant] acknowledged" in out
+    # v1.1 subheaders present when the matching source is populated.
+    assert "### TUI user intent" in out
+    assert "### Clarifications (recent)" in out
+    # Per-turn lines tagged by source (plus op_id when present).
+    assert "[tui_user] focus on the auth module today" in out
+    assert "[ask_human_q op=op-abc] which provider?" in out
     # Authority-invariant copy present (matches §9).
     assert "no authority" in out.lower()
     assert "FORBIDDEN_PATH" in out
@@ -234,9 +244,13 @@ def test_inject_metrics_shape(monkeypatch):
     _enable(monkeypatch)
     bridge = cb.ConversationBridge()
     bridge.record_turn("user", "short")
-    enabled, n_turns, chars_in, redacted_any, hash8 = bridge.inject_metrics()
+    (enabled, n_turns, n_user, n_assistant, n_postmortem,
+     chars_in, redacted_any, hash8) = bridge.inject_metrics()
     assert enabled is True
     assert n_turns == 1
+    assert n_user == 1
+    assert n_assistant == 0
+    assert n_postmortem == 0
     assert chars_in == len("short")
     assert redacted_any is False
     assert re.fullmatch(r"[0-9a-f]{8}", hash8)
@@ -246,7 +260,7 @@ def test_inject_metrics_redacted_flag(monkeypatch):
     _enable(monkeypatch)
     bridge = cb.ConversationBridge()
     bridge.record_turn("user", "key sk-abcdefghij1234567890xyz here")
-    _, _, _, redacted_any, _ = bridge.inject_metrics()
+    redacted_any = bridge.inject_metrics()[6]
     assert redacted_any is True
 
 
@@ -256,8 +270,8 @@ def test_inject_metrics_hash_is_deterministic(monkeypatch):
     b = cb.ConversationBridge()
     a.record_turn("user", "identical text")
     b.record_turn("user", "identical text")
-    _, _, _, _, hash_a = a.inject_metrics()
-    _, _, _, _, hash_b = b.inject_metrics()
+    hash_a = a.inject_metrics()[7]
+    hash_b = b.inject_metrics()[7]
     assert hash_a == hash_b
 
 
@@ -273,14 +287,15 @@ def test_invalid_role_rejected(monkeypatch):
     assert bridge.snapshot() == []
 
 
-def test_source_tag_preserved(monkeypatch):
+def test_source_tag_preserved_and_legacy_alias(monkeypatch):
+    """v1.1: known sources preserved; legacy `tui` remapped to `tui_user`."""
     _enable(monkeypatch)
     bridge = cb.ConversationBridge()
     bridge.record_turn("user", "hi", source="voice")
-    bridge.record_turn("user", "ho", source="tui")
+    bridge.record_turn("user", "ho", source="tui")  # legacy → tui_user
     snap = bridge.snapshot()
     assert snap[0].source == "voice"
-    assert snap[1].source == "tui"
+    assert snap[1].source == "tui_user"
 
 
 # ---------------------------------------------------------------------------
