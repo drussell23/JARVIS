@@ -135,6 +135,8 @@ Boots the full 6-layer stack: GovernedLoopService, IntakeLayer (16 sensors), Tri
 
 On startup, the harness auto-reaps any zombie `ouroboros_battle_test.py` processes from earlier crashed sessions (psutil-based, strict path-tail match, SIGTERM → SIGKILL escalation) and removes stale `.jarvis/intake_router.lock` files whose owning PID is dead. Prevents budget competition between sessions. Master switch: `JARVIS_BATTLE_REAP_ZOMBIES` (default `true`).
 
+Partial-shutdown insurance: the harness registers an `atexit` fallback **and** a sync signal-handler write so every session dir ends up with a v1.1a-parseable `summary.json` — even when SIGTERM arrives mid-cleanup or the async finally can't complete. `SIGKILL` remains unrecoverable by design (OS-level, uncatchable in Python). Regression spine for "session continuity + aborted runs": `tests/governance/test_last_session_summary_composition.py` (proves production injection path wires LSS tokens into the composed CONTEXT_EXPANSION prompt) + `tests/battle_test/test_harness_partial_shutdown.py` (proves partial summaries land on every reachable exit path and are LSS-parseable on the next boot).
+
 ## File Layout (Key Paths)
 
 ```

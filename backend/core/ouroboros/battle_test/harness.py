@@ -13,6 +13,7 @@ dependencies.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 import os
 import re
@@ -124,6 +125,16 @@ class BattleTestHarness:
         self._stop_reason: str = "unknown"
         self._started_at: float = 0.0
 
+        # Partial-shutdown insurance: flipped True by _generate_report's
+        # save_summary call. Read by the atexit fallback — if False at
+        # interpreter shutdown, the fallback writes a minimal best-effort
+        # summary.json so the session dir is never left with only
+        # debug.log. Covers the gap where SIGTERM + asyncio finally can't
+        # complete (exception in shutdown components, parent kills hard
+        # before async cleanup, interpreter teardown during async work).
+        self._summary_written: bool = False
+        self._install_atexit_fallback()
+
         # Component references (populated during boot)
         self._oracle: Any = None
         self._governance_stack: Any = None
@@ -138,6 +149,125 @@ class BattleTestHarness:
             os.environ.get("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", "").strip().lower()
             in _TRUTHY
         )
+
+    # ------------------------------------------------------------------
+    # Partial-shutdown insurance (atexit fallback)
+    # ------------------------------------------------------------------
+
+    def _install_atexit_fallback(self) -> None:
+        """Register the atexit fallback summary writer.
+
+        The fallback ensures that every battle-test session dir ends up
+        with a ``summary.json`` — even when the clean async path in
+        ``_generate_report`` never completed (SIGTERM arrives mid-cleanup,
+        exception in ``_shutdown_components``, parent sends SIGKILL
+        shortly after SIGTERM, interpreter teardown during async work).
+
+        atexit cannot intercept ``SIGKILL`` (signal 9, uncatchable) or a
+        hard ``os._exit``; those remain unrecoverable by design. For every
+        other exit path — normal exit, uncaught exception, SIGTERM-driven
+        shutdown — atexit fires exactly once after the interpreter stops
+        running user code but before the process goes away.
+
+        The fallback is a no-op when ``_summary_written`` is True (the
+        clean path already wrote a full summary).
+        """
+        atexit.register(self._atexit_fallback_write)
+
+    def _atexit_fallback_write(self) -> None:
+        """Best-effort synchronous summary.json writer for partial shutdown.
+
+        Stamps ``stop_reason="partial_shutdown:atexit_fallback"`` (or
+        preserves the existing ``_stop_reason`` if it has a signal-driven
+        value like ``shutdown_signal``, with a ``+atexit`` suffix so
+        downstream can tell the clean path didn't finish). Uses the
+        SessionRecorder's already-accumulated state (stats, ops_digest,
+        operations list) so partial sessions still yield v1.1a-compatible
+        summaries — LastSessionSummary on the next boot can parse them
+        the same way it parses clean summaries.
+
+        Never raises: any exception is logged and swallowed. Running
+        during interpreter teardown means we can't trust the event loop
+        or many imports; this writer is pure-sync and defensive.
+        """
+        if self._summary_written:
+            return  # Clean path won — no fallback needed.
+        try:
+            session_dir = self._session_dir
+            session_dir.mkdir(parents=True, exist_ok=True)
+
+            # Preserve any meaningful stop_reason already stamped; suffix
+            # it with "+atexit" so the caller can distinguish the partial
+            # case. When nothing was stamped ("unknown" default), use an
+            # explicit partial-shutdown tag.
+            raw = self._stop_reason or "unknown"
+            if raw in ("unknown", ""):
+                reason = "partial_shutdown:atexit_fallback"
+            else:
+                reason = f"{raw}+atexit_fallback"
+
+            # Duration: best-effort from _started_at if run() got that far.
+            duration_s = (
+                time.time() - self._started_at if self._started_at else 0.0
+            )
+
+            # Cost snapshot — CostTracker exposes `total_spent` / `breakdown`
+            # as live accumulators; read defensively.
+            try:
+                cost_total = float(self._cost_tracker.total_spent)
+                cost_breakdown = dict(self._cost_tracker.breakdown)
+            except Exception:  # noqa: BLE001
+                cost_total = 0.0
+                cost_breakdown = {}
+
+            # Branch stats: if the branch manager made it up, snapshot;
+            # otherwise emit zeros so downstream parsing stays stable.
+            branch_stats: dict = {
+                "commits": 0, "files_changed": 0,
+                "insertions": 0, "deletions": 0,
+            }
+            try:
+                if self._branch_manager is not None:
+                    branch_stats = self._branch_manager.get_diff_stats()
+            except Exception:  # noqa: BLE001
+                pass
+
+            self._session_recorder.save_summary(
+                output_dir=session_dir,
+                stop_reason=reason,
+                duration_s=duration_s,
+                cost_total=cost_total,
+                cost_breakdown=cost_breakdown,
+                branch_stats=branch_stats,
+                convergence_state="INSUFFICIENT_DATA",
+                convergence_slope=0.0,
+                convergence_r2=0.0,
+            )
+            self._summary_written = True
+            # Can't trust logger during interpreter teardown — fallback
+            # to stderr for visibility if the log handlers are gone.
+            try:
+                logger.warning(
+                    "[Harness] atexit fallback wrote partial summary.json "
+                    "(stop_reason=%s session=%s)",
+                    reason, self._session_id,
+                )
+            except Exception:  # noqa: BLE001
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[Harness] atexit fallback wrote partial summary.json "
+                    f"(stop_reason={reason} session={self._session_id})\n"
+                )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                logger.error(
+                    "[Harness] atexit fallback failed: %r", exc,
+                )
+            except Exception:  # noqa: BLE001
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[Harness] atexit fallback failed: {exc!r}\n"
+                )
 
     # ------------------------------------------------------------------
     # Properties
@@ -1714,14 +1844,45 @@ class BattleTestHarness:
     def register_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Register SIGINT/SIGTERM handlers to trigger clean shutdown.
 
+        Insurance pattern: each signal handler does a **synchronous**
+        partial-summary write BEFORE setting the shutdown event. This
+        ensures the session dir ends up with a summary.json even when
+        the subsequent async cleanup can't complete (parent escalates
+        SIGTERM to SIGKILL, asyncio gets stuck in a C extension, or
+        an exception in ``_shutdown_components`` aborts the finally
+        block mid-execution).
+
+        The sync write is idempotent: the ``_summary_written`` flag
+        prevents the atexit fallback from double-writing if the async
+        path DOES complete afterward. If the async clean path runs
+        successfully, it overwrites the partial summary with the full
+        one (same flag check, opposite direction).
+
         Catches ``NotImplementedError`` on Windows where
         ``loop.add_signal_handler`` is not supported.
         """
         try:
-            loop.add_signal_handler(signal.SIGINT, self._shutdown_event.set)
-            loop.add_signal_handler(signal.SIGTERM, self._shutdown_event.set)
+            loop.add_signal_handler(signal.SIGINT, self._handle_shutdown_signal)
+            loop.add_signal_handler(signal.SIGTERM, self._handle_shutdown_signal)
         except NotImplementedError:
             logger.warning("Signal handlers not supported on this platform")
+
+    def _handle_shutdown_signal(self) -> None:
+        """Bound callback fired by asyncio on SIGINT/SIGTERM.
+
+        Performs the sync partial-summary write BEFORE setting the
+        shutdown event so the async cleanup cannot be cut off without
+        at least a v1.1a-parseable summary.json landing on disk. If
+        the async clean path subsequently completes, it overwrites
+        the partial with the full summary (same ``_summary_written``
+        flag gate).
+        """
+        try:
+            self._atexit_fallback_write()
+        except Exception:  # noqa: BLE001
+            logger.debug("signal-driven partial write failed", exc_info=True)
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
 
     # ------------------------------------------------------------------
     # GLS Activity Monitor (staleness-aware)
@@ -2233,6 +2394,9 @@ class BattleTestHarness:
                 convergence_r2=convergence_r2,
                 strategic_drift=strategic_drift,
             )
+            # Flag prevents the atexit fallback from double-writing a
+            # partial summary on top of the clean one.
+            self._summary_written = True
             logger.info("Summary written to %s", summary_path)
         except Exception as exc:
             logger.warning("Failed to save session summary: %s", exc)

@@ -835,15 +835,48 @@ class UnifiedIntakeRouter:
                 raise RouterAlreadyRunningError(
                     f"Another router instance holds the lock at {lock_path}"
                 )
-        # Write PID metadata for stale-lock detection
+        # Write PID metadata for stale-lock detection.
+        #
+        # Visibility note: the flock auto-releases when the holding
+        # process dies, so the common "dead process left behind stale
+        # metadata" case never hits the reaper at ``_cleanup_stale_lock``
+        # (that path only fires when flock itself is still held — e.g.
+        # inherited by a live child process). Instead, stale metadata
+        # is overwritten *silently* here. When we detect prior metadata
+        # from a non-self PID, log a one-line INFO so operators can
+        # tell a stale-lock overwrite from a fresh-first-boot write.
         self._lock_fd = fd
         try:
+            import json as _json
+            _prior_pid: Optional[int] = None
+            _prior_age_s: Optional[float] = None
+            try:
+                _prior_raw = os.read(fd, 4096)
+                if _prior_raw:
+                    _prior_json = _json.loads(_prior_raw.decode(errors="replace"))
+                    _prior_pid = int(_prior_json.get("pid", 0)) or None
+                    _prior_ts = float(_prior_json.get("ts", 0.0)) or None
+                    if _prior_ts:
+                        _prior_age_s = time.time() - _prior_ts
+            except (ValueError, OSError, KeyError, TypeError):
+                _prior_pid = None
+                _prior_age_s = None
+
             os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)
-            import json as _json
             _meta = _json.dumps({"pid": os.getpid(), "ts": time.time()})
             os.write(fd, _meta.encode())
             os.fsync(fd)
+
+            if _prior_pid and _prior_pid != os.getpid():
+                _age_str = (
+                    f"{_prior_age_s:.0f}s" if _prior_age_s is not None else "?s"
+                )
+                logger.info(
+                    "[IntakeRouter] Overwrote stale lock metadata "
+                    "(prior_pid=%d prior_age=%s new_pid=%d)",
+                    _prior_pid, _age_str, os.getpid(),
+                )
         except OSError:
             pass  # Lock is held — metadata is advisory
 
