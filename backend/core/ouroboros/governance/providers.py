@@ -4971,9 +4971,47 @@ class ClaudeProvider:
 
             # Streaming: use stream() for token-by-token output via TUI callback.
             # Falls back to create() if streaming unavailable or callback not set.
+            #
+            # Callback resolution order:
+            #   1. Tool-loop coordinator (existing — internal debug render).
+            #   2. Operator-visible StreamRenderer (new — battle-test TUI).
+            #
+            # When both exist (tool-loop round with an operator watching),
+            # wrap them in a fanout so the model's text streams to BOTH
+            # the tool-loop's internal handler and the operator terminal.
+            # When only one exists, use it directly. When neither exists,
+            # fall through to the non-streaming create() path (headless /
+            # background routes).
             _stream_callback = None
+            _tool_cb = None
             if self._tool_loop is not None:
-                _stream_callback = getattr(self._tool_loop, "on_token", None)
+                _tool_cb = getattr(self._tool_loop, "on_token", None)
+            _render_cb = None
+            try:
+                from backend.core.ouroboros.battle_test.stream_renderer import (
+                    get_stream_renderer,
+                )
+                _renderer = get_stream_renderer()
+                if _renderer is not None:
+                    _render_cb = _renderer.on_token
+            except Exception:
+                _render_cb = None
+
+            if _tool_cb is not None and _render_cb is not None:
+                def _stream_fanout(text: str) -> None:
+                    try:
+                        _tool_cb(text)
+                    except Exception:
+                        pass
+                    try:
+                        _render_cb(text)
+                    except Exception:
+                        pass
+                _stream_callback = _stream_fanout
+            elif _tool_cb is not None:
+                _stream_callback = _tool_cb
+            elif _render_cb is not None:
+                _stream_callback = _render_cb
 
             # Assistant prefill: force JSON-first output by seeding the
             # assistant turn with an opening brace. Benefit: eliminates the

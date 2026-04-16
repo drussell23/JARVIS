@@ -374,6 +374,22 @@ class SerpentFlow:
         self._stream_buffer: str = ""
         self._stream_language: str = "json"
 
+        # Operator-visible token streaming (Priority 2 UX fix — tokens
+        # on the glass in real-time during GENERATE). Owns its own
+        # Rich.Live + Markdown widget, async-isolated consumer, 16ms
+        # batch cadence. Registered as the process-global singleton so
+        # providers can look it up at stream time. Env-gated via
+        # JARVIS_UI_STREAMING_ENABLED (default on).
+        try:
+            from backend.core.ouroboros.battle_test.stream_renderer import (
+                StreamRenderer,
+                register_stream_renderer,
+            )
+            self._stream_renderer: Optional[Any] = StreamRenderer(console=self.console)
+            register_stream_renderer(self._stream_renderer)
+        except Exception:
+            self._stream_renderer = None
+
     # ══════════════════════════════════════════════════════════
     # Zone 0: Boot Banner
     # ══════════════════════════════════════════════════════════

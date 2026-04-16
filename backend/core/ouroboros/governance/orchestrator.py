@@ -2433,12 +2433,50 @@ class GovernedOrchestrator:
                     )
                 except Exception:
                     pass
+                # Operator-visible token streaming (UX Priority 2 — closes
+                # the "spinner for 2 minutes" gap). Gated on (1) the
+                # JARVIS_UI_STREAMING_ENABLED env flag (checked inside the
+                # renderer), and (2) the route: only IMMEDIATE / STANDARD /
+                # COMPLEX are operator-visible. BACKGROUND and SPECULATIVE
+                # skip — no operator is watching, and streaming serialization
+                # would waste CPU that should go to inference.
+                _stream_renderer = None
+                if _route not in ("background", "speculative"):
+                    try:
+                        from backend.core.ouroboros.battle_test.stream_renderer import (
+                            get_stream_renderer,
+                        )
+                        _stream_renderer = get_stream_renderer()
+                        if _stream_renderer is not None:
+                            _stream_renderer.start(
+                                op_id=ctx.op_id,
+                                provider=getattr(ctx, "task_complexity", "") or "claude",
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[Orchestrator] stream renderer start failed",
+                            exc_info=True,
+                        )
+                        _stream_renderer = None
                 # Hard timeout — the deadline is advisory to the generator,
                 # but asyncio.wait_for is the Iron Gate (Manifesto §6).
-                generation = await asyncio.wait_for(
-                    self._generator.generate(ctx, deadline),
-                    timeout=_gen_timeout + _OUTER_GATE_GRACE_S,
-                )
+                try:
+                    generation = await asyncio.wait_for(
+                        self._generator.generate(ctx, deadline),
+                        timeout=_gen_timeout + _OUTER_GATE_GRACE_S,
+                    )
+                finally:
+                    # End the stream regardless of success / failure so the
+                    # Live widget closes and the observability INFO line
+                    # emits TTFT + TPS even when generation times out.
+                    if _stream_renderer is not None:
+                        try:
+                            _stream_renderer.end()
+                        except Exception:
+                            logger.debug(
+                                "[Orchestrator] stream renderer end failed",
+                                exc_info=True,
+                            )
                 # Charge the CostGovernor with the actual generation cost.
                 # Non-positive costs (cache hits, fallback stubs) are a no-op.
                 try:
