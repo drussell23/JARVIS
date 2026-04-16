@@ -2275,6 +2275,21 @@ class AsyncProcessToolBackend:
                 question = call.arguments.get("question", "")
                 options_raw = call.arguments.get("options", [])
                 options = list(options_raw) if isinstance(options_raw, (list, tuple)) else []
+
+                # ConversationBridge v1.1: capture the model's question as an
+                # assistant turn *before* presenting it to the human. Runs
+                # inside try/except — bridge failures never break Venom.
+                try:
+                    from backend.core.ouroboros.governance.conversation_bridge import (
+                        get_default_bridge,
+                    )
+                    get_default_bridge().record_turn(
+                        "assistant", question,
+                        source="ask_human_q", op_id=policy_ctx.op_id,
+                    )
+                except Exception:
+                    pass
+
                 answer = await asyncio.wait_for(
                     self._approval_provider.elicit(
                         request_id=policy_ctx.op_id,
@@ -2288,6 +2303,19 @@ class AsyncProcessToolBackend:
                     output = json.dumps({"status": "timeout", "answer": None})
                 else:
                     output = json.dumps({"status": "answered", "answer": answer})
+                    # v1.1: capture the human answer as a user turn. Same
+                    # op_id pairs it with the question. Timeouts produce no
+                    # answer turn — silence is not a conversational signal.
+                    try:
+                        from backend.core.ouroboros.governance.conversation_bridge import (
+                            get_default_bridge,
+                        )
+                        get_default_bridge().record_turn(
+                            "user", str(answer),
+                            source="ask_human_a", op_id=policy_ctx.op_id,
+                        )
+                    except Exception:
+                        pass
 
             elif call.name == "delegate_to_agent":
                 # Phase 2: Sub-Agent Delegation. Spawn an isolated read-only

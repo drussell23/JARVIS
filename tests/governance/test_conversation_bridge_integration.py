@@ -175,10 +175,14 @@ def test_priority_1_gap_intent_reaches_generation_prompt(monkeypatch):
     assert "no authority" in bridge_block.lower()
     assert "FORBIDDEN_PATH" in bridge_block  # named as non-overridable
 
-    # (e) Telemetry shape (§8 observability contract).
-    enabled, n_turns, chars_in, redacted, hash8 = bridge.inject_metrics()
+    # (e) Telemetry shape (§8 observability contract — v1.1 8-tuple).
+    (enabled, n_turns, n_user, n_assistant, n_postmortem,
+     chars_in, redacted, hash8) = bridge.inject_metrics()
     assert enabled is True
     assert n_turns == 2
+    assert n_user == 2
+    assert n_assistant == 0
+    assert n_postmortem == 0
     assert chars_in > 0
     assert redacted is False
     assert re.fullmatch(r"[0-9a-f]{8}", hash8), (
@@ -227,7 +231,7 @@ def test_adversarial_input_neutralized_end_to_end(monkeypatch):
     assert "no authority" in prompt.lower()
 
     # Telemetry reflects the redaction.
-    _, _, _, redacted, _ = bridge.inject_metrics()
+    redacted = bridge.inject_metrics()[6]
     assert redacted is True
 
 
@@ -295,5 +299,5 @@ def test_buffer_pressure_drops_oldest_turns(monkeypatch):
     assert "old directive one" not in prompt
     assert "old directive two" not in prompt
 
-    _, n_turns, _, _, _ = bridge.inject_metrics()
+    n_turns = bridge.inject_metrics()[1]
     assert n_turns == 3

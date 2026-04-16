@@ -1036,9 +1036,16 @@ class GovernedOrchestrator:
                 get_default_bridge,
             )
             _bridge = get_default_bridge()
-            _bridge_enabled, _n_turns, _chars_in, _redacted, _hash8 = (
-                _bridge.inject_metrics()
-            )
+            (
+                _bridge_enabled,
+                _n_turns,
+                _n_user,
+                _n_assistant,
+                _n_postmortem,
+                _chars_in,
+                _redacted,
+                _hash8,
+            ) = _bridge.inject_metrics()
             if _bridge_enabled:
                 _conv_prompt = _bridge.format_for_prompt()
                 if _conv_prompt:
@@ -1052,13 +1059,15 @@ class GovernedOrchestrator:
                         ),
                         strategic_memory_digest=ctx.strategic_memory_digest,
                     )
-                # §8 one-line observability contract. Logged whether or
-                # not there were turns to inject — operators need to see
-                # that the wiring fired.
+                # §8 one-line observability contract (v1.1 source breakdown).
+                # Logged whether or not there were turns to inject —
+                # operators need to see that the wiring fired.
                 logger.info(
                     "[ConversationBridge] op=%s enabled=true n_turns=%d "
-                    "chars_in=%d inject_site=context_expansion redacted=%s hash8=%s",
-                    ctx.op_id, _n_turns, _chars_in, _redacted, _hash8,
+                    "n_user=%d n_assistant=%d n_postmortem=%d chars_in=%d "
+                    "inject_site=context_expansion redacted=%s hash8=%s",
+                    ctx.op_id, _n_turns, _n_user, _n_assistant, _n_postmortem,
+                    _chars_in, _redacted, _hash8,
                 )
             else:
                 # §8 §7-tweak: DEBUG line at inject site when master switch
