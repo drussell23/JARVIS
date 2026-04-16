@@ -169,6 +169,28 @@ def test_self_skip_only_session_returns_empty(monkeypatch, tmp_path):
     assert summary.format_for_prompt() is None
 
 
+def test_defensive_filter_skips_in_flight_session_without_active_id(monkeypatch, tmp_path):
+    """Belt-and-suspenders: even without set_active_session_id, dirs whose
+    summary.json doesn't exist yet (in-flight session) are skipped.
+
+    Regression guard for the 2026-04-16 live session where the harness
+    hadn't wired the lss.set_active_session_id hook yet — load() now
+    auto-skips current-session dirs via summary-exists filter.
+    """
+    _enable(monkeypatch)
+    # Create an "in-flight" session dir without summary.json.
+    in_flight = tmp_path / ".ouroboros" / "sessions" / "bt-2026-04-16-100000"
+    in_flight.mkdir(parents=True)
+    # And a completed prior session.
+    _write_summary(tmp_path, "bt-2026-04-15-090000")
+
+    # Do NOT set_active_session_id — prove the filter catches it anyway.
+    summary = lss.LastSessionSummary(tmp_path)
+    records = summary.load(n_sessions=1)
+    assert len(records) == 1
+    assert records[0].session_id == "bt-2026-04-15-090000"
+
+
 # ---------------------------------------------------------------------------
 # (6) N=1 default; N>3 clamped to 3; N=0 empty
 # ---------------------------------------------------------------------------

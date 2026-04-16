@@ -1303,6 +1303,13 @@ class OracleSemanticIndex:
 
         try:
             query_embedding = await self._embedder.embed(query)
+            if query_embedding is None:
+                # Embedder returned no vector (empty query, model not ready,
+                # upstream encode() returned empty). This is a known "couldn't
+                # embed" state, not an error — return empty to match the
+                # "not available" fast-path above instead of raising into
+                # the outer except (which would log a misleading WARNING).
+                return []
 
             results = self._collection.query(
                 query_embeddings=[query_embedding.tolist()],

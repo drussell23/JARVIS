@@ -373,9 +373,21 @@ class LastSessionSummary:
         """Return up to ``n`` bt-* directories, lex-max first (newest first).
 
         Pure directory scan — no mtime, no subprocess. Lexicographic order
-        on ``bt-YYYY-MM-DD-HHMMSS`` equals chronological order. Self-skip
-        drops the lex-max directory when its name matches the active
-        session id (we want the *previous* session, not self).
+        on ``bt-YYYY-MM-DD-HHMMSS`` equals chronological order.
+
+        Two defensive filters guarantee we never try to read the *current*
+        session's incomplete state:
+          1. **Self-skip by id** — drop candidates whose name matches
+             :func:`get_active_session_id` (set by the battle-test harness
+             at boot).
+          2. **Summary-exists filter** — drop candidates whose
+             ``summary.json`` doesn't exist on disk. The harness only
+             writes it at session end, so an in-flight session is
+             automatically excluded even if the active-id hook is missing.
+
+        Either filter alone suffices; both provide belt-and-suspenders
+        protection against adjacent failure modes (harness forgot to call
+        the hook / stale lock dir with no summary yet).
         """
         sessions_root = self._sessions_dir()
         if not sessions_root.exists() or not sessions_root.is_dir():
@@ -389,11 +401,20 @@ class LastSessionSummary:
         candidates.sort(key=lambda p: p.name, reverse=True)
 
         active = get_active_session_id()
-        if active and candidates and candidates[0].name == active:
-            # Self-skip — we want the previous session, not our own run.
-            candidates = candidates[1:]
+        filtered: List[Path] = []
+        for p in candidates:
+            if active and p.name == active:
+                # Self-skip by id.
+                continue
+            if not (p / "summary.json").is_file():
+                # Self-skip by absence — session still in flight, no summary
+                # written yet, so the candidate can't contribute. Equivalent
+                # guard for when the harness hasn't called
+                # set_active_session_id.
+                continue
+            filtered.append(p)
 
-        return candidates[:max(0, n)]
+        return filtered[:max(0, n)]
 
     def load(self, n_sessions: Optional[int] = None) -> List[SessionRecord]:
         """Load up to ``n_sessions`` most-recent session summaries.

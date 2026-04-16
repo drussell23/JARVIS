@@ -182,6 +182,17 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             logger.debug("set_active_session_id(boot) failed", exc_info=True)
 
+        # LastSessionSummary v0.1: same pattern — stamp the active session
+        # id so the self-skip logic knows NOT to read our own still-empty
+        # summary.json (which only gets written at session end).
+        try:
+            from backend.core.ouroboros.governance.last_session_summary import (
+                set_active_session_id as _lss_set_active,
+            )
+            _lss_set_active(self._session_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("lss set_active_session_id(boot) failed", exc_info=True)
+
         try:
             # Boot sequence
             await self.boot_oracle()
@@ -2291,3 +2302,12 @@ class BattleTestHarness:
             set_active_session_id(None)
         except Exception:
             logger.debug("set_active_session_id(clear) failed", exc_info=True)
+
+        # LastSessionSummary: symmetric teardown.
+        try:
+            from backend.core.ouroboros.governance.last_session_summary import (
+                set_active_session_id as _lss_set_active,
+            )
+            _lss_set_active(None)
+        except Exception:
+            logger.debug("lss set_active_session_id(clear) failed", exc_info=True)
