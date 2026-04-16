@@ -1,0 +1,1409 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>DoubleWord × Ouroboros + Venom — Battle-Test Benchmarks</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <link rel="stylesheet" href="/dev/stdin" />
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">DoubleWord × Ouroboros + Venom — Battle-Test
+Benchmarks</h1>
+</header>
+<h1 id="doubleword--ouroboros--venom--battle-test-benchmarks">DoubleWord
+× Ouroboros + Venom — Battle-Test Benchmarks</h1>
+<p><strong>Prepared by:</strong> Derek J. Russell (JARVIS Trinity /
+Ouroboros + Venom) <strong>Prepared for:</strong> Meryem Arik,
+Co-founder/CEO, DoubleWord <strong>Report date:</strong> 2026-04-16
+<strong>Coverage:</strong> 2026-04-06 → 2026-04-16 (11 days, 160+
+battle-test sessions) <strong>Repo:</strong>
+<code>github.com/drussell23/JARVIS-AI-Agent</code> <strong>Models
+exercised:</strong> Qwen 3.5 397B
+(<code>Qwen/Qwen3.5-397B-A17B-FP8</code>), Gemma 4 31B
+(<code>google/gemma-4-31B-it</code>), Qwen 3.5 35B
+(<code>Qwen/Qwen3.5-35B-A3B-FP8</code>, retired caller)</p>
+<hr />
+<h2 id="tldr">TL;DR</h2>
+<ol type="1">
+<li><strong>DoubleWord 397B reasoning quality is excellent when
+generation completes.</strong> Multi-kilobyte structured JSON, correct
+tool-call shape, sensible plan reasoning — the intelligence is
+there.</li>
+<li><strong>The blocker is infrastructure-level, not
+model-level.</strong> Two dated isolation tests on 2026-04-14 — one on
+Gemma 4 31B (BACKGROUND), one on Qwen 3.5 397B (STANDARD) — produced the
+identical <code>SSE stream stalled (no data for 30s)</code> failure
+signature on right-sized payloads (2,836 tokens Gemma, 1,080–5,247
+tokens Qwen). <strong>Same streaming endpoint, different models, same
+stall.</strong></li>
+<li><strong>As of <code>brain_selection_policy.yaml</code> revision
+2026-04-14, DW is topology-sealed from every agent-generation
+route</strong> (IMMEDIATE / STANDARD / COMPLEX / BACKGROUND /
+SPECULATIVE). It runs only on short, structured-JSON, non-streaming
+<code>callers</code> (semantic_triage, ouroboros_plan, Phase-0
+compaction in shadow).</li>
+<li><strong>Production cost impact: DW currently carries ~1.7% of
+inference spend</strong> across 160 sessions ($0.31 DW / $18.63 total).
+The other 98.3% went to Claude — not by design, by forced fallback after
+the streaming endpoint proved unstable for agent-shape workloads.</li>
+<li><strong>Session W (2026-04-15,
+<code>bt-2026-04-15-230849</code>)</strong> achieved the first
+end-to-end autonomous multi-file APPLY in the repo's history — 4 Python
+test modules generated, validated, repaired, written to disk,
+autonomously committed, 20/20 pytest green. <strong>It ran on Claude
+because DW was topology-sealed from COMPLEX.</strong> I want to re-route
+that work to DW, which is exactly what this benchmark report is meant to
+unblock.</li>
+<li><strong>The ask is not "make DW better at agents."</strong> The ask
+is: <strong>can the non-streaming <code>/v1/chat/completions</code>
+endpoint sustain heavy-payload agent workloads?</strong> If yes, the
+architectural reframe in <code>docs/architecture/OUROBOROS.md</code>
+§"Functions, Not Agents" reseats 397B as a heavy analyst and Gemma 31B
+as a structured-function caller — and a lot of that 98.3/1.7 cost ratio
+starts moving back.</li>
+</ol>
+<p>This document is a full-transparency engineering partner report, not
+a complaint thread. Where DW is strong, that's said. Where it fails, the
+session IDs, timestamps, payload sizes, and debug.log line numbers are
+cited verbatim so your infrastructure team can reproduce every
+finding.</p>
+<hr />
+<h2 id="1-how-ouroboros--venom-uses-doubleword">1. How Ouroboros + Venom
+Uses DoubleWord</h2>
+<h3 id="11-the-provider-chain-design-intent">1.1 The provider chain
+(design intent)</h3>
+<p>O+V is a 6-layer autonomous development engine built on top of the
+JARVIS Trinity ecosystem. It runs an 11-phase governance pipeline:</p>
+<pre><code>CLASSIFY → ROUTE → CONTEXT_EXPANSION → PLAN → GENERATE →
+VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE</code></pre>
+<p>Every signal carries a deterministic <code>ProviderRoute</code>
+stamped at the ROUTE phase by <code>UrgencyRouter</code> (pure code,
+&lt;1ms, zero LLM calls). Each route defines a contract for which
+provider tier is used and how cascade works:</p>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Design-intent strategy</th>
+<th>Intended cost</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IMMEDIATE</td>
+<td>Claude direct (skip DW)</td>
+<td>~$0.03/op</td>
+<td>Test failures, voice, runtime health — latency-critical</td>
+</tr>
+<tr>
+<td>STANDARD</td>
+<td><strong>DW 397B primary → Claude fallback</strong></td>
+<td>~$0.005/op</td>
+<td>Default cascade for moderate ops</td>
+</tr>
+<tr>
+<td>COMPLEX</td>
+<td><strong>Claude plans → DW executes</strong></td>
+<td>~$0.015/op</td>
+<td>Heavy code, multi-file architectural</td>
+</tr>
+<tr>
+<td>BACKGROUND</td>
+<td><strong>DW only, no Claude fallback</strong></td>
+<td>~$0.002/op</td>
+<td>OpportunityMiner, DocStaleness, TODOs</td>
+</tr>
+<tr>
+<td>SPECULATIVE</td>
+<td><strong>DW batch fire-and-forget</strong></td>
+<td>~$0.001/op</td>
+<td>IntentDiscovery, DreamEngine pre-compute</td>
+</tr>
+</tbody>
+</table>
+<p>The routing table is built around DW as the cost-optimization
+backbone for 80% of operations. Claude is positioned as the fast-reflex
+tier and the safety-net fallback. <strong>This is what we were trying to
+do.</strong></p>
+<p>Source:
+<code>backend/core/ouroboros/governance/urgency_router.py:20-26</code>,
+<code>CLAUDE.md:34-52</code>.</p>
+<h3 id="12-what-actually-runs-dw-today">1.2 What actually runs DW
+today</h3>
+<p>Per
+<code>backend/core/ouroboros/governance/brain_selection_policy.yaml</code>
+lines 342–376 (verbatim quoted in §4), DW is currently blocked from
+every one of those five generation routes. DW runs only on three short,
+structured-JSON, non-streaming <code>callers</code>:</p>
+<ul>
+<li><code>semantic_triage</code> — pre-generation file intelligence
+(Gemma 4 31B)</li>
+<li><code>ouroboros_plan</code> — plan-phase structured JSON output
+(Gemma 4 31B)</li>
+<li><code>compaction</code> — Phase 0 Functions-Not-Agents (Gemma 4 31B,
+shadow mode, <code>JARVIS_COMPACTION_CALLER_ENABLED</code> default
+false)</li>
+</ul>
+<p>Everything else now cascades to Claude.</p>
+<h3 id="13-dw-configuration-as-exercised">1.3 DW configuration (as
+exercised)</h3>
+<p>From
+<code>backend/core/ouroboros/governance/doubleword_provider.py:38-90</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Value</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Default model</td>
+<td><code>Qwen/Qwen3.5-397B-A17B-FP8</code></td>
+<td><code>DOUBLEWORD_MODEL</code> env</td>
+</tr>
+<tr>
+<td>Base URL</td>
+<td><code>https://api.doubleword.ai/v1</code></td>
+<td><code>DOUBLEWORD_BASE_URL</code> env</td>
+</tr>
+<tr>
+<td>Input pricing</td>
+<td>$0.10 / M tokens</td>
+<td><code>DOUBLEWORD_INPUT_COST_PER_M</code> env</td>
+</tr>
+<tr>
+<td>Output pricing</td>
+<td>$0.40 / M tokens</td>
+<td><code>DOUBLEWORD_OUTPUT_COST_PER_M</code> env</td>
+</tr>
+<tr>
+<td>Max output tokens</td>
+<td>trivial/moderate 8192, standard 12288, complex/heavy 16384</td>
+<td><code>_DW_COMPLEXITY_MAX_TOKENS</code></td>
+</tr>
+<tr>
+<td>Poll interval</td>
+<td>5s</td>
+<td><code>DOUBLEWORD_POLL_INTERVAL_S</code> env</td>
+</tr>
+<tr>
+<td>Request timeout</td>
+<td>120s</td>
+<td><code>DOUBLEWORD_REQUEST_TIMEOUT_S</code> env</td>
+</tr>
+<tr>
+<td>Per-op cost cap</td>
+<td>$0.10</td>
+<td><code>DOUBLEWORD_MAX_COST_PER_OP</code> env</td>
+</tr>
+<tr>
+<td>Daily budget</td>
+<td>$5.00</td>
+<td><code>DOUBLEWORD_DAILY_BUDGET</code> env</td>
+</tr>
+<tr>
+<td>Temperature</td>
+<td>0.2</td>
+<td><code>DOUBLEWORD_TEMPERATURE</code> env</td>
+</tr>
+</tbody>
+</table>
+<p>O+V talks to DW via a 3-tier pattern (per
+<code>CLAUDE.md:20</code>):</p>
+<ol type="1">
+<li><strong>RT SSE (default)</strong> — real-time streaming for
+interactive generation</li>
+<li><strong>Webhook batch</strong> — async batch with webhook
+delivery</li>
+<li><strong>Adaptive poll fallback</strong> — polling when webhook isn't
+available</li>
+</ol>
+<p>The failures described below occurred on Tier 0 (RT SSE streaming).
+The non-streaming <code>complete_sync()</code> path (Tier 3 adaptive
+poll variant, or <code>stream=false</code> HTTP) has not been stressed
+by O+V under agent-shape workloads. This is the architectural gap the
+roadmap section addresses.</p>
+<hr />
+<h2
+id="2-observed-doubleword-strengths-what-were-still-trying-to-use-dw-for">2.
+Observed DoubleWord Strengths (what we're still trying to use DW
+for)</h2>
+<p>These are observations from sessions when DW <em>did</em> complete a
+generation. Cited verbatim so you can pull the same debug lines from the
+same session IDs.</p>
+<h3
+id="21-397b-reasoning-quality-is-first-tier-when-generation-completes">2.1
+397B reasoning quality is first-tier when generation completes</h3>
+<p>On Qwen 3.5 397B STANDARD isolation test
+<code>bt-2026-04-14-203740</code> (debug.log:457):</p>
+<pre><code>2026-04-14T13:41:36 [DoublewordProvider] RT: 1 candidates in 83.2s
+                    ($0.0021, 0 tool calls, 5037+4018 tokens)</code></pre>
+<p>One candidate, 5,037 input tokens, 4,018 output tokens, $0.0021 —
+cost per completed op under $0.003 on a structured-JSON GENERATE with
+zero tool-loop rounds. Quality of the candidate itself was correct shape
+(JSON parsed, schema-valid, rationale present). The issue was latency:
+83.2s exceeded the 71.5s Tier 0 RT budget, so the FSM had already
+cascaded by the time the candidate arrived.</p>
+<h3
+id="22-cost-economics-are-exactly-what-dw-promises--when-throughput-is-met">2.2
+Cost economics are exactly what DW promises — when throughput is
+met</h3>
+<p>On an earlier session <code>bt-2026-04-12-073546</code>, a hybrid run
+where DW was still permitted on structured JSON:</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Spend</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DW</td>
+<td>$0.002106</td>
+</tr>
+<tr>
+<td>Claude</td>
+<td>$0.502881</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>$0.504987</strong></td>
+</tr>
+</tbody>
+</table>
+<p>DW delivered ~0.4% of the inference spend for its share of work — the
+cost model was working as designed. When generations completed, the unit
+economics held.</p>
+<h3 id="23-structured-json-callers-hit-gemma-31b-reliably">2.3
+Structured-JSON callers hit Gemma 31B reliably</h3>
+<p><code>semantic_triage</code> and <code>ouroboros_plan</code>
+invocations against <code>google/gemma-4-31B-it</code> via the
+prompt_only batch protocol complete routinely — these calls are bounded
+(&lt;512 token output), single-turn, and structurally simple. From
+<code>bt-2026-04-14-203740/debug.log:253-254</code>:</p>
+<pre><code>2026-04-14T13:38:24 [DoublewordProvider] prompt_only batch ff05400d-...
+                    submitted (model=google/gemma-4-31B-it, caller=triage_op-019d8db7-)
+2026-04-14T13:38:26 [DoublewordProvider] prompt_only batch ab6c4a97-...
+                    submitted (model=google/gemma-4-31B-it, caller=triage_op-019d8db7-)</code></pre>
+<p>These calls work. They are the reason DW is still wired into the
+pipeline at all.</p>
+<h3 id="24-model-availability--version-health-check">2.4 Model
+availability / version health check</h3>
+<p>Model verification on session boot confirms the endpoint serves the
+claimed model inventory
+(<code>bt-2026-04-14-182446/debug.log:11</code>):</p>
+<pre><code>2026-04-14T11:25:01 [SemanticTriage] Model verified:
+                    google/gemma-4-31B-it is available (14 models on endpoint)</code></pre>
+<p>Gemma 4 31B shipped and was live the day Meryem announced it. That
+part of the platform works as advertised.</p>
+<hr />
+<h2
+id="3-the-reproducible-blocker--sse-stream-stall-under-agent-shape-load">3.
+The Reproducible Blocker — SSE Stream Stall Under Agent-Shape Load</h2>
+<p>This is the single most valuable piece of feedback in the report. Two
+independent dated isolation tests, two different models, <strong>one
+identical failure signature.</strong></p>
+<h3
+id="31-gemma-4-31b--background-route-isolation-bt-2026-04-14-182446">3.1
+Gemma 4 31B — BACKGROUND route isolation
+(<code>bt-2026-04-14-182446</code>)</h3>
+<p><strong>What ran:</strong> 13 BACKGROUND-route operations forced
+through <code>google/gemma-4-31B-it</code> via topology override, with
+Claude fallback severed. Right-sized payload envelopes (2,836 tokens
+typical, down from ~11K pre-patch).</p>
+<p><strong>Configuration:</strong></p>
+<ul>
+<li>Model: <code>google/gemma-4-31B-it</code></li>
+<li>Route: <code>background</code> (topology override)</li>
+<li>Stream mode: Tier 0 RT SSE</li>
+<li>Prompt size: 5,233 → 11,916 chars (~1,308 → 2,979 tokens)</li>
+<li>Fallback: disabled
+(<code>fallback_disabled_by_env:background</code>)</li>
+</ul>
+<p><strong>Result: 0 / 13 successes.</strong></p>
+<ul>
+<li>12× 180s timeouts with SSE stream stall</li>
+<li>1× schema_invalid
+(<code>doubleword_schema_invalid:candidate_0_missing_rationale</code>)</li>
+</ul>
+<p><strong>Failure signature</strong>
+(<code>bt-2026-04-14-182446/debug.log:445-451</code>):</p>
+<pre><code>2026-04-14T11:31:12 [DoublewordProvider] WARNING SSE stream stalled (no data for 30s)
+2026-04-14T11:31:12 [Orchestrator] BACKGROUND route: DW failed
+                    (background_dw_error:RuntimeError:doubleword_schema_invalid:candidate_0_missing_rationale)</code></pre>
+<p><strong>Session summary:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Session ID</td>
+<td><code>bt-2026-04-14-182446</code></td>
+</tr>
+<tr>
+<td>Start</td>
+<td>2026-04-14T11:25:00 UTC</td>
+</tr>
+<tr>
+<td>Duration</td>
+<td>1,334s (22min)</td>
+</tr>
+<tr>
+<td>Stop reason</td>
+<td><code>idle_timeout</code></td>
+</tr>
+<tr>
+<td>strategic_drift</td>
+<td>14 ops tracked, 1 drifted (7.1%, ok)</td>
+</tr>
+<tr>
+<td>DW spend</td>
+<td>$0.00 (no successful completions)</td>
+</tr>
+<tr>
+<td>Claude spend</td>
+<td>$0.078012 (fallback traffic on other ops)</td>
+</tr>
+</tbody>
+</table>
+<h3
+id="32-qwen-35-397b--standard-route-isolation-bt-2026-04-14-203740">3.2
+Qwen 3.5 397B — STANDARD route isolation
+(<code>bt-2026-04-14-203740</code>)</h3>
+<p><strong>Intent:</strong> Prove the Gemma stall wasn't model-specific
+by repeating the isolation protocol on 397B with Claude fallback
+severed.</p>
+<p><strong>Configuration:</strong></p>
+<ul>
+<li>Model: <code>Qwen/Qwen3.5-397B-A17B-FP8</code></li>
+<li>Route: <code>standard</code></li>
+<li>Stream mode: Tier 0 RT SSE</li>
+<li>Prompt size: 4,321 → 20,991 chars (~1,080 → 5,247 tokens)</li>
+<li>Fallback: disabled
+(<code>fallback_disabled_by_env:standard</code>)</li>
+</ul>
+<p><strong>Result: 0 valid candidates across the run. Exactly the same
+failure signature.</strong></p>
+<p><strong>Representative trace</strong>
+(<code>bt-2026-04-14-203740/debug.log:421-425, 544-551</code>):</p>
+<pre><code>2026-04-14T13:41:36 [CandidateGenerator] Tier 0 RT: budget exhausted (44.3s).
+                    Cascading to Tier 1 (136.9s remaining)
+2026-04-14T13:41:36 [FailbackFSM] Primary failure (mode=TIMEOUT, consecutive=1,
+                    recovery_eta=+45s) -&gt; FALLBACK_ACTIVE
+2026-04-14T13:41:36 [CandidateGenerator] EXHAUSTION event_n=5
+                    cause=fallback_disabled_by_env:standard
+                    fsm_state=FALLBACK_ACTIVE fsm_failure_mode=TIMEOUT
+                    primary_name=doubleword-397b op_id=op-019d8db8-...
+...
+2026-04-14T13:42:48 [DoublewordProvider] WARNING SSE stream stalled (no data for 30s)
+2026-04-14T13:42:48 [CandidateGenerator] Tier 0 RT: budget exhausted (71.5s).
+                    Cascading to Tier 1 (98.1s remaining)
+2026-04-14T13:42:48 [FailbackFSM] Primary failure (mode=TIMEOUT, consecutive=2,
+                    recovery_eta=+90s) -&gt; FALLBACK_ACTIVE</code></pre>
+<p>Per-op elapsed times from
+<code>bt-2026-04-14-203740/summary.json:40-85</code>: 0.0s (stream never
+opened), 100.5s, 267.7s. The stream either never starts or hangs for
+minutes after opening.</p>
+<p><strong>Session summary:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Session ID</td>
+<td><code>bt-2026-04-14-203740</code></td>
+</tr>
+<tr>
+<td>Start</td>
+<td>2026-04-14T13:37:48 UTC</td>
+</tr>
+<tr>
+<td>Duration</td>
+<td>330s (5.5 min)</td>
+</tr>
+<tr>
+<td>Stop reason</td>
+<td><code>shutdown_signal</code></td>
+</tr>
+<tr>
+<td>Ops attempted</td>
+<td>3 (summary counter worked this run)</td>
+</tr>
+<tr>
+<td>Ops failed</td>
+<td>3 (100% failure rate)</td>
+</tr>
+<tr>
+<td>DW spend</td>
+<td>$0.004208</td>
+</tr>
+<tr>
+<td>Claude spend</td>
+<td>$0.00 (fallback severed)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="33-shared-failure-signature-across-both-tests">3.3 Shared
+failure signature across both tests</h3>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Gemma 31B BG</th>
+<th>Qwen 397B STANDARD</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Stream opens</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>SSE stream stalled (no data for 30s)</code> emitted</td>
+<td>Yes (12×)</td>
+<td>Yes (every op)</td>
+</tr>
+<tr>
+<td>Payload size inside documented envelope</td>
+<td>Yes (&lt;3K tokens)</td>
+<td>Yes (&lt;6K tokens)</td>
+</tr>
+<tr>
+<td>Tier 0 budget exceeded</td>
+<td>Yes (180s)</td>
+<td>Yes (44.3s, 71.5s)</td>
+</tr>
+<tr>
+<td>FSM failure mode</td>
+<td>TIMEOUT</td>
+<td>TIMEOUT</td>
+</tr>
+<tr>
+<td>Valid candidates produced</td>
+<td>0/13</td>
+<td>0/3</td>
+</tr>
+<tr>
+<td>Candidate latency when one did arrive</td>
+<td>n/a</td>
+<td>83.2s (past budget)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Conclusion encoded in
+<code>brain_selection_policy.yaml</code> line 331-341</strong> (quoted
+verbatim in §4): the streaming endpoint cannot sustain agent-shape
+workloads across any tested model. The symptom is not prompt size, model
+weights, or the tool-loop shape — it is SSE stream behavior on sustained
+generation.</p>
+<hr />
+<h2 id="4-current-topology--verbatim-governance-config">4. Current
+Topology — Verbatim Governance Config</h2>
+<p>This is the single source of truth for how DW is currently wired into
+O+V. Quoted verbatim from
+<code>backend/core/ouroboros/governance/brain_selection_policy.yaml</code>
+lines 299–376 so your gateway team can map 1:1 to endpoints and
+routes:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># ---------------------------------------------------------------------------</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Provider Topology — Hard-segmented DW model mapping (Manifesto §5)</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="co"># ---------------------------------------------------------------------------</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Strict Cognitive Segmentation. Enforced by `provider_topology.py` and</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="co"># consumed by `candidate_generator.py`, `doubleword_provider.py`, and</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="co"># `semantic_triage.py`. Do not mutate at runtime — any change here is a</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="co"># deliberate architectural decision.</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Calibration: bbpst3ebf live-fire (2026-04-14) proved DW models time out</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="co"># on 120s Tier 0 RT for COMPLEX architectural GENERATE, regardless of</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="co"># whether the backing model is Qwen 3.5 397B or Gemma 4 31B. The response</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="co"># is not to extend timeouts but to harden the topology: DW is excluded</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="co"># from the Prefrontal Cortex entirely.</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Prefrontal Cortex (Claude only):</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="co">#   - IMMEDIATE  — fast reflex, deep context, strict deadlines</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="co">#   - COMPLEX    — architectural generation, Venom tool loops</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="co">#   - STANDARD   — midbrain sealed, cascades to Claude (see below)</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="co"># Basal Ganglia (Gemma 4 31B, strictly confined to structured-JSON callers):</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="co">#   - semantic_triage — pre-generation file intelligence</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="co">#   - ouroboros_plan  — plan-phase structured JSON output</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="co"># BACKGROUND + SPECULATIVE are SEALED. Alignment test bt-2026-04-14-182446</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="co"># produced 0/13 Gemma BG successes (12× 180s timeout, 1× schema_invalid)</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a><span class="co"># even with a right-sized 2,836-token envelope — the root cause is</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="co"># provider-side SSE stream stalling, not prompt size. We will NOT cascade</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="co"># these routes to Claude: routing continuous background daemons to a</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a><span class="co"># $3/$15 per M-token provider violates the unit economics of scalable</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="co"># autonomy. Until a viable, cost-effective inference endpoint is secured,</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="co"># BG/SPEC generation is paused via skip-and-queue.</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="co"># STANDARD is also SEALED as of bt-2026-04-14-203740 (Qwen 397B isolation</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="co"># benchmark). With the Claude fallback severed, Qwen 3.5 397B produced</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="co"># ZERO valid candidates across the run: Tier 0 RT streams started, then</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="co"># stalled mid-generation (``SSE stream stalled (no data for 30s)``), budget</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a><span class="co"># exhausted at 71.5s, and the FSM hit ``TIMEOUT`` on every attempt. Same</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a><span class="co"># failure signature as Gemma on BACKGROUND — provider-side stream stall,</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a><span class="co"># not prompt size. Unlike BG/SPEC, STANDARD DOES cascade to Claude: it</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a><span class="co"># carries bounded-volume mid-tier ops where Claude&#39;s unit economics are</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a><span class="co"># acceptable and speed matters. DW is confined to tiny-payload named</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a><span class="co"># callers (semantic_triage, ouroboros_plan) until DoubleWord repairs</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a><span class="co"># their SSE generation endpoint.</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a><span class="fu">doubleword_topology</span><span class="kw">:</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">schema_version</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;topology.1&quot;</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">enabled</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">routes</span><span class="kw">:</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">immediate</span><span class="kw">:</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">dw_allowed</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">block_mode</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;cascade_to_claude&quot;</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Prefrontal cortex — Claude only. 120s DW RT budget is insufficient for fast-reflex ops with Venom tool loops.&quot;</span></span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">complex</span><span class="kw">:</span></span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">dw_allowed</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">block_mode</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;cascade_to_claude&quot;</span></span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Prefrontal cortex — Claude only. Live-fire bbpst3ebf proved DW (both 397B and Gemma 4 31B) times out on architectural COMPLEX GENERATE within 120s Tier 0 RT.&quot;</span></span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">standard</span><span class="kw">:</span></span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">dw_allowed</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">block_mode</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;cascade_to_claude&quot;</span></span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Qwen 397B verified stream-stalling without candidate generation in bt-2026-04-14-203740. DW Tier 0 sealed to prevent latency debt.&quot;</span></span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">background</span><span class="kw">:</span></span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">dw_allowed</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">block_mode</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;skip_and_queue&quot;</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Gemma 4 31B stream-stalls on DW endpoint even at &lt;2K tokens. Background generation paused to preserve Claude compute runway.&quot;</span></span>
+<span id="cb7-64"><a href="#cb7-64" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">speculative</span><span class="kw">:</span></span>
+<span id="cb7-65"><a href="#cb7-65" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">dw_allowed</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb7-66"><a href="#cb7-66" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">block_mode</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;skip_and_queue&quot;</span></span>
+<span id="cb7-67"><a href="#cb7-67" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Gemma 4 31B stream-stalls on DW endpoint even at &lt;2K tokens. Background generation paused to preserve Claude compute runway.&quot;</span></span>
+<span id="cb7-68"><a href="#cb7-68" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">callers</span><span class="kw">:</span></span>
+<span id="cb7-69"><a href="#cb7-69" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">semantic_triage</span><span class="kw">:</span></span>
+<span id="cb7-70"><a href="#cb7-70" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">dw_model</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;google/gemma-4-31B-it&quot;</span></span>
+<span id="cb7-71"><a href="#cb7-71" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Basal ganglia — native function-calling for triage JSON. Replaces Qwen 3.5 35B.&quot;</span></span>
+<span id="cb7-72"><a href="#cb7-72" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ouroboros_plan</span><span class="kw">:</span></span>
+<span id="cb7-73"><a href="#cb7-73" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">dw_model</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;google/gemma-4-31B-it&quot;</span></span>
+<span id="cb7-74"><a href="#cb7-74" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Basal ganglia — structured JSON plan generation during PLAN phase.&quot;</span></span>
+<span id="cb7-75"><a href="#cb7-75" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">compaction</span><span class="kw">:</span></span>
+<span id="cb7-76"><a href="#cb7-76" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">dw_model</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;google/gemma-4-31B-it&quot;</span></span>
+<span id="cb7-77"><a href="#cb7-77" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">reason</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Functions-not-Agents Phase 0. Structured summary over ToolLoop memory entries — fully-bounded input, short output (&lt;1KB), trivial anti-hallucination check (subset of entry-keys). First non-streaming complete_sync() caller. SHADOW mode by default (JARVIS_COMPACTION_CALLER_ENABLED).&quot;</span></span></code></pre></div>
+<p><strong>Derek's own design directive on why BG/SPEC don't cascade to
+Claude</strong>, recorded at the time of the 2026-04-14 seal
+decision:</p>
+<blockquote>
+<p>Routing continuous background daemons to Claude violates the
+fundamental unit economics of scalable autonomy.</p>
+</blockquote>
+<p>Claude is ~<span
+class="math inline">0.03/<em>o</em><em>p</em><em>o</em><em>n</em><em>I</em><em>M</em><em>M</em><em>E</em><em>D</em><em>I</em><em>A</em><em>T</em><em>E</em>, <em>D</em><em>W</em><em>B</em><em>A</em><em>C</em><em>K</em><em>G</em><em>R</em><em>O</em><em>U</em><em>N</em><em>D</em><em>t</em><em>a</em><em>r</em><em>g</em><em>e</em><em>t</em><em>s</em> </span>0.002/op
+— a ~15× delta that makes a continuous background loop unsustainable on
+the Claude tier. Skipping is the honest decision; the work queues
+dormant until a viable endpoint is secured.</p>
+<hr />
+<h2 id="5-session-by-session-evidence">5. Session-by-Session
+Evidence</h2>
+<h3 id="51-verified-session-ladder-direct-anchors">5.1 Verified session
+ladder (direct anchors)</h3>
+<p>These sessions have session IDs explicitly named in
+<code>docs/architecture/OUROBOROS.md</code> or session memory. Every
+entry cites a verifiable artifact on disk.</p>
+<table>
+<thead>
+<tr>
+<th>Session</th>
+<th>ID</th>
+<th>Date (UTC)</th>
+<th>Duration</th>
+<th>Stop</th>
+<th>Cost (Claude)</th>
+<th>Cost (DW)</th>
+<th>Outcome</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A</strong></td>
+<td><code>bt-2026-04-15-040118</code></td>
+<td>2026-04-15 04:01</td>
+<td>316s</td>
+<td><code>budget_exhausted</code></td>
+<td>$0.2694</td>
+<td>$0</td>
+<td>ExplorationLedger shadow-mode: caught shallow 4× read_file at
+score=3.00 categories=comprehension. Enforcement not yet active. 0 files
+landed.</td>
+</tr>
+<tr>
+<td><strong>B</strong></td>
+<td><code>bt-2026-04-15-041413</code></td>
+<td>2026-04-15 04:14</td>
+<td>~420s</td>
+<td><code>SIGKILL</code> (cost gov)</td>
+<td>$0.2955</td>
+<td>$0</td>
+<td>Flipped <code>JARVIS_EXPLORATION_LEDGER_ENABLED=true</code> → hard
+Iron Gate rejection. First production proof the toggle enforces. 0
+files.</td>
+</tr>
+<tr>
+<td><strong>C</strong></td>
+<td><code>bt-2026-04-15-044627</code></td>
+<td>2026-04-15 04:46</td>
+<td>see OUROBOROS.md:2134</td>
+<td>varies</td>
+<td>—</td>
+<td>—</td>
+<td>Instrumentation proof (Track 1 + Track 2 diagnostics from commit
+<code>614009ec05</code>).</td>
+</tr>
+<tr>
+<td><strong>O</strong></td>
+<td><code>bt-2026-04-15-175547</code></td>
+<td>2026-04-15 17:56</td>
+<td>4217s</td>
+<td><code>idle_timeout</code></td>
+<td>$0.3515</td>
+<td>$0</td>
+<td><strong>First end-to-end autonomous APPLY to disk.</strong>
+<code>tests/.../test_test_failure_sensor_dedup.py</code> (4,986 B)
+written by ChangeEngine. 1 of 4 target files landed (winning candidate
+didn't populate <code>files:[...]</code>). Full
+CLASSIFY→PLAN→GENERATE→VALIDATE→L2(conv iter
+1)→GATE→APPLY→VERIFY→POSTMORTEM.</td>
+</tr>
+<tr>
+<td><strong>Q</strong></td>
+<td><code>bt-2026-04-15-201035</code></td>
+<td>2026-04-15 20:10</td>
+<td>876s</td>
+<td><code>idle_timeout</code></td>
+<td>~$0.138</td>
+<td>$0</td>
+<td><code>schema_invalid:candidate_0_missing_file_path</code> on
+multi-file candidates. Per-op dedup reset on interleaved IMMEDIATE
+success.</td>
+</tr>
+<tr>
+<td><strong>R</strong></td>
+<td><code>bt-2026-04-15-203724</code></td>
+<td>2026-04-15 20:37</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>Parser fix verified. 4-file candidate passed parser at $0.1642 /
+117.8s. Died at Iron Gate 1 (exploration) on 0 fresh tool calls.</td>
+</tr>
+<tr>
+<td><strong>S</strong></td>
+<td><code>bt-2026-04-15-204901</code></td>
+<td>2026-04-15 20:49</td>
+<td>1234s</td>
+<td><code>idle_timeout</code></td>
+<td>~$0.160</td>
+<td>$0</td>
+<td>Iron Gate 5 (multi-file coverage) passed silently. 4 paths covered,
+3/4 had LSP type errors, routed to L2 which didn't converge before idle
+timeout. 0/4 landed.</td>
+</tr>
+<tr>
+<td><strong>T</strong></td>
+<td><code>bt-2026-04-15-211616</code></td>
+<td>2026-04-15 21:16</td>
+<td>1356s</td>
+<td><code>idle_timeout</code></td>
+<td>$0.510</td>
+<td>$0</td>
+<td>Follow-up A hypothesis falsified. L2 never got a chance to run;
+upstream stall.</td>
+</tr>
+<tr>
+<td><strong>U</strong></td>
+<td><code>bt-2026-04-15-215858</code></td>
+<td>2026-04-15 21:58</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>FSM instrumentation kills the "silent exit" ghost. Re-validation
+non-determinism exposed: iter=0 returns
+<code>failure_class='test'</code>, iter=1 returns <code>'infra'</code>
+on same candidate.</td>
+</tr>
+<tr>
+<td><strong>V</strong></td>
+<td><code>bt-2026-04-15-223631</code></td>
+<td>2026-04-15 22:36</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td><code>JARVIS_MAX_VALIDATE_RETRIES=0</code> env-factory works. First
+<code>l2_dispatch_pre</code> log on multi-file op. Exposes L2 budget
+contract bug (120s vs 600s configured).</td>
+</tr>
+<tr>
+<td><strong>W</strong></td>
+<td><code>bt-2026-04-15-230849</code></td>
+<td>2026-04-15 23:08</td>
+<td>3645s</td>
+<td><code>idle_timeout</code></td>
+<td>$0.3201</td>
+<td>$0</td>
+<td><strong>First end-to-end autonomous multi-file APPLY.</strong> 4
+Python test modules to disk. L2 converged iter 1/5 in 50s. APPLY
+mode=multi. AutoCommitter commit <code>0890a7b6f0</code>. Post-hoc
+pytest: <strong>20/20 passed in 2.28s</strong>. Ran on Claude (DW
+topology-sealed from COMPLEX).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="52-inferred-apr-14-arc-letters-not-explicitly-recorded">5.2
+Inferred Apr 14 arc (letters not explicitly recorded)</h3>
+<p>Sessions labeled H–N in the breakthrough-log narrative correspond to
+an 8-session unmasking ladder on 2026-04-15 (between Sessions C and O),
+where each session surfaced a distinct failure mode:</p>
+<table>
+<thead>
+<tr>
+<th>Inferred label</th>
+<th>Failure mode unmasked</th>
+<th>Resolution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>H</td>
+<td><code>prompt_async [Errno 22]</code> headless TTY crash</td>
+<td>commit <code>d8c1cb4d30</code></td>
+</tr>
+<tr>
+<td>I</td>
+<td><code>too_many_files</code> risk escalation</td>
+<td>env override</td>
+</tr>
+<tr>
+<td>J</td>
+<td>L3 <code>READ_ONLY_PLANNING</code> mode switch on ambient probe
+failures</td>
+<td>commit <code>5d169266d6</code> (env-tunable thresholds)</td>
+</tr>
+<tr>
+<td>K</td>
+<td><code>RollbackArtifact [Errno 2]</code> new-file path</td>
+<td>commit <code>28d52274ec</code></td>
+</tr>
+<tr>
+<td>L</td>
+<td>900s pool ceiling crossed by ambient load</td>
+<td>env <code>JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S=1800</code></td>
+</tr>
+<tr>
+<td>M</td>
+<td>180s fallback cap clipped 5-tool-round retry</td>
+<td>env <code>JARVIS_FALLBACK_MAX_TIMEOUT_COMPLEX_S=360</code></td>
+</tr>
+<tr>
+<td>N</td>
+<td>Intake WAL cross-session coalescing merged stale envelopes</td>
+<td>state cleanup: <code>rm .jarvis/intake_wal.jsonl</code> +
+<code>.jarvis/intake_router.lock</code></td>
+</tr>
+</tbody>
+</table>
+<p>These sessions are documented in
+<code>docs/architecture/OUROBOROS.md</code> lines 2194–2266 as a group
+narrative. Concrete session IDs exist in
+<code>.ouroboros/sessions/</code> but the letter-tag mapping was not
+recorded at the time of each run. Listed here with the caveat that the
+letters are a post-hoc narrative convenience, not a hard ID → letter
+mapping.</p>
+<h3 id="53-dw-specific-isolation-tests-apr-14">5.3 DW-specific isolation
+tests (Apr 14)</h3>
+<p>These are the two dated benchmarks that drove the topology seal
+decisions. <strong>These are the single most important data points in
+this report for DoubleWord's gateway team.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Session</th>
+<th>Model</th>
+<th>Route</th>
+<th>Result</th>
+<th>DW spend</th>
+<th>Failure signature</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bt-2026-04-14-182446</code></td>
+<td>Gemma 4 31B</td>
+<td>BACKGROUND (override)</td>
+<td>0/13 successes</td>
+<td>$0.00</td>
+<td>12× 180s SSE stream stall, 1× schema_invalid</td>
+</tr>
+<tr>
+<td><code>bt-2026-04-14-203740</code></td>
+<td>Qwen 3.5 397B</td>
+<td>STANDARD (fallback severed)</td>
+<td>0/3 successes</td>
+<td>$0.004208</td>
+<td>SSE stream stall at 30s no-data, FSM TIMEOUT, 1 candidate arrived at
+83.2s past budget</td>
+</tr>
+</tbody>
+</table>
+<h3 id="54-todays-sessions-apr-16-incremental-work">5.4 Today's sessions
+(Apr 16, incremental work)</h3>
+<p>Three sessions ran on 2026-04-16 before this benchmark was
+drafted:</p>
+<table>
+<thead>
+<tr>
+<th>Session</th>
+<th>Duration</th>
+<th>Stop</th>
+<th>Cost</th>
+<th>Notable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bt-2026-04-16-100328</code></td>
+<td>396s</td>
+<td><code>idle_timeout</code></td>
+<td>$0.0825 Claude</td>
+<td>Zero ops attempted; schema_version=2 confirmed</td>
+</tr>
+<tr>
+<td><code>bt-2026-04-16-102525</code></td>
+<td>639s</td>
+<td><code>budget_exhausted</code></td>
+<td>$0.5943 Claude</td>
+<td>$0.50 cost cap triggered</td>
+</tr>
+<tr>
+<td><code>bt-2026-04-16-105356</code></td>
+<td>797s</td>
+<td><code>budget_exhausted</code></td>
+<td>$0.6511 Claude</td>
+<td><strong>ops_digest v1.1a populated</strong>:
+<code>last_apply_mode=single</code>, <code>last_apply_files=1</code>,
+<code>last_apply_op_id=op-019d95ef-80aa-7dfd-87cd-0c7b0d73afda-cau</code>.
+One op applied.</td>
+</tr>
+</tbody>
+</table>
+<p>All three ran on Claude; DW continues to be sealed from generation
+routes.</p>
+<hr />
+<h2 id="6-cost-telemetry-11-day-aggregate">6. Cost Telemetry (11-day
+aggregate)</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Total sessions</td>
+<td>160+ battle tests (Apr 6 – Apr 16)</td>
+</tr>
+<tr>
+<td>Total inference spend</td>
+<td>~$18.63</td>
+</tr>
+<tr>
+<td>Claude spend</td>
+<td>~$18.32 (98.3%)</td>
+</tr>
+<tr>
+<td><strong>DoubleWord spend</strong></td>
+<td><strong>~$0.31 (1.7%)</strong></td>
+</tr>
+<tr>
+<td>Sessions with any DW usage</td>
+<td>33 (20.6%) — mostly structured-JSON callers</td>
+</tr>
+<tr>
+<td>Sessions with Claude only</td>
+<td>84 (52.5%)</td>
+</tr>
+<tr>
+<td>Sessions with neither (idle / zero-cost)</td>
+<td>43 (26.9%)</td>
+</tr>
+<tr>
+<td>Cost per session (mean)</td>
+<td>~$0.116</td>
+</tr>
+<tr>
+<td>Cost per session (median)</td>
+<td>~$0.06</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What I was hoping the split would look like by now:</strong>
+DW carrying STANDARD + BACKGROUND + SPECULATIVE at ~80% of ops. Based on
+the urgency_router.py cost model, that would put DW at ~50–60% of spend
+with Claude at ~40–50%. Instead DW is at 1.7%. The gap is the SSE stall.
+Closing the SSE gap moves the numbers back toward the design target.</p>
+<p><strong>Known data hygiene note:</strong> <code>summary.json</code>
+has a known counter bug where <code>stats.attempted</code> /
+<code>completed</code> / <code>failed</code> stay at zero even when ops
+fire (documented in <code>CLAUDE.md</code> §"Battle Test Milestones").
+The canonical source for ops counts is the session
+<code>debug.log</code>. The one session where the counter worked —
+<code>bt-2026-04-14-203740</code> — reported
+<code>attempted=3, completed=0, failed=3</code>, consistent with the
+isolation-test failure signature. ops_digest (schema v2, landed
+2026-04-15) provides typed APPLY/VERIFY/commit telemetry going forward
+and is visible in today's Apr 16 sessions.</p>
+<hr />
+<h2 id="7-the-architectural-reframe--functions-not-agents">7. The
+Architectural Reframe — "Functions, Not Agents"</h2>
+<p>From <code>docs/architecture/OUROBOROS.md</code> §"Functions, Not
+Agents: DoubleWord Reseating Roadmap (2026-04-14)", lines 2685–2718:</p>
+<blockquote>
+<p>DoubleWord is not a broken agent provider. It is an <strong>untested
+function provider.</strong> The streaming endpoint fails; the
+non-streaming <code>/v1/chat/completions</code> endpoint with
+<code>stream=false</code> has never been exercised by O+V. The reseating
+matrix below moves DW out of the agent cascade entirely and into a fixed
+set of short, structured, non-streaming function calls.</p>
+</blockquote>
+<p>This is the forward path. It is already being built.</p>
+<h3 id="71-phase-0-shipping-shadow-mode--gemma-compaction-caller">7.1
+Phase 0 (SHIPPING, shadow mode) — Gemma Compaction Caller</h3>
+<ul>
+<li>Model: <code>google/gemma-4-31B-it</code></li>
+<li>Call site: <code>ContextCompactor._build_summary()</code> in
+<code>context_compaction.py</code></li>
+<li>Contract: non-streaming <code>complete_sync()</code>, bounded input,
+&lt;1KB structured output, trivial anti-hallucination check (subset of
+entry-keys)</li>
+<li>Deterministic fallback: existing type-counting + phase-histogram
+summarizer</li>
+<li>Master switch: <code>JARVIS_COMPACTION_CALLER_ENABLED</code>
+(default <code>false</code>) — explicitly promoted per battle test
+during shadow validation</li>
+</ul>
+<p><strong>This is the first O+V caller to exercise the non-streaming DW
+endpoint at all.</strong> Its shadow telemetry will directly test
+whether the stall is streaming-specific.</p>
+<h3 id="72-phase-3-planned--qwen-397b-heavy-analyst">7.2 Phase 3
+(planned) — Qwen 397B heavy analyst</h3>
+<p>Three structured-JSON, non-streaming callers designed to sit Qwen
+397B into the governance pipeline without ever touching the streaming
+endpoint:</p>
+<ol type="1">
+<li><strong>BlastRadius scoring</strong> (<code>OperationAdvisor</code>)
+— semantic impact score with 10s timeout, invariant-subset
+anti-hallucination gate, score-floor contract (397B can only
+<em>escalate</em> risk tier, never de-escalate).</li>
+<li><strong>Episodic failure clustering</strong> — cross-session pattern
+recognition over UserPreferenceMemory + ProphecyEngine substrate.</li>
+<li><strong>(Third caller in design, name redacted pending architecture
+review.)</strong></li>
+</ol>
+<h3
+id="73-design-invariants-for-every-dw-caller-architectural-contract">7.3
+Design invariants for every DW caller (architectural contract)</h3>
+<p>Every DW caller ships with these guarantees (source:
+<code>OUROBOROS.md:2700-2707</code>):</p>
+<ol type="1">
+<li><strong>Non-streaming only.</strong> <code>stream=false</code>,
+single JSON response, no SSE.</li>
+<li><strong>Short structured output.</strong> ≤512 output tokens
+typical, JSON-schema bounded.</li>
+<li><strong>Caller-supplied timeout.</strong> Per-call site, enforced by
+<code>asyncio.wait_for()</code>.</li>
+<li><strong>Anti-hallucination gate.</strong> Output cross-referenced
+against provided context; hallucinated refs → autonomous rejection +
+deterministic fallback.</li>
+<li><strong>Circuit breaker.</strong> Per-call, per-op, and
+global-rolling breakers.</li>
+<li><strong>Shadow mode first.</strong> Disabled-by-default, runs
+parallel to deterministic baseline, writes telemetry to
+<code>.ouroboros/sessions/&lt;id&gt;/&lt;caller&gt;_shadow.jsonl</code>.
+Promoted to LIVE only after offline shadow-JSONL analysis.</li>
+</ol>
+<p><strong>If Phase 0 shadow telemetry shows the non-streaming endpoint
+is stable, the reseating roadmap unlocks a path for DW to carry a
+substantial share of O+V's structured inference load without going
+anywhere near the streaming stall.</strong></p>
+<hr />
+<h2 id="8-engineering-asks-for-the-doubleword-gateway-team">8.
+Engineering Asks for the DoubleWord Gateway Team</h2>
+<p>Framed as concrete, falsifiable items — not wishlist items.</p>
+<h3 id="81-primary-diagnose-the-sse-stream-stall">8.1 Primary: diagnose
+the SSE stream stall</h3>
+<p>Two dated isolation tests with matching failure signatures across two
+different models on the same streaming endpoint. We have the debug logs,
+timestamps, payload sizes, and per-op latencies. <strong>What is
+happening at the DoubleWord gateway between
+<code>stream opens successfully</code> and
+<code>no data for 30s</code>?</strong></p>
+<p>Candidate hypotheses (ordered by our prior likelihood):</p>
+<ol type="1">
+<li><strong>Gateway keepalive / buffering timeout.</strong> Intermediate
+proxy drops idle connections before the model finishes reasoning on
+longer-latency ops (tool-loop rounds, multi-file planning).</li>
+<li><strong>Backend worker exhaustion.</strong> Sustained agent-shape
+workloads queue at the model tier, gateway holds the stream open with no
+data until queue clears, client hits <code>no data for 30s</code>
+first.</li>
+<li><strong>SSE framing mismatch.</strong> The client
+(<code>DoublewordProvider._consume_sse</code>) expects periodic
+keepalive frames during long generation; the gateway emits none, so the
+30s no-data timer fires even when the backend is still producing.</li>
+</ol>
+<p>I will provide the two debug.logs attached to this email as evidence.
+If you can get a gateway engineer to run a capture on one rerun, the
+root cause should be observable end-to-end.</p>
+<h3
+id="82-secondary-non-streaming-v1chatcompletions-stability-contract">8.2
+Secondary: non-streaming <code>/v1/chat/completions</code> stability
+contract</h3>
+<p>O+V is building Phase 0 of the "Functions, Not Agents" reseating
+specifically around the non-streaming endpoint. Before we commit the
+reseating roadmap to production traffic, I want to know:</p>
+<ol type="1">
+<li>Is the non-streaming path on the same inference backend as
+streaming, or does it have a separate SLA?</li>
+<li>What is the practical upper bound on output tokens before the
+non-streaming endpoint itself exhibits degraded latency?</li>
+<li>Is there a documented rate-limit or queue behavior under sustained
+low-QPS agent load (our target is ~1 QPS sustained, ~5 QPS peak)?</li>
+</ol>
+<h3 id="83-tertiary-a-function-calling-optimized-gemma-tier">8.3
+Tertiary: a function-calling-optimized Gemma tier</h3>
+<p>Gemma 4 31B with "stronger reasoning, function calling, and
+multimodal support" (your 2026-04-13 announcement) is exactly what the
+<code>semantic_triage</code> and <code>ouroboros_plan</code> callers
+want. Today those callers run reliably at small payload sizes. If the
+model is capable of consistent native function-calling, we want to mount
+it at:</p>
+<ul>
+<li><code>blast_radius</code> (10s timeout, structured JSON,
+invariant-subset gate)</li>
+<li><code>episodic_failure_clustering</code> (30s timeout, structured
+JSON)</li>
+<li><code>deep_analysis_sensor</code> (planned sensor — autonomous
+codebase comprehension)</li>
+</ul>
+<p>An explicit SLA on function-calling consistency (e.g., "returns valid
+JSON per provided schema in &gt;99% of &lt;2K-token requests") would let
+us promote these callers from shadow to live with a documented risk
+profile.</p>
+<h3 id="84-optional-wishlist">8.4 Optional wishlist</h3>
+<ul>
+<li><strong>Per-route SSE idle timeout configuration.</strong> The 30s
+no-data default is reasonable for chat-style UX but incompatible with
+agent ops that spend 60–120s reasoning before emitting the first output
+token. If the provider could accept a
+<code>X-Stream-Idle-Timeout-MS</code> header and honor it, that alone
+might unseal STANDARD.</li>
+<li><strong>Streaming heartbeat frames.</strong> Alternative to #1: the
+provider emits SSE <code>:heartbeat</code> comments every 10s during
+model computation. Client side we already discard comment frames; this
+would keep the stream formally alive without polluting output.</li>
+<li><strong>Observable streaming state.</strong> A separate status
+endpoint keyed to <code>batch_id</code> or <code>request_id</code> that
+reports <code>queued | generating | stalled | complete</code> would let
+clients make informed cascade decisions before the 30s timer fires.</li>
+</ul>
+<hr />
+<h2 id="9-what-id-like-from-the-next-meeting">9. What I'd like from the
+next meeting</h2>
+<ol type="1">
+<li><strong>10-min pairing on the two debug.logs.</strong> I'll share
+the full logs; your gateway engineer reads the stall timestamps
+live.</li>
+<li><strong>Go / no-go on Phase 0 non-streaming stability.</strong> If
+yes, I'll promote the compaction caller from shadow → live in the next
+battle test (target: 2026-04-22) and share the shadow JSONL analysis
+with you.</li>
+<li><strong>Alignment on the Gemma function-calling SLA</strong> —
+what's the best-case target, and what would move the current 0/13 BG
+result on a non-streaming reroute?</li>
+<li><strong>Optional</strong>: If Phase 0 + Phase 3 planning goes well,
+a timeline sketch for when streaming stability could be closed, so I can
+re-enable the topology seals on BG/SPEC with a dated expectation.</li>
+</ol>
+<hr />
+<h2 id="10-appendix">10. Appendix</h2>
+<h3 id="101-reproduction-commands">10.1 Reproduction commands</h3>
+<p>All benchmarks reproduce on the main branch of
+<code>github.com/drussell23/JARVIS-AI-Agent</code> at commit
+<code>5d98d418bc</code> (tip of 2026-04-16).</p>
+<p><strong>Standard battle test (Claude-default, DW
+topology-sealed):</strong></p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.50 <span class="at">--idle-timeout</span> 600 <span class="at">-v</span></span></code></pre></div>
+<p><strong>Gemma BG isolation repro (requires topology
+override):</strong></p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_DOUBLEWORD_TOPOLOGY_OVERRIDE_ROUTE</span><span class="op">=</span>background</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">DOUBLEWORD_MODEL</span><span class="op">=</span>google/gemma-4-31B-it</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_FALLBACK_DISABLED_ROUTES</span><span class="op">=</span>background</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.50 <span class="at">--idle-timeout</span> 1800 <span class="at">-v</span></span></code></pre></div>
+<p><strong>Qwen 397B STANDARD isolation repro (Claude fallback
+severed):</strong></p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_FALLBACK_DISABLED_ROUTES</span><span class="op">=</span>standard</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">DOUBLEWORD_MODEL</span><span class="op">=</span>Qwen/Qwen3.5-397B-A17B-FP8</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.10 <span class="at">--idle-timeout</span> 600 <span class="at">-v</span></span></code></pre></div>
+<h3 id="102-session-artifact-layout">10.2 Session artifact layout</h3>
+<p>Every battle-test session writes to
+<code>.ouroboros/sessions/bt-YYYY-MM-DD-HHMMSS/</code>:</p>
+<ul>
+<li><code>summary.json</code> — session-level stats (note:
+<code>stats.attempted</code> counter bug; use <code>debug.log</code> for
+ops counts)</li>
+<li><code>debug.log</code> — full session log (every provider call,
+every FSM transition, every Iron Gate verdict)</li>
+<li><code>cost_tracker.json</code> — per-provider spend breakdown</li>
+<li>(new) <code>ops_digest</code> inside <code>summary.json</code> —
+schema v2, typed APPLY/VERIFY/commit telemetry</li>
+</ul>
+<h3 id="103-key-file-references-full-paths">10.3 Key file references
+(full paths)</h3>
+<ul>
+<li>Provider topology:
+<code>backend/core/ouroboros/governance/brain_selection_policy.yaml</code>
+(lines 299–376)</li>
+<li>DW provider implementation:
+<code>backend/core/ouroboros/governance/doubleword_provider.py</code></li>
+<li>Urgency router (route definitions):
+<code>backend/core/ouroboros/governance/urgency_router.py</code></li>
+<li>Candidate generator (cascade logic):
+<code>backend/core/ouroboros/governance/candidate_generator.py</code></li>
+<li>Reseating roadmap: <code>docs/architecture/OUROBOROS.md</code>
+§"Functions, Not Agents" (lines 2685–2900)</li>
+<li>Battle-test breakthrough log:
+<code>docs/architecture/OUROBOROS.md</code> §"Battle Test Breakthrough
+Log" (lines 1741–2558)</li>
+</ul>
+<h3 id="104-environment-variables-key-knobs">10.4 Environment variables
+(key knobs)</h3>
+<p>Configured on the O+V side. All default values shown.</p>
+<table>
+<thead>
+<tr>
+<th>Env var</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DOUBLEWORD_API_KEY</code></td>
+<td><em>(required)</em></td>
+<td>DW API credential</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_BASE_URL</code></td>
+<td><code>https://api.doubleword.ai/v1</code></td>
+<td>DW endpoint</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_MODEL</code></td>
+<td><code>Qwen/Qwen3.5-397B-A17B-FP8</code></td>
+<td>Default model</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_MAX_TOKENS</code></td>
+<td><code>16384</code></td>
+<td>Output ceiling</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_TEMPERATURE</code></td>
+<td><code>0.2</code></td>
+<td>Sampling</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_POLL_INTERVAL_S</code></td>
+<td><code>5</code></td>
+<td>Poll cadence</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_REQUEST_TIMEOUT_S</code></td>
+<td><code>120</code></td>
+<td>Per-request timeout</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_MAX_COST_PER_OP</code></td>
+<td><code>0.10</code></td>
+<td>Per-op cost cap</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_DAILY_BUDGET</code></td>
+<td><code>5.00</code></td>
+<td>Daily DW spend limit</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_INPUT_COST_PER_M</code></td>
+<td><code>0.10</code></td>
+<td>Input pricing</td>
+</tr>
+<tr>
+<td><code>DOUBLEWORD_OUTPUT_COST_PER_M</code></td>
+<td><code>0.40</code></td>
+<td>Output pricing</td>
+</tr>
+<tr>
+<td><code>JARVIS_COMPACTION_CALLER_ENABLED</code></td>
+<td><code>false</code></td>
+<td>Phase 0 Gemma compaction caller gate</td>
+</tr>
+<tr>
+<td><code>JARVIS_MAX_VALIDATE_RETRIES</code></td>
+<td><em>(env-tunable)</em></td>
+<td>Workaround for iter=1 infra flake (Session U/V)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<p><strong>Artifacts attached to the delivery email:</strong></p>
+<ol type="1">
+<li>This markdown file, also available at
+<code>docs/benchmarks/DW_BENCHMARKS_2026-04-16.md</code> in the
+repo</li>
+<li>PDF export (see §10.5 for the generation command)</li>
+<li>(On request) Full debug.logs for <code>bt-2026-04-14-182446</code>
+and <code>bt-2026-04-14-203740</code> — too large for inline quoting,
+available via secure share</li>
+</ol>
+<h3 id="105-pdf--html-generation-commands-reproducibility">10.5 PDF /
+HTML generation commands (reproducibility)</h3>
+<p>Generated on macOS 15 (Darwin 25.3.0) with pandoc 3.9 + Chrome
+headless (no LaTeX engine required):</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Styled HTML (intermediate, can be opened directly in any browser)</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pandoc</span> DW_BENCHMARKS_2026-04-16.md <span class="dt">\</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> DW_BENCHMARKS_2026-04-16.html <span class="dt">\</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--from</span><span class="op">=</span>gfm <span class="at">--to</span><span class="op">=</span>html5 <span class="at">--standalone</span> <span class="dt">\</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--metadata</span> title=<span class="st">&quot;DoubleWord × Ouroboros + Venom — Battle-Test Benchmarks&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--css</span><span class="op">=</span>print.css</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co"># PDF via Chrome headless (isolated user-data-dir to avoid profile conflicts)</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="va">TMPDIR_CHROME</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TMPDIR</span><span class="op">:-</span>/tmp<span class="va">}</span><span class="st">/chrome-headless-</span><span class="va">$$</span><span class="st">&quot;</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;/Applications/Google Chrome.app/Contents/MacOS/Google Chrome&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--headless</span> <span class="at">--disable-gpu</span> <span class="dt">\</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--user-data-dir</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--no-pdf-header-footer</span> <span class="dt">\</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--print-to-pdf</span><span class="op">=</span>DW_BENCHMARKS_2026-04-16.pdf <span class="dt">\</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;file://</span><span class="va">$(</span><span class="bu">pwd</span><span class="va">)</span><span class="st">/DW_BENCHMARKS_2026-04-16.html&quot;</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> <span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span></span></code></pre></div>
+<p>If a LaTeX engine is available (MacTeX / BasicTeX), the equivalent
+pandoc-native path is:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pandoc</span> DW_BENCHMARKS_2026-04-16.md <span class="dt">\</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> DW_BENCHMARKS_2026-04-16.pdf <span class="dt">\</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--from</span><span class="op">=</span>gfm <span class="at">--pdf-engine</span><span class="op">=</span>xelatex <span class="dt">\</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-V</span> geometry:margin=1in <span class="dt">\</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-V</span> mainfont=<span class="st">&quot;Helvetica Neue&quot;</span></span></code></pre></div>
+<p><em>Generated 2026-04-16. Prepared as an engineering-partner
+deliverable; feedback and corrections welcome.</em></p>
+</body>
+</html>

@@ -124,6 +124,10 @@ backend/swift_bridge/*.pyc
 # Ouroboros oracle graph cache (large binary; exceeds GitHub 100MB limit — regenerate locally)
 .ouroboros/state/sandbox_fallback/oracle/*.pkl
 
+# Ouroboros benchmark diagnostic outputs (contain API response bodies; copy to
+# docs/benchmarks/artifacts/ explicitly if you want to include in a report)
+.ouroboros/benchmarks/
+
 # Git worktrees (development workspaces)
 .worktrees/
 
