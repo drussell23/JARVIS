@@ -1260,6 +1260,19 @@ def _should_use_lean_prompt(
     2. Not a cross-repo operation (lean doesn't support 2c.1/2d.1 schemas)
     3. Not explicitly forced to full mode
     4. Not a repair iteration (repair needs the full candidate in-prompt)
+    5. Route is not ``background`` or ``speculative`` (those skip the tool
+       loop regardless of ``tools_enabled`` — see PrimeProvider/ClaudeProvider
+       ``_skip_tools = _route in ("background", "speculative")``). Giving
+       the lean (tool-first) prompt when the loop is skipped invites
+       ``tool_call_without_tool_loop`` schema failures — the model reads
+       the tool instructions, emits a ``2b.2-tool`` tool-call, and then
+       the provider has no loop to execute it.
+
+    Env override: ``JARVIS_BG_CASCADE_LEAN_PROMPT_ENABLED=true`` restores
+    the pre-v1.1a behavior (lean prompt even for BG/SPEC). Off by default.
+    Purpose: keep the guardrail greppable and reversible if a future
+    experiment wants the lean prompt back on BG with a different loop
+    strategy.
 
     Returns True if the lean prompt should be used.
     """
@@ -1271,6 +1284,17 @@ def _should_use_lean_prompt(
     # would confuse the model into returning tool calls that nobody handles.
     if getattr(ctx, "task_complexity", "") in ("trivial",):
         return False
+    # BG/SPEC skip the tool loop for cost reasons. Without this guard the
+    # BG-cascade path (enabled via JARVIS_TOPOLOGY_BG_CASCADE_ENABLED) sees
+    # Claude emit tool_calls → schema_invalid:tool_call_without_tool_loop
+    # → generation fails → op never reaches APPLY. Documented upstream in
+    # providers.py lines 5294-5301 and 3436-3440.
+    _route = getattr(ctx, "provider_route", "")
+    if _route in ("background", "speculative"):
+        if os.environ.get(
+            "JARVIS_BG_CASCADE_LEAN_PROMPT_ENABLED", "false",
+        ).lower() not in ("1", "true", "yes", "on"):
+            return False
     if getattr(ctx, "cross_repo", False):
         return False
     # Env override: JARVIS_LEAN_PROMPT=false to disable
