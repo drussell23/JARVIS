@@ -139,50 +139,64 @@ def fig01_trinity_architecture() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 2 — 11-phase pipeline
+# Figure 2 — 11-phase pipeline (two rows, clearer)
 # ---------------------------------------------------------------------------
 def fig02_pipeline_flow() -> None:
-    fig, ax = plt.subplots(figsize=(13, 5.5))
-    ax.set_xlim(0, 14)
-    ax.set_ylim(0, 6)
+    fig, ax = plt.subplots(figsize=(11.5, 7))
+    ax.set_xlim(0, 11.5)
+    ax.set_ylim(0, 7)
     ax.set_aspect("equal")
     ax.axis("off")
 
-    phases = [
-        ("CLASSIFY", 0.3),
-        ("ROUTE", 1.7),
-        ("CONTEXT\nEXPANSION", 3.1),
-        ("PLAN", 4.7),
-        ("GENERATE", 6.0),
-        ("VALIDATE", 7.5),
-        ("GATE", 9.0),
-        ("APPROVE", 10.3),
-        ("APPLY", 11.7),
-        ("VERIFY", 13.0),
+    # Row 1 — first half (CLASSIFY through GENERATE)
+    row1 = [
+        ("CLASSIFY", 0.5),
+        ("ROUTE", 2.5),
+        ("CONTEXT\nEXPANSION", 4.5),
+        ("PLAN", 6.7),
+        ("GENERATE", 8.7),
     ]
-    y = 3.8
-    for (name, x) in phases:
-        _box(ax, x, y, 1.2, 0.95, name, BLUE_BG, BLUE, fontsize=10, fontweight="bold")
+    y1 = 4.7
+    box_w, box_h = 1.7, 1.1
+    for (name, x) in row1:
+        _box(ax, x, y1, box_w, box_h, name, BLUE_BG, BLUE, fontsize=11, fontweight="bold")
+    # Arrows row 1
+    for i in range(len(row1) - 1):
+        x1 = row1[i][1] + box_w
+        x2 = row1[i + 1][1]
+        _arrow(ax, (x1, y1 + box_h/2), (x2, y1 + box_h/2), color=NEUTRAL, lw=2)
 
-    # Arrows between phases
-    for i in range(len(phases) - 1):
-        x1 = phases[i][1] + 1.2
-        x2 = phases[i + 1][1]
-        _arrow(ax, (x1, y + 0.47), (x2, y + 0.47), color=NEUTRAL, lw=1.5)
+    # Turn-around arrow (row 1 to row 2)
+    ax.add_patch(FancyArrowPatch(
+        (row1[-1][1] + box_w/2, y1),
+        (8.7 + box_w/2, 3.2),
+        arrowstyle="-|>", mutation_scale=20, color=NEUTRAL, lw=2,
+        connectionstyle="arc3,rad=-0.25"))
 
-    # COMPLETE at end
-    _box(ax, 13.3, 3.8, 0.7, 0.95, "✓\nCOMPLETE", GREEN_BG, GREEN, fontsize=9, fontweight="bold")
-    _arrow(ax, (14.2, y + 0.47), (14.2, y + 0.47), color=GREEN, lw=1.5)
+    # Row 2 — second half (VALIDATE through VERIFY) — right-to-left
+    row2 = [
+        ("VERIFY", 0.5),
+        ("APPLY", 2.5),
+        ("APPROVE", 4.5),
+        ("GATE", 6.7),
+        ("VALIDATE", 8.7),
+    ]
+    y2 = 2.1
+    for (name, x) in row2:
+        _box(ax, x, y2, box_w, box_h, name, BLUE_BG, BLUE, fontsize=11, fontweight="bold")
+    # Arrows row 2 (right to left)
+    for i in range(len(row2) - 1, 0, -1):
+        x1 = row2[i][1]
+        x2 = row2[i - 1][1] + box_w
+        _arrow(ax, (x1, y2 + box_h/2), (x2, y2 + box_h/2), color=NEUTRAL, lw=2)
 
-    # POSTMORTEM below (failure branch)
-    _box(ax, 6.5, 1.8, 2.0, 0.95, "✗\nPOSTMORTEM\n(any failure)", RED_BG, RED, fontsize=9, fontweight="bold")
-    _arrow(ax, (7.5, 3.5), (7.5, 2.8), color=RED, lw=1.3, style="-|>")
+    # COMPLETE at end of row 2
+    _box(ax, 0.5, 0.4, box_w, box_h, "COMPLETE", GREEN_BG, GREEN, fontsize=11, fontweight="bold")
+    _arrow(ax, (0.5 + box_w/2, y2), (0.5 + box_w/2, 0.4 + box_h), color=GREEN, lw=2)
 
     # Title
-    ax.text(7, 5.4, "Ouroboros Pipeline — 11 Phases", ha="center",
-            fontsize=14, fontweight="bold", color=NEUTRAL)
-    ax.text(7, 0.8, "Every operation traverses the same phases. Every phase transition is logged.\nEvery unhandled exception routes to POSTMORTEM. Every retry is bounded.",
-            ha="center", fontsize=10, color=NEUTRAL_MID, style="italic")
+    ax.text(5.75, 6.6, "Ouroboros Pipeline — Eleven Phases",
+            ha="center", fontsize=15, fontweight="bold", color=NEUTRAL)
 
     _save(fig, "fig02_pipeline_flow.png")
 
@@ -302,42 +316,53 @@ def fig05_risk_escalator() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 6 — Venom tool ecosystem
+# Figure 6 — Venom tool ecosystem (cleaner 2-row layout with MCP as sidebar)
 # ---------------------------------------------------------------------------
 def fig06_venom_tools() -> None:
-    fig, ax = plt.subplots(figsize=(12, 6.5))
+    fig, ax = plt.subplots(figsize=(12, 7.5))
     ax.set_xlim(0, 12)
-    ax.set_ylim(0, 6.5)
+    ax.set_ylim(0, 7.5)
     ax.set_aspect("equal")
     ax.axis("off")
 
+    # Larger, fewer-columns layout: 2 rows × 4 columns, each box ~2.3 wide × 2.0 tall
     categories = [
-        ("Comprehension", ["read_file", "search_code", "list_symbols"], BLUE_BG, BLUE, 0.3, 4.8),
-        ("Discovery", ["glob_files", "list_dir"], GREEN_BG, GREEN, 3.5, 4.8),
-        ("Call Graph", ["get_callers"], PURPLE_BG, PURPLE, 5.9, 4.8),
-        ("History", ["git_log", "git_diff", "git_blame"], AMBER_BG, AMBER, 8.0, 4.8),
-        ("Mutation", ["edit_file", "write_file", "delete_file"], RED_BG, RED, 0.3, 2.3),
-        ("Execution", ["bash", "run_tests"], "#f0e0e8", "#8a3a6a", 3.5, 2.3),
-        ("Web", ["web_fetch", "web_search"], "#e0f0f0", "#3a7a7a", 5.9, 2.3),
-        ("Human", ["ask_human"], "#f8e0e0", "#7a3a3a", 8.0, 2.3),
+        ("Comprehension", ["read_file", "search_code", "list_symbols"], BLUE_BG, BLUE),
+        ("Discovery", ["glob_files", "list_dir"], GREEN_BG, GREEN),
+        ("Call Graph", ["get_callers"], PURPLE_BG, PURPLE),
+        ("History", ["git_log", "git_diff", "git_blame"], AMBER_BG, AMBER),
+        ("Mutation", ["edit_file", "write_file", "delete_file"], RED_BG, RED),
+        ("Execution", ["bash", "run_tests"], "#f0e0e8", "#8a3a6a"),
+        ("Web", ["web_fetch", "web_search"], "#e0f0f0", "#3a7a7a"),
+        ("Human", ["ask_human"], "#f8e0e0", "#7a3a3a"),
     ]
 
-    for (cat, tools, bg, fg, x, y) in categories:
-        h = 0.5 + len(tools) * 0.38
-        _box(ax, x, y - h + 0.5, 2.4, h, "", bg, fg)
-        ax.text(x + 1.2, y + 0.25, cat, ha="center", fontsize=11, fontweight="bold", color=fg)
+    box_w = 2.3
+    box_h = 2.0
+    x_positions = [0.3, 2.75, 5.2, 7.65]
+    for idx, (cat, tools, bg, fg) in enumerate(categories):
+        row = idx // 4
+        col = idx % 4
+        x = x_positions[col]
+        y = 4.6 - row * 2.3
+        _box(ax, x, y, box_w, box_h, "", bg, fg)
+        ax.text(x + box_w/2, y + box_h - 0.3, cat, ha="center",
+                fontsize=12, fontweight="bold", color=fg)
         for j, t in enumerate(tools):
-            ax.text(x + 1.2, y - 0.1 - j * 0.32, t, ha="center", fontsize=10, color=NEUTRAL,
-                    family="monospace")
+            ax.text(x + box_w/2, y + box_h - 0.75 - j * 0.38, t,
+                    ha="center", fontsize=10, color=NEUTRAL, family="monospace")
 
-    # MCP External
-    _box(ax, 10.2, 2.3, 1.5, 3.0, "MCP\nExternal\ntools\n\ndiscovered\nat prompt time\n\nmcp_*_*\nauto-allowed",
-         "#eee4f5", "#5a3a8a", fontsize=9)
+    # MCP External — standalone wide box at bottom
+    _box(ax, 0.3, 0.5, 11.4, 1.2, "", "#eee4f5", "#5a3a8a")
+    ax.text(0.6, 1.35, "MCP External Tools",
+            ha="left", fontsize=12, fontweight="bold", color="#5a3a8a")
+    ax.text(0.6, 1.0, "Discovered dynamically from connected servers at prompt-construction time.",
+            ha="left", fontsize=10, color=NEUTRAL)
+    ax.text(0.6, 0.7, "Naming convention: mcp_{server}_{tool}  •  Policy rule 0b: auto-allowed  •  Transport: stdio or SSE with signature verification",
+            ha="left", fontsize=10, color=NEUTRAL, family="monospace")
 
-    ax.text(6, 6.05, "Venom Tool Ecosystem — 16 built-in + dynamic MCP",
+    ax.text(6, 7.1, "Venom Tool Ecosystem — 16 built-in tools + dynamic MCP",
             ha="center", fontsize=14, fontweight="bold", color=NEUTRAL)
-    ax.text(6, 0.8, "All default-allowed. Iron Gate provides structural containment per tool call.",
-            ha="center", fontsize=10, color=NEUTRAL_MID, style="italic")
 
     _save(fig, "fig06_venom_tools.png")
 
@@ -387,62 +412,69 @@ def fig07_consciousness_layers() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 8 — Sensor funnel
+# Figure 8 — Sensor funnel (grouped by category, cleaner convergence)
 # ---------------------------------------------------------------------------
 def fig08_sensor_funnel() -> None:
-    fig, ax = plt.subplots(figsize=(11.5, 7.5))
-    ax.set_xlim(0, 11.5)
-    ax.set_ylim(0, 7.5)
+    fig, ax = plt.subplots(figsize=(12, 7))
+    ax.set_xlim(0, 12)
+    ax.set_ylim(0, 7)
     ax.set_aspect("equal")
     ax.axis("off")
 
-    # Sensors column (2 columns of 8)
-    sensors_col1 = [
-        "TestFailureSensor",
-        "VoiceCommandSensor",
-        "OpportunityMinerSensor",
-        "CapabilityGapSensor",
-        "ScheduledTriggerSensor",
-        "BacklogSensor",
-        "RuntimeHealthSensor",
-        "WebIntelligenceSensor",
-    ]
-    sensors_col2 = [
-        "PerformanceRegressionSensor",
-        "DocStalenessSensor",
-        "GitHubIssueSensor",
-        "ProactiveExplorationSensor",
-        "CrossRepoDriftSensor",
-        "TodoScannerSensor",
-        "CUExecutionSensor",
-        "IntentDiscoverySensor",
+    # Group sensors into 4 logical category boxes instead of 16 individual arrows
+    groups = [
+        ("File / Code events", [
+            "TestFailureSensor", "OpportunityMinerSensor",
+            "DocStalenessSensor", "TodoScannerSensor", "CrossRepoDriftSensor",
+        ], BLUE_BG, BLUE, 5.8),
+        ("Health & Performance", [
+            "RuntimeHealthSensor", "PerformanceRegressionSensor",
+            "CapabilityGapSensor",
+        ], GREEN_BG, GREEN, 4.2),
+        ("External triggers", [
+            "VoiceCommandSensor", "GitHubIssueSensor",
+            "WebIntelligenceSensor", "CUExecutionSensor",
+        ], PURPLE_BG, PURPLE, 2.6),
+        ("Scheduled / Proactive", [
+            "ScheduledTriggerSensor", "BacklogSensor",
+            "ProactiveExplorationSensor", "IntentDiscoverySensor",
+        ], AMBER_BG, AMBER, 1.0),
     ]
 
-    y0 = 6.5
-    dy = 0.55
-    for i, s in enumerate(sensors_col1):
-        _box(ax, 0.3, y0 - i * dy, 2.8, 0.48, s, BLUE_BG, BLUE, fontsize=9.5)
-    for i, s in enumerate(sensors_col2):
-        _box(ax, 3.2, y0 - i * dy, 2.8, 0.48, s, BLUE_BG, BLUE, fontsize=9.5)
+    group_w = 4.0
+    group_h = 1.35
+    for (name, sensors, bg, fg, y) in groups:
+        _box(ax, 0.3, y, group_w, group_h, "", bg, fg)
+        ax.text(0.5, y + group_h - 0.3, name, ha="left",
+                fontsize=11, fontweight="bold", color=fg)
+        sensor_text = "  •  ".join(sensors)
+        # Wrap long sensor lines
+        if len(sensor_text) > 55:
+            half = len(sensors) // 2
+            line1 = "  •  ".join(sensors[:half + (len(sensors) % 2)])
+            line2 = "  •  ".join(sensors[half + (len(sensors) % 2):])
+            ax.text(0.5, y + 0.55, line1, ha="left", fontsize=9, color=NEUTRAL, family="monospace")
+            ax.text(0.5, y + 0.22, line2, ha="left", fontsize=9, color=NEUTRAL, family="monospace")
+        else:
+            ax.text(0.5, y + 0.35, sensor_text, ha="left", fontsize=9, color=NEUTRAL, family="monospace")
+        # Arrow from group to router
+        ax.annotate("", xy=(6.2, 3.85), xytext=(4.35, y + group_h/2),
+                    arrowprops=dict(arrowstyle="->", color=fg, lw=1.5, alpha=0.7))
 
-    # Funnel arrows to router
-    for i in range(8):
-        y = y0 - i * dy + 0.24
-        ax.annotate("", xy=(6.5, 3.7), xytext=(5.95, y),
-                    arrowprops=dict(arrowstyle="->", color=NEUTRAL_MID, lw=0.7))
+    # Router (centered)
+    _box(ax, 6.2, 2.8, 3.6, 2.0,
+         "UnifiedIntakeRouter\n\n• deduplication\n• file-lock DAG\n• priority queue\n• coalescing (30s window)\n• WAL persistence",
+         AMBER_BG, AMBER, fontsize=10.5)
 
-    # Router
-    _box(ax, 6.5, 2.8, 2.8, 1.6, "UnifiedIntakeRouter\n\n- dedup\n- file-lock DAG\n- priority queue\n- coalescing",
-         AMBER_BG, AMBER, fontsize=10, fontweight="bold")
-
-    _arrow(ax, (9.3, 3.6), (10.4, 3.6), color=NEUTRAL, lw=1.5)
-    _box(ax, 10.4, 3.0, 1.0, 1.2, "Pipeline", GREEN_BG, GREEN, fontsize=10, fontweight="bold")
+    # Router → Pipeline
+    _arrow(ax, (9.8, 3.8), (11.1, 3.8), color=NEUTRAL, lw=2)
+    _box(ax, 11.1, 3.1, 0.9, 1.5, "Pipeline", GREEN_BG, GREEN, fontsize=10, fontweight="bold")
 
     # Title + footer
-    ax.text(5.7, 7.2, "Intake Layer — 16 Sensors → Unified Router → Pipeline",
-            ha="center", fontsize=13, fontweight="bold", color=NEUTRAL)
-    ax.text(5.7, 1.3, "Event-driven. Four-layer storm protection. WAL persistence for crash recovery.",
-            ha="center", fontsize=10, color=NEUTRAL_MID, style="italic")
+    ax.text(6, 6.6, "Intake Layer — 16 Sensors, 4 Groups → Router → Pipeline",
+            ha="center", fontsize=14, fontweight="bold", color=NEUTRAL)
+    ax.text(6, 0.35, "Event-driven. Four-layer storm protection (debounce, SHA dedup, per-sensor gating, envelope dedup_key).",
+            ha="center", fontsize=9.5, color=NEUTRAL_MID, style="italic")
 
     _save(fig, "fig08_sensor_funnel.png")
 
@@ -482,44 +514,72 @@ def fig09_dw_3tier() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 10 — Breakthrough timeline
+# Figure 10 — Breakthrough timeline (arc-grouped, clearer spacing)
 # ---------------------------------------------------------------------------
 def fig10_breakthrough_timeline() -> None:
-    fig, ax = plt.subplots(figsize=(12, 5.5))
-    ax.set_xlim(-0.5, 12)
-    ax.set_ylim(-0.5, 5)
+    fig, ax = plt.subplots(figsize=(13, 6.5))
+    ax.set_xlim(-0.5, 13)
+    ax.set_ylim(-0.5, 6.5)
     ax.axis("off")
 
-    sessions = [
-        ("A", 0.3, "ExplorationLedger\nshadow mode", BLUE_LIGHT),
-        ("B", 1.2, "Enforcement\nturned on", BLUE_LIGHT),
-        ("C", 2.1, "Instrumentation\nproof", BLUE_LIGHT),
-        ("G", 3.0, "Full adaptation\nloop (score=25.5)", BLUE),
-        ("H-N", 4.2, "8-session\nunmasking ladder", AMBER_LIGHT),
-        ("O", 5.6, "First APPLY\nto disk (1/4 files)", AMBER),
-        ("Q-S", 6.8, "Multi-file\nenforcement gates", BLUE_LIGHT),
-        ("T", 7.9, "Follow-up A\nhypothesis falsified", AMBER_LIGHT),
-        ("U", 8.8, "FSM trail kills\n'silent exit'", BLUE_LIGHT),
-        ("V", 9.7, "L2 budget\ncontract bug found", AMBER_LIGHT),
-        ("W", 10.8, "First multi-file\nAPPLY to disk\n20/20 pytest", GREEN),
+    # Group sessions into four color-coded arcs for clarity
+    arcs = [
+        ("Exploration arc (A–G)", BLUE, 0.5, 3.2, [
+            ("A", 0.9, "Shadow\nmode"),
+            ("B", 1.6, "Enforcement\non"),
+            ("C", 2.3, "Instrumentation\nproof"),
+            ("G", 3.0, "Full adaptation\nloop score=25.5"),
+        ]),
+        ("First APPLY (H–O)", AMBER, 3.8, 6.5, [
+            ("H–N", 4.6, "8-session\nunmasking ladder"),
+            ("O", 6.1, "First APPLY\n(1 of 4 files)"),
+        ]),
+        ("Multi-file enforcement (Q–S)", PURPLE, 7.1, 8.3, [
+            ("Q–S", 7.7, "Parser fix +\nIron Gate 5"),
+        ]),
+        ("First multi-file APPLY (T–W)", GREEN, 8.9, 12.2, [
+            ("T", 9.3, "Follow-up A\nfalsified"),
+            ("U", 10.0, "FSM trail kills\n'silent exit'"),
+            ("V", 10.8, "L2 budget\ncontract bug"),
+            ("W", 11.7, "First multi-file\nAPPLY 20/20"),
+        ]),
     ]
 
+    # Draw arc background bands
+    for (arc_name, arc_color, x1, x2, points) in arcs:
+        ax.add_patch(FancyBboxPatch((x1, 2.2), x2 - x1, 1.6,
+                                    boxstyle="round,pad=0.04",
+                                    facecolor=arc_color, alpha=0.09,
+                                    edgecolor=arc_color, linewidth=1.2))
+        ax.text((x1 + x2) / 2, 4.0, arc_name, ha="center", fontsize=10.5,
+                fontweight="bold", color=arc_color)
+
     # Timeline line
-    ax.plot([0, 11.5], [2.5, 2.5], color=NEUTRAL_MID, lw=2.5, zorder=1)
+    ax.plot([0, 12.5], [3.0, 3.0], color=NEUTRAL_MID, lw=2.0, zorder=1)
 
-    for (label, x, descr, color) in sessions:
-        # Circle
-        ax.scatter([x], [2.5], s=200, c=[color], edgecolors=NEUTRAL, linewidths=1.5, zorder=3)
-        ax.text(x, 2.5, label, ha="center", va="center", fontsize=8.5, fontweight="bold", zorder=4)
-        # Label above or below
-        y_label = 3.4 if label in ["A", "C", "G", "O", "U", "W"] else 1.6
-        va = "bottom" if y_label > 2.5 else "top"
-        ax.text(x, y_label, descr, ha="center", va=va, fontsize=8.5, color=NEUTRAL)
+    # Plot points
+    for (arc_name, arc_color, x1, x2, points) in arcs:
+        for (label, x, descr) in points:
+            # Highlight breakthrough points (O and W)
+            is_breakthrough = label in ["O", "W"]
+            size = 500 if is_breakthrough else 300
+            ax.scatter([x], [3.0], s=size, c=[arc_color],
+                       edgecolors=NEUTRAL, linewidths=1.5, zorder=3)
+            ax.text(x, 3.0, label, ha="center", va="center",
+                    fontsize=10 if is_breakthrough else 9,
+                    fontweight="bold", zorder=4,
+                    color="white" if is_breakthrough else NEUTRAL)
+            # Description below timeline
+            ax.text(x, 2.3, descr, ha="center", va="top", fontsize=9, color=NEUTRAL)
 
-    ax.text(5.75, 4.5, "Battle Test Breakthrough Arc — Sessions A through W (2026-04-15)",
-            ha="center", fontsize=13, fontweight="bold", color=NEUTRAL)
-    ax.text(5.75, 0.3, "Each session revealed a distinct failure mode. Session W is the first end-to-end multi-file APPLY to disk.",
-            ha="center", fontsize=10, color=NEUTRAL_MID, style="italic")
+    # Title + footer
+    ax.text(6.25, 5.8, "Battle-Test Breakthrough Arc — Sessions A through W",
+            ha="center", fontsize=15, fontweight="bold", color=NEUTRAL)
+    ax.text(6.25, 5.3, "2026-04-15, ~11 hours of continuous battle-testing",
+            ha="center", fontsize=11, color=NEUTRAL_MID, style="italic")
+    ax.text(6.25, 0.3,
+            "Sessions O (first APPLY, 1 of 4 files) and W (first multi-file APPLY, 20/20 pytest green) are the headline outcomes.",
+            ha="center", fontsize=9.5, color=NEUTRAL_MID, style="italic")
 
     _save(fig, "fig10_breakthrough_timeline.png")
 
