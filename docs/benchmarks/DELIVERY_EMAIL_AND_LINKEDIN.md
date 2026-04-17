@@ -15,7 +15,7 @@ Hi Meryem,
 
 Please find the promised write-up on how DoubleWord 397B and Gemma 4 31B have performed under Ouroboros + Venom's (O+V) battle tests over the last 11 days. The full report is available in the repo and I've attached a PDF version for your convenience.
 
-**Full report:** https://drussell23.github.io/JARVIS/docs/benchmarks/DW_BENCHMARKS_2026-04-16.html
+**Full report:** https://drussell23.github.io/JARVIS/benchmarks/DW_BENCHMARKS_2026-04-16.html
 **PDF:** attached to this email
 
 I want to flag three key items up-front to frame the report correctly:
@@ -41,13 +41,13 @@ Derek
 
 ## LinkedIn message draft (2–3 sentences)
 
-> Hi Meryem — finished the DW benchmark write-up from the last 11 days of O+V battle tests. Full report is live at https://drussell23.github.io/JARVIS/docs/benchmarks/DW_BENCHMARKS_2026-04-16.html (PDF also attached to the email I just sent), written to work for both the business and engineering sides of your team. Quick headline: 397B reasoning quality + your pricing are both already first-tier; the April 14 stall signature didn't reproduce on today's standalone smoke tests (including a clean 258-second Qwen 397B agent-scale run) — so the picture's more encouraging than the initial report framing suggested. Part VI has the commercial opportunity numbers.
+> Hi Meryem — finished the DW benchmark write-up from the last 11 days of O+V battle tests. Full report is live at https://drussell23.github.io/JARVIS/benchmarks/DW_BENCHMARKS_2026-04-16.html (PDF also attached to the email I just sent), written to work for both the business and engineering sides of your team. Quick headline: 397B reasoning quality + your pricing are both already first-tier; the April 14 stall signature didn't reproduce on today's standalone smoke tests (including a clean 258-second Qwen 397B agent-scale run) — so the picture's more encouraging than the initial report framing suggested. Part VI has the commercial opportunity numbers.
 
 ---
 
 ## Notes on delivery
 
-- **GitHub Pages URL:** `https://drussell23.github.io/JARVIS/docs/benchmarks/DW_BENCHMARKS_2026-04-16.html` — renders the HTML with figures, clickable TOC, embedded styling. Requires Pages enabled on the repo (Settings → Pages → Source: main branch, `/` root). A `.nojekyll` file is committed at repo root to disable Jekyll processing (which otherwise hides the `_report_style.css` due to underscore prefix).
+- **GitHub Pages URL:** `https://drussell23.github.io/JARVIS/benchmarks/DW_BENCHMARKS_2026-04-16.html` — renders the HTML with figures, clickable TOC, embedded styling. Pages source is `main` branch + `/docs` folder (pre-existing config from the voice.ai report), so the URL drops the `/docs` prefix — the `/docs/` in the repo path maps to the site root. `.nojekyll` is committed at `docs/.nojekyll` (inside the Pages source) to disable Jekyll processing on the served tree.
 - **PDF attachment:** `DW_BENCHMARKS_2026-04-16.pdf` (~3 MB, 64 pages) renders cleanly on standard email clients. Has a navigable sidebar outline (96 bookmark nodes) and clickable in-body TOC (212 named destinations). Generated via pandoc → Chrome headless → pypdf outline post-processor.
 - **Debug.log sharing:** the two isolation-test debug.logs total ~15–25 MB each; share via Google Drive / Dropbox / secure share rather than inline.
 - **Signing:** sign off as "Derek" (the LinkedIn thread already uses first-name), not "Derek J. Russell."
