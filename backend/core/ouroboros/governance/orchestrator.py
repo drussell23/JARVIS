@@ -1192,6 +1192,46 @@ class GovernedOrchestrator:
                 exc_info=True,
             )
 
+        # ---- TDD directive (Feature 1 V1 — prompt contract, NOT red-green) ----
+        #
+        # When the intent envelope carries evidence["tdd_mode"]=True,
+        # prepend a prompt directive instructing the model to emit
+        # tests + impl together (test file first in files: [...]).
+        # Honest scope: this is a prompt contract, not a red-green
+        # proof. True test-first orchestration (run tests → confirm
+        # fail → generate impl → run tests → confirm pass) is a
+        # separate multi-commit project scoped for V1.1. The V1
+        # module ships the declarative layer so ops can be marked
+        # TDD now; V1.1 flips the flag from "prompt hint" to
+        # "pipeline sub-phase trigger" without client-side changes.
+        try:
+            from backend.core.ouroboros.governance.tdd_directive import (
+                is_tdd_op,
+                tdd_prompt_directive,
+            )
+            if is_tdd_op(ctx):
+                _tdd_text = tdd_prompt_directive()
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=ctx.strategic_intent_id or "tdd-v1",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=(
+                        _existing + "\n\n" + _tdd_text
+                        if _existing else _tdd_text
+                    ),
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.info(
+                    "[TDDDirective] op=%s tdd_mode=true directive_chars=%d "
+                    "scope=prompt_contract_not_red_green",
+                    ctx.op_id, len(_tdd_text),
+                )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] TDD directive injection skipped",
+                exc_info=True,
+            )
+
         # ---- LastSessionSummary v0.1: session-to-session episodic continuity ----
         # Read-only structured summary of past session(s), rendered as
         # a dense untrusted block. Injected between SemanticIndex (above)
@@ -1425,6 +1465,71 @@ class GovernedOrchestrator:
                     )
             except Exception:
                 pass
+
+        # ---- ClassifyClarify: one operator question at the CLASSIFY→ROUTE boundary ----
+        #
+        # Closes the "intake description is ambiguous" gap. Narrow
+        # ambiguity heuristic (short desc + no target files, or generic
+        # target list, or no goal-keyword match). On trigger, ask the
+        # operator ONE concise question with a bounded timeout. The
+        # answer enriches ctx.description + evidence only — it has NO
+        # authority over risk classification, routing law, SemanticGuardian
+        # findings, or any deterministic engine input (Manifesto §1
+        # Boundary Principle).
+        #
+        # Default OFF (JARVIS_CLASSIFY_CLARIFY_ENABLED=0). Opt-in means
+        # no session is interrupted until the operator explicitly
+        # enables the feature + the heuristic actually fires.
+        try:
+            from backend.core.ouroboros.governance.classify_clarify import (
+                ask_operator as _clarify_ask,
+                merge_into_context as _clarify_merge,
+                clarify_enabled as _clarify_enabled,
+            )
+            if _clarify_enabled():
+                # Extract goal keywords from the active GoalTracker so
+                # the heuristic can check "no goal keyword match".
+                _goal_keywords: tuple = ()
+                try:
+                    from backend.core.ouroboros.governance.strategic_direction import (
+                        GoalTracker,
+                    )
+                    _kws: list = []
+                    for _g in GoalTracker(
+                        self._config.project_root,
+                    ).active_goals:
+                        _kws.extend(getattr(_g, "keywords", ()) or ())
+                    _goal_keywords = tuple(_kws)
+                except Exception:
+                    _goal_keywords = ()
+                _clarify_response = await _clarify_ask(
+                    op_id=ctx.op_id,
+                    description=ctx.description or "",
+                    target_files=tuple(ctx.target_files or ()),
+                    goal_keywords=_goal_keywords,
+                )
+                if _clarify_response.outcome == "answered":
+                    # Merge the sanitized answer into the description.
+                    # The risk classifier has ALREADY run above — we do
+                    # not re-classify. The clarification only affects
+                    # downstream prompt content (description + evidence).
+                    _new_desc, _patch = _clarify_merge(
+                        original_description=ctx.description or "",
+                        response=_clarify_response,
+                    )
+                    try:
+                        import dataclasses as _dc
+                        ctx = _dc.replace(ctx, description=_new_desc)
+                    except Exception:
+                        logger.debug(
+                            "[Orchestrator] ClassifyClarify ctx merge skipped",
+                            exc_info=True,
+                        )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] ClassifyClarify skipped",
+                exc_info=True,
+            )
 
         # ---- Phase 2: ROUTE ----
 

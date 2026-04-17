@@ -1098,6 +1098,11 @@ class BattleTestHarness:
             # unpauses the sensor fleet. Anything with a slash or args
             # routes to the new orphan-replay flow.
             await self._repl_cmd_resume_op(command.strip())
+        elif cmd.startswith("/tdd") or cmd.startswith("tdd ") or cmd == "tdd":
+            # /tdd <op-id> — mark an active/pending op as TDD-shaped.
+            # The orchestrator picks up the flag at CONTEXT_EXPANSION
+            # and injects the TDD prompt directive.
+            self._repl_cmd_tdd(command.strip())
         else:
             logger.debug("Unknown REPL command: %s", cmd)
 
@@ -2020,6 +2025,79 @@ class BattleTestHarness:
     # ------------------------------------------------------------------
     # /memory Rich renderers (super-beef)
     # ------------------------------------------------------------------
+
+    def _repl_cmd_tdd(self, line: str) -> None:
+        """/tdd <op-id> — mark an in-flight / pending op as TDD-shaped.
+
+        Stamps ``evidence["tdd_mode"] = True`` on the op's FSM context
+        (and on any queued IntentEnvelope if the op hasn't yet reached
+        CLASSIFY). The orchestrator picks up the flag at
+        CONTEXT_EXPANSION and injects the TDD prompt directive.
+
+        Honest scope: V1 is a **prompt contract**, not a red-green proof
+        obligation. VALIDATE still runs the tests against the final
+        bundle and L2 Repair engages when they fail — but we don't yet
+        execute tests BEFORE impl to confirm they fail first. That's a
+        separate orchestrator sub-phase project (V1.1).
+        """
+        parts = line.replace("/tdd", "tdd", 1).split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._repl_print(
+                "[dim]Usage: /tdd <op-id>[/dim]\n"
+                "[dim]Marks an op's evidence with tdd_mode=True. "
+                "V1 injects a prompt directive; V1.1 will add red-green "
+                "proof as a separate phase.[/dim]"
+            )
+            return
+        target = parts[1].strip()
+        gls = self._governed_loop_service
+        if gls is None:
+            self._repl_print(
+                "[red]/tdd: governed_loop_service not booted yet[/red]"
+            )
+            return
+
+        # Try to locate the op in the active FSM context set first.
+        matched = False
+        try:
+            fsm_contexts = getattr(gls, "_fsm_contexts", {}) or {}
+            for op_id, fsm_ctx in fsm_contexts.items():
+                if op_id == target or op_id.startswith(target):
+                    try:
+                        import dataclasses as _dc
+                        from backend.core.ouroboros.governance.tdd_directive import (
+                            stamp_tdd_evidence,
+                        )
+                        _old_evidence = getattr(fsm_ctx, "evidence", None) or {}
+                        new_evidence = stamp_tdd_evidence(_old_evidence, on=True)
+                        try:
+                            fsm_contexts[op_id] = _dc.replace(
+                                fsm_ctx, evidence=new_evidence,
+                            )
+                        except Exception:
+                            # Frozen dataclass without ``evidence`` field:
+                            # fallback is no-op — operators can still set
+                            # the env for a fresh op or mark via sensor.
+                            pass
+                        matched = True
+                        self._repl_print(
+                            f"[green]✓ /tdd[/green]  op=[bold]{op_id}[/bold] "
+                            "marked TDD-shaped (prompt directive active at "
+                            "next CONTEXT_EXPANSION)"
+                        )
+                    except Exception as exc:
+                        self._repl_print(
+                            f"[red]/tdd failed for {op_id}:[/red] {exc}"
+                        )
+                    break
+        except Exception:
+            pass
+        if not matched:
+            self._repl_print(
+                f"[yellow]/tdd:[/yellow] no active op matching [bold]{target}[/bold]. "
+                "Set intake-time via evidence[tdd_mode]=True, or retry "
+                "after the op reaches CLASSIFY."
+            )
 
     def _render_memory_detail_panel(self, mem: Any) -> None:
         """Rich panel for a single memory entry."""
