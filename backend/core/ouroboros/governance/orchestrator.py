@@ -4681,8 +4681,28 @@ class GovernedOrchestrator:
                     except Exception:
                         _old = ""
                     _pairs.append((_path, _old, _new))
+
+                # Time the whole batch so operators can detect a pattern
+                # detector regressing into a slow path (Track A telemetry).
+                _sg_t0 = time.monotonic()
                 _guardian_findings = _guardian.inspect_batch(_pairs)
+                _sg_duration_ms = int((time.monotonic() - _sg_t0) * 1000)
+
+                # Compute structured telemetry fields BEFORE any tier
+                # upgrade so ``risk_before`` reflects the classifier's
+                # verdict pre-guardian. The single INFO contract below
+                # fires on every op (hit OR clean) so downstream grep /
+                # aggregation pipelines have a stable one-line record.
+                _hard_count = sum(
+                    1 for f in _guardian_findings if f.severity == "hard"
+                )
+                _soft_count = sum(
+                    1 for f in _guardian_findings if f.severity == "soft"
+                )
+                _risk_before_name = risk_tier.name
+
                 _floor_name = recommend_tier_floor(_guardian_findings)
+                _upgrade: Optional[RiskTier] = None
                 if _floor_name is not None:
                     _upgrade_map = {
                         "notify_apply": RiskTier.NOTIFY_APPLY,
@@ -4690,22 +4710,30 @@ class GovernedOrchestrator:
                     }
                     _upgrade = _upgrade_map.get(_floor_name)
                     if _upgrade is not None and risk_tier.value < _upgrade.value:
-                        _pattern_names = ", ".join(
-                            sorted({f.pattern for f in _guardian_findings})
-                        )
-                        logger.info(
-                            "[SemanticGuard] op=%s findings=%d patterns=[%s] "
-                            "downgrade=%s→%s",
-                            ctx.op_id, len(_guardian_findings),
-                            _pattern_names,
-                            risk_tier.name, _upgrade.name,
-                        )
                         risk_tier = _upgrade
-                else:
-                    logger.debug(
-                        "[SemanticGuard] op=%s clean (no findings)",
-                        ctx.op_id,
-                    )
+                    else:
+                        _upgrade = None  # floor wasn't stricter; no upgrade
+
+                # Stable structured line — always emitted. Fields are
+                # intentionally key=value so a simple split("=") parser
+                # can build rollup counters (top patterns, top files,
+                # FP rate estimate). Track A observability contract.
+                _pattern_names = (
+                    ",".join(sorted({f.pattern for f in _guardian_findings}))
+                    if _guardian_findings else "none"
+                )
+                logger.info(
+                    "[SemanticGuard] op=%s findings=%d hard=%d soft=%d "
+                    "patterns=[%s] risk_before=%s risk_after=%s "
+                    "duration_ms=%d files_scanned=%d",
+                    ctx.op_id,
+                    len(_guardian_findings),
+                    _hard_count, _soft_count,
+                    _pattern_names,
+                    _risk_before_name, risk_tier.name,
+                    _sg_duration_ms,
+                    len(_pairs),
+                )
             except Exception:
                 logger.debug(
                     "[Orchestrator] SemanticGuardian skipped",

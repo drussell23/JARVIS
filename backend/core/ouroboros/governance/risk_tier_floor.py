@@ -18,7 +18,14 @@ sleep:
 * ``JARVIS_AUTO_APPLY_QUIET_HOURS=<start>-<end>``
     Time-of-day window during which ``MIN_RISK_TIER=notify_apply`` is
     implicitly active. Supports wrap-around (``22-7`` → 10 PM to 7 AM).
-    Uses the local timezone (``datetime.now()``).
+    **Defaults to UTC** when ``JARVIS_AUTO_APPLY_QUIET_HOURS_TZ`` is
+    unset — implicit local-wall-clock semantics are ambiguous across
+    multi-operator deployments (Manifesto §4: clarity over convenience).
+
+* ``JARVIS_AUTO_APPLY_QUIET_HOURS_TZ=UTC|America/Los_Angeles|...``
+    IANA timezone name used to interpret ``QUIET_HOURS``. Absent /
+    malformed → falls back to UTC with a DEBUG log. An explicit
+    ``UTC`` pass-through keeps the default documented.
 
 Authority invariant: this module is pure-read. It consumes env vars +
 the current time and returns a recommended floor. The caller (the
@@ -36,7 +43,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.RiskFloor")
@@ -44,6 +51,7 @@ logger = logging.getLogger("Ouroboros.RiskFloor")
 _ENV_MIN_TIER = "JARVIS_MIN_RISK_TIER"
 _ENV_PARANOIA = "JARVIS_PARANOIA_MODE"
 _ENV_QUIET_HOURS = "JARVIS_AUTO_APPLY_QUIET_HOURS"
+_ENV_QUIET_HOURS_TZ = "JARVIS_AUTO_APPLY_QUIET_HOURS_TZ"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -104,14 +112,57 @@ def _parse_quiet_hours(raw: str) -> Optional[Tuple[int, int]]:
     return (start, end)
 
 
+def _resolve_tz():
+    """Resolve JARVIS_AUTO_APPLY_QUIET_HOURS_TZ to a tzinfo. Falls back
+    to UTC when unset / malformed. Emits one DEBUG line on fallback so
+    operators can spot a typo without spam.
+
+    Uses stdlib ``zoneinfo`` (Python 3.9+); if ZoneInfoNotFoundError or
+    import failure occurs, returns UTC. Returning a concrete tzinfo
+    keeps ``datetime.now(tz=...)`` call sites simple.
+    """
+    raw = os.environ.get(_ENV_QUIET_HOURS_TZ, "").strip()
+    if not raw or raw.upper() == "UTC":
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[RiskFloor] zoneinfo unavailable — falling back to UTC",
+        )
+        return timezone.utc
+    try:
+        return ZoneInfo(raw)
+    except ZoneInfoNotFoundError:
+        logger.debug(
+            "[RiskFloor] unknown IANA zone %r — falling back to UTC",
+            raw,
+        )
+        return timezone.utc
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[RiskFloor] zone resolution raised — falling back to UTC",
+            exc_info=True,
+        )
+        return timezone.utc
+
+
 def quiet_hours_active(now: Optional[datetime] = None) -> bool:
     """True when ``JARVIS_AUTO_APPLY_QUIET_HOURS`` is set and the current
-    local hour falls inside the configured window.
+    wall-clock hour (in ``QUIET_HOURS_TZ``, defaulting to UTC) falls
+    inside the configured window.
 
-    Supports wrap-around: ``22-7`` means 22:00-06:59 local. A window
-    of ``9-17`` means 09:00-16:59. Equal start/end is treated as the
-    whole day (rare — operator wanted 24h paranoia, should use
-    ``MIN_RISK_TIER`` instead, but we honor it).
+    Supports wrap-around: ``22-7`` means 22:00-06:59 in the resolved
+    zone. A window of ``9-17`` means 09:00-16:59. Equal start/end is
+    treated as the whole day (rare — operator wanted 24h paranoia,
+    should use ``MIN_RISK_TIER`` instead, but we honor it).
+
+    Parameters
+    ----------
+    now:
+        Optional explicit datetime for testing. May be naive (assumed
+        UTC) or aware. When aware, it's converted to the resolved zone
+        before extracting the hour.
     """
     raw = os.environ.get(_ENV_QUIET_HOURS, "").strip()
     if not raw:
@@ -120,7 +171,19 @@ def quiet_hours_active(now: Optional[datetime] = None) -> bool:
     if parsed is None:
         return False
     start, end = parsed
-    hour = (now or datetime.now()).hour
+
+    tz = _resolve_tz()
+    if now is None:
+        # Default: current time in the resolved zone (UTC by default).
+        hour = datetime.now(tz=tz).hour
+    elif now.tzinfo is None:
+        # Naive datetime — historically this was "local time". The new
+        # contract: naive is treated as UTC, then converted if TZ set.
+        aware = now.replace(tzinfo=timezone.utc)
+        hour = aware.astimezone(tz).hour
+    else:
+        hour = now.astimezone(tz).hour
+
     if start == end:
         return True
     if start < end:
@@ -191,7 +254,8 @@ def floor_reason(now: Optional[datetime] = None) -> str:
         bits.append(f"{_ENV_PARANOIA}=1")
     if quiet_hours_active(now):
         raw = os.environ.get(_ENV_QUIET_HOURS, "").strip()
-        bits.append(f"{_ENV_QUIET_HOURS}={raw} active")
+        tz_env = os.environ.get(_ENV_QUIET_HOURS_TZ, "").strip() or "UTC"
+        bits.append(f"{_ENV_QUIET_HOURS}={raw} (tz={tz_env}) active")
     if not bits:
         return "(no floor active)"
     return ", ".join(bits)
