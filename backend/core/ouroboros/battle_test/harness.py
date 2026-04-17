@@ -783,6 +783,17 @@ class BattleTestHarness:
                     exc, exc_info=True,
                 )
 
+            # ── Boot-time orphan scan (Priority 2F resume) ────────────
+            # Non-blocking: logs one INFO line if orphans exist so the
+            # operator knows to run /resume list. Never prompts.
+            try:
+                self._notify_orphaned_ops_at_boot()
+            except Exception:
+                logger.debug(
+                    "[Harness] orphan-scan notification failed",
+                    exc_info=True,
+                )
+
             # Boot each subsystem independently — failure of one should not
             # prevent others from starting (Manifesto §2: progressive awakening).
 
@@ -1053,6 +1064,15 @@ class BattleTestHarness:
             # /undo N (revert last N O+V commits); /undo preview [N];
             # /undo --hard N. Async because executor awaits comm emits.
             await self._repl_cmd_undo(command.strip())
+        elif cmd.startswith("/resume") or (
+            cmd.startswith("resume ") and not cmd == "resume"
+        ):
+            # /resume, /resume list, /resume all, /resume <op-prefix>.
+            # Note: bare "resume" (no slash, no args) is handled above
+            # by the legacy intake-resume handler — that pauses /
+            # unpauses the sensor fleet. Anything with a slash or args
+            # routes to the new orphan-replay flow.
+            await self._repl_cmd_resume_op(command.strip())
         else:
             logger.debug("Unknown REPL command: %s", cmd)
 
@@ -1950,6 +1970,180 @@ class BattleTestHarness:
             f"reverted=[bold]{result.n_reverted}[/bold]  "
             f"files=[bold]{len(result.files_affected)}[/bold]"
             f"{sha_tail}"
+        )
+
+    async def _repl_cmd_resume_op(self, line: str) -> None:
+        """/resume — re-enqueue an orphaned in-flight op from the ledger.
+
+        Distinct from the legacy sync :meth:`_repl_cmd_resume` which
+        unpauses the intake sensor fleet. This handler owns the
+        orphan-replay flow (ledger scan + intake re-enqueue).
+
+        Grammar
+        -------
+        /resume                → resume the most recent orphan
+        /resume list           → Rich table of all orphans (read-only)
+        /resume <op-prefix>    → resume a specific op by id/short-id prefix
+        /resume all            → batch re-enqueue every qualifying orphan
+
+        V1 scope: re-enqueues the intent (goal + target_files) as a
+        fresh IntentEnvelope. The in-flight candidate, validation, and
+        L2 iteration state are NOT preserved (require a separate
+        orchestrator refactor). Workspace restoration is also deferred
+        until checkpoint persistence lands — operators see an explicit
+        honesty note in every render.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.resume_command import (
+                ResumeExecutor,
+                ResumeScanner,
+                parse_resume_args,
+                render_plan,
+            )
+        except Exception:
+            self._repl_print("[red]Resume module unavailable.[/red]")
+            return
+
+        mode, op_prefix, err = parse_resume_args(line)
+        if err:
+            self._repl_print(
+                f"[red]/resume: {err}[/red]\n"
+                f"[dim]usage: /resume | /resume list | /resume all | /resume <op-prefix>[/dim]"
+            )
+            return
+
+        ledger_root = (
+            self._config.repo_path
+            / ".ouroboros" / "state" / "ouroboros" / "ledger"
+        )
+        scanner = ResumeScanner(
+            ledger_root=ledger_root,
+            governed_loop_service=self._governed_loop_service,
+        )
+        plan = scanner.plan(mode=mode, op_id_prefix=op_prefix)
+        self._repl_print(render_plan(plan))
+
+        # List mode is read-only by contract.
+        if mode == "list":
+            return
+        # Global errors block execution.
+        if plan.has_global_errors:
+            self._repl_print(
+                "[bold red]/resume aborted — resolve errors above.[/bold red]"
+            )
+            return
+        if plan.resumable_count == 0:
+            self._repl_print(
+                "[yellow]No resumable orphans.[/yellow]"
+            )
+            return
+
+        # Resolve the intake router via the GLS (the executor talks
+        # directly to the router to avoid re-entering the sensor chain).
+        router = None
+        try:
+            gls = self._governed_loop_service
+            # Multiple attribute paths used in the codebase at different
+            # versions; try each.
+            for attr in (
+                "_intake_router", "intake_router", "_router", "router",
+            ):
+                cand = getattr(gls, attr, None)
+                if cand is not None:
+                    router = cand
+                    break
+        except Exception:
+            router = None
+        if router is None:
+            self._repl_print(
+                "[bold red]/resume failed:[/bold red] intake router unavailable"
+            )
+            return
+
+        comm = None
+        try:
+            comm = getattr(self._governance_stack, "comm", None)
+        except Exception:
+            comm = None
+
+        executor = ResumeExecutor(
+            repo_name=getattr(self._config, "primary_repo", "") or "jarvis",
+            intake_router=router,
+            comm=comm,
+        )
+        result = await executor.execute(plan)
+
+        if not result.executed and result.error:
+            self._repl_print(
+                f"[bold red]/resume failed:[/bold red] {result.error}"
+            )
+            return
+
+        new_ids = ", ".join(
+            x[:12] for x in result.resumed_op_ids[:4]
+        ) + (" …" if len(result.resumed_op_ids) > 4 else "")
+        self._repl_print(
+            f"[bold green]✓ /resume[/bold green]  "
+            f"resumed=[bold]{len(result.resumed_op_ids)}[/bold]  "
+            f"skipped=[bold]{len(result.skipped_reasons)}[/bold]"
+            + (f"  new_ids=[dim]{new_ids}[/dim]" if new_ids else "")
+        )
+        for parent, reason in result.skipped_reasons[:5]:
+            parent_short = parent.split("-", 1)[1][:10] if "-" in parent else parent[:10]
+            self._repl_print(
+                f"  [dim]skipped {parent_short}: {reason}[/dim]"
+            )
+
+    def _notify_orphaned_ops_at_boot(self) -> None:
+        """Emit a non-blocking INFO line when orphaned ops are available.
+
+        Called once after GLS is booted but before the REPL opens.
+        Intentionally does not prompt — operators drive /resume when
+        ready. A noisy interactive prompt would block the boot sequence
+        for headless / CI runs.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.resume_command import (
+                ResumeScanner,
+                resume_enabled,
+            )
+        except Exception:
+            return
+        if not resume_enabled():
+            return
+        ledger_root = (
+            self._config.repo_path
+            / ".ouroboros" / "state" / "ouroboros" / "ledger"
+        )
+        try:
+            scanner = ResumeScanner(
+                ledger_root=ledger_root,
+                governed_loop_service=self._governed_loop_service,
+            )
+            orphans = scanner.scan_orphans()
+        except Exception:
+            logger.debug("[Resume] boot scan failed", exc_info=True)
+            return
+        if not orphans:
+            return
+        # Only surface orphans within the age window; otherwise operators
+        # get pestered by ancient history.
+        try:
+            from backend.core.ouroboros.battle_test.resume_command import (
+                max_age_s,
+            )
+            cutoff = max_age_s()
+        except Exception:
+            cutoff = 86400
+        fresh = [o for o in orphans if o.age_s <= cutoff]
+        if not fresh:
+            return
+        logger.info(
+            "[Resume] %d orphaned op(s) available — /resume list to review "
+            "(oldest=%ds last_phase=%s)",
+            len(fresh),
+            int(max(o.age_s for o in fresh)),
+            fresh[0].last_state,
         )
 
     # ------------------------------------------------------------------
