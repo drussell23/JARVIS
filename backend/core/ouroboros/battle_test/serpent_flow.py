@@ -3097,6 +3097,9 @@ class SerpentREPL:
                     if line in ("/lessons", "lessons"):
                         self._print_lessons()
                         continue
+                    if line.startswith("/mutation") or line.startswith("mutation "):
+                        await self._handle_mutation(line)
+                        continue
 
                     # ConversationBridge capture (V1: user turns only).
                     # Any line that fell through the built-in dispatch is
@@ -3195,6 +3198,7 @@ class SerpentREPL:
             f"  [{_C['dim']}]/memory [...][/{_C['dim']}]     list/add/rm/forbid user-pref memories",
             f"  [{_C['dim']}]/remember <text>[/{_C['dim']}]  shortcut: add a USER memory",
             f"  [{_C['dim']}]/forget <id>[/{_C['dim']}]      shortcut: remove a memory by id",
+            f"  [{_C['dim']}]/mutation <src>[/{_C['dim']}]   mutation-test <src> (meta-test: do tests catch bugs?)",
             f"  [{_C['dim']}]help[/{_C['dim']}]              this message",
             f"  [{_C['dim']}]quit[/{_C['dim']}]              graceful shutdown",
         ]
@@ -3400,6 +3404,103 @@ class SerpentREPL:
           /forget <id>
         """
         await self._delegate_to_harness(line, error_label="Forget error")
+
+    async def _handle_mutation(self, line: str) -> None:
+        """Run the mutation tester against a source file.
+
+        Usage:
+          /mutation <src>                   — auto-discover tests/test_<stem>.py
+          /mutation <src> -- <test> [...]   — explicit test paths
+
+        The mutation tester writes AST-mutated variants of <src>, re-runs
+        the provided test suite against each, and reports how many
+        mutants were caught. A high score means the tests exercise
+        behavior; a low score means the tests are performative.
+
+        This is an operator-only meta-test — it is NEVER called from the
+        pipeline (cost ≈ N × 30s) and NEVER overrides governance.
+        """
+        parts = line.replace("/mutation", "mutation", 1).split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._flow.console.print(
+                f"  [{_C['dim']}]Usage: /mutation <src> [-- <test_file> ...][/{_C['dim']}]\n"
+                f"  [{_C['dim']}]Example: /mutation backend/core/ouroboros/governance/"
+                f"intake/sensors/test_failure_sensor.py[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        arg = parts[1].strip()
+        # Split on ' -- ' sentinel for explicit test paths.
+        if " -- " in arg:
+            src_str, tests_str = arg.split(" -- ", 1)
+            src_path = Path(src_str.strip())
+            test_paths = [
+                Path(t.strip()) for t in tests_str.split()
+                if t.strip()
+            ]
+        else:
+            src_path = Path(arg.strip())
+            test_paths = self._discover_tests_for(src_path)
+        if not src_path.is_file():
+            self._flow.console.print(
+                f"  [{_C['death']}]Source file not found: {src_path}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        if not test_paths:
+            self._flow.console.print(
+                f"  [{_C['death']}]No test files found for {src_path.name}. "
+                f"Pass explicitly with '-- <paths>'.[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        try:
+            from backend.core.ouroboros.governance.mutation_tester import (
+                render_console_report,
+                run_mutation_test,
+            )
+        except ImportError as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]Mutation tester unavailable: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        self._flow.console.print(
+            f"  [{_C['neural']}]Mutation-testing[/{_C['neural']}] {src_path} "
+            f"with {len(test_paths)} test file(s) — this can take minutes.",
+            highlight=False,
+        )
+        # Run off the REPL thread so we don't block the event loop while
+        # pytest subprocesses execute serially.
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: run_mutation_test(
+                src_path, test_files=test_paths,
+            ),
+        )
+        report = render_console_report(result)
+        self._flow.console.print()
+        for line_out in report.splitlines():
+            self._flow.console.print(line_out, highlight=False)
+        self._flow.console.print()
+
+    @staticmethod
+    def _discover_tests_for(src_path: Path) -> List[Path]:
+        """Heuristic test discovery for ``/mutation <src>`` without args.
+
+        Looks under ``tests/`` for any file whose name matches
+        ``test_<stem>*.py`` (covers Session-W-style
+        ``test_test_failure_sensor_dedup.py``).
+        """
+        stem = src_path.stem
+        tests_dir = Path("tests")
+        if not tests_dir.is_dir():
+            return []
+        found: List[Path] = []
+        for candidate in tests_dir.rglob(f"test_{stem}*.py"):
+            if candidate.is_file():
+                found.append(candidate)
+        return sorted(found)
 
     async def _delegate_to_harness(self, line: str, *, error_label: str) -> None:
         """Forward the raw line to the harness ``on_command`` callback.
