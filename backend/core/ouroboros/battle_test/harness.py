@@ -1150,6 +1150,10 @@ class BattleTestHarness:
         elif cmd == "/plugins" or cmd.startswith("/plugins "):
             # /plugins — list loaded + failed plugins (Rich table).
             self._repl_cmd_plugins(command.strip())
+        elif cmd == "/infer" or cmd.startswith("/infer "):
+            # /infer — Rich table of inferred directions;
+            # /infer accept <id> / reject <id> / stats
+            self._repl_cmd_infer(command.strip())
         elif await self._try_dispatch_plugin_command(command.strip()):
             # Plugin-registered slash commands: /greet, /<plugin_cmd>, etc.
             # Returns True iff a plugin handled the command.
@@ -2076,6 +2080,188 @@ class BattleTestHarness:
     # ------------------------------------------------------------------
     # /memory Rich renderers (super-beef)
     # ------------------------------------------------------------------
+
+    def _repl_cmd_infer(self, line: str) -> None:
+        """/infer — inspect and manage inferred goal hypotheses.
+
+        Grammar:
+          /infer               → Rich table of current hypotheses
+          /infer refresh       → rebuild now (ignores cache)
+          /infer accept <id>   → promote to declared goal (via GoalTracker)
+          /infer reject <id>   → record FEEDBACK memory; future builds filter
+          /infer stats         → counts per source + cache age
+
+        The engine is OFF by default (JARVIS_GOAL_INFERENCE_ENABLED=0).
+        """
+        try:
+            from backend.core.ouroboros.governance.goal_inference import (
+                GoalInferenceEngine,
+                accept_inferred_goal,
+                get_default_engine,
+                inference_enabled,
+                reject_inferred_goal,
+                register_default_engine,
+            )
+        except Exception:
+            self._repl_print("[red]Goal inference module unavailable.[/red]")
+            return
+
+        if not inference_enabled():
+            self._repl_print(
+                "[yellow]Goal inference disabled.[/yellow]  "
+                "[dim]Set JARVIS_GOAL_INFERENCE_ENABLED=1 and retry.[/dim]"
+            )
+            return
+
+        engine = get_default_engine(self._config.repo_path)
+        if engine is None:
+            engine = GoalInferenceEngine(repo_root=self._config.repo_path)
+            register_default_engine(engine)
+
+        parts = line.split(None, 2)
+        sub = parts[1].strip().lower() if len(parts) > 1 else ""
+        arg = parts[2].strip() if len(parts) > 2 else ""
+
+        if sub == "refresh":
+            result = engine.build(force=True)
+            self._repl_print(
+                f"[green]✓ rebuilt[/green]  hypotheses={len(result.inferred)}  "
+                f"samples={result.total_samples}  build_ms={result.build_ms}"
+            )
+            sub = ""   # fall through to render
+
+        if not sub or sub == "list":
+            result = engine.build()
+            self._render_infer_panel(result)
+            return
+
+        if sub == "stats":
+            result = engine.get_current() or engine.build()
+            self._render_infer_stats(result)
+            return
+
+        if sub in ("accept", "reject"):
+            if not arg:
+                self._repl_print(
+                    f"[red]Usage: /infer {sub} <id>[/red]"
+                )
+                return
+            result = engine.get_current() or engine.build()
+            target = next(
+                (g for g in result.inferred if g.inferred_id == arg),
+                None,
+            )
+            if target is None:
+                self._repl_print(
+                    f"[red]No inferred goal with id {arg!r}[/red]"
+                )
+                return
+            if sub == "accept":
+                ok, msg = accept_inferred_goal(
+                    repo_root=self._config.repo_path, inferred=target,
+                )
+            else:
+                ok, msg = reject_inferred_goal(
+                    repo_root=self._config.repo_path, inferred=target,
+                )
+            engine.invalidate()   # next build picks up the change
+            color = "green" if ok else "red"
+            self._repl_print(f"[{color}]{msg}[/{color}]")
+            return
+
+        self._repl_print(
+            "[dim]Usage: /infer | /infer refresh | /infer accept <id> | "
+            "/infer reject <id> | /infer stats[/dim]"
+        )
+
+    def _render_infer_panel(self, result: Any) -> None:
+        """Rich table of current inferred goals."""
+        try:
+            from rich.panel import Panel
+            from rich.table import Table
+            from rich.text import Text
+            from rich.console import Group
+        except Exception:
+            if not result.inferred:
+                self._repl_print("[dim]No inferred goals.[/dim]")
+                return
+            for g in result.inferred:
+                self._repl_print(
+                    f"  {g.inferred_id}  conf={g.confidence:.2f}  "
+                    f"{g.theme}"
+                )
+            return
+
+        if not result.inferred:
+            self._repl_print(
+                "[dim]No inferred goals yet — insufficient signal.[/dim]"
+            )
+            return
+
+        tbl = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
+        tbl.add_column("id", no_wrap=True)
+        tbl.add_column("conf", justify="right")
+        tbl.add_column("theme")
+        tbl.add_column("sources")
+        tbl.add_column("files")
+        for g in result.inferred:
+            conf_color = (
+                "bold green" if g.confidence >= 0.75
+                else "yellow" if g.confidence >= 0.5
+                else "dim"
+            )
+            tbl.add_row(
+                g.inferred_id,
+                Text(f"{g.confidence:.2f}", style=conf_color),
+                g.theme[:60],
+                ", ".join(g.supporting_sources),
+                ", ".join(g.supporting_files[:2]),
+            )
+
+        summary = Text()
+        summary.append(
+            "inferred direction — hypotheses, NOT declared goals. "
+            "accept / reject per id.",
+            style="dim italic",
+        )
+        age = time.time() - result.built_at if result.built_at else 0
+        summary.append(
+            f"\nbuilt {int(age)}s ago · samples={result.total_samples} · "
+            f"build_ms={result.build_ms}",
+            style="dim",
+        )
+
+        panel = Panel(
+            Group(tbl, Text(""), summary),
+            title="[bold]Inferred Direction[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+        sf = getattr(self, "_serpent_flow", None)
+        console = getattr(sf, "console", None) if sf is not None else None
+        if console is not None:
+            console.print(panel, highlight=False)
+        else:
+            self._repl_print(str(panel))
+
+    def _render_infer_stats(self, result: Any) -> None:
+        if result is None:
+            self._repl_print("[dim]No build yet.[/dim]")
+            return
+        self._repl_print(
+            f"[bold]Goal inference stats[/bold]\n"
+            f"  build_ms:   {result.build_ms}\n"
+            f"  samples:    {result.total_samples}\n"
+            f"  hypotheses: {len(result.inferred)}\n"
+            f"  reason:     {result.build_reason}"
+        )
+        if result.sources_contributing:
+            self._repl_print("  sources:")
+            for src, n in sorted(
+                result.sources_contributing.items(),
+                key=lambda kv: kv[1], reverse=True,
+            ):
+                self._repl_print(f"    {src:<20} {n}")
 
     def _repl_cmd_plugins(self, line: str) -> None:
         """/plugins — list loaded / failed / disabled plugins.

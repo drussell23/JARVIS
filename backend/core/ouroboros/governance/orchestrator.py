@@ -1232,6 +1232,71 @@ class GovernedOrchestrator:
                 exc_info=True,
             )
 
+        # ---- Goal inference — hypothesized direction from multi-signal cross-corr ----
+        #
+        # Closes the "read the room" gap: watch commits, REPL inputs,
+        # memory, completed ops, file hotspots, and declared goals;
+        # synthesize ranked hypotheses about where the operator is
+        # headed. Injected as a clearly-labeled "Inferred Direction
+        # (hypotheses — not declared goals)" section so the model
+        # weights it BELOW explicit goals. Default OFF, fail-closed.
+        #
+        # Authority invariant: hypotheses inform prompt surface only.
+        # They NEVER affect risk tier, route, guardian findings, gate
+        # verdicts, or approval. Operator accepts/rejects via /infer.
+        try:
+            from backend.core.ouroboros.governance.goal_inference import (
+                GoalInferenceEngine,
+                get_default_engine,
+                inference_enabled,
+                render_prompt_section,
+            )
+            if inference_enabled():
+                _engine = get_default_engine(self._config.project_root)
+                if _engine is None:
+                    _engine = GoalInferenceEngine(
+                        repo_root=self._config.project_root,
+                    )
+                _inf_result = _engine.build()
+                _inf_text = render_prompt_section(_inf_result)
+                if _inf_text:
+                    _existing = getattr(
+                        ctx, "strategic_memory_prompt", "",
+                    ) or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=(
+                            ctx.strategic_intent_id or "goal-inference-v1"
+                        ),
+                        strategic_memory_fact_ids=(
+                            ctx.strategic_memory_fact_ids
+                        ),
+                        strategic_memory_prompt=(
+                            _existing + "\n\n" + _inf_text
+                            if _existing else _inf_text
+                        ),
+                        strategic_memory_digest=(
+                            ctx.strategic_memory_digest
+                        ),
+                    )
+                    logger.info(
+                        "[GoalInference] op=%s injected hypotheses=%d "
+                        "top_conf=%.2f chars=%d",
+                        ctx.op_id,
+                        min(
+                            len(_inf_result.inferred),
+                            # top_k applied inside render
+                            5,
+                        ),
+                        (_inf_result.inferred[0].confidence
+                         if _inf_result.inferred else 0.0),
+                        len(_inf_text),
+                    )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] Goal inference injection skipped",
+                exc_info=True,
+            )
+
         # ---- LastSessionSummary v0.1: session-to-session episodic continuity ----
         # Read-only structured summary of past session(s), rendered as
         # a dense untrusted block. Injected between SemanticIndex (above)
