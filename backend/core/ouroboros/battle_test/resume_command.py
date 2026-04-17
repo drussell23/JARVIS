@@ -453,9 +453,17 @@ class ResumeExecutor:
                 continue
 
             # Synthesize the fresh envelope.
+            #
+            # ``source="voice_human"`` is the most honest pick from the
+            # intake source enum — /resume is operator-triggered, just
+            # like a voice command. The actual "this is a resume"
+            # semantics live in ``evidence.resume_of_op`` + siblings so
+            # downstream callers (session recorder, drift tracker) can
+            # identify resumed envelopes without adding a new source
+            # value to the governance-policy enum.
             try:
                 envelope = make_envelope(
-                    source="resume",
+                    source="voice_human",
                     description=orph.goal,
                     target_files=orph.target_files,
                     repo=self._repo_name,
@@ -466,6 +474,7 @@ class ResumeExecutor:
                         "resume_orig_phase": orph.last_state,
                         "resume_orig_age_s": int(orph.age_s),
                         "resume_orig_risk_tier": orph.risk_tier,
+                        "is_resume": True,
                     },
                     requires_human_ack=False,
                 )
