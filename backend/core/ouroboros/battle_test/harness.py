@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from backend.core.ouroboros.battle_test.cost_tracker import CostTracker
 from backend.core.ouroboros.battle_test.idle_watchdog import IdleWatchdog
@@ -31,6 +31,31 @@ from backend.core.ouroboros.battle_test.session_recorder import SessionRecorder
 logger = logging.getLogger(__name__)
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+# ---------------------------------------------------------------------------
+# Memory-type decoration (used by /memory Rich renderers)
+# ---------------------------------------------------------------------------
+def _memory_type_emoji(type_name: str) -> str:
+    return {
+        "user": "👤",
+        "feedback": "🗣",
+        "project": "📋",
+        "reference": "🔗",
+        "forbidden_path": "🚫",
+        "style": "🎨",
+    }.get(type_name.lower(), "•")
+
+
+def _memory_border_for_type(type_name: str) -> str:
+    return {
+        "user": "cyan",
+        "feedback": "yellow",
+        "project": "blue",
+        "reference": "magenta",
+        "forbidden_path": "red",
+        "style": "green",
+    }.get(type_name.lower(), "white")
 
 
 # ---------------------------------------------------------------------------
@@ -1211,36 +1236,193 @@ class BattleTestHarness:
             sf.set_plan_review_mode(enabled)
 
     def _repl_cmd_plan(self, line: str) -> None:
-        """Show or toggle plan review mode for the current session."""
-        normalized = line[1:] if line.startswith("/") else line
-        parts = normalized.split(None, 1)
+        """Show or toggle plan-review + dry-run modes for the current session.
 
-        if len(parts) < 2:
-            state = "[green]ON[/green]" if self._plan_before_execute else "[dim]OFF[/dim]"
-            self._repl_print(
-                "[bold]Plan Review:[/bold] "
-                f"{state}  [dim]show the plan before executing anything in this session[/dim]"
-            )
-            self._repl_print("[dim]Usage: /plan on | off[/dim]")
+        Grammar
+        -------
+        /plan                        → show status of every gate (Rich panel)
+        /plan status                 → same as /plan
+        /plan on | off               → toggle plan-review (gates GENERATE)
+        /plan dry-run [on|off]       → toggle dry-run (blocks APPLY session-wide)
+        /plan dry-run                → toggle dry-run (on if off, off if on)
+
+        Plan review vs dry run — distinct gates:
+
+          ``plan-review`` gates at the PLAN→GENERATE boundary. With it on,
+          the orchestrator shows the plan and waits for human approval
+          before any code generation. Disabling it does not affect later
+          gates.
+
+          ``dry-run`` is a harder gate that fires just before APPLY. The
+          op runs the full pipeline (CLASSIFY, PLAN, GENERATE, VALIDATE,
+          security review, risk classification, guardian, floor), then
+          short-circuits to CANCELLED(dry_run_session) before any disk
+          write / git mutation / push. Operators get full observability
+          into "what the model wanted to do" with zero side effects.
+        """
+        normalized = line[1:] if line.startswith("/") else line
+        parts = normalized.split(None, 2)
+        sub = parts[1].strip().lower() if len(parts) > 1 else ""
+        arg = parts[2].strip().lower() if len(parts) > 2 else ""
+
+        # No subcommand → show status panel.
+        if not sub or sub == "status":
+            self._render_plan_status_panel()
             return
 
-        raw = parts[1].strip().lower()
-        if raw in {"on", "enable", "enabled", "true", "1"}:
+        # Plan-review toggle (legacy semantics).
+        if sub in {"on", "enable", "enabled", "true", "1"}:
             self._set_plan_review_mode(True)
             self._repl_print(
                 "[green]🗺 Plan review enabled — the next operation will show a plan "
                 "and wait for approval before GENERATE.[/green]"
             )
             return
-        if raw in {"off", "disable", "disabled", "false", "0"}:
+        if sub in {"off", "disable", "disabled", "false", "0"}:
             self._set_plan_review_mode(False)
+            os.environ["JARVIS_DRY_RUN"] = "0"
             self._repl_print(
-                "[yellow]🗺 Plan review disabled — the next operation can execute "
-                "without a mandatory pre-run plan gate.[/yellow]"
+                "[yellow]🗺 Plan review + dry-run both disabled — operations can "
+                "execute normally.[/yellow]"
             )
             return
 
-        self._repl_print("[red]Usage: /plan on | off[/red]")
+        # Dry-run toggle. ``/plan dry-run`` (no arg) flips; explicit on|off wins.
+        if sub in {"dry-run", "dry_run", "dryrun", "dry"}:
+            cur_on = os.environ.get("JARVIS_DRY_RUN", "").strip().lower() in _TRUTHY
+            if arg in {"on", "enable", "enabled", "true", "1"}:
+                new_on = True
+            elif arg in {"off", "disable", "disabled", "false", "0"}:
+                new_on = False
+            else:
+                new_on = not cur_on
+            os.environ["JARVIS_DRY_RUN"] = "1" if new_on else "0"
+            if new_on:
+                self._repl_print(
+                    "[bold yellow]🧪 Dry-run ENABLED[/bold yellow] — ops will run "
+                    "through every gate but stop before APPLY. No disk writes, "
+                    "no commits, no pushes. Flip off with [bold]/plan dry-run off[/bold]."
+                )
+            else:
+                self._repl_print(
+                    "[green]🧪 Dry-run disabled — ops can modify files again.[/green]"
+                )
+            return
+
+        self._repl_print(
+            "[red]Usage:[/red] /plan | /plan status | /plan on | off | "
+            "dry-run [on|off]"
+        )
+
+    def _render_plan_status_panel(self) -> None:
+        """Rich panel summarising every gate that affects execution in
+        the current session. Called by ``/plan`` / ``/plan status``.
+        Falls back to plain text when Rich is unavailable.
+        """
+        _truthy = _TRUTHY
+        plan_review = bool(self._plan_before_execute) or (
+            os.environ.get("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", "").strip().lower() in _truthy
+        )
+        dry_run = os.environ.get("JARVIS_DRY_RUN", "").strip().lower() in _truthy
+        paranoia = os.environ.get("JARVIS_PARANOIA_MODE", "").strip().lower() in _truthy
+        min_tier = os.environ.get("JARVIS_MIN_RISK_TIER", "").strip().lower() or "(unset)"
+        risk_ceiling = os.environ.get("JARVIS_RISK_CEILING", "").strip() or "(unset)"
+        quiet_raw = os.environ.get("JARVIS_AUTO_APPLY_QUIET_HOURS", "").strip() or "(unset)"
+        quiet_tz = os.environ.get("JARVIS_AUTO_APPLY_QUIET_HOURS_TZ", "").strip() or "UTC"
+
+        try:
+            from rich.panel import Panel
+            from rich.table import Table
+            from rich.text import Text
+            from rich.console import Group
+        except Exception:
+            # Plain fallback.
+            self._repl_print(
+                f"plan_review={plan_review}  dry_run={dry_run}  "
+                f"paranoia={paranoia}  min_tier={min_tier}  "
+                f"risk_ceiling={risk_ceiling}  quiet={quiet_raw} tz={quiet_tz}"
+            )
+            return
+
+        tbl = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
+        tbl.add_column("Gate")
+        tbl.add_column("State")
+        tbl.add_column("Effect when active", no_wrap=False)
+
+        def _row(name: str, on: bool, effect: str, value: str = "") -> None:
+            state = (
+                Text("ON", style="bold yellow") if on else Text("off", style="dim")
+            )
+            if value and on:
+                state = Text.assemble(state, " ", Text(f"({value})", style="dim"))
+            tbl.add_row(name, state, effect)
+
+        _row(
+            "plan-review",
+            plan_review,
+            "PLAN→GENERATE paused; human approves plan first",
+        )
+        _row(
+            "dry-run",
+            dry_run,
+            "pipeline runs; APPLY short-circuits (no side effects)",
+        )
+        _row(
+            "paranoia",
+            paranoia,
+            "forces NOTIFY_APPLY floor; no SAFE_AUTO landings",
+        )
+        _row(
+            "min-risk-tier",
+            min_tier not in {"(unset)", ""},
+            "explicit tier floor; strictest-wins composition",
+            value=min_tier if min_tier != "(unset)" else "",
+        )
+        _row(
+            "risk-ceiling",
+            risk_ceiling not in {"(unset)", ""},
+            "/risk command floor (legacy)",
+            value=risk_ceiling if risk_ceiling != "(unset)" else "",
+        )
+        _row(
+            "quiet-hours",
+            quiet_raw != "(unset)",
+            f"window-based paranoia (tz={quiet_tz})",
+            value=quiet_raw if quiet_raw != "(unset)" else "",
+        )
+
+        summary = Text()
+        if dry_run:
+            summary.append(
+                "⚠ DRY-RUN ACTIVE — no ops will modify files this session.",
+                style="bold yellow",
+            )
+        elif paranoia or plan_review or min_tier not in {"(unset)", ""}:
+            summary.append(
+                "✓ At least one paranoia gate is on. Auto-apply is gated.",
+                style="green",
+            )
+        else:
+            summary.append(
+                "No paranoia gates active — ops auto-apply per risk engine.",
+                style="dim",
+            )
+
+        panel = Panel(
+            Group(tbl, Text(""), summary),
+            title="[bold]Plan & Execution Gates[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+        try:
+            sf = getattr(self, "_serpent_flow", None)
+            console = getattr(sf, "console", None) if sf is not None else None
+            if console is not None:
+                console.print(panel, highlight=False)
+            else:
+                self._repl_print(str(panel))
+        except Exception:
+            self._repl_print(str(panel))
 
     def _repl_cmd_goal(self, line: str) -> None:
         """Manage active goals at runtime.
@@ -1805,7 +1987,51 @@ class BattleTestHarness:
             if mem is None:
                 self._repl_print(f"[red]No memory matching '{rest}'[/red]")
                 return
-            self._repl_print(f"[bold]{mem.type.value}:{mem.name}[/bold]  [dim]({mem.id})[/dim]")
+            self._render_memory_detail_panel(mem)
+            return
+
+        # ---- New subcommands (super-beef) ------------------------------------
+        if subcmd == "stats":
+            self._render_memory_stats_panel(store, MemoryType)
+            return
+
+        if subcmd == "search":
+            if not rest:
+                self._repl_print("[red]Usage: /memory search <query>[/red]")
+                return
+            self._render_memory_search(store, rest)
+            return
+
+        if subcmd == "recent":
+            try:
+                n = int(rest) if rest else 10
+            except ValueError:
+                n = 10
+            self._render_memory_recent(store, max(1, min(100, n)))
+            return
+
+        self._repl_print(
+            "[dim]Usage: /memory | /memory list [type] | /memory add <type> "
+            "<name> | <desc> | /memory rm <id> | /memory forbid <path> | "
+            "/memory show <id> | /memory stats | /memory search <q> | "
+            "/memory recent [N][/dim]"
+        )
+
+    # ------------------------------------------------------------------
+    # /memory Rich renderers (super-beef)
+    # ------------------------------------------------------------------
+
+    def _render_memory_detail_panel(self, mem: Any) -> None:
+        """Rich panel for a single memory entry."""
+        try:
+            from rich.panel import Panel
+            from rich.text import Text
+            from rich.console import Group
+        except Exception:
+            # Plain fallback — same content as the legacy show output.
+            self._repl_print(
+                f"[bold]{mem.type.value}:{mem.name}[/bold]  [dim]({mem.id})[/dim]"
+            )
             self._repl_print(f"  [dim]description:[/dim] {mem.description}")
             if mem.why:
                 self._repl_print(f"  [dim]why:[/dim] {mem.why}")
@@ -1815,15 +2041,182 @@ class BattleTestHarness:
                 self._repl_print(f"  [dim]tags:[/dim] {', '.join(mem.tags)}")
             if mem.paths:
                 self._repl_print(f"  [dim]paths:[/dim] {', '.join(mem.paths)}")
-            if mem.content:
-                self._repl_print(f"  [dim]content:[/dim] {mem.content[:200]}")
             return
 
-        self._repl_print(
-            "[dim]Usage: /memory | /memory list [type] | /memory add <type> "
-            "<name> | <desc> | /memory rm <id> | /memory forbid <path> | "
-            "/memory show <id>[/dim]"
+        lines: List[Any] = []
+        header = Text()
+        header.append(_memory_type_emoji(mem.type.value), style="bold")
+        header.append(" ")
+        header.append(mem.type.value, style="bold cyan")
+        header.append("  ")
+        header.append(mem.name, style="bold")
+        header.append("  ")
+        header.append(f"({mem.id})", style="dim")
+        lines.append(header)
+        lines.append(Text(mem.description))
+        if mem.why:
+            lines.append(Text.assemble(("Why:  ", "bold dim"), Text(mem.why)))
+        if mem.how_to_apply:
+            lines.append(Text.assemble(("How:  ", "bold dim"), Text(mem.how_to_apply)))
+        if mem.tags:
+            lines.append(Text.assemble(
+                ("Tags: ", "bold dim"),
+                Text(", ".join(mem.tags), style="yellow"),
+            ))
+        if mem.paths:
+            lines.append(Text.assemble(
+                ("Paths: ", "bold dim"),
+                Text(", ".join(mem.paths), style="magenta"),
+            ))
+        if mem.content:
+            lines.append(Text(""))
+            lines.append(Text(mem.content[:800], style="dim"))
+            if len(mem.content) > 800:
+                lines.append(Text(
+                    f"… ({len(mem.content) - 800} chars truncated)",
+                    style="dim italic",
+                ))
+
+        panel = Panel(
+            Group(*lines),
+            title=f"[bold]Memory[/bold]  [dim]{mem.source or 'unknown-source'}[/dim]",
+            border_style=_memory_border_for_type(mem.type.value),
+            padding=(1, 2),
         )
+        sf = getattr(self, "_serpent_flow", None)
+        console = getattr(sf, "console", None) if sf is not None else None
+        if console is not None:
+            console.print(panel, highlight=False)
+        else:
+            self._repl_print(str(panel))
+
+    def _render_memory_stats_panel(self, store: Any, MemoryType: Any) -> None:
+        """Count + most-recent per type, as a Rich table."""
+        try:
+            from rich.panel import Panel
+            from rich.table import Table
+            from rich.text import Text
+        except Exception:
+            mems = store.list_all()
+            counts = {}
+            for m in mems:
+                counts[m.type.value] = counts.get(m.type.value, 0) + 1
+            for t, c in sorted(counts.items()):
+                self._repl_print(f"  {t}: {c}")
+            self._repl_print(f"  total: {len(mems)}")
+            return
+
+        tbl = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
+        tbl.add_column("Type")
+        tbl.add_column("Count", justify="right")
+        tbl.add_column("Most recent", no_wrap=False)
+
+        all_mems = list(store.list_all())
+        total = len(all_mems)
+        types_seen = {}
+        for t in MemoryType:
+            mems_t = [m for m in all_mems if m.type is t]
+            most_recent = (
+                max(mems_t, key=lambda m: m.updated_at or m.created_at or "")
+                if mems_t else None
+            )
+            types_seen[t] = (len(mems_t), most_recent)
+
+        for t, (count, most_recent) in types_seen.items():
+            count_style = "dim" if count == 0 else "bold"
+            recent_txt = (
+                Text(
+                    f"{most_recent.name} ({most_recent.id})",
+                    style="dim",
+                )
+                if most_recent else Text("—", style="dim")
+            )
+            tbl.add_row(
+                Text(
+                    f"{_memory_type_emoji(t.value)} {t.value}",
+                    style="cyan",
+                ),
+                Text(str(count), style=count_style),
+                recent_txt,
+            )
+
+        summary = Text()
+        summary.append(f"Total memories: ", style="dim")
+        summary.append(str(total), style="bold")
+        summary.append(
+            f"  |  store path: {store._root}",
+            style="dim",
+        )
+
+        from rich.console import Group
+        panel = Panel(
+            Group(tbl, Text(""), summary),
+            title="[bold]Memory Stats[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+        sf = getattr(self, "_serpent_flow", None)
+        console = getattr(sf, "console", None) if sf is not None else None
+        if console is not None:
+            console.print(panel, highlight=False)
+        else:
+            self._repl_print(str(panel))
+
+    def _render_memory_search(self, store: Any, query: str) -> None:
+        """Full-text search across name + description + content."""
+        q = query.strip().lower()
+        if not q:
+            return
+        hits = []
+        for m in store.list_all():
+            haystack = " ".join([
+                m.name or "", m.description or "",
+                m.content or "", m.why or "", m.how_to_apply or "",
+                " ".join(m.tags or ()), " ".join(m.paths or ()),
+            ]).lower()
+            if q in haystack:
+                hits.append(m)
+        if not hits:
+            self._repl_print(
+                f"[dim]No memories match '{query}'[/dim]"
+            )
+            return
+        self._repl_print(
+            f"[bold]Search[/bold]  [dim]query='{query}'  hits={len(hits)}[/dim]"
+        )
+        for m in hits[:25]:
+            type_tag = f"[cyan]{m.type.value}[/cyan]"
+            self._repl_print(
+                f"  {type_tag}  [bold]{m.name}[/bold] "
+                f"[dim]({m.id})[/dim]  {m.description[:80]}"
+            )
+        if len(hits) > 25:
+            self._repl_print(
+                f"  [dim]… {len(hits) - 25} more — refine the query[/dim]"
+            )
+
+    def _render_memory_recent(self, store: Any, n: int) -> None:
+        """Show the N most-recently-updated memories."""
+        all_mems = sorted(
+            store.list_all(),
+            key=lambda m: m.updated_at or m.created_at or "",
+            reverse=True,
+        )[:n]
+        if not all_mems:
+            self._repl_print("[dim]No memories recorded.[/dim]")
+            return
+        self._repl_print(
+            f"[bold]Recent memories[/bold]  [dim](top {len(all_mems)})[/dim]"
+        )
+        for m in all_mems:
+            ts = m.updated_at or m.created_at or ""
+            ts_short = ts[:19] if ts else ""
+            type_tag = f"[cyan]{m.type.value}[/cyan]"
+            self._repl_print(
+                f"  [dim]{ts_short}[/dim]  {type_tag}  "
+                f"[bold]{m.name}[/bold] [dim]({m.id})[/dim]  "
+                f"{m.description[:70]}"
+            )
 
     def _repl_cmd_remember(self, line: str) -> None:
         """Shortcut for /memory add user: stores a free-form USER memory.

@@ -5154,6 +5154,33 @@ class GovernedOrchestrator:
             await self._record_ledger(ctx, OperationState.FAILED, {"reason": "user_cancelled"})
             return ctx
 
+        # ── Session-scoped dry-run gate (Priority 4 /plan dry-run) ──
+        #
+        # Flipped by ``/plan dry-run`` in the REPL; ops pass every gate
+        # up to here (CLASSIFY → PLAN → GENERATE → VALIDATE → SECURITY
+        # → GATE → APPROVE → pre-APPLY checks), then short-circuit just
+        # before disk writes begin. Operators get full observability
+        # into "what the model wanted to do" without any filesystem /
+        # git side effects. This is distinct from JARVIS_SHOW_PLAN_BEFORE_EXECUTE
+        # (which gates at the PLAN→GENERATE boundary) — the dry-run
+        # flag is the hard "no side effects this session" kill switch.
+        if os.environ.get("JARVIS_DRY_RUN", "").strip().lower() in _TRUTHY:
+            logger.info(
+                "[Orchestrator] DRY_RUN: op=%s would APPLY %d file(s) — "
+                "skipping disk writes (set JARVIS_DRY_RUN=0 or /plan off)",
+                ctx.op_id,
+                len(ctx.target_files) if ctx.target_files else 0,
+            )
+            ctx = ctx.advance(
+                OperationPhase.CANCELLED,
+                terminal_reason_code="dry_run_session",
+            )
+            await self._record_ledger(
+                ctx, OperationState.FAILED,
+                {"reason": "dry_run_session"},
+            )
+            return ctx
+
         # ---- Phase 7: APPLY ----
         ctx = ctx.advance(OperationPhase.APPLY)
 
