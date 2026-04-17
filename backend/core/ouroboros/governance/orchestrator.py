@@ -4690,50 +4690,105 @@ class GovernedOrchestrator:
             except Exception:
                 pass
 
-            # Render diff preview in CLI before auto-apply
+            # Render diff preview in CLI before auto-apply.
+            #
+            # V1 rich preview: file tree + per-file panels + status
+            # badges + live countdown + cancel polling. Safe fallback
+            # to the legacy plain-sleep path on TTY-absent / env-off /
+            # any render failure — NOTIFY_APPLY behavior is preserved
+            # exactly in those cases. See diff_preview.py for the
+            # authority / kill-switch / dump-path contract.
             _notify_delay_s = float(os.environ.get("JARVIS_NOTIFY_APPLY_DELAY_S", "5"))
             if best_candidate is not None and _notify_delay_s > 0:
-                _diff_preview = (
-                    best_candidate.get("unified_diff")
-                    or best_candidate.get("full_content", "")
-                )
-                if _diff_preview:
-                    # Emit diff via heartbeat so SerpentFlow renders it
-                    try:
-                        for _t in getattr(self._stack.comm, "_transports", []):
-                            try:
-                                _preview_msg = type("_Msg", (), {
-                                    "payload": {
-                                        "phase": "notify_apply_diff",
-                                        "diff_preview": str(_diff_preview)[:4000],
-                                        "delay_s": _notify_delay_s,
-                                        "target_files": list(ctx.target_files),
-                                    },
-                                    "op_id": ctx.op_id,
-                                    "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
-                                })()
-                                await _t.send(_preview_msg)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    # Delay window — /reject during this window triggers cancellation
+                _changes: list = []
+                try:
+                    from backend.core.ouroboros.battle_test.diff_preview import (
+                        build_changes_from_candidate,
+                    )
+                    _changes = build_changes_from_candidate(
+                        best_candidate, self._config.project_root,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] build_changes_from_candidate failed; "
+                        "using legacy plain preview",
+                        exc_info=True,
+                    )
+                    _changes = []
+
+                # Resolve the SerpentFlow instance from the stack. When
+                # absent (headless / non-battle-test harness), take the
+                # plain asyncio.sleep path — behavior identical to legacy.
+                _serpent = getattr(self._stack, "serpent_flow", None)
+                _cancel_check = lambda: self._is_cancel_requested(ctx.op_id)
+                _cancelled = False
+
+                if _serpent is not None and hasattr(_serpent, "show_notify_apply_preview"):
                     logger.info(
-                        "[Orchestrator] NOTIFY_APPLY diff preview shown, waiting %.0fs for /reject",
+                        "[Orchestrator] NOTIFY_APPLY rich preview — op=%s "
+                        "files=%d delay=%.1fs",
+                        ctx.op_id, len(_changes), _notify_delay_s,
+                    )
+                    try:
+                        _cancelled = await _serpent.show_notify_apply_preview(
+                            op_id=ctx.op_id,
+                            reason=_reason,
+                            changes=_changes,
+                            delay_s=_notify_delay_s,
+                            cancel_check=_cancel_check,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "[Orchestrator] rich NOTIFY_APPLY preview raised; "
+                            "plain-sleep fallback",
+                            exc_info=True,
+                        )
+                        await asyncio.sleep(_notify_delay_s)
+                        _cancelled = _cancel_check()
+                else:
+                    # Legacy path preserved: emit heartbeat + sleep +
+                    # post-sleep cancel check.
+                    _diff_preview = (
+                        best_candidate.get("unified_diff")
+                        or best_candidate.get("full_content", "")
+                    )
+                    if _diff_preview:
+                        try:
+                            for _t in getattr(self._stack.comm, "_transports", []):
+                                try:
+                                    _preview_msg = type("_Msg", (), {
+                                        "payload": {
+                                            "phase": "notify_apply_diff",
+                                            "diff_preview": str(_diff_preview)[:4000],
+                                            "delay_s": _notify_delay_s,
+                                            "target_files": list(ctx.target_files),
+                                        },
+                                        "op_id": ctx.op_id,
+                                        "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                                    })()
+                                    await _t.send(_preview_msg)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    logger.info(
+                        "[Orchestrator] NOTIFY_APPLY diff preview shown, "
+                        "waiting %.0fs for /reject",
                         _notify_delay_s,
                     )
                     await asyncio.sleep(_notify_delay_s)
-                    # Check if user cancelled during the window
-                    if self._is_cancel_requested(ctx.op_id):
-                        ctx = ctx.advance(
-                            OperationPhase.CANCELLED,
-                            terminal_reason_code="user_rejected_notify_apply",
-                        )
-                        await self._record_ledger(
-                            ctx, OperationState.FAILED,
-                            {"reason": "user_rejected_notify_apply"},
-                        )
-                        return ctx
+                    _cancelled = _cancel_check()
+
+                if _cancelled:
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="user_rejected_notify_apply",
+                    )
+                    await self._record_ledger(
+                        ctx, OperationState.FAILED,
+                        {"reason": "user_rejected_notify_apply"},
+                    )
+                    return ctx
 
         # ---- Phase 6: APPROVE (conditional) ----
         if risk_tier is RiskTier.APPROVAL_REQUIRED:

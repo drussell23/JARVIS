@@ -1389,6 +1389,192 @@ class SerpentFlow:
                 f"[{_C['neural']}]⏺ Proposed changes[/{_C['neural']}]  {summary}",
             )
 
+    # ── NOTIFY_APPLY rich preview (V1) ────────────────────────────
+    #
+    # Replaces the legacy 4000-char truncated plain-text preview on the
+    # Yellow-tier auto-apply path. The renderer handles tree + badges +
+    # per-file panels + countdown + cancel polling. Safe fallback: if
+    # the Rich preview fails or the TTY/env gate is off, we revert to
+    # the plain asyncio.sleep + legacy preview path and NOTIFY_APPLY
+    # behaves exactly as it did before.
+
+    async def show_notify_apply_preview(
+        self,
+        *,
+        op_id: str,
+        reason: str,
+        changes: Any,
+        delay_s: float,
+        cancel_check: Optional[Any] = None,
+    ) -> bool:
+        """Render the Yellow-tier diff preview with live countdown.
+
+        Parameters
+        ----------
+        op_id : str
+            Canonical op id (appears in header + dump filename).
+        reason : str
+            Risk-engine reason code (e.g. ``single_file_small_diff``).
+        changes : Sequence[FileChange]
+            Pre-built list of FileChange records (the caller owns
+            disk-read + binary detection via ``build_changes_from_candidate``).
+        delay_s : float
+            Total delay window in seconds. The live panel ticks down at
+            250ms cadence; ``cancel_check`` is polled on each tick so
+            /reject feels instant.
+        cancel_check : Callable[[], bool] | None
+            Returns True if the operator requested cancellation mid-window.
+            When None, no polling — the delay runs to completion.
+
+        Returns
+        -------
+        bool
+            True if ``cancel_check`` flagged cancellation during the window,
+            False if the delay completed naturally. The orchestrator uses
+            the return value to take the CANCELLED path.
+        """
+        import asyncio
+        import time as _time
+
+        try:
+            from backend.core.ouroboros.battle_test.diff_preview import (
+                DiffPreviewRenderer,
+                dump_full_diff,
+                should_render,
+            )
+        except Exception:
+            logger.debug(
+                "[NotifyApply] diff_preview import failed — plain fallback",
+                exc_info=True,
+            )
+            return await self._notify_apply_plain_fallback(
+                delay_s=delay_s, cancel_check=cancel_check,
+            )
+
+        # Optional on-disk dump — never fails loudly.
+        try:
+            dump_full_diff(op_id=op_id, changes=changes)
+        except Exception:
+            pass
+
+        # Combined gate: env on AND real TTY. In background / CI / piped
+        # runs the rich panel is noise; fall through to plain delay.
+        if not should_render(self.console):
+            return await self._notify_apply_plain_fallback(
+                delay_s=delay_s, cancel_check=cancel_check,
+            )
+
+        if not changes:
+            # Degenerate — still honor the delay so behavior is unchanged.
+            return await self._notify_apply_plain_fallback(
+                delay_s=delay_s, cancel_check=cancel_check,
+            )
+
+        try:
+            from rich.live import Live
+        except Exception:
+            return await self._notify_apply_plain_fallback(
+                delay_s=delay_s, cancel_check=cancel_check,
+            )
+
+        renderer = DiffPreviewRenderer()
+        deadline = _time.monotonic() + max(0.0, delay_s)
+        TICK_S = 0.25
+
+        try:
+            live = Live(
+                renderer.build(
+                    op_id=op_id, reason=reason,
+                    changes=list(changes),
+                    delay_remaining_s=max(0.0, delay_s),
+                ),
+                console=self.console,
+                transient=False,
+                refresh_per_second=8,
+            )
+        except Exception:
+            logger.debug(
+                "[NotifyApply] Live construction failed — plain fallback",
+                exc_info=True,
+            )
+            return await self._notify_apply_plain_fallback(
+                delay_s=delay_s, cancel_check=cancel_check,
+            )
+
+        try:
+            live.start()
+            while True:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                if cancel_check is not None:
+                    try:
+                        if cancel_check():
+                            return True
+                    except Exception:
+                        # Cancel-check errors must not break the countdown.
+                        pass
+                try:
+                    live.update(
+                        renderer.build(
+                            op_id=op_id, reason=reason,
+                            changes=list(changes),
+                            delay_remaining_s=max(0.0, remaining),
+                        )
+                    )
+                except Exception:
+                    # Re-render failure is non-fatal; keep ticking.
+                    logger.debug(
+                        "[NotifyApply] re-render failed; continuing",
+                        exc_info=True,
+                    )
+                await asyncio.sleep(min(TICK_S, max(0.05, remaining)))
+            # Final cancel check after the loop exits cleanly.
+            if cancel_check is not None:
+                try:
+                    if cancel_check():
+                        return True
+                except Exception:
+                    pass
+            return False
+        finally:
+            try:
+                live.stop()
+            except Exception:
+                pass
+
+    async def _notify_apply_plain_fallback(
+        self,
+        *,
+        delay_s: float,
+        cancel_check: Optional[Any] = None,
+    ) -> bool:
+        """Legacy plain-sleep path — used when the rich preview is off
+        or fails. Polls the cancel flag on the same 250ms cadence so
+        /reject feels the same to the operator either way.
+        """
+        import asyncio
+        import time as _time
+        deadline = _time.monotonic() + max(0.0, delay_s)
+        while True:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+            if cancel_check is not None:
+                try:
+                    if cancel_check():
+                        return True
+                except Exception:
+                    pass
+            await asyncio.sleep(min(0.25, max(0.05, remaining)))
+        if cancel_check is not None:
+            try:
+                if cancel_check():
+                    return True
+            except Exception:
+                pass
+        return False
+
     # ── Operation completion ──────────────────────────────────
 
     def op_completed(
