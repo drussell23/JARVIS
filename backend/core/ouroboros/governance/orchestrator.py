@@ -2448,9 +2448,14 @@ class GovernedOrchestrator:
                         )
                         _stream_renderer = get_stream_renderer()
                         if _stream_renderer is not None:
+                            # Provider name is unknown at this point
+                            # (adaptive failback chooses mid-generate).
+                            # Pass empty string; the renderer's INFO line
+                            # will show provider="" rather than mislabeling
+                            # with task_complexity.
                             _stream_renderer.start(
                                 op_id=ctx.op_id,
-                                provider=getattr(ctx, "task_complexity", "") or "claude",
+                                provider="",
                             )
                     except Exception:
                         logger.debug(
