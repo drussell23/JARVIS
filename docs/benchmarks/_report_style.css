@@ -1,0 +1,415 @@
+/* ============================================================
+ * Research-paper styling for DW_BENCHMARKS_2026-04-16
+ * Print-optimized, clickable-navigation ready.
+ * ============================================================ */
+
+:root {
+  --text: #1f2328;
+  --text-muted: #59636e;
+  --accent: #2c5aa0;
+  --accent-dark: #1e3f70;
+  --border: #d1d9e0;
+  --border-strong: #59636e;
+  --bg-subtle: #f6f8fa;
+  --bg-code: #f6f8fa;
+  --bg-quote: #f0f5ff;
+  --bg-cover: #1f2328;
+  --cover-text: #ffffff;
+  --success: #1a7f37;
+  --warn: #9a6700;
+  --danger: #cf222e;
+  --max-width: 780px;
+  --figure-max: 760px;
+}
+
+* { box-sizing: border-box; }
+
+html {
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: "Charter", "Georgia", "Palatino", "Times New Roman", serif;
+  line-height: 1.7;
+  color: var(--text);
+  background: #ffffff;
+  max-width: var(--max-width);
+  margin: 3em auto;
+  padding: 0 2.5em;
+  font-feature-settings: "liga", "kern", "onum";
+}
+
+/* ---- Typography — sans for display, serif for body ---- */
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-weight: 700;
+  line-height: 1.2;
+  color: #0a0c10;
+  letter-spacing: -0.015em;
+  font-feature-settings: "liga", "kern";
+}
+
+h1 {
+  font-size: 2.2em;
+  margin-top: 2.2em;
+  margin-bottom: 0.45em;
+  padding-bottom: 0.3em;
+  border-bottom: 3px solid var(--border-strong);
+  letter-spacing: -0.025em;
+}
+
+/* Cover treatment for the title H1 */
+body > h1:first-of-type {
+  font-size: 2.7em;
+  margin-top: 0.5em;
+  margin-bottom: 0.2em;
+  border-bottom: none;
+  padding-bottom: 0;
+  text-align: left;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+}
+
+h2 {
+  font-size: 1.55em;
+  margin-top: 2.3em;
+  margin-bottom: 0.5em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--border);
+}
+
+h3 {
+  font-size: 1.22em;
+  margin-top: 1.8em;
+  margin-bottom: 0.4em;
+}
+
+h4 {
+  font-size: 1.05em;
+  margin-top: 1.4em;
+  margin-bottom: 0.3em;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+p, ul, ol {
+  margin-top: 0.55em;
+  margin-bottom: 0.85em;
+}
+
+p { hyphens: auto; -webkit-hyphens: auto; }
+
+strong {
+  font-weight: 700;
+  color: #0a0c10;
+}
+
+em { color: var(--text); font-style: italic; }
+
+/* ---- Title block (YAML front matter) ---- */
+
+header#title-block-header {
+  padding: 2em 0 1.6em 0;
+  margin-bottom: 2em;
+  border-bottom: 1px solid var(--border);
+}
+
+header#title-block-header h1.title {
+  font-size: 2.7em;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
+  margin: 0 0 0.3em 0;
+  padding: 0;
+  border: none;
+}
+
+header#title-block-header .subtitle {
+  font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 1.2em;
+  color: var(--text-muted);
+  font-style: italic;
+  font-weight: 400;
+  margin: 0 0 1em 0;
+}
+
+header#title-block-header .author,
+header#title-block-header .date {
+  font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, sans-serif;
+  color: var(--text-muted);
+  font-size: 0.98em;
+  margin: 0.15em 0;
+  font-weight: 500;
+}
+
+/* ---- Auto-generated TOC from pandoc --toc ---- */
+
+nav#TOC {
+  font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 0.92em;
+  padding: 1.4em 1.6em;
+  margin: 2em 0 2.5em 0;
+  background: var(--bg-subtle);
+  border-left: 4px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  line-height: 1.45;
+}
+
+nav#TOC::before {
+  content: "Table of Contents";
+  display: block;
+  font-family: "SF Pro Display", sans-serif;
+  font-size: 1.35em;
+  font-weight: 700;
+  color: #0a0c10;
+  margin-bottom: 0.7em;
+  letter-spacing: -0.01em;
+}
+
+nav#TOC ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.2em 0;
+}
+
+nav#TOC > ul { padding-left: 0; }
+nav#TOC > ul > li { margin: 0.35em 0; font-weight: 600; }
+nav#TOC > ul > li > a { color: var(--accent-dark); }
+
+nav#TOC ul ul { padding-left: 1.4em; margin-top: 0.15em; }
+nav#TOC ul ul li { margin: 0.15em 0; font-weight: 400; font-size: 0.95em; }
+nav#TOC ul ul li > a { color: var(--text); }
+
+nav#TOC ul ul ul { padding-left: 1.2em; }
+nav#TOC ul ul ul li { font-size: 0.9em; color: var(--text-muted); }
+nav#TOC ul ul ul li > a { color: var(--text-muted); }
+
+nav#TOC a {
+  text-decoration: none;
+  border-bottom: none;
+  transition: color 0.15s ease;
+}
+
+nav#TOC a:hover { color: var(--accent); }
+
+/* ---- Links ---- */
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s ease;
+}
+
+a:hover { border-bottom-color: var(--accent); }
+
+/* ---- Code ---- */
+
+code {
+  font-family: "SF Mono", "Menlo", "Monaco", "Consolas", "Liberation Mono", monospace;
+  font-size: 0.85em;
+  background: var(--bg-code);
+  padding: 0.14em 0.38em;
+  border-radius: 4px;
+  color: #1f2328;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+pre {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1em 1.2em;
+  overflow-x: auto;
+  font-size: 0.82em;
+  line-height: 1.55;
+  margin: 1em 0;
+}
+
+pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+  color: #1f2328;
+  white-space: pre;
+}
+
+/* ---- Tables ---- */
+
+table {
+  border-collapse: collapse;
+  margin: 1.2em auto;
+  width: 100%;
+  font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 0.9em;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+thead { background: var(--bg-subtle); }
+
+th {
+  padding: 0.6em 0.85em;
+  text-align: left;
+  font-weight: 700;
+  color: #0a0c10;
+  border-bottom: 2px solid var(--border-strong);
+  vertical-align: top;
+  font-size: 0.95em;
+}
+
+td {
+  padding: 0.55em 0.85em;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  line-height: 1.5;
+}
+
+tr:last-child td { border-bottom: none; }
+tr:nth-child(even) td { background: #fafbfc; }
+
+/* ---- Figures ---- */
+
+p > img, figure > img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 1.2em auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+/* Pandoc renders ![caption](path) as a <figure> if implicit_figures is enabled.
+ * Without that, it's just a <p><img></p>. Either way, we want centered images. */
+
+figure {
+  margin: 1.4em auto;
+  text-align: center;
+}
+
+figcaption {
+  font-family: "SF Pro Text", sans-serif;
+  font-size: 0.88em;
+  color: var(--text-muted);
+  text-align: center;
+  margin-top: 0.5em;
+  font-style: italic;
+  line-height: 1.4;
+}
+
+/* ---- Blockquotes (Big Picture callouts) ---- */
+
+blockquote {
+  background: var(--bg-quote);
+  border-left: 4px solid var(--accent);
+  margin: 1.4em 0;
+  padding: 0.9em 1.3em;
+  border-radius: 0 6px 6px 0;
+  color: var(--text);
+  font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 0.95em;
+  line-height: 1.6;
+}
+
+blockquote p { margin: 0.4em 0; }
+blockquote p:first-child { margin-top: 0; }
+blockquote p:last-child { margin-bottom: 0; }
+blockquote strong { color: var(--accent-dark); }
+
+/* ---- Horizontal rule as page-break signal ---- */
+
+hr {
+  border: 0;
+  border-top: 2px solid var(--border-strong);
+  margin: 3em 0;
+  height: 1px;
+}
+
+/* ---- Lists ---- */
+
+ul, ol { padding-left: 1.6em; }
+
+li {
+  margin: 0.3em 0;
+  line-height: 1.6;
+}
+
+li > p { margin: 0.25em 0; }
+
+/* ---- Print / PDF specifics ---- */
+
+@page {
+  size: Letter;
+  margin: 0.85in 0.8in 0.95in 0.8in;
+  @bottom-center {
+    content: "Page " counter(page) " of " counter(pages);
+    font-family: "SF Pro Text", sans-serif;
+    font-size: 8pt;
+    color: #7a7a7a;
+  }
+  @top-right {
+    content: "DoubleWord × Ouroboros + Venom — Benchmarks";
+    font-family: "SF Pro Text", sans-serif;
+    font-size: 8pt;
+    color: #7a7a7a;
+  }
+}
+
+@page :first {
+  @top-right { content: none; }
+  @bottom-center { content: none; }
+}
+
+@media print {
+  body {
+    max-width: none;
+    margin: 0;
+    padding: 0;
+    font-size: 10.5pt;
+    color: #000;
+  }
+  header#title-block-header {
+    padding-top: 2.5in;
+    padding-bottom: 1in;
+    page-break-after: always;
+    border-bottom: none;
+    text-align: left;
+  }
+  header#title-block-header h1.title { font-size: 28pt; }
+  header#title-block-header .subtitle { font-size: 14pt; }
+  nav#TOC {
+    page-break-before: always;
+    page-break-after: always;
+    border-left-width: 3px;
+    break-inside: avoid;
+  }
+  h1 {
+    page-break-before: always;
+    page-break-after: avoid;
+    font-size: 20pt;
+  }
+  h1:first-of-type { page-break-before: avoid; }
+  h2 { page-break-after: avoid; font-size: 14pt; margin-top: 1.3em; }
+  h3 { page-break-after: avoid; font-size: 11.5pt; }
+  h4 { page-break-after: avoid; }
+  pre, table, blockquote, figure { page-break-inside: avoid; }
+  tr { page-break-inside: avoid; }
+  p { orphans: 3; widows: 3; }
+  a { color: #000; border-bottom: none; }
+  a[href^="http"]:after {
+    content: " (" attr(href) ")";
+    font-size: 0.85em;
+    color: var(--text-muted);
+    word-break: break-all;
+  }
+  nav#TOC a::after { content: none; }
+  hr { page-break-after: always; visibility: hidden; margin: 0; height: 0; }
+  thead { display: table-header-group; }
+  blockquote { background: #f0f5ff; border-left-color: #000; }
+  p > img, figure > img { max-width: 92%; }
+}
