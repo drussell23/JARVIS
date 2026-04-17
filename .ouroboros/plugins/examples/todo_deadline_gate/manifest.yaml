@@ -1,0 +1,12 @@
+name: todo_deadline_gate
+type: gate
+entry_module: gate
+entry_class: TodoDeadlineGate
+version: 1.0.0
+description: >
+  Example gate plugin — adds a SemanticGuardian pattern that flags
+  new TODO/FIXME/XXX comments without an adjacent deadline marker
+  (YYYY-MM-DD). Real teams enforce commit-hygiene rules like "every
+  TODO must have an owner + a deadline" at code-review time; this
+  plugin lets O+V enforce them pre-APPLY.
+author: ouroboros-examples

@@ -819,6 +819,50 @@ class BattleTestHarness:
                     exc_info=True,
                 )
 
+            # ── Plugin registry discovery + load (Priority 3 Feature B) ──
+            # Gated by JARVIS_PLUGINS_ENABLED (default OFF). Discovers
+            # plugins under .ouroboros/plugins/ + $JARVIS_PLUGINS_PATH,
+            # validates manifests, loads + wires into the appropriate
+            # subsystem (sensor / gate / repl). Every error is isolated
+            # — one bad plugin never blocks others.
+            self._plugin_registry = None
+            try:
+                from backend.core.ouroboros.plugins import (
+                    PluginRegistry,
+                    register_default_plugins,
+                    plugins_enabled,
+                )
+                if plugins_enabled():
+                    # Resolve the intake router for sensor plugins.
+                    _router = None
+                    for _attr in (
+                        "_intake_router", "intake_router",
+                        "_router", "router",
+                    ):
+                        _cand = getattr(
+                            self._governed_loop_service, _attr, None,
+                        )
+                        if _cand is not None:
+                            _router = _cand
+                            break
+                    self._plugin_registry = PluginRegistry(
+                        repo_root=self._config.repo_path,
+                    )
+                    await self._plugin_registry.discover_and_load(
+                        intake_router=_router,
+                    )
+                    register_default_plugins(self._plugin_registry)
+                else:
+                    logger.debug(
+                        "[Harness] plugins disabled — set "
+                        "JARVIS_PLUGINS_ENABLED=1 to enable",
+                    )
+            except Exception:
+                logger.warning(
+                    "[Harness] plugin discovery/load failed — continuing",
+                    exc_info=True,
+                )
+
             # Boot each subsystem independently — failure of one should not
             # prevent others from starting (Manifesto §2: progressive awakening).
 
@@ -1103,6 +1147,13 @@ class BattleTestHarness:
             # The orchestrator picks up the flag at CONTEXT_EXPANSION
             # and injects the TDD prompt directive.
             self._repl_cmd_tdd(command.strip())
+        elif cmd == "/plugins" or cmd.startswith("/plugins "):
+            # /plugins — list loaded + failed plugins (Rich table).
+            self._repl_cmd_plugins(command.strip())
+        elif await self._try_dispatch_plugin_command(command.strip()):
+            # Plugin-registered slash commands: /greet, /<plugin_cmd>, etc.
+            # Returns True iff a plugin handled the command.
+            pass
         else:
             logger.debug("Unknown REPL command: %s", cmd)
 
@@ -2025,6 +2076,134 @@ class BattleTestHarness:
     # ------------------------------------------------------------------
     # /memory Rich renderers (super-beef)
     # ------------------------------------------------------------------
+
+    def _repl_cmd_plugins(self, line: str) -> None:
+        """/plugins — list loaded / failed / disabled plugins.
+
+        Usage
+        -----
+        /plugins           → Rich table of all plugins + states
+        /plugins failed    → only show failed plugins with error text
+        """
+        reg = getattr(self, "_plugin_registry", None)
+        if reg is None:
+            from backend.core.ouroboros.plugins import plugins_enabled
+            if not plugins_enabled():
+                self._repl_print(
+                    "[yellow]Plugins disabled.[/yellow] "
+                    "[dim]Set JARVIS_PLUGINS_ENABLED=1 and restart.[/dim]"
+                )
+            else:
+                self._repl_print(
+                    "[dim]No plugin registry (enabled but not yet booted).[/dim]"
+                )
+            return
+
+        parts = line.split(None, 1)
+        sub = parts[1].strip().lower() if len(parts) > 1 else ""
+        outcomes = list(reg.outcomes)
+        if sub == "failed":
+            outcomes = [o for o in outcomes if o.state == "failed"]
+
+        try:
+            from rich.panel import Panel
+            from rich.table import Table
+            from rich.text import Text
+        except Exception:
+            # Plain fallback.
+            if not outcomes:
+                self._repl_print("[dim]No plugins loaded.[/dim]")
+                return
+            for o in outcomes:
+                self._repl_print(
+                    f"  {o.state:>10}  {o.name:<30}  {o.error or ''}"
+                )
+            return
+
+        if not outcomes:
+            self._repl_print("[dim]No plugins discovered.[/dim]")
+            return
+
+        tbl = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
+        tbl.add_column("state", justify="center")
+        tbl.add_column("type")
+        tbl.add_column("name")
+        tbl.add_column("version", justify="right")
+        tbl.add_column("details", no_wrap=False)
+
+        state_color = {
+            "loaded": "green",
+            "failed": "red",
+            "disabled_by_type": "dim",
+            "skipped_master_off": "dim",
+            "pending": "yellow",
+        }
+        for o in outcomes:
+            m = o.manifest
+            color = state_color.get(o.state, "white")
+            details = ""
+            if o.state == "failed" and o.error:
+                details = o.error
+            elif o.state == "loaded" and m is not None:
+                details = (m.description or "")[:80]
+            tbl.add_row(
+                Text(o.state, style=color),
+                (m.type if m else "?"),
+                (m.name if m else o.name),
+                (m.version if m else ""),
+                details,
+            )
+        summary = Text()
+        loaded = sum(1 for o in outcomes if o.state == "loaded")
+        failed = sum(1 for o in outcomes if o.state == "failed")
+        summary.append(f"loaded={loaded}  failed={failed}", style="bold")
+        if failed:
+            summary.append(
+                "  /plugins failed for error details", style="dim",
+            )
+        panel = Panel(
+            tbl,
+            title="[bold]Plugin Registry[/bold]",
+            subtitle=str(summary),
+            border_style="cyan",
+            padding=(1, 2),
+        )
+        sf = getattr(self, "_serpent_flow", None)
+        console = getattr(sf, "console", None) if sf is not None else None
+        if console is not None:
+            console.print(panel, highlight=False)
+        else:
+            self._repl_print(str(panel))
+
+    async def _try_dispatch_plugin_command(self, line: str) -> bool:
+        """Return True if a plugin-registered REPL command matched and
+        executed. False means the dispatch should fall through to the
+        "Unknown REPL command" DEBUG log.
+
+        The dispatch is tolerant — exceptions in plugin ``run()``
+        surface as an error message to the operator, never crash the
+        REPL loop.
+        """
+        reg = getattr(self, "_plugin_registry", None)
+        if reg is None:
+            return False
+        stripped = line.strip()
+        if not stripped.startswith("/"):
+            return False
+        head, _, args = stripped[1:].partition(" ")
+        plugin = reg.repl_command(head)
+        if plugin is None:
+            return False
+        try:
+            output = await plugin.run(args.strip())
+        except Exception as exc:
+            self._repl_print(
+                f"[red]/{head}: plugin raised {type(exc).__name__}: {exc}[/red]"
+            )
+            return True
+        if output:
+            self._repl_print(output)
+        return True
 
     def _repl_cmd_tdd(self, line: str) -> None:
         """/tdd <op-id> — mark an in-flight / pending op as TDD-shaped.

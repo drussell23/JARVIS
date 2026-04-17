@@ -1,0 +1,12 @@
+name: heartbeat_sensor
+type: sensor
+entry_module: sensor
+entry_class: HeartbeatSensor
+version: 1.0.0
+description: >
+  Example sensor plugin — emits a low-urgency heartbeat signal every N
+  seconds. Demonstrates the SensorPlugin.on_tick() model. Useful as a
+  template for plugins that poll external systems (Slack, GitHub,
+  Linear, custom dashboards).
+author: ouroboros-examples
+tick_interval_s: 300

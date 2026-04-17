@@ -1,0 +1,10 @@
+name: greet_cmd
+type: repl
+entry_module: cmd
+entry_class: GreetCommand
+version: 1.0.0
+description: >
+  Trivial example REPL command — adds /greet to the slash dispatch.
+  Intended as the minimum template for operator-authored commands:
+  copy this directory, rename, rewrite run().
+author: ouroboros-examples
