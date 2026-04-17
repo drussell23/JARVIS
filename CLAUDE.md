@@ -137,6 +137,8 @@ On startup, the harness auto-reaps any zombie `ouroboros_battle_test.py` process
 
 Partial-shutdown insurance: the harness registers an `atexit` fallback **and** a sync signal-handler write so every session dir ends up with a v1.1a-parseable `summary.json` — even when SIGTERM arrives mid-cleanup or the async finally can't complete. `SIGKILL` remains unrecoverable by design (OS-level, uncatchable in Python). Regression spine for "session continuity + aborted runs": `tests/governance/test_last_session_summary_composition.py` (proves production injection path wires LSS tokens into the composed CONTEXT_EXPANSION prompt) + `tests/battle_test/test_harness_partial_shutdown.py` (proves partial summaries land on every reachable exit path and are LSS-parseable on the next boot).
 
+Operator-visible UX (Rich): the GENERATE token stream (`stream_renderer.py`) and the NOTIFY_APPLY rich diff preview (`diff_preview.py`) both require a real interactive TTY — headless / sandbox / CI runs always fall through to the plain (spinner-and-sleep) paths, so visual verification of these features is a local interactive battle test, not a background run.
+
 ## File Layout (Key Paths)
 
 ```
