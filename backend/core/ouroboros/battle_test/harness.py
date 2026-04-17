@@ -760,6 +760,29 @@ class BattleTestHarness:
             await self._governed_loop_service.start()
             logger.info("GovernedLoopService booted")
 
+            # ── Glanceable operator status line (Priority 2B) ─────────
+            # Aggregates cost / idle / phase / op / route data from the
+            # live subsystems and feeds SerpentFlow's bottom_toolbar.
+            # Registration is best-effort — any failure leaves the
+            # legacy verbose toolbar intact.
+            try:
+                from backend.core.ouroboros.battle_test.status_line import (
+                    StatusLineBuilder,
+                    register_status_line_builder,
+                )
+                _status_builder = StatusLineBuilder(
+                    cost_tracker=self._cost_tracker,
+                    idle_watchdog=self._idle_watchdog,
+                    governed_loop_service=self._governed_loop_service,
+                )
+                register_status_line_builder(_status_builder)
+                logger.info("[Harness] StatusLineBuilder registered")
+            except Exception as exc:
+                logger.debug(
+                    "[Harness] StatusLineBuilder registration failed: %s",
+                    exc, exc_info=True,
+                )
+
             # Boot each subsystem independently — failure of one should not
             # prevent others from starting (Manifesto §2: progressive awakening).
 

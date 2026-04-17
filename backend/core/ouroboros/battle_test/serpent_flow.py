@@ -2985,7 +2985,31 @@ class SerpentREPL:
         # ── Zone 3: Status bar via bottom_toolbar ──
         # The toolbar callable is invoked on every prompt redraw,
         # giving us a live-updating status line at the terminal bottom.
+        #
+        # Priority 2B: delegates to ``StatusLineBuilder`` when registered
+        # (Phase · Cost · Idle · Op · [route·provider] — glanceable,
+        # scannable, colour-graded). Falls back to the legacy verbose
+        # layout when the builder is absent (headless harness, tests)
+        # or when JARVIS_UI_STATUS_LINE_ENABLED=0. ``refresh_interval``
+        # on PromptSession ticks the toolbar every 500ms (env-tunable
+        # via JARVIS_UI_STATUS_LINE_REFRESH_MS) so the line updates
+        # smoothly through execution phases, not just on keystrokes.
         def _toolbar():
+            # Try the glanceable builder first.
+            try:
+                from backend.core.ouroboros.battle_test.status_line import (
+                    get_status_line_builder,
+                )
+                _builder = get_status_line_builder()
+                if _builder is not None:
+                    _html_str = _builder.render_prompt_toolkit()
+                    if _html_str:
+                        return HTML(_html_str)
+            except Exception:
+                # Any failure in the glanceable path is non-fatal —
+                # fall through to the legacy layout below.
+                pass
+
             f = self._flow
             elapsed = time.time() - f._started_at
             m, s = int(elapsed // 60), int(elapsed % 60)
@@ -3006,7 +3030,17 @@ class SerpentREPL:
                 f"⏱ {m}m {s:02d}s"
             )
 
-        self._session = PromptSession(bottom_toolbar=_toolbar)
+        # Refresh cadence from the status-line env (default 500ms).
+        try:
+            from backend.core.ouroboros.battle_test.status_line import (
+                refresh_interval_s as _status_refresh_s,
+            )
+            _refresh = _status_refresh_s()
+        except Exception:
+            _refresh = 0.5
+        self._session = PromptSession(
+            bottom_toolbar=_toolbar, refresh_interval=_refresh,
+        )
 
         with patch_stdout(raw=True):
             while self._running:

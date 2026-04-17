@@ -317,8 +317,56 @@ class RepairEngine:
         else:
             self._sandbox_factory = sandbox_factory
         self._classifier = _lazy_classifier()
+        # Live iteration accounting — read by the operator status line
+        # (``StatusLineBuilder``) so the glanceable TUI can render
+        # ``Phase: L2 Repair 2/8`` while ``run()`` is in progress.
+        # Zeroes outside an active ``run()`` call. Write-only inside
+        # the run loop; readers should treat as advisory (no lock).
+        self._current_iteration: int = 0
+        self._max_iterations_live: int = 0
+
+    # ------------------------------------------------------------------
+    # Public live-iteration accessors (read by operator status line)
+    # ------------------------------------------------------------------
+    @property
+    def current_iteration(self) -> int:
+        """0 when not running; 1..N during an active repair pass."""
+        return self._current_iteration
+
+    @property
+    def max_iterations_live(self) -> int:
+        """``budget.max_iterations`` while ``run()`` is in flight; else 0."""
+        return self._max_iterations_live
+
+    @property
+    def is_running(self) -> bool:
+        """True iff ``run()`` is currently inside its loop."""
+        return self._max_iterations_live > 0
 
     async def run(
+        self,
+        ctx: Any,
+        _best_validation: Any,
+        pipeline_deadline: datetime,
+    ) -> RepairResult:
+        """Execute the L2 repair loop. See :meth:`_run_inner` for behavior.
+
+        This outer wrapper exists solely to guarantee that the live
+        iteration counters exposed via :attr:`current_iteration` /
+        :attr:`max_iterations_live` / :attr:`is_running` reset to zero
+        no matter which of ``run()``'s many return paths (or exceptions)
+        fires. The operator status line reads these counters to render
+        ``Phase: L2 Repair 2/8`` — stale values after a completed run
+        would cause the status line to claim "L2 still running" until
+        the next op overwrites them.
+        """
+        try:
+            return await self._run_inner(ctx, _best_validation, pipeline_deadline)
+        finally:
+            self._current_iteration = 0
+            self._max_iterations_live = 0
+
+    async def _run_inner(
         self,
         ctx: Any,
         _best_validation: Any,
@@ -349,6 +397,11 @@ class RepairEngine:
         """
         budget = self._budget
         iteration = 0
+        # Expose live iteration accounting for the operator status line.
+        # ``max_iterations_live`` is non-zero iff the run loop is active;
+        # the status line uses that as the ``is_running`` signal.
+        self._current_iteration = 0
+        self._max_iterations_live = budget.max_iterations
         repair_context = None
         seen_pairs: Set[Tuple[str, str]] = set()
         class_retry_counts: Dict[str, int] = {}
@@ -399,6 +452,7 @@ class RepairEngine:
                 return _stopped("max_validation_runs_exhausted")
 
             iteration += 1
+            self._current_iteration = iteration  # live counter for status line
             _logger.info(
                 "\U0001f527 [L2 Repair] Iteration %d/%d starting (%.0fs elapsed, %.0fs remaining)",
                 iteration, budget.max_iterations, elapsed, remaining_s,
