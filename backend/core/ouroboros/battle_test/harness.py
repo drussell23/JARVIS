@@ -1049,6 +1049,10 @@ class BattleTestHarness:
             self._repl_cmd_remember(command.strip())
         elif cmd.startswith("/forget") or cmd.startswith("forget "):
             self._repl_cmd_forget(command.strip())
+        elif cmd.startswith("/undo") or cmd.startswith("undo ") or cmd == "undo":
+            # /undo N (revert last N O+V commits); /undo preview [N];
+            # /undo --hard N. Async because executor awaits comm emits.
+            await self._repl_cmd_undo(command.strip())
         else:
             logger.debug("Unknown REPL command: %s", cmd)
 
@@ -1859,6 +1863,94 @@ class BattleTestHarness:
             self._repl_print(f"[green]Forgotten: {mem_id}[/green]")
         else:
             self._repl_print(f"[red]No memory matching '{mem_id}'[/red]")
+
+    async def _repl_cmd_undo(self, line: str) -> None:
+        """/undo N — revert the last N O+V auto-commits.
+
+        Grammar
+        -------
+        /undo                  → undo last 1 auto-commit
+        /undo N                → undo last N auto-commits (N ≤ MAX_BATCH)
+        /undo preview [N]      → dry-run: plan + safety check, no git mutation
+        /undo --hard N         → reset --hard (history rewrite, unpushed only)
+
+        Safety gate (all must pass before execute):
+          • JARVIS_UNDO_ENABLED truthy
+          • Working tree clean
+          • No in-flight ops (gls._active_ops empty)
+          • Every target commit bears the O+V trailer
+          • N ≤ JARVIS_UNDO_MAX_BATCH (default 10)
+          • --hard is refused on pushed branches
+        """
+        try:
+            from backend.core.ouroboros.battle_test.undo_command import (
+                UndoExecutor,
+                UndoPlanner,
+                parse_undo_args,
+                render_plan,
+            )
+        except Exception:
+            self._repl_print("[red]Undo module unavailable.[/red]")
+            return
+
+        n, mode, parse_err = parse_undo_args(line)
+        if parse_err:
+            self._repl_print(
+                f"[red]/undo: {parse_err}[/red]\n"
+                f"[dim]usage: /undo [N] | /undo preview [N] | /undo --hard N[/dim]"
+            )
+            return
+
+        repo_root = self._config.repo_path
+        planner = UndoPlanner(
+            repo_root=repo_root,
+            governed_loop_service=self._governed_loop_service,
+        )
+        plan = planner.plan(n, mode=mode)
+
+        # Render + print the plan so the operator sees the verdict
+        # before any mutation (and always for preview mode).
+        self._repl_print(render_plan(plan))
+
+        if mode == "preview":
+            return
+
+        if not plan.is_safe:
+            # Errors already printed inside render_plan output.
+            self._repl_print(
+                "[bold red]/undo aborted — resolve errors above.[/bold red]"
+            )
+            return
+
+        # Execute the mutation.
+        comm = None
+        try:
+            comm = getattr(self._governance_stack, "comm", None)
+        except Exception:
+            comm = None
+
+        executor = UndoExecutor(repo_root=repo_root, comm=comm)
+        result = await executor.execute(plan)
+
+        if not result.executed:
+            self._repl_print(
+                f"[bold red]/undo failed:[/bold red] {result.error or 'unknown error'}"
+            )
+            return
+
+        # Session stats counter (surfaced in end-of-session summary).
+        try:
+            self._undone_count = getattr(self, "_undone_count", 0) + result.n_reverted
+        except Exception:
+            pass
+
+        sha_tail = f" → {result.committed_sha[:10]}" if result.committed_sha else ""
+        self._repl_print(
+            f"[bold green]✓ /undo {mode}[/bold green]  "
+            f"reverted=[bold]{result.n_reverted}[/bold]  "
+            f"files=[bold]{len(result.files_affected)}[/bold]"
+            f"{sha_tail}"
+        )
 
     # ------------------------------------------------------------------
     # Signal handlers
