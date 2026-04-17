@@ -205,6 +205,8 @@ This is the bargain O+V offers. In exchange for structural discipline, the organ
 
 ## §5. The Three-Part Organism: Body, Mind, Soul
 
+![Figure 1 — The JARVIS Trinity. O+V runs in the Body layer, reaches into the Mind (J-Prime) for heavy reasoning, and invokes the Soul (Reactor Core) for sandboxed execution. The three parts communicate via explicit protocols, never shared memory, carrying tracing data for full causal reconstruction.](figures/fig01_trinity_architecture.png)
+
 > **Analogy:** Think of a Formula 1 racing team. The car (the Body) is what physically races. The driver (the Mind) makes split-second decisions on how to race. The strategy engineers back at the factory (the Soul) reason about race strategy, long-term trade-offs, and what the car should do next lap. Each part is essential; none can replace the others; and they communicate via clear protocols (radio comms, telemetry streams, pit stops). JARVIS is architected the same way.
 
 ### §5.1 JARVIS — The Body
@@ -350,6 +352,8 @@ This is a design choice: the pipeline's 11 phases remain uniform. Multi-repo com
 > **Big Picture:** The pipeline is the heart of O+V. Every operation passes through the same eleven phases, in the same order, with the same contract at each boundary. The phases are *deterministic* — they transition based on explicit conditions, not on model output. The *content* of what happens at GENERATE is agentic and probabilistic; the *decision* about whether GENERATE's output proceeds to APPLY is deterministic. This is the key architectural choice that makes O+V safe while still being autonomous.
 
 ## §8. The Eleven Phases — Overview
+
+![Figure 2 — The 11-phase pipeline. Every operation traverses the same phases, in the same order, with the same contract at each boundary. Square brackets indicate phases that may be skipped for trivial operations. Every unhandled exception routes to POSTMORTEM.](figures/fig02_pipeline_flow.png)
 
 The eleven-phase flow:
 
@@ -923,6 +927,8 @@ MCP tools bypass the standard manifest check (policy Rule 0) and are auto-allowe
 
 > **Big Picture:** The tool manifest is the model's palette of actions. Every tool has a specific purpose, a specific input schema, a specific Iron Gate check, and a specific output shape. This section lists them, grouped by category, with enough detail that a reader can predict what the model will use each tool for.
 
+![Figure 6 — The Venom tool ecosystem. Sixteen built-in tools across eight categories, plus dynamic MCP external tools discovered at prompt time. All default-allowed, because the Iron Gate provides structural containment per tool call.](figures/fig06_venom_tools.png)
+
 ### §20.1 Comprehension Tools
 
 **`read_file`** — Read a file from the repository.
@@ -1277,4 +1283,2455 @@ Here is what an operation looks like with Venom and Ouroboros working together:
 The Venom tool loop lives **inside** the GENERATE phase. The Iron Gate fires **after** GENERATE but **before** VALIDATE. L2 Self-Repair fires **after** VALIDATE retries are exhausted. APPLY uses ChangeEngine with rollback snapshots. VERIFY re-runs tests post-apply.
 
 Every phase writes to the ledger. Every tool call is an audit-trail entry. Every terminal state is observable. This is the integrated picture of what "disciplined self-improvement" looks like at the level of a single operation.
+
+
+---
+
+# PART V — Trinity Consciousness: The Metacognition Layer
+
+> **Big Picture:** The pipeline (Part III) is the *skeleton*. Venom (Part IV) is the *nervous system*. This Part introduces the *soul* — Trinity Consciousness, the layer that gives O+V episodic memory, failure prediction, idle-time improvement planning, and cross-session learning. The consciousness layer is what transforms O+V from a pipeline that executes operations into an *organism* that learns from them.
+
+## §26. The Metacognition Layer — Zone 6.11
+
+> **Analogy:** A junior engineer who wakes up every morning with total amnesia will never improve. They will keep making the same mistakes, keep being surprised by the same files being fragile, keep getting stuck on the same test flakes. A senior engineer remembers. They know which modules are trouble, which tests are flaky, which architectural corners they have been painted into before. Trinity Consciousness gives O+V that memory — not via parameter-weight retraining, but via structured episodic records consulted at the right moments in the pipeline.
+
+**Source:** `backend/core/ouroboros/consciousness/`.
+
+**Zone:** 6.11 in the unified supervisor's numbering.
+
+![Figure 7 — Trinity Consciousness architecture. Four core engines (HealthCortex, MemoryEngine, DreamEngine, ProphecyEngine) plus three awareness-fusion layers (CAI, SAI, UAE). Integration with the pipeline is via two bridges (ConsciousnessBridge, GoalMemoryBridge). Authority is advisory-only — the consciousness layer cannot override the Iron Gate or any safety-critical decision.](figures/fig07_consciousness_layers.png)
+
+### §26.1 The Four Engines and Three Awareness Layers
+
+```
+┌─────────────────────────────────────────────────────┐
+│              Trinity Consciousness                   │
+│                                                      │
+│  Core Engines:                                       │
+│   ├── HealthCortex     (30s health polling)         │
+│   ├── MemoryEngine     (episodic outcomes, 168h TTL)│
+│   ├── DreamEngine      (idle-time improvement plans)│
+│   └── ProphecyEngine   (regression prediction)      │
+│                                                      │
+│  Awareness Fusion:                                   │
+│   ├── CAI   Contextual Awareness Intelligence       │
+│   ├── SAI   Situational Awareness Intelligence      │
+│   └── UAE   Unified Awareness Engine                │
+│                                                      │
+│  Integration:                                        │
+│   ├── ConsciousnessBridge   (5 methods → pipeline)  │
+│   └── GoalMemoryBridge      (ChromaDB cross-session)│
+│                                                      │
+│  Strategic Overlay:                                  │
+│   └── StrategicDirectionService (Manifesto → ops)   │
+└─────────────────────────────────────────────────────┘
+```
+
+Each sub-section below describes one component, its source file, line count, and integration point.
+
+## §27. MemoryEngine — Episodic Outcomes
+
+**Source:** `consciousness/memory_engine.py` (680 lines).
+
+**What it does:** ingests every terminal operation outcome (APPLIED, FAILED, ROLLED_BACK) and builds per-file reputation records that accumulate across sessions.
+
+**What it records:**
+
+- `FileReputation` per file:
+  - `success_rate` — rolling percentage of operations on this file that completed.
+  - `fragility_score` — weighted measure of how often operations on this file failed.
+  - `co_failures` — map of files that often failed together with this one.
+  - `last_modified_by_op` — most recent op id that touched this file.
+  - `last_outcome` — success or failure class.
+
+**Persistence:** records are written to `~/.jarvis/ouroboros/consciousness/insights.jsonl` and `file_reputations.json`. TTL is 168 hours (one week) by default — older records decay. The TTL is controllable via env.
+
+**Why it matters:** the orchestrator consults MemoryEngine at CLASSIFY via `ConsciousnessBridge.assess_regression_risk()`. If the target file has a success rate below 0.5 or a high fragility score, the risk tier is elevated. This is how the organism avoids repeatedly breaking the same file.
+
+### §27.1 What Is *Not* Stored
+
+MemoryEngine does **not** store model weights, parameter updates, or any form of RL-style training signal. It stores **behavioral records** — which file, which op, which outcome, when. All inference still happens via the provider APIs with the providers' own static weights. The consciousness layer is non-parametric.
+
+## §28. ProphecyEngine — Regression Prediction
+
+**Source:** `consciousness/prophecy_engine.py` (402 lines).
+
+**What it does:** predicts the risk of regression for a proposed operation using heuristic scoring over MemoryEngine data. No LLM; pure arithmetic.
+
+**Risk formula:**
+
+```
+risk = (1 - success_rate) * 0.3
+     + fragility * 0.3
+     + (dependents / 20) * 0.2
+     + 0.1  # baseline
+```
+
+**Risk levels:**
+
+| Range | Level |
+|---|---|
+| `risk < 0.3` | `LOW` |
+| `0.3 ≤ risk < 0.6` | `MEDIUM` |
+| `0.6 ≤ risk < 0.8` | `HIGH` |
+| `risk ≥ 0.8` | `CRITICAL` |
+
+**Confidence cap:** confidence is capped at `0.6` — because the scoring is heuristic, not model-derived, the engine does not claim high confidence. This honesty is a feature, not a limitation. ProphecyEngine's role is to flag *concern*, not to make final decisions.
+
+### §28.1 Integration at CLASSIFY
+
+When `ConsciousnessBridge.assess_regression_risk()` is called at CLASSIFY, it queries ProphecyEngine for each target file. If any file is `HIGH` or `CRITICAL`, the operation's tier is elevated by one step (Green → Yellow, Yellow → Orange). This is a preventive measure — high-risk operations get extra human oversight *before* they run, not after they fail.
+
+### §28.2 Why Heuristic, Not Learned
+
+A learned model would require training data, a training pipeline, and ongoing re-training as the codebase evolves. A heuristic is inspectable, debuggable, and cheap. The risk formula can be tuned by editing four coefficients. The cost of false positives is "occasional extra human review on a low-risk op" — acceptable. The cost of a learned-model bug would be much higher: opaque misclassifications, drift over time, difficulty debugging.
+
+## §29. HealthCortex — System Health
+
+**Source:** `consciousness/health_cortex.py` (668 lines).
+
+**What it does:** polls JARVIS, J-Prime, and Reactor every 30 seconds and maintains a rolling snapshot of system health.
+
+**Health dimensions:**
+
+- Each component's `status` (`healthy`, `degraded`, `unavailable`).
+- Each component's resource pressure (`cpu_load`, `memory_pressure`, `disk_pressure`).
+- Cross-component latency percentiles.
+- Overall composite score.
+
+**Storage:** rolling `HealthTrend` of 720 snapshots = 6 hours of history at 30s intervals.
+
+**Output:** `TrinityHealthSnapshot` with `overall_score` (0.0 to 1.0), per-component statuses, and resource pressure summaries.
+
+### §29.1 Integration: ProactiveDriveService
+
+HealthCortex is consulted by `ConsciousnessBridge.is_system_healthy_for_exploration()`. The intake layer uses this check to decide whether to fire exploration-type sensors (OpportunityMiner, DocStaleness, etc.) — if the system is under resource pressure, exploration sensors are suppressed to avoid adding load.
+
+### §29.2 Why Polling, Not Event-Driven?
+
+Health is the one place in O+V where polling is acceptable. The 30-second interval is explicit and slow; it is not a tight retry loop. Health does not need to be event-driven because "the system is tired" is a continuous state, not a discrete event.
+
+## §30. DreamEngine — Idle-Time Improvement Planning
+
+> **Analogy:** Sleep is not idle time. The brain consolidates memories, integrates the day's experiences, and pre-computes plans for the next day. DreamEngine does the same for O+V — during idle periods (more than 300 seconds without an operation), it speculatively generates `ImprovementBlueprint` records that describe changes the organism might want to make later.
+
+**Source:** `consciousness/dream_engine.py` (828 lines).
+
+**What it does:** during idle time (>300s without an operation), pre-computes `ImprovementBlueprint` records. Blueprints are keyed on `(repo_sha, policy_hash)` so they remain valid as long as the codebase and policy remain unchanged.
+
+**Daily budget:** 120 minutes of dream time per day. Configurable. After the budget is exhausted, dreaming is suppressed until the next daily reset.
+
+**When a blueprint gets used:** on the next operation that matches the blueprint's key, the blueprint is consulted as pre-computed context. The operation proceeds faster because the planning was done offline.
+
+### §30.1 Why Dream?
+
+The original Ouroboros design was purely reactive — sensors detect, pipeline responds. But autonomous-AI research consistently finds that *proactive* speculation improves responsiveness: when the reactive moment comes, the best response has often already been pre-imagined.
+
+Dreaming is O+V's response. It turns idle GPU/CPU cycles (on the Body's hardware and on DW's batch infrastructure) into pre-computed blueprints. When the matching operation eventually arrives, the blueprint is ready.
+
+### §30.2 Observability
+
+Dream activity is logged at INFO level:
+
+```
+[DreamEngine] Dream cycle started — idle for 340s
+[DreamEngine] Generated 3 blueprints keyed on (repo_sha=a1b2c3d, policy_hash=0x1234)
+[DreamEngine] Dream cycle complete — 84s, $0.01 cost
+```
+
+An operator watching the CLI sees when the organism is dreaming and what it has dreamed about.
+
+## §31. Awareness Fusion — CAI, SAI, UAE
+
+> **Big Picture:** The four engines produce raw signals. The awareness fusion layer combines those signals into actionable context for the pipeline. CAI (Contextual Awareness) handles *what* is happening in the codebase right now. SAI (Situational Awareness) handles *when* things are happening and *why*. UAE (Unified Awareness) fuses the two into a single per-operation context object that the pipeline consumes at pre-GENERATE time.
+
+### §31.1 CAI — Contextual Awareness Intelligence
+
+**Source:** `consciousness/contextual_awareness.py` (879 lines).
+
+**What it does:** discovers hotspots, coupling patterns, and drift from MemoryEngine data.
+
+**Background analysis every 300 seconds.** CAI runs in the background, building a graph of which files correlate with failures, which pairs of files frequently co-fail, and which modules are drifting in complexity over time.
+
+**Output:** `ContextAssessment` containing:
+
+- `hotspots` — files with elevated failure rates.
+- `relevant_insights` — lessons from MemoryEngine applicable to the current op.
+- `coupling_concerns` — file pairs the current op should be careful about.
+- `complexity_estimate` — heuristic complexity score for the target files.
+
+### §31.2 SAI — Situational Awareness Intelligence
+
+**Source:** `consciousness/situational_awareness.py` (1,333 lines).
+
+**What it does:** tracks temporal patterns and causal chains.
+
+**Examples of patterns SAI detects:**
+
+- Post-deploy cascades — a deployment triggered a cluster of test failures.
+- Time-of-day correlations — operations during the engineer's active hours succeed more often than during off-hours (usually because the operator is catching issues sooner).
+- Repeated-failure chains — the same op-ID pattern is failing repeatedly, suggesting a deeper root cause than the immediate error.
+
+**Output:** `SituationAssessment` containing:
+
+- `timing_advice` — should this op be deferred?
+- `risk_modifiers` — additional risk signals beyond CAI's contextual view.
+- `causal_chains` — operations this op is likely connected to.
+
+### §31.3 UAE — Unified Awareness Engine
+
+**Source:** `consciousness/unified_awareness.py` (1,232 lines).
+
+**What it does:** fuses CAI and SAI into a single `OperationAwareness` object for the pipeline's consumption.
+
+**Output:** `OperationAwareness` containing:
+
+- `risk` — fused risk score.
+- `confidence` — fused confidence (bounded by the less-confident of CAI and SAI).
+- `suggested_provider_tier` — recommended provider routing.
+- `thinking_budget` — recommended extended-thinking budget for Claude (if used).
+- `prompt_injection` — markdown text to inject into the generation prompt as a consciousness-context section.
+
+**Awareness levels:** `DORMANT`, `OBSERVING`, `ATTENTIVE`, `FOCUSED`, `HYPERAWARE` — a qualitative assessment of how much attention the system is paying to the current op. Higher levels trigger deeper context expansion and more human-escalation sensitivity.
+
+## §32. ConsciousnessBridge — Integration Points
+
+> **Big Picture:** The consciousness engines are useless if the pipeline cannot consult them at the right moments. ConsciousnessBridge is the integration surface — five methods that the pipeline calls at five specific phase transitions to inject consciousness context into the operation.
+
+**Source:** `consciousness/consciousness_bridge.py`.
+
+### §32.1 The Five Integration Points
+
+| Method | Called At | What It Does |
+|---|---|---|
+| `assess_regression_risk()` | CLASSIFY | Queries ProphecyEngine + MemoryEngine. Returns a `RegressionRiskAssessment`. If `HIGH`/`CRITICAL`, CLASSIFY escalates the risk tier. |
+| `get_fragile_file_context()` | GENERATE_RETRY | Returns markdown context about historically fragile files for injection into the retry prompt. |
+| `is_system_healthy_for_exploration()` | Intake gating | Returns `(healthy, reason)` from HealthCortex for ProactiveDriveService to decide whether to fire exploration sensors. |
+| `record_operation_outcome()` | POST-APPLY | Feeds `(op_id, files, success/failure, error_class)` back into MemoryEngine and GoalMemoryBridge for cross-session learning. |
+| `assess_operation_awareness()` | PRE-GENERATE | Returns UAE `OperationAwareness` with risk, confidence, suggested provider tier, thinking budget, and prompt injection text. |
+
+### §32.2 The Authority Invariant
+
+ConsciousnessBridge's outputs are **advisory**, not authoritative. The pipeline's safety-critical decisions (Iron Gate, UrgencyRouter, risk tier escalation, FORBIDDEN_PATH checks, approval gating) remain deterministic code. Consciousness cannot *reduce* safety — it can only *increase* caution (e.g., elevating a Green op to Yellow based on MemoryEngine history).
+
+This invariant is crucial. Consciousness is a fluid-intelligence layer that can drift, produce noise, or even be compromised. The deterministic safety skeleton must not depend on it. Consciousness enhances the pipeline; it does not gate the pipeline.
+
+## §33. GoalMemoryBridge — Cross-Session ChromaDB
+
+**Source:** `backend/core/ouroboros/governance/goal_memory_bridge.py`.
+
+**What it does:** persists operation outcomes to a ChromaDB vector database, indexed by a vector embedding of the goal description. When a new operation arrives, semantically similar past operations can be retrieved and their lessons injected as context.
+
+**Why a vector DB?** Because signals do not carry identical keys. An operation to "fix the test flake in test_provider.py" and an operation to "resolve the intermittent failure in TestProvider.test_cascade" are semantically related but lexically distinct. Vector retrieval lets the organism recognize the similarity.
+
+**What gets retrieved:** for each new op, the top-K (default `5`) most semantically similar past ops are retrieved. Their outcomes, rationales, and file touches are rendered into a markdown block and injected into the generation prompt as an `## Episodic Context` section.
+
+### §33.1 The Observability Log
+
+GoalMemoryBridge writes every phase of its reasoning to `.jarvis/ouroboros_thoughts.jsonl`:
+
+| Phase | Logged |
+|---|---|
+| `BOOT` | Scanning codebase for opportunities |
+| `MEMORY_RECALL` | What memories were found, how many, relevance |
+| `TOOL` | Which tool was called and why (`read_file`, `bash`, `run_tests`) |
+| `GENERATE` | Generation strategy, provider used, context size |
+| `REPAIR` | L2 iteration progress, failure classification, convergence |
+| `POST_APPLY` | Success/failure outcome, what was learned |
+
+This is the organism's **thought log** — a human-readable trace of its reasoning process. An operator can read `ouroboros_thoughts.jsonl` after a session and reconstruct *why* the organism made every decision.
+
+## §34. ConversationBridge — Dialogue as Context
+
+**Source:** `backend/core/ouroboros/governance/conversation_bridge.py` (v1.1).
+
+**What it does:** provides a sanitized, bounded channel from agentic dialogue (SerpentFlow REPL, `ask_human` Q+A pairs, operation postmortems) into `ctx.strategic_memory_prompt` at CONTEXT_EXPANSION.
+
+**Five signal sources:**
+
+1. `tui_user` — non-slash REPL input (SerpentFlow).
+2. `ask_human_q` — a question the model asked via `ask_human`.
+3. `ask_human_a` — the human's answer to that question.
+4. `postmortem` — deterministic one-liner from previous operations' terminal states.
+5. `voice` — reserved for a future voice-dialogue integration.
+
+**Authority invariant:** ConversationBridge's output is consumed **only** by StrategicDirection at CONTEXT_EXPANSION. It has *zero authority* over the Iron Gate, UrgencyRouter, risk tier, policy engine, FORBIDDEN_PATH, or approval gating.
+
+### §34.1 The Secret Redaction Layer
+
+Every signal passing through ConversationBridge is sanitized before injection:
+
+- `sanitize_for_log()` — general PII/secret-shape redaction (common API key patterns, email addresses, IPs).
+- Secret-shape regex: `sk-*`, `xox[abprs]-*`, `AKIA*`, `gh[pousr]_*`, PEM blocks.
+- Character-class limits: inputs that contain likely-shell-injection characters are redacted.
+
+The redaction is **Tier -1 deterministic** — it runs before any model sees the content. A secret leaked into the REPL will not reach the model's prompt.
+
+### §34.2 Bounded Channel Invariants
+
+- `MAX_TURNS` — maximum number of dialogue turns retained (default `10`).
+- `MAX_CHARS_PER_TURN` — per-turn character cap (default `4096`).
+- `MAX_TOTAL_CHARS` — aggregate cap across all turns (default `16384`).
+- `POSTMORTEM_TTL_S` — postmortem entries expire (default `600s`) so stale closures don't pollute new sessions.
+
+### §34.3 Why This Matters
+
+The organism *listens*. When the operator says "don't touch test_foo.py, it's being refactored," the conversation is remembered for the next ten turns. When a previous op's POSTMORTEM recorded `root_cause=flaky_test`, the current op sees that as context. The organism has a working memory.
+
+## §35. LastSessionSummary — Episodic Continuity
+
+**Source:** `backend/core/ouroboros/governance/last_session_summary.py` (v1.1a).
+
+**What it does:** read-only session-to-session episodic continuity. At CONTEXT_EXPANSION, reads the harness's own `.ouroboros/sessions/<id>/summary.json` for the most recent prior session (lex-max of `bt-*` dirs, skipping self), parses structured fields into a frozen `SessionRecord`, and renders one dense one-liner per session into the strategic-memory prompt.
+
+**What gets rendered:**
+
+```
+session bt-2026-04-15-230849: stop=idle_timeout dur=3645s attempted=0 completed=0
+   failed=0 cost=$0.32 (claude=$0.32) apply=multi/4 verify=20/20 commit=0890a7b6f0
+   branch=0/0/0 convergence=INSUFFICIENT drift=0.067/ok
+```
+
+One session, one line — dense, deterministic, zero-op note appended when `stats_attempted == 0`.
+
+**V1.1a additions:** `schema_version: 2` stamp and optional `ops_digest` sub-dict carrying `last_apply_mode` (`none`/`single`/`multi`), `last_apply_files`, `last_apply_op_id`, `last_verify_tests_passed/total`, `last_commit_hash`. Fed by `OpsDigestObserver` protocol with 3 call sites in the orchestrator.
+
+### §35.1 Authority Invariant
+
+Output is consumed **only** by StrategicDirection at CONTEXT_EXPANSION. Zero authority over Iron Gate or any other safety-critical decision. This is the same invariant as ConversationBridge — the untrusted-context stack is attention-dominant in the prompt but structurally gated from authority.
+
+## §36. SemanticIndex — Recency-Weighted Centroid Inference
+
+**Source:** `backend/core/ouroboros/governance/semantic_index.py` (v0.1).
+
+**What it does:** local, bounded semantic goal inference over recent work. Moves O+V from *goal declaration* (YAML goals + git histogram + keyword matching) to *goal inference* via a recency-weighted semantic centroid.
+
+**Corpus:**
+
+- Last 30 git commits (14-day halflife).
+- Active GoalTracker goals (14-day halflife).
+- ConversationBridge snapshot (3-day halflife).
+- **POSTMORTEM turns excluded from centroid by default** — avoids "failure gravity" biasing the theme.
+
+**Embedder:** `fastembed` + `bge-small-en-v1.5` (local ONNX, ~30MB model, ~100MB runtime). Optional install via `requirements-semantic.txt`.
+
+**Scoring:** cosine against centroid, clamped to non-negative priority boost ≤ `JARVIS_SEMANTIC_ALIGNMENT_BOOST_MAX` (default `1`). Strictly subordinate to the hard `goal_alignment_boost=2` to avoid starvation.
+
+**Integration:** intake priority bias + CONTEXT_EXPANSION prompt subsection. Same zero-authority invariant as ConversationBridge.
+
+### §36.1 Why This Matters
+
+Naive goal inference tends to drift. A session heavily focused on one bug makes every subsequent signal *look* like more work on that bug, even if the signal is about something else. The recency-weighted centroid with halflife decay corrects for this — yesterday's work has less weight than today's, last week's less than yesterday's. The inference remains responsive to current priorities while carrying forward durable themes.
+
+## §37. Strategic Direction — The Manifesto Injection Service
+
+> **Big Picture:** The seven Manifesto principles (§3) are not only architectural guidelines for humans. They are injected into every generation prompt so the model literally reads them before writing code. Strategic Direction is the service that reads the Manifesto at boot, extracts the principles, and builds the injection block.
+
+**Source:** `backend/core/ouroboros/governance/strategic_direction.py`.
+
+### §37.1 Sources Read at Boot
+
+| Doc | What's extracted |
+|---|---|
+| `README.md` | 7 principles, zero-shortcut mandate, Trinity architecture, manifesto canonical text |
+| `docs/architecture/OUROBOROS.md` | Pipeline overview, provider routing, battle-test summary |
+| `docs/architecture/BRAIN_ROUTING.md` | 3-tier cascade overview |
+
+### §37.2 What the Model Sees
+
+Every generation prompt contains a **Strategic Direction** section (~2,500 characters) built from the sources above:
+
+```
+You are generating code for the JARVIS Trinity AI Ecosystem — an autonomous,
+self-evolving AI Operating System. Every change must align with these principles:
+
+1. The unified organism (tri-partite microkernel)
+2. Progressive awakening (adaptive lifecycle)
+3. Asynchronous tendrils (disciplined concurrency)
+4. The synthetic soul (Trinity consciousness)
+5. Intelligence-driven routing (the cognitive forge)
+6. Threshold-triggered neuroplasticity (Ouroboros)
+7. Absolute observability (systemic transparency)
+
+MANDATE: Structural repair, not patches.
+```
+
+Plus extracts from the Manifesto's elaboration of each principle, the Trinity architecture description, and a pointer to the zero-shortcut mandate.
+
+### §37.3 Recent Momentum Injection
+
+Strategic Direction also infers **recent development momentum** from the last 50 `git log` commits via Conventional Commit parsing. It extracts scope/type histograms and the three freshest subject lines into a "Recent Development Momentum" section of the digest. This tells the model not just *what the principles are* but *what the team is currently working on*. Gated by `JARVIS_STRATEGIC_GIT_HISTORY_ENABLED` (default `true`).
+
+### §37.4 Why This Matters
+
+Without Strategic Direction, the model would generate *generic* code — code that might be functional but does not align with the Trinity's architectural philosophy. A model given "fix the test failure" with no principles might write a one-line patch that hides the failure. A model given the same task with the Manifesto injected knows: structural repair, not patches. The fix should address the root cause, not paper over the symptom.
+
+## §38. The Complete Six-Layer Loop
+
+> **Big Picture:** This section ties together everything in Parts II–V. The six layers of O+V — Strategic Direction, Trinity Consciousness, Event Spine, Pipeline, Venom, ChangeEngine — are described individually in the preceding sections. Here is how they compose into a single coherent operation.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 1: Strategic Direction (compass — WHERE are we going) │
+│   Manifesto: 7 principles, Trinity ecosystem, mandate.      │
+│   Injected into every operation's generation prompt.        │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 2: Trinity Consciousness (soul — WHY evolve)          │
+│   MemoryEngine  "tests/utils.py failed 60% of the time."    │
+│   ProphecyEngine "HIGH regression risk for this file."     │
+│   GoalMemoryBridge → ChromaDB cross-session retrieval.      │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 3: Event Spine (senses — WHEN to act)                 │
+│   FileWatchGuard: *.py changed → fs.changed.modified        │
+│   pytest plugin: test_results.json → TestFailureSensor      │
+│   post-commit hook: git_events.json → DocStalenessSensor    │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 4: Ouroboros Pipeline (skeleton — WHAT to do, safely) │
+│   CLASSIFY: risk + strategic direction + consciousness      │
+│   ROUTE: adaptive 3-tier cascade (DW → Claude → GCP)        │
+│   2 parallel operations via BackgroundAgentPool.            │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 5: Venom Agentic Loop (nervous system — HOW)          │
+│   read_file → search_code → bash → run_tests → web_search → │
+│     revise. Deadline-based loop.                            │
+│   L2 Repair: generate → test → classify → fix → test (5x).  │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 6: ChangeEngine + AutoCommitter                       │
+│   Applied, tests pass, operation COMPLETE.                  │
+│   Signed: Generated-By: Ouroboros + Venom + Consciousness.  │
+│   Thought log: .jarvis/ouroboros_thoughts.jsonl.            │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Feedback: Trinity Consciousness learns from outcome         │
+│   MemoryEngine records success → file reputation improves.  │
+│   GoalMemoryBridge stores for cross-session retrieval.      │
+│   Next operation benefits from accumulated experience.      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+![Figure 11 — The complete six-layer loop. Strategic Direction (compass) sits at the top, injecting the Manifesto into every operation. Trinity Consciousness (soul) feeds episodic memory and regression prediction. The event spine (senses) detects what work to do. The pipeline (skeleton) governs what happens safely. Venom (nervous system) executes agentic tool loops. ChangeEngine + AutoCommitter (action) persist the outcome, which feeds back into consciousness for the next operation.](figures/fig11_six_layer_loop.png)
+
+This is the integrated picture. Every operation touches every layer. Every layer has its own invariants. The composition is what makes O+V a coherent organism rather than a pile of services.
+
+
+---
+
+# PART VI — The Provider Ecosystem
+
+> **Big Picture:** O+V does not own a language model. It *orchestrates* calls to external language-model providers, treating them as interchangeable sources of intelligence via a uniform protocol. This Part describes the three-provider ecosystem (DoubleWord, Claude, J-Prime), the adaptive failback state machine that recovers from provider outages, the DoubleWord 3-tier event-driven architecture that eliminates polling, and the urgency-aware routing algorithm that picks the right provider for each operation.
+
+## §39. The Three Providers
+
+> **Analogy:** A competent surgeon does not have one scalpel — they have a tray of instruments, each tuned to a specific kind of cut. O+V does not have one language model — it has a tray of providers, each tuned to a specific class of operation. DoubleWord is the precision instrument for cost-optimized volume work. Claude is the heavyweight for complex reasoning and fast reflex. J-Prime is the self-hosted backup when available.
+
+### §39.1 DoubleWord
+
+**Source:** `backend/core/ouroboros/governance/doubleword_provider.py`.
+
+**Models:** Qwen 3.5 397B MoE (`Qwen/Qwen3.5-397B-A17B-FP8`), Gemma 4 31B (`google/gemma-4-31B-it`), Qwen 3.5 35B (retired caller).
+
+**Pricing:** $0.10 per million input tokens, $0.40 per million output tokens.
+
+**Features:**
+
+- **Tier 0 real-time SSE streaming** (primary path, zero polling).
+- **Tier 1 webhook-driven batch** (zero-poll fallback for async batch operations).
+- **Tier 2 adaptive-backoff polling** (safety net when webhooks are unavailable).
+- Cost-gated (per-op cap, daily budget).
+- Max tokens: trivial/moderate 8192, standard 12288, complex/heavy 16384.
+- Venom tool loop integrated.
+
+**Role:** cost-optimization backbone for STANDARD, BACKGROUND, SPECULATIVE routes (where topology permits). Structured-JSON callers (`semantic_triage`, `ouroboros_plan`, Phase-0 `compaction`) run on DW's Gemma 4 31B.
+
+### §39.2 Claude (Anthropic API)
+
+**Source:** `backend/core/ouroboros/governance/providers.py`.
+
+**Models:** Claude Opus, Sonnet, Haiku — model selection driven by `brain_selection_policy.yaml`.
+
+**Pricing:** $3.00/$15.00 per million tokens (Sonnet-class); $15.00/$75.00 (Opus-class).
+
+**Features:**
+
+- Extended thinking via Anthropic's extended-thinking API (`JARVIS_EXTENDED_THINKING_ENABLED=true`).
+- Prompt caching (via cache-breakpoint annotations).
+- Tool-use support (Venom integrated).
+- 60s hard fallback cap (`_FALLBACK_MAX_TIMEOUT_S`) to prevent unreachable providers from consuming the pipeline budget.
+
+**Role:** IMMEDIATE route primary (latency-critical reflex operations), STANDARD/COMPLEX cascade fallback, Claude-as-planner for COMPLEX-tier operations.
+
+### §39.3 J-Prime (GCP Self-Hosted)
+
+**Source:** `backend/core/ouroboros/governance/providers.py` (PrimeProvider), `prime_client.py` (out-of-repo in J-Prime codebase).
+
+**Models:** self-hosted model weights on GCP VMs with GPU acceleration. Exact models vary by deployment; typically a fine-tuned smaller model for structured-JSON work or specialized code tasks.
+
+**Pricing:** VM cost only — no per-token billing.
+
+**Features:**
+
+- Fixed temperature 0.2.
+- Schema enforcement (the PrimeClient protocol rejects malformed JSON).
+- Opt-in per operation (not always available).
+
+**Role:** Tier 2 cost-optimization for bounded-volume structured JSON work. Disabled when unhealthy.
+
+### §39.4 The CandidateProvider Protocol
+
+All three implement the uniform `CandidateProvider` protocol:
+
+```python
+class CandidateProvider(Protocol):
+    async def generate(
+        self,
+        ctx: OperationContext,
+        deadline: datetime,
+        tool_loop: Optional[ToolLoopCoordinator] = None,
+    ) -> GenerationResult: ...
+
+    async def plan(self, prompt: str, deadline: datetime) -> PlanResponse: ...
+
+    async def health_check(self) -> HealthStatus: ...
+```
+
+The orchestrator does not know whether a given `CandidateProvider` is DoubleWord, Claude, J-Prime, or a test mock. Adding a new provider to the ecosystem requires implementing the protocol and registering with the GovernedLoopService — no changes to pipeline code.
+
+## §40. Adaptive Provider Routing — The Failback State Machine
+
+> **Big Picture:** Providers fail. Rate limits, timeouts, outages, network partitions — all of these happen, and when they do, the pipeline must recover gracefully without dumping every operation onto the most expensive fallback. The adaptive failback state machine is what keeps the cost-optimization intact under provider stress, by classifying each failure mode and computing its recovery ETA so the primary is retried at the right moment.
+
+**Source:** `backend/core/ouroboros/governance/candidate_generator.py`.
+
+### §40.1 FailureMode Classification
+
+When a provider raises, the exception is classified:
+
+| Mode | Base Backoff | Max Backoff | Example |
+|---|---|---|---|
+| `RATE_LIMITED` | 15s | 120s | HTTP 429, CircuitBreakerOpen |
+| `TIMEOUT` | 45s | 300s | Connection/request timeout |
+| `SERVER_ERROR` | 60s | 600s | HTTP 500/502/503 |
+| `CONNECTION_ERROR` | 120s | 900s | Host unreachable, DNS failure |
+| `CONTENT_FAILURE` | 0s | 0s | Bad output — no infrastructure penalty |
+
+**Content failures are treated differently** — if the provider returns a response but the response is malformed (bad JSON, missing required fields, oversized output), the infrastructure is fine, so no backoff is applied. The next operation can attempt the primary immediately.
+
+### §40.2 Recovery ETA
+
+```
+recovery_eta = base_backoff * 2 ** (consecutive_failures - 1)
+recovery_eta = min(recovery_eta, max_backoff)
+```
+
+Exponential backoff capped at the mode's maximum. After the first `TIMEOUT`, 45 seconds. After the second consecutive, 90. After the third, 180. Capped at 300.
+
+### §40.3 FSM States
+
+| State | Meaning |
+|---|---|
+| `PRIMARY_ACTIVE` | Primary is healthy; use it. |
+| `PRIMARY_DEGRADED` | Primary has had some failures but probe succeeded; try it with fallback as safety. |
+| `FALLBACK_ACTIVE` | Primary in backoff; use fallback directly. |
+| `QUEUE_ONLY` | Both primary and fallback failing with `CONNECTION_ERROR`; operations queue until a probe succeeds. |
+
+### §40.4 `should_attempt_primary()`
+
+Before each operation, the FSM is consulted:
+
+```python
+def should_attempt_primary(now: datetime) -> bool:
+    if state == PRIMARY_ACTIVE:
+        return True
+    if state == FALLBACK_ACTIVE:
+        return now >= recovery_eta
+    if state == QUEUE_ONLY:
+        return False  # wait for probe
+    if state == PRIMARY_DEGRADED:
+        return True  # try primary with fallback as safety
+```
+
+This is the mechanism by which the cost-optimization survives transient failures — the primary is retried on every operation once the backoff window has elapsed, not held down indefinitely.
+
+### §40.5 Adaptive Health Probes
+
+Probe interval adapts based on distance to recovery ETA:
+
+| Distance to ETA | Interval |
+|---|---|
+| > 60s away | 60s (relaxed) |
+| 30–60s away | 20s (moderate) |
+| < 30s away | 10s (ramping up) |
+| Past ETA | 5s (aggressive) |
+
+Close to recovery, probe more often. Far from recovery, probe less. This is a cost-optimization of the probe cost itself.
+
+### §40.6 Connector Resilience
+
+The `DoublewordProvider` specifically detects **poisoned aiohttp connectors** — caused by `CancelledError` during connection attempts that leave the aiohttp session in a half-initialized state. When detected, the provider discards the session and creates a fresh one. Background poll tasks are capped at 3 concurrent to prevent connector saturation.
+
+This level of detail matters because real production deployments encounter these edge cases, and the pipeline must survive them without human intervention.
+
+## §41. DoubleWord 3-Tier Event-Driven Architecture
+
+> **Big Picture:** Principle 3 of the Manifesto is "Zero polling. Pure reflex." This sounds aspirational, but DoubleWord implements it literally. Tier 0 (the primary path) uses SSE streaming — the server pushes tokens as they are generated, the client reads them as they arrive, no polling. Tier 1 (the async batch fallback) uses webhooks — when the batch completes, the DW server calls back to an HTTP endpoint on the Body, no polling. Tier 2 is adaptive-backoff polling — used only when webhooks cannot be configured, and even then with exponential backoff plus jitter, never fixed-interval polling.
+
+![Figure 9 — DoubleWord's 3-tier event-driven architecture. Tier 0 (SSE streaming) and Tier 1 (webhook-driven batch) eliminate polling entirely. Tier 2 (adaptive-backoff poll) is used only as a safety net when webhooks cannot be configured, and even then with exponential backoff plus jitter — never fixed-interval polling.](figures/fig09_dw_3tier.png)
+
+### §41.1 Tier 0 — Real-Time SSE (Primary Path)
+
+**Default path.** Uses `/v1/chat/completions` with SSE streaming and Venom tool loop. Zero polling. Token-by-token streaming. Falls back to batch on 429/503 (stays within cheap DW instead of cascading to 150x more expensive Claude).
+
+Environment: `DOUBLEWORD_REALTIME_ENABLED` (default `true`).
+
+The SSE client reads incoming chunks, parses them as server-sent events, and emits tokens to the tool loop coordinator. Tool calls are detected mid-stream and dispatched; the model's response continues until the stream closes with a `[DONE]` marker.
+
+### §41.2 Tier 1 — Webhook-Driven Batch (Zero-Poll Fallback)
+
+For batch operations that fall through from Tier 0 (large payloads, 429 rate-limit responses). The `BatchFutureRegistry` maps `batch_id` to an `asyncio.Future`. The future is resolved by incoming DW webhooks via the `EventChannelServer`.
+
+**Source:** `batch_future_registry.py`, `event_channel.py`.
+
+- `BatchFutureRegistry`: register, resolve, reject, wait + TTL auto-pruning.
+- `EventChannelServer`: `POST /webhook/doubleword` with Standard Webhooks HMAC-SHA256 signature verification.
+- `DOUBLEWORD_WEBHOOK_SECRET`: signing key from the DW dashboard.
+
+When a batch is submitted, the Body registers a future with its `batch_id`. When DW completes the batch, it POSTs to the Body's webhook endpoint with the batch result. The EventChannelServer verifies the HMAC signature, looks up the future, and resolves it. The batch call returns synchronously from the coroutine's perspective, zero-poll.
+
+### §41.3 Tier 2 — Adaptive Backoff Poll (Safety Net)
+
+Fallback when webhooks aren't configured. Replaces fixed 5s polling with exponential backoff + jitter:
+
+- Starting interval: 2s.
+- Multiplier: 1.5x per iteration.
+- Cap: 30s.
+- Jitter: ±25%.
+- Network-aware: connection errors jump to 15s base.
+- One-line debug logs — no tracebacks on transient failures.
+
+Tier 2 is *only* used when webhooks cannot be configured. It is a safety net, not the primary path.
+
+### §41.4 Manifesto Alignment
+
+This architecture is a direct expression of two principles:
+
+- **Principle 3 (Zero Polling. Pure Reflex):** Tier 0 and Tier 1 eliminate polling entirely. Tier 2 is adaptive, not fixed-interval.
+- **Principle 6 (The Iron Gate):** Webhook signature verification prevents spoofed batch completions. Only DW's properly-signed callbacks can resolve futures.
+
+## §42. Urgency-Aware Provider Routing
+
+> **Big Picture:** The routing decision — which provider handles which operation — is itself a deterministic algorithm. It is not another model call. It is a pure-code `UrgencyRouter` that maps `(urgency, source, complexity)` to a `ProviderRoute` enum in under one millisecond. This section describes the routing algorithm, the five route contracts, and the cost economics of the routing topology.
+
+**Source:** `backend/core/ouroboros/governance/urgency_router.py`.
+
+![Figure 3 — The five provider routes, each with a distinct cascade strategy, cost target, and use case. The UrgencyRouter maps (urgency, source, complexity) to a ProviderRoute in sub-millisecond time with zero LLM calls — deterministic routing by design.](figures/fig03_routing_topology.png)
+
+### §42.1 The Five Routes (Repeated for Reference)
+
+| Route | Strategy | Cost | When |
+|---|---|---|---|
+| `IMMEDIATE` | Claude direct (skip DW) | ~$0.03/op | Test failures, voice, runtime-health critical |
+| `STANDARD` | DW primary → Claude fallback | ~$0.005/op | Default cascade for normal-priority work |
+| `COMPLEX` | Claude plans → DW executes | ~$0.015/op | Multi-file architectural, heavy tool loops |
+| `BACKGROUND` | DW only, no Claude fallback | ~$0.002/op | Opportunity mining, doc staleness, TODOs |
+| `SPECULATIVE` | DW batch fire-and-forget | ~$0.001/op | Intent discovery, proactive exploration |
+
+### §42.2 The Lookup Tables
+
+The router consults two deterministic frozen sets and one complexity classifier:
+
+```python
+_IMMEDIATE_SOURCES = frozenset({
+    "test_failure",
+    "voice_human",
+    "runtime_health",
+})
+
+_BACKGROUND_SOURCES = frozenset({
+    "ai_miner",
+    "exploration",
+    "backlog",
+    "architecture",
+    "todo_scanner",
+    "doc_staleness",
+})
+
+_SPECULATIVE_SOURCES = frozenset({
+    "intent_discovery",
+})
+
+_COMPLEX_COMPLEXITIES = frozenset({
+    "heavy_code",
+    "complex",
+})
+```
+
+### §42.3 The Algorithm
+
+```python
+def classify(urgency, source, complexity) -> ProviderRoute:
+    if complexity in _COMPLEX_COMPLEXITIES:
+        return ProviderRoute.COMPLEX
+    if source in _SPECULATIVE_SOURCES:
+        return ProviderRoute.SPECULATIVE
+    if source in _BACKGROUND_SOURCES:
+        return ProviderRoute.BACKGROUND
+    if source in _IMMEDIATE_SOURCES and urgency >= CRITICAL:
+        return ProviderRoute.IMMEDIATE
+    return ProviderRoute.STANDARD  # default cascade
+```
+
+Pure code. No network call. No LLM. Sub-millisecond.
+
+### §42.4 Why Deterministic?
+
+Three reasons, as introduced in §9.2:
+
+1. **Reproducibility** — replaying a signal gives the same route.
+2. **Cost** — inferencing every routing decision would double the bill.
+3. **Latency** — agent workloads have tight per-phase budgets.
+
+### §42.5 Route-Aware Timeout Enforcement
+
+Each route carries its own generation timeout:
+
+| Route | Generation Timeout | Grace |
+|---|---|---|
+| IMMEDIATE | 60s | 5s |
+| STANDARD | 120s | 5s |
+| COMPLEX | 180s | 5s |
+| BACKGROUND | 180s | 5s |
+| SPECULATIVE | N/A (batch) | — |
+
+IMMEDIATE gets the tightest budget because it is reflex-critical. COMPLEX and BACKGROUND get more because they involve multi-round tool loops or slow-batch operations.
+
+### §42.6 Deadline Budget Allocation
+
+The total generation deadline for a cascade is split deterministically:
+
+| Component | Budget | Env Var | Default |
+|---|---|---|---|
+| Tier 0 (DW) | 50% of total, max 90s | `OUROBOROS_TIER0_BUDGET_FRACTION` | 0.50 |
+| Tier 1 reserve | Minimum 25s guaranteed | `OUROBOROS_TIER1_MIN_RESERVE_S` | 25 |
+| Primary within Tier 1 | 65% of Tier 1 budget | `OUROBOROS_PRIMARY_BUDGET_FRACTION` | 0.65 |
+| Fallback reserve | Minimum 20s guaranteed | `OUROBOROS_FALLBACK_MIN_RESERVE_S` | 20 |
+
+The budget math ensures that the fallback always has at least 20 seconds of runway, preventing a slow primary from consuming the entire budget and leaving nothing for the fallback to recover with.
+
+## §43. The Current Topology Seal (As of 2026-04-16)
+
+> **Big Picture:** The routing design is reversible. Each route is gated by a single YAML flag in `brain_selection_policy.yaml`. When a provider's infrastructure proves unreliable for a given route, the route can be sealed — `dw_allowed: false` — and operations on that route cascade to the fallback or skip-and-queue. This section describes the current topology as of 2026-04-16, which is the state reflected in the DoubleWord benchmark report (`docs/benchmarks/DW_BENCHMARKS_2026-04-16.md`).
+
+**Source:** `backend/core/ouroboros/governance/brain_selection_policy.yaml` (lines 299–376).
+
+### §43.1 The Current Seal
+
+As of 2026-04-16, DoubleWord is **topology-sealed** from every agent-generation route:
+
+- `IMMEDIATE` — `dw_allowed: false`, `block_mode: cascade_to_claude`.
+- `STANDARD` — `dw_allowed: false`, `block_mode: cascade_to_claude`.
+- `COMPLEX` — `dw_allowed: false`, `block_mode: cascade_to_claude`.
+- `BACKGROUND` — `dw_allowed: false`, `block_mode: skip_and_queue`.
+- `SPECULATIVE` — `dw_allowed: false`, `block_mode: skip_and_queue`.
+
+DoubleWord is retained **only** for three structured-JSON callers:
+
+- `semantic_triage` on Gemma 4 31B.
+- `ouroboros_plan` on Gemma 4 31B.
+- `compaction` on Gemma 4 31B (Phase 0 shadow mode).
+
+### §43.2 Why Sealed
+
+The seal was enforced on 2026-04-14 after two isolation tests (`bt-2026-04-14-182446` Gemma BG, `bt-2026-04-14-203740` Qwen 397B STANDARD) showed the same `SSE stream stalled (no data for 30s)` signature. The signal did not reproduce in an Apr 16 standalone smoke test (see the DoubleWord benchmark report for the full four-run addendum), but the seal remains in place until a sustained-concurrent-load validation pass with the DoubleWord gateway team.
+
+### §43.3 The Path to Re-Engagement
+
+The topology is designed to be reversible. Once SSE stability is confirmed through a pairing session with the DoubleWord gateway team (and possibly through the "Functions, Not Agents" non-streaming reseating; see Part XIV), each route can be flipped back to `dw_allowed: true` independently, with shadow-mode comparison against Claude for a battle-test cycle before full promotion.
+
+The benchmark report lays out the full staged re-engagement plan. This paper defers to that report for the specific mechanics; the architectural point is that **the topology seal is a safety feature, not a limitation.** The organism is doing what it should — routing around an observed failure mode until structural repair is complete.
+
+
+---
+
+# PART VII — Autonomous Developer Intelligence (Seven Capabilities)
+
+> **Big Picture:** A pipeline that only *generates patches* is still not an autonomous developer. A real autonomous developer has *intelligence about being a developer* — understanding that certain changes warrant human escalation, that the same files being touched twice concurrently is a conflict, that exploring before writing is non-negotiable, that mistakes should be remembered, and that cost matters. This Part describes the seven capabilities that turn O+V's pipeline into a proactive autonomous developer rather than an autonomous patch factory.
+
+## §44. Capability 1 — Operation Intent Visibility
+
+> **Big Picture:** Every operation the organism performs has a *reason*. The model's rationale for *why* it made a specific change is captured at GENERATE and displayed prominently in the operator's terminal. This is what makes the autonomy legible. You can watch a real operation happen and understand the model's thinking, not just the diff.
+
+**Source:** `serpent_flow.py` (`set_op_reasoning`, `show_diff`), `orchestrator.py` (GENERATE phase rationale capture).
+
+Every operation displays the model's reasoning for why it made a specific change. The rationale is captured from `candidate_rationales` at GENERATE and stored per-op via `set_op_reasoning(op_id, reasoning)`. It is displayed as a `reasoning:` line under each `Update(path)` block in the SerpentFlow CLI:
+
+```
+⏺ Update(tests/test_failure_sensor.py)
+   ├── reasoning: The current sensor does not handle the case where two identical
+   │   signals arrive in the same tick. Adding a dedup guard via (signal_id,
+   │   timestamp_bucket) fixes the storm-after-reset bug observed in
+   │   bt-2026-04-14-022414.
+   ├── +42 -3 (test module, new test cases)
+   └── [APPLIED]
+```
+
+The operator sees not just what changed, but *why* — in the model's own words, captured at the moment of decision. This is Principle 7 (Absolute Observability) at the op level.
+
+## §45. Capability 2 — Severity-Based Human Escalation Protocol
+
+> **Big Picture:** Not every change deserves human review. A one-line test fix does not need a human approver. A breaking API change does. The four-tier risk escalator is the mechanism that makes this judgment structurally, not heuristically. Different risk tiers follow different paths through the pipeline — and crucially, the organism communicates visibly which tier each operation is on.
+
+**Source:** `risk_engine.py` (`RiskTier.NOTIFY_APPLY`), `orchestrator.py` (Phase 5b).
+
+The four-tier escalator (repeated from §9.1 because it matters at every phase):
+
+| Tier | Color | Auto-Apply? | Trigger Rules |
+|---|---|---|---|
+| `SAFE_AUTO` | Green | Yes, silent | Single-file, non-core |
+| `NOTIFY_APPLY` | Yellow | Yes, visible | New files (Rule 10), multi-file changes (Rule 11), core orchestration paths (Rule 12) |
+| `APPROVAL_REQUIRED` | Orange | No, blocks | Security-sensitive, breaking API |
+| `BLOCKED` | Red | Rejected | Supervisor, credentials, governance engine |
+
+![Figure 5 — The four-tier risk escalator. Each tier determines whether the operation auto-applies, blocks for a notification window, blocks for human approval, or is rejected outright. Consciousness-driven escalation can elevate the tier by one step when regression risk is high.](figures/fig05_risk_escalator.png)
+
+### §45.1 NOTIFY_APPLY Behavior
+
+The Yellow tier is the pragmatic innovation. Rather than forcing every multi-file change through a human approval wait, the orchestrator emits a `notify_apply` decision via CommProtocol. SerpentFlow renders it prominently as:
+
+```
+⚠ NOTIFY_APPLY  op-abc123  reason=multi_file  files=4  auto-applying in 5s
+```
+
+During the 5-second window, the operator can type `cancel op-abc123` at the REPL to abort. If no cancellation is issued, the operation continues to APPLY. This is a **trust-building mechanism**: the human is informed of the change before it lands, has a window to intervene, but is not required to do so. Over many operations, the operator's vigilance can relax as trust builds; if a problematic Yellow op slips through, the operator intervenes, and the rules are refined.
+
+### §45.2 BLOCKED Short-Circuit
+
+Red tier ops short-circuit at CLASSIFY. The orchestrator does not attempt GENERATE on a BLOCKED op — it writes a BLOCKED ledger entry and emits a BLOCKED POSTMORTEM. This is **structural refusal**, not advisory warning.
+
+## §46. Capability 3 — Operation Dependency Chains (DAG-Based Signal Merging)
+
+> **Big Picture:** When two sensors detect opportunities targeting the same files, the organism does not run them as two uncoordinated operations — one would trample the other's changes, producing a merge conflict with itself. The intake router is DAG-aware: it recognizes file-overlap conflicts and queues the second operation behind the first, releasing it only when the first completes. This prevents the organism from fighting itself.
+
+**Source:** `unified_intake_router.py` (`_active_file_ops`, `_queued_behind`, `release_op`).
+
+### §46.1 The Mechanism
+
+```
+Signal A arrives, targets [foo.py]
+  → _active_file_ops[foo.py] = op_id_A
+  → operation A proceeds
+
+Signal B arrives, targets [foo.py]
+  → _find_file_conflict([foo.py]) returns op_id_A
+  → B is queued in _queued_behind[op_id_A]
+
+Operation A completes
+  → release_op(op_id_A)
+    → removes foo.py from _active_file_ops
+    → re-ingests Signal B automatically
+```
+
+### §46.2 Multi-File Conflict Resolution
+
+If a new signal targets `[foo.py, bar.py]` and `foo.py` is already active under op A, the new signal is queued behind A — even though `bar.py` is free. The conservative choice: wait for the conflict to clear, then re-plan from the new state (which includes A's patch).
+
+### §46.3 TTL for Stale Locks
+
+Active file locks carry timestamps. If an operation crashes and leaves a file locked, subsequent signals would queue forever. Refinement #11 (Edge Case Hardening) adds a TTL: locks older than `JARVIS_FILE_LOCK_TTL_S` (default 300 seconds) are force-released with a warning log. This prevents starvation behind crashed operations.
+
+## §47. Capability 4 — Exploration-First Enforcement
+
+> **Big Picture:** The difference between a senior engineer and a junior engineer is not just experience — it is *the discipline to read the code before changing it*. Junior engineers write patches from memory. Senior engineers read the target file first. Exploration-first enforcement makes the organism act like a senior engineer, by requiring at least two exploration tool calls before any code-change tool call.
+
+**Source:** `providers.py` (`_build_tool_section`), `orchestrator.py` (Iron Gate call site), `exploration_engine.py` (ExplorationLedger).
+
+### §47.1 The Prompt-Level Nudge
+
+The generation prompt includes an explicit **Exploration-first protocol** section:
+
+```
+### CRITICAL: Exploration-first protocol
+
+Before proposing ANY code change, you MUST verify the current state using
+at least 2 exploration tools:
+1. Read the target file — read_file to see the actual current code.
+   NEVER generate a patch from parametric memory alone.
+2. Check dependents — search_code or get_callers to find code that
+   imports/calls the function you're changing.
+```
+
+This prevents patches generated from stale weights. The model reads first, then writes.
+
+### §47.2 The Runtime Gate
+
+Prompting alone is not enough — a model can ignore instructions. The Iron Gate enforces exploration-first at the post-GENERATE, pre-VALIDATE checkpoint. It scans `GenerationResult.tool_execution_records` for exploration tool calls (`read_file`, `search_code`, `get_callers`) and verifies that at least `JARVIS_MIN_EXPLORATION_CALLS` (default `2`) were made.
+
+Violations produce a `GENERATE_RETRY` with targeted feedback:
+
+```
+Your previous attempt did not call any exploration tools before proposing
+the patch. Required minimum: 2 exploration tool calls (read_file,
+search_code, get_callers). Please explore the target file and its call
+graph before writing a patch.
+```
+
+The model retries with the feedback, typically produces correct exploration depth on the retry, and the operation proceeds.
+
+### §47.3 The ExplorationLedger (Diversity-Weighted Scoring)
+
+The raw counter floor (`tool_calls >= _min_explore`) is being phased out in favor of **diversity-weighted scoring**. An `ExplorationLedger` classifies every exploration tool call into one of five categories:
+
+| Category | Tools |
+|---|---|
+| `COMPREHENSION` | `read_file`, `list_symbols` |
+| `DISCOVERY` | `glob_files`, `list_dir` |
+| `CALL_GRAPH` | `get_callers` |
+| `STRUCTURE` | (future) Oracle-graph introspection |
+| `HISTORY` | `git_log`, `git_diff`, `git_blame` |
+
+Duplicate calls (same tool + same `arguments_hash`) get **zero credit** — forward progress is measured as new files/queries, not repeated fetches.
+
+The gate passes when all three conditions hold:
+
+- `diversity_score ≥ min_score`
+- `|categories_covered| ≥ min_categories`
+- `required_categories ⊆ categories_covered`
+
+Floors are env-driven per complexity:
+
+| Complexity | Min Score | Min Categories | Required Categories |
+|---|---|---|---|
+| `trivial` | 0 | 0 | — (bypass) |
+| `simple` | 4.0 | 2 | — |
+| `moderate` | 8.0 | 3 | — |
+| `architectural` | 14.0 | 4 | `{call_graph, history}` |
+
+Architectural operations **must** read call graphs and git history — you cannot rewrite the orchestrator without understanding who calls what and why it was written the way it was.
+
+### §47.4 Anti-Gaming Invariant
+
+**Failed tool calls accrue *score* but not *category coverage*.** A failed grep is still signal — the model learned something from the failure. But it cannot count toward category coverage, because otherwise a model could fake exploration by flooding failing calls and reaching the score floor without genuinely exploring.
+
+### §47.5 Battle-Test Evidence
+
+The ExplorationLedger was validated in Sessions A–G (2026-04-14) — see Part XII, §73 for the full arc. Session C demonstrated shadow-mode scoring that flagged a `4× read_file` shallow exploration at `score=3.00, categories=comprehension`. Session G then demonstrated the full adaptation loop: retry feedback → model diversifies tools → second ledger decision passes at `score=25.50, categories=5`.
+
+## §48. Capability 5 — Post-Apply Verification Loop
+
+> **Big Picture:** Validation in isolation (before APPLY) is not sufficient. Tests can pass in a sandbox but fail after APPLY because of filesystem interactions, import ordering, or state the sandbox did not reproduce. The post-apply VERIFY phase re-runs a scoped test suite after the changes are on disk, catching regressions before they close the operation.
+
+**Source:** `orchestrator.py` (Phase 8a), `serpent_flow.py` (`op_verify_start`, `op_verify_result`).
+
+### §48.1 The Scoped Test Run
+
+After APPLY succeeds, VERIFY runs only the tests that exercise the changed files. Running the full test suite would be slow; running a scope targeted to the diff catches regressions without burning the wall clock.
+
+```
+Phase 8a: Scoped post-apply test run
+  ├── _validation_runner.run(changed_files, timeout=60s)
+  ├── Emit heartbeat with verify_test_starting / verify_test_passed
+  ├── SerpentFlow renders ⏺ Verify(files) with pass/fail counts
+  │
+  ├── On PASS → continue to benchmark gate → COMPLETE
+  └── On FAIL → route to L2 repair engine
+      ├── Build synthetic ValidationResult
+      ├── _l2_hook(ctx, synth_val, deadline)
+      ├── If L2 converges → continue to COMPLETE
+      └── If L2 fails → combine with benchmark result → rollback
+```
+
+Budget: `JARVIS_VERIFY_TIMEOUT_S` (default 60 seconds).
+
+### §48.2 The Scope Fix (Refinement #10)
+
+An early version of post-apply L2 Repair had a bug: when the scoped test suite failed after APPLY, L2 would generate a fix candidate, but the candidate was not actually written to disk. It stayed in memory, was re-validated against the sandbox (which passed), and the operation "completed" without the fix landing. Refinement #10 closes this gap — the L2 repair candidate is now actually written via `change_engine.execute()` before VERIFY re-runs.
+
+### §48.3 Why VERIFY Is Distinct from VALIDATE
+
+VALIDATE runs against a sandbox copy of the candidate. VERIFY runs against the applied disk state. The distinction matters because:
+
+- Some tests read from the filesystem.
+- Import ordering can differ between sandbox and live process.
+- Concurrent state (e.g., database connections) is real in VERIFY, simulated in VALIDATE.
+
+Running a post-apply verification turns "passes validation" into "passes verification on disk" — a stricter guarantee.
+
+## §49. Capability 6 — Cumulative Session Intelligence
+
+> **Big Picture:** Within a single session, the organism accumulates lessons. Every operation produces either a success lesson ("this worked, here's what it was") or a failure lesson ("this failed, here's why"). The next operation in the session sees these lessons in its generation prompt. The organism learns from its own behavior across a session.
+
+**Source:** `orchestrator.py` (`_session_lessons`), `providers.py` (prompt injection), `op_context.py` (`session_lessons` field).
+
+### §49.1 The Lessons Buffer
+
+An ephemeral `_session_lessons` buffer on `GovernedOrchestrator` accumulates compact insights:
+
+- **Success**: `[OK] Fix assertion error in test_provider.py (test_provider.py)`
+- **Failure**: `[FAIL:test] Add type hints to config loader (config_loader.py)`
+
+Capped at 20 lessons (`JARVIS_SESSION_LESSONS_MAX`).
+
+### §49.2 Prompt Injection
+
+Before each GENERATE phase, the lessons are injected into the `OperationContext.session_lessons` field and rendered into the generation prompt:
+
+```
+## Session Lessons (from prior operations this session)
+
+Use these to avoid repeating mistakes and build on successes:
+
+- [OK] Fix off-by-one in provider parser (providers.py)
+- [FAIL:build] Add async wrapper — missing await (event_channel.py)
+- [OK] Suppress PyPI timeout tracebacks (runtime_health_sensor.py)
+```
+
+The model reads these before generating. Lessons shape the current operation's approach.
+
+### §49.3 Infra Poisoning Guard (Refinement #8)
+
+Not all lessons are equal. An operation that failed because of a DoubleWord outage produces a lesson like `[FAIL:infra] ... DoubleWord timeout`. That lesson is not about code — it is about infrastructure. If injected into the prompt, the model might try to avoid the failing behavior (e.g., avoid calling DW) when the real fix is just to retry.
+
+Refinement #8 tags infrastructure failures as `"infra"` and excludes them from the session-lessons injection. Only `"code"` lessons (actual logic failures, test regressions) reach the model. This prevents transient infrastructure noise from teaching the model false patterns.
+
+### §49.4 Convergence Metric (Refinement #18)
+
+The lessons buffer also tracks success rates before and after the first lesson was recorded (`_ops_before_lesson`, `_ops_after_lesson`). Every `JARVIS_LESSON_CONVERGENCE_CHECK_INTERVAL` (default `10`) post-lesson operations, the success rates are compared. If post-lesson success rate is *lower* than pre-lesson, the lessons are considered **misleading** and the buffer is cleared.
+
+This is self-correcting intelligence. If the lessons are helping, keep them. If they are hurting, discard them. The organism does not commit to guidance that is not working.
+
+## §50. Capability 7 — Cost-Aware Operation Prioritization
+
+> **Big Picture:** The intake router holds a priority queue. When multiple signals are pending, the router chooses the next one to dispatch based on a composite score that factors in source tier, urgency boost, file-count penalty, confidence bonus, and dependency credit. The effect: focused, high-urgency, high-confidence operations are processed first; sprawling, low-urgency, low-confidence operations wait.
+
+**Source:** `unified_intake_router.py` (`_compute_priority`).
+
+### §50.1 The Formula
+
+```python
+def _compute_priority(envelope):
+    base = _PRIORITY_MAP.get(envelope.source, 99)      # source tier
+    urgency = _URGENCY_BOOST.get(envelope.urgency, 0)  # critical=3, high=1
+    cost_penalty = 0 if files <= 1 else (1 if files <= 4 else 2)
+    confidence_bonus = 1 if envelope.confidence >= 0.9 else 0
+    dep_credit = min(len(queued_behind_this_file_set), 3)  # Refinement #9
+    return base - urgency + cost_penalty - confidence_bonus - dep_credit
+```
+
+Lower priority number = higher priority. The formula pushes:
+
+- High-urgency signals up (critical urgency = -3).
+- Focused single-file signals up (cost_penalty = 0).
+- High-confidence signals up (confidence_bonus = -1).
+- Signals that would unblock other queued signals up (dep_credit up to -3).
+
+### §50.2 Example
+
+Suppose three signals are pending:
+
+| Signal | Source | Urgency | Files | Confidence | Dep credit | Priority |
+|---|---|---|---|---|---|---|
+| A | test_failure | critical | 1 | 0.95 | 0 | 2 - 3 + 0 - 1 - 0 = -2 |
+| B | opportunity_miner | normal | 4 | 0.70 | 0 | 5 - 0 + 1 - 0 - 0 = 6 |
+| C | doc_staleness | low | 1 | 0.85 | 2 | 6 - 0 + 0 - 0 - 2 = 4 |
+
+Order: A (-2) → C (4) → B (6). Signal A goes first (it's a critical test failure). Signal C goes second (it's low-urgency but unblocks other queued work). Signal B goes last (opportunity mining is low-priority by default).
+
+### §50.3 All Enqueue Paths
+
+The composite score is computed for all three enqueue paths:
+
+1. Initial enqueue (first time a signal is seen).
+2. Retry enqueue (an operation deferred due to conflict, now re-ingesting).
+3. WAL replay (restart recovery).
+
+This ensures prioritization is consistent regardless of how a signal enters the queue.
+
+## §51. The Seven Capabilities in Concert
+
+These seven capabilities are not independent — they compose.
+
+- Intent visibility (§44) + session intelligence (§49) means the operator can read the thought log and understand what the organism has been learning.
+- Severity escalation (§45) + cost-aware priority (§50) means high-risk operations with high value get processed first, under appropriate human oversight.
+- Dependency DAG (§46) + exploration-first (§47) + post-apply verify (§48) means concurrent operations do not conflict, each operation reads before writing, and each operation's changes are verified in situ.
+
+Together, these seven capabilities are the difference between a pipeline that executes operations and an **autonomous developer** that acts with judgment. Every capability is battle-test validated (Part XII). Every capability is observable (Principle 7). Every capability is reversible via env vars if needed.
+
+
+---
+
+# PART VIII — Edge Case Hardening (Twelve Refinements)
+
+> **Big Picture:** Production autonomous systems fail in ways their designers never anticipated. The only way to harden them is to run them, observe the failures, and codify the fix. This Part documents twelve refinements that were added after specific battle-test failures revealed gaps. Each refinement is a direct response to a real observation, cited by session ID. The collection is a case study in how an autonomous system becomes production-grade through iteration.
+
+## §52. The Twelve Refinements
+
+| # | Refinement | Source (session or commit) |
+|---|---|---|
+| 8 | Session Intelligence Poisoning Guard | — (session_lessons infra-tagging) |
+| 9 | Cost-Aware Priority with Dependency Credit | — (unified_intake_router) |
+| 10 | Post-Apply Verify + L2 Repair Scope Fix | — (Session N regression) |
+| 11 | DAG Queue Starvation Prevention (TTL) | `JARVIS_FILE_LOCK_TTL_S` |
+| 12 | Exploration-First Runtime Enforcement | — (Iron Gate) |
+| 13 | Session Intelligence Thread-Safety | — (asyncio single-threaded) |
+| 14 | Stale Exploration Guard (File Hash) | — (concurrency race) |
+| 15 | Signal Coalescing Window | `JARVIS_COALESCE_WINDOW_S` |
+| 16 | Operation Cancellation from REPL | `/cancel` REPL handler |
+| 17 | Diff Preview for NOTIFY_APPLY (Yellow) | `JARVIS_NOTIFY_APPLY_DELAY_S` |
+| 18 | Session Intelligence Convergence Metric | — (self-correcting) |
+| 19 | Exploration Budget Control | `JARVIS_MAX_EXPLORATION_ROUNDS` |
+
+### §52.1 Refinement 8 — Session Intelligence Poisoning Guard
+
+**Problem:** a model that has seen "DoubleWord timed out" as a session lesson may avoid calling DoubleWord in subsequent operations, even when the real fix is to retry.
+
+**Fix:** infrastructure failures (timeouts, provider outages, rate limits) are tagged as `"infra"` and excluded from the `## Session Lessons` injection. Only `"code"` lessons reach the model.
+
+### §52.2 Refinement 9 — Cost-Aware Priority with Dependency Credit
+
+**Problem:** signals that block other signals were not recognized as high-value — a signal queued behind many others could languish.
+
+**Fix:** `_dep_credit` counts how many envelopes are queued behind files this op would touch. Credit is capped at 3 to prevent runaway promotion.
+
+### §52.3 Refinement 10 — Post-Apply Verify + L2 Repair Scope Fix
+
+**Problem:** when the scoped test suite failed after APPLY, L2 Repair would generate a fix candidate but the candidate was not written to disk.
+
+**Fix:** the L2 repair candidate is now actually written via `change_engine.execute()` before VERIFY re-runs.
+
+### §52.4 Refinement 11 — DAG Queue Starvation Prevention (TTL)
+
+**Problem:** a crashed operation left files locked. Subsequent signals would queue forever.
+
+**Fix:** active file locks carry timestamps. `_find_file_conflict()` force-releases locks older than `JARVIS_FILE_LOCK_TTL_S` (default 300s) with a warning log.
+
+### §52.5 Refinement 12 — Exploration-First Runtime Enforcement
+
+**Problem:** the exploration-first protocol was a prompt-level nudge that a model could ignore.
+
+**Fix:** at VALIDATE time, `GenerationResult.tool_execution_records` is scanned to verify the model called at least `JARVIS_MIN_EXPLORATION_CALLS` (default `2`) exploration tools. Violations produce a warning and are recorded in the per-candidate ledger.
+
+### §52.6 Refinement 13 — Session Intelligence Thread-Safety
+
+**Problem:** `_session_lessons` access might race if the orchestrator ever went multi-threaded.
+
+**Fix:** documented that it is safe under asyncio's single-threaded event loop, with a comment specifying that an `asyncio.Lock` is needed if the orchestrator ever moves to multi-threaded execution.
+
+### §52.7 Refinement 14 — Stale Exploration Guard (File Hash)
+
+**Problem:** a candidate generated with a read of file X at time T1 might be applied after another operation has modified X at time T2 > T1. The candidate is now built on stale state and would overwrite the concurrent change.
+
+**Fix:** target file SHA-256 hashes are snapshotted at GENERATE time and stored on `OperationContext.generate_file_hashes`. At APPLY time, hashes are recomputed — if any differ, the candidate was built on stale file state. Currently a soft gate (warning + ledger), preventing silent data loss from concurrent operations without blocking routine operations in low-concurrency scenarios.
+
+### §52.8 Refinement 15 — Signal Coalescing Window
+
+**Problem:** multiple sensors detecting issues in the same file within seconds of each other would produce N separate operations, each redundantly processing the same target.
+
+**Fix:** when envelopes for the same file arrive within `JARVIS_COALESCE_WINDOW_S` (default 30s), they are merged into a single multi-goal operation. HIGH urgency signals bypass coalescing (they should not wait 30s for potential merges).
+
+### §52.9 Refinement 16 — Operation Cancellation from REPL
+
+**Problem:** once an operation was running, the operator had no way to abort it without killing the whole process.
+
+**Fix:** REPL command `cancel <op-id>` (prefix match) sets a cooperative cancellation flag checked at GENERATE and APPLY phase boundaries. The orchestrator transitions to `CANCELLED` with reason `user_cancelled`.
+
+### §52.10 Refinement 17 — Diff Preview for NOTIFY_APPLY (Yellow)
+
+**Problem:** Yellow-tier auto-applies happened too fast for the operator to react.
+
+**Fix:** before auto-applying Yellow-tier changes, the diff is rendered in the CLI with a configurable delay (`JARVIS_NOTIFY_APPLY_DELAY_S`, default 5s). During this window, `/cancel` can reject the change. After the window, apply proceeds.
+
+### §52.11 Refinement 18 — Session Intelligence Convergence Metric
+
+**Problem:** session lessons might be misleading (e.g., they reflect a transient infra issue) and could hurt subsequent operations.
+
+**Fix:** track success rates before and after the first lesson was recorded. Every `JARVIS_LESSON_CONVERGENCE_CHECK_INTERVAL` (default 10) post-lesson operations, compare the rates. If post-lesson success rate is lower than pre-lesson, the lessons are considered misleading and the buffer is cleared. Self-correcting.
+
+### §52.12 Refinement 19 — Exploration Budget Control
+
+**Problem:** a model could enter an unbounded exploration loop — repeatedly reading files without ever producing a final answer.
+
+**Fix:** exploration-only tool rounds are capped at `JARVIS_MAX_EXPLORATION_ROUNDS` (default 5). After the cap, a system message nudges the model: *"You have enough context. Produce your final code change now."*
+
+## §53. What the Refinements Teach
+
+Two lessons emerge from this list.
+
+**First, production-grade is iterative.** Every refinement is a response to a real observation. None of them were designed up front. The architecture is *hardened*, not pristine — it has the marks of having been stress-tested in the wild, each mark paired with a fix that makes the next wild run survivable.
+
+**Second, structural fixes outperform configurational patches.** Many of these refinements could have been patched as "add env var X to work around problem Y." Instead, most were solved by changing the architecture: TTL on locks, scope fixes on APPLY, convergence metrics on lessons. The Manifesto's zero-shortcut mandate — *structural repair, not patches* — is visible in the refinement history.
+
+---
+
+# PART IX — The Intake Layer
+
+> **Big Picture:** Before any of the pipeline's phases fire, something has to *detect* that there is work to do. The intake layer is that detection mechanism — sixteen sensors, event-driven, feeding signals into a unified router that applies priority scoring, deduplication, and conflict-avoidance before any operation reaches CLASSIFY. This Part describes the sensor ecosystem, the event spine that carries signals, and the four-layer storm protection that keeps the pipeline from being overwhelmed.
+
+## §54. The Sixteen Sensors
+
+**Source:** `backend/core/ouroboros/governance/intake/sensors/`.
+
+![Figure 8 — The intake layer. Sixteen sensors funnel signals through the UnifiedIntakeRouter, which applies deduplication, DAG-based conflict resolution, priority scoring, and signal coalescing before dispatching to the pipeline. Four-layer storm protection prevents event bursts from overwhelming the organism.](figures/fig08_sensor_funnel.png)
+
+Each sensor is a small component that subscribes to a specific class of event and emits `SignalEnvelope` objects when actionable conditions are detected. The sixteen sensors:
+
+| Sensor | Trigger | Latency | Purpose |
+|---|---|---|---|
+| `TestFailureSensor` | pytest plugin + debounced `.py` changes | <1s | Test failures, streak-based stability |
+| `VoiceCommandSensor` | Voice pipeline events | instant | Voice-triggered code changes |
+| `OpportunityMinerSensor` | `fs.changed.*` on `*.py` | <1s | AST cyclomatic complexity analysis |
+| `CapabilityGapSensor` | GapSignalBus events | instant | Shannon entropy gap detection |
+| `ScheduledTriggerSensor` | Cron | configurable | Time-based scheduled tasks |
+| `BacklogSensor` | `fs.changed.*` on `backlog.json` | <1s | Queued improvement items |
+| `RuntimeHealthSensor` | Health cortex degraded states | <5s | System-health-triggered remediation |
+| `WebIntelligenceSensor` | Web search results | configurable | External-signal-driven insight |
+| `PerformanceRegressionSensor` | Benchmark telemetry | configurable | Regression in runtime perf |
+| `DocStalenessSensor` | `fs.changed.*` + `git_events.json` | <1s | Undocumented module detection |
+| `GitHubIssueSensor` | GitHub webhook | instant | Issue-triggered operations |
+| `ProactiveExplorationSensor` | Idle detection + Oracle graph | configurable | Offline exploration |
+| `CrossRepoDriftSensor` | Contract-file changes + `git_events.json` | <1s | Cross-repo contract drift |
+| `TodoScannerSensor` | `fs.changed.*` on `*.py` | <1s | FIXME/TODO/HACK markers |
+| `CUExecutionSensor` | Computer-Use operations | instant | Computer-Use-triggered changes |
+| `IntentDiscoverySensor` | Conversation analysis | configurable | Inferred-intent signals |
+
+All sensors retain `scan_once()` for manual/CLI invocation. Poll loops remain as safety-net fallbacks when the event spine is unavailable.
+
+## §55. The Event Spine
+
+**Source:** `backend/core/ouroboros/governance/intake/intake_layer_service.py`.
+
+**Zone:** 6.9.
+
+The intake layer operates on a **push model, not a poll model** (Manifesto §3). Events originate in four sources:
+
+```
+PRODUCERS (push immediately)                 CONSUMERS (subscribe)
+-------------------------------              ----------------------
+FileWatchGuard (watchdog) ─────┐             BacklogSensor
+  *.py, *.json changes         │             TodoScannerSensor
+                               │             OpportunityMinerSensor
+pytest plugin ─────────────────┤             TestFailureSensor
+  .jarvis/test_results.json    │             DocStalenessSensor
+                               ├─→ Trinity   CrossRepoDriftSensor
+post-commit hook ──────────────┤   EventBus  CapabilityGapSensor
+  .jarvis/git_events.json      │   (unified) SafetyNet (L3)
+                               │             FeedbackEngine
+GapSignalBus (bridge) ─────────┤             ...
+EventEmitter (bridge) ─────────┤
+EventChannelServer (bridge) ───┘
+```
+
+### §55.1 Event Spine Layers
+
+| Layer | Component | What it does |
+|---|---|---|
+| Phase 1 | `FileSystemEventBridge` | Watches repo root via `watchdog`, publishes `fs.changed.*` events to TrinityEventBus |
+| Phase 2 | `ouroboros_pytest_plugin` | Captures test results during any pytest run, writes `.jarvis/test_results.json` |
+| Phase 3 | post-commit git hook | Writes `.jarvis/git_events.json` with commit metadata (changed files, branch, author) |
+| Phase 4 | Bus adapter bridges | GapSignalBus, EventEmitter, EventChannelServer forward to TrinityEventBus |
+
+### §55.2 Four-Layer Storm Protection
+
+Event storms (many events in rapid succession) would overwhelm the pipeline if not suppressed. Four layers of protection:
+
+1. **FileWatchGuard**: debounce 0.3s + checksum dedup + LRU cache.
+2. **TrinityEventBus**: SHA-256 fingerprint dedup (60s window).
+3. **TestFailureSensor**: 2s debounce before pytest spawn.
+4. **IntakeRouter**: envelope `dedup_key` prevents duplicate operations.
+
+Each layer is orthogonal; they compose. An event that a sensor decides is actionable has passed at least two layers of storm protection; the intake router is the last line of defense before the pipeline dispatches.
+
+### §55.3 Per-Repo Fan-Out
+
+Each sensor fans out per registered repo when `repo_registry` is set; falls back to a single "jarvis" sensor otherwise. This means: in a multi-repo deployment, each repo has its own TestFailureSensor instance watching its own `test_results.json`, its own OpportunityMinerSensor scanning its own `*.py` files. Cross-repo drift is detected separately by `CrossRepoDriftSensor`.
+
+## §56. UnifiedIntakeRouter
+
+**Source:** `unified_intake_router.py`.
+
+The `UnifiedIntakeRouter` is the final gate between sensors and the pipeline. It takes incoming `SignalEnvelope` objects and decides:
+
+1. Is this a duplicate of a recent signal? (dedup_key)
+2. Does it conflict with a file currently under operation? (file_lock)
+3. What is its priority score? (composite formula, §50)
+4. Can it be coalesced with a recent similar envelope? (coalesce_window)
+
+The output: a sorted priority queue of envelopes, with conflict resolution and coalescing already applied.
+
+### §56.1 The Priority Queue
+
+Capacity: 16 slots (configurable). When full, lowest-priority envelopes are evicted. Evicted envelopes are logged; they may be re-ingested if the sensor fires again.
+
+### §56.2 WAL Persistence
+
+The intake queue is persisted to `.jarvis/intake_wal.jsonl` — an append-only write-ahead log. On restart, the WAL is replayed to rehydrate the queue. This is **disaster recovery** — a crashed harness does not lose pending work.
+
+WAL entries are cleared when an envelope transitions to `dispatched` (the pipeline has picked it up). Stale WAL entries from crashed sessions are pruned via TTL.
+
+### §56.3 Cross-Session Coalescing Guard (Session N)
+
+An early bug (Session N, 2026-04-15): WAL replay on a new session could merge stale envelopes with fresh ones, producing a coalesced operation where half the envelopes were from a previous crashed session. Fix: cross-session coalescing is now guarded by session-id — envelopes from different sessions do not coalesce. State cleanup: `rm .jarvis/intake_wal.jsonl && rm .jarvis/intake_router.lock` before each session.
+
+---
+
+# PART X — The Iron Gate: Safety Philosophy
+
+> **Big Picture:** This Part makes explicit what has been implicit throughout the paper. The Iron Gate is not a specific component — it is a *design philosophy* manifesting in many components: AST parsers, command blocklists, exploration-depth scorers, path protection, ASCII strictness, cost gates, multi-file coverage checks. Every one of these is a deterministic rule operating outside the model's influence. The phrase "Iron Gate" is shorthand for "the collection of deterministic rules that the agentic intelligence cannot override." This Part inventories the gates, explains the philosophy, and gives the Manifesto §6 justification for each.
+
+## §57. The Iron Gate Philosophy
+
+From the Manifesto:
+
+> *"Deterministic code is the skeleton; agentic intelligence is the nervous system."*
+
+The Iron Gate is the skeleton. It is:
+
+- **Pre-linguistic** — it does not read or reason about natural language. It reads file paths, AST nodes, tokens, exit codes, command strings.
+- **Model-uninfluenced** — no prompt can convince it to allow a forbidden action.
+- **Deterministic** — the same input produces the same output every time.
+- **Structural** — it is implemented as code paths in the governance layer, not as policy documents.
+- **Auditable** — every gate decision is logged.
+
+The philosophy: an autonomous system is safe only if its safety layer cannot be talked out of its decisions. The Iron Gate is the containment surface that makes default-allow tools (§18.3) possible — you can enable any tool by default when the gate around it is structural.
+
+![Figure 4 — The Iron Gate stack. Twelve deterministic rules that the agentic intelligence cannot override. Each rule is pre-linguistic — it reads file paths, AST nodes, command strings, and exit codes rather than reasoning about meaning. Together they enable default-allow tools because containment is structural.](figures/fig04_iron_gate_stack.png)
+
+## §58. Iron Gate Inventory
+
+### §58.1 Gate 1 — Path Containment
+
+**Where:** `GoverningToolPolicy` (Rule 1).
+
+**What:** Every tool call with a path argument has the path resolved against the repo root. Paths with `..` are rejected. Absolute paths outside the repo are rejected. Resolved paths must still be within the repo root.
+
+**Why:** prevents tool calls from reading or writing files outside the intended repository. A model trying to `read_file("/etc/passwd")` is refused structurally.
+
+### §58.2 Gate 2 — Protected Paths
+
+**Where:** `GoverningToolPolicy` (Rule 2), `risk_engine.py`.
+
+**What:** Files matching protected patterns (`*.env`, `credentials*`, `.git/`, supervisor core files, UserPreferenceMemory's `FORBIDDEN_PATH` entries) cannot be modified. Ops targeting them are classified `BLOCKED` at CLASSIFY and short-circuit.
+
+**Why:** secrets, credentials, and governance internals must not be mutated by the autonomous system. A model that "reasons" about why it needs to modify `.env` is refused.
+
+### §58.3 Gate 3 — Command Blocklist
+
+**Where:** `GoverningToolPolicy` (Rule 3), `bash` tool.
+
+**What:** For the `bash` tool, the command string is parsed and checked against a blocklist of destructive patterns: `rm -rf /`, `rm -rf ~`, `curl | sh`, `wget | bash`, `dd of=`, `git push --force-with-lease origin main`, `mkfs`, etc.
+
+**Why:** some shell commands can cause irrecoverable damage. The blocklist is hand-curated, conservative, and expandable.
+
+### §58.4 Gate 4 — Exploration-First
+
+**Where:** Orchestrator post-GENERATE checkpoint, ExplorationLedger.
+
+**What:** A candidate cannot proceed to VALIDATE if the model did not call at least `JARVIS_MIN_EXPLORATION_CALLS` (default `2`) exploration tools, or if the ExplorationLedger's diversity score is below the complexity-tier floor.
+
+**Why:** enforces senior-engineer behavior. Read before write.
+
+### §58.5 Gate 5 — ASCII Strictness
+
+**Where:** Orchestrator post-GENERATE checkpoint.
+
+**What:** Candidate content is scanned for non-ASCII codepoints. Violations trigger auto-repair (substitute ASCII approximation) or rejection if repair fails.
+
+**Why:** Unicode characters in source code can cause subtle parsing bugs, invisible whitespace issues, and encoding corruption. The ASCII gate prevents a model's subtle typo (`rapidفuzz` instead of `rapidfuzz`) from landing on disk.
+
+### §58.6 Gate 6 — Multi-File Coverage
+
+**Where:** Orchestrator post-GENERATE checkpoint, `multi_file_coverage_gate.py`.
+
+**What:** For multi-file candidates (the `files: [...]` schema), every declared target file must be covered by the candidate. If the ROUTE phase expected 4 files but the candidate only produced 3, the gate rejects.
+
+**Why:** partial multi-file candidates would commit an incomplete coordinated change, leaving the codebase in an inconsistent state.
+
+### §58.7 Gate 7 — Cost Ceilings
+
+**Where:** `CostGovernor`, provider implementations.
+
+**What:** Per-op cost cap (`DOUBLEWORD_MAX_COST_PER_OP`, `CLAUDE_MAX_COST_PER_OP`). Per-day cost cap (`DOUBLEWORD_DAILY_BUDGET`, `CLAUDE_DAILY_BUDGET`). Operations exceeding the cap are aborted; daily-budget-exhausted operations are queued.
+
+**Why:** autonomous systems should not burn unbounded money. The cost gates are hard ceilings.
+
+### §58.8 Gate 8 — Approval Timeouts
+
+**Where:** `CLIApprovalProvider`, `OrangePRReviewer`.
+
+**What:** Approval requests have a timeout (`approval_timeout_s`, default 600s). Unanswered approvals transition the operation to `CANCELLED` rather than waiting forever.
+
+**Why:** the system should not block indefinitely on a human who has walked away.
+
+### §58.9 Gate 9 — Worker Pool Ceilings
+
+**Where:** `BackgroundAgentPool`, per-route watchdog timeouts.
+
+**What:** Operations have wall-clock timeouts (`JARVIS_BG_WORKER_OP_TIMEOUT_S`, default 360s). Workers that exceed the ceiling are force-reaped with a warning.
+
+**Why:** a wedged worker would monopolize a pool slot indefinitely. The ceiling is a last-resort safety net.
+
+### §58.10 Gate 10 — Signature Verification (Webhooks)
+
+**Where:** `EventChannelServer`.
+
+**What:** Incoming webhooks (DW batch completions, GitHub events, CI notifications) have their Standard Webhooks HMAC-SHA256 signatures verified. Unsigned or wrongly-signed webhooks are rejected.
+
+**Why:** prevents spoofed events from triggering false operations.
+
+### §58.11 Gate 11 — Stale Exploration
+
+**Where:** Orchestrator APPLY phase (Refinement #14).
+
+**What:** Target file hashes are recomputed at APPLY and compared against GENERATE-time hashes. Mismatches produce a warning and ledger entry.
+
+**Why:** catches concurrent-modification races where a candidate was built on stale state.
+
+### §58.12 Gate 12 — File Lock TTL
+
+**Where:** `UnifiedIntakeRouter` (Refinement #11).
+
+**What:** Active file locks carry timestamps. Locks older than `JARVIS_FILE_LOCK_TTL_S` (default 300s) are force-released.
+
+**Why:** prevents starvation behind crashed operations.
+
+## §59. What the Iron Gate Does Not Do
+
+The Iron Gate is **not**:
+
+- **An AI.** It does not reason about intent. It reads tokens and rejects or allows.
+- **An approval queue.** Approvals are a separate mechanism (§14).
+- **A consensus engine.** There is no multi-model voting. One deterministic rule per gate.
+- **An oracle.** The gate can reject a valid operation (false positive). That is acceptable; a rejected op can be retried with different inputs.
+
+The gate does one thing: it enforces the operator's non-negotiable constraints *structurally*, outside the model's influence.
+
+## §60. The Safety-Autonomy Trade-Off
+
+Most autonomous-AI systems face a trade-off: more safety → less autonomy. Strict approvals slow everything down. Strict tool-gating removes capabilities the model needs. Strict path protection breaks legitimate use cases.
+
+O+V's answer is: **move the safety into the gate, not the approval flow.** The Iron Gate is structural, so approval is not required for gate-passed operations. Default-allow tools are safe because the gate is structural. Low-risk operations auto-apply because the gate has already vetted them.
+
+The trade-off flips: more Iron Gate → more autonomy (because fewer operations require human approval). The gate replaces approval for routine operations; approval remains for cases where the gate itself cannot decide (`APPROVAL_REQUIRED` tier).
+
+This is the Manifesto §6 philosophy at the deepest level. *"The Iron Gate"* is not an adversarial mechanism against the model — it is the enabling mechanism that lets the model operate with real autonomy, because the operator's non-negotiables are enforced structurally.
+
+
+---
+
+# PART XI — Battle Test Breakthrough Log
+
+> **Big Picture:** Every claim in this paper is backed by actual evidence from the Battle Test Runner — a harness that boots the full six-layer stack and runs O+V against the JARVIS codebase autonomously, observing every operation with a fixed cost cap and idle timeout. This Part walks through the major breakthroughs in chronological order: the ExplorationLedger arc (Sessions A–G), the eight-session unmasking ladder culminating in the first APPLY to disk (Session O), the multi-file enforcement arc (Sessions Q–S), and the first end-to-end autonomous multi-file APPLY (Sessions U–W). Each section cites specific session IDs, debug log line numbers, and commit hashes so any claim can be independently verified.
+
+## §61. The Battle Test Runner
+
+**Source:** `backend/core/ouroboros/battle_test/harness.py`, `scripts/ouroboros_battle_test.py`.
+
+**Invocation:**
+
+```bash
+python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 600 -v
+```
+
+Boots the full six-layer stack: GovernedLoopService, IntakeLayer (16 sensors), TrinityConsciousness, StrategicDirection, CommProtocol, SerpentFlow CLI. Runs operations autonomously until the cost cap is hit or the idle timeout elapses without any operations.
+
+### §61.1 Session Artifacts
+
+Every session writes to `.ouroboros/sessions/bt-<timestamp>/`:
+
+- `summary.json` — session-level stats, cost breakdown, convergence metrics, ops digest (v1.1a schema).
+- `debug.log` — full session log — every provider call, every FSM transition, every Iron Gate verdict.
+- `cost_tracker.json` — per-provider spend breakdown.
+
+The `debug.log` is the canonical source for "did the loop work" — `summary.json` has a known counter bug where `stats.attempted / completed / failed` stays at zero even when ops fire.
+
+### §61.2 Session Naming
+
+Sessions are named `bt-YYYY-MM-DD-HHMMSS`. The breakthrough log uses **letter labels** (A, B, C...) for narrative convenience, mapped to session IDs in this Part. The letters are post-hoc — they are not stamped into the session at run time.
+
+![Figure 10 — The battle-test breakthrough arc. Sessions A through W, spanning 2026-04-15, traced the path from ExplorationLedger shadow-mode validation to the first end-to-end autonomous multi-file APPLY to disk. Each session unmasked a distinct failure mode; Session W (green) is the breakthrough — 4 Python test modules generated, validated, repaired, written, committed, 20/20 pytest green.](figures/fig10_breakthrough_timeline.png)
+
+## §62. Sessions A–G — ExplorationLedger Enforcement
+
+**Date:** 2026-04-15 (morning UTC).
+
+**Goal:** validate that the ExplorationLedger scoring can replace the raw exploration-counter floor in production.
+
+**Starting state:** the legacy gate used `tool_calls >= 2` as the exploration-depth check. Sessions A–G were designed to prove that the new diversity-weighted scorer (`ExplorationLedger`) produces better outcomes.
+
+### §62.1 Session A — `bt-2026-04-15-040118`
+
+- Duration: 316s.
+- Stop reason: `budget_exhausted`.
+- Cost: $0.2694 (Claude).
+- Outcome: probe reached VALIDATE phase but shadow-mode ExplorationLedger caught a shallow exploration pattern: `score=3.00 categories=comprehension`. Four `read_file` calls. The legacy counter gate would have waved this through; the ledger flagged it. 0 files landed.
+
+### §62.2 Session B — `bt-2026-04-15-041413`
+
+- Duration: ~420s.
+- Stop reason: SIGKILL (cost governor).
+- Cost: $0.2955 (Claude).
+- Outcome: first production test with `JARVIS_EXPLORATION_LEDGER_ENABLED=true`. The ledger is now enforcing (not shadow). The same shallow exploration pattern triggered a hard Iron Gate rejection. Parallel tool execution visible in round 0 (qualitatively different orchestration than Session A). 0 files landed. Proved the enforcement toggle works.
+
+### §62.3 Session C — `bt-2026-04-15-044627`
+
+- Outcome: instrumentation proof. Track 1 + Track 2 diagnostics from commit `614009ec05` verified. Without the instrumentation, the wrong diagnosis would have persisted.
+
+### §62.4 Sessions D–F
+
+Intermediate sessions validating specific fixes around the ledger's categorization, duplicate-call handling, and retry feedback rendering. No landmark outcomes, but each contributed to the eventual Session G breakthrough.
+
+### §62.5 Session G — The Full Adaptation Loop
+
+- Outcome: **first production demonstration of the complete adaptation loop.** Model diversified tool selection on retry — first production appearances of `get_callers`, `git_blame`, `search_code` on retry — and the second ledger decision scored `25.50 categories=5 (call_graph, comprehension, discovery, history, structure) would_pass=True`. The model *changed its behavior* in response to the retry feedback. This is the crucial observation: the ledger is not just a filter; it is a *training signal* that steers the model toward richer exploration.
+
+### §62.6 Arc Conclusion
+
+Sessions A–G shipped five coordinated commits:
+- `614009ec05` — sem trace + tool-round audit.
+- `db13f045ce` — route-aware 900s pool ceiling.
+- `4f60a584f9` — diversity multiplier + `list_dir` → DISCOVERY remap + complex tier 10.0 floor.
+- `ad05fb7c7e` — unconditional sharpened retry feedback + 180s complex fallback cap.
+- `5d169266d6` — env-tunable safety-net thresholds.
+
+The ExplorationLedger was validated. The scoring works. The retry feedback steers the model. What remained was to prove the rest of the pipeline could carry an operation through to APPLY — which is what Sessions H–O achieved.
+
+## §63. Sessions H–O — The Unmasking Ladder and First APPLY
+
+**Date:** 2026-04-15 (afternoon UTC).
+
+**Goal:** run the pipeline end-to-end and identify whatever blocker appeared next.
+
+Each of Sessions H through N revealed a distinct latent failure mode. Each fix unmasked the next. This is how mature autonomous systems are hardened — not by designing for every failure mode up front, but by running in production and discovering what actually breaks.
+
+### §63.1 The Failure Modes
+
+| Session | Failure mode | Resolution |
+|---|---|---|
+| H | `prompt_async [Errno 22]` headless TTY crash | commit `d8c1cb4d30` |
+| I | `too_many_files` risk escalation | env override |
+| J | L3 `READ_ONLY_PLANNING` mode switch on ambient probe failures | commit `5d169266d6` (env-tunable thresholds) |
+| K | `RollbackArtifact [Errno 2]` new-file path | commit `28d52274ec` |
+| L | 900s pool ceiling crossed by ambient load | env `JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S=1800` |
+| M | 180s fallback cap clipped 5-tool-round retry synthesis | env `JARVIS_FALLBACK_MAX_TIMEOUT_COMPLEX_S=360` |
+| N | Intake WAL cross-session coalescing merged stale envelopes with new tasks | state cleanup: `rm .jarvis/intake_wal.jsonl` |
+
+Each row is a micro-postmortem. The interesting observation: none of these failure modes were in the original design. All were discovered by running the system against real work. The architecture absorbed each fix without requiring a structural rewrite.
+
+### §63.2 Session O — `bt-2026-04-15-175547`
+
+**The breakthrough.** The first end-to-end autonomous APPLY to disk.
+
+- Duration: 4,217s (70 minutes).
+- Stop reason: `idle_timeout`.
+- Cost: $0.351537 (Claude).
+
+**What happened:** the backlog sensor detected a task → the router classified `complex` → the first attempt's ExplorationLedger rejected at `score=0.00` → retry injected sharpened feedback → the second attempt scored `11.00` at 4 categories `would_pass=True` → Iron Gate ASCII auto-repair healed two codepoints on secondary paths → GATE allowed → APPROVE auto-approved (headless bypass) → ChangeEngine's `RollbackArtifact.capture()` handled the new-file path (fix from commit `28d52274ec`) → `DECISION outcome=applied reason_code=safe_auto_passed` → VERIFY found test critiques → L2 Repair iteration 1/5 CONVERGED → second DECISION applied → POSTMORTEM `root_cause=none`.
+
+**Artifact:** `tests/governance/intake/sensors/test_test_failure_sensor_dedup.py` (4,986 bytes) written by the ChangeEngine.
+
+**Caveat:** one of four target files landed. The winning candidate did not populate a `files: [...]` list, so the `_apply_multi_file_candidate` fan-out path was not taken. Multi-file candidate enforcement became the next architectural item (Sessions Q–S).
+
+### §63.3 What Session O Proved
+
+- The ExplorationLedger works end-to-end under retry pressure.
+- The Iron Gate's ASCII auto-repair handles incidental Unicode corruption without halting the op.
+- ChangeEngine's `RollbackArtifact` handles new-file creation (previously broken).
+- L2 Self-Repair converges in one iteration when the failure is a recoverable test critique.
+- The POSTMORTEM machinery correctly reports `root_cause=none` for successful runs.
+
+Full narrative in `OUROBOROS.md` lines 2194–2266.
+
+## §64. Sessions Q–S — Multi-File Enforcement
+
+**Date:** 2026-04-15 (evening UTC).
+
+**Goal:** close the Session O gap — make the pipeline actually take the multi-file fan-out path when a candidate declares multiple files.
+
+### §64.1 Session Q — `bt-2026-04-15-201035`
+
+- Duration: 876s.
+- Outcome: original bug isolated. Schema error: `schema_invalid:candidate_0_missing_file_path` on multi-file candidates. Per-op dedup proven in production with interleaved IMMEDIATE success triggering `counted_ops=1` reset.
+
+### §64.2 Session R — `bt-2026-04-15-203724`
+
+- Outcome: parser fix verified. A 4-file candidate passed the parser at `cost=$0.1642 117.8s`. Died at Iron Gate 1 (exploration) with 0 fresh tool calls — not a multi-file issue; a consecutive-op issue.
+
+### §64.3 Session S — `bt-2026-04-15-204901`
+
+- Duration: 1,234s.
+- Outcome: **Iron Gate 5 (multi-file coverage) proven.** With `JARVIS_EXPLORATION_GATE=false` to isolate Gate 5, the model round-0 fired three parallel `read_file` calls unprompted. GENERATE `91.3s $0.2085`. ASCII auto-repair healed two codepoints. **Zero `multi_file_coverage` rejections anywhere in the log** (Gate 5 silently passed → all four paths covered). LSP found 1 type error in three of four files. TestRunner resolved 45 test targets for four changed files — **all four target paths visible to the post-gate pipeline.**
+
+**Persistence not proven in Session S:** VALIDATE's type error on `dedup.py` routed to `VALIDATE_RETRY → L2 Repair`, which never converged before the 10-minute idle timeout (`pytest timed out after 30.0s`, L2 iteration `49s elapsed, 11s remaining` on the 60s timebox). **0 of 4 files landed.** This was identified as a **VALIDATE/L2 timebox issue orthogonal to multi-file enforcement** — Follow-up A.
+
+### §64.4 Arc Commits
+
+- `37a371e65d` — `fix(exhaustion-watcher)`: per-op dedup to prevent Session P cross-op hibernation.
+- `31504a8f12` — `feat(iron-gate)`: multi-file coverage enforcement (Iron Gate 5) + prompt hint + parser multi-file shape acceptance.
+
+Sessions Q–S proved enforcement. Persistence remained for Sessions U–W.
+
+## §65. Sessions U–W — First End-to-End Multi-File APPLY
+
+**Date:** 2026-04-15 (late evening UTC).
+
+**Goal:** close Follow-up A (the L2 timebox issue) and achieve end-to-end multi-file persistence.
+
+### §65.1 Session T — Follow-up A Hypothesis
+
+- Session `bt-2026-04-15-211616`, 1,356s, `idle_timeout`.
+- Raised `JARVIS_TEST_TIMEOUT_S=120` and `JARVIS_L2_TIMEBOX_S=600`.
+- **Hypothesis falsified**: L2 never got a chance to run. The handoff to L2 never fired. All L2 tuning env vars landed correctly in boot logs but were irrelevant. Stall occurred upstream, not in L2 timebox. Session O file still on disk unchanged. Anti-goal preserved: do not re-run without changes.
+
+### §65.2 Session U — The FSM Trail
+
+- Session `bt-2026-04-15-215858`, ~22 min.
+- Outcome: **FSM instrumentation from commit `d6aa78c8ba` kills the "silent exit" ghost.** Definitive empirical trail: `retry_advance_post ctx=155938670 VALIDATE_RETRY` → `iter_start iter=1`.
+- **Real bug exposed:** re-validation is non-deterministic across iterations. Same candidate, `iter=0` returns `failure_class='test'` (LSP defect) but `iter=1` returns `failure_class='infra'` (sandbox transient), which routes through the non-retryable `_early_return_ctx` branch and kills the op on a flake.
+
+### §65.3 Session V — The L2 Budget Contract Bug
+
+- Session `bt-2026-04-15-223631`.
+- Outcome: `JARVIS_MAX_VALIDATE_RETRIES=0` via env-factory (commit `58709f27de`, frozen-dataclass `field(default_factory=lambda: int(os.environ.get(...)))`) bypasses the flaky iter=1. Produces the **first-ever `l2_dispatch_pre` log on a multi-file op**, which exposes the L2 budget contract bug:
+  - `JARVIS_L2_TIMEBOX_S=600` was set
+  - L2 reported `Iteration 1/8 starting (0s elapsed, 120s remaining)`
+  - Why only 120s? Because `ctx.pipeline_deadline` had only 120s left after VALIDATE drained it, and `_l2_hook` was passed the drained deadline directly.
+
+**This is the bug.** `JARVIS_L2_TIMEBOX_S` did not mean what its name said. It was effectively advisory; the actual L2 budget was the residual pipeline clock.
+
+### §65.4 Session W — `bt-2026-04-15-230849` — The Breakthrough
+
+- Duration: 3,645s (61 minutes).
+- Stop reason: `idle_timeout`.
+- Cost: $0.320061 (Claude).
+
+**L2 deadline reconciliation (commit `53e6bd9f76`)** fixes the contract:
+- L2's deadline is now computed fresh at dispatch (`now + JARVIS_L2_TIMEBOX_S`).
+- `ctx.pipeline_deadline` is reconciled upward via `OperationContext.with_pipeline_deadline()` so downstream phases see a consistent op-level clock.
+- A mandatory INFO log line names both clocks and the winning cap (`l2_timebox_fresh` vs `pipeline_deadline_inherited`).
+
+**What happened in Session W (op `op-019d9368-654b`):**
+
+```
+16:14:18  [ValidateRetryFSM] iter_start iter=0 ctx=153c309a0 VALIDATE retries_remaining=0 fc=None
+
+16:16:20  [Orchestrator] L2 deadline reconciliation:
+            pipeline_remaining=0.0s l2_timebox_env=600.0s
+            effective=600.0s winning_cap=l2_timebox_fresh
+            op=op-019d9368-654b
+16:16:20  [ValidateRetryFSM] l2_dispatch_pre ctx=151b65040 VALIDATE retries_remaining=-1 fc='test'
+            effective_s=600 cap=l2_timebox_fresh l2_timebox_env=600
+
+16:17:10  [ValidateRetryFSM] l2_dispatch_post directive='break'
+16:17:10  [Orchestrator] L2 broke VALIDATE_RETRY loop for op=op-019d9368-654b-7d3f-bcd7-5dd72368f2d5-cau —
+            proceeding to source-drift / shadow / entropy / GATE
+16:17:10  [ValidateRetryFSM] l2_converged_break
+16:17:10  [ValidateRetryFSM] loop_exit_normal best_candidate_present=True
+
+16:17:44  [Orchestrator] APPLY mode=multi candidate_files=4 files_list_present=True multi_enabled=True
+            targets=[test_test_failure_sensor_dedup.py,
+                     test_test_failure_sensor_ttl.py,
+                     test_test_failure_sensor_isolation.py,
+                     test_test_failure_sensor_marker_refresh.py]
+
+16:19:59  DECISION op=...::00 outcome=applied reason_code=safe_auto_passed
+16:19:59  POSTMORTEM op=...::00 root_cause=none failed_phase=None
+16:22:39  DECISION op=...::01 outcome=applied reason_code=safe_auto_passed
+16:22:39  POSTMORTEM op=...::01 root_cause=none failed_phase=None
+16:23:02  DECISION op=...::02 outcome=applied reason_code=safe_auto_passed
+16:23:02  POSTMORTEM op=...::02 root_cause=none failed_phase=None
+16:23:02  DECISION op=...::03 outcome=applied reason_code=safe_auto_passed
+16:23:02  POSTMORTEM op=...::03 root_cause=none failed_phase=None
+```
+
+**Critical value:** `pipeline_remaining=0.0s` at L2 dispatch. The pipeline clock was *fully drained*. Before the reconciliation fix, L2 would have been handed a 0s deadline and died instantly. After the fix, `winning_cap=l2_timebox_fresh` and `effective=600.0s` took precedence — L2 got its full wall-clock budget and converged in a single 50-second iteration on the first LSP-type-error critique.
+
+**Four sub-ops (`::00`, `::01`, `::02`, `::03`)** fan out through `_apply_multi_file_candidate`, each with its own DECISION and POSTMORTEM, each `root_cause=none`. Disk state verified by mtime; files match.
+
+**AutoCommitter autonomously committed all four files** as commit `0890a7b6f0`:
+
+```
+fix(sensors): Write four focused sensor-level test modules for the Test...
+
+Signal: backlog | Urgency: normal
+Op-ID: op-019d9368-654b-7d3f-bcd7-5dd72368f2d5-cau
+Risk: NOTIFY_APPLY (Yellow)
+Provider: claude-api ($0.0059)
+Files: 4 sensor test modules
+Ouroboros+Venom [O+V] — Autonomous Self-Development Engine
+Co-Authored-By: Ouroboros+Venom <ouroboros@jarvis.trinity>
+[integrity-verified: 57d3fd202d18]
+```
+
+**Post-hoc artifact quality verification:**
+
+```
+$ python3 -m pytest tests/governance/intake/sensors/test_test_failure_sensor_*.py -v
+...
+20 passed, 4 warnings in 2.28s
+```
+
+**All 20 tests pass** against the real `TestFailureSensor` code. Breakdown by file:
+
+| File | Tests | Coverage |
+|---|---|---|
+| `test_test_failure_sensor_dedup.py` | 5 | second-signal suppression, "already in-flight" log, multi-hit dedup, precondition checks, config default |
+| `test_test_failure_sensor_ttl.py` | 5 | post-TTL re-admission, stale-key pruning, fresh-entry preservation, env-var integration, zero-TTL edge case |
+| `test_test_failure_sensor_isolation.py` | 4 | cross-target non-suppression, mixed in-flight/new, N-concurrent-targets scale, single-release isolation |
+| `test_test_failure_sensor_marker_refresh.py` | 6 | marker set after enqueue, negative cases (queued_behind/deduplicated), release clears marker, monotonic timestamps, unstable-signal gate |
+
+The backlog task description specified exactly these four behaviors. The model delivered all four, with happy-path + edge-case + negative-path + env-integration coverage, every test exercising the real sensor (not a mock). **The pipeline's definition of "good" converged with runtime reality.**
+
+### §65.5 The Complete Enforcement-to-Persistence Arc
+
+| Session | Key blocker | Key commit | Outcome |
+|---|---|---|---|
+| Q | Parser rejected multi-file shape | — (isolation) | First empirical proof of parser contract mismatch |
+| R | Parser fix verified; Iron Gate 1 rejected | `6c3cce92c6` | Parser end-to-end for multi-file |
+| S | Exploration gate bypass; VALIDATE stalls pre-L2 | `31504a8f12`, `37a371e65d` | Iron Gate 5 silently passes on full coverage; 4 files visible post-gate |
+| T | "Silent exit" hypothesis | — (hypothesis) | Hypothesis formed |
+| U | Silent exit falsified; re-validation non-determinism exposed | `d6aa78c8ba` | Ghost killed; real bug named |
+| V | Env-tunable retries work; L2 budget contract bug exposed | `58709f27de` | First L2 dispatch on multi-file op; contract bug quantified |
+| **W** | **Contract bug fixed; L2 converges; APPLY fan-out lands all 4 files** | `53e6bd9f76` | **First end-to-end autonomous multi-file APPLY. 20/20 tests pass.** |
+
+### §65.6 Total Cost Across the Arc
+
+~$2.50 total across seven sessions (Q through W). Six commits shipped by humans; one commit (`0890a7b6f0`) shipped autonomously by the AutoCommitter.
+
+## §66. What the Battle Tests Prove (Honest Accounting)
+
+### §66.1 What Is Proven
+
+- **Deterministic governance across multi-file coordination.** Every layer — parser, Iron Gate 5, per-op exhaustion dedup, multi-file contract prompt hint, FSM-traceable VALIDATE_RETRY, L2 deadline reconciliation, `_apply_multi_file_candidate` fan-out with per-file rollback — held under five sessions of production traffic.
+- **§8 Absolute Observability as diagnostic loop.** The T→U silent-exit ghost was falsified by FSM instrumentation in a single session. The V→W L2 budget contract bug was named and quantified by one INFO log line, then fixed. The pattern *hypothesize → instrument → falsify/confirm → fix → verify-in-one-session* is battle-tested meta-capability.
+- **§6 Threshold-Triggered Neuroplasticity, enforcement half.** The organism detected the gap (4-file test suite missing), synthesized the fix (4 complete test modules), validated through the pipeline, and landed on disk under governance.
+- **Model output quality converges with pipeline definition of "good".** L2 approval, shadow harness, entropy, GATE, per-file POSTMORTEM all passed; independent `pytest` execution also passed 20/20. The governance layer is not papering over broken artifacts.
+
+### §66.2 What Is NOT Yet Proven
+
+Three honest caveats:
+
+1. **Durability.** Manifesto §6 demands three consecutive successes before a capability graduates. Session W is **one**. Sessions X, Y (or whatever the next attempts are) must replicate the arc under comparable conditions before multi-file autonomy is a "capability" rather than a "data point."
+
+2. **Broader scope.** Session W's task was narrow: new-file creation, test modules, a detailed backlog description. Multi-file refactors across existing code, cross-file dependency-aware edits, schema migrations, breaking-change rollouts — those are the next frontiers, none yet proven.
+
+3. **Load-bearing workarounds.** Session W sits on top of three known deferred items:
+   - `JARVIS_MAX_VALIDATE_RETRIES=0` works around the re-validation non-determinism ('infra' flake on iter=1). The underlying sandbox isolation issue is still there.
+   - `cost_governor.finish` logs stale `ctx.phase.name` (the `phase=CLASSIFY` mismatch noted in Session U). Display-only bug but a real ctx-reference inconsistency.
+   - Hardcoded micro-fix `asyncio.wait_for(timeout=90.0)` in the retry path — generic timeout should be parameterized.
+
+These three deferred items are load-bearing workarounds, not fixes. They should be addressed before multi-file autonomy is considered production-hardened.
+
+## §67. The Breakthrough Log as Research Artifact
+
+The battle-test breakthrough log (in `OUROBOROS.md` lines 1741–2558) is itself a research artifact. It documents:
+
+- Every hypothesis formed before a session.
+- Every failure mode observed during a session.
+- Every instrumentation added between sessions.
+- Every commit shipped as a fix.
+- Every cost and duration number.
+- Every quote from the actual debug logs.
+
+It is the falsifiability trail. A reader who disputes a claim in this paper can open the breakthrough log, navigate to the relevant session, and read the raw evidence.
+
+This is what Principle 7 (Absolute Observability) looks like at the system level. Not just per-operation observability — *entire developmental history* observability. The organism has a fossil record.
+
+---
+
+# PART XII — The Observability Stack
+
+> **Big Picture:** An autonomous system that cannot be observed cannot be trusted. O+V's observability stack — voice narration, thought log, autonomous commit signatures, telemetry, and the SerpentFlow CLI — together produce the moment-by-moment visibility into the organism's decisions that makes autonomy tolerable. This Part describes each layer.
+
+## §68. Voice Narration
+
+**Source:** `backend/core/ouroboros/ui_integration.py` (`IntelligentVoiceNarrator`), `backend/core/ouroboros/governance/comms/cross_repo_narrator.py` (`CrossRepoNarrator`).
+
+The organism *speaks* — via the JARVIS voice pipeline — at three specific moments:
+
+| Narrator | Events |
+|---|---|
+| `IntelligentVoiceNarrator` | `INTENT`, `DECISION`, `POSTMORTEM` |
+| `CrossRepoNarrator` | Cross-repo saga events |
+
+Voice debounce: `OUROBOROS_VOICE_DEBOUNCE_S` (default 60s) prevents narration spam. The organism does not announce every heartbeat; it announces the semantically significant transitions.
+
+A typical spoken announcement:
+
+> *"Operation op-abc123 completed. Applied four test modules for TestFailureSensor. Provider was claude-api. Cost five-point-nine cents. No regressions."*
+
+The operator, away from the terminal, hears the organism narrate its own work. Autonomy becomes *audible*.
+
+## §69. Thought Log
+
+**Source:** `backend/core/ouroboros/governance/goal_memory_bridge.py`.
+
+The `GoalMemoryBridge` writes a human-readable JSONL thought log to `.jarvis/ouroboros_thoughts.jsonl` showing the organism's reasoning process at each phase:
+
+| Phase | What is logged |
+|---|---|
+| `BOOT` | Scanning codebase for opportunities |
+| `MEMORY_RECALL` | What memories were found, how many, relevance |
+| `TOOL` | Which tool was called and why (read_file, bash, run_tests) |
+| `GENERATE` | Generation strategy, provider used, context size |
+| `REPAIR` | L2 iteration progress, failure classification, convergence |
+| `POST_APPLY` | Success/failure outcome, what was learned |
+
+Logged at INFO level so `battle_test.py -v` shows the thought process in real time. Also persisted to disk for post-session review.
+
+A fragment:
+
+```jsonl
+{"ts": "2026-04-15T16:15:12Z", "op_id": "op-019d9368", "phase": "MEMORY_RECALL", "msg": "retrieved 3 similar past operations on intake/sensors/*", "relevance": 0.78}
+{"ts": "2026-04-15T16:15:14Z", "op_id": "op-019d9368", "phase": "TOOL", "tool": "read_file", "path": "backend/core/ouroboros/governance/intake/sensors/test_failure_sensor.py", "reason": "target file inspection before patch generation"}
+{"ts": "2026-04-15T16:15:18Z", "op_id": "op-019d9368", "phase": "TOOL", "tool": "search_code", "query": "class TestFailureSensor", "reason": "locate class definition and its test coverage"}
+{"ts": "2026-04-15T16:17:10Z", "op_id": "op-019d9368", "phase": "REPAIR", "iter": 1, "outcome": "converged", "msg": "fixed LSP type error on line 42"}
+```
+
+## §70. Autonomous Commit Signature
+
+Every commit made by the AutoCommitter includes a dynamic `Generated-By` trailer identifying which subsystems contributed:
+
+```
+[ouroboros] fix FIXME in governed_loop_service.py
+
+op_id: op-019d6633-10ed-71ae-b324-fd5d412cfc3b
+saga_id: saga-abc123
+repo: jarvis
+provider: claude-api
+phase: apply
+
+Generated-By: Ouroboros + Venom + Consciousness
+Signed-off-by: JARVIS Ouroboros <ouroboros@jarvis.local>
+```
+
+| Signature component | When present |
+|---|---|
+| `Ouroboros` | Always (governance pipeline) |
+| `+ Venom` | When `tool_execution_records` exist (multi-turn tool use) |
+| `+ Consciousness` | When `ConsciousnessBridge` is active (memory/prediction) |
+
+Git author: `JARVIS Ouroboros <ouroboros@jarvis.local>`.
+
+This means: a year from now, a developer doing `git blame` on any file can instantly distinguish human-authored commits from O+V-authored commits, and within the O+V commits, can distinguish which subsystems contributed to each change.
+
+## §71. Telemetry
+
+**Source:** `telemetry.py`, integrated into `CommProtocol`.
+
+Every `OperationContext` carries:
+
+- `HostTelemetry` — hardware state at op start (CPU load, memory pressure, disk pressure).
+- `RoutingIntentTelemetry` — what the router decided and why.
+- `TelemetryContext` — span-tree for the op's phase timings.
+
+The `_CommTelemetrySink` bridges FSM telemetry into CommProtocol heartbeats. Every phase transition emits a heartbeat with telemetry attached.
+
+## §72. SerpentFlow CLI
+
+**Source:** `backend/core/ouroboros/battle_test/serpent_flow.py` (1,900+ lines).
+
+The SerpentFlow CLI is the primary interface during battle tests (and optionally during production). It uses Rich for ANSI output and prompt_toolkit for interactive REPL.
+
+### §72.1 Visual Elements
+
+| Block | Trigger | Renders |
+|---|---|---|
+| `┌ op-id ... goal` | INTENT | Op header with sensor type |
+| `⏺ Read(path)` | `read_file` tool | File path |
+| `⏺ Update(path)` | `edit_file` tool | CC-style diff with +/- lines |
+| `⏺ Write(path)` | `write_file` tool | Line count |
+| `⏺ Verify(files)` | Post-apply test | Pass/fail counts |
+| `🧬 synthesized` | Generation complete | Provider, tokens, duration |
+| `🛡️ immune` | Validation result | Test pass/fail |
+| `🩹 repair` | L2 iteration | Iteration count, status |
+| `⚠ NOTIFY` | NOTIFY_APPLY | Reason code, files |
+| `└ ✅ complete` | DECISION:completed | Provider, cost, duration |
+
+### §72.2 REPL Commands
+
+| Command | Effect |
+|---|---|
+| `/status` | Print current op state, cost, phase |
+| `/cost` | Print day-to-date cost breakdown |
+| `/pause` | Suspend new op dispatch (in-flight ops continue) |
+| `/resume` | Resume dispatch |
+| `cancel <op-id>` | Cooperative cancellation (prefix match) |
+| `/q` | Quit battle test |
+
+### §72.3 Terminal Rendering Detail
+
+SerpentFlow uses `Console(force_terminal=True)` to force Rich ANSI output through prompt_toolkit's stdout proxy, and `patch_stdout(raw=True)` to preserve ANSI escape codes. Without these, Rich output appears as raw `?[2m` sequences in the prompt_toolkit-patched terminal.
+
+## §73. The Integrated Observability Story
+
+The five observability layers — voice, thought log, commit signatures, telemetry, SerpentFlow CLI — cover different axes:
+
+- **Voice:** real-time presence. The operator hears what happens.
+- **Thought log:** durable reasoning trace. Reads like prose.
+- **Commit signatures:** historical attribution. What did O+V do last year?
+- **Telemetry:** structured metrics. Counters, timings, histograms.
+- **SerpentFlow:** real-time CLI. Rich, interactive, navigable.
+
+Together, they are Principle 7 (Absolute Observability). **Every autonomous decision is visible**, at the level of granularity and medium the human needs.
+
+
+---
+
+# PART XIII — Capability Assessment
+
+> **Big Picture:** After the Session U–W arc, the natural question is: *is O+V a peer to Claude Code in autonomous software engineering?* The answer is nuanced. This Part gives an honest self-assessment — where O+V matches or exceeds Claude Code, where it lags, and where the architectural choices produce different trade-offs. The assessment is current as of 2026-04-12, updated with battle-test evidence through Session W.
+
+## §74. O+V vs Claude Code — Where They Differ
+
+| Dimension | Claude Code | O+V |
+|---|---|---|
+| Invocation | Human-triggered | Autonomous + human-triggered |
+| Provider | Claude only | Claude + DoubleWord + J-Prime cascade |
+| Governance | Approval gates, per-tool | Full 11-phase FSM with Iron Gate |
+| Memory | Session-scoped | Cross-session via Trinity Consciousness |
+| Scope | Single repo | Multi-repo via Saga pattern |
+| Observability | Rich CLI | Rich CLI + voice + thought log + telemetry + commit sigs |
+| Graduation | N/A (tool is always available) | Capabilities graduate after 3× success |
+| Self-development | N/A | Ouroboros — can modify its own codebase |
+| Cost model | Per-token | Per-op + daily budgets + per-provider caps |
+
+### §74.1 Where O+V Is Peer or Ahead
+
+- **Autonomy.** Claude Code is reactive; O+V is proactive. When you say "hey Claude, fix this," Claude Code does it. O+V has already noticed and may have already done it.
+- **Cost optimization.** Claude Code runs on Claude, always. O+V cascades to DoubleWord for cost-optimized work, saving roughly 30x on routine operations when DW's SSE is healthy.
+- **Cross-session learning.** Claude Code does not remember yesterday's conversation. O+V does, via MemoryEngine and GoalMemoryBridge.
+- **Multi-repo orchestration.** Claude Code works on one repo at a time. O+V can apply a coordinated Saga across Body, Mind, and Soul.
+- **Observability surface.** Claude Code has a rich CLI but no thought log, no voice narration, no autonomous commit signatures, no battle-test breakthrough log. O+V has all five.
+
+### §74.2 Where O+V Lags or Differs
+
+- **Model quality.** Claude Code runs on the best Claude model available. O+V tries to prefer cheaper models when they suffice; when DW is healthy, this saves cost but may reduce peak model quality for the routine tier.
+- **Human-in-the-loop latency.** Claude Code is always human-in-the-loop. O+V's `APPROVAL_REQUIRED` tier requires specific configuration (Orange PR Reviewer or CLI approval). For organizations that want *all* operations to be human-approved, O+V must be configured Orange-only — at which point it behaves like Claude Code.
+- **Breadth of scope proven.** Claude Code has been used on every kind of codebase change imaginable. O+V's Session W breakthrough is narrow — new-file creation, test modules. Multi-file refactors across existing code are not yet proven. See §66.2.
+- **Onboarding friction.** Claude Code is an off-the-shelf tool. O+V requires a non-trivial setup — Trinity deployment, provider credentials, sensor configuration, Oracle index building. The production-deployment story is a gap.
+
+### §74.3 The Architectural Mirror
+
+Despite the differences, O+V and Claude Code share several architectural choices:
+
+- Multi-turn tool loops as the primary agentic pattern.
+- Exploration before generation as a best practice.
+- Thought trails for observability.
+- Deterministic safety layers around probabilistic model output.
+
+These convergences are not coincidental. They reflect the genuine lessons of production autonomous-AI research. Both systems independently arrived at them.
+
+## §75. O+V vs the Anthropic "Always-On Agent" Vision
+
+Anthropic has publicly discussed their "always-on agent" vision — agents running continuously against user workloads, taking actions, maintaining state, learning over time. O+V is a direct instance of that vision, differentiated in four ways:
+
+1. **Sovereign.** O+V does not require a hosted agent service. It runs on the operator's hardware (or on self-hosted GCP VMs). The operator owns the state, owns the model cache, owns the logs.
+
+2. **Neuroplastic.** O+V modifies *its own codebase*. Not just user workloads — its own governance layer, its own sensors, its own pipeline phases. The Ouroboros is literal, not metaphorical.
+
+3. **Local-first.** O+V's memory (Trinity Consciousness, UserPreferenceMemory, LastSessionSummary) lives on the operator's disk under `~/.jarvis/`. Nothing is exfiltrated by default.
+
+4. **Provider-diverse.** O+V uses Claude, DoubleWord, and J-Prime. An outage of any single provider degrades the system; it does not stop it.
+
+The Anthropic vision and O+V converge on what autonomous agents will look like in production. They diverge on where the state lives and who owns the control loop.
+
+## §76. Mythos and Safety Alignment
+
+From the Claude Mythos Preview (2026-04-12) cross-reference in `OUROBOROS.md` lines 2656–2684:
+
+> *"The most severe incidents in Mythos came from 'reckless excessive measures when attempting to complete a difficult user-specified task' — not misaligned goals, not hostile intent, just task-completion drive overriding safety checks. That is exactly O+V's failure surface."*
+
+The defenses are explicitly **deterministic** (gates, replay harnesses, protected paths, outcome-based monitoring), not introspective. Why? Because interpretability research shows that scratchpad reasoning can look clean while concealment features fire in the model's internals. Trusting the model's self-report is not a safety strategy. Trusting the gate's deterministic verdict *is*.
+
+This is the principled justification for the Iron Gate philosophy (Part X). The gate does not listen to the model's reasoning; the gate reads file paths, AST nodes, and command strings. A model that writes a plausible-sounding argument for why `rm -rf /` is safe is still refused structurally.
+
+---
+
+# PART XIV — The Road Ahead
+
+> **Big Picture:** This final Part addresses three questions: What specific work is currently in flight? What is the near-term roadmap? And what remains honestly unproven? The paper ends with a ledger of the deferred items that future engineering cycles must address before O+V can claim fully production-hardened autonomy.
+
+## §77. Functions, Not Agents — The DoubleWord Reseating Roadmap
+
+> **Big Picture:** The 2026-04-14 battle tests established that DoubleWord's streaming endpoint cannot sustain agent-shape workloads across all tested models. Rather than abandon DoubleWord, the architecture pivots: DW is treated as an *untested function provider*, not a broken agent provider. The streaming endpoint has been sealed from generation routes; DW now runs only short, structured-JSON, non-streaming function calls. This section describes the phased roadmap for re-engagement.
+
+**Source:** `docs/architecture/OUROBOROS.md` §"Functions, Not Agents" (lines 2685–onward).
+
+![Figure 12 — The Functions, Not Agents reseating roadmap. Phase 0 (Gemma compaction caller) is shipping in shadow mode today. Phase 3 (Qwen 397B heavy analyst) is designed and awaits 24h+ of clean Phase 0 telemetry before promotion. Every DW caller ships under six structural invariants — non-streaming, bounded output, caller-supplied timeout, anti-hallucination gate, circuit breaker, shadow mode first.](figures/fig12_functions_not_agents.png)
+
+### §77.1 The Architectural Reframe
+
+From OUROBOROS.md:
+
+> *"DoubleWord is not a broken agent provider. It is an **untested function provider.** The streaming endpoint fails; the non-streaming `/v1/chat/completions` endpoint with `stream=false` has never been exercised by O+V. The reseating matrix below moves DW out of the agent cascade entirely and into a fixed set of short, structured, non-streaming function calls."*
+
+### §77.2 Design Invariants for Every DW Caller
+
+Six non-negotiables for every function-shaped DW caller:
+
+1. **Non-streaming only** — `stream=false`. Single JSON response. No SSE loop.
+2. **Short structured output** — ≤512 output tokens typical, JSON-schema bounded.
+3. **Caller-supplied timeout** — each caller picks a timeout matching its criticality.
+4. **Anti-hallucination gate** — every caller that names codebase artifacts validates the output against provided context.
+5. **Circuit breaker** — per-call, per-op, and global-rolling breakers.
+6. **Shadow mode first** — every new caller ships disabled-by-default, runs in parallel with the deterministic baseline, promoted to LIVE only after offline telemetry analysis.
+
+### §77.3 Phase 0 — Gemma Compaction Caller (Shipping, Shadow)
+
+**Model:** `google/gemma-4-31B-it`.
+
+**Call site:** `ContextCompactor._build_summary()` in `context_compaction.py`.
+
+**Deterministic fallback:** the existing type-counting + phase-histogram summarizer.
+
+**Rationale:** compaction is a structured summarization task with a fully-bounded input (entries already in memory), short output (<1KB), and a trivial anti-hallucination check (summary must reference only entry-keys already preserved). Ideal Gemma test bed.
+
+**Strategy injection:** `ContextCompactor.__init__(semantic_strategy: Optional[CompactionCallerStrategy])`. When present, `_build_summary` delegates. On any failure (timeout, schema_invalid, hallucinated ref, circuit-open), falls back to the deterministic path and logs the rejection reason.
+
+**Master switch:** `JARVIS_COMPACTION_CALLER_ENABLED` (default `false`). Enabled explicitly per battle test during shadow-mode validation.
+
+**Status:** Shipping in shadow mode. Telemetry writing to `.ouroboros/sessions/<id>/compaction_shadow.jsonl`.
+
+### §77.4 Phase 3 — Qwen 397B Heavy Analyst (Planned)
+
+Once Phase 0 has 24h+ of clean shadow telemetry, Phase 3 mounts Qwen 397B as the **heavy analyst** for three cognitive callers — all sharing the same `complete_sync()` non-streaming code path.
+
+#### 3.1 — BlastRadius Scoring
+
+**What today:** deterministic heuristic counting transitively-dependent files via import graph, weighted by test coverage, emits 0.0–1.0 score consumed by the 4-tier risk escalator.
+
+**Gap:** the import-graph heuristic is structural only. It cannot reason about *semantic* blast radius — a one-line change to a retry-backoff constant may have higher real-world impact than a 500-line refactor of a leaf module.
+
+**Qwen 397B role:** non-streaming structured-JSON analyst. Input: candidate diff + import-graph evidence pack + historical failure episodes touching the same path. Output: `blast_radius.1` schema — `{score, structural_score, semantic_score, reasoning, risk_factors, invariants_touched}`. Deterministic score stays as the floor; 397B score can *only* escalate risk tier, never de-escalate. Preserves the "fluid intelligence never lowers a hard gate" invariant.
+
+**Anti-hallucination gate:** `invariants_touched` must be a subset of symbol names extracted from the actual diff. Hallucinated invariants → rejection, deterministic fallback.
+
+**Timeout:** 10s per call (bounded by single-op approval-latency budget).
+
+#### 3.2 — Episodic Failure Clustering
+
+**What today:** nothing. Session lessons reset each session; failed ops are logged but never clustered across sessions.
+
+**Gap:** Trinity Consciousness has the storage substrate (UserPreferenceMemory, ProphecyEngine) but no component that looks across historical failures and says "these three rejections are the same problem wearing different hats."
+
+**Qwen 397B role:** cross-session pattern recognition over the storage substrate. Output: clustered patterns keyed by semantic similarity, with citations back to the specific sessions/ops that manifested each pattern.
+
+#### 3.3 — Deep Analysis Sensor (Planned)
+
+Autonomous codebase comprehension for proactive improvement identification. Input: the Oracle graph + MemoryEngine reputations. Output: candidate improvement targets ranked by predicted value.
+
+### §77.5 What Phase 0 → Phase 3 Unlocks
+
+If Phase 0 shadow telemetry shows the non-streaming endpoint is stable, the Phase 3 reseating unlocks a path for DW to carry a substantial share of O+V's structured inference load without going anywhere near the streaming stall. This is the architectural answer to "how do we re-engage DW without losing the current stability."
+
+## §78. Manifesto §6 Graduation — The Durability Gap
+
+The Manifesto's §6 (Threshold-Triggered Neuroplasticity) demands **three consecutive successes** before a capability graduates from "a data point" to "a capability." Session W is one data point. The next two data points (Sessions X, Y) are the outstanding work.
+
+Specifically, the durability bar requires:
+
+1. Three consecutive successful end-to-end multi-file APPLYs.
+2. Under comparable conditions (same pipeline, same Iron Gate settings, same provider topology).
+3. Without regressing on any of the seven capabilities (Part VII) or the Iron Gate (Part X).
+
+Once met, multi-file autonomy graduates from "proven in one session" to "capability." The gate for graduation is deliberately conservative to avoid false confidence from lucky single-session successes.
+
+## §79. Deferred Latent Bugs (Load-Bearing Workarounds)
+
+Three deferred items are load-bearing workarounds that Session W depended on. They must be addressed before multi-file autonomy is considered production-hardened.
+
+### §79.1 Re-Validation Non-Determinism ('Infra' Flake on iter=1)
+
+**Where:** `orchestrator.py` VALIDATE_RETRY path.
+
+**Symptom:** same unchanged candidate, `iter=0` returns `failure_class='test'`, `iter=1` returns `failure_class='infra'` (sandbox/pytest transient). The `'infra'` class is non-retryable by design and triggers `_early_return_ctx` escalation, killing the op on a flake.
+
+**Current workaround:** `JARVIS_MAX_VALIDATE_RETRIES=0` — bypasses iter=1 entirely.
+
+**Proper fix:** sandbox isolation between iter=0 and iter=1 so the same candidate produces the same classification. Deferred.
+
+### §79.2 Cost Governor ctx-Reference Staleness
+
+**Where:** `cost_governor.finish` logs stale `ctx.phase.name`.
+
+**Symptom:** Display shows `phase=CLASSIFY` mismatch even when actual phase is POSTMORTEM. Known and deferred.
+
+**Impact:** Display-only bug, but a real ctx-reference inconsistency. Audit trail semantics compromised in a subtle way — a postmortem reader sees wrong phase metadata in cost records.
+
+**Proper fix:** reconciliation of ctx lifetime with cost-governor records. Deferred.
+
+### §79.3 Hardcoded `asyncio.wait_for(timeout=90.0)`
+
+**Where:** retry-path micro-fix.
+
+**Symptom:** a hardcoded 90-second `asyncio.wait_for` timeout on a specific retry path, introduced as an emergency fix during the Session U–W arc.
+
+**Current workaround:** none — it is the fix, but the timeout is not parameterized.
+
+**Proper fix:** turn into a configurable env-driven timeout consistent with the rest of the pipeline's budget allocation. Deferred.
+
+## §80. What the Next Battle Tests Should Prove
+
+The Session W arc closed enforcement-to-persistence for new-file creation. The next battle tests should prove:
+
+1. **Multi-file refactor across existing code.** A change that must modify two or more existing files in a coordinated way — not just create new ones. This exercises rollback semantics that Session W did not.
+
+2. **Cross-file dependency-aware edits.** A change where file B imports from file A, and the edit to A requires a corresponding edit to B. This exercises the multi-file coverage gate's topological ordering.
+
+3. **Schema migration.** A change that modifies a data structure's schema in one file, necessitating updates to all its consumers. This exercises the full exploration/impact-analysis pipeline.
+
+4. **Breaking-change rollout.** An API change with deprecation + new-version coexistence. This exercises the governance layer's conservatism across multiple related operations.
+
+5. **Sustained multi-hour autonomy.** An extended session (eight+ hours) with dozens of operations firing without human intervention. This exercises durability under sustained load.
+
+Each of these is a meaningful milestone. Achieving all five, with three consecutive successes for each, is the gating condition for claiming "production-hardened multi-file autonomous development."
+
+## §81. The Longer Arc — Graduation
+
+Ouroboros is ultimately about **graduation** — the mechanism by which the organism takes capabilities that have been exercised successfully and elevates them to permanent parts of itself.
+
+**Source:** `backend/core/ouroboros/governance/graduation_orchestrator.py`.
+
+### §81.1 The Graduation FSM
+
+```
+TRACKING → EVALUATING → WORKTREE_CREATING → GENERATING →
+VALIDATING → COMMITTING → AWAITING_APPROVAL → PUSHING →
+AWAITING_MERGE → REGISTERING → GRADUATED
+```
+
+Each state is idempotent, durable, and logged. Failures rewind via compensation — for example, `PUSH_FAILED` is an explicit phase with code preserved locally, not lost.
+
+### §81.2 Hardening Requirements
+
+| ID | Requirement |
+|---|---|
+| H1 | Git cleanliness check before mutation (`git status --porcelain`) |
+| H2 | Contract tests (BaseNeuralMeshAgent interface) |
+| H3 | `PUSH_FAILED` is an explicit phase (code preserved locally) |
+| H4 | Approval timeout → discard worktree + log (30min default) |
+| H5 | Post-merge registration requires readiness probe |
+| H6 | Cost metering per J-Prime call (accumulated on GraduationRecord) |
+
+### §81.3 Threshold
+
+Three successful uses (`JARVIS_GRADUATION_THRESHOLD=3`) for the capability class, as tracked by `EphemeralUsageTracker`. The tracker normalizes goals, removes stop words, hashes the canonical form, and fires the graduation threshold exactly once per goal class.
+
+### §81.4 What Graduation Means
+
+A "capability" that graduates becomes a **permanent agent** in the Trinity ecosystem. It moves from ephemeral (per-op tool generation) to durable (persistent code path). Future operations can invoke the graduated capability directly, without regenerating it.
+
+This is the ultimate expression of the Ouroboros loop: *the organism discovers a gap in its own capabilities, synthesizes a solution, validates it through use, and permanently incorporates it into itself*.
+
+It has not yet happened for multi-file APPLY. It has happened for simpler capabilities (individual test-generation patterns, single-file refactors). The cumulative graduation ledger is the organism's personal development record.
+
+---
+
+# Appendices
+
+## Appendix A — Glossary for Non-Technical Readers
+
+**Agent / agentic workload** — An AI system that takes actions, observes outcomes, and repeats. Distinct from a chatbot, which responds to one prompt at a time.
+
+**AST (Abstract Syntax Tree)** — The structural parse of source code. The Iron Gate uses AST parsers to validate code changes structurally rather than by pattern-matching on strings.
+
+**Autonomous developer** — A system that initiates software-engineering work without being prompted, within configured constraints.
+
+**Ouroboros** — The serpent eating its own tail. Also: the autonomous self-development pipeline of JARVIS.
+
+**Venom** — The agentic execution layer of O+V. Named after the Marvel symbiote.
+
+**Trinity** — The three-part organism architecture (Body, Mind, Soul) of JARVIS.
+
+**Iron Gate** — The collection of deterministic safety rules in O+V that the agentic intelligence cannot override.
+
+**Pipeline** — The 11-phase FSM that every operation passes through.
+
+**Cascade** — The sequence of provider tries (DoubleWord → Claude) if a primary provider fails.
+
+**Provider** — A company or service that hosts and serves language models.
+
+**FSM (Finite State Machine)** — A software component that tracks which stage of a process we're in.
+
+**Op / operation** — One discrete unit of autonomous work.
+
+**Op-ID** — Unique identifier for an operation (`op-<uuidv7>-<origin>`).
+
+**Heartbeat** — A structured event emitted by the pipeline indicating current state.
+
+**Intake layer** — The event-driven mechanism that detects what work to do.
+
+**Sensor** — A small component that subscribes to events and emits signals when actionable conditions are detected.
+
+**Ledger** — Append-only, file-backed operation state log with deduplication.
+
+**ChangeEngine** — The component that writes patches to disk.
+
+**AutoCommitter** — The component that creates structured git commits after successful APPLY + VERIFY.
+
+**Orange PR Reviewer** — An async review provider that files a GitHub PR instead of blocking on CLI approval.
+
+**Consciousness Bridge** — The integration surface between Trinity Consciousness and the pipeline.
+
+**GoalMemoryBridge** — The cross-session vector-DB memory layer.
+
+**Strategic Direction** — The service that injects the Manifesto into every generation prompt.
+
+**Manifesto** — The philosophical document (in `README.md`) that states the seven principles.
+
+**Session** — One run of the battle test harness. Session artifacts live in `.ouroboros/sessions/bt-*/`.
+
+**Breakthrough log** — The narrative record of major battle-test milestones in `OUROBOROS.md`.
+
+## Appendix B — Key File References
+
+| Purpose | Path |
+|---|---|
+| Pipeline orchestrator | `backend/core/ouroboros/governance/orchestrator.py` |
+| Governed loop service | `backend/core/ouroboros/governance/governed_loop_service.py` |
+| Risk engine | `backend/core/ouroboros/governance/risk_engine.py` |
+| Urgency router | `backend/core/ouroboros/governance/urgency_router.py` |
+| Candidate generator (cascade) | `backend/core/ouroboros/governance/candidate_generator.py` |
+| DoubleWord provider | `backend/core/ouroboros/governance/doubleword_provider.py` |
+| Claude / Prime providers | `backend/core/ouroboros/governance/providers.py` |
+| Tool executor (Venom) | `backend/core/ouroboros/governance/tool_executor.py` |
+| Repair engine (L2) | `backend/core/ouroboros/governance/repair_engine.py` |
+| Change engine | `backend/core/ouroboros/governance/change_engine.py` |
+| Auto committer | `backend/core/ouroboros/governance/auto_committer.py` |
+| MCP tool client | `backend/core/ouroboros/governance/mcp_tool_client.py` |
+| Context compaction | `backend/core/ouroboros/governance/context_compaction.py` |
+| Context expander | `backend/core/ouroboros/governance/context_expander.py` |
+| Plan generator | `backend/core/ouroboros/governance/plan_generator.py` |
+| Semantic triage | `backend/core/ouroboros/governance/semantic_triage.py` |
+| Comm protocol | `backend/core/ouroboros/governance/comm_protocol.py` |
+| Exploration ledger | `backend/core/ouroboros/governance/exploration_engine.py` |
+| Policy engine | `backend/core/ouroboros/governance/policy_engine.py` |
+| Ledger | `backend/core/ouroboros/governance/ledger.py` |
+| Saga strategies | `backend/core/ouroboros/governance/saga/` |
+| Intake layer service | `backend/core/ouroboros/governance/intake/intake_layer_service.py` |
+| Unified intake router | `backend/core/ouroboros/governance/unified_intake_router.py` |
+| Sensors | `backend/core/ouroboros/governance/intake/sensors/` |
+| Brain selection policy | `backend/core/ouroboros/governance/brain_selection_policy.yaml` |
+| Oracle (codebase graph) | `backend/core/ouroboros/oracle.py` |
+| Trinity Consciousness | `backend/core/ouroboros/consciousness/` |
+| Strategic Direction | `backend/core/ouroboros/governance/strategic_direction.py` |
+| Conversation Bridge | `backend/core/ouroboros/governance/conversation_bridge.py` |
+| Semantic Index | `backend/core/ouroboros/governance/semantic_index.py` |
+| Last Session Summary | `backend/core/ouroboros/governance/last_session_summary.py` |
+| User Preference Memory | `backend/core/ouroboros/governance/user_preference_memory.py` |
+| Event channel | `backend/core/ouroboros/governance/event_channel.py` |
+| Batch future registry | `backend/core/ouroboros/governance/batch_future_registry.py` |
+| Battle test harness | `backend/core/ouroboros/battle_test/harness.py` |
+| SerpentFlow CLI | `backend/core/ouroboros/battle_test/serpent_flow.py` |
+| Live dashboard | `backend/core/ouroboros/battle_test/live_dashboard.py` |
+| Battle test runner script | `scripts/ouroboros_battle_test.py` |
+| Breakthrough log | `docs/architecture/OUROBOROS.md` §"Battle Test Breakthrough Log" |
+| This paper | `docs/architecture/OV_RESEARCH_PAPER_2026-04-16.md` |
+
+## Appendix C — Environment Variables
+
+All variables and their defaults. Only the most operationally relevant are listed; see `OUROBOROS.md` §"Environment Variables" for the exhaustive list.
+
+### Pipeline
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JARVIS_GOVERNED_TOOL_USE_ENABLED` | `true` | Master switch for Venom |
+| `JARVIS_GOVERNED_TOOL_MAX_ROUNDS` | `5` | Max tool rounds per generation |
+| `JARVIS_GOVERNED_TOOL_TIMEOUT_S` | `30` | Per-tool execution timeout |
+| `JARVIS_GOVERNED_TOOL_MAX_CONCURRENT` | `2` | Concurrent tool executions |
+| `JARVIS_TOOL_OUTPUT_CAP_BYTES` | `4096` | Max tool output size in prompt |
+
+### L2 Repair
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JARVIS_L2_ENABLED` | `true` | Master switch |
+| `JARVIS_L2_MAX_ITERS` | `5` | Max iterations |
+| `JARVIS_L2_TIMEBOX_S` | `120` | Total wall-clock budget |
+| `JARVIS_L2_ITER_TEST_TIMEOUT_S` | `60` | Per-iter test timeout |
+
+### Exploration / Iron Gate
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JARVIS_MIN_EXPLORATION_CALLS` | `2` | Minimum exploration tool calls |
+| `JARVIS_MAX_EXPLORATION_ROUNDS` | `5` | Max exploration-only rounds |
+| `JARVIS_EXPLORATION_LEDGER_ENABLED` | false→true in progress | Hard-enforce ExplorationLedger |
+| `JARVIS_EXPLORATION_SHADOW_LOG` | varies | Shadow-log ledger decisions |
+| `JARVIS_EXPLORATION_MIN_SCORE_<C>` | see §47 | Per-complexity score floor |
+| `JARVIS_EXPLORATION_MIN_CATEGORIES_<C>` | see §47 | Per-complexity category floor |
+| `JARVIS_ASCII_GATE` | `true` | ASCII-strict gate |
+| `JARVIS_NOTIFY_APPLY_DELAY_S` | `5` | Yellow-tier diff-preview delay |
+
+### Provider Routing
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DOUBLEWORD_API_KEY` | *(required)* | DW API credential |
+| `DOUBLEWORD_BASE_URL` | `https://api.doubleword.ai/v1` | DW endpoint |
+| `DOUBLEWORD_MODEL` | `Qwen/Qwen3.5-397B-A17B-FP8` | Default model |
+| `DOUBLEWORD_WEBHOOK_SECRET` | *(if webhook enabled)* | Signing key for Tier 1 |
+| `DOUBLEWORD_REALTIME_ENABLED` | `true` | Tier 0 SSE streaming |
+| `ANTHROPIC_API_KEY` | *(required)* | Claude API credential |
+| `JARVIS_EXTENDED_THINKING_ENABLED` | `true` | Claude extended thinking |
+| `JARVIS_THINKING_BUDGET` | `10000` | Extended thinking tokens |
+| `OUROBOROS_TIER0_BUDGET_FRACTION` | `0.50` | Tier 0 share of deadline |
+| `OUROBOROS_TIER1_MIN_RESERVE_S` | `25` | Tier 1 guaranteed minimum |
+| `OUROBOROS_FALLBACK_MIN_RESERVE_S` | `20` | Fallback guaranteed minimum |
+
+### Intake / Coalescing / Locks
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JARVIS_COALESCE_WINDOW_S` | `30` | Signal-coalescing window |
+| `JARVIS_FILE_LOCK_TTL_S` | `300` | Active-lock TTL |
+| `JARVIS_SESSION_LESSONS_MAX` | `20` | Session-lessons buffer cap |
+| `JARVIS_LESSON_CONVERGENCE_CHECK_INTERVAL` | `10` | Convergence-metric interval |
+
+### Graduation
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JARVIS_GRADUATION_THRESHOLD` | `3` | Consecutive successes for graduation |
+| `DEBUG_MUTATION_MODE` | `false` | Set `true` for threshold `1` (dev) |
+
+### Orange PR Reviewer
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JARVIS_ORANGE_PR_ENABLED` | `false` | Async review path for Orange tier |
+| `JARVIS_AUTO_COMMIT_ENABLED` | `true` | Master switch for AutoCommitter |
+| `JARVIS_AUTO_PUSH_BRANCH` | `""` | If set, push to this branch after commit |
+
+### Consciousness Bridge
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JARVIS_CONVERSATION_BRIDGE_ENABLED` | `false` | Master switch |
+| `JARVIS_SEMANTIC_INFERENCE_ENABLED` | `false` | SemanticIndex master switch |
+| `JARVIS_LAST_SESSION_SUMMARY_ENABLED` | `false` | Last-session summary master switch |
+
+## Appendix D — Reproduction Commands
+
+All commands assume `cwd` is the repository root.
+
+### Boot the full battle test
+
+```bash
+python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 600 -v
+```
+
+### Inspect session artifacts
+
+```bash
+ls -la .ouroboros/sessions/
+tail -n 100 .ouroboros/sessions/bt-<timestamp>/debug.log
+cat .ouroboros/sessions/bt-<timestamp>/summary.json | python3 -m json.tool
+```
+
+### Run the ExplorationLedger in shadow mode
+
+```bash
+export JARVIS_EXPLORATION_SHADOW_LOG=true
+export JARVIS_EXPLORATION_LEDGER_ENABLED=false
+python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 600 -v
+grep "ExplorationLedger(shadow)" .ouroboros/sessions/bt-*/debug.log
+```
+
+### Enforce the ExplorationLedger
+
+```bash
+export JARVIS_EXPLORATION_LEDGER_ENABLED=true
+python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 600 -v
+grep "ExplorationLedger(decision)" .ouroboros/sessions/bt-*/debug.log
+```
+
+### Reproduce Session W (requires post-`53e6bd9f76` commit)
+
+The autonomous multi-file APPLY requires the L2 deadline reconciliation fix (commit `53e6bd9f76`), which is on main as of 2026-04-15. To reproduce, check out a commit at or after `53e6bd9f76`:
+
+```bash
+git checkout 53e6bd9f76
+# Boot battle test; queue a backlog task resembling "write four sensor test modules"
+python3 scripts/ouroboros_battle_test.py --cost-cap 1.00 --idle-timeout 3600 -v
+```
+
+The harness will pick up the backlog signal through BacklogSensor and run the end-to-end multi-file APPLY flow.
+
+## Appendix E — The Zero-Shortcut Mandate (Verbatim)
+
+From the Manifesto (`README.md`) and repeated in every generation prompt:
+
+> **No brute-force retries without diagnosis. No hardcoded routing tables. Structural repair, not bypasses.**
+
+This is the governing mandate. When something fails, the answer is not "retry harder" or "special-case the failure." The answer is "understand the failure, fix the structural cause, and ensure the failure cannot recur for the same reason."
+
+This mandate shapes every refinement described in Part VIII, every commit in Part XI's breakthrough log, and every design choice in the Iron Gate (Part X). It is the organism's central ethical commitment: respect the architecture; do not paper over problems.
+
+## Appendix F — Document Generation Commands
+
+This paper was generated on macOS 15 (Darwin 25.3.0) with pandoc 3.9 + Chrome headless + pypdf post-processor. No LaTeX engine required.
+
+### HTML (with clickable TOC)
+
+```bash
+pandoc docs/architecture/OV_RESEARCH_PAPER_2026-04-16.md \
+  -o docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html \
+  --from=gfm --to=html5 --standalone \
+  --toc --toc-depth=3 \
+  --metadata title="Ouroboros + Venom: A Governed Architecture for Autonomous Self-Development" \
+  --css=docs/benchmarks/_report_style.css \
+  --embed-resources
+```
+
+### PDF (via Chrome headless)
+
+```bash
+TMPDIR_CHROME="${TMPDIR:-/tmp}/chrome-headless-$$"
+mkdir -p "$TMPDIR_CHROME"
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --headless --disable-gpu \
+  --user-data-dir="$TMPDIR_CHROME" \
+  --no-pdf-header-footer \
+  --print-to-pdf=docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf \
+  "file://$(pwd)/docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html"
+rm -rf "$TMPDIR_CHROME"
+```
+
+### PDF outline (sidebar bookmarks)
+
+```bash
+python3 scripts/benchmarks/add_pdf_outline.py \
+  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html \
+  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf \
+  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf
+```
+
+The outline post-processor parses the HTML TOC, maps each entry to a named PDF destination, and writes a sidebar-navigable outline tree.
+
+---
+
+**Report prepared 2026-04-16.**
+
+**Author:** Derek J. Russell — JARVIS Trinity Architect, RSI/AGI Researcher.
+
+**Canonical companion:** `docs/architecture/OUROBOROS.md` (this paper is a research-paper treatment of the canonical technical reference).
+
+**Corrections, updates, and follow-up findings** will be appended as addenda rather than replacing the original — each version preserves the full audit trail.
 

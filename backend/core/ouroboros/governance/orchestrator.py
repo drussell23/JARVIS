@@ -4622,6 +4622,137 @@ class GovernedOrchestrator:
                 )
                 risk_tier = _floor
 
+        # ---- SemanticGuardian: deterministic pre-APPLY pattern check ----
+        #
+        # Closes the SAFE_AUTO blast-radius gap (Priority 3 audit):
+        # risk_engine.py classifies on size (blast radius / file count /
+        # test confidence) only — a syntactically-valid but semantically-
+        # inverted candidate (flipped boolean, removed import, collapsed
+        # body, hardcoded credential, inverted test assertion, loosened
+        # perms …) lands as SAFE_AUTO and auto-applies while the operator
+        # is asleep. The guardian runs 10 deterministic AST/regex
+        # patterns on (pre-apply on-disk content) vs (candidate content)
+        # and, if any fire, upgrades the tier:
+        #
+        #   hard detection → APPROVAL_REQUIRED (force human gate)
+        #   soft detection → NOTIFY_APPLY      (force 5s preview window)
+        #
+        # Pure-deterministic, no LLM, ~10ms per candidate. Master switch
+        # JARVIS_SEMANTIC_GUARD_ENABLED (default on).
+        _guardian_findings: list = []
+        if best_candidate is not None:
+            try:
+                from backend.core.ouroboros.governance.semantic_guardian import (
+                    SemanticGuardian,
+                    recommend_tier_floor,
+                )
+                _guardian = SemanticGuardian()
+                # Build (path, old, new) triples from the candidate. For
+                # multi-file candidates the orchestrator already has
+                # _iter_candidate_files; we replicate its unpacking here
+                # so we don't need to thread ctx through.
+                _pairs: list = []
+                _candidate_files = best_candidate.get("files") if isinstance(
+                    best_candidate.get("files"), list,
+                ) else None
+                if _candidate_files:
+                    _iter = [
+                        (entry.get("file_path", ""), entry.get("full_content", ""))
+                        for entry in _candidate_files
+                        if isinstance(entry, dict)
+                    ]
+                else:
+                    _iter = [(
+                        best_candidate.get("file_path", ""),
+                        best_candidate.get("full_content", ""),
+                    )]
+                for _path, _new in _iter:
+                    if not _path or not isinstance(_new, str):
+                        continue
+                    _old = ""
+                    try:
+                        _abs = (
+                            self._config.project_root / _path
+                            if not Path(_path).is_absolute()
+                            else Path(_path)
+                        )
+                        if _abs.is_file():
+                            _old = _abs.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        _old = ""
+                    _pairs.append((_path, _old, _new))
+                _guardian_findings = _guardian.inspect_batch(_pairs)
+                _floor_name = recommend_tier_floor(_guardian_findings)
+                if _floor_name is not None:
+                    _upgrade_map = {
+                        "notify_apply": RiskTier.NOTIFY_APPLY,
+                        "approval_required": RiskTier.APPROVAL_REQUIRED,
+                    }
+                    _upgrade = _upgrade_map.get(_floor_name)
+                    if _upgrade is not None and risk_tier.value < _upgrade.value:
+                        _pattern_names = ", ".join(
+                            sorted({f.pattern for f in _guardian_findings})
+                        )
+                        logger.info(
+                            "[SemanticGuard] op=%s findings=%d patterns=[%s] "
+                            "downgrade=%s→%s",
+                            ctx.op_id, len(_guardian_findings),
+                            _pattern_names,
+                            risk_tier.name, _upgrade.name,
+                        )
+                        risk_tier = _upgrade
+                else:
+                    logger.debug(
+                        "[SemanticGuard] op=%s clean (no findings)",
+                        ctx.op_id,
+                    )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] SemanticGuardian skipped",
+                    exc_info=True,
+                )
+
+        # ---- MIN_RISK_TIER floor (paranoia mode + quiet hours) ----
+        #
+        # Separate from JARVIS_RISK_CEILING above — that knob is scoped
+        # to the /risk REPL command. This floor composes THREE operator
+        # signals into a single tier floor:
+        #
+        #   JARVIS_MIN_RISK_TIER=notify_apply  (explicit)
+        #   JARVIS_PARANOIA_MODE=1              (shortcut for notify_apply)
+        #   JARVIS_AUTO_APPLY_QUIET_HOURS=22-7 (time-of-day window)
+        #
+        # The strictest of the three applies. Flipping PARANOIA_MODE or
+        # QUIET_HOURS before going to sleep guarantees zero SAFE_AUTO
+        # auto-applies land overnight.
+        try:
+            from backend.core.ouroboros.governance.risk_tier_floor import (
+                apply_floor_to_name,
+                floor_reason,
+            )
+            _cur_name = risk_tier.name.lower()
+            _effective, _applied = apply_floor_to_name(_cur_name)
+            if _applied is not None:
+                _floor_tier_map = {
+                    "safe_auto": RiskTier.SAFE_AUTO,
+                    "notify_apply": RiskTier.NOTIFY_APPLY,
+                    "approval_required": RiskTier.APPROVAL_REQUIRED,
+                    "blocked": RiskTier.BLOCKED,
+                }
+                _tgt = _floor_tier_map.get(_effective)
+                if _tgt is not None and risk_tier.value < _tgt.value:
+                    logger.info(
+                        "[Orchestrator] GATE: MIN_RISK_TIER floor → %s→%s "
+                        "op=%s reason=%s",
+                        risk_tier.name, _tgt.name, ctx.op_id, floor_reason(),
+                    )
+                    risk_tier = _tgt
+        except Exception:
+            logger.debug(
+                "[Orchestrator] MIN_RISK_TIER floor skipped",
+                exc_info=True,
+            )
+
         # ---- Phase 5a-green: SAFE_AUTO diff preview (Green — when human is watching) ----
         # Mythos §7.4 UX: when a human is watching (TTY or explicit flag),
         # show a brief diff preview even for Green ops so the operator can
