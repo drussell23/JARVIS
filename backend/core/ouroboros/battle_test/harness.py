@@ -3546,6 +3546,24 @@ class BattleTestHarness:
         except Exception as exc:
             logger.warning("Failed to save session summary: %s", exc)
 
+        # --- Session replay viewer (Priority 3 §8 observability) ---
+        # Consolidate debug.log + summary.json + cost_tracker.json +
+        # per-op ledger into one standalone replay.html. Written after
+        # summary.json so the replay sees the final summary contents.
+        # Env-gated + error-isolated so shutdown never depends on it.
+        try:
+            from backend.core.ouroboros.battle_test.session_replay import (
+                SessionReplayBuilder,
+                replay_enabled,
+            )
+            if replay_enabled():
+                SessionReplayBuilder(self._session_dir).build()
+        except Exception:
+            logger.debug(
+                "[Harness] session replay generation skipped",
+                exc_info=True,
+            )
+
         # --- Terminal summary ---
         try:
             terminal_summary = self._session_recorder.format_terminal_summary(
