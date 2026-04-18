@@ -1508,7 +1508,32 @@ def _build_codegen_prompt(
     # verbatim context lines, causing diff_apply_failed on most operations.
     # Always use full_content (2b.1) for single-file tasks.
     _single_file_task = False
-    if (
+
+    # Read-only schema swap (Option α — Manifesto §7 Attention Mechanism
+    # Supremacy). When ctx.is_read_only=True the code-gen schema is
+    # semantically incoherent — the op is structurally forbidden from
+    # producing a candidate file. Replace the entire schema instruction
+    # with a weaponized CRITICAL_SYSTEM_DIRECTIVE that forbids code
+    # generation and mandates dispatch_subagent. This takes precedence
+    # over every other schema branch (cross-repo, execution-graph, diff,
+    # single-file, BG strict, default) because the read-only contract
+    # overrides all of them: no mutation can happen regardless of which
+    # schema shape we emit, and the model will otherwise attempt to
+    # write code that the orchestrator will refuse at APPLY.
+    if bool(getattr(ctx, "is_read_only", False)):
+        schema_instruction = (
+            "<CRITICAL_SYSTEM_DIRECTIVE>\n"
+            "This operation is mathematically locked into READ-ONLY mode. "
+            "You are forbidden from generating code.\n"
+            "You must execute deep architectural cartography. To do this, "
+            "you MUST utilize the 'dispatch_subagent' tool "
+            "(subagent_type=explore).\n"
+            "Do not attempt to answer the prompt using your internal "
+            "knowledge. You must dispatch the subagent, await the JSON "
+            "result, and then summarize the findings.\n"
+            "</CRITICAL_SYSTEM_DIRECTIVE>"
+        )
+    elif (
         getattr(ctx, "cross_repo", False)
         and repo_roots
         and getattr(ctx, "parallelism_budget", 0) > 1
@@ -1852,7 +1877,15 @@ Rules:
     # above have their own schemas and are not affected. BACKGROUND
     # route also skipped because Gemma 31B is a single-candidate path
     # and multi-file ops don't route through BG anyway.
-    if not _is_bg_route and not getattr(ctx, "cross_repo", False):
+    # Multi-file contract suppressed under read-only contract: the block
+    # tells the model "emit files: [...]" which is code-gen shape and
+    # directly contradicts the CRITICAL_SYSTEM_DIRECTIVE we just emitted.
+    _is_read_only_ctx = bool(getattr(ctx, "is_read_only", False))
+    if (
+        not _is_bg_route
+        and not getattr(ctx, "cross_repo", False)
+        and not _is_read_only_ctx
+    ):
         _mf_block = _build_multi_file_contract_block(
             getattr(ctx, "target_files", ()) or ()
         )
