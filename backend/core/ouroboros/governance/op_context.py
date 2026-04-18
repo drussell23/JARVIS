@@ -33,6 +33,9 @@ import collections
 import dataclasses
 import hashlib
 import json
+import os
+import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -352,6 +355,210 @@ class ShadowResult:
 
 
 # ---------------------------------------------------------------------------
+# Attachment — bounded, redacted-by-hash image reference
+# ---------------------------------------------------------------------------
+#
+# Substrate shared exclusively between VisionSensor and visual_verify.py per
+# the I7 substrate export-ban invariant in
+# docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md.
+#
+# Design invariants (all enforced at construction, all tested):
+#   1. Frozen. No in-place mutation. Hash-chain safe.
+#   2. kind / mime_type are hard whitelisted — no free-form strings.
+#   3. hash8 is first 8 lowercase hex chars of sha256(bytes). Stable,
+#      redaction-safe identifier that never leaks bytes to logs.
+#   4. image_path validated absolute and length-capped.
+#   5. __repr__ redacts the full path — only basename + hash8 escape.
+#   6. from_file() is the canonical constructor; forbids forged
+#      hash8/mime triples by computing both from the actual file.
+#   7. read_bytes() enforces a size cap; read_bytes_verified() also
+#      re-checks the hash8 → detects silent file rotation/corruption.
+#   8. OperationContext caps at 8 attachments (MAX_PER_CTX).
+
+_VALID_ATTACHMENT_KINDS: Tuple[str, ...] = ("pre_apply", "post_apply", "sensor_frame")
+_VALID_ATTACHMENT_MIMES: Tuple[str, ...] = ("image/jpeg", "image/png", "image/webp")
+_ATTACHMENT_HASH8_PATTERN = re.compile(r"^[0-9a-f]{8}$")
+_ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT = 10 * 1024 * 1024   # 10 MiB per frame
+_ATTACHMENT_MAX_PATH_LEN = 512
+_ATTACHMENT_MAX_APP_ID_LEN = 256
+_ATTACHMENT_MAX_PER_CTX = 8
+_ATTACHMENT_EXT_TO_MIME: Dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """Bounded, redacted-by-hash image reference on ``OperationContext``.
+
+    Consumable only by ``VisionSensor`` and ``visual_verify.py`` per I7.
+    Any other reader must go through a spec review (see
+    ``tests/governance/test_attachment_export_ban.py``).
+
+    Parameters
+    ----------
+    kind:
+        One of ``{"pre_apply", "post_apply", "sensor_frame"}``.
+        Hard whitelisted.
+    image_path:
+        Absolute local filesystem path. Validated at construction.
+        Length-capped at ``_ATTACHMENT_MAX_PATH_LEN`` chars.
+    mime_type:
+        One of ``{"image/jpeg", "image/png", "image/webp"}``.
+    hash8:
+        First 8 lowercase hex chars of ``sha256(image_bytes)``. Redaction-
+        safe identifier for deduplication, logging, and change detection.
+    ts:
+        Non-negative capture monotonic timestamp (``time.monotonic()``).
+    app_id:
+        Optional macOS bundle identifier (e.g. ``"com.apple.Terminal"``).
+    """
+
+    kind: str
+    image_path: str
+    mime_type: str
+    hash8: str
+    ts: float
+    app_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in _VALID_ATTACHMENT_KINDS:
+            raise ValueError(
+                f"Attachment.kind must be one of {_VALID_ATTACHMENT_KINDS}; "
+                f"got {self.kind!r}"
+            )
+        if not isinstance(self.image_path, str) or not self.image_path:
+            raise ValueError("Attachment.image_path must be a non-empty string")
+        if not os.path.isabs(self.image_path):
+            raise ValueError(
+                f"Attachment.image_path must be absolute; got {self.image_path!r}"
+            )
+        if len(self.image_path) > _ATTACHMENT_MAX_PATH_LEN:
+            raise ValueError(
+                f"Attachment.image_path exceeds {_ATTACHMENT_MAX_PATH_LEN} chars "
+                f"(got {len(self.image_path)})"
+            )
+        if self.mime_type not in _VALID_ATTACHMENT_MIMES:
+            raise ValueError(
+                f"Attachment.mime_type must be one of {_VALID_ATTACHMENT_MIMES}; "
+                f"got {self.mime_type!r}"
+            )
+        if not isinstance(self.hash8, str) or not _ATTACHMENT_HASH8_PATTERN.match(self.hash8):
+            raise ValueError(
+                f"Attachment.hash8 must be exactly 8 lowercase hex chars; "
+                f"got {self.hash8!r}"
+            )
+        if not isinstance(self.ts, (int, float)) or self.ts < 0:
+            raise ValueError(f"Attachment.ts must be non-negative float; got {self.ts!r}")
+        if self.app_id is not None:
+            if not isinstance(self.app_id, str) or not self.app_id:
+                raise ValueError("Attachment.app_id, if set, must be a non-empty string")
+            if len(self.app_id) > _ATTACHMENT_MAX_APP_ID_LEN:
+                raise ValueError(
+                    f"Attachment.app_id exceeds {_ATTACHMENT_MAX_APP_ID_LEN} chars"
+                )
+
+    def __repr__(self) -> str:
+        """Redaction-safe repr — never leaks the full ``image_path``."""
+        basename = os.path.basename(self.image_path) if self.image_path else "<unset>"
+        return (
+            f"Attachment(kind={self.kind!r}, hash8={self.hash8!r}, "
+            f"mime={self.mime_type!r}, app_id={self.app_id!r}, "
+            f"path=<redacted:basename={basename!r}>)"
+        )
+
+    __str__ = __repr__
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str,
+        *,
+        kind: str,
+        app_id: Optional[str] = None,
+        ts: Optional[float] = None,
+    ) -> "Attachment":
+        """Canonical constructor — computes ``hash8`` and infers ``mime_type``.
+
+        Callers cannot forge a mismatched ``(path, mime_type, hash8)``
+        triple — both fields are derived from the actual file.
+
+        Raises
+        ------
+        FileNotFoundError
+            If ``path`` does not exist.
+        ValueError
+            If ``path`` is not absolute, the extension is unsupported,
+            or any ``Attachment`` invariant fails.
+        """
+        if not isinstance(path, str) or not path:
+            raise ValueError("Attachment.from_file requires a non-empty string path")
+        if not os.path.isabs(path):
+            raise ValueError(f"Attachment.from_file requires absolute path; got {path!r}")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Attachment image missing: {path}")
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in _ATTACHMENT_EXT_TO_MIME:
+            raise ValueError(
+                f"Attachment.from_file unsupported extension {ext!r}; "
+                f"must be one of {sorted(_ATTACHMENT_EXT_TO_MIME.keys())}"
+            )
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        return cls(
+            kind=kind,
+            image_path=path,
+            mime_type=_ATTACHMENT_EXT_TO_MIME[ext],
+            hash8=digest[:8],
+            ts=ts if ts is not None else time.monotonic(),
+            app_id=app_id,
+        )
+
+    def read_bytes(self, *, max_bytes: Optional[int] = None) -> bytes:
+        """Read the underlying image bytes with an enforced size cap.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the image has been removed since construction.
+        ValueError
+            If the file size exceeds ``max_bytes``.
+        """
+        cap = max_bytes if max_bytes is not None else _ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT
+        if cap <= 0:
+            raise ValueError(f"max_bytes must be positive; got {cap}")
+        if not os.path.exists(self.image_path):
+            raise FileNotFoundError(f"Attachment image disappeared: {self.image_path}")
+        size = os.path.getsize(self.image_path)
+        if size > cap:
+            raise ValueError(
+                f"Attachment {self.hash8} exceeds cap: size={size} > max_bytes={cap}"
+            )
+        with open(self.image_path, "rb") as fh:
+            return fh.read()
+
+    def read_bytes_verified(self, *, max_bytes: Optional[int] = None) -> bytes:
+        """Read bytes and verify ``hash8`` still matches the on-disk content.
+
+        Raises
+        ------
+        ValueError
+            If on-disk bytes no longer match the captured ``hash8``.
+        """
+        data = self.read_bytes(max_bytes=max_bytes)
+        actual = hashlib.sha256(data).hexdigest()[:8]
+        if actual != self.hash8:
+            raise ValueError(
+                f"Attachment integrity check failed: expected hash8={self.hash8}, "
+                f"on-disk hash8={actual}. File changed since construction."
+            )
+        return data
+
+
+# ---------------------------------------------------------------------------
 # Saga Types
 # ---------------------------------------------------------------------------
 
@@ -644,6 +851,14 @@ class OperationContext:
     # a threshold rests on deterministic enforcement, not a label).
     is_read_only: bool = False
 
+    # ---- Image attachments (I7 substrate; Vision-phase only) ----
+    # Consumable only by VisionSensor and visual_verify.py. All other
+    # readers are forbidden by tests/governance/test_attachment_export_ban.py
+    # and providers._serialize_attachments(purpose=) gate. Capped at
+    # _ATTACHMENT_MAX_PER_CTX entries. Default empty tuple — non-vision
+    # ops traverse the pipeline exactly as before.
+    attachments: Tuple[Attachment, ...] = ()
+
     # ------------------------------------------------------------------
     # Post-init
     # ------------------------------------------------------------------
@@ -679,6 +894,7 @@ class OperationContext:
         signal_urgency: str = "",
         signal_source: str = "",
         is_read_only: bool = False,
+        attachments: Tuple[Attachment, ...] = (),
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
 
@@ -758,7 +974,13 @@ class OperationContext:
             "provider_route": "",
             "provider_route_reason": "",
             "is_read_only": is_read_only,
+            "attachments": attachments,
         }
+        if len(attachments) > _ATTACHMENT_MAX_PER_CTX:
+            raise ValueError(
+                f"OperationContext.create: at most {_ATTACHMENT_MAX_PER_CTX} "
+                f"attachments per context; got {len(attachments)}"
+            )
         context_hash = _compute_hash(fields_for_hash)
 
         return cls(
@@ -799,6 +1021,7 @@ class OperationContext:
             signal_urgency=signal_urgency,
             signal_source=signal_source,
             is_read_only=is_read_only,
+            attachments=attachments,
         )
 
     # ------------------------------------------------------------------
@@ -1107,6 +1330,59 @@ class OperationContext:
         new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
 
+    def with_attachments(
+        self,
+        attachments: Tuple[Attachment, ...],
+    ) -> "OperationContext":
+        """Stamp image ``attachments`` onto the context (no phase change).
+
+        Called by ``VisionSensor`` (``kind="sensor_frame"``) and
+        ``visual_verify`` (``kind="pre_apply"`` / ``"post_apply"``). All
+        other callers are forbidden by the I7 substrate export-ban
+        (``tests/governance/test_attachment_export_ban.py``).
+
+        Validates the per-context cap and element types; preserves the
+        hash-chain exactly like the other ``with_*`` helpers.
+
+        Raises
+        ------
+        ValueError
+            If ``len(attachments) > _ATTACHMENT_MAX_PER_CTX``.
+        TypeError
+            If any element is not an ``Attachment``.
+        """
+        if not isinstance(attachments, tuple):
+            attachments = tuple(attachments)
+        if len(attachments) > _ATTACHMENT_MAX_PER_CTX:
+            raise ValueError(
+                f"OperationContext.with_attachments: at most "
+                f"{_ATTACHMENT_MAX_PER_CTX} attachments per context; "
+                f"got {len(attachments)}"
+            )
+        for i, att in enumerate(attachments):
+            if not isinstance(att, Attachment):
+                raise TypeError(
+                    f"attachments[{i}] must be Attachment; "
+                    f"got {type(att).__name__}"
+                )
+        intermediate = dataclasses.replace(
+            self,
+            attachments=attachments,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def add_attachment(self, attachment: Attachment) -> "OperationContext":
+        """Convenience: append a single ``Attachment`` to the existing tuple.
+
+        Delegates to :meth:`with_attachments`, which enforces the cap and
+        re-validates element types.
+        """
+        return self.with_attachments(self.attachments + (attachment,))
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -1117,7 +1393,9 @@ def _context_to_hash_dict(ctx: OperationContext) -> Dict[str, Any]:
     """Extract all fields from *ctx* into a dict suitable for hashing.
 
     The ``context_hash`` field is excluded since it is the value being
-    computed.  Enum values are serialized by name for stability.
+    computed.  Enum values are serialized by name for stability. Tuples of
+    frozen dataclasses (e.g. ``attachments``) are canonicalized element-
+    wise so hashing is deterministic regardless of ``__repr__`` layout.
     """
     d: Dict[str, Any] = {}
     for f in dataclasses.fields(ctx):
@@ -1130,6 +1408,15 @@ def _context_to_hash_dict(ctx: OperationContext) -> Dict[str, Any]:
         # Serialize frozen dataclass sub-objects to dict
         elif dataclasses.is_dataclass(value) and not isinstance(value, type):
             value = dataclasses.asdict(value)
+        # Tuple of dataclass elements (e.g. attachments) — canonicalize
+        # each element so the hash is stable independent of repr layout.
+        elif (
+            isinstance(value, tuple)
+            and value
+            and dataclasses.is_dataclass(value[0])
+            and not isinstance(value[0], type)
+        ):
+            value = tuple(dataclasses.asdict(elt) for elt in value)
         d[f.name] = value
     return d
 
