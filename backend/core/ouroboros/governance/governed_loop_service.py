@@ -3305,11 +3305,12 @@ class GovernedLoopService:
             logger.debug("[GLS] ExplorationFleet skipped: %s", exc)
 
         # ---- Wire Phase 1 SubagentOrchestrator (dispatch_subagent Venom tool) ----
-        # Gated by JARVIS_SUBAGENT_DISPATCH_ENABLED (default false). Construction
-        # itself is side-effect-free; the master switch only gates the dispatch
-        # path inside SubagentOrchestrator.dispatch(). An unwired orchestrator
-        # reference is safe — the tool backend handler returns EXEC_ERROR with
-        # a clear message when dispatch_subagent is called without wiring.
+        # Gated by JARVIS_SUBAGENT_DISPATCH_ENABLED (default true as of
+        # 2026-04-18 graduation). Construction itself is side-effect-free;
+        # the master switch only gates the dispatch path inside
+        # SubagentOrchestrator.dispatch(). An unwired orchestrator reference
+        # is safe — the tool backend handler returns EXEC_ERROR with a clear
+        # message when dispatch_subagent is called without wiring.
         #
         # Step 5 observability: CommProtocolCommSink routes subagent spawn /
         # result events through the same CommProtocol heartbeat channel that
@@ -3345,8 +3346,9 @@ class GovernedLoopService:
                 _backend_ref.set_subagent_orchestrator(_sub_orch)
                 logger.info(
                     "[GLS] SubagentOrchestrator wired "
-                    "(Venom dispatch_subagent — gated by "
-                    "JARVIS_SUBAGENT_DISPATCH_ENABLED, default false; "
+                    "(Venom dispatch_subagent — default enabled after "
+                    "Phase 1 graduation 2026-04-18; set "
+                    "JARVIS_SUBAGENT_DISPATCH_ENABLED=false to disable; "
                     "observability via CommProtocol heartbeats + "
                     "OperationLedger SUBAGENT_DISPATCH records; "
                     "SerpentFlow ⏺ Subagent(explore) block rendering)"

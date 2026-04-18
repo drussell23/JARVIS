@@ -766,7 +766,7 @@ def _build_tool_section(
         "**Web:**\n"
         "- `web_fetch(url)` — fetch URL, return text content (HTML stripped)\n"
         '- `web_search(query, max_results=5)` — search the web (DuckDuckGo)\n\n'
-        "**Subagents (Phase 1 — gated by JARVIS_SUBAGENT_DISPATCH_ENABLED):**\n"
+        "**Subagents (Phase 1 — graduated 2026-04-18, enabled by default):**\n"
         '- `dispatch_subagent(subagent_type="explore", goal, target_files=[], scope_paths=[], parallel_scopes=1, timeout_s=120)` —\n'
         "    Spawn a read-only subagent to explore the codebase in its own context.\n"
         "    Use this when you need to understand a large area BEFORE making changes:\n"

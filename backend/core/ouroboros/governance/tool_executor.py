@@ -655,11 +655,12 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         capabilities=frozenset({"delegate", "read"}),
     ),
     # ---- Phase 1 Subagents (dispatch_subagent Venom tool — gated by
-    #      JARVIS_SUBAGENT_DISPATCH_ENABLED, default false). Routes through
-    #      SubagentOrchestrator → AgenticExploreSubagent → returns structured
-    #      SubagentResult JSON. Distinct from delegate_to_agent: master-switch
-    #      gated, Iron Gate diversity-checked, supports parallel_scopes
-    #      fan-out via asyncio.TaskGroup, returns typed SubagentFindings. ----
+    #      JARVIS_SUBAGENT_DISPATCH_ENABLED, default true as of 2026-04-18
+    #      graduation). Routes through SubagentOrchestrator →
+    #      AgenticExploreSubagent → returns structured SubagentResult JSON.
+    #      Distinct from delegate_to_agent: master-switch gated, Iron Gate
+    #      diversity-checked, supports parallel_scopes fan-out via
+    #      asyncio.TaskGroup, returns typed SubagentFindings. ----
     "dispatch_subagent": ToolManifest(
         name="dispatch_subagent", version="1.0",
         description=(

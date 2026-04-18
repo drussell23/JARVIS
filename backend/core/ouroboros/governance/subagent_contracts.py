@@ -8,9 +8,14 @@ Phase 1 ships only the `explore` subagent type. Additional types
 (`plan`, `review`, `research`, `refactor`) are reserved for Phases B/C
 and will be rejected by the policy engine until those phases land.
 
-Master switch: `JARVIS_SUBAGENT_DISPATCH_ENABLED` (default `false`).
-Until the switch flips, these types are unreachable — they exist as
-inert scaffolding for incremental commits.
+Master switch: `JARVIS_SUBAGENT_DISPATCH_ENABLED` (default `true` as
+of 2026-04-18 graduation). The switch remains env-tunable so operators
+can disable dispatch for isolation battle tests, but Phase 1 is now
+in production by default after the three-consecutive-clean-session
+graduation arc (Sessions 14 / 15 / 16, Trinity cartography task,
+all reaching POSTMORTEM root_cause=read_only_complete). See
+`memory/project_phase_1_subagent_graduation.md` for the full
+architectural genealogy + regression spine.
 
 Manifesto alignment:
   §3 — Asynchronous tendrils: frozen-dataclass types are safe across
@@ -51,12 +56,16 @@ SCHEMA_VERSION = "subagent.1"
 def subagent_dispatch_enabled() -> bool:
     """Master switch for subagent dispatch.
 
-    Default `false` until Phase 1 graduates per Manifesto §6 neuroplasticity
-    threshold (three consecutive clean battle-test sessions). Until then,
-    the `dispatch_subagent` Venom tool is registered but the policy engine
-    refuses to allow it.
+    Default `true` as of 2026-04-18 — Phase 1 graduated per Manifesto §6
+    neuroplasticity threshold (three consecutive clean battle-test sessions
+    14/15/16, Trinity cartography task, all reaching POSTMORTEM
+    root_cause=read_only_complete with 80 findings × 3 subagents, 35-68KB
+    synthesis payloads, within the 900s/630s/570s/60s/(soft+30s)
+    five-budget-layer envelope). The switch remains env-tunable: set
+    `JARVIS_SUBAGENT_DISPATCH_ENABLED=false` to disable (isolation battle
+    tests, debugging a regression, etc.).
     """
-    return os.environ.get("JARVIS_SUBAGENT_DISPATCH_ENABLED", "false").lower() == "true"
+    return os.environ.get("JARVIS_SUBAGENT_DISPATCH_ENABLED", "true").lower() == "true"
 
 
 # ============================================================================

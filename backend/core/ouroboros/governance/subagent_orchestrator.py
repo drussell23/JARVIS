@@ -10,7 +10,8 @@ and returns well-formed `SubagentResult` objects with
 
 Nothing in this file calls an LLM. Nothing in this file mutates disk.
 The module is import-safe, side-effect-free on construction, and inert
-when `JARVIS_SUBAGENT_DISPATCH_ENABLED` is unset or `false`.
+when `JARVIS_SUBAGENT_DISPATCH_ENABLED` is explicitly set to `false`
+(default `true` as of Phase 1 graduation 2026-04-18).
 
 Manifesto alignment:
   §3 — Asynchronous tendrils: parallel fan-out uses `asyncio.TaskGroup`

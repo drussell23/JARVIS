@@ -19,9 +19,10 @@ Mathematical forbiddance of mutation (Manifesto §6 — Iron Gate):
     The underlying ExplorationSubagent has no mutation call paths
     whatsoever. This wrapper adds no filesystem writes. Every tool
     class exercised maps to READONLY_TOOL_MANIFEST. The master switch
-    (JARVIS_SUBAGENT_DISPATCH_ENABLED, default false) still gates any
-    dispatch attempt at the orchestrator boundary — this class is
-    importable at any time but unreachable until the switch flips.
+    (JARVIS_SUBAGENT_DISPATCH_ENABLED, default true as of 2026-04-18
+    graduation) still gates any dispatch attempt at the orchestrator
+    boundary — operators can disable by setting the env var to 'false'
+    for isolation battle tests.
 
 Iron Gate diversity requirement (Derek's Phase 1 mandate):
     After the deterministic backbone completes, we count the tool
