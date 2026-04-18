@@ -110,6 +110,35 @@ class ReviewExecutor:
         )
 
 
+class PlanExecutor:
+    """Structural protocol for Phase B PLAN subagents.
+
+    Concrete implementation: ``AgenticPlanSubagent`` in
+    ``agentic_plan_subagent.py``. The orchestrator only needs
+    ``.plan(ctx)`` to return an awaitable SubagentResult whose
+    ``type_payload`` carries the typed DAG tuple (dag_units, dag_edges,
+    barriers, validation_result).
+
+    Manifesto §2 (Directed Acyclic Graph): PLAN cannot output flat
+    task lists. It must emit a strict, mathematically verifiable DAG
+    of implementation units. Concrete implementations MUST self-
+    validate via ``dag_validator.validate_plan_dag(units)`` and refuse
+    to return an invalid DAG.
+
+    PLAN is orchestrator-driven (same as REVIEW): dispatched pre-
+    GENERATE from the orchestrator's PLAN phase for any op with ≥ 2
+    target files. Single-file ops skip PLAN entirely — no DAG to
+    build. The SubagentContext carries the op being planned in
+    ``ctx.request.plan_target``.
+    """
+
+    async def plan(self, ctx: SubagentContext) -> SubagentResult:  # pragma: no cover — interface stub
+        raise NotImplementedError(
+            "PlanExecutor.plan requires a concrete implementation. "
+            "Use AgenticPlanSubagent from agentic_plan_subagent.py."
+        )
+
+
 class CommSink(Protocol):
     """Structural protocol — emits subagent lifecycle events.
 
@@ -237,13 +266,16 @@ class SubagentOrchestrator:
         ledger: Optional[LedgerSink] = None,
         now: Optional[Callable[[], datetime]] = None,
         review_factory: Optional[Callable[[], "ReviewExecutor"]] = None,
+        plan_factory: Optional[Callable[[], "PlanExecutor"]] = None,
     ) -> None:
         self._explore_factory = explore_factory
-        # Phase B: review_factory is optional at construction so existing
-        # call sites that only wire explore keep working. Dispatches for
-        # subagent_type=review without a review_factory return a NOT_IMPLEMENTED
-        # SubagentResult with a clear error_detail — no silent fallbacks.
+        # Phase B: review_factory + plan_factory are optional at
+        # construction so existing call sites that only wire explore
+        # keep working. Dispatches for those types without the matching
+        # factory return NOT_IMPLEMENTED with a clear error_detail —
+        # no silent fallbacks.
         self._review_factory = review_factory
+        self._plan_factory = plan_factory
         self._comm: CommSink = comm or LoggerCommSink()
         self._ledger: LedgerSink = ledger or InMemoryLedgerSink()
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -275,6 +307,68 @@ class SubagentOrchestrator:
             return await self._dispatch_single(parent_ctx, request, scope=scopes[0])
 
         return await self._dispatch_parallel(parent_ctx, request, scopes)
+
+    async def dispatch_plan(
+        self,
+        parent_ctx: "OperationContext",
+        *,
+        op_description: str,
+        target_files: Tuple[str, ...],
+        primary_repo: str = "jarvis",
+        risk_tier: str = "",
+        timeout_s: float = 60.0,
+    ) -> SubagentResult:
+        """Orchestrator-driven PLAN dispatch (Manifesto §2 DAG).
+
+        Constructs a SubagentRequest programmatically and dispatches
+        through the same machinery used for model-driven EXPLORE calls.
+        PLAN is orchestrator-driven — the Venom ``dispatch_subagent``
+        tool does NOT expose plan; the orchestrator calls this method
+        unconditionally pre-GENERATE for ops with >= 2 target files
+        (single-file ops skip PLAN — there is no DAG to build).
+
+        The returned SubagentResult's ``type_payload`` carries the
+        typed DAG tuple. The caller MUST treat ``valid=False`` in
+        the embedded validation_result as a hard failure — do not
+        consume an invalid DAG downstream (§2 is non-negotiable).
+
+        Parameters
+        ----------
+        op_description:
+            The goal text from the parent op. Passed unchanged to the
+            planner; the planner's prompt + DAG construction rules
+            own interpretation.
+        target_files:
+            The target files scoped by the parent op. The planner
+            partitions these into DAG units.
+        primary_repo:
+            Repo the op belongs to. Most ops are "jarvis"; passed
+            through for cross-repo DAGs (which delegate to
+            _SCHEMA_VERSION_EXECUTION_GRAPH's multi-repo shape).
+        risk_tier:
+            Parent op's risk tier. Planner may widen acceptance_tests
+            on higher tiers.
+        timeout_s:
+            Plan budget. Short by default — DAG construction on <20
+            files is fast; longer if the concrete planner is LLM-driven.
+        """
+        request = SubagentRequest(
+            subagent_type=SubagentType.PLAN,
+            goal=f"Plan DAG for: {op_description[:200]}",
+            target_files=target_files,
+            scope_paths=(),
+            max_files=max(len(target_files), 1),
+            max_depth=1,
+            timeout_s=timeout_s,
+            parallel_scopes=1,
+            plan_target={
+                "op_description": op_description,
+                "target_files": tuple(target_files),
+                "primary_repo": primary_repo,
+                "risk_tier": risk_tier,
+            },
+        )
+        return await self.dispatch(parent_ctx, request)
 
     async def dispatch_review(
         self,
@@ -557,9 +651,9 @@ class SubagentOrchestrator:
         started_ns = time.time_ns()
         try:
             # Route by subagent_type. EXPLORE is Phase 1 (graduated).
-            # REVIEW is Phase B (orchestrator-driven dispatch). Future
-            # types add additional branches here; do not collapse back
-            # to a single factory.
+            # REVIEW + PLAN are Phase B (orchestrator-driven dispatch).
+            # Future types add additional branches here; do not collapse
+            # back to a single factory.
             if ctx.subagent_type == SubagentType.REVIEW:
                 if self._review_factory is None:
                     logger.warning(
@@ -569,8 +663,19 @@ class SubagentOrchestrator:
                         ctx.subagent_id,
                     )
                     return self._not_implemented_result(ctx, started_ns)
-                executor = self._review_factory()
-                result = await executor.review(ctx)
+                review_executor = self._review_factory()
+                result = await review_executor.review(ctx)
+            elif ctx.subagent_type == SubagentType.PLAN:
+                if self._plan_factory is None:
+                    logger.warning(
+                        "[Subagent] PLAN dispatch attempted without a "
+                        "plan_factory wired — returning NOT_IMPLEMENTED. "
+                        "sub=%s",
+                        ctx.subagent_id,
+                    )
+                    return self._not_implemented_result(ctx, started_ns)
+                plan_executor = self._plan_factory()
+                result = await plan_executor.plan(ctx)
             else:
                 executor = self._explore_factory()
                 # Step-1 stub: the default ExploreExecutor raises NotImplementedError.

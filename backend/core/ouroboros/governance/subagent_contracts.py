@@ -220,7 +220,7 @@ class SubagentType(str, Enum):
     """
     EXPLORE = "explore"
     REVIEW = "review"      # Phase B — graduated-pending; see project_phase_b_subagent_roadmap.md
-    # PLAN = "plan"          # Phase B — infra pending
+    PLAN = "plan"          # Phase B — graduated-pending; §2 DAG output contract
     # RESEARCH = "research"  # Phase B — deferred
     # REFACTOR = "refactor"  # Phase B — deferred (mutating, needs own graduation)
     # GENERAL = "general"    # Phase B — deferred (semantic firewall)
@@ -302,6 +302,13 @@ class SubagentRequest:
     # Shape: {"file_path": str, "pre_apply_content": str, "candidate_content": str,
     #         "generation_intent": str}
     review_target_candidate: Optional[Dict[str, Any]] = None
+    # Phase B PLAN input — the op to plan for. Orchestrator populates
+    # this programmatically at dispatch_plan() time. Same model-can't-opt-
+    # out design as REVIEW — §2 DAG mandates planning runs unconditionally
+    # before GENERATE for any op with ≥ 2 target files.
+    # Shape: {"op_description": str, "target_files": Tuple[str, ...],
+    #         "primary_repo": str, "risk_tier": str}
+    plan_target: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not self.goal:
