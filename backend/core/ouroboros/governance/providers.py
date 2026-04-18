@@ -5254,10 +5254,59 @@ class ClaudeProvider:
                         deadline=deadline,
                     )
 
+                # Hard-kill wrapper (Option C — Manifesto §3 Disciplined
+                # Concurrency, Derek 2026-04-18). Session 13
+                # (bt-2026-04-18-060505) silently deadlocked for 90+
+                # minutes because the Anthropic SDK's stream iterator
+                # stopped responding to cancellation — the soft
+                # asyncio.wait_for's cancel signal went nowhere, and
+                # wait_for itself blocked indefinitely awaiting the
+                # hung task to finish cancelling. asyncio.wait in
+                # Python 3.9+ returns (done, pending) without awaiting
+                # cancel completion, so we can abandon a wedged task
+                # and keep the microkernel in control of its own
+                # threads. Grace = 30s past the soft timeout: if the
+                # soft wait_for didn't succeed in shutting down the
+                # task within 30s of its own deadline, we hard-kill.
+                _stream_task = asyncio.create_task(_stream_with_resilience())
+                _hard_kill_budget_s = timeout_s + 30.0
                 try:
-                    await asyncio.wait_for(
-                        _stream_with_resilience(), timeout=timeout_s,
+                    done, pending = await asyncio.wait(
+                        {_stream_task},
+                        timeout=_hard_kill_budget_s,
                     )
+                    if pending:
+                        # Task wedged past the hard-kill budget. Fire
+                        # cancel but do NOT await its completion — if
+                        # the SDK swallowed the cancel signal, waiting
+                        # here would re-create the Session-13 deadlock.
+                        # asyncio will GC the coroutine eventually; the
+                        # task-exception-never-retrieved warning is
+                        # acceptable telemetry (Manifesto §8 visibility
+                        # trumps warning hygiene when the alternative
+                        # is organism paralysis).
+                        for _t in pending:
+                            _t.cancel()
+                        logger.error(
+                            "[ClaudeProvider] HARD-KILL claude stream after "
+                            "%.1fs (soft_timeout=%.1fs did not propagate "
+                            "cancel — SDK wedged, microkernel severing) "
+                            "tool_round=%s thinking=%s prompt_chars=%d",
+                            _hard_kill_budget_s,
+                            timeout_s,
+                            "yes" if _is_tool_round else "no",
+                            "on" if _thinking_param is not None else "off",
+                            len(str(_messages)),
+                        )
+                        raise asyncio.TimeoutError(
+                            f"claude_stream_hard_kill:"
+                            f"task_did_not_return_or_cancel_within_"
+                            f"{_hard_kill_budget_s:.0f}s"
+                        )
+                    # Task completed within budget — re-raise any
+                    # exception it produced so the existing fallback
+                    # paths (prefill-retry, backoff, etc.) still fire.
+                    await _stream_task
                 except (asyncio.TimeoutError, asyncio.CancelledError) as _te:
                     # Catch BOTH timeout and cancellation so we always get
                     # diagnostic data. Outer candidate_generator wait_for
