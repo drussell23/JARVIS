@@ -1818,9 +1818,19 @@ class GoverningToolPolicy:
         # orchestrator also raises SubagentDispatchDisabled, but we refuse
         # the call at policy time so the tool round short-circuits and the
         # subagent orchestrator never sees a dispatch while the switch is
-        # off. Phase 1 ships only the "explore" subagent type; "plan",
-        # "review", "research", "refactor" are reserved for Phases B/C and
-        # will be denied here with a specific reason until those phases land.
+        # off. Phase 1 ships "explore" (graduated 2026-04-18). Phase B adds
+        # "review" at the policy layer, but REVIEW dispatch is
+        # orchestrator-driven (post-VALIDATE unconditional, Manifesto §6
+        # Execution Validation) — the Venom tool call path is allowed only
+        # for completeness / future invocation patterns; "plan", "research",
+        # "refactor", "general" remain reserved.
+        #
+        # Phase B note on REVIEW via tool path: the model CAN request
+        # dispatch_subagent(type=review) from the tool loop, and we allow
+        # it, but the orchestrator typically issues REVIEW itself via
+        # dispatch_review() — the tool-path is defense-in-depth for
+        # advanced workflows, not the primary invocation.
+        _READ_ONLY_SUBAGENT_TYPES = frozenset({"explore", "review"})
         if name == "dispatch_subagent":
             try:
                 from backend.core.ouroboros.governance.subagent_contracts import (
@@ -1833,14 +1843,15 @@ class GoverningToolPolicy:
                     detail="subagent_contracts module not importable",
                 )
             subagent_type = str(call.arguments.get("subagent_type", "") or "").lower()
-            if subagent_type != "explore":
+            if subagent_type not in _READ_ONLY_SUBAGENT_TYPES:
                 return PolicyResult(
                     decision=PolicyDecision.DENY,
                     reason_code="tool.denied.subagent_type_unsupported",
                     detail=(
                         f"subagent_type={subagent_type!r} not yet supported. "
-                        "Phase 1 ships only 'explore'; plan/review/research/"
-                        "refactor are reserved for Phases B/C."
+                        f"Currently allowed: {sorted(_READ_ONLY_SUBAGENT_TYPES)}. "
+                        "plan/research/refactor/general are reserved for "
+                        "future phases."
                     ),
                 )
             if not subagent_dispatch_enabled():
@@ -1849,15 +1860,15 @@ class GoverningToolPolicy:
                     reason_code="tool.denied.subagent_dispatch_disabled",
                     detail=(
                         "JARVIS_SUBAGENT_DISPATCH_ENABLED is not 'true'. "
-                        "Phase 1 Subagents remain gated until battle-test "
-                        "graduation per Manifesto §6."
+                        "Default is true as of 2026-04-18 graduation — "
+                        "this denial fires only on explicit operator override."
                     ),
                 )
             return PolicyResult(
                 decision=PolicyDecision.ALLOW,
-                reason_code="tool.allowed.subagent_explore",
+                reason_code=f"tool.allowed.subagent_{subagent_type}",
                 detail=(
-                    "dispatch_subagent(type=explore) allowed: master switch "
+                    f"dispatch_subagent(type={subagent_type}) allowed: master switch "
                     "on, read-only manifest enforced downstream."
                 ),
             )

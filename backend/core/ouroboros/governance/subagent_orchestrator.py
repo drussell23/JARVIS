@@ -81,6 +81,35 @@ class ExploreExecutor:
         )
 
 
+class ReviewExecutor:
+    """Structural protocol for Phase B REVIEW subagents.
+
+    Concrete implementation: ``AgenticReviewSubagent`` in
+    ``agentic_review_subagent.py``. The orchestrator only needs
+    ``.review(ctx)`` to return an awaitable SubagentResult whose
+    ``type_payload`` carries the verdict tuple (verdict,
+    semantic_integrity_score, mutation_score, reservations,
+    reject_reasons, rationale).
+
+    Manifesto §6 (Execution Validation): REVIEW's verdict must be
+    structurally derived from AST signals + optional mutation testing,
+    not LLM-prose intuition. Concrete implementations MUST wire
+    SemanticGuardian's pattern set as the primary integrity signal
+    and MAY add mutation_score for allowlisted critical paths.
+
+    REVIEW is orchestrator-driven: dispatched from post-VALIDATE
+    unconditionally (not via the model's tool loop). The SubagentContext
+    carries the candidate being reviewed in
+    ``ctx.request.review_target_candidate``.
+    """
+
+    async def review(self, ctx: SubagentContext) -> SubagentResult:  # pragma: no cover — interface stub
+        raise NotImplementedError(
+            "ReviewExecutor.review requires a concrete implementation. "
+            "Use AgenticReviewSubagent from agentic_review_subagent.py."
+        )
+
+
 class CommSink(Protocol):
     """Structural protocol — emits subagent lifecycle events.
 
@@ -207,8 +236,14 @@ class SubagentOrchestrator:
         comm: Optional[CommSink] = None,
         ledger: Optional[LedgerSink] = None,
         now: Optional[Callable[[], datetime]] = None,
+        review_factory: Optional[Callable[[], "ReviewExecutor"]] = None,
     ) -> None:
         self._explore_factory = explore_factory
+        # Phase B: review_factory is optional at construction so existing
+        # call sites that only wire explore keep working. Dispatches for
+        # subagent_type=review without a review_factory return a NOT_IMPLEMENTED
+        # SubagentResult with a clear error_detail — no silent fallbacks.
+        self._review_factory = review_factory
         self._comm: CommSink = comm or LoggerCommSink()
         self._ledger: LedgerSink = ledger or InMemoryLedgerSink()
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -241,6 +276,58 @@ class SubagentOrchestrator:
 
         return await self._dispatch_parallel(parent_ctx, request, scopes)
 
+    async def dispatch_review(
+        self,
+        parent_ctx: "OperationContext",
+        *,
+        file_path: str,
+        pre_apply_content: str,
+        candidate_content: str,
+        generation_intent: str,
+        timeout_s: float = 60.0,
+    ) -> SubagentResult:
+        """Orchestrator-driven REVIEW dispatch (Manifesto §6).
+
+        Constructs a SubagentRequest programmatically and dispatches it
+        through the same machinery used for model-driven EXPLORE calls.
+        Review is orchestrator-driven (unconditional, post-VALIDATE) —
+        the Venom ``dispatch_subagent`` tool does NOT expose review; the
+        model cannot opt out of review by not asking for it.
+
+        Parameters
+        ----------
+        file_path:
+            Repo-relative path of the candidate file.
+        pre_apply_content:
+            Original file content as on disk before the candidate would
+            apply. Required for AST diff signals.
+        candidate_content:
+            The candidate's proposed new content — what APPLY would write.
+        generation_intent:
+            Short summary of what the parent op was trying to achieve.
+            Used by AgenticReviewSubagent to judge semantic alignment.
+        timeout_s:
+            Review budget. Short by default because AST analysis is fast;
+            longer if a mutation-testing hook is triggered.
+        """
+        request = SubagentRequest(
+            subagent_type=SubagentType.REVIEW,
+            goal=f"Review candidate for {file_path}: {generation_intent[:200]}",
+            target_files=(file_path,),
+            scope_paths=(),
+            max_files=1,
+            max_depth=1,
+            timeout_s=timeout_s,
+            parallel_scopes=1,
+            review_target_candidate={
+                "file_path": file_path,
+                "pre_apply_content": pre_apply_content,
+                "candidate_content": candidate_content,
+                "generation_intent": generation_intent,
+            },
+        )
+        return await self.dispatch(parent_ctx, request)
+
     # ------------------------------------------------------------------
     # Master-switch guard (Manifesto §6 — structural refusal before work)
     # ------------------------------------------------------------------
@@ -248,8 +335,10 @@ class SubagentOrchestrator:
     def _ensure_dispatch_enabled(self) -> None:
         if not subagent_dispatch_enabled():
             raise SubagentDispatchDisabled(
-                "Subagent dispatch is disabled. Set JARVIS_SUBAGENT_DISPATCH_ENABLED=true "
-                "to enable. Default is false until Phase 1 graduates per Manifesto §6."
+                "Subagent dispatch is disabled via "
+                "JARVIS_SUBAGENT_DISPATCH_ENABLED=false. Default is true as "
+                "of the 2026-04-18 Phase 1 graduation — only explicit "
+                "operator override reaches this error."
             )
 
     # ------------------------------------------------------------------
@@ -467,11 +556,27 @@ class SubagentOrchestrator:
         """
         started_ns = time.time_ns()
         try:
-            executor = self._explore_factory()
-            # Step-1 stub: the default ExploreExecutor raises NotImplementedError.
-            # We catch that here and return a NOT_IMPLEMENTED status so callers
-            # get a well-formed result while Step 2 is in development.
-            result = await executor.explore(ctx)
+            # Route by subagent_type. EXPLORE is Phase 1 (graduated).
+            # REVIEW is Phase B (orchestrator-driven dispatch). Future
+            # types add additional branches here; do not collapse back
+            # to a single factory.
+            if ctx.subagent_type == SubagentType.REVIEW:
+                if self._review_factory is None:
+                    logger.warning(
+                        "[Subagent] REVIEW dispatch attempted without a "
+                        "review_factory wired — returning NOT_IMPLEMENTED. "
+                        "sub=%s",
+                        ctx.subagent_id,
+                    )
+                    return self._not_implemented_result(ctx, started_ns)
+                executor = self._review_factory()
+                result = await executor.review(ctx)
+            else:
+                executor = self._explore_factory()
+                # Step-1 stub: the default ExploreExecutor raises NotImplementedError.
+                # We catch that here and return a NOT_IMPLEMENTED status so callers
+                # get a well-formed result while Step 2 is in development.
+                result = await executor.explore(ctx)
             # Always stamp the final timing fields in case the executor didn't.
             if not result.started_at_ns or not result.finished_at_ns:
                 result = self._stamp_timing(result, started_ns)

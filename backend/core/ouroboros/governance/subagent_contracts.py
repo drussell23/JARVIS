@@ -194,6 +194,24 @@ EXPLORE_SUBAGENT_SYSTEM_PROMPT = (
 # ============================================================================
 
 
+# Phase B: REVIEW verdict literals. Typed string constants so code paths
+# that inspect verdicts don't scatter string literals across the codebase.
+REVIEW_VERDICT_APPROVE = "approve"
+REVIEW_VERDICT_APPROVE_WITH_RESERVATIONS = "approve_with_reservations"
+REVIEW_VERDICT_REJECT = "reject"
+
+# Semantic integrity score floors (Manifesto §6 Execution Validation).
+# Below these, the verdict is forced to downgrade regardless of what
+# the subagent would otherwise have emitted. Env-tunable — the defaults
+# are calibrated for the Phase B graduation arc.
+REVIEW_MIN_SCORE_APPROVE = float(
+    os.environ.get("JARVIS_REVIEW_MIN_SCORE_APPROVE", "0.80")
+)
+REVIEW_MIN_SCORE_APPROVE_WITH_RESERVATIONS = float(
+    os.environ.get("JARVIS_REVIEW_MIN_SCORE_APPROVE_WITH_RESERVATIONS", "0.55")
+)
+
+
 class SubagentType(str, Enum):
     """Subagent types available for dispatch.
 
@@ -201,10 +219,11 @@ class SubagentType(str, Enum):
     engine denies requests for them in Phase 1 with a specific reason.
     """
     EXPLORE = "explore"
-    # PLAN = "plan"          # Phase C
-    # REVIEW = "review"      # Phase B
-    # RESEARCH = "research"  # Phase B
-    # REFACTOR = "refactor"  # Phase B
+    REVIEW = "review"      # Phase B — graduated-pending; see project_phase_b_subagent_roadmap.md
+    # PLAN = "plan"          # Phase B — infra pending
+    # RESEARCH = "research"  # Phase B — deferred
+    # REFACTOR = "refactor"  # Phase B — deferred (mutating, needs own graduation)
+    # GENERAL = "general"    # Phase B — deferred (semantic firewall)
 
 
 class SubagentStatus(str, Enum):
@@ -275,6 +294,14 @@ class SubagentRequest:
     max_depth: int = 3
     timeout_s: float = 120.0
     parallel_scopes: int = 1
+    # Phase B REVIEW input — the candidate being reviewed. Orchestrator
+    # populates this programmatically at dispatch_review() time; the
+    # Venom `dispatch_subagent` tool does NOT accept this field (REVIEW
+    # is orchestrator-driven, not model-driven — §6 Execution Validation
+    # mandates unconditional review, not optional).
+    # Shape: {"file_path": str, "pre_apply_content": str, "candidate_content": str,
+    #         "generation_intent": str}
+    review_target_candidate: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not self.goal:
@@ -351,6 +378,13 @@ class SubagentResult:
     fallback_triggered: bool = False     # True when Nervous System Reflex fired
     error_class: str = ""
     error_detail: str = ""
+    # Phase B REVIEW output — verdict payload (empty dict for EXPLORE).
+    # Frozen via tuple-of-tuple representation so the dataclass stays
+    # immutable. Callers convert to dict via dict(self.type_payload).
+    # Shape for REVIEW: (("verdict", str), ("semantic_integrity_score", float),
+    # ("mutation_score", float|None), ("reservations", Tuple[str, ...]),
+    # ("reject_reasons", Tuple[str, ...]), ("rationale", str))
+    type_payload: Tuple[Tuple[str, Any], ...] = ()
 
     @property
     def duration_s(self) -> float:
@@ -392,6 +426,7 @@ class SubagentResult:
             fallback_triggered=self.fallback_triggered,
             error_class=self.error_class,
             error_detail=self.error_detail,
+            type_payload=self.type_payload,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -415,6 +450,7 @@ class SubagentResult:
             "fallback_triggered": self.fallback_triggered,
             "error_class": self.error_class,
             "error_detail": self.error_detail,
+            "type_payload": dict(self.type_payload) if self.type_payload else {},
         }
 
 
