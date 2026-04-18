@@ -36,7 +36,7 @@ import dataclasses
 from dataclasses import asdict as _dc_asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
@@ -4910,6 +4910,93 @@ class GovernedOrchestrator:
                     exc_info=True,
                 )
 
+        # ---- MutationGate: APPLY-phase execution boundary (cached) ----
+        #
+        # Closes the "tests pass != tests test" gap empirically surfaced
+        # by the Session W calibration (28.6% mutation score on green
+        # test suite). For operator-allowlisted critical paths only:
+        #
+        #   * Enumerate deterministic AST mutants (cached by content hash).
+        #   * For each mutant, run the scoped test suite; cache outcomes
+        #     by (sut_hash, tests_hash) so repeat ops on unchanged files
+        #     are near-free.
+        #   * Map score → decision:
+        #       score >= allow_threshold  (default 0.75) → no change
+        #       score in [block, allow)                  → force APPROVAL_REQUIRED
+        #       score <  block_threshold (default 0.40)  → force BLOCKED
+        #
+        # Authority split (Manifesto §1): the tester measures; this
+        # module decides; the orchestrator enforces. The gate never
+        # auto-improves tests, never short-circuits VALIDATE, never
+        # runs on non-critical paths (cost would be prohibitive).
+        #
+        # Master switch JARVIS_MUTATION_GATE_ENABLED (default 0).
+        if best_candidate is not None:
+            try:
+                from backend.core.ouroboros.governance import mutation_gate as _mg
+                if _mg.gate_enabled():
+                    _mg_allowlist = _mg.load_allowlist()
+                    # Reuse the _iter already built for SemanticGuardian.
+                    _candidate_pairs = []
+                    _candidate_files_mg = best_candidate.get("files") if isinstance(
+                        best_candidate.get("files"), list,
+                    ) else None
+                    if _candidate_files_mg:
+                        _candidate_pairs = [
+                            entry.get("file_path", "")
+                            for entry in _candidate_files_mg
+                            if isinstance(entry, dict)
+                        ]
+                    else:
+                        _single = best_candidate.get("file_path", "")
+                        if _single:
+                            _candidate_pairs = [_single]
+                    # Filter to critical-only.
+                    _critical = [
+                        Path(p) for p in _candidate_pairs
+                        if _mg.is_path_critical(Path(p), allowlist=_mg_allowlist)
+                    ]
+                    if _critical:
+                        _verdicts = []
+                        for _sp in _critical:
+                            _abs_sp = (
+                                self._config.project_root / _sp
+                                if not _sp.is_absolute() else _sp
+                            )
+                            # Caller supplies tests — a path-correlated
+                            # discovery helper keeps the wiring minimal
+                            # (Session W style: tests/test_<stem>*.py).
+                            _tests = self._discover_tests_for_gate(_sp)
+                            _verdicts.append(
+                                _mg.evaluate_file(_abs_sp, _tests)
+                            )
+                        if _verdicts:
+                            _merged = _mg.merge_verdicts(_verdicts)
+                            _risk_before_mg = risk_tier.name
+                            if _merged.decision == "block":
+                                risk_tier = RiskTier.BLOCKED
+                            elif _merged.decision == "upgrade_to_approval":
+                                if risk_tier.value < RiskTier.APPROVAL_REQUIRED.value:
+                                    risk_tier = RiskTier.APPROVAL_REQUIRED
+                            # Stable one-line telemetry — grepable.
+                            logger.info(
+                                "[MutationGate] op=%s decision=%s score=%.2f "
+                                "grade=%s caught=%d/%d survivors=%d "
+                                "cache_hits=%d cache_misses=%d duration=%.1fs "
+                                "risk_before=%s risk_after=%s",
+                                ctx.op_id, _merged.decision, _merged.score,
+                                _merged.grade, _merged.caught,
+                                _merged.total_mutants, len(_merged.survivors),
+                                _merged.cache_hits, _merged.cache_misses,
+                                _merged.duration_s,
+                                _risk_before_mg, risk_tier.name,
+                            )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] MutationGate skipped",
+                    exc_info=True,
+                )
+
         # ---- MIN_RISK_TIER floor (paranoia mode + quiet hours) ----
         #
         # Separate from JARVIS_RISK_CEILING above — that knob is scoped
@@ -7541,6 +7628,24 @@ class GovernedOrchestrator:
             profile=profile,
             op_id=ctx.op_id,
         )
+
+    def _discover_tests_for_gate(self, sut_path: Path) -> List[Path]:
+        """Discover pytest files scoped to one SUT for the MutationGate.
+
+        Matches Session-W style fan-out (``tests/test_<stem>*.py``) via
+        rglob under the project root's ``tests/`` dir. Returned paths
+        are absolute so the mutation runner sees stable targets even
+        when the gate is called from a non-project cwd.
+        """
+        stem = sut_path.stem
+        tests_dir = self._config.project_root / "tests"
+        if not tests_dir.is_dir():
+            return []
+        found: List[Path] = []
+        for candidate in tests_dir.rglob(f"test_{stem}*.py"):
+            if candidate.is_file():
+                found.append(candidate)
+        return sorted(found)
 
     async def _apply_multi_file_candidate(
         self,
