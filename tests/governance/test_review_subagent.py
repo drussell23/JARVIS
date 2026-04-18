@@ -155,7 +155,7 @@ def test_policy_allows_dispatch_subagent_type_explore_still(
 
 
 @pytest.mark.parametrize(
-    "unsupported_type", ["research", "refactor", "general", "bogus"],
+    "unsupported_type", ["research", "refactor", "bogus"],
 )
 def test_policy_denies_unsupported_subagent_types(
     policy, tmp_path: Path, monkeypatch, unsupported_type: str,

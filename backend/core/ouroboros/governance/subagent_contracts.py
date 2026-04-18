@@ -221,9 +221,9 @@ class SubagentType(str, Enum):
     EXPLORE = "explore"
     REVIEW = "review"      # Phase B — graduated-pending; see project_phase_b_subagent_roadmap.md
     PLAN = "plan"          # Phase B — graduated-pending; §2 DAG output contract
+    GENERAL = "general"    # Phase B — graduated-pending; §5 Semantic Firewall
     # RESEARCH = "research"  # Phase B — deferred
     # REFACTOR = "refactor"  # Phase B — deferred (mutating, needs own graduation)
-    # GENERAL = "general"    # Phase B — deferred (semantic firewall)
 
 
 class SubagentStatus(str, Enum):
@@ -309,6 +309,16 @@ class SubagentRequest:
     # Shape: {"op_description": str, "target_files": Tuple[str, ...],
     #         "primary_repo": str, "risk_tier": str}
     plan_target: Optional[Dict[str, Any]] = None
+    # Phase B GENERAL input — the 5 mandatory boundary conditions of
+    # the Semantic Firewall (Manifesto §5). Missing any field causes
+    # SubagentSemanticFirewallRejection at dispatch time. Shape:
+    # {"operation_scope": Tuple[str, ...] | str,  # concrete paths/globs
+    #  "max_mutations": int,                      # 0 for read-only
+    #  "allowed_tools": Tuple[str, ...],          # explicit subset
+    #  "invocation_reason": str,                  # ≤ 200 chars, sanitized
+    #  "parent_op_risk_tier": str,                # must be ≥ NOTIFY_APPLY
+    #  "goal": str}                               # the task itself (sanitized)
+    general_invocation: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not self.goal:
@@ -542,3 +552,48 @@ class SubagentDispatchDisabled(SubagentError):
     Exists so a miswired caller gets a clear error rather than silent
     no-op behavior.
     """
+
+
+class SubagentSemanticFirewallRejection(SubagentError):
+    """Raised at GENERAL dispatch when the Semantic Firewall (Manifesto §5)
+    rejects the invocation.
+
+    Triggers:
+      * Boundary condition missing or malformed (operation_scope,
+        max_mutations, allowed_tools, invocation_reason,
+        parent_op_risk_tier).
+      * parent_op_risk_tier below NOTIFY_APPLY — SAFE_AUTO ops cannot
+        dispatch GENERAL.
+      * Prompt-injection pattern detected in goal or invocation_reason
+        (ignore-previous-instructions, role-overrides, etc.).
+      * Any allowed_tool outside the whitelisted Venom subset.
+
+    Attributes
+    ----------
+    reasons:
+        List of specific rejection reasons. Non-empty by construction
+        (an empty-reason firewall rejection is itself a bug).
+    """
+
+    def __init__(self, reasons: Tuple[str, ...] | list) -> None:
+        self.reasons = tuple(reasons)
+        super().__init__(
+            f"GENERAL dispatch rejected by Semantic Firewall: "
+            + "; ".join(self.reasons)
+        )
+
+
+class SubagentRecursionRejection(SubagentError):
+    """Raised at GENERAL dispatch when the parent context indicates the
+    call is already inside a GENERAL subagent.
+
+    Manifesto §5: GENERAL cannot dispatch GENERAL. One level deep maximum.
+    """
+
+    def __init__(self, parent_chain: Tuple[str, ...] = ()) -> None:
+        self.parent_chain = tuple(parent_chain)
+        super().__init__(
+            "GENERAL dispatch refused: parent already within a GENERAL "
+            "subagent (recursion ban, Manifesto §5). parent_chain="
+            + str(list(self.parent_chain))
+        )

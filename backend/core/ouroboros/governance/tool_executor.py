@@ -1830,10 +1830,16 @@ class GoverningToolPolicy:
         # it, but the orchestrator typically issues REVIEW itself via
         # dispatch_review() — the tool-path is defense-in-depth for
         # advanced workflows, not the primary invocation.
-        # Phase B: explore (graduated) + review + plan. plan is
-        # orchestrator-driven (same as review) — allowed at the tool
-        # layer for completeness / future invocation patterns.
-        _READ_ONLY_SUBAGENT_TYPES = frozenset({"explore", "review", "plan"})
+        # Phase B: explore (graduated) + review + plan + general.
+        # review/plan/general are orchestrator-driven — the policy
+        # layer allows them for completeness, but primary invocation
+        # is via the orchestrator's dispatch_{review,plan,general}()
+        # methods. GENERAL also enforces the Semantic Firewall (§5)
+        # inside dispatch_general(), which is a stricter boundary than
+        # this policy check.
+        _READ_ONLY_SUBAGENT_TYPES = frozenset(
+            {"explore", "review", "plan", "general"}
+        )
         if name == "dispatch_subagent":
             try:
                 from backend.core.ouroboros.governance.subagent_contracts import (

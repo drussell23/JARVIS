@@ -37,7 +37,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Callable, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, TYPE_CHECKING, Tuple
 
 from backend.core.ouroboros.governance.subagent_contracts import (
     SCHEMA_VERSION,
@@ -136,6 +136,40 @@ class PlanExecutor:
         raise NotImplementedError(
             "PlanExecutor.plan requires a concrete implementation. "
             "Use AgenticPlanSubagent from agentic_plan_subagent.py."
+        )
+
+
+class GeneralExecutor:
+    """Structural protocol for Phase B GENERAL subagents.
+
+    Concrete implementation: ``AgenticGeneralSubagent`` in
+    ``agentic_general_subagent.py``. The orchestrator only needs
+    ``.general(ctx)`` to return an awaitable SubagentResult whose
+    ``type_payload`` carries the quarantined output + execution trace.
+
+    Manifesto §5 (Semantic Firewall): GENERAL is the most vulnerable
+    subagent type because it lacks a specific domain constraint. The
+    dispatch path therefore enforces five boundary conditions BEFORE
+    the executor ever runs (see semantic_firewall.validate_boundary_
+    conditions). The executor itself must:
+      * Treat every input as untrusted until re-sanitized.
+      * Wrap its output in a ``<general_subagent_output untrusted="true">``
+        fence so downstream consumers preserve the trust boundary.
+      * Refuse to dispatch GENERAL recursively (one level deep max).
+      * Log every tool call at INFO with ``via=general_subagent``.
+
+    GENERAL dispatch failures are expressive:
+      * ``SubagentSemanticFirewallRejection`` — boundary conditions
+        failed or injection pattern detected. No subagent work
+        happens; the SubagentResult carries the rejection reasons.
+      * ``SubagentRecursionRejection`` — parent already within a
+        GENERAL subagent.
+    """
+
+    async def general(self, ctx: SubagentContext) -> SubagentResult:  # pragma: no cover — interface stub
+        raise NotImplementedError(
+            "GeneralExecutor.general requires a concrete implementation. "
+            "Use AgenticGeneralSubagent from agentic_general_subagent.py."
         )
 
 
@@ -267,15 +301,17 @@ class SubagentOrchestrator:
         now: Optional[Callable[[], datetime]] = None,
         review_factory: Optional[Callable[[], "ReviewExecutor"]] = None,
         plan_factory: Optional[Callable[[], "PlanExecutor"]] = None,
+        general_factory: Optional[Callable[[], "GeneralExecutor"]] = None,
     ) -> None:
         self._explore_factory = explore_factory
-        # Phase B: review_factory + plan_factory are optional at
-        # construction so existing call sites that only wire explore
-        # keep working. Dispatches for those types without the matching
-        # factory return NOT_IMPLEMENTED with a clear error_detail —
-        # no silent fallbacks.
+        # Phase B: review_factory + plan_factory + general_factory are
+        # optional at construction so existing call sites that only wire
+        # explore keep working. Dispatches for those types without the
+        # matching factory return NOT_IMPLEMENTED with a clear
+        # error_detail — no silent fallbacks.
         self._review_factory = review_factory
         self._plan_factory = plan_factory
+        self._general_factory = general_factory
         self._comm: CommSink = comm or LoggerCommSink()
         self._ledger: LedgerSink = ledger or InMemoryLedgerSink()
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -369,6 +405,155 @@ class SubagentOrchestrator:
             },
         )
         return await self.dispatch(parent_ctx, request)
+
+    async def dispatch_general(
+        self,
+        parent_ctx: "OperationContext",
+        *,
+        goal: str,
+        operation_scope: Tuple[str, ...],
+        max_mutations: int,
+        allowed_tools: Tuple[str, ...],
+        invocation_reason: str,
+        parent_op_risk_tier: str,
+        timeout_s: float = 120.0,
+    ) -> SubagentResult:
+        """Orchestrator-driven GENERAL dispatch (Manifesto §5).
+
+        Applies the Semantic Firewall AT DISPATCH TIME:
+          1. Rejects recursive GENERAL dispatches via
+             ``is_within_general_subagent(parent_ctx)``.
+          2. Sanitizes goal + invocation_reason via
+             ``sanitize_for_firewall()``. Any injection pattern hit
+             raises ``SubagentSemanticFirewallRejection``.
+          3. Validates the five boundary conditions via
+             ``validate_boundary_conditions()``.
+
+        On any rejection the caller gets a structured SubagentResult
+        with status=FAILED, error_class="SubagentSemanticFirewallRejection"
+        (or "SubagentRecursionRejection"), and error_detail carrying
+        every specific reason. Raised exceptions are translated into
+        results here so caller flow stays uniform.
+        """
+        # Late import — firewall + contract exceptions live in separate
+        # modules, and we want a single top-level circular-import-safe
+        # entry point for GENERAL dispatch.
+        from backend.core.ouroboros.governance.semantic_firewall import (
+            is_within_general_subagent,
+            sanitize_for_firewall,
+            validate_boundary_conditions,
+        )
+        from backend.core.ouroboros.governance.subagent_contracts import (
+            SubagentRecursionRejection,
+            SubagentSemanticFirewallRejection,
+        )
+
+        # ---- 1. Recursion ban --------------------------------------------
+        if is_within_general_subagent(parent_ctx):
+            # One level deep max. Surface as a structured FAILED result
+            # rather than raising, so the caller's flow is uniform.
+            return self._firewall_rejection_result(
+                parent_ctx=parent_ctx,
+                error_class="SubagentRecursionRejection",
+                reasons=(
+                    "GENERAL dispatch refused — parent already within a "
+                    "GENERAL subagent (Manifesto §5, recursion ban)",
+                ),
+            )
+
+        # ---- 2. Input sanitization ---------------------------------------
+        goal_scan = sanitize_for_firewall(goal, field_name="goal")
+        reason_scan = sanitize_for_firewall(
+            invocation_reason, max_chars=200, field_name="invocation_reason",
+        )
+        injection_reasons: List[str] = []
+        if goal_scan.rejected:
+            injection_reasons.extend(goal_scan.reasons)
+        if reason_scan.rejected:
+            injection_reasons.extend(reason_scan.reasons)
+
+        # ---- 3. Boundary validation --------------------------------------
+        invocation_for_validate: Dict[str, Any] = {
+            "operation_scope": operation_scope,
+            "max_mutations": max_mutations,
+            "allowed_tools": allowed_tools,
+            "invocation_reason": invocation_reason,
+            "parent_op_risk_tier": parent_op_risk_tier,
+        }
+        valid, boundary_reasons = validate_boundary_conditions(
+            invocation_for_validate,
+        )
+
+        all_reasons: List[str] = []
+        all_reasons.extend(injection_reasons)
+        if not valid:
+            all_reasons.extend(boundary_reasons)
+
+        if all_reasons:
+            # Aggregate firewall rejection — structured FAILED result so
+            # the caller can log + POSTMORTEM without catching.
+            return self._firewall_rejection_result(
+                parent_ctx=parent_ctx,
+                error_class="SubagentSemanticFirewallRejection",
+                reasons=tuple(all_reasons),
+            )
+
+        # ---- 4. Build request with sanitized invocation ------------------
+        # Sanitized payload — the subagent NEVER sees the raw goal or
+        # invocation_reason; it sees the redacted versions.
+        request = SubagentRequest(
+            subagent_type=SubagentType.GENERAL,
+            goal=goal_scan.sanitized or goal,
+            target_files=tuple(operation_scope),
+            scope_paths=tuple(operation_scope),
+            max_files=max(len(operation_scope), 1),
+            max_depth=1,
+            timeout_s=timeout_s,
+            parallel_scopes=1,
+            general_invocation={
+                "goal": goal_scan.sanitized or goal,
+                "operation_scope": tuple(operation_scope),
+                "max_mutations": int(max_mutations),
+                "allowed_tools": tuple(allowed_tools),
+                "invocation_reason": reason_scan.sanitized or invocation_reason,
+                "parent_op_risk_tier": parent_op_risk_tier,
+            },
+        )
+        return await self.dispatch(parent_ctx, request)
+
+    def _firewall_rejection_result(
+        self,
+        *,
+        parent_ctx: "OperationContext",
+        error_class: str,
+        reasons: Tuple[str, ...],
+    ) -> SubagentResult:
+        """Build a structured SubagentResult for a pre-dispatch
+        firewall/recursion rejection.
+
+        A separate helper (vs raising + catching) so the orchestrator
+        log stream + ledger records observe the rejection with the same
+        shape they'd observe any other subagent outcome. No exception
+        escape = no uncaught-exception gray area.
+        """
+        from datetime import datetime as _dt
+        now_ns = int(_dt.now().timestamp() * 1_000_000_000)
+        parent_op_id = self._parent_op_id(parent_ctx)
+        sub_id = self._next_sub_id(parent_op_id)
+        return SubagentResult(
+            subagent_id=sub_id,
+            subagent_type=SubagentType.GENERAL,
+            status=SubagentStatus.FAILED,
+            goal="(rejected by Semantic Firewall)",
+            started_at_ns=now_ns,
+            finished_at_ns=now_ns,
+            error_class=error_class,
+            error_detail="; ".join(reasons)[:500],
+            provider_used="firewall",
+            type_payload=(
+                ("rejection_reasons", tuple(reasons)),
+            ),
+        )
 
     async def dispatch_review(
         self,
@@ -676,6 +861,17 @@ class SubagentOrchestrator:
                     return self._not_implemented_result(ctx, started_ns)
                 plan_executor = self._plan_factory()
                 result = await plan_executor.plan(ctx)
+            elif ctx.subagent_type == SubagentType.GENERAL:
+                if self._general_factory is None:
+                    logger.warning(
+                        "[Subagent] GENERAL dispatch attempted without a "
+                        "general_factory wired — returning NOT_IMPLEMENTED. "
+                        "sub=%s",
+                        ctx.subagent_id,
+                    )
+                    return self._not_implemented_result(ctx, started_ns)
+                general_executor = self._general_factory()
+                result = await general_executor.general(ctx)
             else:
                 executor = self._explore_factory()
                 # Step-1 stub: the default ExploreExecutor raises NotImplementedError.
