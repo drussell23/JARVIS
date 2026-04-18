@@ -2633,9 +2633,14 @@ class GovernedOrchestrator:
                         )
                     except Exception:
                         _fanout_budget_s = 3 * 90  # Phase 1 Defaults
+                    # Default 180s matches candidate_generator
+                    # _BG_READONLY_SYNTHESIS_RESERVE_S — the two must
+                    # stay aligned so the inner fallback cap and the
+                    # outer orchestrator wait_for use the same reserve
+                    # assumption. Session 12 empirically sized this.
                     _synthesis_reserve_s = float(os.environ.get(
                         "JARVIS_GEN_TIMEOUT_READONLY_SYNTHESIS_RESERVE_S",
-                        "90",
+                        "180",
                     ))
                     _gen_timeout_readonly = _gen_timeout + _fanout_budget_s + _synthesis_reserve_s
                     # Allow operator override via dedicated env var.

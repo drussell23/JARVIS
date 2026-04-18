@@ -2385,8 +2385,15 @@ class CandidateGenerator:
     # but strictly bounded by what the actual wall-clock needs for a
     # 3-subagent cartography op. Env-tunable so operators can retune
     # after graduation data accumulates.
+    # Default sized from Session-12 empirical data (bt-2026-04-18-055042).
+    # Session 11 synthesized 80 findings in 472s (8s under 480s cap).
+    # Session 12 with 108 findings took 491.93s — 11.93s over. Subagent
+    # finding counts are model-driven (exploration depth varies per
+    # provider + cache state), so a fixed 90s reserve was too tight for
+    # the high-yield end of the distribution. 180s absorbs another ~40%
+    # finding-count drift before the cap bites.
     _BG_READONLY_SYNTHESIS_RESERVE_S: float = float(
-        os.environ.get("JARVIS_BG_READONLY_SYNTHESIS_RESERVE_S", "90.0")
+        os.environ.get("JARVIS_BG_READONLY_SYNTHESIS_RESERVE_S", "180.0")
     )
 
     async def _call_fallback(
