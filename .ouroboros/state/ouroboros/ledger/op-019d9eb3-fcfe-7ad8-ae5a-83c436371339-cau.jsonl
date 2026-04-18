@@ -1,2 +1,0 @@
-{"data": {"provider": "claude-api", "reason": "noop"}, "op_id": "op-019d9eb3-fcfe-7ad8-ae5a-83c436371339-cau", "state": "applied", "timestamp": 216.266341916, "wall_time": 1776484244.546879}
-{"data": {"reason": "boot_recovery_missing_provenance", "recovery_attempt_id": "dac6de697bbe4d5f8174ba7333dfadf1"}, "op_id": "op-019d9eb3-fcfe-7ad8-ae5a-83c436371339-cau", "state": "failed", "timestamp": 26.317092083, "wall_time": 1776484718.331359}

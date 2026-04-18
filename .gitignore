@@ -121,8 +121,12 @@ backend/swift_bridge/*.pyc
 .jarvis/
 *.json.cache
 
-# Ouroboros oracle graph cache (large binary; exceeds GitHub 100MB limit — regenerate locally)
-.ouroboros/state/sandbox_fallback/oracle/*.pkl
+# Ouroboros session-churn artifacts — regenerated every battle-test run; tracking them
+# churns the git index and overwhelms the Cursor/VS Code Git extension. Keep .ouroboros/plugins/
+# tracked since it contains real code.
+.ouroboros/sessions/
+.ouroboros/state/
+.ouroboros/parse_failures/
 
 # Ouroboros benchmark diagnostic outputs (contain API response bodies; copy to
 # docs/benchmarks/artifacts/ explicitly if you want to include in a report)
