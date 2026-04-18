@@ -3304,6 +3304,45 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] ExplorationFleet skipped: %s", exc)
 
+        # ---- Wire Phase 1 SubagentOrchestrator (dispatch_subagent Venom tool) ----
+        # Gated by JARVIS_SUBAGENT_DISPATCH_ENABLED (default false). Construction
+        # itself is side-effect-free; the master switch only gates the dispatch
+        # path inside SubagentOrchestrator.dispatch(). An unwired orchestrator
+        # reference is safe — the tool backend handler returns EXEC_ERROR with
+        # a clear message when dispatch_subagent is called without wiring.
+        #
+        # Default CommSink / LedgerSink are the logger + in-memory defaults
+        # from subagent_orchestrator.py; Step 4a/4b will swap in real
+        # CommProtocol-backed and OperationLedger-backed sinks. Those are
+        # purely observability upgrades — they do not change dispatch behavior.
+        try:
+            _backend_ref = getattr(self, "_tool_backend", None)
+            if _backend_ref is not None and hasattr(_backend_ref, "set_subagent_orchestrator"):
+                from backend.core.ouroboros.governance.subagent_orchestrator import (
+                    SubagentOrchestrator,
+                )
+                from backend.core.ouroboros.governance.agentic_subagent import (
+                    build_default_explore_factory,
+                )
+                _sub_orch = SubagentOrchestrator(
+                    explore_factory=build_default_explore_factory(
+                        self._config.project_root
+                    ),
+                )
+                self._subagent_orchestrator_ref = _sub_orch
+                _backend_ref.set_subagent_orchestrator(_sub_orch)
+                logger.info(
+                    "[GLS] SubagentOrchestrator wired "
+                    "(Venom dispatch_subagent — gated by "
+                    "JARVIS_SUBAGENT_DISPATCH_ENABLED, default false)"
+                )
+            else:
+                logger.debug(
+                    "[GLS] SubagentOrchestrator skipped — tool backend not present"
+                )
+        except Exception as exc:
+            logger.debug("[GLS] SubagentOrchestrator skipped: %s", exc)
+
         # ---- Wire Self-Critique Engine (Phase 3a — post-VERIFY quality signal) ----
         # Cheap DW critique over the applied diff against the original goal.
         # Poor ratings become FEEDBACK memories; excellent ratings reinforce
