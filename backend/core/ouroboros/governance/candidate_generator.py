@@ -2364,6 +2364,31 @@ class CandidateGenerator:
         os.environ.get("JARVIS_FALLBACK_MAX_TIMEOUT_COMPLEX_S", "180.0")
     )
 
+    # ── Synthesis reserve for read-only BG subagent fan-out (Session 5) ──
+    # Session 5 (bt-2026-04-18-035817) proved the graduation signal: three
+    # parallel subagents dispatched, 80 findings returned, all with Iron
+    # Gate diversity=3. But the parent Claude synthesis round died with
+    # TimeoutError because the BG fallback cap (120s) was sized for a
+    # single-shot Claude completion, not "Claude fans out → 3 subagents
+    # consume 135s → Claude synthesizes the findings". Per Derek's
+    # 2026-04-17 directive, the cap for read-only BG ops must dynamically
+    # expand to account for subagent wall-clock PLUS a hard synthesis
+    # reserve. The formula is:
+    #
+    #     _max_cap = base_cap  (=_FALLBACK_MAX_TIMEOUT_S, 120s default)
+    #              + MAX_PARALLEL_SCOPES * PRIMARY_PROVIDER_TIMEOUT_S
+    #              + _BG_READONLY_SYNTHESIS_RESERVE_S
+    #
+    # With Phase 1 constants (MAX_PARALLEL_SCOPES=3,
+    # PRIMARY_PROVIDER_TIMEOUT_S=90) and the mandated 90s synthesis
+    # reserve, this evaluates to 480s — about 4× the mutating-BG cap,
+    # but strictly bounded by what the actual wall-clock needs for a
+    # 3-subagent cartography op. Env-tunable so operators can retune
+    # after graduation data accumulates.
+    _BG_READONLY_SYNTHESIS_RESERVE_S: float = float(
+        os.environ.get("JARVIS_BG_READONLY_SYNTHESIS_RESERVE_S", "90.0")
+    )
+
     async def _call_fallback(
         self,
         context: OperationContext,
@@ -2408,11 +2433,44 @@ class CandidateGenerator:
         # to generate coherently. Non-complex routes keep the 120s cap.
         # _op_route was already computed earlier in this method for the
         # fallback-disabled-by-env check, so we reuse the lowercased value.
-        _max_cap = (
-            self._FALLBACK_MAX_TIMEOUT_COMPLEX_S
-            if _op_route == "complex"
-            else self._FALLBACK_MAX_TIMEOUT_S
-        )
+        #
+        # Read-only BG subagent fan-out override (Session 5 graduation
+        # directive, Derek 2026-04-17): when the op is read-only AND on
+        # BG route, dynamically extend the cap to account for parallel
+        # subagent wall-clock plus a 90s synthesis reserve. The three
+        # parallel ExploreAgents consume up to
+        # MAX_PARALLEL_SCOPES * PRIMARY_PROVIDER_TIMEOUT_S seconds of
+        # wall-clock before the parent Claude begins synthesizing the
+        # rolled-up findings — charging the parent's 120s cap for that
+        # wait is the arithmetic that killed Session 5 at 134.56s.
+        _is_read_only = bool(getattr(context, "is_read_only", False))
+        if _is_read_only and _op_route == "background":
+            # Lazy import to avoid a new top-level dependency on
+            # subagent_contracts — this module is imported eagerly
+            # at provider boot, subagent_contracts is imported by
+            # the orchestrator later.
+            try:
+                from backend.core.ouroboros.governance.subagent_contracts import (
+                    MAX_PARALLEL_SCOPES,
+                    PRIMARY_PROVIDER_TIMEOUT_S,
+                )
+                _subagent_wallclock_budget_s = (
+                    MAX_PARALLEL_SCOPES * PRIMARY_PROVIDER_TIMEOUT_S
+                )
+            except Exception:
+                # Defensive fallback — hardcode the current Phase 1
+                # constants so the cap still extends meaningfully if
+                # the import fails for any reason.
+                _subagent_wallclock_budget_s = 3 * 90  # = 270s
+            _max_cap = (
+                self._FALLBACK_MAX_TIMEOUT_S
+                + _subagent_wallclock_budget_s
+                + self._BG_READONLY_SYNTHESIS_RESERVE_S
+            )
+        elif _op_route == "complex":
+            _max_cap = self._FALLBACK_MAX_TIMEOUT_COMPLEX_S
+        else:
+            _max_cap = self._FALLBACK_MAX_TIMEOUT_S
 
         # Promoted to INFO with phase label so traces distinguish first
         # GENERATE from GENERATE_RETRY contention on the shared fallback

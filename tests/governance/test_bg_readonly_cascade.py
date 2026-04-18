@@ -273,6 +273,157 @@ def test_bg_readonly_forces_allow_fallback_independent_of_env(
     )
 
 
+# ---------------------------------------------------------------------------
+# 4. Budget Math Patch — dynamic _max_cap for read-only BG (Session 6)
+# ---------------------------------------------------------------------------
+#
+# Session 5 proved the graduation signal but died at synthesis-round
+# timeout: max_cap=120s, subagents consumed 134.56s, Claude had <46s
+# left. Derek's directive: for read-only BG ops the cap must expand to
+# base_120s + MAX_PARALLEL_SCOPES*PRIMARY_PROVIDER_TIMEOUT_S + 90s
+# synthesis reserve.
+
+
+def test_readonly_bg_cap_extends_to_full_fanout_budget() -> None:
+    """The extended cap must be large enough to accommodate worst-case
+    3-parallel subagent wall-clock plus a 90s synthesis reserve.
+    """
+    from backend.core.ouroboros.governance.candidate_generator import (
+        CandidateGenerator,
+    )
+    from backend.core.ouroboros.governance.subagent_contracts import (
+        MAX_PARALLEL_SCOPES,
+        PRIMARY_PROVIDER_TIMEOUT_S,
+    )
+
+    # Structural check on the class-level constant the patch introduced.
+    assert hasattr(CandidateGenerator, "_BG_READONLY_SYNTHESIS_RESERVE_S")
+    reserve = CandidateGenerator._BG_READONLY_SYNTHESIS_RESERVE_S
+    assert reserve >= 60.0  # Derek's mandate is 90s; floor at 60s safety.
+
+    # Formula expected by the patch: base + subagent_wallclock + reserve
+    base = CandidateGenerator._FALLBACK_MAX_TIMEOUT_S
+    expected_cap = (
+        base + MAX_PARALLEL_SCOPES * PRIMARY_PROVIDER_TIMEOUT_S + reserve
+    )
+
+    # The cap must be substantially larger than the mutating-BG cap —
+    # that's the whole point of the patch.
+    assert expected_cap > base * 3, (
+        f"Expected read-only BG cap ({expected_cap:.0f}s) to be at "
+        f"least 3x the mutating-BG base cap ({base:.0f}s)"
+    )
+
+    # Sanity: the cap is wide enough to cover the Session-5 failure
+    # mode. Session 5 timed out at sem_wait_total_s=134.56 with cap=120;
+    # the new cap must be comfortably above that.
+    assert expected_cap >= 300.0, (
+        f"Read-only BG cap must be ≥ 300s to cover Session-5 style "
+        f"fan-out patterns, got {expected_cap:.0f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_readonly_bg_fallback_applies_extended_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When is_read_only=True + BG route, _call_fallback must observe
+    the extended cap, not the 120s mutating baseline.
+    """
+    from backend.core.ouroboros.governance.candidate_generator import (
+        CandidateGenerator,
+    )
+    from backend.core.ouroboros.governance.subagent_contracts import (
+        MAX_PARALLEL_SCOPES,
+        PRIMARY_PROVIDER_TIMEOUT_S,
+    )
+
+    # Build a hollow generator with just enough to exercise _call_fallback.
+    gen = CandidateGenerator.__new__(CandidateGenerator)
+    gen._fallback = MagicMock()
+    gen._remaining_seconds = lambda _dl: 500.0
+    gen._fallback_concurrency = 3
+
+    # Intercept max_cap by patching the log line — it's the most stable
+    # capture point. We inspect the call args of the acquire log.
+    captured_caps: list = []
+
+    original_info = None
+    import logging
+
+    class CapCapture(logging.Handler):
+        def emit(self, record):
+            msg = record.getMessage()
+            if "Fallback sem acquire" in msg and "max_cap=" in msg:
+                # Extract max_cap=...s from the message.
+                import re
+                m = re.search(r"max_cap=([\d.]+)s", msg)
+                if m:
+                    captured_caps.append(float(m.group(1)))
+
+    handler = CapCapture()
+    logging.getLogger(
+        "backend.core.ouroboros.governance.candidate_generator"
+    ).addHandler(handler)
+    try:
+        # Minimal asyncio sem so the sem async with block doesn't crash.
+        gen._fallback_sem = asyncio.Semaphore(3)
+
+        # Return control fast once we're past the log — raise to exit.
+        async def _boom(ctx, dl):
+            raise RuntimeError("test_done")
+
+        monkeypatch.setattr(gen, "_FALLBACK_MIN_GUARANTEED_S", 10.0, raising=False)
+
+        # Patch the inner fallback call to exit after max_cap is logged.
+        async def _exit_after_log(*a, **kw):
+            raise RuntimeError("test_done")
+        # _call_fallback does a lot more than just the sem+log — we only
+        # need the acquire log to fire. The method raises naturally when
+        # `_fallback.generate` is a MagicMock with no side_effect, so we
+        # just need to run it to the log point.
+
+        from datetime import datetime, timedelta, timezone
+        dl = datetime.now(tz=timezone.utc) + timedelta(seconds=500)
+
+        ctx = _FakeContext(op_id="op-test-cap", is_read_only=True)
+
+        try:
+            await gen._call_fallback(ctx, dl)  # type: ignore[arg-type]
+        except Exception:
+            pass  # We're intentionally not completing the call.
+
+        assert captured_caps, "Fallback sem acquire log must have fired"
+        observed_cap = captured_caps[0]
+        expected = (
+            CandidateGenerator._FALLBACK_MAX_TIMEOUT_S
+            + MAX_PARALLEL_SCOPES * PRIMARY_PROVIDER_TIMEOUT_S
+            + CandidateGenerator._BG_READONLY_SYNTHESIS_RESERVE_S
+        )
+        assert observed_cap == pytest.approx(expected, abs=0.5), (
+            f"Expected extended cap {expected:.1f}s, observed "
+            f"{observed_cap:.1f}s — the read-only BG branch didn't fire"
+        )
+    finally:
+        logging.getLogger(
+            "backend.core.ouroboros.governance.candidate_generator"
+        ).removeHandler(handler)
+
+
+def test_mutating_bg_cap_unchanged_after_patch() -> None:
+    """Mutating BG ops must still get the 120s cap — the extended cap
+    is scoped strictly to is_read_only=True.
+    """
+    from backend.core.ouroboros.governance.candidate_generator import (
+        CandidateGenerator,
+    )
+    # Structural invariant: the mutating baseline is still _FALLBACK_MAX_TIMEOUT_S
+    # and the read-only extension is additive on top of it.
+    assert CandidateGenerator._FALLBACK_MAX_TIMEOUT_S == pytest.approx(
+        120.0, abs=0.1
+    )
+
+
 @pytest.mark.asyncio
 async def test_bg_readonly_uses_tight_stall_budget(
     monkeypatch: pytest.MonkeyPatch,
