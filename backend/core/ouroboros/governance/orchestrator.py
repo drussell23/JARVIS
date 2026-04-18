@@ -1691,6 +1691,7 @@ class GovernedOrchestrator:
                 op_id=ctx.op_id,
                 route=getattr(ctx, "provider_route", "") or "",
                 complexity=getattr(ctx, "task_complexity", "") or "",
+                is_read_only=bool(getattr(ctx, "is_read_only", False)),
             )
         except Exception:
             logger.debug("[Orchestrator] CostGovernor.start failed", exc_info=True)
@@ -3487,6 +3488,7 @@ class GovernedOrchestrator:
                                 op_id=ctx.op_id,
                                 route="standard",
                                 complexity=getattr(ctx, "task_complexity", "") or "",
+                                is_read_only=bool(getattr(ctx, "is_read_only", False)),
                             )
                         except Exception:
                             pass
@@ -3945,22 +3947,65 @@ class GovernedOrchestrator:
                     ctx.op_id, getattr(_rec, "call_id", "?"), _exc,
                 )  # ledger failure must never abort governance pipeline
 
-        # Short-circuit: model signalled the change is already present
+        # Short-circuit: model signalled the change is already present.
+        #
+        # Read-only discipline (Session 10, Derek 2026-04-17 Manifesto §8):
+        # when ctx.is_read_only=True the noop short-circuit represents the
+        # structurally expected terminal state (findings delivered via
+        # subagent rollup, no code change by contract). Emit a POSTMORTEM
+        # event with root_cause="read_only_complete" so the Synthetic Soul
+        # has a clean audit trail and post-hoc analysis can distinguish
+        # cartography completions from "model said no-op" completions.
+        # Terminal reason code + ledger reason are aligned to the same
+        # value so log, ledger, and comm-protocol all agree.
         if generation.is_noop:
+            _is_read_only_terminal = bool(
+                getattr(ctx, "is_read_only", False)
+            )
+            _terminal_reason = (
+                "read_only_complete"
+                if _is_read_only_terminal
+                else "noop"
+            )
             logger.info(
-                "[Orchestrator] op=%s is_noop=True (provider=%s) — skipping APPLY",
+                "[Orchestrator] op=%s is_noop=True (provider=%s) "
+                "terminal_reason_code=%s — skipping APPLY",
                 ctx.op_id,
                 generation.provider_name,
+                _terminal_reason,
             )
+            # POSTMORTEM emission for read-only ops (Manifesto §8).
+            # Emitted BEFORE ctx.advance so the audit trail matches
+            # the lifecycle: GENERATE → (synthesis produced findings)
+            # → POSTMORTEM → COMPLETE. Non-read-only noop ops retain
+            # the legacy silent-complete semantics (no POSTMORTEM) to
+            # preserve backward compatibility with existing analytics
+            # that treat noop as a null event.
+            if _is_read_only_terminal:
+                try:
+                    await self._stack.comm.emit_postmortem(
+                        op_id=ctx.op_id,
+                        root_cause="read_only_complete",
+                        failed_phase=None,
+                        next_safe_action="none",
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] read-only POSTMORTEM emit failed",
+                        exc_info=True,
+                    )
             ctx = ctx.advance(
                 OperationPhase.COMPLETE,
                 generation=generation,
-                terminal_reason_code="noop",
+                terminal_reason_code=_terminal_reason,
             )
             await self._record_ledger(
                 ctx,
                 OperationState.APPLIED,
-                {"reason": "noop", "provider": generation.provider_name},
+                {
+                    "reason": _terminal_reason,
+                    "provider": generation.provider_name,
+                },
             )
             return ctx
 

@@ -165,6 +165,18 @@ class CostGovernorConfig:
     max_cap_usd: float = field(
         default_factory=lambda: _env_float("JARVIS_OP_COST_MAX_CAP_USD", 5.00)
     )
+    # Read-only multiplier (Session 10, Derek 2026-04-17). Read-only
+    # cartography ops fan out to N parallel subagents and then run a
+    # Claude synthesis over the rolled-up findings. Session 10's Trinity
+    # op: 3 subagents × 4-6 tool_calls each + ~50KB synthesis output =
+    # $0.3446 on a route[background]=0.5 * complexity[moderate]=~1.0 *
+    # headroom=3.0 * baseline=$0.10 = $0.15 cap (observed cap). 2.3×
+    # overrun. The right fix is a scoped multiplier for read-only ops
+    # rather than raising the BG route or moderate complexity factors,
+    # which would also loosen mutating-op budgets.
+    readonly_factor: float = field(
+        default_factory=lambda: _env_float("JARVIS_OP_COST_READONLY_FACTOR", 5.0)
+    )
     # Default multiplier if route/complexity key is unknown (unknown token
     # taxonomy shouldn't starve the op — default to standard/light).
     default_route_factor: float = 1.5
@@ -239,11 +251,18 @@ class CostGovernor:
     # Cap derivation
     # --------------------------------------------------------------
 
-    def _derive_cap(self, route: str, complexity: str) -> Tuple[float, float, float]:
+    def _derive_cap(
+        self, route: str, complexity: str, is_read_only: bool = False,
+    ) -> Tuple[float, float, float]:
         """Compute ``(cap_usd, route_factor, complexity_factor)`` dynamically.
 
         No hardcoded scalars — every component is either from env-resolved
         config or a documented default-factor fallback for unknown keys.
+
+        When ``is_read_only=True`` the cap is multiplied by
+        ``cfg.readonly_factor`` (default 5.0) BEFORE the min/max clamp
+        to account for subagent fan-out + Claude synthesis payload sizes.
+        Still bounded by max_cap_usd so runaway costs remain capped.
         """
         cfg = self._config
         route_key = (route or "").strip().lower() or "standard"
@@ -260,6 +279,8 @@ class CostGovernor:
             * complexity_factor
             * cfg.retry_headroom
         )
+        if is_read_only:
+            raw_cap *= cfg.readonly_factor
 
         # Clamp into [min_cap_usd, max_cap_usd]; protects against env typos.
         cap = max(cfg.min_cap_usd, min(cfg.max_cap_usd, raw_cap))
@@ -274,19 +295,28 @@ class CostGovernor:
         op_id: str,
         route: str,
         complexity: str,
+        is_read_only: bool = False,
     ) -> float:
         """Register a new op and return its dynamic cap.
 
         Idempotent: calling ``start`` twice for the same op refreshes the
         cap (in case route or complexity was updated post-CLASSIFY) but
         preserves the cumulative spend.
+
+        When ``is_read_only=True`` the cap is raised by
+        ``cfg.readonly_factor`` (default 5×) to cover subagent fan-out +
+        Claude synthesis — Session 10 (bt-2026-04-18-050658) charged
+        $0.3446 against a $0.15 cap, a clean 2.3× overrun that the new
+        multiplier absorbs.
         """
         if not self._config.enabled:
             return float("inf")
 
         self._prune_stale()
 
-        cap, route_factor, complexity_factor = self._derive_cap(route, complexity)
+        cap, route_factor, complexity_factor = self._derive_cap(
+            route, complexity, is_read_only=is_read_only,
+        )
         existing = self._entries.get(op_id)
         if existing is not None:
             existing.route = route
