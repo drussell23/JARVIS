@@ -76,6 +76,12 @@ class OperationState(Enum):
     PRE_SCORED = "pre_scored"
     VINDICATION_CHECKED = "vindication_checked"
 
+    # Phase 1 Subagents — per-dispatch record from SubagentOrchestrator.
+    # Multiple entries may share one op_id (one per subagent in a parallel
+    # fan-out), so LedgerSubagentSink supplies the subagent_id as entry_id
+    # to honor the (op_id, state, entry_id) dedup key.
+    SUBAGENT_DISPATCH = "subagent_dispatch"
+
 
 # ---------------------------------------------------------------------------
 # Data classes

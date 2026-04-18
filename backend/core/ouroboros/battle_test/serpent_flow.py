@@ -1654,6 +1654,101 @@ class SerpentFlow:
         self._close_op_block(op_id)
 
     # ══════════════════════════════════════════════════════════
+    # Phase 1 Subagent rendering — dispatch_subagent Venom tool
+    # ══════════════════════════════════════════════════════════
+
+    def op_subagent_spawn(
+        self,
+        op_id: str,
+        subagent_id: str,
+        subagent_type: str,
+        goal: str = "",
+    ) -> None:
+        """A dispatch_subagent Venom tool call spawned a subagent.
+
+        Renders a ⏺ Subagent(type) line in the op block. One line per
+        subagent — a parallel fan-out (parallel_scopes=3) produces three
+        consecutive spawn lines, each pairing with its own result line
+        when the dispatch completes.
+        """
+        short_sub = subagent_id.rsplit("::", 1)[-1] if "::" in subagent_id else subagent_id
+        goal_str = f"  [{_C['dim']}]{goal[:70]}[/{_C['dim']}]" if goal else ""
+        self._op_line(
+            op_id,
+            f"[{_C.get('neural', 'cyan')}]⏺ Subagent({subagent_type})"
+            f"[/{_C.get('neural', 'cyan')}]  "
+            f"[{_C['dim']}]{short_sub}[/{_C['dim']}]{goal_str}",
+        )
+
+    def op_subagent_result(
+        self,
+        op_id: str,
+        subagent_id: str,
+        subagent_type: str,
+        status: str = "",
+        findings_count: int = 0,
+        tool_calls: int = 0,
+        tool_diversity: int = 0,
+        cost_usd: float = 0.0,
+        duration_s: float = 0.0,
+        provider_used: str = "",
+        fallback_triggered: bool = False,
+        error_class: str = "",
+    ) -> None:
+        """A subagent dispatch completed — render the terminal line.
+
+        Shape:
+          ✓ completed  36 findings · diversity=3 · 8 tools · 12.3s · $0.0058
+          ✗ failed     SubagentTimeout: exceeded timeout=120s
+          ⚠ partial    12 findings (fallback via claude-api)
+        """
+        short_sub = subagent_id.rsplit("::", 1)[-1] if "::" in subagent_id else subagent_id
+        fallback_tag = f" [fallback→{provider_used or 'claude'}]" if fallback_triggered else ""
+
+        # Marker + color by status
+        if status == "completed":
+            marker = "✓"
+            color = _C.get("success", "green")
+            summary = (
+                f"{findings_count} finding{'s' if findings_count != 1 else ''} "
+                f"· diversity={tool_diversity} · "
+                f"{tool_calls} tool{'s' if tool_calls != 1 else ''} · "
+                f"{duration_s:.1f}s · ${cost_usd:.4f}"
+            )
+        elif status == "partial":
+            marker = "⚠"
+            color = _C.get("warn", "yellow")
+            summary = (
+                f"{findings_count} finding{'s' if findings_count != 1 else ''} "
+                f"· {duration_s:.1f}s · ${cost_usd:.4f}"
+            )
+        elif status == "diversity_rejected":
+            marker = "⊘"
+            color = _C.get("warn", "yellow")
+            summary = f"Iron Gate: tool_diversity={tool_diversity} below floor"
+        elif status == "budget_exhausted":
+            marker = "⊘"
+            color = _C.get("warn", "yellow")
+            summary = f"parent budget exhausted · {duration_s:.1f}s"
+        elif status == "cancelled":
+            marker = "⊘"
+            color = _C["dim"]
+            summary = f"cancelled · {duration_s:.1f}s"
+        else:
+            marker = "✗"
+            color = _C.get("error", "red")
+            detail = error_class or status or "failed"
+            summary = f"{detail} · {duration_s:.1f}s"
+
+        self._op_line(
+            op_id,
+            f"  [{color}]{marker}[/{color}]  "
+            f"[{_C['dim']}]{short_sub}[/{_C['dim']}]  "
+            f"[{color}]{status or 'unknown'}[/{color}]  "
+            f"[{_C['dim']}]{summary}{fallback_tag}[/{_C['dim']}]",
+        )
+
+    # ══════════════════════════════════════════════════════════
     # Organism intelligence updates
     # ══════════════════════════════════════════════════════════
 
@@ -2481,6 +2576,32 @@ class SerpentTransport:
                         reason=payload.get("route_reason", ""),
                         budget_profile=payload.get("budget_profile", ""),
                     )
+
+                # Phase 1 Subagents: dispatch_subagent Venom tool lifecycle
+                if phase == "subagent_spawn":
+                    self._flow.op_subagent_spawn(
+                        op_id=op_id,
+                        subagent_id=payload.get("subagent_id", ""),
+                        subagent_type=payload.get("subagent_type", "explore"),
+                        goal=payload.get("goal", ""),
+                    )
+                    return
+                if phase == "subagent_result":
+                    self._flow.op_subagent_result(
+                        op_id=op_id,
+                        subagent_id=payload.get("subagent_id", ""),
+                        subagent_type=payload.get("subagent_type", "explore"),
+                        status=payload.get("status", ""),
+                        findings_count=int(payload.get("findings_count", 0) or 0),
+                        tool_calls=int(payload.get("tool_calls", 0) or 0),
+                        tool_diversity=int(payload.get("tool_diversity", 0) or 0),
+                        cost_usd=float(payload.get("cost_usd", 0.0) or 0.0),
+                        duration_s=float(payload.get("duration_s", 0.0) or 0.0),
+                        provider_used=payload.get("provider_used", ""),
+                        fallback_triggered=bool(payload.get("fallback_triggered", False)),
+                        error_class=payload.get("error_class", ""),
+                    )
+                    return
 
                 # P3.1: Intent chain — full reasoning chain visibility
                 if phase == "intent_chain":

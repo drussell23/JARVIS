@@ -3329,12 +3329,17 @@ class GovernedLoopService:
                 from backend.core.ouroboros.governance.subagent_comm_sink import (
                     build_comm_sink_from_gls,
                 )
+                from backend.core.ouroboros.governance.subagent_ledger_sink import (
+                    build_ledger_sink_from_gls,
+                )
                 _sub_comm = build_comm_sink_from_gls(self)
+                _sub_ledger = build_ledger_sink_from_gls(self)
                 _sub_orch = SubagentOrchestrator(
                     explore_factory=build_default_explore_factory(
                         self._config.project_root
                     ),
                     comm=_sub_comm,
+                    ledger=_sub_ledger,
                 )
                 self._subagent_orchestrator_ref = _sub_orch
                 _backend_ref.set_subagent_orchestrator(_sub_orch)
@@ -3342,7 +3347,9 @@ class GovernedLoopService:
                     "[GLS] SubagentOrchestrator wired "
                     "(Venom dispatch_subagent — gated by "
                     "JARVIS_SUBAGENT_DISPATCH_ENABLED, default false; "
-                    "observability via CommProtocol heartbeats)"
+                    "observability via CommProtocol heartbeats + "
+                    "OperationLedger SUBAGENT_DISPATCH records; "
+                    "SerpentFlow ⏺ Subagent(explore) block rendering)"
                 )
             else:
                 logger.debug(
