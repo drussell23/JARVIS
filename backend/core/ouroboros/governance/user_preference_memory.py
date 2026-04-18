@@ -154,6 +154,7 @@ class MemoryType(str, Enum):
     PROJECT = "project"
     REFERENCE = "reference"
     FORBIDDEN_PATH = "forbidden_path"
+    FORBIDDEN_APP = "forbidden_app"  # VisionSensor denylist — bundle IDs in ``apps``
     STYLE = "style"
 
     @classmethod
@@ -187,6 +188,7 @@ class UserMemory:
     source: str = "user"                      # "user" | "postmortem:op-id" | ...
     tags: Tuple[str, ...] = ()
     paths: Tuple[str, ...] = ()               # path scope (forbidden_path uses this)
+    apps: Tuple[str, ...] = ()                # macOS bundle-id scope (forbidden_app uses this)
     created_at: str = ""                      # ISO 8601 UTC
     updated_at: str = ""                      # ISO 8601 UTC
 
@@ -197,6 +199,24 @@ class UserMemory:
         norm = rel_path.replace("\\", "/")
         for p in self.paths:
             if p and p in norm:
+                return True
+        return False
+
+    def matches_app(self, bundle_id: str) -> bool:
+        """Exact match over ``apps`` — used by FORBIDDEN_APP checks.
+
+        Bundle IDs are compared literally (not substring) because
+        ``com.apple.mail`` must not match ``com.apple.mailapp`` or
+        ``org.mozilla.thunderbird`` just because the string prefix
+        happens to align. ``apps`` entries are normalised to
+        lowercase at :meth:`UserPreferenceStore.add` time, so we
+        compare case-insensitively here.
+        """
+        if not self.apps or not bundle_id:
+            return False
+        target = bundle_id.strip().lower()
+        for a in self.apps:
+            if a and a.strip().lower() == target:
                 return True
         return False
 
@@ -212,6 +232,8 @@ class UserMemory:
             lines.append(f"tags: [{', '.join(_yaml_escape(t) for t in self.tags)}]")
         if self.paths:
             lines.append(f"paths: [{', '.join(_yaml_escape(p) for p in self.paths)}]")
+        if self.apps:
+            lines.append(f"apps: [{', '.join(_yaml_escape(a) for a in self.apps)}]")
         if self.created_at:
             lines.append(f"created_at: {self.created_at}")
         if self.updated_at:
@@ -264,6 +286,44 @@ def get_protected_path_provider() -> Optional[Callable[[], Iterable[str]]]:
 
 
 # ---------------------------------------------------------------------------
+# Global protected-app provider hook (set by UserPreferenceStore on load)
+# ---------------------------------------------------------------------------
+#
+# Parallel of the protected-path hook but for macOS bundle IDs. Consumed
+# by ``VisionSensor`` before OCR — frames from any app in this list are
+# dropped at the sensor boundary, never reaching classifier / prompt /
+# ledger. See spec §Policy Layer → User / workspace scope.
+
+
+_PROTECTED_APP_PROVIDER: Optional[Callable[[], Iterable[str]]] = None
+_PROTECTED_APP_LOCK = threading.Lock()
+
+
+def register_protected_app_provider(
+    provider: Optional[Callable[[], Iterable[str]]],
+) -> None:
+    """Install (or clear) a callable that returns extra forbidden bundle IDs.
+
+    ``VisionSensor`` calls this provider before OCR on each frame — any
+    bundle ID returned here drops the frame before OCR, in addition to
+    the hard-coded denylist (1Password / Bitwarden / Keychain /
+    Messages / Mail / Signal).
+
+    Mirrors ``register_protected_path_provider`` exactly — including the
+    soft contract that providers must be fast and must not raise.
+    """
+    global _PROTECTED_APP_PROVIDER
+    with _PROTECTED_APP_LOCK:
+        _PROTECTED_APP_PROVIDER = provider
+
+
+def get_protected_app_provider() -> Optional[Callable[[], Iterable[str]]]:
+    """Return the currently registered app provider, or None."""
+    with _PROTECTED_APP_LOCK:
+        return _PROTECTED_APP_PROVIDER
+
+
+# ---------------------------------------------------------------------------
 # UserPreferenceStore
 # ---------------------------------------------------------------------------
 
@@ -283,6 +343,10 @@ class UserPreferenceStore:
         When ``True`` (default) the store installs itself as the global
         protected-path provider for ``tool_executor``. Set to ``False``
         in tests that want to manage the hook manually.
+    auto_register_protected_apps:
+        When ``True`` (default) the store installs itself as the global
+        protected-app provider for ``VisionSensor``. Set to ``False`` in
+        tests that want to manage the hook manually.
     """
 
     def __init__(
@@ -290,15 +354,19 @@ class UserPreferenceStore:
         project_root: Path,
         *,
         auto_register_protected_paths: bool = True,
+        auto_register_protected_apps: bool = True,
     ) -> None:
         self._root = Path(project_root).resolve()
         self._dir = self._root / _MEMORY_DIR
         self._memories: Dict[str, UserMemory] = {}
         self._lock = threading.RLock()
         self._auto_register = auto_register_protected_paths
+        self._auto_register_apps = auto_register_protected_apps
         self.load()
         if auto_register_protected_paths:
             register_protected_path_provider(self._provide_protected_paths)
+        if auto_register_protected_apps:
+            register_protected_app_provider(self._provide_protected_apps)
 
     # ------------------------------------------------------------------
     # Persistence
@@ -358,12 +426,17 @@ class UserPreferenceStore:
         source: str = "user",
         tags: Sequence[str] = (),
         paths: Sequence[str] = (),
+        apps: Sequence[str] = (),
     ) -> UserMemory:
         """Create or replace a memory. Returns the persisted instance.
 
         If a memory with the same ``id`` already exists, its content is
         overwritten *in place* — this is the "upsert" behaviour the
         postmortem hooks rely on to deduplicate repeat rejections.
+
+        ``apps`` entries are normalised to lowercase so later
+        case-insensitive matching in :meth:`UserMemory.matches_app` is
+        deterministic.
         """
         if not name or not name.strip():
             raise ValueError("UserMemory name cannot be empty")
@@ -385,6 +458,9 @@ class UserPreferenceStore:
                 source=source.strip() or "user",
                 tags=tuple(t.strip() for t in tags if t and t.strip()),
                 paths=tuple(p.strip() for p in paths if p and p.strip()),
+                apps=tuple(
+                    a.strip().lower() for a in apps if a and a.strip()
+                ),
                 created_at=existing.created_at if existing else now,
                 updated_at=now,
             )
@@ -403,13 +479,13 @@ class UserPreferenceStore:
 
         Returns the updated instance or ``None`` if the id is unknown.
         Only these fields are mutable: description, content, why,
-        how_to_apply, tags, paths, source. Attempting to change ``id``,
-        ``type``, ``name``, or ``created_at`` is silently ignored — those
-        are the identity of the memory. Create a new one instead.
+        how_to_apply, tags, paths, apps, source. Attempting to change
+        ``id``, ``type``, ``name``, or ``created_at`` is silently ignored —
+        those are the identity of the memory. Create a new one instead.
         """
         _MUTABLE_FIELDS = {
             "description", "content", "why", "how_to_apply",
-            "tags", "paths", "source",
+            "tags", "paths", "apps", "source",
         }
         with self._lock:
             existing = self._memories.get(mem_id)
@@ -419,7 +495,13 @@ class UserPreferenceStore:
             for k, v in changes.items():
                 if k not in _MUTABLE_FIELDS:
                     continue
-                if k in ("tags", "paths"):
+                if k == "apps":
+                    # Same lowercase normalisation as ``add()`` so updates
+                    # cannot sneak in case-mismatched bundle IDs.
+                    filtered[k] = tuple(
+                        str(x).strip().lower() for x in (v or ()) if str(x).strip()
+                    )
+                elif k in ("tags", "paths"):
                     filtered[k] = tuple(
                         str(x).strip() for x in (v or ()) if str(x).strip()
                     )
@@ -489,6 +571,45 @@ class UserPreferenceStore:
             for m in self._memories.values():
                 if m.type is MemoryType.FORBIDDEN_PATH:
                     out.extend(m.paths)
+            return out
+
+    # ------------------------------------------------------------------
+    # Forbidden-app lookup (VisionSensor integration)
+    # ------------------------------------------------------------------
+
+    def find_forbidden_for_app(self, bundle_id: str) -> List[UserMemory]:
+        """Return FORBIDDEN_APP memories whose ``apps`` match ``bundle_id``.
+
+        Exact (case-insensitive) match — ``com.apple.mail`` does not
+        trigger ``com.apple.mailapp`` and vice versa. See
+        :meth:`UserMemory.matches_app`.
+        """
+        with self._lock:
+            return [
+                m
+                for m in self._memories.values()
+                if m.type is MemoryType.FORBIDDEN_APP and m.matches_app(bundle_id)
+            ]
+
+    def is_forbidden_app(self, bundle_id: str) -> bool:
+        """Return ``True`` iff any FORBIDDEN_APP memory matches ``bundle_id``.
+
+        Fast predicate used by ``VisionSensor`` in the frame-ingress path.
+        """
+        return bool(self.find_forbidden_for_app(bundle_id))
+
+    def _provide_protected_apps(self) -> List[str]:
+        """Callback for the VisionSensor hook — returns bundle-id list.
+
+        Flat union of every FORBIDDEN_APP memory's ``apps`` tuple.
+        Duplicates are allowed; the sensor compares element-wise with
+        :meth:`UserMemory.matches_app` semantics, not substring.
+        """
+        with self._lock:
+            out: List[str] = []
+            for m in self._memories.values():
+                if m.type is MemoryType.FORBIDDEN_APP:
+                    out.extend(m.apps)
             return out
 
     # ------------------------------------------------------------------
