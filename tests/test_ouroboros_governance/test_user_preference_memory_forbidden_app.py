@@ -104,6 +104,7 @@ def test_user_memory_apps_defaults_empty():
         type=MemoryType.FORBIDDEN_APP,
         name="x",
         description="y",
+        content="",
     )
     assert m.apps == ()
 
@@ -114,6 +115,7 @@ def test_user_memory_matches_app_exact_bundle_id():
         type=MemoryType.FORBIDDEN_APP,
         name="no_1password",
         description="no 1password",
+        content="",
         apps=("com.1password.mac",),
     )
     assert m.matches_app("com.1password.mac") is True
@@ -130,6 +132,7 @@ def test_user_memory_matches_app_rejects_substring_overlap():
         type=MemoryType.FORBIDDEN_APP,
         name="no_mail",
         description="no mail",
+        content="",
         apps=("com.apple.mail",),
     )
     assert m.matches_app("com.apple.mailapp") is False
@@ -138,7 +141,13 @@ def test_user_memory_matches_app_rejects_substring_overlap():
 
 
 def test_user_memory_matches_app_returns_false_when_apps_empty():
-    m = UserMemory(id="t1", type=MemoryType.USER, name="x", description="y")
+    m = UserMemory(
+        id="t1",
+        type=MemoryType.USER,
+        name="x",
+        description="y",
+        content="",
+    )
     assert m.matches_app("com.anything") is False
 
 
@@ -365,8 +374,13 @@ def test_auto_register_app_provider_wires_global_hook(store):
     # store fixture passes auto_register_protected_apps=True
     hook = get_protected_app_provider()
     assert hook is not None
-    # Hook is the store's callback
-    assert hook is store._provide_protected_apps
+    # Bound-method equality (not identity — each attribute access produces
+    # a fresh bound-method object, so ``is`` fails even when the underlying
+    # function is the same).
+    assert hook == store._provide_protected_apps
+    # Invoking the hook returns an iterable of strings, same as the
+    # protected-path provider contract.
+    assert isinstance(list(hook()), list)
 
 
 def test_isolated_store_does_not_register_global_hook(isolated_store):
