@@ -3311,10 +3311,12 @@ class GovernedLoopService:
         # reference is safe — the tool backend handler returns EXEC_ERROR with
         # a clear message when dispatch_subagent is called without wiring.
         #
-        # Default CommSink / LedgerSink are the logger + in-memory defaults
-        # from subagent_orchestrator.py; Step 4a/4b will swap in real
-        # CommProtocol-backed and OperationLedger-backed sinks. Those are
-        # purely observability upgrades — they do not change dispatch behavior.
+        # Step 5 observability: CommProtocolCommSink routes subagent spawn /
+        # result events through the same CommProtocol heartbeat channel that
+        # carries INTENT / PLAN / HEARTBEAT / DECISION / POSTMORTEM. Sink
+        # resolves the live CommProtocol via late-bound lookup — if the
+        # governance stack isn't yet constructed (or comm is None), the sink
+        # silently no-ops rather than breaking dispatch.
         try:
             _backend_ref = getattr(self, "_tool_backend", None)
             if _backend_ref is not None and hasattr(_backend_ref, "set_subagent_orchestrator"):
@@ -3324,17 +3326,23 @@ class GovernedLoopService:
                 from backend.core.ouroboros.governance.agentic_subagent import (
                     build_default_explore_factory,
                 )
+                from backend.core.ouroboros.governance.subagent_comm_sink import (
+                    build_comm_sink_from_gls,
+                )
+                _sub_comm = build_comm_sink_from_gls(self)
                 _sub_orch = SubagentOrchestrator(
                     explore_factory=build_default_explore_factory(
                         self._config.project_root
                     ),
+                    comm=_sub_comm,
                 )
                 self._subagent_orchestrator_ref = _sub_orch
                 _backend_ref.set_subagent_orchestrator(_sub_orch)
                 logger.info(
                     "[GLS] SubagentOrchestrator wired "
                     "(Venom dispatch_subagent — gated by "
-                    "JARVIS_SUBAGENT_DISPATCH_ENABLED, default false)"
+                    "JARVIS_SUBAGENT_DISPATCH_ENABLED, default false; "
+                    "observability via CommProtocol heartbeats)"
                 )
             else:
                 logger.debug(
