@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -69,20 +70,61 @@ _READ_ONLY_POSITIVE: Tuple[str, ...] = (
     "do not write any source files",
 )
 
+# Mutation verbs — matched as **whole words** (word-boundary regex below).
+# Substring-match was used in v1 but tripped on compound words — "dispatch"
+# contains "patch", "implementation" contains "implement", etc. — so the
+# Trinity cartography task was mis-classified as mutating in the first
+# Session-3 run (debug.log bt-2026-04-18-032138).
 _READ_ONLY_NEGATIVE: Tuple[str, ...] = (
     "refactor",
+    "refactors",
+    "refactoring",
     "rewrite",
-    "implement ",
-    "fix ",
-    "patch ",
-    "rename ",
-    "replace ",
+    "rewrites",
+    "rewriting",
+    "implement",
+    "implements",
+    "implementing",
+    "fix",
+    "fixes",
+    "fixing",
+    "patch",
+    "patches",
+    "patching",
+    "rename",
+    "renames",
+    "renaming",
+    "replace",
+    "replaces",
+    "replacing",
+    "remove",
+    "removes",
+    "removing",
+    "delete",
+    "deletes",
+    "deleting",
+    "migrate",
+    "migrates",
+    "migrating",
+    "upgrade",
+    "upgrades",
+    "upgrading",
+    # Two-word phrases kept as substring checks below — they can't
+    # collide with compound words the way single verbs can.
+)
+
+_READ_ONLY_NEGATIVE_PHRASES: Tuple[str, ...] = (
     "add a ",
     "add new ",
-    "remove ",
-    "delete ",
-    "migrate ",
-    "upgrade ",
+    "add an ",
+)
+
+# Pre-compile one alternation regex with word boundaries on both sides.
+# \b treats "-" as a word boundary in Python re, which is what we want
+# for hyphenated verbs like "re-write" if they ever appear.
+_READ_ONLY_NEGATIVE_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _READ_ONLY_NEGATIVE) + r")\b",
+    re.IGNORECASE,
 )
 
 
@@ -90,16 +132,22 @@ def infer_read_only_intent(description: str) -> bool:
     """Return True iff *description* strongly signals a non-mutating op.
 
     Deterministic keyword scan, no LLM call. Conservative: requires at
-    least one positive signal AND no mutation verbs. False negatives are
-    acceptable (the op proceeds through normal risk gating); false
-    positives would reach APPLY and be short-circuited by the orchestrator.
+    least one positive signal AND no mutation verbs. Mutation verbs are
+    matched as **whole words** so "dispatch" / "implementation" / "fixed"
+    don't collide with "patch" / "implement" / "fix". False negatives
+    remain acceptable (the op proceeds through normal risk gating);
+    false positives are structurally clamped — the orchestrator's APPLY
+    short-circuit and the policy engine's Rule 0d refuse mutations even
+    if a mutating op slipped the classifier.
     """
     if not description:
         return False
     norm = description.lower()
     if not any(kw in norm for kw in _READ_ONLY_POSITIVE):
         return False
-    if any(kw in norm for kw in _READ_ONLY_NEGATIVE):
+    if _READ_ONLY_NEGATIVE_RE.search(norm):
+        return False
+    if any(phrase in norm for phrase in _READ_ONLY_NEGATIVE_PHRASES):
         return False
     return True
 

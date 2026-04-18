@@ -57,6 +57,16 @@ READ_ONLY_DESCRIPTIONS: Tuple[str, ...] = (
     "Build a gap analysis covering every subsystem boundary.",
     "Pure-exploration discovery across three distinct subsystems.",
     "Call graph survey — no code changes, documentation output only.",
+    # ---- Regression: word-boundary collision cases -------------------
+    # These tripped substring-match in the first Session-3 run
+    # (bt-2026-04-18-032138) — "dispatch" contains "patch",
+    # "implementation" contains "implement", "fixed" contains "fix".
+    # The fix switched mutation-verb matching to \b word boundaries.
+    "Read-only analysis. Dispatch parallel exploration subagents for "
+    "cartography across three scopes.",
+    "Cartography of the implementation surface — documentation only, "
+    "do not mutate any code.",
+    "Read-only gap analysis. No changes required to the fixed contract.",
 )
 
 MUTATING_DESCRIPTIONS: Tuple[str, ...] = (
@@ -66,6 +76,10 @@ MUTATING_DESCRIPTIONS: Tuple[str, ...] = (
     "Add new BackgroundAgentPool knob for per-route concurrency.",
     "Rewrite the auto_committer to use signed commits.",
     "Remove the dead code path in orchestrator.py:4815.",
+    # ---- Word-boundary correctness: these remain blocked even though
+    #      the surrounding text contains read-only-looking words.
+    "Read-only audit of X. Then refactor the dispatcher.",
+    "Cartography first, then fix the flake.",
 )
 
 AMBIGUOUS_DESCRIPTIONS: Tuple[str, ...] = (
