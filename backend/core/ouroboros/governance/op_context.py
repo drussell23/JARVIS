@@ -635,6 +635,15 @@ class OperationContext:
     # ---- Reasoning chain result (stamped at CLASSIFY if chain is active) ----
     reasoning_chain_result: Optional[Dict[str, Any]] = None
 
+    # ---- Read-only intent (stamped pre-CLASSIFY by orchestrator) ----
+    # When True, the op is a cartography/analysis task — no mutating tool
+    # calls permitted and the APPLY phase is short-circuited. The flag is
+    # trusted by OperationAdvisor to bypass blast_radius + test_coverage
+    # blocks ONLY because tool_executor + orchestrator jointly enforce the
+    # no-mutation contract (Manifesto §1 Boundary Principle: friction at
+    # a threshold rests on deterministic enforcement, not a label).
+    is_read_only: bool = False
+
     # ------------------------------------------------------------------
     # Post-init
     # ------------------------------------------------------------------
@@ -669,6 +678,7 @@ class OperationContext:
         correlation_id: str = "",
         signal_urgency: str = "",
         signal_source: str = "",
+        is_read_only: bool = False,
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
 
@@ -747,6 +757,7 @@ class OperationContext:
             "task_complexity": "",
             "provider_route": "",
             "provider_route_reason": "",
+            "is_read_only": is_read_only,
         }
         context_hash = _compute_hash(fields_for_hash)
 
@@ -787,6 +798,7 @@ class OperationContext:
             frozen_autonomy_tier="governed",
             signal_urgency=signal_urgency,
             signal_source=signal_source,
+            is_read_only=is_read_only,
         )
 
     # ------------------------------------------------------------------
@@ -1070,6 +1082,24 @@ class OperationContext:
         intermediate = dataclasses.replace(
             self,
             human_instructions=instructions,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_read_only_intent(self, is_read_only: bool) -> "OperationContext":
+        """Stamp the read-only intent flag onto the context (no phase change).
+
+        Called pre-CLASSIFY by the orchestrator after deterministic intent
+        inference. Downstream consumers trust the flag because tool_executor
+        + orchestrator jointly enforce the no-mutation contract — the flag
+        is not advisory metadata, it is part of the hash-chained state.
+        """
+        intermediate = dataclasses.replace(
+            self,
+            is_read_only=is_read_only,
             previous_hash=self.context_hash,
             context_hash="",
         )

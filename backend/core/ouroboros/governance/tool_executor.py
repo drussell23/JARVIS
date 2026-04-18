@@ -118,6 +118,13 @@ class PolicyContext:
     call_id:     str   # "{op_id}:r{round_index}:{tool_name}"
     round_index: int
     risk_tier:   Optional[Any] = None  # Optional[RiskTier] — gated import to avoid circular
+    # Read-only intent from OperationContext.is_read_only — when True the
+    # policy engine denies every tool in scoped_tool_access._MUTATION_TOOLS
+    # (edit_file/write_file/delete_file/bash/apply_patch). This is the
+    # cryptographic half of the Advisor's blast_radius/coverage bypass:
+    # the Advisor trusts the flag because the policy engine refuses to
+    # let mutations happen under it.
+    is_read_only: bool = False
 
 @dataclass(frozen=True)
 class TestFailure:
@@ -1854,6 +1861,39 @@ class GoverningToolPolicy:
                 ),
             )
 
+        # Rule 0d: read-only operation lock — when ctx.is_read_only is True,
+        # every tool whose manifest declares a "write" capability (or is in
+        # the shared scoped_tool_access._MUTATION_TOOLS set) is refused at
+        # policy time. This is the cryptographic enforcement the Advisor's
+        # blast_radius + coverage bypass rests on: the Advisor says "blast
+        # radius is irrelevant because no mutation can happen"; this rule
+        # mathematically guarantees exactly that.
+        if ctx.is_read_only:
+            try:
+                from backend.core.ouroboros.governance.scoped_tool_access import (
+                    _MUTATION_TOOLS,
+                )
+            except Exception:
+                _MUTATION_TOOLS = frozenset({
+                    "edit_file", "write_file", "delete_file",
+                    "bash", "apply_patch",
+                })
+            manifest = _L1_MANIFESTS.get(name)
+            has_write_cap = bool(
+                manifest and "write" in manifest.capabilities
+            )
+            if name in _MUTATION_TOOLS or has_write_cap:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.read_only_operation",
+                    detail=(
+                        f"Tool {name!r} refused: op is marked is_read_only. "
+                        "No mutation tool may execute under the read-only "
+                        "contract (Advisor blast/coverage bypass rests on "
+                        "this guarantee)."
+                    ),
+                )
+
         # Rule 1: read_file — path must be within repo_root
         if name == "read_file":
             path_arg = call.arguments.get("path", "")
@@ -3372,6 +3412,7 @@ class ToolLoopCoordinator:
         op_id: str,
         deadline: float,
         risk_tier: Optional[Any] = None,  # Optional[RiskTier] for ask_human gating
+        is_read_only: bool = False,  # forwarded from ctx.is_read_only — gates mutation tools
     ) -> Tuple[str, List[ToolExecutionRecord]]:
         """Multi-turn tool loop with parallel execution support.
 
@@ -3563,7 +3604,7 @@ class ToolLoopCoordinator:
 
                 policy_ctx = PolicyContext(repo=repo, repo_root=repo_root,
                     op_id=op_id, call_id=call_id, round_index=round_index,
-                    risk_tier=risk_tier)
+                    risk_tier=risk_tier, is_read_only=is_read_only)
                 policy_result = self._policy.evaluate(tc, policy_ctx)
 
                 if policy_result.decision == PolicyDecision.DENY:

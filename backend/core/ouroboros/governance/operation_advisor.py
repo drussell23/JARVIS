@@ -36,6 +36,74 @@ _BLAST_RADIUS_WARN = int(os.environ.get("JARVIS_ADVISOR_BLAST_RADIUS_WARN", "10"
 _FAILURE_STREAK_WARN = int(os.environ.get("JARVIS_ADVISOR_FAILURE_STREAK_WARN", "3"))
 
 
+# ---------------------------------------------------------------------------
+# Read-only intent inference (deterministic keyword scan)
+# ---------------------------------------------------------------------------
+#
+# The orchestrator calls infer_read_only_intent() BEFORE the Advisor so the
+# flag can be stamped onto the OperationContext hash chain. The Advisor then
+# trusts the flag — not because of the keywords, but because tool_executor
+# + orchestrator jointly refuse any mutating tool call / APPLY transition
+# whenever ctx.is_read_only is True. The keywords are a soft trigger; the
+# enforcement is the mathematical guarantee.
+
+_READ_ONLY_POSITIVE: Tuple[str, ...] = (
+    "read-only",
+    "read only",
+    "readonly",
+    "do not mutate",
+    "do not write",
+    "do not modify",
+    "do not change",
+    "cartography",
+    "architectural mapping",
+    "call graph",
+    "gap analysis",
+    "coupling map",
+    "pure-exploration",
+    "pure exploration",
+    "exploration-only",
+    "survey",
+    "audit",
+    "do not run any tests",
+    "do not write any source files",
+)
+
+_READ_ONLY_NEGATIVE: Tuple[str, ...] = (
+    "refactor",
+    "rewrite",
+    "implement ",
+    "fix ",
+    "patch ",
+    "rename ",
+    "replace ",
+    "add a ",
+    "add new ",
+    "remove ",
+    "delete ",
+    "migrate ",
+    "upgrade ",
+)
+
+
+def infer_read_only_intent(description: str) -> bool:
+    """Return True iff *description* strongly signals a non-mutating op.
+
+    Deterministic keyword scan, no LLM call. Conservative: requires at
+    least one positive signal AND no mutation verbs. False negatives are
+    acceptable (the op proceeds through normal risk gating); false
+    positives would reach APPLY and be short-circuited by the orchestrator.
+    """
+    if not description:
+        return False
+    norm = description.lower()
+    if not any(kw in norm for kw in _READ_ONLY_POSITIVE):
+        return False
+    if any(kw in norm for kw in _READ_ONLY_NEGATIVE):
+        return False
+    return True
+
+
 class AdvisoryDecision(str, Enum):
     RECOMMEND = "recommend"            # Proceed normally
     CAUTION = "caution"                # Proceed but inject warnings into prompt
@@ -75,8 +143,18 @@ class OperationAdvisor:
         target_files: Tuple[str, ...],
         description: str,
         op_id: str = "",
+        is_read_only: bool = False,
     ) -> Advisory:
-        """Evaluate an operation and return advisory judgment."""
+        """Evaluate an operation and return advisory judgment.
+
+        When ``is_read_only`` is True the Advisor skips blast_radius and
+        test_coverage signals — the downstream contract is that tool_executor
+        will refuse every mutating tool call and the orchestrator will
+        refuse the APPLY transition, so those two signals are mathematically
+        unreachable. Stale-file, large-file, time-of-day, and chronic-entropy
+        signals still apply because they speak to generation quality, not
+        blast radius.
+        """
         if not _ENABLED:
             return Advisory(
                 decision=AdvisoryDecision.RECOMMEND,
@@ -88,16 +166,20 @@ class OperationAdvisor:
         risk_factors: List[float] = []
 
         # Signal 1: Blast radius (how many files import the targets)
+        # Always computed for observability — surfaced as a reason only
+        # for mutating ops.
         blast_radius = self._compute_blast_radius(target_files)
-        if blast_radius >= _BLAST_RADIUS_WARN:
+        if not is_read_only and blast_radius >= _BLAST_RADIUS_WARN:
             reasons.append(
                 f"High blast radius: {blast_radius} files import these targets"
             )
             risk_factors.append(min(1.0, blast_radius / 30))
 
         # Signal 2: Test coverage
+        # Same bypass logic — read-only ops don't execute mutations, so
+        # coverage of the targets is structurally irrelevant.
         test_coverage = self._compute_test_coverage(target_files)
-        if test_coverage < 0.5:
+        if not is_read_only and test_coverage < 0.5:
             reasons.append(
                 f"Low test coverage: {test_coverage:.0%} of targets have tests"
             )
@@ -147,10 +229,23 @@ class OperationAdvisor:
         else:
             decision = AdvisoryDecision.RECOMMEND
 
-        # Special case: block if touching LOCKED trust tier with no tests
-        if test_coverage == 0 and blast_radius >= 20:
+        # Special case: block if touching LOCKED trust tier with no tests.
+        # Read-only ops bypass this block because the no-mutation contract
+        # makes blast radius and coverage unreachable — enforced downstream
+        # by tool_executor (mutating tools refused) and orchestrator (APPLY
+        # phase short-circuited to COMPLETE).
+        if not is_read_only and test_coverage == 0 and blast_radius >= 20:
             decision = AdvisoryDecision.BLOCK
             reasons.append("BLOCKED: Zero test coverage + extreme blast radius")
+
+        # Observability: surface the bypass as a positive reason so the
+        # log line and prompt-context both show WHY a high-blast op passed.
+        if is_read_only:
+            reasons.insert(
+                0,
+                f"Read-only op: blast_radius={blast_radius}, "
+                f"coverage={test_coverage:.0%} bypassed (no-mutation contract)",
+            )
 
         # Build voice message
         voice = self._build_voice_message(decision, reasons, target_files)
@@ -166,11 +261,11 @@ class OperationAdvisor:
         )
 
         logger.info(
-            "[Advisor] %s (risk=%.2f, blast=%d, coverage=%.0f%%, entropy=%.0f%%) "
-            "reasons=%d op=%s",
+            "[Advisor] %s (risk=%.2f, blast=%d, coverage=%.0f%%, entropy=%.0f%%, "
+            "read_only=%s) reasons=%d op=%s",
             decision.value, risk_score, blast_radius,
             test_coverage * 100, chronic_entropy * 100,
-            len(reasons), op_id,
+            is_read_only, len(reasons), op_id,
         )
 
         return advisory

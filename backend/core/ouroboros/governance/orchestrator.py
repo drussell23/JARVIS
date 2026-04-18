@@ -923,10 +923,28 @@ class GovernedOrchestrator:
         _advisory = None
         try:
             from backend.core.ouroboros.governance.operation_advisor import (
-                OperationAdvisor, AdvisoryDecision,
+                OperationAdvisor, AdvisoryDecision, infer_read_only_intent,
             )
+            # Stamp read-only intent onto the hash-chained context BEFORE
+            # advising. The Advisor's bypass of blast_radius + test_coverage
+            # is mathematically safe only because ctx.is_read_only is
+            # enforced downstream by tool_executor (mutating tools refused)
+            # and the orchestrator's APPLY short-circuit.
+            if not ctx.is_read_only:
+                _inferred_ro = infer_read_only_intent(ctx.description)
+                if _inferred_ro:
+                    ctx = ctx.with_read_only_intent(True)
+                    logger.info(
+                        "[Orchestrator] Read-only intent inferred op=%s "
+                        "— Advisor blast/coverage bypass active; tool_executor "
+                        "will refuse mutations; APPLY phase will short-circuit",
+                        ctx.op_id,
+                    )
             _advisor = OperationAdvisor(self._config.project_root)
-            _advisory = _advisor.advise(ctx.target_files, ctx.description, ctx.op_id)
+            _advisory = _advisor.advise(
+                ctx.target_files, ctx.description, ctx.op_id,
+                is_read_only=ctx.is_read_only,
+            )
 
             if _advisory.decision == AdvisoryDecision.BLOCK:
                 logger.warning(
@@ -4615,6 +4633,40 @@ class GovernedOrchestrator:
             pass  # entropy_calculator not available — degrade gracefully
         except Exception:
             logger.debug("[Orchestrator] Entropy computation failed", exc_info=True)
+
+        # Read-only APPLY short-circuit (Manifesto §1 Boundary Principle).
+        # When ctx.is_read_only is True the op is a cartography/analysis task
+        # — the model's tool-round findings (including any dispatch_subagent
+        # rollups) are the deliverable. GATE/APPLY/VERIFY have no semantic
+        # meaning because nothing is being written. Skip straight to COMPLETE
+        # with a structural terminal reason. This is the second half of the
+        # cryptographic guarantee the Advisor's blast/coverage bypass rests
+        # on: tool_executor refuses mutating tool calls, the orchestrator
+        # refuses the APPLY transition.
+        if ctx.is_read_only:
+            logger.info(
+                "[Orchestrator] Read-only APPLY short-circuit op=%s — "
+                "skipping GATE/APPLY/VERIFY (no-mutation contract). "
+                "Findings are delivered via POSTMORTEM + ledger.",
+                ctx.op_id,
+            )
+            try:
+                await self._stack.comm.emit_decision(
+                    op_id=ctx.op_id,
+                    outcome="read_only_complete",
+                    reason_code="read_only_complete",
+                    diff_summary="",
+                )
+            except Exception:
+                pass
+            ctx = ctx.advance(
+                OperationPhase.COMPLETE,
+                terminal_reason_code="read_only_complete",
+                validation=best_validation,
+            )
+            if _serpent:
+                await _serpent.stop(success=True)
+            return ctx
 
         # Store compact validation result in context; full output is in ledger
         ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)

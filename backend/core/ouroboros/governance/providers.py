@@ -3487,6 +3487,7 @@ class PrimeProvider:
                 op_id=getattr(context, "op_id", ""),
                 deadline=deadline_mono,
                 risk_tier=getattr(context, "risk_tier", None),
+                is_read_only=bool(getattr(context, "is_read_only", False)),
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
@@ -5386,6 +5387,7 @@ class ClaudeProvider:
                 op_id=getattr(context, "op_id", ""),
                 deadline=deadline_mono,
                 risk_tier=getattr(context, "risk_tier", None),
+                is_read_only=bool(getattr(context, "is_read_only", False)),
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)

@@ -1117,6 +1117,7 @@ class DoublewordProvider:
                 op_id=getattr(context, "operation_id", f"dw-rt-{int(time.time())}"),
                 deadline=deadline_mono,
                 risk_tier=getattr(context, "risk_tier", None),
+                is_read_only=bool(getattr(context, "is_read_only", False)),
             )
             tool_records = tuple(tool_records_list)
             # Venom mutation audit — captured from per-op ToolExecutor at
