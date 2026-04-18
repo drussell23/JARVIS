@@ -3409,27 +3409,45 @@ class SerpentREPL:
         """Run the mutation tester against a source file.
 
         Usage:
-          /mutation <src>                   — auto-discover tests/test_<stem>.py
-          /mutation <src> -- <test> [...]   — explicit test paths
+          /mutation <src>                          — auto-discover tests/test_<stem>.py
+          /mutation <src> -- <test> [...]          — explicit test paths
+          /mutation --survivors-only <src> [...]   — survivors-only report + telemetry
 
         The mutation tester writes AST-mutated variants of <src>, re-runs
         the provided test suite against each, and reports how many
         mutants were caught. A high score means the tests exercise
         behavior; a low score means the tests are performative.
 
-        This is an operator-only meta-test — it is NEVER called from the
-        pipeline (cost ≈ N × 30s) and NEVER overrides governance.
+        ``--survivors-only`` mode emits a structured operator-terminal
+        line per survivor (one log event per mutant that bypassed the
+        test suite) so downstream telemetry can route critical-path
+        bypasses without drowning operators in coverage summaries.
+
+        Operator-only by default — the matching APPLY-phase enforcement
+        lives in ``mutation_gate.py`` and fires only on allowlisted
+        critical paths with ``JARVIS_MUTATION_GATE_ENABLED=1``.
         """
         parts = line.replace("/mutation", "mutation", 1).split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
             self._flow.console.print(
-                f"  [{_C['dim']}]Usage: /mutation <src> [-- <test_file> ...][/{_C['dim']}]\n"
+                f"  [{_C['dim']}]Usage: /mutation [--survivors-only] "
+                f"<src> [-- <test_file> ...][/{_C['dim']}]\n"
                 f"  [{_C['dim']}]Example: /mutation backend/core/ouroboros/governance/"
                 f"intake/sensors/test_failure_sensor.py[/{_C['dim']}]",
                 highlight=False,
             )
             return
         arg = parts[1].strip()
+        survivors_only = False
+        if arg.startswith("--survivors-only"):
+            survivors_only = True
+            arg = arg[len("--survivors-only"):].strip()
+        if not arg:
+            self._flow.console.print(
+                f"  [{_C['dim']}]--survivors-only requires a source path[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
         # Split on ' -- ' sentinel for explicit test paths.
         if " -- " in arg:
             src_str, tests_str = arg.split(" -- ", 1)
@@ -3478,11 +3496,62 @@ class SerpentREPL:
                 src_path, test_files=test_paths,
             ),
         )
-        report = render_console_report(result)
         self._flow.console.print()
-        for line_out in report.splitlines():
-            self._flow.console.print(line_out, highlight=False)
+        if survivors_only:
+            self._emit_survivors_report(result)
+        else:
+            report = render_console_report(result)
+            for line_out in report.splitlines():
+                self._flow.console.print(line_out, highlight=False)
         self._flow.console.print()
+
+    def _emit_survivors_report(self, result) -> None:
+        """Print + log one line per survivor for operator-terminal telemetry.
+
+        Each line is a stable key=value INFO log record so the operator
+        TUI, downstream log scrapers, and any future telemetry bus can
+        all consume the same wire format. On a zero-survivor run we
+        still emit a single clean marker so silence isn't mistaken for
+        a tool failure.
+        """
+        import logging as _logging
+        tel_logger = _logging.getLogger("Ouroboros.MutationTelemetry")
+        f = self._flow
+        f.console.print(
+            f"  [{_C['neural']}]Mutation survivors[/{_C['neural']}] — "
+            f"score={result.score:.1%} grade={result.grade} "
+            f"caught={result.caught}/{result.total_mutants} "
+            f"(survivors={len(result.survivors)})",
+            highlight=False,
+        )
+        if not result.survivors:
+            f.console.print(
+                f"  [{_C['life']}]No survivors — tests caught every mutant.[/{_C['life']}]",
+                highlight=False,
+            )
+            tel_logger.info(
+                "[MutationTelemetry] file=%s survivors=0 score=%.4f grade=%s",
+                result.source_file, result.score, result.grade,
+            )
+            return
+        for s in result.survivors:
+            m = s.mutant
+            # Terminal line — highlights the bypass for the operator.
+            f.console.print(
+                f"  [{_C['death']}]SURVIVED[/{_C['death']}] "
+                f"{m.source_file}:{m.line}  {m.op:<14} "
+                f"{m.original[:24]} -> {m.mutated[:24]}",
+                highlight=False,
+            )
+            # Structured log — single-line, grep-friendly, includes op
+            # type so downstream filters can isolate (e.g.) all
+            # bool_flip survivors across the repo.
+            tel_logger.info(
+                "[MutationTelemetry] file=%s line=%d col=%d op=%s "
+                "original=%r mutated=%r reason=%s",
+                m.source_file, m.line, m.col, m.op,
+                m.original, m.mutated, s.reason,
+            )
 
     @staticmethod
     def _discover_tests_for(src_path: Path) -> List[Path]:

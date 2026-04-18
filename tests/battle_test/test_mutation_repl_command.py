@@ -151,3 +151,103 @@ def test_help_mentions_mutation_command():
     # Help entry line exists.
     assert "/mutation <src>" in src
     assert "meta-test" in src.lower()
+
+
+@pytest.mark.asyncio
+async def test_survivors_only_renders_each_survivor_once(tmp_path, monkeypatch, caplog):
+    """`/mutation --survivors-only` must emit one printed line + one
+    structured log record per survivor. Zero-survivor runs emit a
+    single 'all caught' marker."""
+    monkeypatch.chdir(tmp_path)
+    src = tmp_path / "sut.py"
+    tst = tmp_path / "test_sut.py"
+    src.write_text("def f(x): return x + 1\n")
+    tst.write_text("def test_pass(): assert True\n")
+
+    from backend.core.ouroboros.governance.mutation_tester import (
+        Mutant, MutantOutcome, MutationResult,
+    )
+    fake_mut = Mutant(
+        op="bool_flip", source_file="sut.py",
+        line=42, col=8, original="True", mutated="False",
+        patched_src="",
+    )
+    fake_out = MutantOutcome(
+        mutant=fake_mut, caught=False,
+        reason="survived", duration_s=0.1,
+    )
+    fake_result = MutationResult(
+        source_file="sut.py",
+        total_mutants=5, caught=4, survived=1,
+        score=0.80, grade="B",
+        survivors=(fake_out,),
+    )
+    repl, flow = _mk_cli(tmp_path)
+    printed = []
+    flow.console.print = lambda *args, **kwargs: printed.append(
+        " ".join(str(a) for a in args)
+    )
+    with patch(
+        "backend.core.ouroboros.governance.mutation_tester.run_mutation_test",
+        return_value=fake_result,
+    ):
+        with caplog.at_level("INFO", logger="Ouroboros.MutationTelemetry"):
+            await repl._handle_mutation(
+                "/mutation --survivors-only sut.py -- test_sut.py"
+            )
+    combined = "\n".join(printed)
+    assert "SURVIVED" in combined
+    assert "bool_flip" in combined
+    # Structured telemetry: one INFO record carrying all the fields a
+    # downstream consumer needs to route the bypass.
+    tel_records = [
+        r for r in caplog.records
+        if r.name == "Ouroboros.MutationTelemetry"
+    ]
+    assert len(tel_records) == 1
+    msg = tel_records[0].getMessage()
+    assert "line=42" in msg
+    assert "op=bool_flip" in msg
+    assert "'True'" in msg
+
+
+@pytest.mark.asyncio
+async def test_survivors_only_emits_clean_marker_when_no_survivors(
+    tmp_path, monkeypatch, caplog,
+):
+    monkeypatch.chdir(tmp_path)
+    src = tmp_path / "sut.py"
+    tst = tmp_path / "test_sut.py"
+    src.write_text("def f(): return 1\n")
+    tst.write_text("def test_x(): assert True\n")
+
+    from backend.core.ouroboros.governance.mutation_tester import (
+        MutationResult,
+    )
+    clean_result = MutationResult(
+        source_file="sut.py",
+        total_mutants=3, caught=3, survived=0,
+        score=1.0, grade="A",
+        survivors=(),
+    )
+    repl, flow = _mk_cli(tmp_path)
+    printed = []
+    flow.console.print = lambda *args, **kwargs: printed.append(
+        " ".join(str(a) for a in args)
+    )
+    with patch(
+        "backend.core.ouroboros.governance.mutation_tester.run_mutation_test",
+        return_value=clean_result,
+    ):
+        with caplog.at_level("INFO", logger="Ouroboros.MutationTelemetry"):
+            await repl._handle_mutation(
+                "/mutation --survivors-only sut.py -- test_sut.py"
+            )
+    combined = "\n".join(printed)
+    assert "No survivors" in combined
+    tel_records = [
+        r for r in caplog.records
+        if r.name == "Ouroboros.MutationTelemetry"
+    ]
+    assert len(tel_records) == 1
+    assert "survivors=0" in tel_records[0].getMessage()
