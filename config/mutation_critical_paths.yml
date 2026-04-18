@@ -1,0 +1,36 @@
+# Mutation-gate critical-paths allowlist (YAML).
+#
+# Consumed by backend/core/ouroboros/governance/mutation_gate.py when
+# JARVIS_MUTATION_GATE_ENABLED=1. Entries are combined with (and
+# deduplicated against) JARVIS_MUTATION_GATE_CRITICAL_PATHS.
+#
+# Matching semantics (see mutation_gate.is_path_critical):
+#   - Exact match on the whole relative path.
+#   - Prefix match at path-component boundaries:
+#       "backend/core/" matches "backend/core/foo.py" but NOT
+#       "backend/core_test/foo.py".
+#
+# Admission criteria (Manifesto §6 — only gate what deserves gating):
+#   1. File has been touched by the autonomous loop at least once and
+#      lives in a governance-critical subtree (intake, orchestrator,
+#      risk, change-engine, tool-executor).
+#   2. Test coverage exists. Adding a gate-only entry without tests
+#      is a no-op — the tester has no way to score the candidate.
+#   3. Blast radius of a bad APPLY here is high enough that the
+#      ~100-140s cold-cache cost is justified over waiting for a
+#      postmortem.
+#
+# Entries NOT to add:
+#   - Brand-new modules with <20 hours of operator exposure.
+#   - Test-only code (self-referential mutation would chase its tail).
+#   - Generated / vendored directories.
+#
+# Operators can inspect the effective list at runtime with:
+#   /mutation-gate status    (from the SerpentFlow TUI)
+
+critical_paths:
+  # Session W baseline — the in-flight dedup sensor that the calibration
+  # run scored at 28.6%. Keeping it first-in-line so the first enforce-
+  # mode flip surfaces the documented weakness immediately rather than
+  # silently passing for a few ops.
+  - backend/core/ouroboros/governance/intake/sensors/test_failure_sensor.py

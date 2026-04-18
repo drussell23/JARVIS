@@ -57,21 +57,49 @@ The orchestrator maps:
     block              → fail the op outright with ``mutation_gate_block``
     skip               → proceed normally
 
+**Rollout modes** (separate knob from master enable/disable):
+
+    shadow    → gate runs, verdict is recorded to ledger + logged to
+                stderr, but the orchestrator NEVER upgrades the risk
+                tier based on the result. Default mode — safe to flip
+                the master switch on with confidence.
+    enforce   → full boundary behavior: upgrade_to_approval /
+                block decisions DO modify risk_tier. Flip to this only
+                after shadow-mode data confirms the gate agrees with
+                operator judgment.
+
+Recommended rollout:
+  1. Enable master: ``JARVIS_MUTATION_GATE_ENABLED=1``.
+  2. Leave mode at default (``shadow``). Ship one or two paths in the
+     allowlist. Let the harness run for several battle-test sessions.
+  3. Inspect the ledger (``.jarvis/mutation_gate_ledger.jsonl``) —
+     confirm scores look reasonable, no surprises.
+  4. Flip ``JARVIS_MUTATION_GATE_MODE=enforce``. From now on low-score
+     ops get upgraded or blocked.
+  5. Widen the allowlist as confidence grows.
+
 Env gates (all fail-closed: default master=OFF so existing sessions
 don't start running expensive mutation runs until explicitly enabled):
 
     JARVIS_MUTATION_GATE_ENABLED           default 0
+    JARVIS_MUTATION_GATE_MODE              shadow|enforce, default shadow
     JARVIS_MUTATION_GATE_CRITICAL_PATHS    comma-separated allowlist
     JARVIS_MUTATION_GATE_ALLOW_THRESHOLD   default 0.75 (Grade B)
     JARVIS_MUTATION_GATE_BLOCK_THRESHOLD   default 0.40 (below Grade D)
     JARVIS_MUTATION_GATE_MAX_MUTANTS       default 25 (matches tester default)
     JARVIS_MUTATION_GATE_PER_TIMEOUT_S     default 30
     JARVIS_MUTATION_GATE_GLOBAL_TIMEOUT_S  default 600 (10min hard cap)
+    JARVIS_MUTATION_GATE_LEDGER_PATH       default .jarvis/mutation_gate_ledger.jsonl
+    JARVIS_MUTATION_GATE_LEDGER_MAX_LINES  default 5000 (soft rotate)
+    JARVIS_MUTATION_GATE_LEDGER_DISABLED   default 0 (kill switch)
+    JARVIS_MUTATION_GATE_PREWARM           default 1 — enumerate catalogs at boot
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -90,20 +118,62 @@ from backend.core.ouroboros.governance.mutation_tester import (
 logger = logging.getLogger("Ouroboros.MutationGate")
 
 _ENV_ENABLED = "JARVIS_MUTATION_GATE_ENABLED"
+_ENV_MODE = "JARVIS_MUTATION_GATE_MODE"
 _ENV_PATHS = "JARVIS_MUTATION_GATE_CRITICAL_PATHS"
 _ENV_ALLOW = "JARVIS_MUTATION_GATE_ALLOW_THRESHOLD"
 _ENV_BLOCK = "JARVIS_MUTATION_GATE_BLOCK_THRESHOLD"
 _ENV_MAX = "JARVIS_MUTATION_GATE_MAX_MUTANTS"
 _ENV_PER_TO = "JARVIS_MUTATION_GATE_PER_TIMEOUT_S"
 _ENV_GLOB_TO = "JARVIS_MUTATION_GATE_GLOBAL_TIMEOUT_S"
+_ENV_LEDGER_PATH = "JARVIS_MUTATION_GATE_LEDGER_PATH"
+_ENV_LEDGER_MAX = "JARVIS_MUTATION_GATE_LEDGER_MAX_LINES"
+_ENV_LEDGER_OFF = "JARVIS_MUTATION_GATE_LEDGER_DISABLED"
+_ENV_PREWARM = "JARVIS_MUTATION_GATE_PREWARM"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+MODE_SHADOW = "shadow"
+MODE_ENFORCE = "enforce"
+_VALID_MODES = frozenset({MODE_SHADOW, MODE_ENFORCE})
 
 _YAML_CONFIG_PATH = Path("config/mutation_critical_paths.yml")
 
 
 def gate_enabled() -> bool:
     return os.environ.get(_ENV_ENABLED, "0").strip().lower() in _TRUTHY
+
+
+def gate_mode() -> str:
+    """Return 'shadow' or 'enforce'. Invalid values fall back to shadow
+    — refusing to enforce when misconfigured is the safer failure mode.
+    """
+    raw = os.environ.get(_ENV_MODE, MODE_SHADOW).strip().lower()
+    if raw in _VALID_MODES:
+        return raw
+    return MODE_SHADOW
+
+
+def ledger_enabled() -> bool:
+    return os.environ.get(_ENV_LEDGER_OFF, "0").strip().lower() not in _TRUTHY
+
+
+def ledger_path() -> Path:
+    return Path(os.environ.get(
+        _ENV_LEDGER_PATH, ".jarvis/mutation_gate_ledger.jsonl",
+    ))
+
+
+def ledger_max_lines() -> int:
+    try:
+        return max(100, min(1_000_000, int(
+            os.environ.get(_ENV_LEDGER_MAX, "5000"),
+        )))
+    except (TypeError, ValueError):
+        return 5000
+
+
+def prewarm_enabled() -> bool:
+    return os.environ.get(_ENV_PREWARM, "1").strip().lower() in _TRUTHY
 
 
 def _float_env(key: str, default: float, *, lo: float, hi: float) -> float:
@@ -333,6 +403,98 @@ def _run_with_cache(
     return result, hits, misses
 
 
+_ledger_lock = threading.Lock()
+
+
+def _ledger_rotate_if_needed(path: Path, max_lines: int) -> None:
+    """If the ledger exceeds ``max_lines * 1.2``, keep only the most
+    recent ``max_lines`` entries. The rotation is lazy — called on every
+    append — so a crash after the truncate but before the new append
+    can lose the truncation work but never old verdicts.
+    """
+    try:
+        if not path.is_file():
+            return
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= int(max_lines * 1.2):
+            return
+        keep = lines[-max_lines:]
+        tmp = path.with_suffix(path.suffix + ".rotating")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.writelines(keep)
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[MutationGate] ledger rotate failed", exc_info=True,
+        )
+
+
+def append_ledger(
+    *,
+    op_id: str,
+    verdict: "GateVerdict",
+    mode: str,
+    enforced: bool,
+    applied_tier_change: Optional[str] = None,
+) -> None:
+    """Persist one verdict line to the JSONL ledger. Best-effort — any
+    disk error is swallowed so ledger issues never break the pipeline.
+    Manifesto §8 observability, not a governance surface.
+    """
+    if not ledger_enabled():
+        return
+    path = ledger_path()
+    entry = {
+        "ts": int(time.time()),
+        "op_id": op_id,
+        "mode": mode,
+        "enforced": enforced,
+        "decision": verdict.decision,
+        "score": round(verdict.score, 4),
+        "grade": verdict.grade,
+        "total_mutants": verdict.total_mutants,
+        "caught": verdict.caught,
+        "survived": verdict.survived,
+        "cache_hits": verdict.cache_hits,
+        "cache_misses": verdict.cache_misses,
+        "duration_s": round(verdict.duration_s, 3),
+        "sut_path": verdict.sut_path,
+        "reason": verdict.reason,
+        "applied_tier_change": applied_tier_change or "",
+    }
+    try:
+        with _ledger_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, sort_keys=True) + "\n")
+            _ledger_rotate_if_needed(path, ledger_max_lines())
+    except Exception:  # noqa: BLE001
+        logger.debug("[MutationGate] ledger append failed", exc_info=True)
+
+
+def read_ledger(*, last_n: int = 10) -> List[Dict[str, Any]]:
+    """Read the tail of the ledger for status-command display."""
+    path = ledger_path()
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:  # noqa: BLE001
+        return []
+    out: List[Dict[str, Any]] = []
+    for raw in lines[-last_n:]:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def _skip_verdict(sut_path: Path, reason: str) -> GateVerdict:
     return GateVerdict(
         decision="skip",
@@ -454,14 +616,86 @@ def merge_verdicts(verdicts: Sequence[GateVerdict]) -> GateVerdict:
     )
 
 
+def prewarm_allowlist(
+    *,
+    project_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Enumerate catalogs for every allowlisted file so the first APPLY
+    doesn't pay the ``ast.unparse`` cost. Idempotent — re-runs are cheap
+    when the cache is already warm. Returns a summary dict for logging.
+    """
+    if not gate_enabled():
+        return {"skipped": "gate_disabled"}
+    if not prewarm_enabled():
+        return {"skipped": "prewarm_disabled"}
+    root = project_root or Path.cwd()
+    allowlist = load_allowlist()
+    if not allowlist:
+        return {"skipped": "empty_allowlist"}
+    from backend.core.ouroboros.governance.mutation_tester import (
+        enumerate_mutants,
+    )
+    warmed: List[str] = []
+    failed: List[str] = []
+    total_mutants = 0
+    t0 = time.time()
+    for entry in allowlist:
+        abs_path = root / entry
+        if not abs_path.is_file():
+            # Entry is a prefix — glob for .py files under it.
+            if abs_path.is_dir():
+                for py in abs_path.rglob("*.py"):
+                    if py.is_file():
+                        try:
+                            sut_hash, cached = MC.get_catalog(py)
+                            if cached is None:
+                                muts = enumerate_mutants(py)
+                                MC.put_catalog(sut_hash, muts)
+                                total_mutants += len(muts)
+                            warmed.append(str(py.relative_to(root)))
+                        except Exception:  # noqa: BLE001
+                            failed.append(str(py))
+            continue
+        try:
+            sut_hash, cached = MC.get_catalog(abs_path)
+            if cached is None:
+                muts = enumerate_mutants(abs_path)
+                MC.put_catalog(sut_hash, muts)
+                total_mutants += len(muts)
+            warmed.append(entry)
+        except Exception:  # noqa: BLE001
+            failed.append(entry)
+    duration = time.time() - t0
+    summary = {
+        "warmed_files": len(warmed),
+        "failed_files": len(failed),
+        "total_mutants_enumerated": total_mutants,
+        "duration_s": round(duration, 2),
+    }
+    logger.info(
+        "[MutationGate] prewarm complete files=%d mutants=%d duration=%.2fs",
+        len(warmed), total_mutants, duration,
+    )
+    return summary
+
+
 __all__ = [
     "GateVerdict",
+    "MODE_ENFORCE",
+    "MODE_SHADOW",
     "allow_threshold",
+    "append_ledger",
     "block_threshold",
     "evaluate_file",
     "evaluate_files",
     "gate_enabled",
+    "gate_mode",
     "is_path_critical",
+    "ledger_enabled",
+    "ledger_path",
     "load_allowlist",
     "merge_verdicts",
+    "prewarm_allowlist",
+    "prewarm_enabled",
+    "read_ledger",
 ]

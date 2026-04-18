@@ -664,6 +664,24 @@ class BattleTestHarness:
                 self._governance_stack.controller.writes_allowed,
             )
 
+            # Prewarm mutation-gate catalogs so the first critical-path
+            # APPLY doesn't pay enumeration cost. Skip silently when the
+            # gate is disabled — no-op for operators who haven't opted in.
+            try:
+                from backend.core.ouroboros.governance import mutation_gate as _mg
+                if _mg.gate_enabled() and _mg.prewarm_enabled():
+                    _summary = _mg.prewarm_allowlist(
+                        project_root=Path("."),
+                    )
+                    logger.info(
+                        "[MutationGate] prewarm_at_boot mode=%s summary=%s",
+                        _mg.gate_mode(), _summary,
+                    )
+            except Exception:
+                logger.debug(
+                    "[MutationGate] boot-time prewarm skipped", exc_info=True,
+                )
+
             # Inject SerpentFlow — flowing organism CLI (preferred)
             # Falls back to scrolling OuroborosTUI, then basic diff transport.
             self._serpent_flow = None

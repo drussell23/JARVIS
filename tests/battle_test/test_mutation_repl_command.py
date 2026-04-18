@@ -212,6 +212,148 @@ async def test_survivors_only_renders_each_survivor_once(tmp_path, monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_mutation_gate_status_prints_mode_and_allowlist(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_ENABLED", "1")
+    monkeypatch.setenv(
+        "JARVIS_MUTATION_GATE_CRITICAL_PATHS",
+        "backend/core/foo.py,backend/core/bar.py",
+    )
+    repl, flow = _mk_cli(tmp_path)
+    # Capture the raw objects handed to console.print so we can introspect
+    # Rich Panels without relying on __str__.
+    printed_objs = []
+    flow.console.print = lambda *args, **kwargs: printed_objs.extend(args)
+    await repl._handle_mutation_gate("/mutation-gate status")
+    # Find the Panel and pull text from its renderable.
+    from rich.panel import Panel
+    panels = [o for o in printed_objs if isinstance(o, Panel)]
+    assert panels, "status should render a Panel"
+    body = str(panels[0].renderable)
+    assert "Master" in body or "master" in body.lower()
+    assert "shadow" in body
+    assert "backend/core/foo.py" in body
+    # Panel title asserts directly.
+    assert "Mutation Gate" in str(panels[0].title)
+
+
+@pytest.mark.asyncio
+async def test_mutation_gate_ledger_empty(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "JARVIS_MUTATION_GATE_LEDGER_PATH",
+        str(tmp_path / "ledger.jsonl"),
+    )
+    repl, flow = _mk_cli(tmp_path)
+    printed = []
+    flow.console.print = lambda *args, **kwargs: printed.append(
+        " ".join(str(a) for a in args)
+    )
+    await repl._handle_mutation_gate("/mutation-gate ledger")
+    combined = "\n".join(printed)
+    assert "ledger empty" in combined
+
+
+@pytest.mark.asyncio
+async def test_mutation_gate_ledger_shows_entries(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_LEDGER_PATH", str(ledger))
+    from backend.core.ouroboros.governance import mutation_gate as _mg
+
+    class _FakeV:
+        decision = "block"
+        score = 0.25
+        grade = "F"
+        total_mutants = 20
+        caught = 5
+        survived = 15
+        cache_hits = 0
+        cache_misses = 20
+        duration_s = 120.0
+        sut_path = "backend/core/foo.py"
+        reason = "score_below_block_threshold"
+        survivors = ()
+
+    _mg.append_ledger(
+        op_id="op-aaa-bbb", verdict=_FakeV(),
+        mode=_mg.MODE_ENFORCE, enforced=True,
+        applied_tier_change="SAFE_AUTO->BLOCKED",
+    )
+    repl, flow = _mk_cli(tmp_path)
+    printed = []
+    flow.console.print = lambda *args, **kwargs: printed.append(
+        " ".join(str(a) for a in args)
+    )
+    await repl._handle_mutation_gate("/mutation-gate ledger 5")
+    combined = "\n".join(printed)
+    assert "op-aaa-bbb" in combined
+    assert "block" in combined
+    assert "SAFE_AUTO->BLOCKED" in combined
+
+
+@pytest.mark.asyncio
+async def test_mutation_gate_dry_run_without_side_effects(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_LEDGER_PATH", str(ledger))
+    src = tmp_path / "sut.py"
+    (tmp_path / "tests").mkdir()
+    tst = tmp_path / "tests" / "test_sut.py"
+    src.write_text("def f(): return 1\n")
+    tst.write_text("def test_x(): assert True\n")
+    repl, flow = _mk_cli(tmp_path)
+    printed = []
+    flow.console.print = lambda *args, **kwargs: printed.append(
+        " ".join(str(a) for a in args)
+    )
+    from backend.core.ouroboros.governance import mutation_gate as _mg
+
+    fake_verdict = _mg.GateVerdict(
+        decision="allow", score=0.85, grade="A",
+        allow_threshold=0.75, block_threshold=0.40,
+        total_mutants=5, caught=4, survived=1,
+        reason="score_above_allow_threshold",
+    )
+    with patch.object(_mg, "evaluate_file", return_value=fake_verdict):
+        await repl._handle_mutation_gate("/mutation-gate dry-run sut.py")
+    combined = "\n".join(printed)
+    assert "dry-run" in combined
+    assert "decision=allow" in combined
+    # Dry-run must NOT append to the ledger (that's the whole point —
+    # operators can sanity-check a file without polluting telemetry).
+    assert not ledger.exists() or ledger.read_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_mutation_gate_usage_on_unknown_sub(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repl, flow = _mk_cli(tmp_path)
+    printed = []
+    flow.console.print = lambda *args, **kwargs: printed.append(
+        " ".join(str(a) for a in args)
+    )
+    await repl._handle_mutation_gate("/mutation-gate bogus")
+    combined = "\n".join(printed)
+    assert "Usage" in combined
+
+
+def test_dispatch_loop_routes_slash_mutation_gate():
+    src = Path(
+        "backend/core/ouroboros/battle_test/serpent_flow.py"
+    ).read_text(encoding="utf-8")
+    assert 'line.startswith("/mutation-gate")' in src
+    assert "await self._handle_mutation_gate(line)" in src
+
+
+def test_help_mentions_mutation_gate():
+    src = Path(
+        "backend/core/ouroboros/battle_test/serpent_flow.py"
+    ).read_text(encoding="utf-8")
+    assert "/mutation-gate ..." in src
+
+
+@pytest.mark.asyncio
 async def test_survivors_only_emits_clean_marker_when_no_survivors(
     tmp_path, monkeypatch, caplog,
 ):

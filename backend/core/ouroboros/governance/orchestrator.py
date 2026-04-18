@@ -4973,18 +4973,43 @@ class GovernedOrchestrator:
                         if _verdicts:
                             _merged = _mg.merge_verdicts(_verdicts)
                             _risk_before_mg = risk_tier.name
-                            if _merged.decision == "block":
-                                risk_tier = RiskTier.BLOCKED
-                            elif _merged.decision == "upgrade_to_approval":
-                                if risk_tier.value < RiskTier.APPROVAL_REQUIRED.value:
-                                    risk_tier = RiskTier.APPROVAL_REQUIRED
-                            # Stable one-line telemetry — grepable.
+                            _mg_mode = _mg.gate_mode()
+                            _enforced = (_mg_mode == _mg.MODE_ENFORCE)
+                            _applied_change = ""
+                            if _enforced:
+                                if _merged.decision == "block":
+                                    risk_tier = RiskTier.BLOCKED
+                                    _applied_change = (
+                                        f"{_risk_before_mg}->BLOCKED"
+                                    )
+                                elif _merged.decision == "upgrade_to_approval":
+                                    if risk_tier.value < RiskTier.APPROVAL_REQUIRED.value:
+                                        risk_tier = RiskTier.APPROVAL_REQUIRED
+                                        _applied_change = (
+                                            f"{_risk_before_mg}->APPROVAL_REQUIRED"
+                                        )
+                            # Ledger EVERY verdict regardless of mode so
+                            # shadow-mode operators accumulate data for
+                            # the enforce-mode flip decision.
+                            try:
+                                _mg.append_ledger(
+                                    op_id=ctx.op_id, verdict=_merged,
+                                    mode=_mg_mode, enforced=_enforced,
+                                    applied_tier_change=_applied_change,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "[MutationGate] ledger append skipped",
+                                    exc_info=True,
+                                )
                             logger.info(
-                                "[MutationGate] op=%s decision=%s score=%.2f "
-                                "grade=%s caught=%d/%d survivors=%d "
-                                "cache_hits=%d cache_misses=%d duration=%.1fs "
+                                "[MutationGate] op=%s mode=%s enforced=%s "
+                                "decision=%s score=%.2f grade=%s "
+                                "caught=%d/%d survivors=%d cache_hits=%d "
+                                "cache_misses=%d duration=%.1fs "
                                 "risk_before=%s risk_after=%s",
-                                ctx.op_id, _merged.decision, _merged.score,
+                                ctx.op_id, _mg_mode, _enforced,
+                                _merged.decision, _merged.score,
                                 _merged.grade, _merged.caught,
                                 _merged.total_mutants, len(_merged.survivors),
                                 _merged.cache_hits, _merged.cache_misses,

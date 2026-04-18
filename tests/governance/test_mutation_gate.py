@@ -57,7 +57,9 @@ def test_gate_env_truthy(monkeypatch, val):
     assert MG.gate_enabled() is True
 
 
-def test_allowlist_env_parsing(monkeypatch):
+def test_allowlist_env_parsing(monkeypatch, tmp_path):
+    # chdir off the repo root so the YAML seed file doesn't contribute.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv(
         "JARVIS_MUTATION_GATE_CRITICAL_PATHS",
         "backend/core/, backend/api/auth.py, ,",
@@ -274,3 +276,164 @@ def test_module_default_block_threshold_is_conservative():
     # this to something permissive.
     assert "0.40" in src
     assert "0.75" in src
+
+
+# ---------------------------------------------------------------------------
+# Shadow/enforce mode — the rollout safety rail
+# ---------------------------------------------------------------------------
+
+
+def test_gate_mode_defaults_to_shadow():
+    assert MG.gate_mode() == MG.MODE_SHADOW
+
+
+@pytest.mark.parametrize("val,expected", [
+    ("shadow", MG.MODE_SHADOW),
+    ("enforce", MG.MODE_ENFORCE),
+    ("SHADOW", MG.MODE_SHADOW),
+    ("ENFORCE", MG.MODE_ENFORCE),
+    ("bogus", MG.MODE_SHADOW),   # fall back to shadow on invalid — safe default
+    ("", MG.MODE_SHADOW),
+])
+def test_gate_mode_parse(monkeypatch, val, expected):
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_MODE", val)
+    assert MG.gate_mode() == expected
+
+
+def test_module_documents_shadow_enforce_rollout():
+    src = Path(
+        "backend/core/ouroboros/governance/mutation_gate.py"
+    ).read_text(encoding="utf-8")
+    assert "shadow" in src.lower()
+    assert "enforce" in src.lower()
+    # Rollout ordering must be documented — shadow before enforce.
+    shadow_idx = src.lower().find("shadow")
+    enforce_idx = src.lower().find("enforce")
+    assert 0 <= shadow_idx < enforce_idx, (
+        "shadow mode must be documented before enforce mode"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ledger
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_append_and_read(monkeypatch, tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_LEDGER_PATH", str(ledger))
+    fake_verdict = _v("allow", score=0.88)
+    MG.append_ledger(
+        op_id="op-test-1", verdict=fake_verdict,
+        mode=MG.MODE_SHADOW, enforced=False,
+    )
+    MG.append_ledger(
+        op_id="op-test-2", verdict=_v("block", score=0.20),
+        mode=MG.MODE_ENFORCE, enforced=True,
+        applied_tier_change="SAFE_AUTO->BLOCKED",
+    )
+    tail = MG.read_ledger(last_n=10)
+    assert len(tail) == 2
+    assert tail[0]["op_id"] == "op-test-1"
+    assert tail[0]["enforced"] is False
+    assert tail[1]["decision"] == "block"
+    assert tail[1]["applied_tier_change"] == "SAFE_AUTO->BLOCKED"
+
+
+def test_ledger_disabled_kill_switch(monkeypatch, tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_LEDGER_PATH", str(ledger))
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_LEDGER_DISABLED", "1")
+    MG.append_ledger(
+        op_id="op-x", verdict=_v("allow"),
+        mode=MG.MODE_SHADOW, enforced=False,
+    )
+    assert not ledger.exists()
+
+
+def test_ledger_rotate_keeps_most_recent(monkeypatch, tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_LEDGER_PATH", str(ledger))
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_LEDGER_MAX_LINES", "100")
+    for i in range(130):
+        MG.append_ledger(
+            op_id=f"op-{i}", verdict=_v("allow", score=0.80 + i * 0.0001),
+            mode=MG.MODE_SHADOW, enforced=False,
+        )
+    tail = MG.read_ledger(last_n=200)
+    # Rotation is lazy: triggers when count > max * 1.2, then trims to max.
+    # Over 130 appends this oscillates between max and ~max*1.2; we assert
+    # the INVARIANT that the oldest entries are evicted and the newest
+    # entry is retained.
+    assert 100 <= len(tail) <= 120
+    assert tail[-1]["op_id"] == "op-129"
+    assert tail[0]["op_id"] != "op-0"  # op-0 was evicted
+
+
+# ---------------------------------------------------------------------------
+# Prewarm
+# ---------------------------------------------------------------------------
+
+
+def test_prewarm_skips_when_gate_disabled(tmp_path):
+    summary = MG.prewarm_allowlist(project_root=tmp_path)
+    assert summary == {"skipped": "gate_disabled"}
+
+
+def test_prewarm_skips_empty_allowlist(monkeypatch, tmp_path):
+    # chdir so the seed YAML isn't picked up by _yaml_allowlist.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_ENABLED", "1")
+    summary = MG.prewarm_allowlist(project_root=tmp_path)
+    assert summary["skipped"] == "empty_allowlist"
+
+
+def test_prewarm_enumerates_allowlisted_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_ENABLED", "1")
+    sut = tmp_path / "a.py"
+    _write(sut, "def f(x): return x == 1")
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_CRITICAL_PATHS", "a.py")
+    summary = MG.prewarm_allowlist(project_root=tmp_path)
+    assert summary["warmed_files"] >= 1
+    assert summary["total_mutants_enumerated"] >= 1
+    # Catalog should now be in the cache.
+    sut_hash, cached = MC.get_catalog(sut)
+    assert cached is not None
+    assert len(cached) >= 1
+
+
+def test_prewarm_disable_via_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_MUTATION_GATE_PREWARM", "0")
+    summary = MG.prewarm_allowlist(project_root=tmp_path)
+    assert summary == {"skipped": "prewarm_disabled"}
+
+
+# ---------------------------------------------------------------------------
+# Config seed file — actually exists and parses
+# ---------------------------------------------------------------------------
+
+
+def test_config_seed_file_exists_and_contains_session_w():
+    config = Path("config/mutation_critical_paths.yml")
+    assert config.is_file(), "ship the seed YAML with the module"
+    text = config.read_text(encoding="utf-8")
+    assert "test_failure_sensor.py" in text
+    assert "critical_paths" in text
+
+
+def test_yaml_allowlist_loads_seed_if_in_project_root(monkeypatch, tmp_path):
+    """YAML loader reads config/mutation_critical_paths.yml relative to cwd.
+    If YAML is installed, the seed file contributes its entries."""
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        pytest.skip("PyYAML not installed")
+    # The seed file lives at config/mutation_critical_paths.yml; load it
+    # from the real project root to verify the format is accepted.
+    seed = Path("config/mutation_critical_paths.yml")
+    if not seed.is_file():
+        pytest.skip("seed file missing")
+    # Run _yaml_allowlist from the repo root — should return ≥1 entry.
+    entries = MG._yaml_allowlist()
+    assert any("test_failure_sensor.py" in e for e in entries)

@@ -3097,6 +3097,9 @@ class SerpentREPL:
                     if line in ("/lessons", "lessons"):
                         self._print_lessons()
                         continue
+                    if line.startswith("/mutation-gate") or line.startswith("mutation-gate "):
+                        await self._handle_mutation_gate(line)
+                        continue
                     if line.startswith("/mutation") or line.startswith("mutation "):
                         await self._handle_mutation(line)
                         continue
@@ -3199,6 +3202,7 @@ class SerpentREPL:
             f"  [{_C['dim']}]/remember <text>[/{_C['dim']}]  shortcut: add a USER memory",
             f"  [{_C['dim']}]/forget <id>[/{_C['dim']}]      shortcut: remove a memory by id",
             f"  [{_C['dim']}]/mutation <src>[/{_C['dim']}]   mutation-test <src> (meta-test: do tests catch bugs?)",
+            f"  [{_C['dim']}]/mutation-gate ...[/{_C['dim']}] APPLY-gate status / dry-run / ledger",
             f"  [{_C['dim']}]help[/{_C['dim']}]              this message",
             f"  [{_C['dim']}]quit[/{_C['dim']}]              graceful shutdown",
         ]
@@ -3551,6 +3555,179 @@ class SerpentREPL:
                 "original=%r mutated=%r reason=%s",
                 m.source_file, m.line, m.col, m.op,
                 m.original, m.mutated, s.reason,
+            )
+
+    async def _handle_mutation_gate(self, line: str) -> None:
+        """Operator-facing view of the mutation-gate state.
+
+        Subcommands:
+          /mutation-gate                     → status (default)
+          /mutation-gate status              → mode, allowlist, cache, ledger tail
+          /mutation-gate dry-run <src>       → evaluate one file, no side effects
+          /mutation-gate ledger [N]          → last N ledger entries (default 20)
+          /mutation-gate prewarm             → re-run boot-time catalog prewarm
+
+        All subcommands are read-only or cache-warming — none modify
+        allowlist, env, or risk-tier policy. Mode / allowlist changes
+        are env-driven by design (persists across restarts; auditable
+        in shell history).
+        """
+        parts = line.replace("/mutation-gate", "mutation-gate", 1).split()
+        sub = parts[1] if len(parts) > 1 else "status"
+        try:
+            from backend.core.ouroboros.governance import (
+                mutation_cache as _mc, mutation_gate as _mg,
+            )
+        except ImportError as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]Mutation gate unavailable: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        if sub == "status":
+            self._mg_print_status(_mg, _mc)
+            return
+        if sub == "ledger":
+            n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 20
+            self._mg_print_ledger(_mg, n)
+            return
+        if sub == "prewarm":
+            summary = _mg.prewarm_allowlist(project_root=Path("."))
+            self._flow.console.print(
+                f"  [{_C['life']}]prewarm[/{_C['life']}] {summary}",
+                highlight=False,
+            )
+            return
+        if sub == "dry-run":
+            if len(parts) < 3:
+                self._flow.console.print(
+                    f"  [{_C['dim']}]Usage: /mutation-gate dry-run <src>[/{_C['dim']}]",
+                    highlight=False,
+                )
+                return
+            src = Path(parts[2])
+            if not src.is_file():
+                self._flow.console.print(
+                    f"  [{_C['death']}]Source not found: {src}[/{_C['death']}]",
+                    highlight=False,
+                )
+                return
+            tests = self._discover_tests_for(src)
+            if not tests:
+                self._flow.console.print(
+                    f"  [{_C['death']}]No tests discovered for {src.name}[/{_C['death']}]",
+                    highlight=False,
+                )
+                return
+            self._flow.console.print(
+                f"  [{_C['neural']}]dry-run[/{_C['neural']}] {src} "
+                f"with {len(tests)} test(s) — force=True, no ledger write",
+                highlight=False,
+            )
+            verdict = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _mg.evaluate_file(src, tests, force=True),
+            )
+            self._flow.console.print(
+                f"  decision={verdict.decision} score={verdict.score:.1%} "
+                f"grade={verdict.grade} caught={verdict.caught}/{verdict.total_mutants} "
+                f"survivors={len(verdict.survivors)} "
+                f"cache_hits={verdict.cache_hits} cache_misses={verdict.cache_misses} "
+                f"duration={verdict.duration_s:.1f}s",
+                highlight=False,
+            )
+            return
+        self._flow.console.print(
+            f"  [{_C['dim']}]Usage: /mutation-gate [status|dry-run <src>|"
+            f"ledger [N]|prewarm][/{_C['dim']}]",
+            highlight=False,
+        )
+
+    def _mg_print_status(self, mg_mod, mc_mod) -> None:
+        f = self._flow
+        allowlist = mg_mod.load_allowlist()
+        cache_stats = mc_mod.cache_stats()
+        last = mg_mod.read_ledger(last_n=5)
+        lines = [
+            f"[bold]Master[/bold]        "
+            f"{'[green]ENABLED[/green]' if mg_mod.gate_enabled() else '[dim]disabled[/dim]'}",
+            f"[bold]Mode[/bold]          "
+            f"[cyan]{mg_mod.gate_mode()}[/cyan]  "
+            f"(shadow=observe-only / enforce=apply risk upgrades)",
+            f"[bold]Allowlist[/bold]     {len(allowlist)} path(s)",
+        ]
+        for entry in allowlist[:5]:
+            lines.append(f"  • {entry}")
+        if len(allowlist) > 5:
+            lines.append(f"  … {len(allowlist) - 5} more")
+        lines.extend([
+            f"[bold]Thresholds[/bold]    "
+            f"allow≥{mg_mod.allow_threshold():.2f} / "
+            f"block<{mg_mod.block_threshold():.2f}",
+            f"[bold]Cache[/bold]         "
+            f"catalog_ram={cache_stats.get('catalog_ram', 0)} "
+            f"outcomes_ram={cache_stats.get('outcomes_ram', 0)}",
+            f"[bold]Prewarm[/bold]       "
+            f"{'on' if mg_mod.prewarm_enabled() else 'off'}",
+            f"[bold]Ledger[/bold]        "
+            f"{mg_mod.ledger_path()} "
+            f"({'on' if mg_mod.ledger_enabled() else 'off'})",
+        ])
+        if last:
+            lines.append("[bold]Recent[/bold]")
+            for e in last:
+                lines.append(
+                    f"  {e.get('op_id', '?')[:16]} "
+                    f"{e.get('decision', '?'):<20} "
+                    f"score={e.get('score', 0):.2f} "
+                    f"{e.get('grade', '?'):<3} "
+                    f"{'enforced' if e.get('enforced') else 'shadow'}"
+                )
+        from rich.panel import Panel
+        f.console.print()
+        f.console.print(
+            Panel(
+                "\n".join(lines),
+                title="[cyan]🛡️  Mutation Gate[/cyan]",
+                border_style="cyan",
+                width=min(f.console.width, 80),
+                padding=(0, 2),
+            )
+        )
+        f.console.print()
+
+    def _mg_print_ledger(self, mg_mod, n: int) -> None:
+        f = self._flow
+        entries = mg_mod.read_ledger(last_n=n)
+        if not entries:
+            f.console.print(
+                f"  [{_C['dim']}]ledger empty[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        f.console.print(
+            f"  [bold]Last {len(entries)} gate verdict(s)[/bold]",
+            highlight=False,
+        )
+        for e in entries:
+            enforced_badge = (
+                f"[{_C['life']}]enforce[/{_C['life']}]"
+                if e.get("enforced") else f"[{_C['dim']}]shadow[/{_C['dim']}]"
+            )
+            color = {
+                "allow": "life",
+                "upgrade_to_approval": "heal",
+                "block": "death",
+                "skip": "dim",
+            }.get(e.get("decision", "skip"), "dim")
+            f.console.print(
+                f"  {e.get('op_id', '?')[:16]}  "
+                f"[{_C[color]}]{e.get('decision', '?'):<20}[/{_C[color]}] "
+                f"score={e.get('score', 0):.2f} "
+                f"g={e.get('grade', '?'):<3} "
+                f"{enforced_badge} "
+                f"tier={e.get('applied_tier_change', '') or '(no change)'} "
+                f"dt={e.get('duration_s', 0):.1f}s",
+                highlight=False,
             )
 
     @staticmethod
