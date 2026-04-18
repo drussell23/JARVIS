@@ -3327,6 +3327,21 @@ class GovernedLoopService:
                 from backend.core.ouroboros.governance.agentic_subagent import (
                     build_default_explore_factory,
                 )
+                # Phase B factories (REVIEW + PLAN + GENERAL) — registered
+                # at boot alongside EXPLORE. Each factory is imported lazily
+                # so a broken module doesn't cascade into the GLS boot
+                # sequence; the try/except below catches any import-level
+                # failure and degrades to EXPLORE-only operation with a
+                # DEBUG log.
+                from backend.core.ouroboros.governance.agentic_review_subagent import (
+                    build_default_review_factory,
+                )
+                from backend.core.ouroboros.governance.agentic_plan_subagent import (
+                    build_default_plan_factory,
+                )
+                from backend.core.ouroboros.governance.agentic_general_subagent import (
+                    build_default_general_factory,
+                )
                 from backend.core.ouroboros.governance.subagent_comm_sink import (
                     build_comm_sink_from_gls,
                 )
@@ -3339,19 +3354,28 @@ class GovernedLoopService:
                     explore_factory=build_default_explore_factory(
                         self._config.project_root
                     ),
+                    review_factory=build_default_review_factory(
+                        self._config.project_root
+                    ),
+                    plan_factory=build_default_plan_factory(
+                        self._config.project_root
+                    ),
+                    general_factory=build_default_general_factory(
+                        self._config.project_root
+                    ),
                     comm=_sub_comm,
                     ledger=_sub_ledger,
                 )
                 self._subagent_orchestrator_ref = _sub_orch
                 _backend_ref.set_subagent_orchestrator(_sub_orch)
                 logger.info(
-                    "[GLS] SubagentOrchestrator wired "
+                    "[GLS] SubagentOrchestrator wired with Phase 1 EXPLORE + "
+                    "Phase B REVIEW/PLAN/GENERAL factories "
                     "(Venom dispatch_subagent — default enabled after "
                     "Phase 1 graduation 2026-04-18; set "
                     "JARVIS_SUBAGENT_DISPATCH_ENABLED=false to disable; "
                     "observability via CommProtocol heartbeats + "
-                    "OperationLedger SUBAGENT_DISPATCH records; "
-                    "SerpentFlow ⏺ Subagent(explore) block rendering)"
+                    "OperationLedger SUBAGENT_DISPATCH records)"
                 )
             else:
                 logger.debug(
