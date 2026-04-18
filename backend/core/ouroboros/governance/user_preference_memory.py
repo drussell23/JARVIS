@@ -622,6 +622,7 @@ class UserPreferenceStore:
         target_files: Sequence[str] = (),
         description: str = "",
         risk_tier: str = "",
+        target_app_id: str = "",
         limit: int = _DEFAULT_RELEVANCE_LIMIT,
     ) -> List[UserMemory]:
         """Return the top-``limit`` memories scored for the current op.
@@ -629,10 +630,14 @@ class UserPreferenceStore:
         Scoring dimensions (all additive):
 
         1. **Path overlap** — any ``paths`` substring matches any
-           ``target_files`` entry. Strongest signal.
-        2. **Tag match** — any tag appears in the description (case
+           ``target_files`` entry. Strongest file-scope signal.
+        2. **App match** — ``target_app_id`` (macOS bundle id) equals any
+           entry in ``apps``. Strongest vision-scope signal. Mirrors the
+           path-match strength, doubled for FORBIDDEN_APP hits so the
+           forbidden memory always dominates its bucket.
+        3. **Tag match** — any tag appears in the description (case
            insensitive) or matches the risk tier.
-        3. **Type bonus** — USER/STYLE memories always get a baseline
+        4. **Type bonus** — USER/STYLE memories always get a baseline
            bonus so they are never pushed out of the prompt by
            noisier feedback entries.
 
@@ -640,6 +645,7 @@ class UserPreferenceStore:
         """
         desc_lower = (description or "").lower()
         risk_lower = (risk_tier or "").lower()
+        bundle_lower = (target_app_id or "").strip().lower()
         scored: List[Tuple[int, str, UserMemory]] = []
 
         with self._lock:
@@ -649,6 +655,7 @@ class UserPreferenceStore:
                     target_files=target_files,
                     desc_lower=desc_lower,
                     risk_lower=risk_lower,
+                    bundle_lower=bundle_lower,
                 )
                 if score <= 0:
                     continue
@@ -665,6 +672,7 @@ class UserPreferenceStore:
         target_files: Sequence[str],
         desc_lower: str,
         risk_lower: str,
+        bundle_lower: str = "",
     ) -> int:
         score = 0
 
@@ -676,7 +684,7 @@ class UserPreferenceStore:
         elif mem.type is MemoryType.PROJECT:
             score += _SCORE_TYPE_BONUS_PROJECT
 
-        # Path overlap — strongest individual signal.
+        # Path overlap — strongest file-scope signal.
         if mem.paths and target_files:
             for tf in target_files:
                 norm = tf.replace("\\", "/") if tf else ""
@@ -686,6 +694,15 @@ class UserPreferenceStore:
                     if p and p in norm:
                         score += _SCORE_PATH_MATCH
                         break
+
+        # App match — strongest vision-scope signal. Exact (case-insensitive)
+        # bundle-id comparison; substring would let ``com.apple.mail`` trigger
+        # on ``com.apple.mailapp`` which is semantically wrong for denylists.
+        if mem.apps and bundle_lower:
+            for a in mem.apps:
+                if a and a.strip().lower() == bundle_lower:
+                    score += _SCORE_PATH_MATCH
+                    break
 
         # Tag match against description or risk tier.
         if mem.tags:
@@ -704,6 +721,16 @@ class UserPreferenceStore:
                     score += _SCORE_PATH_MATCH * 2
                     break
 
+        # Forbidden-app memories ALWAYS surface when they match the active
+        # app. Same doubling pattern as FORBIDDEN_PATH — the forbidden
+        # memory must dominate its bucket so the VisionSensor's denial
+        # rationale is always attention-dominant in the prompt.
+        if mem.type is MemoryType.FORBIDDEN_APP and mem.apps and bundle_lower:
+            for a in mem.apps:
+                if a and a.strip().lower() == bundle_lower:
+                    score += _SCORE_PATH_MATCH * 2
+                    break
+
         return score
 
     # ------------------------------------------------------------------
@@ -716,6 +743,7 @@ class UserPreferenceStore:
         target_files: Sequence[str] = (),
         description: str = "",
         risk_tier: str = "",
+        target_app_id: str = "",
         limit: int = _DEFAULT_RELEVANCE_LIMIT,
     ) -> str:
         """Render a compact "User Preferences" section for generation prompts.
@@ -729,6 +757,7 @@ class UserPreferenceStore:
             target_files=target_files,
             description=description,
             risk_tier=risk_tier,
+            target_app_id=target_app_id,
             limit=limit,
         )
         if not memories:
@@ -999,6 +1028,7 @@ class UserPreferenceStore:
 
         tags = _parse_list_value(header.get("tags", ""))
         paths = _parse_list_value(header.get("paths", ""))
+        apps = _parse_list_value(header.get("apps", ""))
 
         return UserMemory(
             id=mem_id,
@@ -1011,6 +1041,10 @@ class UserPreferenceStore:
             source=(header.get("source") or "user").strip(),
             tags=tuple(tags),
             paths=tuple(paths),
+            # Lowercase normalisation on load — v1 files written before
+            # FORBIDDEN_APP landed have no ``apps`` field and end up with
+            # an empty tuple, exactly matching the dataclass default.
+            apps=tuple(a.strip().lower() for a in apps if a and a.strip()),
             created_at=(header.get("created_at") or "").strip(),
             updated_at=(header.get("updated_at") or "").strip(),
         )
@@ -1187,3 +1221,4 @@ def reset_default_store() -> None:
     with _DEFAULT_STORE_LOCK:
         _DEFAULT_STORE = None
     register_protected_path_provider(None)
+    register_protected_app_provider(None)
