@@ -636,13 +636,28 @@ class UnifiedIntakeRouter:
         # is unavailable. This enables the organism to work on multiple
         # operations concurrently (Manifesto §3: disciplined concurrency).
         from backend.core.ouroboros.governance.op_context import OperationContext
+        from backend.core.ouroboros.governance.operation_advisor import (
+            infer_read_only_intent,
+        )
 
+        # Stamp is_read_only at intake (NOT in orchestrator — too late).
+        # Session 8 (bt-2026-04-18-044640) exposed the ordering bug:
+        # BackgroundAgentPool worker picks up op.context BEFORE orchestrator
+        # runs, so a later orchestrator-side stamp never propagates back to
+        # the pool's per-worker ceiling selection. Stamping at intake means
+        # op.context.is_read_only is already True by the time the pool sees
+        # the op, so the 900s read-only ceiling branch at
+        # background_agent_pool.py:~691 fires correctly.
+        _is_read_only_at_intake = bool(infer_read_only_intent(
+            envelope.description or ""
+        ))
         ctx = OperationContext.create(
             target_files=envelope.target_files,
             description=envelope.description,
             op_id=envelope.causal_id,
             signal_urgency=envelope.urgency,
             signal_source=envelope.source,
+            is_read_only=_is_read_only_at_intake,
         )
         try:
             _submit_fn = getattr(self._gls, "submit_background", None)
