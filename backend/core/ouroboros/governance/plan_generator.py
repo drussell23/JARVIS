@@ -42,8 +42,15 @@ Schema: plan.1
         ],
         "risk_factors": ["Risk description"],
         "test_strategy": "How to verify the changes",
-        "architectural_notes": "Cross-cutting concerns, invariants to preserve"
+        "architectural_notes": "Cross-cutting concerns, invariants to preserve",
+        "ui_affected": false
     }
+
+The ``ui_affected`` field (added by Task 5 of the VisionSensor + Visual
+VERIFY arc) is stamped *deterministically* by ``classify_ui_affected``
+after parse — not produced by the model. It routes Visual VERIFY (see
+``docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md``
+§VERIFY Extension → Trigger conditions).
 """
 
 from __future__ import annotations
@@ -51,10 +58,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from backend.core.ouroboros.governance.op_context import OperationContext
 
@@ -86,6 +94,120 @@ def _plan_review_required() -> bool:
         os.environ.get("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", "").strip().lower()
         in _TRUTHY
     )
+
+
+# ---------------------------------------------------------------------------
+# UI-affected classification (feeds Visual VERIFY trigger — D2 decision)
+# ---------------------------------------------------------------------------
+#
+# Design spec: docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md
+#   §VERIFY Extension → Trigger conditions (structured > prose).
+#
+# Primary authoritative signal = target_files extension classification.
+# Prose (plan approach text) is used *only* when the structured signal is
+# absent or ambiguous. This keeps deterministic routing anchored on file
+# scope and never lets a keyword in a prompt hijack UI-mode detection
+# when the actual target files say otherwise (e.g. a backend refactor
+# whose description happens to say "layout the migration").
+
+_FRONTEND_EXTENSIONS: frozenset = frozenset({
+    ".tsx", ".jsx", ".vue", ".svelte", ".css", ".scss", ".html", ".htm",
+})
+
+# Language extensions that constitute an "unambiguous" signal — if a target
+# file matches any of these, we have a structured classification and do NOT
+# fall through to the prose keyword check. Frontend ∪ backend ∪ shared.
+# Deliberately conservative: listed languages must be ones where we trust
+# the extension conveys a stable scope signal. Anything unlisted (e.g.
+# .md / .yaml / .json / .txt / binary) is treated as ambiguous.
+_CLASSIFIABLE_EXTENSIONS: frozenset = frozenset(
+    _FRONTEND_EXTENSIONS
+    | {
+        # Python / Ruby / PHP families
+        ".py", ".rb", ".php",
+        # Systems + statically typed
+        ".go", ".rs", ".java", ".kt", ".scala",
+        # JVM / dotnet
+        ".cs", ".fs", ".fsx", ".clj", ".cljs", ".cljc",
+        # C family
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+        # Apple platforms
+        ".swift", ".m", ".mm",
+        # Shared JS/TS (not inherently frontend — treated as classifiable but
+        # not frontend-exclusive)
+        ".ts", ".js", ".mjs", ".cjs",
+        # Other
+        ".dart", ".elm", ".ex", ".exs", ".erl", ".hrl",
+        ".hs", ".lua", ".pl", ".pm", ".r", ".jl", ".nim", ".zig",
+    }
+)
+
+# Secondary-fallback keyword set. Only consulted when target_files is empty
+# or entirely unclassifiable. Word-boundary + case-insensitive — "restyle"
+# as a raw substring does NOT match "style" (would need the full word),
+# but typical descriptions mentioning "component" or "layout" do.
+_UI_APPROACH_KEYWORD_PATTERN: re.Pattern = re.compile(
+    r"\b(UI|render|style|component|viewport|layout)\b",
+    re.IGNORECASE,
+)
+
+
+def _ext(path: str) -> str:
+    """Return lowercase extension including the dot, or empty string."""
+    if not path:
+        return ""
+    # Normalise path separators so a Windows-style "src\\Button.tsx" works.
+    norm = path.replace("\\", "/")
+    base = norm.rsplit("/", 1)[-1]
+    dot = base.rfind(".")
+    if dot < 0 or dot == 0:          # no extension or leading-dot dotfile
+        return ""
+    return base[dot:].lower()
+
+
+def classify_ui_affected(
+    target_files: Sequence[str],
+    approach: str = "",
+) -> bool:
+    """Deterministically classify whether an op touches the UI surface.
+
+    Decision order (primary wins; secondary only when primary is silent):
+
+    1. **Primary** — any file in ``target_files`` has a frontend extension
+       (``.tsx`` / ``.jsx`` / ``.vue`` / ``.svelte`` / ``.css`` / ``.scss`` /
+       ``.html`` / ``.htm``) → ``True``.
+    2. **Structured-negative** — ``target_files`` is non-empty AND every
+       file has a *classifiable* extension (frontend or backend or shared),
+       but none is frontend → ``False``. Prose hints are ignored; the
+       structured signal is authoritative.
+    3. **Secondary fallback** — ``target_files`` is empty OR every entry
+       is unclassifiable (e.g. ``.md`` / ``.yaml`` / binaries): scan the
+       ``approach`` text for UI keywords (case-insensitive, word-boundary
+       regex). Any hit → ``True``.
+    4. Else → ``False``.
+
+    Pure function. No filesystem IO. Used both inside ``PlanGenerator``
+    (stamps ``PlanResult.ui_affected``) and directly by the Visual VERIFY
+    trigger (Task 17) for ops that skipped planning.
+    """
+    # 1. Primary — frontend extension wins unconditionally.
+    for f in target_files:
+        if _ext(f) in _FRONTEND_EXTENSIONS:
+            return True
+
+    # 2. Structured-negative — if we have any classifiable evidence at
+    #    all, trust the structure and ignore the prose.
+    if target_files:
+        any_classifiable = any(_ext(f) in _CLASSIFIABLE_EXTENSIONS for f in target_files)
+        if any_classifiable:
+            return False
+
+    # 3. Secondary fallback — prose keyword scan.
+    if approach and _UI_APPROACH_KEYWORD_PATTERN.search(approach):
+        return True
+
+    # 4. No structured, no prose signal → not UI-affected.
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +245,7 @@ class PlanResult:
     __slots__ = (
         "plan_json", "approach", "complexity", "ordered_changes",
         "risk_factors", "test_strategy", "architectural_notes",
-        "planning_duration_s", "skipped", "skip_reason",
+        "planning_duration_s", "skipped", "skip_reason", "ui_affected",
     )
 
     def __init__(
@@ -138,6 +260,7 @@ class PlanResult:
         planning_duration_s: float = 0.0,
         skipped: bool = False,
         skip_reason: str = "",
+        ui_affected: bool = False,
     ) -> None:
         self.plan_json = plan_json
         self.approach = approach
@@ -149,6 +272,13 @@ class PlanResult:
         self.planning_duration_s = planning_duration_s
         self.skipped = skipped
         self.skip_reason = skip_reason
+        # Stamped deterministically by ``generate_plan`` via
+        # ``classify_ui_affected(ctx.target_files, result.approach)``.
+        # The parser and skipped_result paths leave this at ``False`` by
+        # default; the Visual VERIFY trigger (Task 17) re-runs the same
+        # classification on ``ctx.target_files`` directly for ops whose
+        # plan was skipped.
+        self.ui_affected = ui_affected
 
     @classmethod
     def skipped_result(cls, reason: str) -> "PlanResult":
@@ -262,6 +392,13 @@ class PlanGenerator:
             raw_response = await self._generator.plan(prompt, deadline)
             result = self._parse_plan_response(raw_response)
             result.planning_duration_s = time.monotonic() - t0
+
+            # Stamp the UI-affected classification from the structured
+            # target_files signal (primary) + approach prose (secondary
+            # fallback). Feeds the Visual VERIFY trigger downstream.
+            result.ui_affected = classify_ui_affected(
+                ctx.target_files, result.approach,
+            )
 
             # Validate plan coherence — planned files should overlap with targets
             self._validate_plan_coherence(ctx, result)
