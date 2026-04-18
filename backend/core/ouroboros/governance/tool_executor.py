@@ -647,6 +647,68 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"delegate", "read"}),
     ),
+    # ---- Phase 1 Subagents (dispatch_subagent Venom tool — gated by
+    #      JARVIS_SUBAGENT_DISPATCH_ENABLED, default false). Routes through
+    #      SubagentOrchestrator → AgenticExploreSubagent → returns structured
+    #      SubagentResult JSON. Distinct from delegate_to_agent: master-switch
+    #      gated, Iron Gate diversity-checked, supports parallel_scopes
+    #      fan-out via asyncio.TaskGroup, returns typed SubagentFindings. ----
+    "dispatch_subagent": ToolManifest(
+        name="dispatch_subagent", version="1.0",
+        description=(
+            "Spawn a read-only subagent to explore the codebase in its own "
+            "context. Use this when you need to understand a large area "
+            "before making changes — the subagent reads files, searches "
+            "code, and returns structured findings without polluting your "
+            "context. Can fan out in parallel across multiple scopes "
+            "(max 3 concurrent) via asyncio.TaskGroup. Phase 1 supports "
+            "subagent_type='explore' only; dispatch gated by "
+            "JARVIS_SUBAGENT_DISPATCH_ENABLED master switch. The subagent "
+            "is mathematically forbidden from mutations; Iron Gate enforces "
+            "a tool-diversity floor so shallow file-only exploration is "
+            "rejected rather than retried."
+        ),
+        arg_schema={
+            "subagent_type": {
+                "type": "string",
+                "enum": ["explore"],
+                "default": "explore",
+                "description": "Subagent kind (Phase 1: explore only).",
+            },
+            "goal": {
+                "type": "string",
+                "description": "1-2 sentence description of what to find.",
+            },
+            "target_files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "Repo-relative entry files (optional).",
+            },
+            "scope_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": (
+                    "Subtree scopes for parallel fan-out. When "
+                    "parallel_scopes>=2, one subagent per scope runs "
+                    "concurrently under a TaskGroup."
+                ),
+            },
+            "max_files": {"type": "integer", "default": 20},
+            "max_depth": {"type": "integer", "default": 3},
+            "timeout_s": {"type": "number", "default": 120.0},
+            "parallel_scopes": {
+                "type": "integer",
+                "default": 1,
+                "description": (
+                    "1 = single dispatch; >=2 = parallel fan-out "
+                    "(clamped to MAX_PARALLEL_SCOPES=3)."
+                ),
+            },
+        },
+        capabilities=frozenset({"subagent", "read"}),
+    ),
 }
 
 
@@ -1742,6 +1804,56 @@ class GoverningToolPolicy:
                 detail=f"MCP tool forwarded to external server: {name}",
             )
 
+        # Rule 0c: dispatch_subagent — Phase 1 Subagents.
+        # ALLOW when subagent_type is a known read-only class AND the master
+        # switch is on. The master-switch check is defence-in-depth: the
+        # orchestrator also raises SubagentDispatchDisabled, but we refuse
+        # the call at policy time so the tool round short-circuits and the
+        # subagent orchestrator never sees a dispatch while the switch is
+        # off. Phase 1 ships only the "explore" subagent type; "plan",
+        # "review", "research", "refactor" are reserved for Phases B/C and
+        # will be denied here with a specific reason until those phases land.
+        if name == "dispatch_subagent":
+            try:
+                from backend.core.ouroboros.governance.subagent_contracts import (
+                    subagent_dispatch_enabled,
+                )
+            except Exception:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.subagent_import_failed",
+                    detail="subagent_contracts module not importable",
+                )
+            subagent_type = str(call.arguments.get("subagent_type", "") or "").lower()
+            if subagent_type != "explore":
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.subagent_type_unsupported",
+                    detail=(
+                        f"subagent_type={subagent_type!r} not yet supported. "
+                        "Phase 1 ships only 'explore'; plan/review/research/"
+                        "refactor are reserved for Phases B/C."
+                    ),
+                )
+            if not subagent_dispatch_enabled():
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.subagent_dispatch_disabled",
+                    detail=(
+                        "JARVIS_SUBAGENT_DISPATCH_ENABLED is not 'true'. "
+                        "Phase 1 Subagents remain gated until battle-test "
+                        "graduation per Manifesto §6."
+                    ),
+                )
+            return PolicyResult(
+                decision=PolicyDecision.ALLOW,
+                reason_code="tool.allowed.subagent_explore",
+                detail=(
+                    "dispatch_subagent(type=explore) allowed: master switch "
+                    "on, read-only manifest enforced downstream."
+                ),
+            )
+
         # Rule 1: read_file — path must be within repo_root
         if name == "read_file":
             path_arg = call.arguments.get("path", "")
@@ -2057,7 +2169,8 @@ class AsyncProcessToolBackend:
                  _executor_instance: Optional["ToolExecutor"] = None,
                  approval_provider: Optional[Any] = None,
                  mcp_client: Optional[Any] = None,
-                 exploration_fleet: Optional[Any] = None) -> None:
+                 exploration_fleet: Optional[Any] = None,
+                 subagent_orchestrator: Optional[Any] = None) -> None:
         self._semaphore = semaphore
         self._executor_instance = _executor_instance
         self._approval_provider = approval_provider  # For ask_human tool
@@ -2067,6 +2180,13 @@ class AsyncProcessToolBackend:
         # because GovernedLoopService constructs the fleet AFTER the tool
         # backend (see governed_loop_service._build_components).
         self._exploration_fleet: Optional[Any] = exploration_fleet
+        # Phase 1 Subagents: SubagentOrchestrator reference for dispatch_subagent
+        # tool. Late-bindable via set_subagent_orchestrator() because
+        # GovernedLoopService constructs the orchestrator after the tool
+        # backend. Gated by JARVIS_SUBAGENT_DISPATCH_ENABLED master switch.
+        # When unset or dispatch is disabled, dispatch_subagent returns a
+        # POLICY_DENIED ToolResult with a clear error string.
+        self._subagent_orchestrator: Optional[Any] = subagent_orchestrator
         # Per-op ToolExecutor cache so instance-scoped state (``_files_read``,
         # ``_edit_history``) persists across calls *within* one op. Without
         # this, every execute_async() would create a fresh executor and the
@@ -2087,6 +2207,17 @@ class AsyncProcessToolBackend:
         backend in GovernedLoopService. Pass ``None`` to detach.
         """
         self._exploration_fleet = fleet
+
+    def set_subagent_orchestrator(self, orchestrator: Optional[Any]) -> None:
+        """Attach a SubagentOrchestrator for dispatch_subagent tool.
+
+        Late-bindable because the orchestrator is constructed after the
+        tool backend in GovernedLoopService. Pass ``None`` to detach.
+        Master switch JARVIS_SUBAGENT_DISPATCH_ENABLED still governs
+        whether dispatch succeeds — an attached orchestrator alone does
+        not enable dispatch.
+        """
+        self._subagent_orchestrator = orchestrator
 
     def _get_executor(
         self,
@@ -2151,13 +2282,15 @@ class AsyncProcessToolBackend:
             if call.name.startswith("mcp_") and self._mcp_client is not None:
                 return await self._run_mcp_tool(call, timeout, cap)
             # Async-native tools (web search, code exploration, ask_human,
-            # delegate_to_agent — Phase 2 sub-agent delegation)
+            # delegate_to_agent — Phase 2 sub-agent delegation,
+            # dispatch_subagent — Phase 1 subagent via SubagentOrchestrator)
             if call.name in (
                 "web_search",
                 "web_fetch",
                 "code_explore",
                 "ask_human",
                 "delegate_to_agent",
+                "dispatch_subagent",
             ):
                 return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
             return await self._run_sync_tool_async(
@@ -2325,6 +2458,15 @@ class AsyncProcessToolBackend:
                     call, policy_ctx, timeout, cap,
                 )
 
+            elif call.name == "dispatch_subagent":
+                # Phase 1 Subagents: route through SubagentOrchestrator →
+                # AgenticExploreSubagent. Gated by JARVIS_SUBAGENT_DISPATCH_ENABLED.
+                # Returns structured SubagentResult JSON with Iron Gate
+                # diversity enforcement and typed findings.
+                return await self._run_dispatch_subagent(
+                    call, policy_ctx, timeout, cap,
+                )
+
             return ToolResult(
                 tool_call=call, output=output[:cap],
                 status=ToolExecStatus.SUCCESS,
@@ -2487,6 +2629,134 @@ class AsyncProcessToolBackend:
             payload["total_files_explored"],
             payload["total_findings"],
             payload["duration_s"],
+        )
+        return ToolResult(
+            tool_call=call, output=output[:cap],
+            status=ToolExecStatus.SUCCESS,
+        )
+
+    async def _run_dispatch_subagent(
+        self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,
+    ) -> ToolResult:
+        """Execute a ``dispatch_subagent`` tool call — Phase 1 Step 3 wiring.
+
+        Routes through the wired SubagentOrchestrator (typically set via
+        ``set_subagent_orchestrator()`` during GovernedLoopService boot).
+        The orchestrator gates on the ``JARVIS_SUBAGENT_DISPATCH_ENABLED``
+        master switch; when off, dispatch raises SubagentDispatchDisabled
+        and we surface that as ``policy_denied`` status so the model
+        receives a clear signal that the tool is structurally disabled
+        rather than malformed.
+
+        All failure modes return a ``ToolResult`` — this method never raises.
+
+        Contract:
+          * Missing orchestrator → exec_error.
+          * Master switch off    → policy_denied.
+          * Invalid arguments    → exec_error (from SubagentRequest.from_args).
+          * Dispatch exception   → exec_error with exception class name.
+          * Success              → SUCCESS with JSON-serialized SubagentResult.
+        """
+        if self._subagent_orchestrator is None:
+            return ToolResult(
+                tool_call=call, output="",
+                error=(
+                    "dispatch_subagent: no SubagentOrchestrator wired. "
+                    "This tool requires GovernedLoopService to attach one "
+                    "via set_subagent_orchestrator()."
+                ),
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+
+        # Parse arguments into the typed request contract. Invalid shapes
+        # surface as clear error strings back to the model.
+        try:
+            from backend.core.ouroboros.governance.subagent_contracts import (
+                SubagentRequest,
+            )
+            request = SubagentRequest.from_args(call.arguments or {})
+        except (ValueError, TypeError) as exc:
+            return ToolResult(
+                tool_call=call, output="",
+                error=f"dispatch_subagent: invalid arguments: {exc}",
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(
+                tool_call=call, output="",
+                error=f"dispatch_subagent: {exc.__class__.__name__}: {exc}",
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+
+        # Build a minimal parent-context shim. The orchestrator only reads
+        # op_id, provider_name, cost_remaining_usd, pipeline_deadline.
+        # Step 4 will plumb the real OperationContext through; for now a
+        # SimpleNamespace with safe defaults is sufficient.
+        import types
+        parent_shim = types.SimpleNamespace(
+            op_id=policy_ctx.op_id,
+            provider_name="unknown",          # Step 4 plumbs real provider
+            cost_remaining_usd=float("inf"),  # Step 4 plumbs CostGovernor
+            pipeline_deadline=None,
+        )
+
+        # Dispatch. The orchestrator handles parallel fan-out, Iron Gate
+        # diversity rejection, cost attribution, and structured result
+        # construction. SubagentDispatchDisabled surfaces as policy_denied.
+        try:
+            from backend.core.ouroboros.governance.subagent_contracts import (
+                SubagentDispatchDisabled,
+            )
+            result = await asyncio.wait_for(
+                self._subagent_orchestrator.dispatch(parent_shim, request),
+                timeout=timeout,
+            )
+        except SubagentDispatchDisabled as exc:
+            return ToolResult(
+                tool_call=call, output="",
+                error=f"dispatch_subagent: master switch off: {exc}",
+                status=ToolExecStatus.POLICY_DENIED,
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                tool_call=call, output="",
+                error=(
+                    f"dispatch_subagent: exceeded tool-round timeout "
+                    f"({timeout:.1f}s) before subagent completed"
+                ),
+                status=ToolExecStatus.TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — defense in depth
+            return ToolResult(
+                tool_call=call, output="",
+                error=f"dispatch_subagent: {exc.__class__.__name__}: {exc}",
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+
+        # Serialize the structured result as JSON for the model. The
+        # orchestrator already applied truncated_for_prompt() so the
+        # payload respects MAX_FINDINGS_RETURNED, MAX_SUMMARY_CHARS,
+        # and MAX_EVIDENCE_CHARS_PER_FINDING.
+        try:
+            payload = result.to_dict()
+            output = json.dumps(payload, indent=2, sort_keys=True)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(
+                tool_call=call, output="",
+                error=f"dispatch_subagent: result serialization failed: {exc}",
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+
+        logger.info(
+            "[dispatch_subagent] op=%s sub=%s status=%s findings=%d "
+            "cost=$%.4f tool_calls=%d diversity=%d",
+            policy_ctx.op_id,
+            result.subagent_id,
+            result.status.value,
+            len(result.findings),
+            result.cost_usd,
+            result.tool_calls,
+            result.tool_diversity,
         )
         return ToolResult(
             tool_call=call, output=output[:cap],
