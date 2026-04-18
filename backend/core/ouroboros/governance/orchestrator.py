@@ -2608,6 +2608,48 @@ class GovernedOrchestrator:
                 _gen_timeout = _route_timeouts.get(
                     _route, self._config.generation_timeout_s
                 )
+                # Read-only BG/SPEC subagent fan-out override (Session 6,
+                # Derek 2026-04-17). The outer asyncio.wait_for at line
+                # below enforces this timeout absolutely — when the op
+                # is read-only and routed BG/SPEC, three parallel
+                # subagents can consume MAX_PARALLEL_SCOPES *
+                # PRIMARY_PROVIDER_TIMEOUT_S seconds of wall-clock before
+                # the parent Claude begins synthesis. 180s is the
+                # Session-5/6 killer. The cap-extension in candidate_
+                # generator._call_fallback is necessary but insufficient
+                # — this outer gate must also widen.
+                if (
+                    bool(getattr(ctx, "is_read_only", False))
+                    and _route in ("background", "speculative")
+                ):
+                    try:
+                        from backend.core.ouroboros.governance.subagent_contracts import (
+                            MAX_PARALLEL_SCOPES,
+                            PRIMARY_PROVIDER_TIMEOUT_S,
+                        )
+                        _fanout_budget_s = (
+                            MAX_PARALLEL_SCOPES * PRIMARY_PROVIDER_TIMEOUT_S
+                        )
+                    except Exception:
+                        _fanout_budget_s = 3 * 90  # Phase 1 Defaults
+                    _synthesis_reserve_s = float(os.environ.get(
+                        "JARVIS_GEN_TIMEOUT_READONLY_SYNTHESIS_RESERVE_S",
+                        "90",
+                    ))
+                    _gen_timeout_readonly = _gen_timeout + _fanout_budget_s + _synthesis_reserve_s
+                    # Allow operator override via dedicated env var.
+                    _gen_timeout_readonly = float(os.environ.get(
+                        "JARVIS_GEN_TIMEOUT_BACKGROUND_READONLY_S",
+                        str(_gen_timeout_readonly),
+                    ))
+                    logger.info(
+                        "[Orchestrator] Read-only %s route: extending "
+                        "gen_timeout %.0fs → %.0fs (fanout_budget=%.0fs, "
+                        "synthesis_reserve=%.0fs) op=%s",
+                        _route, _gen_timeout, _gen_timeout_readonly,
+                        _fanout_budget_s, _synthesis_reserve_s, ctx.op_id,
+                    )
+                    _gen_timeout = _gen_timeout_readonly
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=_gen_timeout
                 )
