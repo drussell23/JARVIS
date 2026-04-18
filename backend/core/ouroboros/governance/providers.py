@@ -3467,10 +3467,24 @@ class PrimeProvider:
             return raw_content
 
         # Complexity routing: skip Venom only for BACKGROUND/SPECULATIVE routes.
+        # EXCEPTION (Option A — Manifesto §1 Boundary Principle): read-only
+        # ops keep the tool loop enabled even on cost-optimized routes.
+        # Rule 0d already refuses every mutation tool under is_read_only=True,
+        # so there is no cost-escalation risk; meanwhile the entire value of
+        # a read-only op (cartography, gap analysis, call-graph survey) lives
+        # in the tool calls. Skipping tools on read-only BG ops would defeat
+        # the purpose and leave subagent dispatch structurally unreachable.
         _route = getattr(context, "provider_route", "")
-        _skip_tools = _route in ("background", "speculative")
+        _is_read_only = bool(getattr(context, "is_read_only", False))
+        _skip_tools = _route in ("background", "speculative") and not _is_read_only
         if _skip_tools:
             logger.info("[PrimeProvider] %s route — skipping Venom tool loop", _route)
+        elif _route in ("background", "speculative") and _is_read_only:
+            logger.info(
+                "[PrimeProvider] %s route + is_read_only=True — Venom tool "
+                "loop kept active (mutation tools refused by policy Rule 0d)",
+                _route,
+            )
 
         tool_records: tuple = ()
         venom_edits: Tuple[Dict[str, Any], ...] = ()
@@ -3487,7 +3501,7 @@ class PrimeProvider:
                 op_id=getattr(context, "op_id", ""),
                 deadline=deadline_mono,
                 risk_tier=getattr(context, "risk_tier", None),
-                is_read_only=bool(getattr(context, "is_read_only", False)),
+                is_read_only=_is_read_only,
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
@@ -5367,10 +5381,22 @@ class ClaudeProvider:
         # where cost optimization trumps capability. IMMEDIATE/STANDARD/COMPLEX
         # routes always get full Venom — Claude may need tools even for "trivial"
         # tasks (the model decides, not us).
+        # EXCEPTION (Option A): read-only ops keep the tool loop enabled. Rule
+        # 0d refuses mutation tools under the read-only contract, so there is
+        # no cost-escalation risk, and the tool loop is the only way for
+        # read-only cartography ops to produce useful output (dispatch_subagent,
+        # read_file, search_code, etc.).
         _route = getattr(context, "provider_route", "")
-        _skip_tools = _route in ("background", "speculative")
+        _is_read_only = bool(getattr(context, "is_read_only", False))
+        _skip_tools = _route in ("background", "speculative") and not _is_read_only
         if _skip_tools:
             logger.info("[ClaudeProvider] %s route — skipping Venom tool loop", _route)
+        elif _route in ("background", "speculative") and _is_read_only:
+            logger.info(
+                "[ClaudeProvider] %s route + is_read_only=True — Venom tool "
+                "loop kept active (mutation tools refused by policy Rule 0d)",
+                _route,
+            )
 
         tool_records: tuple = ()
         venom_edits: Tuple[Dict[str, Any], ...] = ()

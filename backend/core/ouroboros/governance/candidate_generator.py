@@ -115,6 +115,27 @@ _FALLBACK_MIN_GUARANTEED_S = float(
 )
 
 # ---------------------------------------------------------------------------
+# Nervous System Reflex — BACKGROUND cascade for read-only ops
+# ---------------------------------------------------------------------------
+#
+# Manifesto §5: "Intelligence-driven routing", but survival and execution
+# speed permanently supersede cost optimization. For read-only ops on the
+# BACKGROUND route we sever the DW thread on a strict temporal budget and
+# cascade to Claude — regardless of topology skip_and_queue flags or the
+# JARVIS_BACKGROUND_ALLOW_FALLBACK gate that gates the same reflex for
+# mutating BG ops.
+#
+# Cost safety is preserved by the upstream is_read_only contract:
+#   * policy Rule 0d refuses every mutating tool under is_read_only=True
+#   * orchestrator short-circuits APPLY on read-only ops
+# so a Claude cascade under is_read_only carries no write risk; it only
+# loses cost optimality, which the Nervous System Reflex explicitly
+# trades against lockup avoidance.
+_BG_READONLY_DW_STALL_BUDGET_S = float(
+    os.environ.get("JARVIS_BG_DW_STALL_BUDGET_S", "60"),
+)
+
+# ---------------------------------------------------------------------------
 # Route-scoped Claude fallback disable (isolation harnesses)
 # ---------------------------------------------------------------------------
 #
@@ -1140,6 +1161,37 @@ class CandidateGenerator:
             _block_reason = _topology.reason_for_route(_provider_route)
             _block_mode = _topology.block_mode_for_route(_provider_route)
             if _block_mode == "skip_and_queue":
+                # Nervous System Reflex (Manifesto §5 — survival supersedes
+                # cost optimization): read-only ops MUST NOT lock up on a
+                # paused DW endpoint. When the topology has skipped DW on
+                # BACKGROUND, cascade straight to Claude for the read-only
+                # op instead of raising skip_and_queue. The is_read_only
+                # contract (Rule 0d + APPLY short-circuit) makes this
+                # structurally safe: no mutation can happen, so the cost
+                # of the Claude call is bounded and observable.
+                _is_read_only = bool(
+                    getattr(context, "is_read_only", False)
+                )
+                if (
+                    _is_read_only
+                    and _provider_route == "background"
+                    and self._fallback is not None
+                ):
+                    logger.info(
+                        "[CandidateGenerator] Nervous-System Reflex: BG "
+                        "topology skip_and_queue bypassed for read-only op "
+                        "— cascading to Claude (reason=%s) [%s]",
+                        _block_reason,
+                        getattr(context, "op_id", "?")[:16],
+                    )
+                    try:
+                        return await self._call_fallback(context, deadline)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"background_fallback_failed:"
+                            f"topology_skip_read_only_cascade:"
+                            f"{type(exc).__name__}:{str(exc)[:80]}"
+                        ) from exc
                 logger.info(
                     "[CandidateGenerator] Topology block: route=%s "
                     "block_mode=skip_and_queue reason=%s — skipping "
@@ -1752,6 +1804,7 @@ class CandidateGenerator:
         """
         _urgency = getattr(context, "signal_urgency", "?")
         _source = getattr(context, "signal_source", "?")
+        _is_read_only = bool(getattr(context, "is_read_only", False))
         remaining = self._remaining_seconds(deadline)
 
         _force_claude = os.environ.get(
@@ -1760,6 +1813,12 @@ class CandidateGenerator:
         _allow_fallback = os.environ.get(
             "JARVIS_BACKGROUND_ALLOW_FALLBACK", "",
         ).strip().lower() in {"1", "true", "yes", "on"}
+        # Nervous System Reflex: read-only ops ALWAYS get the Claude cascade
+        # on DW failure, regardless of the env gate. Locking a read-only
+        # cartography op onto a paused DW endpoint is the exact failure
+        # mode that prompted this reflex (bt-2026-04-18-032820).
+        if _is_read_only and self._fallback is not None:
+            _allow_fallback = True
 
         # ── FORCE_CLAUDE_BACKGROUND bypass ─────────────────────────────
         # Skip DW entirely and route straight to Claude. No DW attempt,
@@ -1786,9 +1845,12 @@ class CandidateGenerator:
 
         logger.info(
             "[CandidateGenerator] BACKGROUND route: DW primary%s "
-            "(urgency=%s, source=%s) [%.1fs budget]",
+            "(urgency=%s, source=%s, read_only=%s) [%.1fs budget"
+            "%s]",
             " + Claude cascade" if _allow_fallback else " (no Claude cascade)",
-            _urgency, _source, remaining,
+            _urgency, _source, _is_read_only, remaining,
+            f", DW stall budget={_BG_READONLY_DW_STALL_BUDGET_S:.0f}s"
+            if _is_read_only else "",
         )
 
         # Phase 3 Scope α — J-Prime primacy pre-check. Returns
@@ -1825,7 +1887,17 @@ class CandidateGenerator:
         # DW cap here and the urgency_router's max_dw_wait_s for
         # BACKGROUND must agree — both tightened to 150s when fallback
         # is enabled.
-        _dw_cap = 150.0 if _allow_fallback else 180.0
+        #
+        # Nervous-System Reflex: read-only ops get a MUCH tighter DW
+        # stall budget (default 60s via JARVIS_BG_DW_STALL_BUDGET_S)
+        # so lockup is bounded. The Trinity cartography op is the
+        # canonical case — it needs to reach the tool loop quickly so
+        # dispatch_subagent can fan out; spending 150s on a stalled DW
+        # stream is dead time the subagent fleet will never recover.
+        if _is_read_only:
+            _dw_cap = _BG_READONLY_DW_STALL_BUDGET_S
+        else:
+            _dw_cap = 150.0 if _allow_fallback else 180.0
         _dw_timeout = min(remaining, _dw_cap)
         _dw_error: Optional[str] = None
 
