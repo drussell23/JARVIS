@@ -678,7 +678,35 @@ class BackgroundAgentPool:
                         )
                     except Exception:
                         _target_file_count = 0
-                    if _target_file_count >= 4:
+                    # Read-only subagent fan-out override (Session 7,
+                    # Derek 2026-04-17). Read-only cartography ops
+                    # dispatch MAX_PARALLEL_SCOPES subagents each
+                    # consuming PRIMARY_PROVIDER_TIMEOUT_S wall-clock,
+                    # then the parent Claude synthesizes findings. This
+                    # burns well past the 360s base ceiling even with
+                    # only 3 target files. Without this branch the
+                    # pool worker cancels the op mid-synthesis and
+                    # surfaces as `fallback_err_class=CancelledError`
+                    # with 342s of nominal budget still remaining
+                    # (Session 7 bt-2026-04-18-043443). Precedence is
+                    # read-only > complex > base so file-count-based
+                    # complex heuristic doesn't mask a read-only
+                    # fan-out profile.
+                    _is_read_only = bool(
+                        getattr(op.context, "is_read_only", False)
+                    )
+                    if _is_read_only:
+                        _op_timeout_s = float(os.environ.get(
+                            "JARVIS_BG_WORKER_OP_TIMEOUT_READONLY_S", "900",
+                        ))
+                        logger.info(
+                            "Worker %d: %s read-only ceiling %.0fs "
+                            "(file_count=%d, base=%.0fs) — subagent "
+                            "fan-out + synthesis profile",
+                            worker_id, op.op_id, _op_timeout_s,
+                            _target_file_count, _op_timeout_base_s,
+                        )
+                    elif _target_file_count >= 4:
                         _op_timeout_s = float(os.environ.get(
                             "JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S", "900",
                         ))
