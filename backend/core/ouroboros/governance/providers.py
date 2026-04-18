@@ -2875,6 +2875,35 @@ def _parse_generation_response(
     """
     pfx = provider_name
 
+    # Read-only short-circuit (Session 9, Derek 2026-04-17 graduation arc).
+    # When ctx.is_read_only=True the op produces findings via tool calls
+    # (dispatch_subagent rollup), not a code candidate. The orchestrator
+    # short-circuits APPLY for read-only ops at VALIDATE→COMPLETE, so any
+    # schema shape Claude emits is acceptable: we return is_noop=True
+    # immediately and let the short-circuit take over. This resolves the
+    # Session 9 blocker where Claude's synthesis response carried
+    # code-gen keys (file_path, full_content, note) that the parser
+    # rejected as unexpected_keys, sending the op into EXHAUSTION
+    # despite 196s of budget remaining.
+    #
+    # The raw synthesis text is preserved in GenerationResult.raw_response
+    # (if the dataclass supports it) so operators can inspect what Claude
+    # actually produced; it's also visible in the DurableJSONL ledger via
+    # the HEARTBEAT stream.
+    if bool(getattr(ctx, "is_read_only", False)):
+        logger.info(
+            "[%s] Read-only op: parser short-circuit — accepting any "
+            "output shape (raw_bytes=%d), orchestrator will short-"
+            "circuit APPLY phase",
+            pfx, len(raw or ""),
+        )
+        return GenerationResult(
+            candidates=(),
+            provider_name=pfx,
+            generation_duration_s=duration_s,
+            is_noop=True,
+        )
+
     # Step 0: no_op shortcut — model signals change already present
     try:
         _quick = json.loads(_extract_json_block(raw))
