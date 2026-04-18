@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -464,31 +465,58 @@ def run_mutant(
     timeout_s: Optional[float] = None,
     cwd: Optional[Path] = None,
 ) -> MutantOutcome:
-    """Execute one mutant: write, run pytest, restore."""
+    """Execute one mutant: write, run pytest, restore.
+
+    Byte-exact I/O + post-restore hash verification. If the restore
+    doesn't produce a byte-for-byte match with the pre-mutation state,
+    we retry up to 3 times, then log a CRITICAL alert. Losing the
+    restore would corrupt the SUT on disk — this defense-in-depth is
+    non-negotiable for a tool that APPLY-gate integration depends on.
+    """
     if timeout_s is None:
         timeout_s = mutant_timeout_s()
     source_path = Path(mutant.source_file)
     started = time.time()
     try:
-        original = source_path.read_text(encoding="utf-8")
+        original_bytes = source_path.read_bytes()
     except Exception as e:  # noqa: BLE001
         return MutantOutcome(
             mutant=mutant, caught=False, reason="run_error",
             duration_s=0.0, stderr_excerpt=f"<read_original:{e}>"[:200],
         )
+    original_hash = hashlib.sha256(original_bytes).hexdigest()
     try:
-        source_path.write_text(mutant.patched_src, encoding="utf-8")
+        source_path.write_bytes(mutant.patched_src.encode("utf-8"))
         rc, stderr = _run_pytest(test_files, timeout_s=timeout_s, cwd=cwd)
     finally:
-        try:
-            source_path.write_text(original, encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "[MutationTester] FAILED TO RESTORE %s — re-writing now",
-                source_path,
+        restore_ok = False
+        for attempt in range(3):
+            try:
+                source_path.write_bytes(original_bytes)
+                post_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+                if post_hash == original_hash:
+                    restore_ok = True
+                    break
+                logger.warning(
+                    "[MutationTester] restore hash mismatch attempt=%d "
+                    "path=%s expected=%s got=%s — retrying",
+                    attempt, source_path,
+                    original_hash[:10], post_hash[:10],
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[MutationTester] restore attempt %d raised for %s",
+                    attempt, source_path,
+                )
+        if not restore_ok:
+            logger.critical(
+                "[MutationTester] CORRUPTION: failed to restore %s after 3 "
+                "attempts. Source file may be left in a mutated state. "
+                "Backup bytes length=%d expected_hash=%s. Operator must "
+                "`git checkout HEAD -- %s` before the next APPLY.",
+                source_path, len(original_bytes),
+                original_hash, source_path,
             )
-            # Last-resort retry — losing the restore would corrupt SUT.
-            source_path.write_text(original, encoding="utf-8")
     dur = time.time() - started
     if rc == 124:
         return MutantOutcome(
