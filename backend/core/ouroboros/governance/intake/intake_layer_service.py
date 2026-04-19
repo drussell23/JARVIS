@@ -686,9 +686,26 @@ class IntakeLayerService:
                 from backend.core.ouroboros.governance.intake.sensors.vision_sensor import (
                     VisionSensor,
                 )
+                # Build the Tier 2 VLM callable via the adapter.
+                # Default: stub (boot-path wiring only, no real calls).
+                # Operator flips ``JARVIS_VISION_VLM_MODE=doubleword`` at
+                # Slice 2 graduation to engage real Qwen3-VL-235B.
+                try:
+                    from backend.core.ouroboros.governance.vision_vlm_adapter import (
+                        make_sensor_vlm_fn,
+                    )
+                    _vlm_fn = make_sensor_vlm_fn()
+                except Exception as exc:
+                    logger.warning(
+                        "[IntakeLayer] VLM adapter construction failed: %s "
+                        "— VisionSensor will run Tier 1 only",
+                        exc,
+                    )
+                    _vlm_fn = None
                 _vision_sensor = VisionSensor(
                     router=self._router,
                     repo="jarvis",
+                    vlm_fn=_vlm_fn,
                 )
                 self._sensors.append(_vision_sensor)
                 self._vision_sensor = _vision_sensor
