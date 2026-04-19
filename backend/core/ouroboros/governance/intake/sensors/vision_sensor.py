@@ -134,6 +134,7 @@ class VisionSensorStats:
     dropped_hash_dedup: int = 0
     dropped_no_match: int = 0
     dropped_ferrari_absent: int = 0
+    dropped_schema_malformed: int = 0
     signals_emitted: int = 0
     degraded_ticks: int = 0
     frames_retained: int = 0
@@ -287,7 +288,10 @@ class VisionSensor:
         self._frame_ttl_s = float(
             frame_ttl_s if frame_ttl_s is not None else _DEFAULT_FRAME_TTL_S
         )
-        self._last_ttl_purge_monotonic: float = 0.0
+        # ``None`` sentinel (not 0.0) mirrors ``_last_degraded_log`` —
+        # ``time.monotonic()`` can be small on recently-started processes
+        # and a zero initializer would skip the first purge opportunity.
+        self._last_ttl_purge_monotonic: Optional[float] = None
 
         # Shutdown hooks (atexit + SIGTERM). Opt-out for tests so each
         # test fixture doesn't leak a permanent atexit entry or clobber
@@ -362,22 +366,35 @@ class VisionSensor:
         retained_path = self._retain_frame(frame)
         evidence_frame_path = retained_path or frame.frame_path
 
-        # Build schema v1 evidence — raises if any field is malformed,
-        # which the orchestrator would treat as a sensor bug. Preferred
-        # over silent defaults per Invariant I1.
-        evidence = build_vision_signal_evidence(
-            frame_hash=frame.dhash,
-            frame_ts=frame.ts,
-            frame_path=evidence_frame_path,
-            classifier_verdict=verdict_meta["classifier_verdict"],
-            classifier_model="deterministic",
-            classifier_confidence=1.0,
-            deterministic_matches=tuple(matched),
-            ocr_snippet=_truncate_snippet(ocr_text),
-            severity=verdict_meta["severity"],
-            app_id=frame.app_id,
-            window_id=frame.window_id,
-        )
+        # Build schema v1 evidence. ``build_vision_signal_evidence``
+        # raises ``ValueError`` on any I1 violation (negative ts, bad
+        # hash format, etc.) — Ferrari could in principle produce a
+        # malformed sidecar (bug, schema drift, corruption). We fail
+        # **closed** rather than loud: drop the frame, bump a counter,
+        # never raise past the sensor boundary. The orchestrator sees
+        # "no signal" which is the safe failure mode.
+        try:
+            evidence = build_vision_signal_evidence(
+                frame_hash=frame.dhash,
+                frame_ts=frame.ts,
+                frame_path=evidence_frame_path,
+                classifier_verdict=verdict_meta["classifier_verdict"],
+                classifier_model="deterministic",
+                classifier_confidence=1.0,
+                deterministic_matches=tuple(matched),
+                ocr_snippet=_truncate_snippet(ocr_text),
+                severity=verdict_meta["severity"],
+                app_id=frame.app_id,
+                window_id=frame.window_id,
+            )
+        except ValueError as exc:
+            self.stats.dropped_schema_malformed += 1
+            logger.debug(
+                "[VisionSensor] dropped frame with malformed evidence "
+                "(dhash=%s): %s",
+                frame.dhash, exc,
+            )
+            return None
 
         signature = (
             f"vision:{verdict_meta['classifier_verdict']}:"
@@ -723,7 +740,10 @@ class VisionSensor:
         if self._frame_ttl_s <= 0:
             return
         now = time.monotonic()
-        if (now - self._last_ttl_purge_monotonic) < _TTL_PURGE_INTERVAL_S:
+        if (
+            self._last_ttl_purge_monotonic is not None
+            and (now - self._last_ttl_purge_monotonic) < _TTL_PURGE_INTERVAL_S
+        ):
             return
         self._last_ttl_purge_monotonic = now
         try:
