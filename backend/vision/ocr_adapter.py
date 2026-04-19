@@ -62,6 +62,7 @@ def _load_vision_framework() -> bool:
             VNImageRequestHandler,
             VNRecognizeTextRequest,
             VNRequestTextRecognitionLevelFast,
+            VNRequestTextRecognitionLevelAccurate,
         )
         _vision_modules.update({
             "NSURL": NSURL,
@@ -70,6 +71,7 @@ def _load_vision_framework() -> bool:
             "VNImageRequestHandler": VNImageRequestHandler,
             "VNRecognizeTextRequest": VNRecognizeTextRequest,
             "VNRequestTextRecognitionLevelFast": VNRequestTextRecognitionLevelFast,
+            "VNRequestTextRecognitionLevelAccurate": VNRequestTextRecognitionLevelAccurate,
         })
         _VISION_AVAILABLE = True
     except ImportError as exc:
@@ -114,12 +116,20 @@ def recognize_text(frame_path: str) -> str:
             return ""
 
         request = mods["VNRecognizeTextRequest"].alloc().init()
-        # Fast mode: typical 50-150ms warm vs 200-500ms for Accurate.
-        # Tier 1 regex matches (traceback/panic/segfault) are unambiguous
-        # tokens that don't benefit from high-accuracy OCR.
-        request.setRecognitionLevel_(
-            mods["VNRequestTextRecognitionLevelFast"],
+        # Recognition level: Accurate by default (~700ms/frame warm) vs Fast
+        # (~100ms/frame). Accurate is required for sparse-text screens
+        # (e.g., a traceback in the top-left of an otherwise-black terminal
+        # window) — empirically Fast mode silently drops such regions. The
+        # VisionSensor's adaptive 1-8s scan cadence accommodates the extra
+        # latency with ample headroom (§3 Disciplined Concurrency).
+        # Env tunable for offline/batch use cases: JARVIS_VISION_OCR_LEVEL=fast
+        _level_name = os.environ.get("JARVIS_VISION_OCR_LEVEL", "accurate").strip().lower()
+        _level_key = (
+            "VNRequestTextRecognitionLevelFast"
+            if _level_name == "fast"
+            else "VNRequestTextRecognitionLevelAccurate"
         )
+        request.setRecognitionLevel_(mods[_level_key])
         request.setUsesLanguageCorrection_(False)
 
         handler = mods["VNImageRequestHandler"].alloc().initWithCGImage_options_(
