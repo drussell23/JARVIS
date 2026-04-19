@@ -199,14 +199,28 @@ def test_truncate_snippet_empty_safe():
 
 @pytest.fixture
 def sensor():
-    """Plain sensor with no OCR and no router side-effect."""
-    return VisionSensor(router=_StubRouter(), ocr_fn=None)
+    """Plain sensor with no OCR and no router side-effect.
+
+    ``finding_cooldown_s=0.0`` so Task 11's repeat-shape suppression
+    doesn't interfere with Tier 0 / Tier 1 unit tests — those exercise
+    dedup + regex, not the policy layer.
+    """
+    return VisionSensor(
+        router=_StubRouter(), ocr_fn=None, finding_cooldown_s=0.0,
+    )
 
 
 @pytest.fixture
 def sensor_with_ocr():
-    """Sensor whose OCR returns whatever callable is patched in."""
-    return VisionSensor(router=_StubRouter(), ocr_fn=lambda _p: "")
+    """Sensor whose OCR returns whatever callable is patched in.
+
+    Same ``finding_cooldown_s=0.0`` rationale as :func:`sensor`.
+    """
+    return VisionSensor(
+        router=_StubRouter(),
+        ocr_fn=lambda _p: "",
+        finding_cooldown_s=0.0,
+    )
 
 
 @pytest.mark.asyncio
@@ -238,7 +252,8 @@ async def test_tier0_dedup_expires_after_cooldown(monkeypatch):
     s = VisionSensor(
         router=_StubRouter(),
         ocr_fn=lambda _p: "Traceback (most recent call last):",
-        hash_cooldown_s=0.01,   # expire almost immediately
+        hash_cooldown_s=0.01,     # expire almost immediately
+        finding_cooldown_s=0.0,   # disable Task 11 cooldown for this Tier 0 test
     )
     f = _make_frame(dhash="bbbbbbbbbbbbbbbb")
     first = await s._ingest_frame(f)
