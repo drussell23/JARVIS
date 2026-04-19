@@ -734,10 +734,24 @@ class IntakeLayerService:
                         exc,
                     )
                     _vlm_fn = None
+                # Wire the macOS Vision OCR adapter so Tier 1 regex has
+                # actual screen text to match. Without this, scan_once
+                # reaches ``skipped: no_regex_match ocr_chars=0`` on every
+                # frame and the sensor is structurally blind.
+                try:
+                    from backend.vision.ocr_adapter import recognize_text as _ocr_fn
+                except Exception as exc:
+                    logger.warning(
+                        "[IntakeLayer] OCR adapter unavailable: %s "
+                        "— VisionSensor will be Tier 1 blind",
+                        exc,
+                    )
+                    _ocr_fn = None
                 _vision_sensor = VisionSensor(
                     router=self._router,
                     repo="jarvis",
                     vlm_fn=_vlm_fn,
+                    ocr_fn=_ocr_fn,
                 )
                 self._sensors.append(_vision_sensor)
                 self._vision_sensor = _vision_sensor
