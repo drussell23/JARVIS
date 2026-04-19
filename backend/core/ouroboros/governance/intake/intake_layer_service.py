@@ -23,6 +23,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("Ouroboros.IntakeLayer")
 
+
+def _sensor_disabled(env_name: str) -> bool:
+    """Return True if ``JARVIS_{env_name}_ENABLED`` is explicitly falsy.
+
+    Default: enabled (backward-compatible — absent or any truthy value keeps
+    the sensor registered). Used to isolate individual sensors for targeted
+    graduation testing without having to modify registration structure.
+    Accepts the usual set of falsy strings: ``0``/``false``/``no``/``off``.
+    """
+    raw = os.environ.get(f"JARVIS_{env_name}_ENABLED", "true").strip().lower()
+    return raw in {"0", "false", "no", "off"}
+
+
 # ---------------------------------------------------------------------------
 # IntakeServiceState
 # ---------------------------------------------------------------------------
@@ -437,6 +450,13 @@ class IntakeLayerService:
                 )
             ]
 
+        if _sensor_disabled("OPPORTUNITY_MINER_SENSOR"):
+            logger.info(
+                "[IntakeLayer] OpportunityMinerSensor disabled via "
+                "JARVIS_OPPORTUNITY_MINER_SENSOR_ENABLED=false"
+            )
+            miner_sensors = []
+
         # VoiceCommandSensor has no start/stop lifecycle; store as attribute only.
         # Wire UserSignalBus so "JARVIS stop" voice commands trigger FSM preemption.
         _signal_bus = getattr(self._gls, "_user_signal_bus", None)
@@ -484,31 +504,37 @@ class IntakeLayerService:
         # Autonomously monitors Python runtime EOL, dependency staleness,
         # security advisories, and legacy compat shims. Deterministic detection,
         # agentic remediation via Ouroboros pipeline.
-        try:
-            from backend.core.ouroboros.governance.intake.sensors.runtime_health_sensor import (
-                RuntimeHealthSensor,
+        if _sensor_disabled("RUNTIME_HEALTH_SENSOR"):
+            logger.info(
+                "[IntakeLayer] RuntimeHealthSensor disabled via "
+                "JARVIS_RUNTIME_HEALTH_SENSOR_ENABLED=false"
             )
-            _health_poll_s = float(
-                os.environ.get("JARVIS_RUNTIME_HEALTH_INTERVAL_S", "86400")
-            )
-            if enabled_repos:
-                for rc in enabled_repos:
+        else:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.runtime_health_sensor import (
+                    RuntimeHealthSensor,
+                )
+                _health_poll_s = float(
+                    os.environ.get("JARVIS_RUNTIME_HEALTH_INTERVAL_S", "86400")
+                )
+                if enabled_repos:
+                    for rc in enabled_repos:
+                        _health_sensor = RuntimeHealthSensor(
+                            repo=rc.name,
+                            router=self._router,
+                            poll_interval_s=_health_poll_s,
+                        )
+                        self._sensors.append(_health_sensor)
+                else:
                     _health_sensor = RuntimeHealthSensor(
-                        repo=rc.name,
+                        repo="jarvis",
                         router=self._router,
                         poll_interval_s=_health_poll_s,
                     )
                     self._sensors.append(_health_sensor)
-            else:
-                _health_sensor = RuntimeHealthSensor(
-                    repo="jarvis",
-                    router=self._router,
-                    poll_interval_s=_health_poll_s,
-                )
-                self._sensors.append(_health_sensor)
-            logger.info("[IntakeLayer] RuntimeHealthSensor added (autonomous dependency monitoring)")
-        except Exception as exc:
-            logger.debug("[IntakeLayer] RuntimeHealthSensor skipped: %s", exc)
+                logger.info("[IntakeLayer] RuntimeHealthSensor added (autonomous dependency monitoring)")
+            except Exception as exc:
+                logger.debug("[IntakeLayer] RuntimeHealthSensor skipped: %s", exc)
 
         # ---- WebIntelligenceSensor (P1: proactive CVE/advisory monitoring) ----
         try:
@@ -567,22 +593,28 @@ class IntakeLayerService:
             logger.debug("[IntakeLayer] DocStalenessSensor skipped: %s", exc)
 
         # ---- GitHubIssueSensor (auto-resolve issues across Trinity repos) ----
-        try:
-            from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
-                GitHubIssueSensor,
+        if _sensor_disabled("GITHUB_ISSUE_SENSOR"):
+            logger.info(
+                "[IntakeLayer] GitHubIssueSensor disabled via "
+                "JARVIS_GITHUB_ISSUE_SENSOR_ENABLED=false"
             )
-            _gh_poll_s = float(
-                os.environ.get("JARVIS_GITHUB_ISSUE_INTERVAL_S", "3600")
-            )
-            _gh_sensor = GitHubIssueSensor(
-                repo="jarvis",
-                router=self._router,
-                poll_interval_s=_gh_poll_s,
-            )
-            self._sensors.append(_gh_sensor)
-            logger.info("[IntakeLayer] GitHubIssueSensor added (Trinity issue auto-resolution)")
-        except Exception as exc:
-            logger.debug("[IntakeLayer] GitHubIssueSensor skipped: %s", exc)
+        else:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                    GitHubIssueSensor,
+                )
+                _gh_poll_s = float(
+                    os.environ.get("JARVIS_GITHUB_ISSUE_INTERVAL_S", "3600")
+                )
+                _gh_sensor = GitHubIssueSensor(
+                    repo="jarvis",
+                    router=self._router,
+                    poll_interval_s=_gh_poll_s,
+                )
+                self._sensors.append(_gh_sensor)
+                logger.info("[IntakeLayer] GitHubIssueSensor added (Trinity issue auto-resolution)")
+            except Exception as exc:
+                logger.debug("[IntakeLayer] GitHubIssueSensor skipped: %s", exc)
 
         # ---- ProactiveExplorationSensor (P3: curiosity-driven domain exploration) ----
         try:
