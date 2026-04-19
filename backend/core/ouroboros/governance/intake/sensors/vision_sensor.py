@@ -582,15 +582,8 @@ class VisionSensor:
         self._fp_budget: float = (
             _DEFAULT_FP_BUDGET if fp_budget is None else float(fp_budget)
         )
-        # !!! REVERT-BEFORE-COMMIT !!! Slice 1 battle-test session override
-        # (operator directive 2026-04-18): when no explicit window is passed
-        # (runtime/intake path), tighten to 3 so a 2-of-3 rejection burst
-        # deterministically trips fp_budget_exhausted in the edge-case probe.
-        # Tests pass explicit fp_window_size and are untouched. Remove this
-        # branch + restore _DEFAULT_FP_WINDOW_SIZE before the next
-        # AutoCommitter sweep or the change will be pushed to origin/main.
         self._fp_window_size: int = (
-            3 if fp_window_size is None else int(fp_window_size)
+            _DEFAULT_FP_WINDOW_SIZE if fp_window_size is None else int(fp_window_size)
         )
         self._finding_cooldown_s: float = (
             _DEFAULT_FINDING_COOLDOWN_S
