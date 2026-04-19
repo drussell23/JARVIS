@@ -130,6 +130,34 @@ _DEFAULT_CHAIN_MAX = int(os.environ.get("JARVIS_VISION_CHAIN_MAX", "1"))
 _DEFAULT_PENALTY_S = float(os.environ.get("JARVIS_VISION_SENSOR_PENALTY_S", "300"))
 _CONSECUTIVE_FAILURES_PAUSE_THRESHOLD = 3
 
+# Tier 2 VLM classifier settings (spec §Sensor Contract Tier 2 + Task 15).
+_DEFAULT_TIER2_ENABLED = os.environ.get(
+    "JARVIS_VISION_SENSOR_TIER2_ENABLED", "false",
+).strip().lower() in ("1", "true", "yes", "on")
+# Default cost per VLM call (Qwen3-VL-235B pricing).
+_DEFAULT_TIER2_COST_USD = float(
+    os.environ.get("JARVIS_VISION_TIER2_COST_USD", "0.005"),
+)
+# Daily cost cap per §Cost / Latency Envelope.
+_DEFAULT_DAILY_COST_CAP_USD = float(
+    os.environ.get("JARVIS_VISION_DAILY_COST_CAP_USD", "1.00"),
+)
+# Confidence threshold below which severity downgrades to info.
+_DEFAULT_MIN_CONFIDENCE = float(
+    os.environ.get("JARVIS_VISION_SENSOR_MIN_CONFIDENCE", "0.70"),
+)
+# Cost ledger path — one per working directory.
+_DEFAULT_COST_LEDGER_PATH = ".jarvis/vision_cost_ledger.json"
+# Cascade thresholds per §Cost / Latency Envelope.
+_COST_DOWNSHIFT_THRESHOLD = 0.80   # Tier 2 VLM skipped; Tier 1 still runs
+_COST_PAUSE_THRESHOLD = 0.95       # entire sensor pauses
+
+# VLM classifier recognised verdicts.
+_VLM_VERDICTS_EMIT: frozenset = frozenset(
+    {"bug_visible", "error_visible", "unclear"},
+)
+_VLM_VERDICT_OK = "ok"             # drop — no signal emitted
+
 # ---------------------------------------------------------------------------
 # T1 / T2 defenses — prompt injection + credential + app denylist
 # ---------------------------------------------------------------------------
@@ -186,6 +214,7 @@ PAUSE_REASON_FP_BUDGET = "fp_budget_exhausted"
 PAUSE_REASON_CHAIN_CAP = "chain_cap_exhausted"
 PAUSE_REASON_CONSECUTIVE_FAILURES = "consecutive_failures"
 PAUSE_REASON_MANUAL = "manual"
+PAUSE_REASON_COST_CAP = "cost_cap_exhausted"
 # Pauses that time out automatically (wall-clock deadline).
 _AUTO_EXPIRING_PAUSE_REASONS = frozenset({PAUSE_REASON_CONSECUTIVE_FAILURES})
 
@@ -223,6 +252,18 @@ class VisionSensorStats:
     consecutive_failures: int = 0
     pause_events: int = 0
     chain_starts: int = 0
+    # Tier 2 / cost counters
+    tier2_calls: int = 0
+    tier2_ok_dropped: int = 0               # VLM verdict=ok → no signal
+    tier2_signals: int = 0                  # VLM-emitted signals
+    tier2_skipped_disabled: int = 0
+    tier2_skipped_tier1_matched: int = 0
+    tier2_skipped_cost_downshift: int = 0
+    tier2_skipped_dhash_dedup: int = 0
+    tier2_exceptions: int = 0
+    tier2_confidence_downgrades: int = 0
+    cost_usd_today: float = 0.0
+    cost_pause_events: int = 0
 
 
 @dataclass(frozen=True)
@@ -288,6 +329,17 @@ def _truncate_snippet(text: str, *, max_len: int = _OCR_SNIPPET_LEN) -> str:
     if not text:
         return ""
     return text[:max_len]
+
+
+def _utc_date_iso() -> str:
+    """Return today's date in ``YYYY-MM-DD`` form in UTC.
+
+    The cost ledger uses this for UTC-midnight rollover: a ledger
+    whose ``utc_date`` differs from the current call's result is stale
+    and its spend resets to zero.
+    """
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def _ocr_has_credential_shape(text: str) -> bool:
@@ -452,6 +504,12 @@ class VisionSensor:
         finding_cooldown_s: Optional[float] = None,
         chain_max: Optional[int] = None,
         penalty_s: Optional[float] = None,
+        vlm_fn: Optional[Callable[[str], Dict[str, Any]]] = None,
+        tier2_enabled: Optional[bool] = None,
+        tier2_cost_usd: Optional[float] = None,
+        daily_cost_cap_usd: Optional[float] = None,
+        min_confidence: Optional[float] = None,
+        cost_ledger_path: Optional[str] = None,
     ) -> None:
         self._router = router
         self._repo = repo
@@ -553,6 +611,44 @@ class VisionSensor:
         # consecutive failure count) if it exists.
         self._load_ledger()
 
+        # ------------------------------------------------------------------
+        # Tier 2 VLM classifier (Task 15 — Slice 2)
+        # ------------------------------------------------------------------
+        self._vlm_fn = vlm_fn
+        self._tier2_enabled: bool = (
+            _DEFAULT_TIER2_ENABLED if tier2_enabled is None else bool(tier2_enabled)
+        )
+        self._tier2_cost_usd: float = (
+            _DEFAULT_TIER2_COST_USD
+            if tier2_cost_usd is None
+            else float(tier2_cost_usd)
+        )
+        self._daily_cost_cap_usd: float = (
+            _DEFAULT_DAILY_COST_CAP_USD
+            if daily_cost_cap_usd is None
+            else float(daily_cost_cap_usd)
+        )
+        self._min_confidence: float = (
+            _DEFAULT_MIN_CONFIDENCE
+            if min_confidence is None
+            else float(min_confidence)
+        )
+        self._cost_ledger_path: Path = Path(
+            cost_ledger_path
+            or (Path.cwd() / _DEFAULT_COST_LEDGER_PATH)
+        )
+        # Last dhash the VLM classified — Tier 2 skips when the current
+        # frame matches (avoids paying for the same screen twice in a
+        # row; Tier 0 dhash dedup catches most but Tier 2 re-runs on
+        # frames that escaped Tier 1 with zero hits).
+        self._last_tier2_dhash: Optional[str] = None
+        # Cost ledger fields — loaded from disk on construction,
+        # persisted after each VLM call + UTC-rollover check.
+        self._cost_today_usd: float = 0.0
+        self._cost_ledger_date: str = _utc_date_iso()
+        self._cost_ledger_calls: int = 0
+        self._load_cost_ledger()
+
     # ------------------------------------------------------------------
     # Pure inner unit — testable without disk or router
     # ------------------------------------------------------------------
@@ -636,9 +732,36 @@ class VisionSensor:
 
         matched = _run_deterministic_patterns(ocr_text)
         verdict_meta = _classify_from_matches(matched)
-        if verdict_meta is None:
-            self.stats.dropped_no_match += 1
-            return None
+        tier2_result: Optional[Dict[str, Any]] = None
+        classifier_model = "deterministic"
+        classifier_confidence = 1.0
+        reasoning_snippet = ""
+
+        if verdict_meta is not None:
+            # Tier 1 deterministic hit — Tier 2 doesn't need to run.
+            if self._tier2_enabled:
+                self.stats.tier2_skipped_tier1_matched += 1
+        else:
+            # Tier 1 quiet — consider Tier 2 VLM classifier.
+            tier2_result = await self._maybe_run_tier2(frame)
+            if tier2_result is None:
+                self.stats.dropped_no_match += 1
+                return None
+            verdict_meta = self._tier2_verdict_meta(
+                verdict=tier2_result["verdict"],
+                confidence=tier2_result["confidence"],
+                min_confidence=self._min_confidence,
+            )
+            # Track confidence-downgrade separately from "normal" VLM emits.
+            if (
+                tier2_result["confidence"] < self._min_confidence
+                and tier2_result["verdict"] in ("error_visible", "bug_visible")
+            ):
+                self.stats.tier2_confidence_downgrades += 1
+            classifier_model = tier2_result["model"]
+            classifier_confidence = tier2_result["confidence"]
+            reasoning_snippet = tier2_result["reasoning"]
+            self.stats.tier2_signals += 1
 
         # Finding cooldown — same verdict+app+match-set within the
         # window collapses. Unlike Tier 0 dedup (which is frame-hash
@@ -668,7 +791,15 @@ class VisionSensor:
         # so an adversarial phrase cannot propagate even if a
         # downstream consumer forgets to wrap vision output in the
         # untrusted fence.
-        ocr_sanitized, had_injection = _sanitize_ocr_for_evidence(ocr_text)
+        #
+        # For Tier 2 emits we fall back to the (already sanitized)
+        # reasoning string — OCR may be empty or uninformative when
+        # the VLM classified based on layout/visual features alone.
+        if tier2_result is not None:
+            snippet_source = reasoning_snippet or ocr_text
+        else:
+            snippet_source = ocr_text
+        ocr_sanitized, had_injection = _sanitize_ocr_for_evidence(snippet_source)
         if had_injection:
             self.stats.injection_sanitized += 1
 
@@ -685,8 +816,8 @@ class VisionSensor:
                 frame_ts=frame.ts,
                 frame_path=evidence_frame_path,
                 classifier_verdict=verdict_meta["classifier_verdict"],
-                classifier_model="deterministic",
-                classifier_confidence=1.0,
+                classifier_model=classifier_model,
+                classifier_confidence=classifier_confidence,
                 deterministic_matches=tuple(matched),
                 ocr_snippet=_truncate_snippet(ocr_sanitized),
                 severity=verdict_meta["severity"],
@@ -1160,6 +1291,210 @@ class VisionSensor:
         self._pause_until_ts = None
         self._chain_started.clear()
         logger.info("[VisionSensor] manually resumed")
+
+    # ------------------------------------------------------------------
+    # Tier 2 VLM classifier + cost ledger (Task 15)
+    # ------------------------------------------------------------------
+
+    def _load_cost_ledger(self) -> None:
+        """Load today's spend from disk. Silent on missing / corrupt.
+
+        Deliberately does NOT load pause state (§Policy Layer: operator
+        gets a fresh budget window each session). The spend counter
+        persists so a restart mid-day picks up where we left off.
+        """
+        try:
+            raw = self._cost_ledger_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        stored_date = data.get("utc_date")
+        stored_spend = data.get("spend_usd")
+        stored_calls = data.get("vlm_calls")
+        today = _utc_date_iso()
+        if stored_date == today and isinstance(stored_spend, (int, float)):
+            self._cost_today_usd = float(stored_spend)
+            self._cost_ledger_date = today
+            self.stats.cost_usd_today = self._cost_today_usd
+            if isinstance(stored_calls, int) and not isinstance(stored_calls, bool):
+                self._cost_ledger_calls = stored_calls
+        # Different UTC day → ledger is stale, spend starts at 0.
+
+    def _persist_cost_ledger(self) -> None:
+        """Atomic write of today's cost ledger. Best-effort."""
+        try:
+            self._cost_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "schema_version": 1,
+                "utc_date": self._cost_ledger_date,
+                "spend_usd": self._cost_today_usd,
+                "vlm_calls": self._cost_ledger_calls,
+                "last_updated_ts": time.time(),
+            }
+            tmp = self._cost_ledger_path.with_suffix(
+                self._cost_ledger_path.suffix + ".tmp",
+            )
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(str(tmp), str(self._cost_ledger_path))
+        except (OSError, TypeError, ValueError):
+            logger.debug("[VisionSensor] cost ledger persist failed", exc_info=True)
+
+    def _maybe_rollover_cost_ledger(self) -> None:
+        """Reset the ledger at UTC midnight.
+
+        Called before every cost-aware decision so an overnight session
+        doesn't stay locked out once the day rolls over.
+        """
+        today = _utc_date_iso()
+        if self._cost_ledger_date != today:
+            logger.info(
+                "[VisionSensor] cost ledger UTC rollover %s → %s "
+                "(spend_reset from $%.4f to $0)",
+                self._cost_ledger_date, today, self._cost_today_usd,
+            )
+            self._cost_ledger_date = today
+            self._cost_today_usd = 0.0
+            self._cost_ledger_calls = 0
+            self.stats.cost_usd_today = 0.0
+            self._persist_cost_ledger()
+            # Clear a cost-cap pause if one is active — the new day
+            # means the operator gets their fresh budget back.
+            if self._paused and self._pause_reason == PAUSE_REASON_COST_CAP:
+                self._paused = False
+                self._pause_reason = ""
+                self._pause_until_ts = None
+
+    def _cost_fraction(self) -> float:
+        """Current spend as a fraction of the daily cap."""
+        if self._daily_cost_cap_usd <= 0:
+            return 0.0
+        return self._cost_today_usd / self._daily_cost_cap_usd
+
+    def _cost_downshift_active(self) -> bool:
+        """True when we should skip the VLM but keep Tier 1 running."""
+        return self._cost_fraction() >= _COST_DOWNSHIFT_THRESHOLD
+
+    def _record_tier2_spend(self) -> None:
+        """Add one VLM call to the ledger and trigger cascade if needed."""
+        self._cost_today_usd += self._tier2_cost_usd
+        self._cost_ledger_calls += 1
+        self.stats.cost_usd_today = self._cost_today_usd
+        # Cascade step 2 (95%): pause the sensor entirely.
+        if self._cost_fraction() >= _COST_PAUSE_THRESHOLD and not self._paused:
+            self.stats.cost_pause_events += 1
+            self._pause(reason=PAUSE_REASON_COST_CAP, duration_s=None)
+        self._persist_cost_ledger()
+
+    async def _maybe_run_tier2(
+        self,
+        frame: FrameData,
+    ) -> Optional[Dict[str, Any]]:
+        """Run the VLM classifier if allowed; return verdict dict or ``None``.
+
+        Return value is a dict with keys ``verdict`` / ``confidence`` /
+        ``model`` / ``reasoning`` (sanitized). ``None`` means one of:
+        Tier 2 disabled, no ``vlm_fn`` set, same-dhash dedup, cost
+        downshift active, VLM raised, VLM returned malformed output.
+
+        Never raises — callers treat ``None`` as "no VLM-emitted signal".
+        """
+        # Rollover check before any gate — new day may restore the budget.
+        self._maybe_rollover_cost_ledger()
+
+        if not self._tier2_enabled:
+            self.stats.tier2_skipped_disabled += 1
+            return None
+        if self._vlm_fn is None:
+            self.stats.tier2_skipped_disabled += 1
+            return None
+        # Same-dhash dedup — don't pay twice for the same screen.
+        if self._last_tier2_dhash == frame.dhash:
+            self.stats.tier2_skipped_dhash_dedup += 1
+            return None
+        # Cascade step 1 (80%): skip the VLM; Tier 1 still runs.
+        if self._cost_downshift_active():
+            self.stats.tier2_skipped_cost_downshift += 1
+            return None
+
+        # Call the VLM. Exceptions never bubble past the sensor.
+        self.stats.tier2_calls += 1
+        self._last_tier2_dhash = frame.dhash
+        try:
+            raw = self._vlm_fn(frame.frame_path)
+        except Exception as exc:  # noqa: BLE001
+            self.stats.tier2_exceptions += 1
+            logger.debug("[VisionSensor] Tier 2 VLM raised: %s", exc)
+            self._record_tier2_spend()   # we paid for the call even if it errored
+            return None
+
+        # Charge the call against the daily cap before inspecting output.
+        self._record_tier2_spend()
+
+        if not isinstance(raw, dict):
+            logger.debug(
+                "[VisionSensor] Tier 2 VLM returned non-dict: %r", type(raw).__name__,
+            )
+            return None
+
+        verdict = str(raw.get("verdict", "")).strip().lower()
+        if verdict == _VLM_VERDICT_OK:
+            self.stats.tier2_ok_dropped += 1
+            return None
+        if verdict not in _VLM_VERDICTS_EMIT:
+            logger.debug(
+                "[VisionSensor] Tier 2 VLM unknown verdict=%r — dropping", verdict,
+            )
+            return None
+
+        confidence_raw = raw.get("confidence")
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not (0.0 <= confidence <= 1.0):
+            confidence = max(0.0, min(1.0, confidence))
+
+        model = str(raw.get("model", "qwen3-vl-235b"))[:64] or "qwen3-vl-235b"
+        reasoning = str(raw.get("reasoning", ""))
+        # T1 sanitization on VLM reasoning — same firewall as OCR.
+        # We bump ``injection_sanitized`` here rather than at the evidence
+        # step below because by then ``sanitized_reasoning`` is already
+        # the fixed placeholder and the second sanitize-call wouldn't
+        # see an injection to count.
+        sanitized_reasoning, had_injection = _sanitize_ocr_for_evidence(reasoning)
+        if had_injection:
+            self.stats.injection_sanitized += 1
+
+        return {
+            "verdict": verdict,
+            "confidence": confidence,
+            "model": model,
+            "reasoning": sanitized_reasoning,
+        }
+
+    @staticmethod
+    def _tier2_verdict_meta(
+        verdict: str, confidence: float, min_confidence: float,
+    ) -> Dict[str, str]:
+        """Map Tier-2 verdict + confidence → severity/urgency.
+
+        Per spec §Severity → route, VLM-only signals always route
+        ``BACKGROUND`` (low priority). Low confidence additionally
+        downgrades severity to ``info``.
+        """
+        if verdict in ("error_visible", "bug_visible"):
+            severity = "error" if verdict == "error_visible" else "warning"
+        else:  # "unclear"
+            severity = "info"
+        if confidence < min_confidence:
+            severity = "info"
+        return {
+            "classifier_verdict": verdict,
+            "severity": severity,
+            "urgency": "low",
+        }
 
     def _on_sigterm(self, signum: int, frame: Any) -> None:
         """SIGTERM handler — purge, then re-dispatch to the prior handler.
