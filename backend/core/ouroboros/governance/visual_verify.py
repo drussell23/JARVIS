@@ -625,3 +625,528 @@ def run_if_triggered(
         # Already fail/skipped — pass through unchanged.
 
     return result
+
+
+# ===========================================================================
+# Slice 4 — Model-assisted advisory verdict (Task 19)
+# ===========================================================================
+#
+# Deterministic Visual VERIFY answers "did *something* visibly change?"
+# The advisory layer answers "did the change *achieve the op's stated
+# intent?*" — a VLM (Qwen3-VL-235B via lean_loop) compares pre/post
+# frames against the op's description and emits a verdict.
+#
+# Advisory is strictly **additive failure signal**. Per I4 asymmetry
+# it CAN route to L2 on a ``regressed`` verdict (+above-threshold
+# confidence); it CANNOT rescue a TestRunner-or-deterministic fail.
+# Advisory is gated behind its own master switch (Slice 4 graduation
+# criterion, Task 20).
+
+# Advisory verdict enum.
+ADVISORY_ALIGNED = "aligned"         # pre + post match the stated intent
+ADVISORY_REGRESSED = "regressed"     # post diverges from the intent
+ADVISORY_UNCLEAR = "unclear"         # VLM couldn't judge
+_ADVISORY_VERDICTS: frozenset = frozenset({
+    ADVISORY_ALIGNED, ADVISORY_REGRESSED, ADVISORY_UNCLEAR,
+})
+
+# Confirmation values (human-provided via /verify-confirm).
+CONFIRM_AGREE = "agree"
+CONFIRM_DISAGREE = "disagree"
+_CONFIRMATION_VALUES: frozenset = frozenset({CONFIRM_AGREE, CONFIRM_DISAGREE})
+
+# Default confidence threshold above which a ``regressed`` verdict
+# routes to L2 (spec §Graduation Slice 4).
+_DEFAULT_REGRESS_CONFIDENCE = float(
+    os.environ.get("JARVIS_VISION_VERIFY_REGRESS_CONFIDENCE", "0.80"),
+)
+
+# Advisory ledger — disk-persisted, per-session rolling record of
+# advisory verdicts + human confirmations. Feeds Slice 4 graduation
+# criteria (≥60% human-agreement on regressed verdicts) and the
+# auto-demotion guardrail (FP rate ≥50% → demotion).
+_DEFAULT_ADVISORY_LEDGER_PATH = ".jarvis/vision_verify_advisory_ledger.json"
+
+# Auto-demotion thresholds.
+_DEMOTION_FP_THRESHOLD = 0.50
+_DEMOTION_MIN_SAMPLES = 3   # need at least 3 regressed+confirmed entries
+_DEMOTION_FLAG_PATH = ".jarvis/vision_verify_model_assisted_demoted.flag"
+
+
+@dataclass(frozen=True)
+class AdvisoryVerdict:
+    """One VLM advisory outcome (input to the L2-routing decision)."""
+
+    verdict: str                       # aligned | regressed | unclear
+    confidence: float                  # [0.0, 1.0]
+    reasoning: str = ""
+    model: str = "qwen3-vl-235b"
+
+    def __post_init__(self) -> None:
+        if self.verdict not in _ADVISORY_VERDICTS:
+            raise ValueError(
+                f"AdvisoryVerdict.verdict must be one of "
+                f"{sorted(_ADVISORY_VERDICTS)}; got {self.verdict!r}"
+            )
+        if not (0.0 <= self.confidence <= 1.0):
+            raise ValueError(
+                f"AdvisoryVerdict.confidence must be in [0.0, 1.0]; "
+                f"got {self.confidence!r}"
+            )
+
+
+@dataclass(frozen=True)
+class AdvisoryOutcome:
+    """Outcome of the ``run_advisory`` entry point.
+
+    ``l2_triggered`` is the single fact the orchestrator consumes —
+    when True, dispatch the op to L2 Repair with ``advisory.reasoning``
+    as the correction prompt. When False, the advisory is logged for
+    observability and the deterministic verdict stands.
+    """
+
+    advisory: Optional[AdvisoryVerdict]
+    l2_triggered: bool
+    reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# run_advisory — the VLM entry point
+# ---------------------------------------------------------------------------
+
+
+def run_advisory(
+    *,
+    attachments: Sequence[Any],
+    op_description: str,
+    advisory_fn: Optional[Callable[..., Dict[str, Any]]],
+    confidence_threshold: float = _DEFAULT_REGRESS_CONFIDENCE,
+    cfg: Optional[VisualVerifyConfig] = None,
+) -> AdvisoryOutcome:
+    """Run the model-assisted advisory layer.
+
+    ``advisory_fn`` is an injectable callable receiving
+    ``(pre_bytes, post_bytes, op_intent)`` and returning a dict with
+    keys ``verdict`` / ``confidence`` / ``reasoning`` / ``model``.
+    ``None`` or a raising callable yields a ``skipped`` outcome.
+
+    Never raises. I4 asymmetry: the advisory alone cannot clamp
+    pass→fail; it only sets ``l2_triggered=True`` which the
+    orchestrator uses to dispatch L2 Repair. The deterministic
+    verdict remains authoritative.
+    """
+    cfg = cfg or VisualVerifyConfig()
+    if advisory_fn is None:
+        return AdvisoryOutcome(
+            advisory=None,
+            l2_triggered=False,
+            reason="advisory_fn unavailable",
+        )
+
+    pre = _attachment_by_kind(attachments, "pre_apply")
+    post = _attachment_by_kind(attachments, "post_apply")
+    if pre is None or post is None:
+        return AdvisoryOutcome(
+            advisory=None,
+            l2_triggered=False,
+            reason="missing pre/post attachment",
+        )
+
+    pre_bytes = _read_bytes(pre, cfg)
+    post_bytes = _read_bytes(post, cfg)
+    if pre_bytes is None or post_bytes is None:
+        return AdvisoryOutcome(
+            advisory=None,
+            l2_triggered=False,
+            reason="attachment read failed",
+        )
+
+    try:
+        raw = advisory_fn(pre_bytes, post_bytes, op_description)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[VisualVerify] advisory_fn raised: %s", exc)
+        return AdvisoryOutcome(
+            advisory=None,
+            l2_triggered=False,
+            reason=f"advisory_fn raised: {type(exc).__name__}",
+        )
+
+    if not isinstance(raw, dict):
+        logger.debug(
+            "[VisualVerify] advisory_fn returned non-dict: %r",
+            type(raw).__name__,
+        )
+        return AdvisoryOutcome(
+            advisory=None,
+            l2_triggered=False,
+            reason="advisory_fn returned non-dict",
+        )
+
+    verdict = str(raw.get("verdict", "")).strip().lower()
+    if verdict not in _ADVISORY_VERDICTS:
+        return AdvisoryOutcome(
+            advisory=None,
+            l2_triggered=False,
+            reason=f"unknown advisory verdict: {verdict!r}",
+        )
+
+    try:
+        confidence = float(raw.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    reasoning = str(raw.get("reasoning", ""))
+    # Sanitize VLM reasoning — same firewall pattern as Tier 2 classifier.
+    try:
+        from backend.core.ouroboros.governance.semantic_firewall import (
+            sanitize_for_firewall,
+        )
+        sanitized = sanitize_for_firewall(reasoning, field_name="advisory_reasoning")
+        if sanitized.rejected and any(
+            "injection pattern hit" in r for r in sanitized.reasons
+        ):
+            reasoning = "[sanitized:prompt_injection_detected]"
+        else:
+            reasoning = sanitized.sanitized
+    except Exception:  # noqa: BLE001
+        pass
+
+    model = str(raw.get("model", "qwen3-vl-235b"))[:64] or "qwen3-vl-235b"
+
+    advisory = AdvisoryVerdict(
+        verdict=verdict,
+        confidence=confidence,
+        reasoning=reasoning,
+        model=model,
+    )
+
+    # L2 routing rule (spec §Advisory): regressed + above confidence → True.
+    l2 = (
+        verdict == ADVISORY_REGRESSED
+        and confidence > confidence_threshold
+    )
+    if l2:
+        reason_tag = (
+            f"regressed above threshold "
+            f"({confidence:.2f} > {confidence_threshold:.2f})"
+        )
+    elif verdict == ADVISORY_REGRESSED:
+        reason_tag = (
+            f"regressed below threshold "
+            f"({confidence:.2f} <= {confidence_threshold:.2f})"
+        )
+    else:
+        reason_tag = f"verdict={verdict} (no L2 dispatch)"
+
+    return AdvisoryOutcome(
+        advisory=advisory,
+        l2_triggered=l2,
+        reason=reason_tag,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Advisory ledger — disk-persisted verdict + confirmation record
+# ---------------------------------------------------------------------------
+
+
+class AdvisoryLedger:
+    """Tracks advisory emissions + human confirmations.
+
+    Schema: list of entries, each
+    ``{op_id, verdict, confidence, l2_triggered, ts, human_confirmation}``.
+    ``human_confirmation`` is ``None`` until the operator runs
+    ``/verify-confirm <op-id> {agree|disagree}``.
+
+    FP rate = disagreements / (agrees + disagrees) over ``regressed``
+    verdicts only — aligned/unclear don't fire L2 so they don't
+    contribute to the L2-accuracy metric.
+    """
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        self._path = Path(
+            path or (Path.cwd() / _DEFAULT_ADVISORY_LEDGER_PATH)
+        )
+        self._entries: List[Dict[str, Any]] = []
+        self._load()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def entries(self) -> List[Dict[str, Any]]:
+        # Defensive copy — callers can't mutate ledger state accidentally.
+        return [dict(e) for e in self._entries]
+
+    def _load(self) -> None:
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        entries = data.get("entries")
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            op_id = entry.get("op_id")
+            verdict = entry.get("verdict")
+            if (
+                isinstance(op_id, str) and op_id
+                and verdict in _ADVISORY_VERDICTS
+            ):
+                self._entries.append(dict(entry))
+
+    def _persist(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "schema_version": 1,
+                "entries": self._entries,
+                "last_updated_ts": time.time(),
+            }
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(str(tmp), str(self._path))
+        except (OSError, TypeError, ValueError):
+            logger.debug(
+                "[VisualVerify] advisory ledger persist failed", exc_info=True,
+            )
+
+    def record_advisory(
+        self,
+        *,
+        op_id: str,
+        advisory: AdvisoryVerdict,
+        l2_triggered: bool,
+    ) -> None:
+        """Append a new advisory emission to the ledger."""
+        if not op_id:
+            raise ValueError("record_advisory requires a non-empty op_id")
+        self._entries.append({
+            "op_id": op_id,
+            "verdict": advisory.verdict,
+            "confidence": advisory.confidence,
+            "model": advisory.model,
+            "reasoning_hash": hashlib.sha256(
+                advisory.reasoning.encode("utf-8"),
+            ).hexdigest()[:16],
+            "l2_triggered": bool(l2_triggered),
+            "ts": time.time(),
+            "human_confirmation": None,
+        })
+        self._persist()
+
+    def record_confirmation(self, *, op_id: str, confirmation: str) -> bool:
+        """Stamp a human confirmation onto an existing ledger entry.
+
+        Returns ``True`` if an entry was updated, ``False`` if no
+        matching op_id was found. Most-recent entry wins when an op
+        has multiple emissions (the confirmation applies to the latest).
+        """
+        if confirmation not in _CONFIRMATION_VALUES:
+            raise ValueError(
+                f"confirmation must be one of {sorted(_CONFIRMATION_VALUES)}; "
+                f"got {confirmation!r}"
+            )
+        # Find the most-recent entry matching op_id.
+        for entry in reversed(self._entries):
+            if entry.get("op_id") == op_id:
+                entry["human_confirmation"] = confirmation
+                entry["confirmed_ts"] = time.time()
+                self._persist()
+                return True
+        return False
+
+    def fp_rate_on_regressed(
+        self, *, min_samples: int = _DEMOTION_MIN_SAMPLES,
+    ) -> Optional[float]:
+        """Fraction of ``regressed`` verdicts the human marked disagree.
+
+        Returns ``None`` when the confirmed-regressed count is below
+        ``min_samples`` — we need enough data to trust the rate.
+        """
+        total = 0
+        disagreements = 0
+        for entry in self._entries:
+            if entry.get("verdict") != ADVISORY_REGRESSED:
+                continue
+            confirmation = entry.get("human_confirmation")
+            if confirmation == CONFIRM_AGREE:
+                total += 1
+            elif confirmation == CONFIRM_DISAGREE:
+                total += 1
+                disagreements += 1
+        if total < min_samples:
+            return None
+        return disagreements / total
+
+
+# ---------------------------------------------------------------------------
+# Auto-demotion (Slice 4 post-graduation guardrail)
+# ---------------------------------------------------------------------------
+
+
+def is_model_assisted_demoted(
+    flag_path: Optional[str] = None,
+) -> bool:
+    """Return ``True`` when the persistent demotion flag is set.
+
+    Slice 4 post-graduation guardrail: a session whose advisory
+    FP rate exceeds the demotion threshold writes this flag; the
+    next session boot reads it and keeps model-assisted off until
+    the operator runs ``/verify-undemote`` (or the flag file is
+    manually removed).
+    """
+    p = Path(flag_path or (Path.cwd() / _DEMOTION_FLAG_PATH))
+    return p.exists()
+
+
+def set_model_assisted_demoted(
+    *,
+    reason: str,
+    flag_path: Optional[str] = None,
+) -> None:
+    """Atomically write the demotion flag with a reason payload."""
+    p = Path(flag_path or (Path.cwd() / _DEMOTION_FLAG_PATH))
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"demoted_at": time.time(), "reason": reason}
+        p.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        logger.debug(
+            "[VisualVerify] demotion flag write failed", exc_info=True,
+        )
+
+
+def clear_model_assisted_demotion(
+    flag_path: Optional[str] = None,
+) -> bool:
+    """Clear the demotion flag (via ``/verify-undemote`` REPL command).
+
+    Returns ``True`` when a flag was removed, ``False`` when none was
+    present. Idempotent.
+    """
+    p = Path(flag_path or (Path.cwd() / _DEMOTION_FLAG_PATH))
+    try:
+        p.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.debug(
+            "[VisualVerify] demotion flag clear failed", exc_info=True,
+        )
+        return False
+
+
+def model_assisted_active() -> bool:
+    """Effective enablement: env master switch AND no demotion flag.
+
+    Orchestrator call-site consults this (not
+    :func:`visual_verify_model_assisted_enabled` directly) so a
+    demotion silently suppresses advisory dispatch without the
+    operator having to unset the env.
+    """
+    return (
+        visual_verify_model_assisted_enabled()
+        and not is_model_assisted_demoted()
+    )
+
+
+def check_and_apply_auto_demotion(
+    ledger: AdvisoryLedger,
+    *,
+    threshold: float = _DEMOTION_FP_THRESHOLD,
+    min_samples: int = _DEMOTION_MIN_SAMPLES,
+    flag_path: Optional[str] = None,
+) -> Tuple[bool, Optional[float]]:
+    """Check the ledger's FP rate and auto-demote if above threshold.
+
+    Called at session end by the orchestrator (or battle-test harness)
+    before shutdown. Returns ``(did_demote, measured_rate)`` — when
+    ``did_demote`` is ``True``, the next session boot will see
+    ``model_assisted_active() is False``.
+
+    Idempotent: calling twice in one session where the first call
+    already demoted does not double-write.
+    """
+    rate = ledger.fp_rate_on_regressed(min_samples=min_samples)
+    if rate is None:
+        return (False, None)
+    if rate < threshold:
+        return (False, rate)
+    if is_model_assisted_demoted(flag_path=flag_path):
+        return (False, rate)  # already demoted — idempotent
+    set_model_assisted_demoted(
+        reason=f"advisory FP rate {rate:.2%} >= {threshold:.2%}",
+        flag_path=flag_path,
+    )
+    return (True, rate)
+
+
+# ---------------------------------------------------------------------------
+# REPL command handler — ``/verify-confirm <op-id> {agree|disagree}``
+# ---------------------------------------------------------------------------
+
+
+def handle_verify_confirm_command(
+    args: str,
+    *,
+    ledger: Optional[AdvisoryLedger] = None,
+) -> str:
+    """Parse and apply a ``/verify-confirm`` REPL invocation.
+
+    Returns a human-readable response string for SerpentFlow. Never
+    raises — malformed input produces a usage hint instead.
+
+    Input shape::
+
+        <op-id> agree
+        <op-id> disagree
+
+    Case-insensitive on the verb; tolerant of extra whitespace.
+    """
+    tokens = (args or "").strip().split()
+    if len(tokens) != 2:
+        return (
+            "usage: /verify-confirm <op-id> {agree|disagree}\n"
+            "  marks the most recent advisory verdict for the given op "
+            "as either confirmed (agree) or a false positive (disagree)."
+        )
+    op_id, verb = tokens[0], tokens[1].strip().lower()
+    if verb not in _CONFIRMATION_VALUES:
+        return (
+            f"/verify-confirm: unknown verb {verb!r}; "
+            f"must be 'agree' or 'disagree'"
+        )
+    led = ledger or AdvisoryLedger()
+    try:
+        updated = led.record_confirmation(op_id=op_id, confirmation=verb)
+    except ValueError as exc:
+        return f"/verify-confirm: {exc}"
+    if not updated:
+        return (
+            f"/verify-confirm: no advisory entry found for op_id={op_id!r} "
+            f"(was an advisory actually emitted for this op?)"
+        )
+    return f"/verify-confirm: op={op_id} marked {verb}"
+
+
+def handle_verify_undemote_command(
+    *,
+    flag_path: Optional[str] = None,
+) -> str:
+    """``/verify-undemote`` — clear the Slice 4 auto-demotion flag.
+
+    Returns a human-readable response. Idempotent.
+    """
+    cleared = clear_model_assisted_demotion(flag_path=flag_path)
+    if cleared:
+        return "/verify-undemote: demotion flag cleared; model-assisted re-armed"
+    return "/verify-undemote: no demotion flag present"
