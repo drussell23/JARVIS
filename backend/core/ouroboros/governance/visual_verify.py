@@ -1150,3 +1150,154 @@ def handle_verify_undemote_command(
     if cleared:
         return "/verify-undemote: demotion flag cleared; model-assisted re-armed"
     return "/verify-undemote: no demotion flag present"
+
+
+# ===========================================================================
+# Orchestrator driver — single-call post-VERIFY dispatch (Task 22 wiring #4)
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class VisualVerifyDispatchOutcome:
+    """End-to-end outcome from the orchestrator's post-VERIFY hook.
+
+    Consumes the exact data the orchestrator already has in hand
+    (target_files, ctx.attachments, TestRunner result) and returns a
+    single decision the orchestrator can act on without re-parsing
+    intermediate state.
+    """
+
+    ran: bool                    # True if should_run_visual_verify fired
+    result: Optional[VisualVerifyResult]
+    advisory: Optional[AdvisoryVerdict]
+    l2_triggered: bool           # one fact for orchestrator dispatch
+    reasoning: str               # combined reason text for operator logs
+    skipped_reason: str = ""     # populated when ran=False
+
+
+def run_post_verify(
+    *,
+    target_files: Sequence[str],
+    attachments: Sequence[Any],
+    op_id: str,
+    op_description: str,
+    plan_ui_affected: bool = False,
+    test_targets_resolved: Optional[Sequence[str]] = None,
+    risk_tier: Optional[str] = None,
+    test_runner_result: Optional[str] = None,
+    # Injectable probes (orchestrator wires real Quartz / PIL / VLM here)
+    hash_fn: Callable[[bytes], str] = default_hash_fn,
+    hash_distance_fn: Callable[[str, str], float] = default_hash_distance,
+    variance_fn: Callable[[bytes], float] = default_variance_fn,
+    app_alive_fn: Callable[[Optional[str]], bool] = default_app_alive_fn,
+    advisory_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+    # Ledgers (operator can inject mocks in tests)
+    ledger: Optional[AdvisoryLedger] = None,
+) -> VisualVerifyDispatchOutcome:
+    """Single-call Visual VERIFY dispatch for the orchestrator.
+
+    Composes Slice 3 (deterministic) + Slice 4 (advisory) + ledger
+    recording into one entry point. The orchestrator calls this once
+    per op after TestRunner returns, and routes based on
+    ``l2_triggered`` / ``result.verdict``:
+
+    Back-compat path: when neither ``visual_verify_enabled()`` (Slice
+    3 switch) nor the trigger fire, returns ``ran=False`` — the
+    orchestrator proceeds to COMPLETE as if this call never happened.
+
+    **Invariants preserved**:
+
+    * I4 asymmetry — the returned ``result.verdict`` respects the
+      TestRunner-red clamp (via :func:`run_if_triggered`).
+    * Advisory never overturns deterministic pass — advisory only
+      sets ``l2_triggered=True`` when ``regressed`` above confidence
+      threshold; orchestrator consumes that flag to dispatch L2 but
+      the deterministic verdict stands.
+    * Auto-demotion + model_assisted_active gate — advisory only
+      runs when deterministic was ``pass`` AND the master switch
+      isn't demoted (no point recording advisory noise against a
+      fail-already op).
+    """
+    # Slice 3 master switch — orchestrator may have called us anyway,
+    # guard for belt-and-braces correctness.
+    if not visual_verify_enabled():
+        return VisualVerifyDispatchOutcome(
+            ran=False,
+            result=None,
+            advisory=None,
+            l2_triggered=False,
+            reasoning="",
+            skipped_reason="master_switch_off",
+        )
+
+    det_result = run_if_triggered(
+        target_files=target_files,
+        attachments=attachments,
+        plan_ui_affected=plan_ui_affected,
+        test_targets_resolved=test_targets_resolved,
+        risk_tier=risk_tier,
+        test_runner_result=test_runner_result,
+        hash_fn=hash_fn,
+        hash_distance_fn=hash_distance_fn,
+        variance_fn=variance_fn,
+        app_alive_fn=app_alive_fn,
+    )
+
+    if det_result.verdict == VERDICT_SKIPPED:
+        return VisualVerifyDispatchOutcome(
+            ran=False,
+            result=det_result,
+            advisory=None,
+            l2_triggered=False,
+            reasoning=det_result.reasoning,
+            skipped_reason=det_result.check,
+        )
+
+    # Deterministic phase ran. Only dispatch advisory when deterministic
+    # PASSED — advisory on a fail would just add noise (orchestrator
+    # already knows to route to L2 on deterministic fail).
+    advisory_outcome: Optional[AdvisoryOutcome] = None
+    if det_result.verdict == VERDICT_PASS and model_assisted_active():
+        advisory_outcome = run_advisory(
+            attachments=attachments,
+            op_description=op_description,
+            advisory_fn=advisory_fn,
+        )
+        if advisory_outcome.advisory is not None:
+            led = ledger or AdvisoryLedger()
+            try:
+                led.record_advisory(
+                    op_id=op_id,
+                    advisory=advisory_outcome.advisory,
+                    l2_triggered=advisory_outcome.l2_triggered,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[VisualVerify] advisory ledger record failed: %s", exc,
+                )
+
+    # Build the combined reasoning string for operator logs.
+    parts: List[str] = [f"det={det_result.verdict}/{det_result.check}"]
+    if det_result.reasoning:
+        parts.append(det_result.reasoning)
+    if advisory_outcome is not None and advisory_outcome.advisory is not None:
+        parts.append(
+            f"advisory={advisory_outcome.advisory.verdict}/"
+            f"conf={advisory_outcome.advisory.confidence:.2f}"
+        )
+        if advisory_outcome.reason:
+            parts.append(advisory_outcome.reason)
+
+    return VisualVerifyDispatchOutcome(
+        ran=True,
+        result=det_result,
+        advisory=(
+            advisory_outcome.advisory if advisory_outcome is not None else None
+        ),
+        l2_triggered=(
+            advisory_outcome.l2_triggered
+            if advisory_outcome is not None
+            else False
+        ),
+        reasoning=" | ".join(parts),
+    )
