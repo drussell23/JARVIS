@@ -11,7 +11,11 @@ in the main JARVIS process (where it conflicts with CoreAudio/sounddevice).
 
 Output files (atomic writes via rename):
     /tmp/claude/latest_frame.jpg   -- latest JPEG frame
-    /tmp/claude/frame_meta.json    -- {timestamp, width, height, dhash, fps}
+    /tmp/claude/latest_frame.json  -- {timestamp, width, height, dhash, fps}
+
+Filename contract: the sidecar JSON MUST be ``latest_frame.json`` — this is
+the name ``VisionSensor._DEFAULT_METADATA_PATH`` reads. Producer conforms
+to consumer, not the other way around.
 
 Run:  python3 backend/vision/frame_server.py [--fps 15] [--quality 70] [--max-dim 1280]
 
@@ -36,7 +40,7 @@ except ImportError:
 
 _TMP_DIR = os.environ.get("VISION_FRAME_DIR", "/tmp/claude")
 _FRAME_PATH = os.path.join(_TMP_DIR, "latest_frame.jpg")
-_META_PATH = os.path.join(_TMP_DIR, "frame_meta.json")
+_META_PATH = os.path.join(_TMP_DIR, "latest_frame.json")
 
 
 def _respond(obj: dict) -> None:
