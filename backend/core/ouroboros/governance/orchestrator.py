@@ -6387,6 +6387,147 @@ class GovernedOrchestrator:
                     ctx.op_id, exc,
                 )
 
+        # ---- Phase 8d: Visual VERIFY (Slices 3-4 — Task 22 handoff #4) ----
+        # Runs deterministic UI-regression checks + model-assisted
+        # advisory between VERIFY and COMPLETE. Master-switch-gated via
+        # ``visual_verify_enabled()`` inside the driver; a disabled
+        # sensor returns ``ran=False`` and we proceed to COMPLETE as
+        # before (back-compat preserved).
+        #
+        # Routing per Manifesto §2 DAG:
+        #   ran=False      → COMPLETE (unchanged back-compat path)
+        #   result=pass    → COMPLETE (FSM transitions VERIFY → VISUAL_VERIFY → COMPLETE)
+        #   result=fail OR l2_triggered=True → L2 Repair via ``_l2_hook``,
+        #     same path VERIFY-red uses; on L2 convergence we re-apply
+        #     the repair candidate and continue to COMPLETE; on L2 escape
+        #     we inherit the terminal ctx L2 advanced to and return early.
+        try:
+            from backend.core.ouroboros.governance.visual_verify import (
+                run_post_verify,
+            )
+            _vv_outcome = run_post_verify(
+                target_files=ctx.target_files,
+                attachments=ctx.attachments,
+                op_id=ctx.op_id,
+                op_description=ctx.description,
+                plan_ui_affected=False,
+                test_targets_resolved=(
+                    ctx.validation.adapter_names_run if ctx.validation else None
+                ),
+                risk_tier=(
+                    ctx.risk_tier.name.lower() if ctx.risk_tier else ""
+                ),
+                # We only reach this block on the VERIFY-passed path, so
+                # the I4 clamp's "red" branch never fires here; passing
+                # "passed" explicitly makes the contract obvious.
+                test_runner_result="passed",
+            )
+            if _vv_outcome.ran:
+                _vv_verdict = (
+                    _vv_outcome.result.verdict if _vv_outcome.result else "?"
+                )
+                logger.info(
+                    "[Orchestrator] Visual VERIFY outcome=%s "
+                    "l2_triggered=%s [%s] %s",
+                    _vv_verdict, _vv_outcome.l2_triggered,
+                    ctx.op_id, _vv_outcome.reasoning,
+                )
+                # Advance the FSM through VISUAL_VERIFY so the traversal
+                # is auditable in the hash-chained ledger.
+                try:
+                    ctx = ctx.advance(OperationPhase.VISUAL_VERIFY)
+                except ValueError as _adv_exc:
+                    # Should never happen on the happy VERIFY-passed path
+                    # but guard against cancel / postmortem races that
+                    # advanced ctx out from under us.
+                    logger.debug(
+                        "[Orchestrator] VISUAL_VERIFY advance rejected "
+                        "(ctx at %s): %s", ctx.phase.name, _adv_exc,
+                    )
+
+                _vv_fail = (
+                    _vv_outcome.l2_triggered
+                    or (
+                        _vv_outcome.result is not None
+                        and _vv_outcome.result.verdict == "fail"
+                    )
+                )
+                if _vv_fail and self._config.repair_engine is not None:
+                    logger.info(
+                        "[Orchestrator] Visual VERIFY fail/advisory — "
+                        "routing to L2 repair [%s]", ctx.op_id,
+                    )
+                    _vv_deadline = ctx.pipeline_deadline or (
+                        datetime.now(timezone.utc) + timedelta(seconds=60)
+                    )
+                    _vv_synth_val = ValidationResult(
+                        passed=False,
+                        best_candidate=best_candidate,
+                        validation_duration_s=0.0,
+                        error=f"visual_verify: {_vv_outcome.reasoning}",
+                        failure_class="test",
+                        short_summary=(
+                            f"visual_verify: "
+                            f"{_vv_outcome.result.check if _vv_outcome.result else 'advisory'}"
+                        ),
+                        adapter_names_run=(),
+                    )
+                    try:
+                        _vv_directive = await self._l2_hook(
+                            ctx, _vv_synth_val, _vv_deadline,
+                        )
+                        if _vv_directive[0] == "break":
+                            # L2 converged — apply the repair candidate.
+                            _vv_l2_candidate = _vv_directive[1]
+                            _vv_l2_change = self._build_change_request(
+                                ctx, _vv_l2_candidate,
+                            )
+                            try:
+                                _vv_l2_result = (
+                                    await self._stack.change_engine.execute(
+                                        _vv_l2_change
+                                    )
+                                )
+                                if _vv_l2_result.success:
+                                    logger.info(
+                                        "[Orchestrator] Visual VERIFY L2 "
+                                        "repair applied [%s]", ctx.op_id,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[Orchestrator] Visual VERIFY L2 "
+                                        "repair candidate failed to apply [%s]",
+                                        ctx.op_id,
+                                    )
+                            except Exception as _vv_apply_exc:
+                                logger.debug(
+                                    "[Orchestrator] Visual VERIFY L2 apply "
+                                    "error: %s", _vv_apply_exc,
+                                )
+                        elif _vv_directive[0] in ("cancel", "fatal"):
+                            # L2 escaped — inherit the terminal ctx.
+                            ctx = _vv_directive[1]
+                            logger.info(
+                                "[Orchestrator] L2 escaped Visual VERIFY — "
+                                "op ctx advanced to %s [%s]",
+                                ctx.phase.name, ctx.op_id,
+                            )
+                            return ctx
+                    except Exception as _vv_l2_exc:
+                        logger.debug(
+                            "[Orchestrator] Visual VERIFY L2 failed: "
+                            "%s: %s",
+                            type(_vv_l2_exc).__name__, _vv_l2_exc,
+                        )
+        except Exception as _vv_exc:
+            # Visual VERIFY dispatch must never break the pipeline.
+            # A bug in the driver drops us through to the normal
+            # COMPLETE path.
+            logger.debug(
+                "[Orchestrator] Visual VERIFY dispatch error: %s: %s",
+                type(_vv_exc).__name__, _vv_exc,
+            )
+
         if _serpent: _serpent.update_phase("COMPLETE")
         ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")
 
