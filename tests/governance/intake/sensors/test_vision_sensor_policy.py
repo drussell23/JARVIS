@@ -242,6 +242,85 @@ async def test_finding_cooldown_drops_repeat_shape(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_finding_cooldown_emits_observability_log(tmp_path, caplog):
+    """§8 Absolute Observability: every finding_cooldown drop MUST emit
+    an INFO log line carrying the verdict + app + match-set tuple
+    and a running total_drops counter.
+
+    Silent suppression was flagged as unacceptable — this test pins
+    the operator-visible log contract so a future regression where
+    someone removes the INFO line turns CI red.
+    """
+    import logging
+    sensor = _make_sensor(
+        tmp_path,
+        finding_cooldown_s=120.0,
+        ocr_fn=lambda _p: "Traceback (most recent call last):",
+    )
+    # First emit — no drop, no log.
+    await sensor._ingest_frame(_make_frame(dhash="aaaaaaaaaaaaaaaa", app_id="com.apple.Terminal"))
+
+    with caplog.at_level(logging.INFO, logger="Ouroboros.VisionSensor"):
+        # Second emit with different dhash + same shape → drop + log.
+        await sensor._ingest_frame(_make_frame(dhash="bbbbbbbbbbbbbbbb", app_id="com.apple.Terminal"))
+
+    drop_lines = [r.message for r in caplog.records if "dropped finding_cooldown" in r.message]
+    assert len(drop_lines) == 1, "exactly one drop → exactly one INFO line"
+    msg = drop_lines[0]
+    # Verdict + app + match-set tuple all present for grep rollups.
+    assert "verdict=error_visible" in msg
+    assert "app=com.apple.Terminal" in msg
+    assert "matches=traceback" in msg
+    # Running total for session-level throttling visibility.
+    assert "total_drops=1" in msg
+
+
+@pytest.mark.asyncio
+async def test_finding_cooldown_log_total_drops_increments_per_session(tmp_path, caplog):
+    """Burst scenario: N drops → N INFO lines with monotonically
+    increasing ``total_drops=`` token. Proves the counter is
+    session-scoped, not per-emit.
+    """
+    import logging
+    sensor = _make_sensor(
+        tmp_path,
+        finding_cooldown_s=120.0,
+        ocr_fn=lambda _p: "Traceback (most recent call last):",
+    )
+    # Prime the cooldown.
+    await sensor._ingest_frame(_make_frame(dhash="0000000000000001", app_id="X"))
+    with caplog.at_level(logging.INFO, logger="Ouroboros.VisionSensor"):
+        for i in range(2, 6):
+            await sensor._ingest_frame(_make_frame(
+                dhash=f"{i:016x}", app_id="X",
+            ))
+
+    drop_lines = [r.message for r in caplog.records if "dropped finding_cooldown" in r.message]
+    assert len(drop_lines) == 4
+    totals = [int(m.split("total_drops=")[1]) for m in drop_lines]
+    assert totals == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_finding_cooldown_log_no_app_id_renders_dash(tmp_path, caplog):
+    """When app_id is None, the log renders ``app=-`` (not ``app=None``)
+    — keeps grep patterns stable across app-available vs not."""
+    import logging
+    sensor = _make_sensor(
+        tmp_path,
+        finding_cooldown_s=120.0,
+        ocr_fn=lambda _p: "Traceback (most recent call last):",
+    )
+    await sensor._ingest_frame(_make_frame(dhash="1111111111111111", app_id=None))
+    with caplog.at_level(logging.INFO, logger="Ouroboros.VisionSensor"):
+        await sensor._ingest_frame(_make_frame(dhash="2222222222222222", app_id=None))
+
+    drop_lines = [r.message for r in caplog.records if "dropped finding_cooldown" in r.message]
+    assert len(drop_lines) == 1
+    assert "app=-" in drop_lines[0]
+
+
+@pytest.mark.asyncio
 async def test_finding_cooldown_allows_different_app(tmp_path):
     sensor = _make_sensor(
         tmp_path,

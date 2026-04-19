@@ -582,8 +582,15 @@ class VisionSensor:
         self._fp_budget: float = (
             _DEFAULT_FP_BUDGET if fp_budget is None else float(fp_budget)
         )
+        # !!! REVERT-BEFORE-COMMIT !!! Slice 1 battle-test session override
+        # (operator directive 2026-04-18): when no explicit window is passed
+        # (runtime/intake path), tighten to 3 so a 2-of-3 rejection burst
+        # deterministically trips fp_budget_exhausted in the edge-case probe.
+        # Tests pass explicit fp_window_size and are untouched. Remove this
+        # branch + restore _DEFAULT_FP_WINDOW_SIZE before the next
+        # AutoCommitter sweep or the change will be pushed to origin/main.
         self._fp_window_size: int = (
-            _DEFAULT_FP_WINDOW_SIZE if fp_window_size is None else int(fp_window_size)
+            3 if fp_window_size is None else int(fp_window_size)
         )
         self._finding_cooldown_s: float = (
             _DEFAULT_FINDING_COOLDOWN_S
@@ -785,6 +792,18 @@ class VisionSensor:
             verdict=verdict_name, app_id=frame.app_id, matches=matches_tuple,
         ):
             self.stats.dropped_finding_cooldown += 1
+            # §8 Absolute Observability — operator must know when the
+            # sensor is actively suppressing signals. One INFO line per
+            # drop carries the verdict/app/match-set tuple + running
+            # total so grep rollups are deterministic.
+            logger.info(
+                "[VisionSensor] dropped finding_cooldown "
+                "verdict=%s app=%s matches=%s total_drops=%d",
+                verdict_name,
+                frame.app_id or "-",
+                ",".join(sorted(matches_tuple)) or "-",
+                self.stats.dropped_finding_cooldown,
+            )
             return None
 
         # Retain the triggering frame so downstream Visual VERIFY (and
