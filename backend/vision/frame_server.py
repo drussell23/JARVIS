@@ -11,7 +11,7 @@ in the main JARVIS process (where it conflicts with CoreAudio/sounddevice).
 
 Output files (atomic writes via rename):
     /tmp/claude/latest_frame.jpg   -- latest JPEG frame
-    /tmp/claude/latest_frame.json  -- {timestamp, width, height, dhash, fps}
+    /tmp/claude/latest_frame.json  -- {ts, width, height, dhash, frame_number}
 
 Filename contract: the sidecar JSON MUST be ``latest_frame.json`` — this is
 the name ``VisionSensor._DEFAULT_METADATA_PATH`` reads. Producer conforms
@@ -203,7 +203,7 @@ def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1280) -> No
 
             # Write metadata
             meta = {
-                "timestamp": time.time(),
+                "ts": time.time(),
                 "width": width,
                 "height": height,
                 "dhash": dhash_val,
