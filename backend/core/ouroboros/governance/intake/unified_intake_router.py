@@ -659,6 +659,42 @@ class UnifiedIntakeRouter:
             signal_source=envelope.source,
             is_read_only=_is_read_only_at_intake,
         )
+
+        # Manifesto §1 — the Tri-Partite Microkernel must bridge Senses→Mind.
+        # When a vision-originated envelope carries a frame_path, hoist it
+        # onto ctx.attachments so the GENERATE phase can perceive the actual
+        # pixels (not just the text evidence verdict). This is the ONLY site
+        # in the CLASSIFY path authorized to populate ctx.attachments from
+        # sensor evidence — per I7, all other readers of ctx.attachments are
+        # limited to the VisionSensor / visual_verify pair.
+        try:
+            _vis_sig = (envelope.evidence or {}).get("vision_signal")
+            if isinstance(_vis_sig, dict):
+                _frame_path = _vis_sig.get("frame_path")
+                _app_id = _vis_sig.get("app_id")
+                if isinstance(_frame_path, str) and _frame_path:
+                    from backend.core.ouroboros.governance.op_context import (
+                        Attachment,
+                    )
+                    _att = Attachment.from_file(
+                        _frame_path,
+                        kind="sensor_frame",
+                        app_id=_app_id if isinstance(_app_id, str) else None,
+                    )
+                    ctx = ctx.with_attachments((_att,))
+                    logger.info(
+                        "[IntakeRouter] attachments_hoisted op=%s kind=sensor_frame "
+                        "hash8=%s app_id=%s source=%s",
+                        envelope.causal_id, _att.hash8,
+                        (_app_id or "-"), envelope.source,
+                    )
+        except Exception as _exc:
+            # Never fail intake on attachment issues — the op can still run
+            # text-only. Log at DEBUG so a stale frame_path doesn't spam.
+            logger.debug(
+                "[IntakeRouter] attachment hoist skipped op=%s: %s",
+                envelope.causal_id, _exc,
+            )
         try:
             _submit_fn = getattr(self._gls, "submit_background", None)
             if _submit_fn is not None:

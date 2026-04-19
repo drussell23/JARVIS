@@ -892,11 +892,44 @@ class DoublewordProvider:
             if self._tool_loop is not None:
                 _stream_callback = getattr(self._tool_loop, "on_token", None)
 
+            # Multi-modal user content — when ctx.attachments is non-empty and
+            # the GENERATE purpose gate is open, splice OpenAI-compatible
+            # image_url blocks alongside the text prompt. Manifesto §1:
+            # Tri-Partite Microkernel — Mind perceives what Senses captured.
+            # Lazy import avoids providers.py ↔ doubleword_provider.py cycle.
+            from backend.core.ouroboros.governance.providers import (
+                _serialize_attachments as _dw_serialize_attachments,
+            )
+            _att_blocks = _dw_serialize_attachments(
+                context, provider_kind="doubleword", purpose="generate",
+            )
+            if _att_blocks:
+                _user_content: Any = [{"type": "text", "text": p}, *_att_blocks]
+                _atts = getattr(context, "attachments", ())
+                _kinds = ",".join(sorted({a.kind for a in _atts})) or "-"
+                _hashes = ",".join(a.hash8 for a in _atts) or "-"
+                _bytes = 0
+                for _a in _atts:
+                    try:
+                        _bytes += os.path.getsize(_a.image_path)
+                    except OSError:
+                        pass
+                logger.info(
+                    "[DoublewordProvider] multi_modal op=%s blocks=%d "
+                    "attachments=%d bytes=%d kinds=[%s] hash8s=[%s] "
+                    "route=%s purpose=generate",
+                    getattr(context, "operation_id", "-"),
+                    len(_att_blocks), len(_atts), _bytes, _kinds, _hashes,
+                    (getattr(context, "provider_route", "") or "-"),
+                )
+            else:
+                _user_content = p
+
             body = {
                 "model": _effective_model,
                 "messages": [
                     {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": p},
+                    {"role": "user", "content": _user_content},
                 ],
                 "max_tokens": _eff_max_tokens,
                 "temperature": _DW_TEMPERATURE,

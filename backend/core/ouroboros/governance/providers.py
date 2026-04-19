@@ -130,8 +130,22 @@ _MULTI_FILE_ENTRY_KEYS = frozenset({"file_path", "full_content", "rationale"})
 # silently gets an empty list — byte-perfect I7 defense-in-depth.
 
 _ATTACHMENT_PURPOSES_ALLOWED: frozenset = frozenset(
-    {"sensor_classify", "visual_verify"}
+    {"sensor_classify", "visual_verify", "generate"}
 )
+
+# Per-purpose kill switch for GENERATE-time multi-modal. Default ON — the
+# Manifesto §1 Tri-Partite Microkernel requires the Mind to perceive what
+# the Senses captured. Flip to "false" to restore pre-v5 text-only behavior
+# (e.g. if a Privacy Shield audit flags a specific data-sovereignty concern
+# and the fix is to strip images at the provider boundary while the deeper
+# policy work lands).
+_GENERATE_ATTACHMENTS_ENABLED_ENV = "JARVIS_GENERATE_ATTACHMENTS_ENABLED"
+
+
+def _generate_attachments_enabled() -> bool:
+    """Env-gate check for GENERATE-time attachment serialization. Default True."""
+    raw = os.environ.get(_GENERATE_ATTACHMENTS_ENABLED_ENV, "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 # BG/SPEC route cost optimization — these routes target text-only models
 # (DW Gemma for BACKGROUND, DW fire-and-forget for SPECULATIVE) where
@@ -203,6 +217,13 @@ def _serialize_attachments(
     """
     # Purpose gate — I7 defense-in-depth boundary.
     if purpose not in _ATTACHMENT_PURPOSES_ALLOWED:
+        return []
+
+    # Generate-purpose kill switch — even if the purpose allow-list has
+    # "generate" registered, operators can still strip GENERATE-time
+    # attachments via JARVIS_GENERATE_ATTACHMENTS_ENABLED=false. Other
+    # purposes (sensor_classify, visual_verify) are NOT affected.
+    if purpose == "generate" and not _generate_attachments_enabled():
         return []
 
     # No attachments → nothing to serialize. Early-exit before any
@@ -5103,17 +5124,54 @@ class ClaudeProvider:
             nonlocal total_cost
             timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
 
-            # Multi-modal: if visual context is available, include screenshot
-            # alongside the text prompt. The model reasons over both simultaneously.
+            # Multi-modal path. Two sources of image content merge here:
+            #
+            # 1. Legacy ``_visual_context_b64`` — pre-v5 single-image field.
+            #    Kept for backward compat with any caller still setting it.
+            #
+            # 2. ``ctx.attachments`` via the sanctioned _serialize_attachments
+            #    gate (Manifesto §1 Tri-Partite Microkernel — Mind perceives
+            #    what the Senses captured).  Honors I7 purpose allow-list,
+            #    BG/SPEC route strip, per-attachment read budget, and the
+            #    JARVIS_GENERATE_ATTACHMENTS_ENABLED kill switch.
+            _image_blocks: List[Dict[str, Any]] = []
             _visual_b64 = getattr(context, "_visual_context_b64", None)
             if _visual_b64 and isinstance(_visual_b64, str):
                 _media = "image/jpeg" if _visual_b64[:4] == "/9j/" else "image/png"
-                user_content = [
-                    {"type": "image", "source": {
+                _image_blocks.append({
+                    "type": "image",
+                    "source": {
                         "type": "base64", "media_type": _media, "data": _visual_b64,
-                    }},
-                    {"type": "text", "text": p},
-                ]
+                    },
+                })
+            _attachment_blocks = _serialize_attachments(
+                context, provider_kind="claude", purpose="generate",
+            )
+            _image_blocks.extend(_attachment_blocks)
+
+            if _image_blocks:
+                # §8 Absolute Observability — a single INFO line per GENERATE
+                # call that ships pixels. ``bytes`` and ``kinds`` come from
+                # ctx.attachments (not the base64-inflated blocks) so grep
+                # rollups match the on-disk hash/byte footprint.
+                _atts = getattr(context, "attachments", ())
+                _kinds = ",".join(sorted({a.kind for a in _atts})) or "-"
+                _hashes = ",".join(a.hash8 for a in _atts) or "-"
+                _bytes = 0
+                for _a in _atts:
+                    try:
+                        _bytes += os.path.getsize(_a.image_path)
+                    except OSError:
+                        pass
+                logger.info(
+                    "[ClaudeProvider] multi_modal op=%s blocks=%d "
+                    "attachments=%d bytes=%d kinds=[%s] hash8s=[%s] "
+                    "route=%s purpose=generate",
+                    getattr(context, "operation_id", "-"),
+                    len(_image_blocks), len(_atts), _bytes, _kinds, _hashes,
+                    (getattr(context, "provider_route", "") or "-"),
+                )
+                user_content = [*_image_blocks, {"type": "text", "text": p}]
             else:
                 user_content = p
 
