@@ -686,6 +686,11 @@ class VisionSensor:
         # Pause gate — short-circuit before any work.
         if self.is_paused():
             self.stats.dropped_paused += 1
+            logger.debug(
+                "[VisionSensor] skipped: paused "
+                "total_dropped_paused=%d",
+                self.stats.dropped_paused,
+            )
             return None
 
         # T2 app denylist — drop *before OCR* so credential-bearing
@@ -706,6 +711,13 @@ class VisionSensor:
         if last_seen is not None and (now - last_seen) < self._hash_cooldown_s:
             self.stats.dropped_hash_dedup += 1
             self._consecutive_unchanged += 1
+            logger.debug(
+                "[VisionSensor] skipped: dhash_dedup dhash=%s "
+                "age=%.2fs cooldown=%.1fs consecutive_unchanged=%d "
+                "total_dropped=%d",
+                frame.dhash, now - last_seen, self._hash_cooldown_s,
+                self._consecutive_unchanged, self.stats.dropped_hash_dedup,
+            )
             return None
         # Fresh frame — remember its hash.
         self._recent_hashes[frame.dhash] = now
@@ -757,6 +769,12 @@ class VisionSensor:
             tier2_result = await self._maybe_run_tier2(frame)
             if tier2_result is None:
                 self.stats.dropped_no_match += 1
+                logger.debug(
+                    "[VisionSensor] skipped: no_regex_match "
+                    "ocr_chars=%d tier2_enabled=%s total_dropped=%d",
+                    len(ocr_text), self._tier2_enabled,
+                    self.stats.dropped_no_match,
+                )
                 return None
             verdict_meta = self._tier2_verdict_meta(
                 verdict=tier2_result["verdict"],
@@ -1664,6 +1682,20 @@ class VisionSensor:
         app_id = str(raw_app) if isinstance(raw_app, str) and raw_app else None
         raw_win = meta.get("window_id")
         window_id = int(raw_win) if isinstance(raw_win, int) and not isinstance(raw_win, bool) else None
+
+        # §8 observability: frame_age lets operators see at a glance whether
+        # the sensor is processing stale disk state (Ferrari dead) vs a
+        # live stream. Does NOT gate the scan — the downstream dhash dedup
+        # is the authoritative "this is the same frame" check.
+        try:
+            frame_age_s = time.time() - os.stat(self._frame_path).st_mtime
+        except OSError:
+            frame_age_s = -1.0
+        logger.debug(
+            "[VisionSensor] read_frame ok: dhash=%s ts=%.3f age=%.2fs "
+            "app=%s win=%s",
+            dhash, float(ts), frame_age_s, app_id or "-", window_id or "-",
+        )
 
         return FrameData(
             frame_path=self._frame_path,
