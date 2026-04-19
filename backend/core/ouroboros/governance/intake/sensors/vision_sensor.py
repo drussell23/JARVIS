@@ -37,9 +37,10 @@ import os
 import re
 import signal as _signal
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.intake.intent_envelope import (
     IntentEnvelope,
@@ -116,6 +117,38 @@ _DEFAULT_RETENTION_ROOT = ".jarvis/vision_frames"
 _DEFAULT_FRAME_TTL_S = float(os.environ.get("JARVIS_VISION_FRAME_TTL_S", "600"))
 _TTL_PURGE_INTERVAL_S = 60.0            # how often the poll loop triggers a TTL scan
 
+# Policy layer settings (spec §Policy Layer + Task 11).
+_DEFAULT_FP_LEDGER_PATH = ".jarvis/vision_sensor_fp_ledger.json"
+_DEFAULT_FP_BUDGET = float(os.environ.get("JARVIS_VISION_SENSOR_FP_BUDGET", "0.3"))
+_DEFAULT_FP_WINDOW_SIZE = int(os.environ.get("JARVIS_VISION_SENSOR_FP_WINDOW", "20"))
+_DEFAULT_FINDING_COOLDOWN_S = float(
+    os.environ.get("JARVIS_VISION_SENSOR_FINDING_COOLDOWN_S", "120"),
+)
+# Default chain cap is ``1`` for Slices 1–2 entry per §Policy Layer →
+# Cooldowns. Flipped to ``3`` only as part of Slice 2 graduation.
+_DEFAULT_CHAIN_MAX = int(os.environ.get("JARVIS_VISION_CHAIN_MAX", "1"))
+_DEFAULT_PENALTY_S = float(os.environ.get("JARVIS_VISION_SENSOR_PENALTY_S", "300"))
+_CONSECUTIVE_FAILURES_PAUSE_THRESHOLD = 3
+
+# Outcome categories for the FP ledger.
+OUTCOME_REJECTED = "rejected"              # FP
+OUTCOME_APPLIED_GREEN = "applied_green"    # TP
+OUTCOME_STALE = "stale"                    # FP
+OUTCOME_UNCERTAIN = "uncertain"            # neither (dropped from rate calc)
+_VALID_OUTCOMES = frozenset({
+    OUTCOME_REJECTED, OUTCOME_APPLIED_GREEN, OUTCOME_STALE, OUTCOME_UNCERTAIN,
+})
+_FP_OUTCOMES = frozenset({OUTCOME_REJECTED, OUTCOME_STALE})
+_TP_OUTCOMES = frozenset({OUTCOME_APPLIED_GREEN})
+
+# Pause reasons
+PAUSE_REASON_FP_BUDGET = "fp_budget_exhausted"
+PAUSE_REASON_CHAIN_CAP = "chain_cap_exhausted"
+PAUSE_REASON_CONSECUTIVE_FAILURES = "consecutive_failures"
+PAUSE_REASON_MANUAL = "manual"
+# Pauses that time out automatically (wall-clock deadline).
+_AUTO_EXPIRING_PAUSE_REASONS = frozenset({PAUSE_REASON_CONSECUTIVE_FAILURES})
+
 
 @dataclass(frozen=True)
 class FrameData:
@@ -135,11 +168,31 @@ class VisionSensorStats:
     dropped_no_match: int = 0
     dropped_ferrari_absent: int = 0
     dropped_schema_malformed: int = 0
+    dropped_finding_cooldown: int = 0
+    dropped_paused: int = 0
     signals_emitted: int = 0
     degraded_ticks: int = 0
     frames_retained: int = 0
     frames_purged_ttl: int = 0
     frames_purged_shutdown: int = 0
+    # Policy-layer counters
+    outcomes_recorded: int = 0
+    consecutive_failures: int = 0
+    pause_events: int = 0
+    chain_starts: int = 0
+
+
+@dataclass(frozen=True)
+class OutcomeEntry:
+    """One row in the FP budget rolling window.
+
+    ``ts`` is wall-clock (``time.time()``) so the ledger survives
+    restart; monotonic timestamps would be meaningless across processes.
+    """
+
+    op_id: str
+    outcome: str
+    ts: float
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +298,12 @@ class VisionSensor:
         retention_root: Optional[str] = None,
         frame_ttl_s: Optional[float] = None,
         register_shutdown_hooks: bool = True,
+        ledger_path: Optional[str] = None,
+        fp_budget: Optional[float] = None,
+        fp_window_size: Optional[int] = None,
+        finding_cooldown_s: Optional[float] = None,
+        chain_max: Optional[int] = None,
+        penalty_s: Optional[float] = None,
     ) -> None:
         self._router = router
         self._repo = repo
@@ -301,6 +360,51 @@ class VisionSensor:
         if register_shutdown_hooks:
             self._register_shutdown_hooks()
 
+        # ------------------------------------------------------------------
+        # Policy layer (Task 11 — spec §Policy Layer)
+        # ------------------------------------------------------------------
+        self._ledger_path: Path = Path(
+            ledger_path
+            or (Path.cwd() / _DEFAULT_FP_LEDGER_PATH)
+        )
+        self._fp_budget: float = (
+            _DEFAULT_FP_BUDGET if fp_budget is None else float(fp_budget)
+        )
+        self._fp_window_size: int = (
+            _DEFAULT_FP_WINDOW_SIZE if fp_window_size is None else int(fp_window_size)
+        )
+        self._finding_cooldown_s: float = (
+            _DEFAULT_FINDING_COOLDOWN_S
+            if finding_cooldown_s is None
+            else float(finding_cooldown_s)
+        )
+        self._chain_max: int = (
+            _DEFAULT_CHAIN_MAX if chain_max is None else int(chain_max)
+        )
+        self._penalty_s: float = (
+            _DEFAULT_PENALTY_S if penalty_s is None else float(penalty_s)
+        )
+
+        # Rolling window of outcomes (newest-right). Capacity = window size.
+        self._outcomes: Deque[OutcomeEntry] = deque(maxlen=self._fp_window_size)
+        # Per-finding cooldown: ``"verdict|app|m1,m2"`` → wall-clock ``ts``.
+        self._finding_cooldowns: Dict[str, float] = {}
+        # Chain tracker: op_ids we've "started" as vision-originated this
+        # session. Does NOT persist — every boot begins with a fresh chain.
+        self._chain_started: set = set()
+        # Consecutive rejected/stale streak (persisted — a pattern that
+        # spans restarts is still worth suppressing).
+        self._consecutive_failures: int = 0
+        # Pause state (NOT persisted — §Policy Layer "fresh budget
+        # window on next session boot"; operator gets a clean slate).
+        self._paused: bool = False
+        self._pause_reason: str = ""
+        self._pause_until_ts: Optional[float] = None     # wall-clock deadline
+
+        # Load persisted ledger (outcomes + finding cooldowns +
+        # consecutive failure count) if it exists.
+        self._load_ledger()
+
     # ------------------------------------------------------------------
     # Pure inner unit — testable without disk or router
     # ------------------------------------------------------------------
@@ -310,17 +414,25 @@ class VisionSensor:
 
         Order of operations:
 
+        0. **Pause gate** — if the sensor is paused (FP budget, chain
+           cap, or penalty), drop immediately.
         1. **Tier 0 hash dedup** — drop if ``frame.dhash`` was seen
            within ``hash_cooldown_s``.
         2. **Tier 1 OCR + regex** — run patterns on OCR text (empty
            when ``ocr_fn`` is unset).
-        3. **Verdict mapping** — no hits → drop; hits → build
-           :class:`VisionSignalEvidence` schema v1 and wrap in an
-           :class:`IntentEnvelope`.
+        3. **Finding cooldown** — drop if the same verdict+app+matches
+           tuple fired within ``finding_cooldown_s``.
+        4. **Verdict mapping + emit** — build :class:`VisionSignalEvidence`
+           schema v1 and wrap in an :class:`IntentEnvelope`.
 
         This method does **not** call the router. Callers (scan_once)
         own the ingest side-effect.
         """
+        # Pause gate — short-circuit before any work.
+        if self.is_paused():
+            self.stats.dropped_paused += 1
+            return None
+
         self.stats.frames_polled += 1
 
         # Tier 0 dedup.
@@ -355,6 +467,19 @@ class VisionSensor:
         verdict_meta = _classify_from_matches(matched)
         if verdict_meta is None:
             self.stats.dropped_no_match += 1
+            return None
+
+        # Finding cooldown — same verdict+app+match-set within the
+        # window collapses. Unlike Tier 0 dedup (which is frame-hash
+        # scoped), this catches repeat-detection of the *same issue*
+        # across differently-hashed frames (scrolling, tooltip
+        # flickers, etc.).
+        verdict_name = verdict_meta["classifier_verdict"]
+        matches_tuple = tuple(matched)
+        if self._finding_cooldown_active(
+            verdict=verdict_name, app_id=frame.app_id, matches=matches_tuple,
+        ):
+            self.stats.dropped_finding_cooldown += 1
             return None
 
         # Retain the triggering frame so downstream Visual VERIFY (and
@@ -395,6 +520,12 @@ class VisionSensor:
                 frame.dhash, exc,
             )
             return None
+
+        # Mark the finding cooldown now that we've decided to emit.
+        self._mark_finding_emitted(
+            verdict=verdict_name, app_id=frame.app_id, matches=matches_tuple,
+        )
+        self._persist_ledger()
 
         signature = (
             f"vision:{verdict_meta['classifier_verdict']}:"
@@ -576,6 +707,270 @@ class VisionSensor:
             self._prev_sigterm_handler = None
         self._shutdown_hooks_registered = True
 
+    # ------------------------------------------------------------------
+    # Policy layer (Task 11)
+    # ------------------------------------------------------------------
+
+    # ---- Ledger persistence ----
+
+    def _load_ledger(self) -> None:
+        """Load persisted FP ledger + finding cooldowns + failure streak.
+
+        Silent on missing / corrupted files: the sensor starts with an
+        empty state rather than crashing. Pause state is deliberately
+        NOT loaded (§Policy Layer: "fresh budget window on next session
+        boot").
+        """
+        try:
+            raw = self._ledger_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        outcomes = data.get("outcomes")
+        if isinstance(outcomes, list):
+            for entry in outcomes[-self._fp_window_size:]:
+                if not isinstance(entry, dict):
+                    continue
+                op_id = entry.get("op_id")
+                outcome = entry.get("outcome")
+                ts = entry.get("ts")
+                if (
+                    isinstance(op_id, str)
+                    and outcome in _VALID_OUTCOMES
+                    and isinstance(ts, (int, float))
+                    and not isinstance(ts, bool)
+                ):
+                    self._outcomes.append(
+                        OutcomeEntry(op_id=op_id, outcome=outcome, ts=float(ts))
+                    )
+        cooldowns = data.get("finding_cooldowns")
+        if isinstance(cooldowns, dict):
+            for key, ts in cooldowns.items():
+                if (
+                    isinstance(key, str)
+                    and isinstance(ts, (int, float))
+                    and not isinstance(ts, bool)
+                ):
+                    self._finding_cooldowns[key] = float(ts)
+        cf = data.get("consecutive_failures")
+        if isinstance(cf, int) and not isinstance(cf, bool) and cf >= 0:
+            self._consecutive_failures = cf
+            self.stats.consecutive_failures = cf
+
+    def _persist_ledger(self) -> None:
+        """Atomically persist ledger state. Best-effort — never raises."""
+        try:
+            self._ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            data: Dict[str, Any] = {
+                "outcomes": [asdict(o) for o in self._outcomes],
+                "finding_cooldowns": dict(self._finding_cooldowns),
+                "consecutive_failures": self._consecutive_failures,
+                "last_updated_ts": time.time(),
+            }
+            tmp = self._ledger_path.with_suffix(self._ledger_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(str(tmp), str(self._ledger_path))
+        except (OSError, TypeError, ValueError):
+            logger.debug("[VisionSensor] ledger persist failed", exc_info=True)
+
+    # ---- Finding cooldown ----
+
+    @staticmethod
+    def _finding_key(
+        verdict: str, app_id: Optional[str], matches: Tuple[str, ...],
+    ) -> str:
+        """Canonical cooldown key for ``(verdict, app, sorted matches)``."""
+        app = app_id or "-"
+        matches_csv = ",".join(sorted(matches))
+        return f"{verdict}|{app}|{matches_csv}"
+
+    def _finding_cooldown_active(
+        self,
+        verdict: str,
+        app_id: Optional[str],
+        matches: Tuple[str, ...],
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """True when this verdict+app+match-set fired within the cooldown."""
+        if self._finding_cooldown_s <= 0:
+            return False
+        key = self._finding_key(verdict, app_id, matches)
+        last = self._finding_cooldowns.get(key)
+        if last is None:
+            return False
+        ref = now if now is not None else time.time()
+        return (ref - last) < self._finding_cooldown_s
+
+    def _mark_finding_emitted(
+        self,
+        verdict: str,
+        app_id: Optional[str],
+        matches: Tuple[str, ...],
+        *,
+        now: Optional[float] = None,
+    ) -> None:
+        ref = now if now is not None else time.time()
+        key = self._finding_key(verdict, app_id, matches)
+        self._finding_cooldowns[key] = ref
+        # Opportunistic GC — drop keys older than 2×cooldown so the dict
+        # doesn't grow unbounded across long sessions.
+        stale_cutoff = ref - (self._finding_cooldown_s * 2)
+        stale = [k for k, t in self._finding_cooldowns.items() if t < stale_cutoff]
+        for k in stale:
+            self._finding_cooldowns.pop(k, None)
+
+    # ---- FP budget ----
+
+    def fp_rate(self) -> Optional[float]:
+        """Return FP rate over the current rolling window, or ``None``.
+
+        ``None`` when there are no FP-or-TP outcomes (i.e. only
+        ``uncertain`` or empty window). Callers that treat ``None`` as
+        "don't pause" get the right behavior automatically.
+        """
+        fp = sum(1 for o in self._outcomes if o.outcome in _FP_OUTCOMES)
+        tp = sum(1 for o in self._outcomes if o.outcome in _TP_OUTCOMES)
+        total = fp + tp
+        if total == 0:
+            return None
+        return fp / total
+
+    # ---- Outcome intake + pause logic ----
+
+    def record_outcome(self, *, op_id: str, outcome: str) -> None:
+        """Record the outcome of a vision-originated op.
+
+        Called by the orchestrator after an op reaches a terminal
+        phase. Accepted values: ``"rejected"`` (FP), ``"applied_green"``
+        (TP), ``"stale"`` (FP), ``"uncertain"`` (neither — doesn't
+        contribute to the rate).
+
+        Side effects:
+        * Appends to the rolling window (drops oldest on overflow).
+        * Updates the consecutive-failures streak.
+        * May pause the sensor (FP budget / consecutive failures).
+        * Persists the ledger to disk.
+        """
+        if outcome not in _VALID_OUTCOMES:
+            raise ValueError(
+                f"unknown outcome {outcome!r}; must be one of "
+                f"{sorted(_VALID_OUTCOMES)}"
+            )
+        if not op_id:
+            raise ValueError("record_outcome requires a non-empty op_id")
+        self._outcomes.append(
+            OutcomeEntry(op_id=op_id, outcome=outcome, ts=time.time())
+        )
+        self.stats.outcomes_recorded += 1
+
+        # Update consecutive-failure streak.
+        if outcome in _FP_OUTCOMES:
+            self._consecutive_failures += 1
+        elif outcome in _TP_OUTCOMES:
+            self._consecutive_failures = 0
+        # Uncertain outcomes neither bump nor reset.
+        self.stats.consecutive_failures = self._consecutive_failures
+
+        # Check FP-budget exhaustion first — it dominates (operator
+        # intervention required) over the auto-expiring consecutive
+        # failure penalty.
+        rate = self.fp_rate()
+        if rate is not None and rate > self._fp_budget:
+            self._pause(reason=PAUSE_REASON_FP_BUDGET, duration_s=None)
+        elif self._consecutive_failures >= _CONSECUTIVE_FAILURES_PAUSE_THRESHOLD:
+            self._pause(
+                reason=PAUSE_REASON_CONSECUTIVE_FAILURES,
+                duration_s=self._penalty_s,
+            )
+
+        self._persist_ledger()
+
+    # ---- Chain cap ----
+
+    def record_chain_start(self, op_id: str) -> None:
+        """Register a new vision-originated op in this session's chain.
+
+        Pauses the sensor with ``chain_cap_exhausted`` once the chain
+        length reaches ``chain_max``. Resume requires manual
+        intervention (``/vision resume``) or next session boot.
+        """
+        if not op_id:
+            raise ValueError("record_chain_start requires a non-empty op_id")
+        if op_id in self._chain_started:
+            return  # idempotent
+        self._chain_started.add(op_id)
+        self.stats.chain_starts += 1
+        if len(self._chain_started) >= self._chain_max:
+            self._pause(reason=PAUSE_REASON_CHAIN_CAP, duration_s=None)
+
+    @property
+    def chain_budget_remaining(self) -> int:
+        """How many more vision-originated ops can start in this session."""
+        return max(0, self._chain_max - len(self._chain_started))
+
+    # ---- Pause / resume ----
+
+    def _pause(self, *, reason: str, duration_s: Optional[float]) -> None:
+        self._paused = True
+        self._pause_reason = reason
+        if duration_s is not None and duration_s > 0:
+            self._pause_until_ts = time.time() + float(duration_s)
+        else:
+            self._pause_until_ts = None
+        self.stats.pause_events += 1
+        logger.info(
+            "[VisionSensor] paused reason=%s pause_until_ts=%s",
+            reason,
+            f"{self._pause_until_ts:.1f}" if self._pause_until_ts else "manual",
+        )
+
+    def is_paused(self) -> bool:
+        """True when the sensor is currently suppressing emissions.
+
+        Auto-expiring pauses (``consecutive_failures``) check the
+        wall-clock deadline on every call — once it passes, the sensor
+        resumes itself transparently. Manual / budget pauses have no
+        deadline and require ``resume()``.
+        """
+        if not self._paused:
+            return False
+        if (
+            self._pause_reason in _AUTO_EXPIRING_PAUSE_REASONS
+            and self._pause_until_ts is not None
+            and time.time() >= self._pause_until_ts
+        ):
+            # Auto-resume — consecutive-failure penalty expired.
+            self._paused = False
+            self._pause_reason = ""
+            self._pause_until_ts = None
+            logger.info("[VisionSensor] auto-resumed after penalty expired")
+            return False
+        return True
+
+    @property
+    def paused(self) -> bool:
+        """Public pause predicate (delegates to :meth:`is_paused`)."""
+        return self.is_paused()
+
+    @property
+    def pause_reason(self) -> str:
+        return self._pause_reason
+
+    def resume(self) -> None:
+        """Manually resume the sensor (``/vision resume`` REPL command).
+
+        Clears the pause state and the chain tracker — the operator has
+        attested that they want a fresh budget/chain window.
+        """
+        self._paused = False
+        self._pause_reason = ""
+        self._pause_until_ts = None
+        self._chain_started.clear()
+        logger.info("[VisionSensor] manually resumed")
+
     def _on_sigterm(self, signum: int, frame: Any) -> None:
         """SIGTERM handler — purge, then re-dispatch to the prior handler.
 
@@ -680,6 +1075,10 @@ class VisionSensor:
 
     async def scan_once(self) -> List[IntentEnvelope]:
         """Run one poll. Returns the envelopes produced and ingested."""
+        # Policy gate first — a paused sensor doesn't even touch disk.
+        if self.is_paused():
+            self.stats.dropped_paused += 1
+            return []
         frame = self._read_frame()
         if frame is None:
             return []
