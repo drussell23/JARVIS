@@ -77,6 +77,7 @@ class OperationPhase(Enum):
     APPROVE = auto()
     APPLY = auto()
     VERIFY = auto()
+    VISUAL_VERIFY = auto()   # Post-APPLY UI regression check (Slices 3-4, Task 17)
     COMPLETE = auto()
     CANCELLED = auto()
     EXPIRED = auto()
@@ -133,7 +134,19 @@ PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
     OperationPhase.APPLY: {
         OperationPhase.VERIFY,
     },
-    OperationPhase.VERIFY: set(),  # terminals only — no forward progress
+    OperationPhase.VERIFY: {
+        # Optional — orchestrator chooses whether to invoke Visual
+        # VERIFY based on env + trigger logic (spec §VERIFY Extension).
+        # Back-compat: VERIFY can still terminate directly to COMPLETE
+        # via the auto-injected terminal reachability, so existing
+        # paths that don't know about Visual VERIFY keep working.
+        OperationPhase.VISUAL_VERIFY,
+    },
+    OperationPhase.VISUAL_VERIFY: {
+        # Visual VERIFY fail → L2 Repair via VALIDATE_RETRY (same
+        # routing TestRunner-red uses). Pass → auto-injected COMPLETE.
+        OperationPhase.VALIDATE_RETRY,
+    },
     # Terminal phases -- no outgoing transitions
     OperationPhase.COMPLETE: set(),
     OperationPhase.CANCELLED: set(),

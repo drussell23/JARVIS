@@ -94,18 +94,26 @@ def make_sensor_vlm_fn() -> Callable[[str], Dict[str, Any]]:
 
 
 def _stub_sensor_vlm_fn(frame_path: str) -> Dict[str, Any]:
-    """Stub classifier — returns a drop-triggering verdict.
+    """Stub classifier — returns ``verdict=ok`` so no signal emits.
 
-    ``verdict=unclear`` with zero confidence means the sensor:
-      * records the Tier 2 call + bills the stub cost ($0.005 default),
-      * does NOT emit a signal (unclear drops by default per spec).
+    Per spec §Severity → route, ``ok`` is the only verdict that's
+    dropped without routing. The stub uses ``ok`` (not ``unclear``,
+    which would still emit at info/BACKGROUND) so the sensor's boot
+    wiring is exercised end-to-end WITHOUT polluting the intake
+    queue with stub-originated signals.
 
-    The stub is deliberately small — it exists so boot wiring is
-    exercised without requiring a real VLM provider.
+    Side effects of the dispatch chain still fire:
+      * Tier 2 call counter increments,
+      * cost ledger debited ($0.005 default),
+      * ``tier2_ok_dropped`` stat bumps.
+
+    Operator sees "Tier 2 is wired but nothing real is happening"
+    until they flip ``JARVIS_VISION_VLM_MODE=doubleword`` and the
+    real impl is plugged in.
     """
     _ = frame_path  # reserved for real impl
     return {
-        "verdict": "unclear",
+        "verdict": "ok",
         "confidence": 0.0,
         "model": "stub-qwen3-vl-235b",
         "reasoning": "stub adapter — no real VLM call made",
