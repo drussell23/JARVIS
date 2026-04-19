@@ -27,10 +27,21 @@ sleep:
     malformed → falls back to UTC with a DEBUG log. An explicit
     ``UTC`` pass-through keeps the default documented.
 
+* ``JARVIS_VISION_SENSOR_RISK_FLOOR={notify_apply|approval_required|blocked}``
+    VisionSensor-specific floor (Task 6 of the VisionSensor + Visual
+    VERIFY arc). When an op's ``signal_source == "vision_sensor"``,
+    this env value is merged into the normal floor composition. The
+    *hard-coded* default is ``notify_apply`` — vision-originated ops
+    can never reach ``safe_auto`` (Invariant I2 in the design spec).
+    The env is tunable *upward only*: ``approval_required`` / ``blocked``
+    strengthen the floor. An explicit ``safe_auto`` raises ``ValueError``
+    because it would break I2; unknown tier names are ignored (DEBUG
+    log) and the default is used.
+
 Authority invariant: this module is pure-read. It consumes env vars +
-the current time and returns a recommended floor. The caller (the
-risk-engine wrapper) is responsible for applying the floor to the
-classification.
+the current time + the op's signal source and returns a recommended
+floor. The caller (the risk-engine wrapper) is responsible for
+applying the floor to the classification.
 
 Orderings are *safer-is-higher*:
 
@@ -52,6 +63,19 @@ _ENV_MIN_TIER = "JARVIS_MIN_RISK_TIER"
 _ENV_PARANOIA = "JARVIS_PARANOIA_MODE"
 _ENV_QUIET_HOURS = "JARVIS_AUTO_APPLY_QUIET_HOURS"
 _ENV_QUIET_HOURS_TZ = "JARVIS_AUTO_APPLY_QUIET_HOURS_TZ"
+_ENV_VISION_FLOOR = "JARVIS_VISION_SENSOR_RISK_FLOOR"
+
+# Canonical signal-source name for the VisionSensor. Mirrors
+# ``SignalSource.VISION_SENSOR.value`` in ``intent/signals.py`` — we
+# stringly-match to avoid an import-cycle (risk_tier_floor is a leaf
+# module consumed by orchestrator / gate layers that also touch
+# intent). The string form is the contract.
+_VISION_SENSOR_SOURCE = "vision_sensor"
+
+# Hard-coded floor for vision-originated ops. Cannot be weakened by env
+# (attempting to set a weaker value raises ValueError). Upward moves
+# (approval_required / blocked) are allowed.
+_VISION_SENSOR_HARD_FLOOR = "notify_apply"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -192,15 +216,70 @@ def quiet_hours_active(now: Optional[datetime] = None) -> bool:
     return hour >= start or hour < end
 
 
-def recommended_floor(now: Optional[datetime] = None) -> Optional[str]:
-    """Compose the three signals into a single floor recommendation.
+def _is_vision_source(signal_source: str) -> bool:
+    """Return ``True`` when *signal_source* names the VisionSensor.
+
+    Case-insensitive + whitespace-tolerant. The enum member
+    ``SignalSource.VISION_SENSOR`` (``intent/signals.py``) compares
+    equal to ``"vision_sensor"`` via its StrEnum semantics, so passing
+    either the enum or the raw string both work.
+    """
+    return _norm_tier(signal_source) == _VISION_SENSOR_SOURCE
+
+
+def _vision_floor_from_env() -> str:
+    """Resolve ``JARVIS_VISION_SENSOR_RISK_FLOOR`` honouring Invariant I2.
+
+    Returns the normalised tier name. Default is ``notify_apply``
+    (the hard floor). Raises ``ValueError`` if the env asks for a tier
+    weaker than ``notify_apply`` — I2 forbids it, and silently coercing
+    upward would mask an operator typo that *thought* it was weakening
+    the floor. Unknown tier values fall back to the default with a
+    DEBUG log (same policy as ``_env_floor``).
+    """
+    raw = _norm_tier(os.environ.get(_ENV_VISION_FLOOR, ""))
+    if not raw:
+        return _VISION_SENSOR_HARD_FLOOR
+    if raw not in _ORDER:
+        logger.debug(
+            "[RiskFloor] unrecognised %s=%r — using default %s",
+            _ENV_VISION_FLOOR, raw, _VISION_SENSOR_HARD_FLOOR,
+        )
+        return _VISION_SENSOR_HARD_FLOOR
+    if _ORDER[raw] < _ORDER[_VISION_SENSOR_HARD_FLOOR]:
+        raise ValueError(
+            f"{_ENV_VISION_FLOOR}={raw!r} cannot be lower than "
+            f"{_VISION_SENSOR_HARD_FLOOR!r}. Vision-originated ops are "
+            "forbidden from reaching safe_auto (Invariant I2 in "
+            "docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md)."
+        )
+    return raw
+
+
+def recommended_floor(
+    now: Optional[datetime] = None,
+    *,
+    signal_source: str = "",
+) -> Optional[str]:
+    """Compose the floor signals into a single recommendation.
 
     Ordering (strictest wins):
         1. ``JARVIS_MIN_RISK_TIER`` explicit value
         2. ``JARVIS_PARANOIA_MODE=1`` implies ``notify_apply``
         3. Active quiet-hours window implies ``notify_apply``
+        4. Vision-originated op (``signal_source == "vision_sensor"``)
+           implies at least ``notify_apply``, or the stronger value
+           in ``JARVIS_VISION_SENSOR_RISK_FLOOR`` (Invariant I2).
 
     Returns the normalised tier name or ``None`` when nothing applies.
+
+    Raises
+    ------
+    ValueError
+        If ``signal_source`` names the VisionSensor and
+        ``JARVIS_VISION_SENSOR_RISK_FLOOR`` is set to a tier weaker
+        than ``notify_apply``. Weakening the vision floor is a
+        configuration error, not a silent clamp.
     """
     explicit = _env_floor()
     candidates: list = []
@@ -210,6 +289,9 @@ def recommended_floor(now: Optional[datetime] = None) -> Optional[str]:
         candidates.append("notify_apply")
     if quiet_hours_active(now):
         candidates.append("notify_apply")
+    if _is_vision_source(signal_source):
+        # Raises ValueError if env tries to weaken below notify_apply.
+        candidates.append(_vision_floor_from_env())
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.
@@ -217,7 +299,10 @@ def recommended_floor(now: Optional[datetime] = None) -> Optional[str]:
 
 
 def apply_floor_to_name(
-    tier_name: str, *, now: Optional[datetime] = None,
+    tier_name: str,
+    *,
+    now: Optional[datetime] = None,
+    signal_source: str = "",
 ) -> Tuple[str, Optional[str]]:
     """Apply the recommended floor to a tier *name*.
 
@@ -228,11 +313,14 @@ def apply_floor_to_name(
     upgraded the tier — useful for observability logging.
 
     Unknown input tier names pass through unchanged.
+
+    Passing ``signal_source="vision_sensor"`` engages the VisionSensor
+    floor (Invariant I2). See :func:`recommended_floor`.
     """
     raw_in = _norm_tier(tier_name)
     if raw_in not in _ORDER:
         return (tier_name, None)
-    floor = recommended_floor(now)
+    floor = recommended_floor(now, signal_source=signal_source)
     if floor is None:
         return (tier_name, None)
     if _ORDER[floor] <= _ORDER[raw_in]:
@@ -240,11 +328,16 @@ def apply_floor_to_name(
     return (floor, floor)
 
 
-def floor_reason(now: Optional[datetime] = None) -> str:
+def floor_reason(
+    now: Optional[datetime] = None,
+    *,
+    signal_source: str = "",
+) -> str:
     """Human-readable explanation of why the floor fires.
 
     Used by the orchestrator when logging a tier upgrade so the operator
-    can tell *which* knob triggered the upgrade.
+    can tell *which* knob triggered the upgrade. When a VisionSensor
+    source is passed, the vision-specific floor rationale is included.
     """
     bits: list = []
     explicit = _env_floor()
@@ -256,6 +349,20 @@ def floor_reason(now: Optional[datetime] = None) -> str:
         raw = os.environ.get(_ENV_QUIET_HOURS, "").strip()
         tz_env = os.environ.get(_ENV_QUIET_HOURS_TZ, "").strip() or "UTC"
         bits.append(f"{_ENV_QUIET_HOURS}={raw} (tz={tz_env}) active")
+    if _is_vision_source(signal_source):
+        try:
+            tier = _vision_floor_from_env()
+        except ValueError:
+            # Don't fail observability formatting — name the bad env value.
+            raw_env = os.environ.get(_ENV_VISION_FLOOR, "").strip() or "(unset)"
+            bits.append(
+                f"signal_source=vision_sensor "
+                f"{_ENV_VISION_FLOOR}={raw_env} (INVALID — rejects safe_auto)"
+            )
+        else:
+            bits.append(
+                f"signal_source=vision_sensor floor={tier} (I2)"
+            )
     if not bits:
         return "(no floor active)"
     return ", ".join(bits)
