@@ -23,7 +23,38 @@ Spec: ``docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md``
 from __future__ import annotations
 
 import sys
+import threading
 from typing import Any, Callable, Optional
+
+
+# ---------------------------------------------------------------------------
+# Active-sensor registry (process-global, set by IntakeLayerService at
+# boot). Mirrors ``get_protected_app_provider`` pattern from Task 4 —
+# the REPL + dashboard consume the sensor reference without needing the
+# whole intake-layer object graph.
+# ---------------------------------------------------------------------------
+
+
+_ACTIVE_SENSOR: Optional[Any] = None
+_ACTIVE_SENSOR_LOCK = threading.Lock()
+
+
+def register_active_vision_sensor(sensor: Optional[Any]) -> None:
+    """Install (or clear) the active VisionSensor reference.
+
+    Called once by ``IntakeLayerService`` when the sensor is constructed
+    during boot. Passing ``None`` clears the registry — useful for
+    tests that manage the singleton manually.
+    """
+    global _ACTIVE_SENSOR
+    with _ACTIVE_SENSOR_LOCK:
+        _ACTIVE_SENSOR = sensor
+
+
+def get_active_vision_sensor() -> Optional[Any]:
+    """Return the currently-registered VisionSensor, or ``None``."""
+    with _ACTIVE_SENSOR_LOCK:
+        return _ACTIVE_SENSOR
 
 
 # ---------------------------------------------------------------------------

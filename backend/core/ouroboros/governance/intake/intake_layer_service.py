@@ -692,6 +692,19 @@ class IntakeLayerService:
                 )
                 self._sensors.append(_vision_sensor)
                 self._vision_sensor = _vision_sensor
+                # Publish the sensor to the process-global registry so
+                # SerpentFlow REPL handlers + LiveDashboard status line
+                # can reach it without threading the intake-layer object
+                # through every call site.
+                try:
+                    from backend.core.ouroboros.governance.vision_repl import (
+                        register_active_vision_sensor,
+                    )
+                    register_active_vision_sensor(_vision_sensor)
+                except Exception as exc:
+                    logger.debug(
+                        "[IntakeLayer] vision_repl register failed: %s", exc,
+                    )
                 _tier2 = _env_truthy(
                     os.environ.get("JARVIS_VISION_SENSOR_TIER2_ENABLED", "false"),
                 )

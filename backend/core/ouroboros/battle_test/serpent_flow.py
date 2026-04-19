@@ -727,6 +727,18 @@ class SerpentFlow:
 
         # Determine sensor type from goal prefix or explicit param
         sensor_label = sensor or "Operation"
+        # Vision-originated ops get a distinctive ``[vision-origin]``
+        # prefix on the sensor label so the op block header tells the
+        # operator where the signal came from at a glance.
+        try:
+            from backend.core.ouroboros.governance.vision_repl import (
+                vision_origin_tag,
+            )
+            prefix = vision_origin_tag(sensor)
+            if prefix:
+                sensor_label = prefix.strip() + " " + sensor_label
+        except Exception:
+            pass  # best-effort — prefix is cosmetic
         self._open_op_block(op_id, sensor_label)
 
         # Risk badge
@@ -3224,6 +3236,22 @@ class SerpentREPL:
                     if line.startswith("/mutation") or line.startswith("mutation "):
                         await self._handle_mutation(line)
                         continue
+                    if (
+                        line.startswith("/vision")
+                        or line.startswith("vision ")
+                        or line == "vision"
+                    ):
+                        self._handle_vision(line)
+                        continue
+                    if (
+                        line.startswith("/verify-confirm")
+                        or line.startswith("verify-confirm ")
+                    ):
+                        self._handle_verify_confirm(line)
+                        continue
+                    if line in ("/verify-undemote", "verify-undemote"):
+                        self._handle_verify_undemote()
+                        continue
 
                     # ConversationBridge capture (V1: user turns only).
                     # Any line that fell through the built-in dispatch is
@@ -3324,6 +3352,9 @@ class SerpentREPL:
             f"  [{_C['dim']}]/forget <id>[/{_C['dim']}]      shortcut: remove a memory by id",
             f"  [{_C['dim']}]/mutation <src>[/{_C['dim']}]   mutation-test <src> (meta-test: do tests catch bugs?)",
             f"  [{_C['dim']}]/mutation-gate ...[/{_C['dim']}] APPLY-gate status / dry-run / ledger",
+            f"  [{_C['dim']}]/vision [...][/{_C['dim']}]      VisionSensor: status | resume | boost <seconds>",
+            f"  [{_C['dim']}]/verify-confirm <op> X[/{_C['dim']}] mark Visual VERIFY advisory as agree|disagree",
+            f"  [{_C['dim']}]/verify-undemote[/{_C['dim']}]   clear Slice 4 auto-demotion flag",
             f"  [{_C['dim']}]help[/{_C['dim']}]              this message",
             f"  [{_C['dim']}]quit[/{_C['dim']}]              graceful shutdown",
         ]
@@ -3762,6 +3793,95 @@ class SerpentREPL:
             f"ledger [N]|prewarm][/{_C['dim']}]",
             highlight=False,
         )
+
+    # ------------------------------------------------------------------
+    # /vision — VisionSensor REPL commands (Task 21 wiring)
+    # ------------------------------------------------------------------
+
+    def _handle_vision(self, line: str) -> None:
+        """Dispatch ``/vision status|resume|boost <n>`` subcommands.
+
+        The underlying handlers live in ``vision_repl.py`` — this
+        method resolves the active sensor from the process-global
+        registry and delegates. When the sensor wasn't constructed at
+        boot (master switch off), the handlers emit a "not configured"
+        line so the operator sees the same UI shape either way.
+        """
+        try:
+            from backend.core.ouroboros.governance.vision_repl import (
+                get_active_vision_sensor,
+                handle_vision_boost,
+                handle_vision_resume,
+                handle_vision_status,
+            )
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/vision: module import failed: {exc}"
+                f"[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        # Parse subcommand. Accepts ``/vision`` (bare = status), ``/vision
+        # status``, ``/vision resume``, ``/vision boost <seconds>``.
+        raw = line.replace("/vision", "vision", 1).strip()
+        parts = raw.split(None, 1)
+        sub = parts[1].strip() if len(parts) > 1 else ""
+        verb = sub.split()[0].lower() if sub else "status"
+        rest = sub[len(verb):].strip() if sub else ""
+
+        sensor = get_active_vision_sensor()
+        if verb == "status" or verb == "":
+            out = handle_vision_status(sensor)
+        elif verb == "resume":
+            out = handle_vision_resume(sensor)
+        elif verb == "boost":
+            out = handle_vision_boost(sensor, rest)
+        else:
+            out = (
+                f"/vision: unknown subcommand {verb!r}; "
+                f"must be one of {{status, resume, boost}}"
+            )
+        self._flow.console.print(out, highlight=False)
+
+    def _handle_verify_confirm(self, line: str) -> None:
+        """Dispatch ``/verify-confirm <op-id> {agree|disagree}`` — marks
+        a Visual VERIFY advisory verdict as human-confirmed (feeds the
+        Slice 4 FP-rate ledger + auto-demotion guardrail).
+        """
+        try:
+            from backend.core.ouroboros.governance.visual_verify import (
+                handle_verify_confirm_command,
+            )
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/verify-confirm: module import failed: {exc}"
+                f"[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        args = line.replace("/verify-confirm", "verify-confirm", 1)
+        args = args.replace("verify-confirm", "", 1).strip()
+        out = handle_verify_confirm_command(args)
+        self._flow.console.print(out, highlight=False)
+
+    def _handle_verify_undemote(self) -> None:
+        """Dispatch ``/verify-undemote`` — clears the Slice 4 auto-
+        demotion flag so model-assisted advisory re-arms on next boot.
+        """
+        try:
+            from backend.core.ouroboros.governance.visual_verify import (
+                handle_verify_undemote_command,
+            )
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/verify-undemote: module import failed: {exc}"
+                f"[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        out = handle_verify_undemote_command()
+        self._flow.console.print(out, highlight=False)
 
     def _mg_print_status(self, mg_mod, mc_mod) -> None:
         f = self._flow
