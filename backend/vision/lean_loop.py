@@ -1624,7 +1624,7 @@ class LeanVisionLoop:
         /tmp/claude/latest_frame.jpg via atomic rename.
         """
         frame_path = os.path.join(_TMP_DIR, "latest_frame.jpg")
-        meta_path = os.path.join(_TMP_DIR, "frame_meta.json")
+        meta_path = os.path.join(_TMP_DIR, "latest_frame.json")
 
         # Auto-start frame_server if not running
         if not self._frame_server_ready:
