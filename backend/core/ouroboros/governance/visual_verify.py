@@ -34,10 +34,13 @@ Spec: ``docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md``
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
-from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence, Tuple
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.VisualVerify")
 
@@ -132,6 +135,42 @@ class VisualVerifyConfig:
                 "JARVIS_VISION_VERIFY_MAX_IMAGE_BYTES", cls.max_image_bytes,
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Master switches (env-gated; orchestrator consults these before calling
+# ``run_if_triggered``)
+# ---------------------------------------------------------------------------
+#
+# Slice 3 (Task 17/18) — deterministic Visual VERIFY. Default OFF until
+# the 3-session graduation arc passes (Task 18 Step 3).
+# Slice 4 (Task 19/20) — model-assisted advisory. Default OFF until
+# its own 3-session arc passes.
+
+
+def _env_truthy(raw: str) -> bool:
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def visual_verify_enabled() -> bool:
+    """Master switch: ``JARVIS_VISION_VERIFY_ENABLED`` (default ``false``).
+
+    Slice 3 entry default — flips to ``true`` as part of Slice 3
+    graduation (Task 18 Step 3). Orchestrator wiring consults this
+    before dispatching to :func:`run_if_triggered`.
+    """
+    return _env_truthy(os.environ.get("JARVIS_VISION_VERIFY_ENABLED", "false"))
+
+
+def visual_verify_model_assisted_enabled() -> bool:
+    """``JARVIS_VISION_VERIFY_MODEL_ASSISTED_ENABLED`` (default ``false``).
+
+    Slice 4 scope — model-assisted advisory verdict on top of the
+    deterministic battery. Stays off throughout Slice 3.
+    """
+    return _env_truthy(
+        os.environ.get("JARVIS_VISION_VERIFY_MODEL_ASSISTED_ENABLED", "false"),
+    )
 
 
 # Verdict strings — public constants so orchestrator call-sites don't
