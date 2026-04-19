@@ -201,12 +201,16 @@ def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1280) -> No
             # Atomic rename
             os.rename(tmp_path, _FRAME_PATH)
 
-            # Write metadata
+            # Write metadata. dhash MUST be a 16-char lowercase hex string to
+            # satisfy VisionSignalEvidence schema v1 validation (enforced
+            # downstream at envelope construction — sensor drops frames with
+            # "malformed evidence" if dhash is any other format). Mask to 64
+            # bits first in case _dhash returns a wider int on some platforms.
             meta = {
                 "ts": time.time(),
                 "width": width,
                 "height": height,
-                "dhash": dhash_val,
+                "dhash": f"{dhash_val & 0xFFFFFFFFFFFFFFFF:016x}",
                 "frame_number": frame_number,
             }
             meta_tmp = _META_PATH + ".tmp"
