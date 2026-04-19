@@ -661,6 +661,7 @@ def main() -> None:
         "httpcore", "httpx",  # HTTP transport internals
         "asyncio",  # event loop debug
         "aiosqlite",  # SQLite debug queries
+        "markdown_it",  # rich.markdown transitive — per-token "entering fence/list/..." spam at DEBUG
     ):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 

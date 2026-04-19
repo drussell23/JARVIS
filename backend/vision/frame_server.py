@@ -13,7 +13,7 @@ Output files (atomic writes via rename):
     /tmp/claude/latest_frame.jpg   -- latest JPEG frame
     /tmp/claude/frame_meta.json    -- {timestamp, width, height, dhash, fps}
 
-Run:  python3 backend/vision/frame_server.py [--fps 15] [--quality 70] [--max-dim 1024]
+Run:  python3 backend/vision/frame_server.py [--fps 15] [--quality 70] [--max-dim 1280]
 
 Stdout protocol:
     Line 1: {"ok":true,"status":"ready","pid":12345}
@@ -27,6 +27,12 @@ import os
 import struct
 import sys
 import time
+
+try:
+    from PIL import Image
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 _TMP_DIR = os.environ.get("VISION_FRAME_DIR", "/tmp/claude")
 _FRAME_PATH = os.path.join(_TMP_DIR, "latest_frame.jpg")
@@ -83,7 +89,7 @@ def _dhash(pixel_data: bytes, width: int, height: int, hash_size: int = 8) -> in
     return result
 
 
-def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1024) -> None:
+def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1280) -> None:
     """Main capture loop using Quartz."""
     try:
         import Quartz
@@ -152,20 +158,41 @@ def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1024) -> No
             # Get raw pixel data for dhash
             provider = CGImageGetDataProvider(image_ref)
             raw_data = CGDataProviderCopyData(provider)
-            dhash_val = _dhash(bytes(raw_data), width, height)
+            raw_bgra = bytes(raw_data)
 
-            # Save as JPEG using ImageIO (no PIL needed)
-            url = CFURLCreateWithFileSystemPath(
-                None, tmp_path, kCFURLPOSIXPathStyle, False,
-            )
-            dest = CGImageDestinationCreateWithURL(url, "public.jpeg", 1, None)
-            if dest is None:
-                time.sleep(interval)
-                continue
+            # Enforce max-dim clamp: Retina captures land at physical resolution
+            # (e.g. 2880x1800), which bottlenecks the encode loop and wastes
+            # downstream token/latency budget. Downscale above threshold.
+            pil_img = None
+            if max_dim > 0 and max(width, height) > max_dim:
+                if not _PIL_AVAILABLE:
+                    _respond({"ok": False, "status": "error", "error": "Pillow required for --max-dim resize (pip install Pillow)"})
+                    sys.exit(1)
+                scale = max_dim / max(width, height)
+                new_w = max(1, int(width * scale))
+                new_h = max(1, int(height * scale))
+                pil_img = Image.frombuffer("RGBA", (width, height), raw_bgra, "raw", "BGRA", 0, 1)
+                pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+                width, height = new_w, new_h
+                raw_bgra = pil_img.tobytes("raw", "BGRA", 0, 1)
 
-            props = {Quartz.kCGImageDestinationLossyCompressionQuality: quality}
-            CGImageDestinationAddImage(dest, image_ref, props)
-            CGImageDestinationFinalize(dest)
+            dhash_val = _dhash(raw_bgra, width, height)
+
+            # JPEG encode: PIL for resized frames, Quartz ImageIO for native frames
+            if pil_img is not None:
+                pil_img.convert("RGB").save(tmp_path, "JPEG", quality=int(quality * 100))
+            else:
+                url = CFURLCreateWithFileSystemPath(
+                    None, tmp_path, kCFURLPOSIXPathStyle, False,
+                )
+                dest = CGImageDestinationCreateWithURL(url, "public.jpeg", 1, None)
+                if dest is None:
+                    time.sleep(interval)
+                    continue
+
+                props = {Quartz.kCGImageDestinationLossyCompressionQuality: quality}
+                CGImageDestinationAddImage(dest, image_ref, props)
+                CGImageDestinationFinalize(dest)
 
             # Atomic rename
             os.rename(tmp_path, _FRAME_PATH)
@@ -212,7 +239,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="JARVIS Frame Server")
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--quality", type=float, default=0.7)
-    parser.add_argument("--max-dim", type=int, default=1024)
+    parser.add_argument("--max-dim", type=int, default=1280)
     args = parser.parse_args()
     capture_loop(fps=args.fps, quality=args.quality, max_dim=args.max_dim)
 

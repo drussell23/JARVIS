@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 from typing import Any, Optional
 
@@ -70,6 +71,14 @@ _BATCH_INTERVAL_S = float(os.environ.get("JARVIS_UI_STREAMING_BATCH_MS", "16")) 
 # from our batch cadence; Rich handles its own render throttling on a
 # background thread so .update() is essentially pointer-swap cheap.
 _LIVE_REFRESH_HZ = int(os.environ.get("JARVIS_UI_STREAMING_LIVE_REFRESH_HZ", "30"))
+
+# Sliding-window cap on the markdown re-parse buffer (Manifesto §3).
+# Rich.Markdown re-parses the full string on every .update(); at the 16ms
+# batch cadence over a 16k-token stream that's O(N²) work where N is
+# accumulated chars. Slicing to the tail keeps the per-render cost O(1)
+# in the stream length — Rich Live only displays the visible viewport
+# anyway, so nothing above the slice would have rendered to the terminal.
+_RENDER_TAIL_CHARS = int(os.environ.get("JARVIS_UI_STREAMING_RENDER_TAIL_CHARS", "4096"))
 
 
 # ---------------------------------------------------------------------------
@@ -163,26 +172,39 @@ class StreamRenderer:
 
         self._queue = asyncio.Queue(maxsize=_QUEUE_MAX)
 
-        # Try to open a Rich Live widget. On any failure (no console, no
-        # Rich, terminal misbehaves), degrade to log-only streaming — the
-        # consumer still drains the queue and emits the INFO line at end.
-        try:
-            from rich.live import Live
-            from rich.markdown import Markdown
-
-            self._live = Live(
-                Markdown(""),
-                console=self._console,
-                transient=False,
-                refresh_per_second=_LIVE_REFRESH_HZ,
-            )
-            self._live.start()
-        except Exception:  # noqa: BLE001
+        # Enforce the TTY contract (Manifesto §3). Headless / sandbox / CI
+        # runs must bypass the Rich Markdown re-parse path entirely — a
+        # cosmetic UI renderer cannot be permitted to block the async
+        # event loop running the Claude stream. The consumer task still
+        # drains the queue so token_count and the final INFO line stay
+        # accurate; only the visible Live widget is skipped.
+        if not sys.stdout.isatty():
             logger.debug(
-                "[StreamRender] op=%s Rich.Live unavailable; log-only stream",
-                op_id, exc_info=True,
+                "[StreamRender] op=%s non-TTY stdout — Live skipped, log-only stream",
+                op_id,
             )
             self._live = None
+        else:
+            # Try to open a Rich Live widget. On any failure (no console, no
+            # Rich, terminal misbehaves), degrade to log-only streaming — the
+            # consumer still drains the queue and emits the INFO line at end.
+            try:
+                from rich.live import Live
+                from rich.markdown import Markdown
+
+                self._live = Live(
+                    Markdown(""),
+                    console=self._console,
+                    transient=False,
+                    refresh_per_second=_LIVE_REFRESH_HZ,
+                )
+                self._live.start()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[StreamRender] op=%s Rich.Live unavailable; log-only stream",
+                    op_id, exc_info=True,
+                )
+                self._live = None
 
         self._consumer_task = loop.create_task(self._consume())
         self._active = True
@@ -230,9 +252,11 @@ class StreamRenderer:
         if self._live is not None:
             try:
                 from rich.markdown import Markdown
-                # Final render of the complete buffer so anything after
-                # the last batch boundary lands in terminal history.
-                self._live.update(Markdown(self._buffer))  # type: ignore[attr-defined]
+                # Final render: tail slice only. Rich Live's viewport shows
+                # at most the visible terminal area, so re-parsing the full
+                # buffer would pay O(N) cost to render content that never
+                # reaches pixels.
+                self._live.update(Markdown(self._buffer[-_RENDER_TAIL_CHARS:]))  # type: ignore[attr-defined]
                 self._live.stop()  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
                 logger.debug(
@@ -344,12 +368,17 @@ class StreamRenderer:
 
     def _render_buffer_safe(self) -> None:
         """Swap the Markdown renderable on Live. Rich handles the
-        actual terminal write on its background thread."""
+        actual terminal write on its background thread.
+
+        Buffer is sliced to ``_RENDER_TAIL_CHARS`` to bound per-render
+        parser work — prevents O(N²) event-loop pressure when a 16k-token
+        stream re-parses a growing buffer on every 16ms batch tick.
+        """
         if self._live is None:
             return
         try:
             from rich.markdown import Markdown
-            self._live.update(Markdown(self._buffer))  # type: ignore[attr-defined]
+            self._live.update(Markdown(self._buffer[-_RENDER_TAIL_CHARS:]))  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[StreamRender] Live.update failed", exc_info=True,
