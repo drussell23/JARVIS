@@ -30,12 +30,15 @@ Spec
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import os
 import re
+import signal as _signal
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.core.ouroboros.governance.intake.intent_envelope import (
@@ -46,6 +49,7 @@ from backend.core.ouroboros.governance.intent.signals import (
     SignalSource,
     build_vision_signal_evidence,
 )
+from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
 logger = logging.getLogger("Ouroboros.VisionSensor")
 
@@ -107,6 +111,11 @@ _ADAPTIVE_STATIC_BEFORE_DOWNSHIFT = 3   # unchanged polls before interval double
 _HASH_COOLDOWN_S = 10.0                 # dhash-dedup window
 _OCR_SNIPPET_LEN = 256                  # matches schema v1 cap
 
+# Retention settings (spec §Retention + threat T7).
+_DEFAULT_RETENTION_ROOT = ".jarvis/vision_frames"
+_DEFAULT_FRAME_TTL_S = float(os.environ.get("JARVIS_VISION_FRAME_TTL_S", "600"))
+_TTL_PURGE_INTERVAL_S = 60.0            # how often the poll loop triggers a TTL scan
+
 
 @dataclass(frozen=True)
 class FrameData:
@@ -127,6 +136,9 @@ class VisionSensorStats:
     dropped_ferrari_absent: int = 0
     signals_emitted: int = 0
     degraded_ticks: int = 0
+    frames_retained: int = 0
+    frames_purged_ttl: int = 0
+    frames_purged_shutdown: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +240,10 @@ class VisionSensor:
         metadata_path: str = _DEFAULT_METADATA_PATH,
         ocr_fn: Optional[Callable[[str], str]] = None,
         hash_cooldown_s: float = _HASH_COOLDOWN_S,
+        session_id: Optional[str] = None,
+        retention_root: Optional[str] = None,
+        frame_ttl_s: Optional[float] = None,
+        register_shutdown_hooks: bool = True,
     ) -> None:
         self._router = router
         self._repo = repo
@@ -255,6 +271,31 @@ class VisionSensor:
         # Lifecycle
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
+
+        # ------------------------------------------------------------------
+        # Retention (Task 9 — §Retention + threat T7)
+        # ------------------------------------------------------------------
+        # Session ID scopes the on-disk retention directory. Two sensors
+        # on the same machine with distinct session_ids will not collide,
+        # and the shutdown hook only nukes *this* sensor's subtree.
+        self._session_id = session_id or generate_operation_id("vis-sess")
+        root = retention_root or str(
+            Path.cwd() / _DEFAULT_RETENTION_ROOT
+        )
+        self._session_retention_dir: Path = Path(root) / self._session_id
+        # TTL <= 0 selects "memory-only mode" — no disk writes at all.
+        self._frame_ttl_s = float(
+            frame_ttl_s if frame_ttl_s is not None else _DEFAULT_FRAME_TTL_S
+        )
+        self._last_ttl_purge_monotonic: float = 0.0
+
+        # Shutdown hooks (atexit + SIGTERM). Opt-out for tests so each
+        # test fixture doesn't leak a permanent atexit entry or clobber
+        # the process-level signal handler.
+        self._shutdown_hooks_registered = False
+        self._prev_sigterm_handler: Any = None
+        if register_shutdown_hooks:
+            self._register_shutdown_hooks()
 
     # ------------------------------------------------------------------
     # Pure inner unit — testable without disk or router
@@ -312,13 +353,22 @@ class VisionSensor:
             self.stats.dropped_no_match += 1
             return None
 
+        # Retain the triggering frame so downstream Visual VERIFY (and
+        # Orange-PR reviewers) read a stable path instead of Ferrari's
+        # volatile ``/tmp/claude/latest_frame.jpg`` that gets overwritten
+        # at 15 fps. Memory-only mode (TTL <= 0) and best-effort failure
+        # both fall back to the volatile source path — the signal still
+        # emits, only its ``frame_path`` differs.
+        retained_path = self._retain_frame(frame)
+        evidence_frame_path = retained_path or frame.frame_path
+
         # Build schema v1 evidence — raises if any field is malformed,
         # which the orchestrator would treat as a sensor bug. Preferred
         # over silent defaults per Invariant I1.
         evidence = build_vision_signal_evidence(
             frame_hash=frame.dhash,
             frame_ts=frame.ts,
-            frame_path=frame.frame_path,
+            frame_path=evidence_frame_path,
             classifier_verdict=verdict_meta["classifier_verdict"],
             classifier_model="deterministic",
             classifier_confidence=1.0,
@@ -360,6 +410,180 @@ class VisionSensor:
         ]
         for h in expired:
             self._recent_hashes.pop(h, None)
+
+    # ------------------------------------------------------------------
+    # Retention (Task 9)
+    # ------------------------------------------------------------------
+
+    def _retain_frame(self, frame: FrameData) -> Optional[str]:
+        """Copy ``frame.frame_path`` into this sensor's retention directory.
+
+        The retained copy's path is substituted for ``frame_path`` in the
+        emitted evidence, so downstream consumers (Visual VERIFY) read a
+        stable path under ``.jarvis/vision_frames/<session>/`` instead of
+        the volatile Ferrari path which gets overwritten at 15 fps.
+
+        Retention is best-effort: any filesystem error drops the copy
+        with a DEBUG log and the evidence falls back to the volatile
+        source path. The signal still emits.
+
+        When ``_frame_ttl_s <= 0`` (memory-only mode), retention is
+        skipped entirely — the evidence keeps the Ferrari path.
+
+        Returns the retained path on success, or ``None`` when retention
+        is skipped / failed.
+        """
+        if self._frame_ttl_s <= 0:
+            return None
+        try:
+            self._session_retention_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.debug(
+                "[VisionSensor] retention mkdir failed: %s",
+                exc,
+            )
+            return None
+        ext = os.path.splitext(frame.frame_path)[1] or ".jpg"
+        target = self._session_retention_dir / f"{frame.dhash}{ext}"
+        if target.exists():
+            # Same dhash previously retained → idempotent reuse.
+            return str(target)
+        try:
+            with open(frame.frame_path, "rb") as src:
+                data = src.read()
+            with open(target, "wb") as dst:
+                dst.write(data)
+        except (OSError, FileNotFoundError) as exc:
+            logger.debug(
+                "[VisionSensor] retention copy failed: %s",
+                exc,
+            )
+            return None
+        self.stats.frames_retained += 1
+        return str(target)
+
+    def _purge_expired_frames(self, *, now: Optional[float] = None) -> int:
+        """Unlink retained frames older than ``_frame_ttl_s``.
+
+        Uses file mtime (wall clock) for age comparison. Retention is a
+        privacy measure, not a crypto primitive — wall-clock drift is
+        acceptable.
+
+        Returns the number of files removed. Missing / unreadable
+        directory returns 0 without error.
+        """
+        if self._frame_ttl_s <= 0:
+            return 0
+        if not self._session_retention_dir.exists():
+            return 0
+        ref_wall = now if now is not None else time.time()
+        removed = 0
+        try:
+            entries = list(self._session_retention_dir.iterdir())
+        except OSError:
+            return 0
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+                age = ref_wall - entry.stat().st_mtime
+            except OSError:
+                continue
+            if age >= self._frame_ttl_s:
+                try:
+                    entry.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        if removed:
+            self.stats.frames_purged_ttl += removed
+        return removed
+
+    def _purge_session_dir_safe(self) -> int:
+        """Shutdown purge — removes every retained file + the session dir.
+
+        Guaranteed non-raising. Safe to call from ``atexit`` or a signal
+        handler. Idempotent (subsequent calls against a missing dir
+        return 0).
+        """
+        try:
+            return self._purge_session_dir_impl()
+        except Exception:  # noqa: BLE001
+            # atexit / signal handlers must never bubble — a shutdown
+            # error that takes down the whole process would be worse
+            # than leaving retained frames on disk.
+            return 0
+
+    def _purge_session_dir_impl(self) -> int:
+        if not self._session_retention_dir.exists():
+            return 0
+        removed = 0
+        try:
+            entries = list(self._session_retention_dir.iterdir())
+        except OSError:
+            return 0
+        for entry in entries:
+            try:
+                if entry.is_file():
+                    entry.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        try:
+            self._session_retention_dir.rmdir()
+        except OSError:
+            # Non-empty (subdir?) or permission issue — leave the dir,
+            # but we did our best on the frame files.
+            pass
+        self.stats.frames_purged_shutdown += removed
+        return removed
+
+    # ------------------------------------------------------------------
+    # Shutdown hooks
+    # ------------------------------------------------------------------
+
+    def _register_shutdown_hooks(self) -> None:
+        """Install ``atexit`` + ``SIGTERM`` purge hooks.
+
+        ``SIGTERM`` registration only succeeds in the main thread — in
+        other threads (e.g. some test runners) ``signal.signal`` raises
+        ``ValueError``. We silently skip that branch; atexit alone is
+        already enough for the common cooperative-shutdown case.
+        """
+        atexit.register(self._purge_session_dir_safe)
+        try:
+            self._prev_sigterm_handler = _signal.signal(
+                _signal.SIGTERM, self._on_sigterm,
+            )
+        except (ValueError, OSError, AttributeError):
+            self._prev_sigterm_handler = None
+        self._shutdown_hooks_registered = True
+
+    def _on_sigterm(self, signum: int, frame: Any) -> None:
+        """SIGTERM handler — purge, then re-dispatch to the prior handler.
+
+        Must never raise. If the previous handler was the OS default, we
+        re-raise SIGTERM via ``signal.raise_signal`` so the process still
+        terminates. Otherwise we chain through whichever callable the
+        previous handler was.
+        """
+        self._purge_session_dir_safe()
+        prev = self._prev_sigterm_handler
+        if callable(prev):
+            try:
+                prev(signum, frame)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # Default handler (``SIG_DFL``) or ``SIG_IGN`` — re-dispatch so
+        # the process actually terminates. ``raise_signal`` honours the
+        # currently-installed handler, which at this point is ours, so
+        # we unset it first to avoid recursion.
+        try:
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            _signal.raise_signal(_signal.SIGTERM)
+        except (ValueError, OSError, AttributeError):
+            pass
 
     # ------------------------------------------------------------------
     # Disk ingress — fail-closed when Ferrari is absent
@@ -484,10 +708,28 @@ class VisionSensor:
             except Exception:
                 logger.exception("[VisionSensor] poll error")
             self._adjust_adaptive_interval()
+            self._maybe_ttl_purge()
             try:
                 await asyncio.sleep(self._current_poll_interval_s)
             except asyncio.CancelledError:
                 break
+
+    def _maybe_ttl_purge(self) -> None:
+        """Trigger a TTL purge at most once per ``_TTL_PURGE_INTERVAL_S``.
+
+        Called from the poll loop after every scan. Keeps disk usage
+        bounded without adding a second background task.
+        """
+        if self._frame_ttl_s <= 0:
+            return
+        now = time.monotonic()
+        if (now - self._last_ttl_purge_monotonic) < _TTL_PURGE_INTERVAL_S:
+            return
+        self._last_ttl_purge_monotonic = now
+        try:
+            self._purge_expired_frames()
+        except Exception:  # noqa: BLE001
+            logger.debug("[VisionSensor] TTL purge raised", exc_info=True)
 
     def _adjust_adaptive_interval(self) -> None:
         """Adaptive throttle: double interval after N static polls.
