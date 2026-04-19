@@ -379,3 +379,11 @@ terraform/terraform.tfvars
 # Claude Code working state
 .claude/worktrees/
 .worktrees/
+
+# VisionSensor + Visual VERIFY retention / ledgers
+# Retained frame files + cost/FP ledgers are per-session local state —
+# must never land in git (privacy: ambient screen content; correctness:
+# session-scoped).
+.jarvis/vision_frames/
+.jarvis/vision_cost_ledger.json
+.jarvis/vision_sensor_fp_ledger.json
