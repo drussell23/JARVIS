@@ -152,6 +152,12 @@ _DEFAULT_COST_LEDGER_PATH = ".jarvis/vision_cost_ledger.json"
 _COST_DOWNSHIFT_THRESHOLD = 0.80   # Tier 2 VLM skipped; Tier 1 still runs
 _COST_PAUSE_THRESHOLD = 0.95       # entire sensor pauses
 
+# Operator-triggered cost-cascade bypass (``/vision boost <seconds>``).
+# Spec §Cost / Latency Envelope: bounded to 300s, TTY-gated (REPL-only),
+# disk-persisted, auto-expires. Used for "survival over cost" moments
+# where the operator explicitly accepts the spend.
+_BOOST_MAX_DURATION_S = 300.0
+
 # VLM classifier recognised verdicts.
 _VLM_VERDICTS_EMIT: frozenset = frozenset(
     {"bug_visible", "error_visible", "unclear"},
@@ -647,6 +653,11 @@ class VisionSensor:
         self._cost_today_usd: float = 0.0
         self._cost_ledger_date: str = _utc_date_iso()
         self._cost_ledger_calls: int = 0
+        # Boost state — operator-triggered cost-cascade bypass via
+        # ``/vision boost <seconds>`` (Task 21). Disk-persisted on the
+        # cost ledger so a restart mid-boost respects the remaining
+        # window. ``None`` = no boost active.
+        self._boost_until_ts: Optional[float] = None
         self._load_cost_ledger()
 
     # ------------------------------------------------------------------
@@ -1322,6 +1333,17 @@ class VisionSensor:
                 self._cost_ledger_calls = stored_calls
         # Different UTC day → ledger is stale, spend starts at 0.
 
+        # Boost state — persists regardless of date rollover (a boost
+        # started at 23:59 should survive midnight crossing for its
+        # remaining window). Wall-clock-expiry handled by
+        # :meth:`is_boost_active`.
+        boost_ts = data.get("boost_until_ts")
+        if isinstance(boost_ts, (int, float)) and not isinstance(boost_ts, bool):
+            # Only restore if still in the future — a stale flag is
+            # silently dropped.
+            if boost_ts > time.time():
+                self._boost_until_ts = float(boost_ts)
+
     def _persist_cost_ledger(self) -> None:
         """Atomic write of today's cost ledger. Best-effort."""
         try:
@@ -1331,6 +1353,7 @@ class VisionSensor:
                 "utc_date": self._cost_ledger_date,
                 "spend_usd": self._cost_today_usd,
                 "vlm_calls": self._cost_ledger_calls,
+                "boost_until_ts": self._boost_until_ts,
                 "last_updated_ts": time.time(),
             }
             tmp = self._cost_ledger_path.with_suffix(
@@ -1373,16 +1396,76 @@ class VisionSensor:
         return self._cost_today_usd / self._daily_cost_cap_usd
 
     def _cost_downshift_active(self) -> bool:
-        """True when we should skip the VLM but keep Tier 1 running."""
+        """True when we should skip the VLM but keep Tier 1 running.
+
+        Respects the operator's explicit ``/vision boost`` override —
+        during a boost window the cost cascade is suppressed
+        regardless of actual spend (spec §"survival over cost").
+        """
+        if self.is_boost_active():
+            return False
         return self._cost_fraction() >= _COST_DOWNSHIFT_THRESHOLD
+
+    # ------------------------------------------------------------------
+    # /vision boost — operator-triggered cost-cascade bypass (Task 21)
+    # ------------------------------------------------------------------
+
+    def enable_boost(self, duration_s: float) -> float:
+        """Enable the cost-cascade bypass for ``duration_s`` seconds.
+
+        ``duration_s`` is clamped to ``[1.0, _BOOST_MAX_DURATION_S]`` —
+        operators can't open the budget door indefinitely (the 300s
+        ceiling is hard-coded per spec). Persisted to the cost ledger
+        so a restart mid-boost honours the remaining window.
+
+        Returns the effective duration granted (after clamp).
+
+        If the sensor is currently paused for ``cost_cap_exhausted``,
+        boost additionally clears that pause — the operator has
+        explicitly accepted the spend.
+        """
+        clamped = max(1.0, min(float(duration_s), _BOOST_MAX_DURATION_S))
+        self._boost_until_ts = time.time() + clamped
+        # Clear a cost-cap pause if one is active.
+        if self._paused and self._pause_reason == PAUSE_REASON_COST_CAP:
+            self._paused = False
+            self._pause_reason = ""
+            self._pause_until_ts = None
+        logger.info(
+            "[VisionSensor] boost enabled duration_s=%.1f until_ts=%.1f",
+            clamped, self._boost_until_ts,
+        )
+        self._persist_cost_ledger()
+        return clamped
+
+    def is_boost_active(self) -> bool:
+        """True while the boost window is open."""
+        return (
+            self._boost_until_ts is not None
+            and time.time() < self._boost_until_ts
+        )
+
+    def boost_remaining_s(self) -> float:
+        """Seconds remaining in the current boost window (``0.0`` if
+        inactive). Never raises."""
+        if self._boost_until_ts is None:
+            return 0.0
+        remaining = self._boost_until_ts - time.time()
+        return max(0.0, remaining)
 
     def _record_tier2_spend(self) -> None:
         """Add one VLM call to the ledger and trigger cascade if needed."""
         self._cost_today_usd += self._tier2_cost_usd
         self._cost_ledger_calls += 1
         self.stats.cost_usd_today = self._cost_today_usd
-        # Cascade step 2 (95%): pause the sensor entirely.
-        if self._cost_fraction() >= _COST_PAUSE_THRESHOLD and not self._paused:
+        # Cascade step 2 (95%): pause the sensor entirely — unless the
+        # operator has explicitly opened a boost window accepting the
+        # spend.
+        if (
+            self._cost_fraction() >= _COST_PAUSE_THRESHOLD
+            and not self._paused
+            and not self.is_boost_active()
+        ):
             self.stats.cost_pause_events += 1
             self._pause(reason=PAUSE_REASON_COST_CAP, duration_s=None)
         self._persist_cost_ledger()
