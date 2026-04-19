@@ -1256,7 +1256,7 @@ class LiveDashboard:
         )
 
     def _build_footer(self) -> Panel:
-        """Build the footer with cost breakdown and controls."""
+        """Build the footer with cost breakdown, vision status, and controls."""
         # Cost breakdown
         cost_parts = []
         for provider, cost in sorted(self._cost_breakdown.items()):
@@ -1264,13 +1264,34 @@ class LiveDashboard:
                 cost_parts.append(f"{provider}: ${cost:.4f}")
         cost_str = "  ".join(cost_parts) if cost_parts else "no spend yet"
 
+        # VisionSensor status line (Task 21 wiring). Best-effort — if
+        # the sensor isn't registered (master switch off at boot) the
+        # renderer returns a compact ``vision: off`` token so the
+        # layout stays stable.
+        vision_str = ""
+        try:
+            from backend.core.ouroboros.governance.vision_repl import (
+                format_vision_status_line,
+                get_active_vision_sensor,
+            )
+            vision_str = format_vision_status_line(get_active_vision_sensor())
+        except Exception:
+            vision_str = ""
+
         controls = (
             "[Ctrl+C: stop]  [e: expand]  [d: diffs]"
         )
 
-        footer = Text.from_markup(
-            f"  💰 {cost_str}    │    {controls}"
-        )
+        # Line layout: cost │ vision status │ controls. Vision middle-
+        # slot is bracketed with separators so a future dashboard
+        # redesign can regex-extract it cleanly.
+        if vision_str:
+            footer_text = (
+                f"  💰 {cost_str}    │    👁 {vision_str}    │    {controls}"
+            )
+        else:
+            footer_text = f"  💰 {cost_str}    │    {controls}"
+        footer = Text.from_markup(footer_text)
         return Panel(footer, style="dim", padding=(0, 0))
 
 
