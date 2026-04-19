@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import dataclasses
 import hashlib
 import json
@@ -109,6 +110,159 @@ _DIFF_CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "unified_diff", "
 # so every single-file consumer keeps working unchanged. The ``files`` list is
 # the source of truth for multi-file VALIDATE and APPLY iteration.
 _MULTI_FILE_ENTRY_KEYS = frozenset({"file_path", "full_content", "rationale"})
+
+
+# ---------------------------------------------------------------------------
+# Attachment Serialization (Task 7 of VisionSensor + Visual VERIFY arc)
+# ---------------------------------------------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md
+#   §Invariant I7 — substrate export-ban
+#   §Shared Substrate → Provider serialization
+#
+# This helper is the **serialization boundary** enforcement of I7.
+# ``ctx.attachments`` is export-banned to all modules except VisionSensor,
+# Visual VERIFY, and this helper (which producers.py is on the
+# _AUTHORIZED_MODULES list for in tests/governance/test_attachment_export_ban.py).
+# The function itself then imposes a second gate: it refuses to walk
+# ``ctx.attachments`` unless ``purpose`` is one of the two sanctioned
+# purposes. Any caller that passes the wrong purpose (or no purpose)
+# silently gets an empty list — byte-perfect I7 defense-in-depth.
+
+_ATTACHMENT_PURPOSES_ALLOWED: frozenset = frozenset(
+    {"sensor_classify", "visual_verify"}
+)
+
+# BG/SPEC route cost optimization — these routes target text-only models
+# (DW Gemma for BACKGROUND, DW fire-and-forget for SPECULATIVE) where
+# multi-modal payloads would either be dropped by the provider or waste
+# tokens. Strip attachments regardless of purpose when route matches.
+_ATTACHMENT_STRIPPED_ROUTES: frozenset = frozenset({"background", "speculative"})
+
+# Provider kind normalization — case-insensitive match, whitespace-tolerant.
+# Unknown kinds return empty list (logged once at DEBUG).
+_ATTACHMENT_PROVIDER_KINDS: frozenset = frozenset({"claude", "doubleword", "jprime"})
+
+
+def _serialize_attachments(
+    ctx: OperationContext,
+    *,
+    provider_kind: str,
+    purpose: str = "generate",
+) -> List[Dict[str, Any]]:
+    """Serialize ``ctx.attachments`` into provider-specific multi-modal blocks.
+
+    This function is the **only** sanctioned path for ``ctx.attachments``
+    bytes to leave the process (Invariant I7). Defense-in-depth:
+
+    1. **Purpose gate** — the function refuses to walk ``ctx.attachments``
+       unless ``purpose`` is ``"sensor_classify"`` (VisionSensor Tier 2
+       VLM classifier call) or ``"visual_verify"`` (Visual VERIFY
+       model-assisted advisory call). Any other purpose — including the
+       default ``"generate"`` — silently returns an empty list. Callers
+       outside the two sanctioned flows cannot surface attachments to
+       a provider API regardless of which call site they reach this
+       function from.
+
+    2. **Route gate** — BG / SPEC routes return an empty list regardless
+       of purpose. These routes target text-only models and a payload
+       with image bytes would waste tokens at best and confuse the
+       provider at worst.
+
+    3. **Per-attachment read gate** — each attachment's bytes are loaded
+       via the bounded ``Attachment.read_bytes()`` path (10 MiB cap).
+       Read failures (missing file, size overflow, permission error)
+       drop that attachment with a WARNING log and continue with the
+       rest; a broken attachment never takes down the whole call.
+
+    Parameters
+    ----------
+    ctx:
+        Operation context — ``ctx.attachments`` is walked iff the two
+        gates above pass.
+    provider_kind:
+        One of ``"claude"`` / ``"doubleword"`` / ``"jprime"``
+        (case-insensitive). Unknown kinds return empty list.
+    purpose:
+        Must be ``"sensor_classify"`` or ``"visual_verify"`` for
+        attachments to materialize. Any other value → ``[]``.
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        Provider-specific content blocks ready to splice into the
+        multi-modal message payload. Shape depends on provider:
+
+        * Claude: ``{"type": "image", "source": {"type": "base64",
+          "media_type": ..., "data": ...}}``
+        * DoubleWord / J-Prime: ``{"type": "image_url", "image_url":
+          {"url": "data:<mime>;base64,<b64>"}}`` (OpenAI-compatible
+          multi-modal schema, which both providers speak natively).
+
+        Empty list when either gate trips or no attachments exist.
+    """
+    # Purpose gate — I7 defense-in-depth boundary.
+    if purpose not in _ATTACHMENT_PURPOSES_ALLOWED:
+        return []
+
+    # No attachments → nothing to serialize. Early-exit before any
+    # further work — cheap in the common (non-vision) hot path.
+    attachments = getattr(ctx, "attachments", ())
+    if not attachments:
+        return []
+
+    # Route gate — BG/SPEC routes target text-only models. Strip bytes
+    # regardless of purpose (cost + correctness optimization).
+    route = (getattr(ctx, "provider_route", "") or "").strip().lower()
+    if route in _ATTACHMENT_STRIPPED_ROUTES:
+        return []
+
+    kind = (provider_kind or "").strip().lower()
+    if kind not in _ATTACHMENT_PROVIDER_KINDS:
+        logger.debug(
+            "[providers._serialize_attachments] unknown provider_kind=%r; "
+            "dropping %d attachment(s)",
+            provider_kind, len(attachments),
+        )
+        return []
+
+    blocks: List[Dict[str, Any]] = []
+    for att in attachments:
+        try:
+            data = att.read_bytes()
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            logger.warning(
+                "[providers._serialize_attachments] drop attachment hash8=%s: %s",
+                att.hash8, exc,
+            )
+            continue
+
+        b64 = base64.b64encode(data).decode("ascii")
+
+        if kind == "claude":
+            # Anthropic Messages API multi-modal image content block.
+            # https://docs.anthropic.com/en/api/messages (image source).
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": att.mime_type,
+                    "data": b64,
+                },
+            })
+        else:
+            # OpenAI-compatible image_url schema. Both DoubleWord and
+            # J-Prime accept data URIs via this shape. Keeps the
+            # serializer minimal — specialise later if either provider
+            # requires a divergent format.
+            blocks.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{att.mime_type};base64,{b64}",
+                },
+            })
+
+    return blocks
 
 
 def _resolve_effective_repo_root(
