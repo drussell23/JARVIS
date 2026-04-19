@@ -827,10 +827,19 @@ class VisionSensor:
     def fp_rate(self) -> Optional[float]:
         """Return FP rate over the current rolling window, or ``None``.
 
-        ``None`` when there are no FP-or-TP outcomes (i.e. only
-        ``uncertain`` or empty window). Callers that treat ``None`` as
-        "don't pause" get the right behavior automatically.
+        ``None`` when:
+
+        * the window is not yet full (spec §Policy Layer specifies
+          "rolling N-op window" — the rate only meaningfully exists
+          once the window is populated; early tripping on tiny samples
+          would pause the sensor on the first FP every boot);
+        * the window holds zero FP-or-TP outcomes (only ``uncertain``).
+
+        Callers that treat ``None`` as "don't pause" get the right
+        behavior automatically.
         """
+        if len(self._outcomes) < self._fp_window_size:
+            return None
         fp = sum(1 for o in self._outcomes if o.outcome in _FP_OUTCOMES)
         tp = sum(1 for o in self._outcomes if o.outcome in _TP_OUTCOMES)
         total = fp + tp

@@ -104,32 +104,47 @@ def test_fp_rate_is_none_on_empty_window(tmp_path):
 
 
 def test_fp_rate_none_when_only_uncertain(tmp_path):
-    sensor = _make_sensor(tmp_path)
+    sensor = _make_sensor(tmp_path, fp_window_size=3)
     for i in range(3):
         sensor.record_outcome(op_id=f"op-{i}", outcome=OUTCOME_UNCERTAIN)
+    # Window is full but zero FP+TP — rate undefined.
     assert sensor.fp_rate() is None
     assert sensor.paused is False
 
 
+def test_fp_rate_none_until_window_full(tmp_path):
+    """Spec §Policy Layer: the rate only meaningfully exists once the
+    rolling window is populated. Early samples never trip the budget."""
+    sensor = _make_sensor(tmp_path, fp_window_size=5, fp_budget=0.1)
+    # 4 of 5 slots filled with REJECTED → rate would be 1.0, but window
+    # is not full yet → None → no pause.
+    for i in range(4):
+        sensor.record_outcome(op_id=f"f-{i}", outcome=OUTCOME_UNCERTAIN)
+    assert sensor.fp_rate() is None
+    # 5th fills the window, uncertain-only still None.
+    sensor.record_outcome(op_id="u5", outcome=OUTCOME_UNCERTAIN)
+    assert sensor.fp_rate() is None
+
+
 def test_fp_rate_all_rejected_is_one(tmp_path):
-    sensor = _make_sensor(tmp_path)
+    # Window size matches the outcome count so the full-window guard
+    # doesn't suppress the rate.
+    sensor = _make_sensor(tmp_path, fp_window_size=5, fp_budget=1.1)
     for i in range(5):
         sensor.record_outcome(op_id=f"op-{i}", outcome=OUTCOME_REJECTED)
     assert sensor.fp_rate() == 1.0
 
 
 def test_fp_rate_all_applied_green_is_zero(tmp_path):
-    # Long enough streak to overwhelm the consecutive-failure threshold
-    # counter cleanly.
-    sensor = _make_sensor(tmp_path)
+    sensor = _make_sensor(tmp_path, fp_window_size=5)
     for i in range(5):
         sensor.record_outcome(op_id=f"op-{i}", outcome=OUTCOME_APPLIED_GREEN)
     assert sensor.fp_rate() == 0.0
 
 
 def test_fp_rate_stale_counted_as_fp(tmp_path):
-    # 2 stale + 8 applied_green → rate = 2/10 = 0.2
-    sensor = _make_sensor(tmp_path, fp_budget=0.3)
+    # 2 stale + 8 applied_green → rate = 2/10 = 0.2, below 0.3 budget.
+    sensor = _make_sensor(tmp_path, fp_budget=0.3, fp_window_size=10)
     for i in range(2):
         sensor.record_outcome(op_id=f"stale-{i}", outcome=OUTCOME_STALE)
     for i in range(8):

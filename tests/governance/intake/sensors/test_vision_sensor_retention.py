@@ -41,6 +41,27 @@ from backend.core.ouroboros.governance.intake.sensors.vision_sensor import (
 
 
 # ---------------------------------------------------------------------------
+# Autouse isolation — keep the FP ledger (Task 11) from leaking
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_vision_sensor_disk_state(tmp_path, monkeypatch):
+    """Chdir into ``tmp_path`` so every ``VisionSensor(...)`` instance in
+    this file writes its default-path disk artifacts (FP ledger,
+    retention directory) into an isolated tmp dir.
+
+    Without this, Task 11's disk-persisted FP ledger leaks finding-
+    cooldown state across tests in this file — each ``_ingest_frame``
+    that emits a signal persists a cooldown entry to
+    ``.jarvis/vision_sensor_fp_ledger.json`` under cwd, which the next
+    test picks up and silently drops subsequent emits against.
+    """
+    monkeypatch.chdir(tmp_path)
+    yield
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 

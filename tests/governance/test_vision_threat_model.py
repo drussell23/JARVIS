@@ -63,15 +63,24 @@ def _make_sensor(**overrides) -> VisionSensor:
 
     ``register_shutdown_hooks`` is forced off so the process-level
     ``atexit`` + ``SIGTERM`` registry doesn't accumulate fixtures.
+    ``ledger_path`` is always isolated to a per-call ``mkdtemp`` so
+    Task 11's disk-persisted FP ledger never leaks state across tests
+    or test files (previously a shared default ledger at
+    ``.jarvis/vision_sensor_fp_ledger.json`` caused the threat-model
+    suite to inherit finding-cooldown state from earlier sensor-unit
+    tests).
     """
+    import tempfile
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="vision-threat-"))
     kwargs = dict(
         router=_StubRouter(),
         session_id="threat-model",
-        retention_root="/tmp/claude-test-threat-model",
+        retention_root=str(scratch / "retention"),
         frame_ttl_s=0.0,              # memory-only — keep the filesystem quiet
         register_shutdown_hooks=False,
-        frame_path="/tmp/claude/nonexistent_frame.jpg",
-        metadata_path="/tmp/claude/nonexistent_frame.json",
+        frame_path=str(scratch / "nonexistent_frame.jpg"),
+        metadata_path=str(scratch / "nonexistent_frame.json"),
+        ledger_path=str(scratch / "fp_ledger.json"),
     )
     kwargs.update(overrides)
     return VisionSensor(**kwargs)

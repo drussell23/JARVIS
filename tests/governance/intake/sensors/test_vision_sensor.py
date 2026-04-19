@@ -42,6 +42,24 @@ from backend.core.ouroboros.governance.intake.sensors.vision_sensor import (
 
 
 # ---------------------------------------------------------------------------
+# Autouse isolation — keep the FP ledger (Task 11) from leaking
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_vision_sensor_disk_state(tmp_path, monkeypatch):
+    """Chdir into ``tmp_path`` so every ``VisionSensor(...)`` instance in
+    this file writes its default-path disk artifacts (FP ledger, retention
+    directory) into an isolated tmp dir — NOT the repo's ``.jarvis/``.
+
+    Without this, the disk-persisted FP ledger introduced in Task 11
+    leaks finding-cooldown state across tests and across test files.
+    """
+    monkeypatch.chdir(tmp_path)
+    yield
+
+
+# ---------------------------------------------------------------------------
 # Test router stub
 # ---------------------------------------------------------------------------
 
@@ -345,9 +363,12 @@ async def test_evidence_ocr_snippet_truncated_at_max_len():
 
 @pytest.mark.asyncio
 async def test_envelope_signature_groups_by_verdict_and_app():
+    # Disable Task 11 finding cooldown so both emissions actually fire
+    # — this test exercises signature-building logic, not cooldowns.
     sensor = VisionSensor(
         router=_StubRouter(),
         ocr_fn=lambda _p: "Traceback (most recent call last):",
+        finding_cooldown_s=0.0,
     )
     e1 = await sensor._ingest_frame(_make_frame(dhash="1111222233334444", app_id="com.apple.Terminal"))
     # Different hash, same verdict+app → same signature (intake dedup unit).
