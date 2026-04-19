@@ -130,6 +130,46 @@ _DEFAULT_CHAIN_MAX = int(os.environ.get("JARVIS_VISION_CHAIN_MAX", "1"))
 _DEFAULT_PENALTY_S = float(os.environ.get("JARVIS_VISION_SENSOR_PENALTY_S", "300"))
 _CONSECUTIVE_FAILURES_PAUSE_THRESHOLD = 3
 
+# ---------------------------------------------------------------------------
+# T1 / T2 defenses — prompt injection + credential + app denylist
+# ---------------------------------------------------------------------------
+#
+# Spec §Threat Model:
+#   T1 — Prompt injection via screen text.
+#   T2 — Credential leak via screenshot (three layers: hard-coded app
+#        denylist + user-extensible FORBIDDEN_APP memory + OCR
+#        credential-shape regex).
+
+# Credential patterns mirror the last 5 entries of the semantic-firewall
+# injection pattern set (sk-*, AKIA*, ghp_*, xox[bp]-*, PEM blocks). An
+# OCR hit drops the whole frame; we never forward credential-shaped
+# bytes to any downstream consumer.
+_CREDENTIAL_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[bp]-[A-Za-z0-9\-]{10,}\b"),
+    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
+)
+
+# Hard-coded app denylist — never overridable downward. Additional
+# deny entries come from ``FORBIDDEN_APP`` memories (Task 4). Matches
+# are case-insensitive on macOS bundle-id strings.
+_HARDCODED_APP_DENYLIST: frozenset = frozenset({
+    "com.1password.mac",
+    "com.1password7.mac",
+    "com.agilebits.onepassword",
+    "com.agilebits.onepassword4",
+    "com.agilebits.onepassword7",
+    "com.bitwarden.desktop",
+    "com.apple.keychainaccess",
+    "com.apple.mobilesms",            # Messages
+    "com.apple.mail",
+    "com.apple.mailcompose",
+    "org.whispersystems.signal-desktop",
+})
+
+
 # Outcome categories for the FP ledger.
 OUTCOME_REJECTED = "rejected"              # FP
 OUTCOME_APPLIED_GREEN = "applied_green"    # TP
@@ -170,6 +210,9 @@ class VisionSensorStats:
     dropped_schema_malformed: int = 0
     dropped_finding_cooldown: int = 0
     dropped_paused: int = 0
+    dropped_app_denied: int = 0
+    dropped_credential_shape: int = 0
+    injection_sanitized: int = 0
     signals_emitted: int = 0
     degraded_ticks: int = 0
     frames_retained: int = 0
@@ -245,6 +288,111 @@ def _truncate_snippet(text: str, *, max_len: int = _OCR_SNIPPET_LEN) -> str:
     if not text:
         return ""
     return text[:max_len]
+
+
+def _ocr_has_credential_shape(text: str) -> bool:
+    """Return ``True`` iff *text* matches any known credential pattern.
+
+    T2c mitigation — an OCR payload carrying a credential-shaped token
+    drops the entire frame. Never forward bytes we know to contain a
+    secret shape to any downstream consumer.
+    """
+    if not text:
+        return False
+    for pat in _CREDENTIAL_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+
+def _is_app_on_hardcoded_denylist(app_id: Optional[str]) -> bool:
+    """Return ``True`` iff *app_id* matches the hard-coded T2 denylist.
+
+    Case-insensitive, whitespace-tolerant. The denylist covers credential
+    managers, secure messengers, and mail clients — frames from these
+    apps are dropped before OCR even runs, so no credential bytes ever
+    enter the classifier.
+    """
+    if not app_id:
+        return False
+    norm = app_id.strip().lower()
+    return norm in _HARDCODED_APP_DENYLIST
+
+
+def _is_app_on_memory_denylist(app_id: Optional[str]) -> bool:
+    """Return ``True`` iff *app_id* matches a user FORBIDDEN_APP memory.
+
+    Consults the module-level provider hook installed by
+    ``UserPreferenceStore._provide_protected_apps`` (Task 4). Silently
+    returns ``False`` on any error — the hard-coded denylist still
+    applies, so a broken memory provider doesn't open the attack
+    surface.
+    """
+    if not app_id:
+        return False
+    try:
+        from backend.core.ouroboros.governance.user_preference_memory import (
+            get_protected_app_provider,
+        )
+        provider = get_protected_app_provider()
+        if provider is None:
+            return False
+        forbidden = list(provider())
+    except Exception:  # noqa: BLE001
+        return False
+    norm = app_id.strip().lower()
+    for entry in forbidden:
+        try:
+            if str(entry).strip().lower() == norm:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _is_app_denied(app_id: Optional[str]) -> bool:
+    """Combined T2 app-denylist predicate (hard-coded OR memory)."""
+    return (
+        _is_app_on_hardcoded_denylist(app_id)
+        or _is_app_on_memory_denylist(app_id)
+    )
+
+
+def _sanitize_ocr_for_evidence(text: str) -> Tuple[str, bool]:
+    """Pass OCR text through the semantic firewall.
+
+    Returns ``(sanitized, injection_detected)``:
+
+    * ``sanitized`` — the firewall's output (credentials redacted to
+      ``[REDACTED]``, injection phrases *not* scrubbed by the
+      firewall's own behavior). When the firewall reports an
+      injection, we additionally overwrite the entire snippet with
+      ``"[sanitized:prompt_injection_detected]"`` so downstream
+      prompts can't carry the adversarial phrase even if a consumer
+      forgets the untrusted-fence wrapper.
+    * ``injection_detected`` — tells the caller whether to bump the
+      ``injection_sanitized`` counter for observability.
+
+    Falls through with ``(text, False)`` if the firewall import fails
+    — the sensor keeps working against the rest of its defenses.
+    """
+    try:
+        from backend.core.ouroboros.governance.semantic_firewall import (
+            sanitize_for_firewall,
+        )
+    except Exception:  # noqa: BLE001
+        return (text or "", False)
+    result = sanitize_for_firewall(text or "", field_name="vision_ocr")
+    if result.rejected:
+        # Inspect reasons to distinguish injection from credential hits
+        # — credential shapes were already dropped at the caller, but
+        # length-cap rejections can also set rejected=True.
+        injection = any(
+            "injection pattern hit" in r for r in result.reasons
+        )
+        if injection:
+            return ("[sanitized:prompt_injection_detected]", True)
+    return (result.sanitized, False)
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +581,16 @@ class VisionSensor:
             self.stats.dropped_paused += 1
             return None
 
+        # T2 app denylist — drop *before OCR* so credential-bearing
+        # frames from sensitive apps never reach the classifier.
+        if _is_app_denied(frame.app_id):
+            self.stats.dropped_app_denied += 1
+            logger.debug(
+                "[VisionSensor] dropped frame — app denylist (app_id=%s)",
+                frame.app_id,
+            )
+            return None
+
         self.stats.frames_polled += 1
 
         # Tier 0 dedup.
@@ -463,6 +621,19 @@ class VisionSensor:
                 )
                 ocr_text = ""
 
+        # T2c credential-shape check — a hit drops the whole frame.
+        # This runs on the raw OCR output (before firewall sanitation)
+        # because the firewall redacts credentials to ``[REDACTED]``
+        # which we specifically want to observe pre-redaction.
+        if _ocr_has_credential_shape(ocr_text):
+            self.stats.dropped_credential_shape += 1
+            logger.debug(
+                "[VisionSensor] dropped frame — credential shape in OCR "
+                "(dhash=%s, app_id=%s)",
+                frame.dhash, frame.app_id,
+            )
+            return None
+
         matched = _run_deterministic_patterns(ocr_text)
         verdict_meta = _classify_from_matches(matched)
         if verdict_meta is None:
@@ -491,6 +662,16 @@ class VisionSensor:
         retained_path = self._retain_frame(frame)
         evidence_frame_path = retained_path or frame.frame_path
 
+        # T1 sanitization — pass OCR through the semantic firewall
+        # before the text lands in ``evidence``. On injection, the
+        # snippet is replaced with ``[sanitized:prompt_injection_detected]``
+        # so an adversarial phrase cannot propagate even if a
+        # downstream consumer forgets to wrap vision output in the
+        # untrusted fence.
+        ocr_sanitized, had_injection = _sanitize_ocr_for_evidence(ocr_text)
+        if had_injection:
+            self.stats.injection_sanitized += 1
+
         # Build schema v1 evidence. ``build_vision_signal_evidence``
         # raises ``ValueError`` on any I1 violation (negative ts, bad
         # hash format, etc.) — Ferrari could in principle produce a
@@ -507,7 +688,7 @@ class VisionSensor:
                 classifier_model="deterministic",
                 classifier_confidence=1.0,
                 deterministic_matches=tuple(matched),
-                ocr_snippet=_truncate_snippet(ocr_text),
+                ocr_snippet=_truncate_snippet(ocr_sanitized),
                 severity=verdict_meta["severity"],
                 app_id=frame.app_id,
                 window_id=frame.window_id,

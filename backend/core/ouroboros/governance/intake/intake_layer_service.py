@@ -666,6 +666,53 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] CUExecutionSensor skipped: %s", exc)
 
+        # ---- VisionSensor (VisionSensor + Visual VERIFY arc, Task 13) ----
+        # Read-only consumer of the Ferrari frame stream owned by
+        # VisionCortex. Registered LAST in the sensor list so every
+        # upstream dependency (VisionCortex, retention dir, FP ledger)
+        # can be constructed first; fails closed if the Ferrari stream
+        # is absent (§Invariant I8).
+        #
+        # Master switch: JARVIS_VISION_SENSOR_ENABLED defaults to "false"
+        # — Slice 1 hasn't graduated yet. Operator opts in per session.
+        self._vision_sensor = None
+        # Local truthy-env helper. Keeps the VisionSensor block
+        # self-contained without touching the module-level imports.
+        def _env_truthy(raw: str) -> bool:
+            return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+        if _env_truthy(os.environ.get("JARVIS_VISION_SENSOR_ENABLED", "false")):
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.vision_sensor import (
+                    VisionSensor,
+                )
+                _vision_sensor = VisionSensor(
+                    router=self._router,
+                    repo="jarvis",
+                )
+                self._sensors.append(_vision_sensor)
+                self._vision_sensor = _vision_sensor
+                _tier2 = _env_truthy(
+                    os.environ.get("JARVIS_VISION_SENSOR_TIER2_ENABLED", "false"),
+                )
+                logger.info(
+                    "[IntakeLayer] VisionSensor registered enabled=true "
+                    "tier2=%s chain_max=%d session_id=%s",
+                    _tier2,
+                    _vision_sensor._chain_max,
+                    _vision_sensor._session_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[IntakeLayer] VisionSensor skipped (construction error): %s",
+                    exc,
+                )
+        else:
+            logger.debug(
+                "[IntakeLayer] VisionSensor registered enabled=false "
+                "(set JARVIS_VISION_SENSOR_ENABLED=1 to opt in)",
+            )
+
         # ---- ReactorEventConsumer (P3) ----
         self._reactor_consumer = None
         try:
