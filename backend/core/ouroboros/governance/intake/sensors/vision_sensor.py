@@ -78,9 +78,13 @@ _INJECTION_PATTERNS: Dict[str, re.Pattern] = {
     ),
     # Modal dialog titles — "Error" followed by UI-ish affordances.
     # The two-phrase requirement (title word + dialog button) dampens
-    # false-fires on code that merely contains the word "Error".
+    # false-fires on code that merely contains the word "Error". Uses
+    # DOTALL so the gap between title and button can cross OCR newlines
+    # (screenshot OCR typically renders modal body text + button on
+    # separate lines).
     "modal_error": re.compile(
-        r"(Error|Failed|Exception)[^\n]{0,80}?(OK|Cancel|Dismiss|Retry)",
+        r"(Error|Failed|Exception).{0,200}?(OK|Cancel|Dismiss|Retry)",
+        re.DOTALL,
     ),
     # Red-squiggle language errors from IDEs / linters.
     "linter_red": re.compile(
@@ -241,7 +245,10 @@ class VisionSensor:
         self._consecutive_unchanged = 0
 
         # Rate-limit the degraded-ferrari-absent log to once per minute.
-        self._last_degraded_log: float = 0.0
+        # ``None`` sentinel (not 0.0) because ``time.monotonic()`` can be
+        # small on recently-started processes — a zero initializer would
+        # silently short-circuit the first breadcrumb.
+        self._last_degraded_log: Optional[float] = None
 
         self.stats = VisionSensorStats()
 
@@ -413,7 +420,10 @@ class VisionSensor:
     def _emit_degraded_breadcrumb(self) -> None:
         """Log ``degraded reason=ferrari_absent`` at most once per 60s."""
         now = time.monotonic()
-        if (now - self._last_degraded_log) < 60.0:
+        if (
+            self._last_degraded_log is not None
+            and (now - self._last_degraded_log) < 60.0
+        ):
             return
         self._last_degraded_log = now
         self.stats.degraded_ticks += 1

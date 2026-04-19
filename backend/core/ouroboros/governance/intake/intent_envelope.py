@@ -40,6 +40,10 @@ _VALID_SOURCES = frozenset({
     "cross_repo_drift",
     "security_advisory",
     "web_intelligence",
+    # Added 2026-04-18 for VisionSensor (Task 8 of VisionSensor + Visual
+    # VERIFY arc). Mirrors ``SignalSource.VISION_SENSOR.value``. See
+    # docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md.
+    "vision_sensor",
 })
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 
@@ -83,7 +87,12 @@ class IntentEnvelope:
             raise EnvelopeValidationError(
                 f"confidence must be in [0.0, 1.0], got {self.confidence}"
             )
-        if not self.target_files:
+        # Vision signals genuinely don't know target files at sensor-emit
+        # time — the op is "there is a traceback visible on screen", not
+        # "fix file X". The orchestrator infers actionable targets from
+        # evidence downstream. Other sources still require non-empty
+        # target_files.
+        if not self.target_files and self.source != "vision_sensor":
             raise EnvelopeValidationError("target_files must be non-empty")
 
     def with_lease(self, lease_id: str) -> "IntentEnvelope":
