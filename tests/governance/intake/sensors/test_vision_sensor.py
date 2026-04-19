@@ -528,8 +528,13 @@ def test_i8_module_does_not_reference_forbidden_capture_symbols():
     import ast
     import pathlib
 
-    src = pathlib.Path(
-        "backend/core/ouroboros/governance/intake/sensors/vision_sensor.py"
+    # Resolve from ``__file__`` (absolute) so the autouse chdir fixture
+    # doesn't break this lookup. ``tests/governance/intake/sensors/
+    # test_vision_sensor.py`` → parents[4] = repo root.
+    repo_root = pathlib.Path(__file__).resolve().parents[4]
+    src = (
+        repo_root
+        / "backend/core/ouroboros/governance/intake/sensors/vision_sensor.py"
     ).read_text(encoding="utf-8")
     tree = ast.parse(src)
 

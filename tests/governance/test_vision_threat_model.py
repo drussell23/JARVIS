@@ -48,8 +48,12 @@ from backend.core.ouroboros.governance.intake.sensors.vision_sensor import (
 )
 
 
-_SENSOR_SOURCE_PATH = pathlib.Path(
-    "backend/core/ouroboros/governance/intake/sensors/vision_sensor.py"
+# Resolve from ``__file__`` (absolute) so threat-model tests survive
+# ``monkeypatch.chdir(tmp_path)`` (autouse in sibling sensor test files).
+# ``tests/governance/test_vision_threat_model.py`` → parents[2] = repo root.
+_SENSOR_SOURCE_PATH = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "backend/core/ouroboros/governance/intake/sensors/vision_sensor.py"
 )
 
 
