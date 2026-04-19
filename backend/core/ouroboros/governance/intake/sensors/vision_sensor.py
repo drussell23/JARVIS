@@ -107,6 +107,19 @@ _BUG_PATTERNS: frozenset = frozenset({"modal_error", "linter_red"})
 _DEFAULT_FRAME_PATH = "/tmp/claude/latest_frame.jpg"
 _DEFAULT_METADATA_PATH = "/tmp/claude/latest_frame.json"
 _DEFAULT_POLL_INTERVAL_S = 1.0
+
+# Staleness threshold — a Ferrari that's crashed, App-Napped, or blocked
+# on a slow Quartz call will leave the JPG frozen on disk. Without this
+# check the sensor reads the fossilized frame, dedups on its stable
+# dhash, and silently stops emitting for the rest of the session. At 5s
+# the guard is generous enough to accommodate Ferrari's worst idle-
+# display throttling (we've observed ~1Hz capture on a static screen)
+# while small enough to catch a truly dead frame_server within two scan
+# cycles. Emits `degraded reason=frame_stale` so operators see the
+# condition in the debug log exactly like `ferrari_absent`.
+_DEFAULT_FRAME_STALENESS_S = float(
+    os.environ.get("JARVIS_VISION_SENSOR_FRAME_STALENESS_S", "5.0")
+)
 _ADAPTIVE_MAX_INTERVAL_S = 8.0
 _ADAPTIVE_STATIC_BEFORE_DOWNSHIFT = 3   # unchanged polls before interval doubles
 _HASH_COOLDOWN_S = 10.0                 # dhash-dedup window
@@ -1658,6 +1671,24 @@ class VisionSensor:
             self._emit_degraded_breadcrumb()
             return None
 
+        # Staleness guard — Ferrari process existence is necessary but not
+        # sufficient. A hung or App-Napped frame_server leaves the files on
+        # disk but stops writing them. Without this check the sensor would
+        # keep reading the frozen JPG, dedup on its stable dhash, and go
+        # silent for the rest of the session (observed 2026-04-19 Session
+        # 7/9/12). Treat stale disk state as semantically equivalent to
+        # ferrari_absent and emit the same rate-limited breadcrumb.
+        try:
+            _frame_age_s = time.time() - os.stat(self._frame_path).st_mtime
+        except OSError:
+            _frame_age_s = -1.0
+        if _frame_age_s > _DEFAULT_FRAME_STALENESS_S:
+            self.stats.dropped_ferrari_absent += 1
+            self._emit_degraded_breadcrumb(
+                reason="frame_stale", frame_age_s=_frame_age_s,
+            )
+            return None
+
         try:
             raw = open(self._metadata_path, "r", encoding="utf-8").read()
             meta = json.loads(raw)
@@ -1705,8 +1736,26 @@ class VisionSensor:
             window_id=window_id,
         )
 
-    def _emit_degraded_breadcrumb(self) -> None:
-        """Log ``degraded reason=ferrari_absent`` at most once per 60s."""
+    def _emit_degraded_breadcrumb(
+        self,
+        *,
+        reason: str = "ferrari_absent",
+        frame_age_s: Optional[float] = None,
+    ) -> None:
+        """Log ``degraded reason=...`` at most once per 60s.
+
+        Two reason codes are emitted by the read path:
+
+        * ``ferrari_absent`` — the JPG or sidecar JSON file is missing
+          (frame_server never wrote it, or files were removed).
+        * ``frame_stale`` — both files exist but the JPG mtime is older
+          than ``_DEFAULT_FRAME_STALENESS_S`` (frame_server is hung /
+          App-Napped / crashed — the capture loop stopped writing).
+
+        Rate-limited to once per 60s across both reasons to avoid log
+        floods. Operators grep ``degraded reason=`` to spot either
+        condition in the debug log.
+        """
         now = time.monotonic()
         if (
             self._last_degraded_log is not None
@@ -1715,11 +1764,18 @@ class VisionSensor:
             return
         self._last_degraded_log = now
         self.stats.degraded_ticks += 1
-        logger.info(
-            "[VisionSensor] degraded reason=ferrari_absent "
-            "frame_path=%s metadata_path=%s",
-            self._frame_path, self._metadata_path,
-        )
+        if reason == "frame_stale" and frame_age_s is not None:
+            logger.info(
+                "[VisionSensor] degraded reason=frame_stale "
+                "age=%.1fs frame_path=%s metadata_path=%s",
+                frame_age_s, self._frame_path, self._metadata_path,
+            )
+        else:
+            logger.info(
+                "[VisionSensor] degraded reason=ferrari_absent "
+                "frame_path=%s metadata_path=%s",
+                self._frame_path, self._metadata_path,
+            )
 
     # ------------------------------------------------------------------
     # Public scan + lifecycle
