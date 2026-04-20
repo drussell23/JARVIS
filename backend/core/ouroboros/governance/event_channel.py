@@ -101,6 +101,7 @@ class EventChannelServer:
         host: str = _CHANNEL_HOST,
         batch_registry: Any = None,  # Optional[BatchFutureRegistry]
         github_issue_sensor: Any = None,  # Optional[GitHubIssueSensor]
+        doc_staleness_sensor: Any = None,  # Optional[DocStalenessSensor]
     ) -> None:
         self._router = router
         self._port = port
@@ -116,6 +117,12 @@ class EventChannelServer:
         # orchestrator postmortems keyed on ``github_issue``) would not
         # recognize them.
         self._github_issue_sensor = github_issue_sensor
+        # Slice 4 — GitHub push events route to DocStalenessSensor when
+        # wired. Second ``event_type`` handled by the same ``_handle_github``
+        # endpoint, demonstrating the EventChannelServer pattern fanning
+        # out to multiple sensors in parallel. Kept optional so partial
+        # wiring (only issues, or only push) continues to work.
+        self._doc_staleness_sensor = doc_staleness_sensor
         self._stats = ChannelStats()
         self._rate_tracker: Dict[str, List[float]] = {}
         self._server_task: Optional[asyncio.Task] = None
@@ -126,6 +133,10 @@ class EventChannelServer:
         self._last_github_webhook_at: float = 0.0
         self._github_webhooks_emitted: int = 0
         self._github_webhooks_ignored: int = 0
+        # Slice 4 counters for DocStalenessSensor push deliveries
+        self._last_doc_push_at: float = 0.0
+        self._doc_pushes_emitted: int = 0
+        self._doc_pushes_ignored: int = 0
 
     @property
     def is_enabled(self) -> bool:
@@ -259,6 +270,63 @@ class EventChannelServer:
                     "sensor=GitHubIssueSensor action=%s emitted=%s "
                     "duration_ms=%d",
                     action_hint, emitted, duration_ms,
+                )
+                return web.Response(status=200, text="OK")
+
+        # --- Slice 4: push events short-circuit to DocStalenessSensor ---
+        #
+        # Same pattern as the ``issues`` branch above but routed to a
+        # different sensor. The sensor's flag is independent — operators
+        # can enable either sensor's webhook path without affecting the
+        # other. Falls through to the generic ``_route_event`` path when
+        # the sensor isn't wired or the flag is off, preserving the
+        # pre-Slice-4 behavior for non-opted-in deployments.
+        if event_type == "push" and self._doc_staleness_sensor is not None:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                    webhook_enabled as _doc_webhook_enabled,
+                )
+                doc_flag_on = _doc_webhook_enabled()
+            except Exception:
+                doc_flag_on = False
+            if doc_flag_on:
+                t0 = time.monotonic()
+                ref_hint = str(payload.get("ref", "?"))
+                try:
+                    emitted = await asyncio.wait_for(
+                        self._doc_staleness_sensor.ingest_webhook(payload),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[EventChannel] DocStalenessSensor.ingest_webhook "
+                        "timed out after 30s (ref=%s)", ref_hint,
+                    )
+                    emitted = False
+                except Exception:
+                    logger.debug(
+                        "[EventChannel] DocStalenessSensor.ingest_webhook raised",
+                        exc_info=True,
+                    )
+                    emitted = False
+                duration_ms = int((time.monotonic() - t0) * 1000)
+
+                self._stats.total_events += 1
+                self._stats.last_event_at = time.time()
+                self._stats.events_by_source["github"] = (
+                    self._stats.events_by_source.get("github", 0) + 1
+                )
+                self._last_doc_push_at = time.time()
+                if emitted:
+                    self._stats.events_routed += 1
+                    self._doc_pushes_emitted += 1
+                else:
+                    self._doc_pushes_ignored += 1
+                logger.info(
+                    "[EventChannel] github/push delivered "
+                    "sensor=DocStalenessSensor ref=%s emitted=%s "
+                    "duration_ms=%d",
+                    ref_hint, emitted, duration_ms,
                 )
                 return web.Response(status=200, text="OK")
 
@@ -409,6 +477,18 @@ class EventChannelServer:
             except Exception:
                 webhook_mode = False
 
+        # Slice 4 — expose DocStalenessSensor push-webhook state too.
+        doc_wired = self._doc_staleness_sensor is not None
+        doc_webhook_mode = False
+        if doc_wired:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                    webhook_enabled as _doc_webhook_enabled,
+                )
+                doc_webhook_mode = bool(_doc_webhook_enabled())
+            except Exception:
+                doc_webhook_mode = False
+
         return web.json_response({
             "status": "healthy",
             "total_events": self._stats.total_events,
@@ -422,6 +502,13 @@ class EventChannelServer:
                 "last_webhook_at": self._last_github_webhook_at,
                 "webhooks_emitted": self._github_webhooks_emitted,
                 "webhooks_ignored": self._github_webhooks_ignored,
+            },
+            "doc_staleness_sensor": {
+                "wired": doc_wired,
+                "webhook_mode": doc_webhook_mode,
+                "last_push_at": self._last_doc_push_at,
+                "pushes_emitted": self._doc_pushes_emitted,
+                "pushes_ignored": self._doc_pushes_ignored,
             },
         })
 

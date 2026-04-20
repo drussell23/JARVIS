@@ -39,6 +39,35 @@ _SCAN_PATHS: Tuple[str, ...] = (
     "backend/intelligence/",
 )
 
+# --- Gap #4 migration: GitHub push webhook path (Slice 4) ------------------
+#
+# When ``JARVIS_DOC_STALENESS_WEBHOOK_ENABLED=true``, incoming GitHub
+# ``push`` webhooks containing modified Python files trigger an immediate
+# ``scan_once`` — reacting to merges at network latency rather than waiting
+# for the 24h poll or the FS watcher to see the merge locally (which never
+# happens in pure-CI environments). The poll loop demotes to a 6h fallback
+# whose job is to catch dropped webhooks.
+#
+# Shadow pattern: flag defaults OFF so current behavior is preserved exactly
+# — FS subscription remains active (unchanged), poll stays at 24h, no
+# webhook path activated. This slice is purely additive when flipped on.
+_DOC_STALENESS_FALLBACK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_DOC_STALENESS_FALLBACK_INTERVAL_S", "21600")
+)
+
+
+def webhook_enabled() -> bool:
+    """Re-read ``JARVIS_DOC_STALENESS_WEBHOOK_ENABLED`` at call-time.
+
+    Mirrors ``github_issue_sensor.webhook_enabled`` and
+    ``test_failure_sensor.fs_events_enabled`` so the three gap-#4 sensor
+    flags behave identically from a testability + operator-flip point
+    of view.
+    """
+    return os.environ.get(
+        "JARVIS_DOC_STALENESS_WEBHOOK_ENABLED", "false",
+    ).lower() in ("true", "1", "yes")
+
 
 @dataclass
 class DocFinding:
@@ -79,15 +108,34 @@ class DocStalenessSensor:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._seen_findings: set[str] = set()
+        # Gap #4 migration captured at __init__. When True, the poll
+        # loop demotes to ``_DOC_STALENESS_FALLBACK_INTERVAL_S`` (6h)
+        # and ``ingest_webhook`` becomes the reactive hot path for
+        # merges. FS subscription is unchanged.
+        self._webhook_mode: bool = webhook_enabled()
+        # Telemetry counters — exposed via health snapshots during the
+        # graduation arc so operators can read the signal:noise ratio.
+        self._webhooks_handled: int = 0
+        self._webhooks_ignored: int = 0
 
     async def start(self) -> None:
         self._running = True
         self._task = asyncio.create_task(
             self._poll_loop(), name=f"doc_staleness_sensor_{self._repo}"
         )
+        effective = (
+            _DOC_STALENESS_FALLBACK_INTERVAL_S
+            if self._webhook_mode
+            else self._poll_interval_s
+        )
+        mode = (
+            "webhook-primary (push → scan_once; poll=fallback)"
+            if self._webhook_mode
+            else "poll-primary"
+        )
         logger.info(
-            "[DocSensor] Started for repo=%s poll_interval=%ds",
-            self._repo, self._poll_interval_s,
+            "[DocSensor] Started for repo=%s poll_interval=%ds mode=%s",
+            self._repo, int(effective), mode,
         )
 
     def stop(self) -> None:
@@ -143,10 +191,98 @@ class DocStalenessSensor:
                 break
             except Exception:
                 logger.exception("[DocSensor] Poll error")
+            # Effective interval selected per-iteration so mid-flight
+            # flag flips take effect on the next wait.
+            effective_interval = (
+                _DOC_STALENESS_FALLBACK_INTERVAL_S
+                if self._webhook_mode
+                else self._poll_interval_s
+            )
             try:
-                await asyncio.sleep(self._poll_interval_s)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
+
+    async def ingest_webhook(self, payload: Dict[str, Any]) -> bool:
+        """Handle a GitHub ``push`` webhook delivery.
+
+        Alternative entry point for doc staleness detection. When a push
+        event arrives containing modified/added Python files under our
+        watched ``_scan_paths``, triggers an immediate ``scan_once``
+        rather than waiting for the 6h poll fallback or the local FS
+        watcher (which never sees remote merges in CI-only environments).
+
+        The existing ``_seen_findings`` set dedups overlapping FS + poll
+        + webhook emissions — no double-envelope risk.
+
+        Never raises. Returns ``True`` when at least one envelope was
+        emitted; ``False`` for non-push events, payloads with no Python
+        changes, ignored refs (non-main pushes), or scan yielding zero
+        new findings. Callers (``EventChannelServer._handle_github``)
+        log the return for observability but do not retry — the 6h
+        fallback poll covers any miss.
+
+        Manifesto §3: complements the FS watcher with a network-side
+        push path — merges committed to GitHub from CI or another dev's
+        machine now trigger the sensor at network latency rather than
+        waiting for a git pull to hit the local FS.
+        """
+        try:
+            if not isinstance(payload, dict):
+                self._webhooks_ignored += 1
+                return False
+            commits = payload.get("commits")
+            if not isinstance(commits, list) or not commits:
+                self._webhooks_ignored += 1
+                logger.debug(
+                    "[DocSensor] webhook ignored — no commits list "
+                    "(keys=%s)", list(payload.keys())[:6],
+                )
+                return False
+
+            ref = str(payload.get("ref", "") or "")
+
+            touched: List[str] = []
+            for commit in commits:
+                if not isinstance(commit, dict):
+                    continue
+                for key in ("added", "modified"):
+                    files = commit.get(key) or []
+                    if not isinstance(files, list):
+                        continue
+                    for f in files:
+                        if not isinstance(f, str):
+                            continue
+                        if not f.endswith(".py"):
+                            continue
+                        if any(f.startswith(p) for p in self._scan_paths):
+                            touched.append(f)
+
+            if not touched:
+                self._webhooks_ignored += 1
+                logger.debug(
+                    "[DocSensor] webhook ignored — no watched-path .py "
+                    "changes (ref=%s commits=%d)", ref, len(commits),
+                )
+                return False
+
+            self._webhooks_handled += 1
+            logger.info(
+                "[DocSensor] webhook push ref=%s touched_py=%d — "
+                "triggering scan_once",
+                ref, len(touched),
+            )
+            findings = await self.scan_once()
+            # Envelope emission + dedup handled by scan_once. We return
+            # True iff the scan produced at least one finding; dedup-hit
+            # scans return [] from scan_once but are still "handled".
+            return bool(findings)
+        except Exception:
+            logger.debug(
+                "[DocSensor] webhook ingest failed", exc_info=True,
+            )
+            self._webhooks_ignored += 1
+            return False
 
     async def scan_once(self) -> List[DocFinding]:
         """Scan Python files for documentation gaps via AST analysis."""

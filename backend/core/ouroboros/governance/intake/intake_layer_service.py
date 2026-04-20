@@ -221,6 +221,11 @@ class IntakeLayerService:
         # the sensor's ``ingest_webhook`` method (shape-identical envelope
         # to the poll path).
         self._github_issue_sensor: Optional[Any] = None
+        # Slice 4 — dedicated handle for DocStalenessSensor push webhook
+        # wiring. Set inside ``_build_components`` when the sensor is
+        # constructed successfully; passed to the EventChannelServer
+        # constructor alongside ``_github_issue_sensor``.
+        self._doc_staleness_sensor: Optional[Any] = None
         self._event_channel_server: Optional[Any] = None
 
     @property
@@ -607,6 +612,9 @@ class IntakeLayerService:
                 project_root=self._config.project_root,
             )
             self._sensors.append(_doc_sensor)
+            # Slice 4 — dedicated reference for EventChannelServer push routing.
+            # Mirrors the ``_github_issue_sensor`` slot populated below.
+            self._doc_staleness_sensor = _doc_sensor
             logger.info("[IntakeLayer] DocStalenessSensor added (documentation gap detection)")
         except Exception as exc:
             logger.debug("[IntakeLayer] DocStalenessSensor skipped: %s", exc)
@@ -923,22 +931,50 @@ class IntakeLayerService:
         ``[IntakeLayer] EventChannelServer activated`` to confirm.
         """
         try:
-            from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
-                webhook_enabled as _gh_webhook_enabled,
-            )
-            if not _gh_webhook_enabled():
+            # Slice 4: server activates if **any** sensor webhook flag is
+            # on. Different operators enable different sensors at
+            # different times; the server itself is a passive dispatcher.
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                    webhook_enabled as _gh_webhook_enabled,
+                )
+                gh_flag_on = _gh_webhook_enabled()
+            except Exception:
+                gh_flag_on = False
+
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                    webhook_enabled as _doc_webhook_enabled,
+                )
+                doc_flag_on = _doc_webhook_enabled()
+            except Exception:
+                doc_flag_on = False
+
+            if not (gh_flag_on or doc_flag_on):
                 logger.debug(
-                    "[IntakeLayer] EventChannelServer skipped — "
-                    "JARVIS_GITHUB_WEBHOOK_ENABLED is off (poll-primary mode)",
+                    "[IntakeLayer] EventChannelServer skipped — no "
+                    "sensor webhook flag is on (GITHUB_WEBHOOK + "
+                    "DOC_STALENESS_WEBHOOK both disabled)",
                 )
                 return
 
-            if self._github_issue_sensor is None:
+            # Decide which sensor references to pass. Passing ``None``
+            # for a sensor whose flag is off keeps the short-circuit
+            # branch dormant inside the handler — the generic
+            # ``_route_event`` path will receive those events instead.
+            gh_ref = self._github_issue_sensor if gh_flag_on else None
+            doc_ref = self._doc_staleness_sensor if doc_flag_on else None
+
+            if gh_flag_on and gh_ref is None:
                 logger.info(
-                    "[IntakeLayer] EventChannelServer skipped — no "
-                    "GitHubIssueSensor wired (gh CLI unavailable?)",
+                    "[IntakeLayer] EventChannelServer: GitHub flag is on "
+                    "but no GitHubIssueSensor wired (gh CLI unavailable?)",
                 )
-                return
+            if doc_flag_on and doc_ref is None:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer: DocStaleness flag "
+                    "is on but no DocStalenessSensor wired",
+                )
 
             try:
                 from backend.core.ouroboros.governance.event_channel import (
@@ -953,7 +989,8 @@ class IntakeLayerService:
 
             server = EventChannelServer(
                 router=self._router,
-                github_issue_sensor=self._github_issue_sensor,
+                github_issue_sensor=gh_ref,
+                doc_staleness_sensor=doc_ref,
             )
             if not server.is_enabled:
                 logger.info(
@@ -964,12 +1001,15 @@ class IntakeLayerService:
 
             await server.start()
             self._event_channel_server = server
+            active_paths = []
+            if gh_ref is not None:
+                active_paths.append("issues→GitHubIssueSensor")
+            if doc_ref is not None:
+                active_paths.append("push→DocStalenessSensor")
             logger.info(
                 "[IntakeLayer] EventChannelServer activated — "
-                "github/issues webhooks now short-circuit to "
-                "GitHubIssueSensor.ingest_webhook "
-                "(poll_interval demoted to %ds fallback)",
-                int(self._github_issue_sensor._poll_interval_s),
+                "github webhooks now short-circuit: %s",
+                ", ".join(active_paths) or "(none)",
             )
         except Exception as exc:
             # Never crash intake because the event channel failed to start.

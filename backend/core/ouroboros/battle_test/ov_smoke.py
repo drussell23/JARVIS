@@ -498,8 +498,11 @@ async def check_fs_event_routing() -> Tuple[bool, str]:
             pre_handled = sensor._fs_events_handled
             pre_ignored = sensor._fs_events_ignored
 
+            # Topic must match the 3-segment pattern ``fs.changed.*``
+            # (MQTT-style wildcard — ``*`` matches exactly one segment).
+            # FileSystemEventBridge publishes to ``fs.changed.{type}``.
             await bus.publish_raw(
-                topic="fs.changed.backend.foo",
+                topic="fs.changed.modified",
                 data={
                     "payload": {
                         "relative_path": "backend/foo.py",
