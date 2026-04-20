@@ -566,11 +566,159 @@ async def check_fs_event_routing() -> Tuple[bool, str]:
 # Registry
 # ===========================================================================
 
+# ===========================================================================
+# CHECK: doc_staleness_push_webhook
+# ===========================================================================
+
+async def check_doc_staleness_push_webhook() -> Tuple[bool, str]:
+    """Slice 4 proof: HTTP POST /webhook/github with X-GitHub-Event: push
+    routes to DocStalenessSensor.ingest_webhook, which triggers scan_once.
+
+    Uses the same EventChannelServer + ephemeral-port pattern as the
+    webhook_http_activation check, but for the push event type + doc
+    sensor. Proves the pattern extends cleanly to a second sensor on the
+    same HTTP receiver.
+    """
+    import json
+    try:
+        import aiohttp
+    except ImportError:
+        return False, "aiohttp not available"
+
+    prev_doc = os.environ.get("JARVIS_DOC_STALENESS_WEBHOOK_ENABLED")
+    prev_ch = os.environ.get("JARVIS_EVENT_CHANNELS_ENABLED")
+    os.environ["JARVIS_DOC_STALENESS_WEBHOOK_ENABLED"] = "true"
+    os.environ["JARVIS_EVENT_CHANNELS_ENABLED"] = "true"
+
+    try:
+        from backend.core.ouroboros.governance.event_channel import EventChannelServer
+        from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+            DocStalenessSensor,
+        )
+
+        class _SpyRouter:
+            def __init__(self) -> None:
+                self.envelopes: List[Any] = []
+
+            async def ingest(self, envelope: Any) -> str:
+                self.envelopes.append(envelope)
+                return "enqueued"
+
+        router = _SpyRouter()
+        sensor = DocStalenessSensor(
+            repo="jarvis",
+            router=router,
+            poll_interval_s=86400.0,
+            project_root=REPO_ROOT,
+            scan_paths=("backend/core/",),
+        )
+
+        # Spy on scan_once so we can assert it was triggered without
+        # actually running the (slow, disk-heavy) AST scan of the repo.
+        scan_calls: List[int] = []
+
+        async def _spy_scan() -> list:
+            scan_calls.append(1)
+            return []
+
+        sensor.scan_once = _spy_scan  # type: ignore[assignment]
+
+        server = EventChannelServer(
+            router=router,
+            port=0,
+            host="127.0.0.1",
+            doc_staleness_sensor=sensor,
+        )
+
+        await server.start()
+        try:
+            site = server._site
+            if site is None:
+                return False, "server failed to start"
+            sock = site._server.sockets[0]  # type: ignore[attr-defined]
+            port = int(sock.getsockname()[1])
+
+            payload = {
+                "ref": "refs/heads/main",
+                "commits": [
+                    {
+                        "id": "ov-smoke-commit",
+                        "added": [],
+                        "modified": ["backend/core/ouroboros/governance/orchestrator.py"],
+                        "removed": [],
+                    }
+                ],
+                "repository": {"full_name": "drussell23/JARVIS-AI-Agent"},
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "X-GitHub-Event": "push",
+            }
+
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    f"http://127.0.0.1:{port}/webhook/github",
+                    data=json.dumps(payload),
+                    headers=headers,
+                ) as resp:
+                    if resp.status != 200:
+                        return False, f"HTTP POST returned {resp.status}"
+                async with client.get(
+                    f"http://127.0.0.1:{port}/channel/health",
+                ) as hresp:
+                    if hresp.status != 200:
+                        return False, f"health endpoint returned {hresp.status}"
+                    health = await hresp.json()
+
+            if len(scan_calls) != 1:
+                return False, (
+                    f"expected scan_once() invoked once, got {len(scan_calls)}"
+                )
+            if sensor._webhooks_handled != 1:
+                return False, (
+                    f"sensor._webhooks_handled expected 1, got {sensor._webhooks_handled}"
+                )
+
+            doc = health.get("doc_staleness_sensor", {})
+            if not doc.get("webhook_mode"):
+                return False, "health.doc_staleness_sensor.webhook_mode must be True"
+            if doc.get("pushes_ignored") != 1:
+                # scan produced 0 findings, so the channel counts this as
+                # "ignored" (no emission) — that's the contract for the
+                # "event processed, nothing emitted" case.
+                return False, (
+                    f"pushes_ignored expected 1 (empty scan), got "
+                    f"{doc.get('pushes_ignored')}"
+                )
+
+            return True, (
+                f"PASS — HTTP push routed to DocStaleness "
+                f"port={port} scan_calls={len(scan_calls)} "
+                f"pushes_ignored={doc.get('pushes_ignored')}"
+            )
+        finally:
+            await server.stop()
+    finally:
+        for key, prev in (
+            ("JARVIS_DOC_STALENESS_WEBHOOK_ENABLED", prev_doc),
+            ("JARVIS_EVENT_CHANNELS_ENABLED", prev_ch),
+        ):
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
+# ===========================================================================
+# Registry
+# ===========================================================================
+
 CHECKS: Dict[str, Callable[[], Awaitable[Tuple[bool, str]]]] = {
     "review_shadow": check_review_shadow,
     "webhook_routing": check_webhook_routing,
     "webhook_http_activation": check_webhook_http_activation,
     "fs_event_routing": check_fs_event_routing,
+    "doc_staleness_push_webhook": check_doc_staleness_push_webhook,
 }
 
 

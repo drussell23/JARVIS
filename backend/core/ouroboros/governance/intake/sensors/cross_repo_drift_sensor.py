@@ -43,6 +43,35 @@ _PROTOCOL_CHECKS: Tuple[Tuple[str, str, str], ...] = (
     ("jarvis", "backend/core/prime_client.py", "PrimeClient protocol"),
 )
 
+# --- Gap #4 migration: GitHub push webhook path (Slice 5) ------------------
+#
+# When ``JARVIS_CROSS_REPO_DRIFT_WEBHOOK_ENABLED=true``, GitHub ``push``
+# webhooks containing modifications to any monitored contract / protocol
+# file trigger an immediate ``scan_once`` — reacting to a merged schema
+# change at network latency rather than waiting for the hourly poll to
+# notice. The poll demotes to a 4h fallback that catches any dropped
+# webhook. When the flag is off the sensor is pure-poll at 1h (legacy
+# behavior preserved exactly).
+_CROSS_REPO_DRIFT_FALLBACK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_CROSS_REPO_DRIFT_FALLBACK_INTERVAL_S", "14400")
+)
+
+
+def webhook_enabled() -> bool:
+    """Re-read ``JARVIS_CROSS_REPO_DRIFT_WEBHOOK_ENABLED`` at call-time."""
+    return os.environ.get(
+        "JARVIS_CROSS_REPO_DRIFT_WEBHOOK_ENABLED", "false",
+    ).lower() in ("true", "1", "yes")
+
+
+# Set of watched contract+protocol file paths (for fast membership test
+# in ``ingest_webhook``). Derived from the two tuples above so a single
+# source of truth stays honest.
+_WATCHED_PATHS: frozenset = frozenset(
+    {entry[1] for entry in _CONTRACT_FILES} |
+    {entry[1] for entry in _PROTOCOL_CHECKS}
+)
+
 
 @dataclass
 class DriftFinding:
@@ -83,6 +112,13 @@ class CrossRepoDriftSensor:
         self._task: Optional[asyncio.Task] = None
         self._baselines: Dict[str, str] = {}  # file_path -> sha256
         self._seen_findings: set[str] = set()
+        # Gap #4 migration — captured at __init__ time. When True, the
+        # poll loop demotes to ``_CROSS_REPO_DRIFT_FALLBACK_INTERVAL_S``
+        # (default 4h) and ``ingest_webhook`` becomes the reactive hot
+        # path for merged contract/protocol changes.
+        self._webhook_mode: bool = webhook_enabled()
+        self._webhooks_handled: int = 0
+        self._webhooks_ignored: int = 0
 
     async def start(self) -> None:
         self._running = True
@@ -91,8 +127,19 @@ class CrossRepoDriftSensor:
         self._task = asyncio.create_task(
             self._poll_loop(), name=f"drift_sensor_{self._repo}"
         )
+        effective = (
+            _CROSS_REPO_DRIFT_FALLBACK_INTERVAL_S
+            if self._webhook_mode
+            else self._poll_interval_s
+        )
+        mode = (
+            "webhook-primary (push→scan_once; poll=fallback)"
+            if self._webhook_mode
+            else "poll-primary"
+        )
         logger.info(
-            "[DriftSensor] Started with %d baseline files", len(self._baselines)
+            "[DriftSensor] Started with %d baseline files, poll=%ds mode=%s",
+            len(self._baselines), int(effective), mode,
         )
 
     def stop(self) -> None:
@@ -147,10 +194,79 @@ class CrossRepoDriftSensor:
                 break
             except Exception:
                 logger.exception("[DriftSensor] Poll error")
+            effective_interval = (
+                _CROSS_REPO_DRIFT_FALLBACK_INTERVAL_S
+                if self._webhook_mode
+                else self._poll_interval_s
+            )
             try:
-                await asyncio.sleep(self._poll_interval_s)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
+
+    async def ingest_webhook(self, payload: Dict[str, Any]) -> bool:
+        """Handle a GitHub ``push`` webhook delivery.
+
+        Gap #4 migration (Slice 5). Reacts to merges that touch monitored
+        contract or protocol files — ``op_context.py``, ``intent_envelope.py``,
+        ``mind_client.py``, ``prime_client.py``, ``docs/cross-repo-contract.md``
+        (see ``_WATCHED_PATHS``). Immediate ``scan_once`` on any match
+        rather than waiting for the 4h poll fallback.
+
+        A push that touches no watched file is a pure no-op — drift is
+        by definition a function of watched-contract changes, so scanning
+        on unrelated pushes would be wasted work.
+
+        Never raises. Returns ``True`` when the scan produced at least
+        one new finding; ``False`` for non-matching pushes, malformed
+        payloads, or scans that return no findings (common since most
+        contract changes are stable after merge).
+        """
+        try:
+            if not isinstance(payload, dict):
+                self._webhooks_ignored += 1
+                return False
+            commits = payload.get("commits")
+            if not isinstance(commits, list) or not commits:
+                self._webhooks_ignored += 1
+                return False
+
+            ref = str(payload.get("ref", "") or "")
+            touched_watched: List[str] = []
+
+            for commit in commits:
+                if not isinstance(commit, dict):
+                    continue
+                for key in ("added", "modified"):
+                    files = commit.get(key) or []
+                    if not isinstance(files, list):
+                        continue
+                    for f in files:
+                        if isinstance(f, str) and f in _WATCHED_PATHS:
+                            touched_watched.append(f)
+
+            if not touched_watched:
+                self._webhooks_ignored += 1
+                logger.debug(
+                    "[DriftSensor] webhook ignored — no watched "
+                    "contract/protocol file touched (ref=%s commits=%d)",
+                    ref, len(commits),
+                )
+                return False
+
+            self._webhooks_handled += 1
+            logger.info(
+                "[DriftSensor] webhook push ref=%s watched_touched=%d "
+                "(%s) — triggering scan_once",
+                ref, len(touched_watched),
+                ",".join(sorted(set(touched_watched))[:4]),
+            )
+            findings = await self.scan_once()
+            return bool(findings)
+        except Exception:
+            logger.debug("[DriftSensor] webhook ingest failed", exc_info=True)
+            self._webhooks_ignored += 1
+            return False
 
     def _capture_baselines(self) -> None:
         """Hash all contract files (normalized) to establish baselines."""

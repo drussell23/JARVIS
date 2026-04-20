@@ -102,6 +102,7 @@ class EventChannelServer:
         batch_registry: Any = None,  # Optional[BatchFutureRegistry]
         github_issue_sensor: Any = None,  # Optional[GitHubIssueSensor]
         doc_staleness_sensor: Any = None,  # Optional[DocStalenessSensor]
+        cross_repo_drift_sensor: Any = None,  # Optional[CrossRepoDriftSensor]
     ) -> None:
         self._router = router
         self._port = port
@@ -137,6 +138,11 @@ class EventChannelServer:
         self._last_doc_push_at: float = 0.0
         self._doc_pushes_emitted: int = 0
         self._doc_pushes_ignored: int = 0
+        # Slice 5 — CrossRepoDriftSensor push deliveries
+        self._cross_repo_drift_sensor = cross_repo_drift_sensor
+        self._last_drift_push_at: float = 0.0
+        self._drift_pushes_emitted: int = 0
+        self._drift_pushes_ignored: int = 0
 
     @property
     def is_enabled(self) -> bool:
@@ -273,42 +279,30 @@ class EventChannelServer:
                 )
                 return web.Response(status=200, text="OK")
 
-        # --- Slice 4: push events short-circuit to DocStalenessSensor ---
+        # --- Slice 5: push events fan out to all active push sensors ---
         #
-        # Same pattern as the ``issues`` branch above but routed to a
-        # different sensor. The sensor's flag is independent — operators
-        # can enable either sensor's webhook path without affecting the
-        # other. Falls through to the generic ``_route_event`` path when
-        # the sensor isn't wired or the flag is off, preserving the
-        # pre-Slice-4 behavior for non-opted-in deployments.
-        if event_type == "push" and self._doc_staleness_sensor is not None:
-            try:
-                from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
-                    webhook_enabled as _doc_webhook_enabled,
-                )
-                doc_flag_on = _doc_webhook_enabled()
-            except Exception:
-                doc_flag_on = False
-            if doc_flag_on:
-                t0 = time.monotonic()
+        # Earlier slices used an ``if/elif`` short-circuit where the
+        # first matching sensor "won" and subsequent handlers never saw
+        # the event. That doesn't scale once two sensors care about the
+        # same event type — both DocStalenessSensor and
+        # CrossRepoDriftSensor have independent reasons to react to a
+        # push. The dispatcher below invokes **every** active sensor
+        # concurrently via ``asyncio.gather`` (each in its own
+        # ``wait_for(30s)`` so one slow sensor can't starve the others).
+        # Falls through to the generic ``_route_event`` path only if
+        # zero sensors are active, preserving pre-Slice-4 behavior.
+        if event_type == "push":
+            push_handlers = await self._collect_active_push_handlers()
+            if push_handlers:
                 ref_hint = str(payload.get("ref", "?"))
-                try:
-                    emitted = await asyncio.wait_for(
-                        self._doc_staleness_sensor.ingest_webhook(payload),
-                        timeout=30.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "[EventChannel] DocStalenessSensor.ingest_webhook "
-                        "timed out after 30s (ref=%s)", ref_hint,
-                    )
-                    emitted = False
-                except Exception:
-                    logger.debug(
-                        "[EventChannel] DocStalenessSensor.ingest_webhook raised",
-                        exc_info=True,
-                    )
-                    emitted = False
+                t0 = time.monotonic()
+                results = await asyncio.gather(
+                    *[
+                        self._invoke_push_handler(name, sensor, payload)
+                        for name, sensor in push_handlers
+                    ],
+                    return_exceptions=False,
+                )
                 duration_ms = int((time.monotonic() - t0) * 1000)
 
                 self._stats.total_events += 1
@@ -316,17 +310,35 @@ class EventChannelServer:
                 self._stats.events_by_source["github"] = (
                     self._stats.events_by_source.get("github", 0) + 1
                 )
-                self._last_doc_push_at = time.time()
-                if emitted:
-                    self._stats.events_routed += 1
-                    self._doc_pushes_emitted += 1
-                else:
-                    self._doc_pushes_ignored += 1
+
+                fired_names: List[str] = []
+                emitted_names: List[str] = []
+                for (name, _sensor), emitted in zip(push_handlers, results):
+                    fired_names.append(name)
+                    if name == "DocStalenessSensor":
+                        self._last_doc_push_at = time.time()
+                        if emitted:
+                            self._doc_pushes_emitted += 1
+                            emitted_names.append(name)
+                        else:
+                            self._doc_pushes_ignored += 1
+                    elif name == "CrossRepoDriftSensor":
+                        self._last_drift_push_at = time.time()
+                        if emitted:
+                            self._drift_pushes_emitted += 1
+                            emitted_names.append(name)
+                        else:
+                            self._drift_pushes_ignored += 1
+                    if emitted:
+                        self._stats.events_routed += 1
+
                 logger.info(
-                    "[EventChannel] github/push delivered "
-                    "sensor=DocStalenessSensor ref=%s emitted=%s "
-                    "duration_ms=%d",
-                    ref_hint, emitted, duration_ms,
+                    "[EventChannel] github/push fan-out ref=%s "
+                    "fired=[%s] emitted=[%s] duration_ms=%d",
+                    ref_hint,
+                    ",".join(fired_names),
+                    ",".join(emitted_names) if emitted_names else "none",
+                    duration_ms,
                 )
                 return web.Response(status=200, text="OK")
 
@@ -338,6 +350,80 @@ class EventChannelServer:
 
         await self._route_event(event)
         return web.Response(status=200, text="OK")
+
+    # ------------------------------------------------------------------
+    # Slice 5 — fan-out dispatcher for GitHub push events
+    # ------------------------------------------------------------------
+
+    async def _collect_active_push_handlers(
+        self,
+    ) -> "List[Tuple[str, Any]]":
+        """Return (name, sensor) for every wired sensor whose webhook
+        flag is currently on.
+
+        Each sensor's flag is re-checked per-request so operators can
+        flip flags at runtime (env change) without needing to restart.
+        Sensors whose import or flag-check raises are silently skipped —
+        the observability contract here is at the per-delivery log line,
+        not at the handler-collection step.
+        """
+        handlers: List[Tuple[str, Any]] = []
+
+        if self._doc_staleness_sensor is not None:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                    webhook_enabled as _doc_webhook_enabled,
+                )
+                if _doc_webhook_enabled():
+                    handlers.append(
+                        ("DocStalenessSensor", self._doc_staleness_sensor),
+                    )
+            except Exception:
+                pass
+
+        if self._cross_repo_drift_sensor is not None:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+                    webhook_enabled as _drift_webhook_enabled,
+                )
+                if _drift_webhook_enabled():
+                    handlers.append(
+                        ("CrossRepoDriftSensor", self._cross_repo_drift_sensor),
+                    )
+            except Exception:
+                pass
+
+        return handlers
+
+    async def _invoke_push_handler(
+        self,
+        name: str,
+        sensor: Any,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Invoke one sensor's ``ingest_webhook`` under a 30s timeout.
+
+        Returns the sensor's emission boolean on clean completion,
+        ``False`` on timeout or any exception (logged at DEBUG/WARNING).
+        Never raises — the fan-out gather relies on this invariant so
+        one sensor cannot poison the batch for the others.
+        """
+        try:
+            return bool(
+                await asyncio.wait_for(sensor.ingest_webhook(payload), timeout=30.0)
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[EventChannel] %s.ingest_webhook timed out after 30s",
+                name,
+            )
+            return False
+        except Exception:
+            logger.debug(
+                "[EventChannel] %s.ingest_webhook raised",
+                name, exc_info=True,
+            )
+            return False
 
     async def _handle_ci(self, request: Any) -> Any:
         """Handle CI system webhook events (Jenkins, GitHub Actions, etc.)."""
@@ -489,6 +575,18 @@ class EventChannelServer:
             except Exception:
                 doc_webhook_mode = False
 
+        # Slice 5 — expose CrossRepoDriftSensor push-webhook state.
+        drift_wired = self._cross_repo_drift_sensor is not None
+        drift_webhook_mode = False
+        if drift_wired:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+                    webhook_enabled as _drift_webhook_enabled,
+                )
+                drift_webhook_mode = bool(_drift_webhook_enabled())
+            except Exception:
+                drift_webhook_mode = False
+
         return web.json_response({
             "status": "healthy",
             "total_events": self._stats.total_events,
@@ -509,6 +607,13 @@ class EventChannelServer:
                 "last_push_at": self._last_doc_push_at,
                 "pushes_emitted": self._doc_pushes_emitted,
                 "pushes_ignored": self._doc_pushes_ignored,
+            },
+            "cross_repo_drift_sensor": {
+                "wired": drift_wired,
+                "webhook_mode": drift_webhook_mode,
+                "last_push_at": self._last_drift_push_at,
+                "pushes_emitted": self._drift_pushes_emitted,
+                "pushes_ignored": self._drift_pushes_ignored,
             },
         })
 

@@ -226,6 +226,8 @@ class IntakeLayerService:
         # constructed successfully; passed to the EventChannelServer
         # constructor alongside ``_github_issue_sensor``.
         self._doc_staleness_sensor: Optional[Any] = None
+        # Slice 5 — CrossRepoDriftSensor handle for push fan-out.
+        self._cross_repo_drift_sensor: Optional[Any] = None
         self._event_channel_server: Optional[Any] = None
 
     @property
@@ -697,6 +699,8 @@ class IntakeLayerService:
                 repo_registry=self._config.repo_registry,
             )
             self._sensors.append(_drift_sensor)
+            # Slice 5 — dedicated reference for EventChannelServer fan-out.
+            self._cross_repo_drift_sensor = _drift_sensor
             logger.info("[IntakeLayer] CrossRepoDriftSensor added (Trinity contract integrity)")
         except Exception as exc:
             logger.debug("[IntakeLayer] CrossRepoDriftSensor skipped: %s", exc)
@@ -950,20 +954,30 @@ class IntakeLayerService:
             except Exception:
                 doc_flag_on = False
 
-            if not (gh_flag_on or doc_flag_on):
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+                    webhook_enabled as _drift_webhook_enabled,
+                )
+                drift_flag_on = _drift_webhook_enabled()
+            except Exception:
+                drift_flag_on = False
+
+            if not (gh_flag_on or doc_flag_on or drift_flag_on):
                 logger.debug(
                     "[IntakeLayer] EventChannelServer skipped — no "
-                    "sensor webhook flag is on (GITHUB_WEBHOOK + "
-                    "DOC_STALENESS_WEBHOOK both disabled)",
+                    "sensor webhook flag is on (GITHUB + DOC_STALENESS + "
+                    "CROSS_REPO_DRIFT all disabled)",
                 )
                 return
 
             # Decide which sensor references to pass. Passing ``None``
-            # for a sensor whose flag is off keeps the short-circuit
-            # branch dormant inside the handler — the generic
-            # ``_route_event`` path will receive those events instead.
+            # for a sensor whose flag is off keeps that sensor dormant
+            # — the channel's fan-out dispatcher will simply not invoke
+            # it, and if no push-handlers are active the event falls
+            # through to the generic ``_route_event`` path.
             gh_ref = self._github_issue_sensor if gh_flag_on else None
             doc_ref = self._doc_staleness_sensor if doc_flag_on else None
+            drift_ref = self._cross_repo_drift_sensor if drift_flag_on else None
 
             if gh_flag_on and gh_ref is None:
                 logger.info(
@@ -974,6 +988,11 @@ class IntakeLayerService:
                 logger.info(
                     "[IntakeLayer] EventChannelServer: DocStaleness flag "
                     "is on but no DocStalenessSensor wired",
+                )
+            if drift_flag_on and drift_ref is None:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer: CrossRepoDrift flag "
+                    "is on but no CrossRepoDriftSensor wired",
                 )
 
             try:
@@ -991,6 +1010,7 @@ class IntakeLayerService:
                 router=self._router,
                 github_issue_sensor=gh_ref,
                 doc_staleness_sensor=doc_ref,
+                cross_repo_drift_sensor=drift_ref,
             )
             if not server.is_enabled:
                 logger.info(
@@ -1004,11 +1024,16 @@ class IntakeLayerService:
             active_paths = []
             if gh_ref is not None:
                 active_paths.append("issues→GitHubIssueSensor")
+            push_sensors = []
             if doc_ref is not None:
-                active_paths.append("push→DocStalenessSensor")
+                push_sensors.append("DocStalenessSensor")
+            if drift_ref is not None:
+                push_sensors.append("CrossRepoDriftSensor")
+            if push_sensors:
+                active_paths.append(f"push→[{','.join(push_sensors)}]")
             logger.info(
                 "[IntakeLayer] EventChannelServer activated — "
-                "github webhooks now short-circuit: %s",
+                "github webhooks now route: %s",
                 ", ".join(active_paths) or "(none)",
             )
         except Exception as exc:

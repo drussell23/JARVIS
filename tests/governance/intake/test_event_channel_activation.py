@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any, List, Optional
 
 import aiohttp
@@ -226,6 +227,172 @@ async def test_health_endpoint_reports_webhook_mode(monkeypatch: Any) -> None:
         assert ghis.get("webhook_mode") is True
         assert ghis.get("webhooks_emitted") == 1
         assert ghis.get("last_webhook_at", 0) > 0
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_push_fans_out_to_both_sensors_when_both_flags_on(
+    monkeypatch: Any,
+) -> None:
+    """Slice 5 — single push delivery fans out to DocStaleness AND
+    CrossRepoDrift via asyncio.gather. Both sensors observe the event
+    concurrently, not sequentially. Proves the dispatcher replaced the
+    earlier if/elif short-circuit that starved the second handler.
+    """
+    monkeypatch.setenv("JARVIS_DOC_STALENESS_WEBHOOK_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_CROSS_REPO_DRIFT_WEBHOOK_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_EVENT_CHANNELS_ENABLED", "true")
+
+    from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+        DocStalenessSensor,
+    )
+    from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+        CrossRepoDriftSensor,
+    )
+
+    router = _SpyRouter()
+    doc = DocStalenessSensor(
+        repo="jarvis", router=router, poll_interval_s=86400.0,
+        project_root=Path("."), scan_paths=("backend/core/",),
+    )
+    drift = CrossRepoDriftSensor(
+        repo="jarvis", router=router, poll_interval_s=3600.0,
+        project_root=Path("."),
+    )
+
+    doc_calls: List[int] = []
+    drift_calls: List[int] = []
+
+    async def _doc_scan() -> list:
+        doc_calls.append(1)
+        return []
+
+    async def _drift_scan() -> list:
+        drift_calls.append(1)
+        return []
+
+    doc.scan_once = _doc_scan  # type: ignore[assignment]
+    drift.scan_once = _drift_scan  # type: ignore[assignment]
+
+    server = EventChannelServer(
+        router=router, port=0, host="127.0.0.1",
+        doc_staleness_sensor=doc,
+        cross_repo_drift_sensor=drift,
+    )
+
+    await server.start()
+    try:
+        port = await _bound_port(server)
+        url = f"http://127.0.0.1:{port}/webhook/github"
+        headers = {"Content-Type": "application/json", "X-GitHub-Event": "push"}
+
+        # Payload touches BOTH a doc-watched .py file AND a drift-watched
+        # contract file, so both sensors have reason to react.
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [
+                {
+                    "id": "fan-out-test",
+                    "added": [],
+                    "modified": [
+                        "backend/core/ouroboros/governance/op_context.py",
+                    ],
+                    "removed": [],
+                }
+            ],
+            "repository": {"full_name": "drussell23/JARVIS-AI-Agent"},
+        }
+
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                url, data=json.dumps(payload), headers=headers,
+            ) as resp:
+                assert resp.status == 200
+
+        assert doc_calls == [1], (
+            f"DocStaleness must run once, got {doc_calls}"
+        )
+        assert drift_calls == [1], (
+            f"CrossRepoDrift must run once, got {drift_calls}"
+        )
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_push_fan_out_respects_independent_flags(
+    monkeypatch: Any,
+) -> None:
+    """Only the sensor whose flag is on is invoked — the other stays
+    idle even when wired. Verifies the dispatcher's per-request flag
+    re-check instead of a boot-time capture."""
+    monkeypatch.setenv("JARVIS_DOC_STALENESS_WEBHOOK_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_CROSS_REPO_DRIFT_WEBHOOK_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_EVENT_CHANNELS_ENABLED", "true")
+
+    from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+        DocStalenessSensor,
+    )
+    from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+        CrossRepoDriftSensor,
+    )
+
+    router = _SpyRouter()
+    doc = DocStalenessSensor(
+        repo="jarvis", router=router, poll_interval_s=86400.0,
+        project_root=Path("."), scan_paths=("backend/core/",),
+    )
+    drift = CrossRepoDriftSensor(
+        repo="jarvis", router=router, poll_interval_s=3600.0,
+        project_root=Path("."),
+    )
+
+    doc_calls: List[int] = []
+    drift_calls: List[int] = []
+
+    async def _doc_scan() -> list:
+        doc_calls.append(1)
+        return []
+
+    async def _drift_scan() -> list:
+        drift_calls.append(1)
+        return []
+
+    doc.scan_once = _doc_scan  # type: ignore[assignment]
+    drift.scan_once = _drift_scan  # type: ignore[assignment]
+
+    server = EventChannelServer(
+        router=router, port=0, host="127.0.0.1",
+        doc_staleness_sensor=doc,
+        cross_repo_drift_sensor=drift,
+    )
+
+    await server.start()
+    try:
+        port = await _bound_port(server)
+        payload = {
+            "ref": "refs/heads/main",
+            "commits": [{
+                "id": "c1",
+                "added": [],
+                "modified": ["backend/core/ouroboros/governance/op_context.py"],
+                "removed": [],
+            }],
+            "repository": {"full_name": "drussell23/JARVIS-AI-Agent"},
+        }
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                f"http://127.0.0.1:{port}/webhook/github",
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json", "X-GitHub-Event": "push"},
+            ) as resp:
+                assert resp.status == 200
+
+        assert doc_calls == [1], "doc flag is on — sensor must fire"
+        assert drift_calls == [], (
+            f"drift flag is off — sensor must NOT fire, got {drift_calls}"
+        )
     finally:
         await server.stop()
 
