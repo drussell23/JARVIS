@@ -55,7 +55,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Literal, Optional, Tuple
+from typing import Any, Deque, Dict, List, Literal, Optional, Tuple
 from collections import deque
 
 from backend.core.secure_logging import sanitize_for_log
@@ -271,6 +271,42 @@ class ConversationBridge:
         self._buf: Deque[ConversationTurn] = deque()
         self._lock = threading.Lock()
         self._stats = BridgeStats()
+        # Fire-and-forget observer registry — used by gap-#4 consumers
+        # (e.g. IntentDiscoverySensor) that need to react to turns.
+        # Observers are sync callables of the form ``cb(turn) -> None``;
+        # they are invoked synchronously from ``record_turn`` AFTER the
+        # turn is admitted to the ring buffer, with all exceptions
+        # swallowed so the bridge's never-raise guarantee is preserved.
+        # Bridge authority invariant is preserved — observers are
+        # advisory fan-out, not authority-carrying consumers.
+        self._turn_observers: list[Any] = []
+
+    def register_turn_observer(self, observer: Any) -> None:
+        """Register a sync callback invoked after each admitted turn.
+
+        Contract for observers:
+          * Signature: ``observer(turn: ConversationTurn) -> None``.
+          * Must be cheap (runs on the caller's thread inside the
+            record_turn fast path) — move any I/O or inference to a
+            background task.
+          * Exceptions are silently swallowed to preserve the bridge's
+            never-raise guarantee. The observer is responsible for its
+            own error handling if it cares.
+
+        Re-registering the same object is a no-op (list membership is
+        idempotent by identity).
+        """
+        with self._lock:
+            if observer not in self._turn_observers:
+                self._turn_observers.append(observer)
+
+    def unregister_turn_observer(self, observer: Any) -> None:
+        """Remove a previously registered observer (idempotent)."""
+        with self._lock:
+            try:
+                self._turn_observers.remove(observer)
+            except ValueError:
+                pass
 
     # ------------------------------------------------------------------
     # Capture
@@ -340,6 +376,7 @@ class ConversationBridge:
                 op_id=str(op_id or ""),
             )
 
+            observers_snapshot: list[Any]
             with self._lock:
                 self._buf.append(turn)
                 self._stats.turns_recorded += 1
@@ -351,6 +388,22 @@ class ConversationBridge:
                 while len(self._buf) > max_turns:
                     self._buf.popleft()
                     self._stats.dropped_by_cap += 1
+                # Snapshot observers inside the lock so concurrent
+                # register/unregister cannot mutate the list we're about
+                # to iterate. Observer invocation happens OUTSIDE the
+                # lock so a slow observer can't stall record_turn.
+                observers_snapshot = list(self._turn_observers)
+
+            # Fire observers fire-and-forget. Swallow every exception so
+            # a broken observer never breaks Venom / POSTMORTEM / TUI.
+            for observer in observers_snapshot:
+                try:
+                    observer(turn)
+                except Exception:  # pragma: no cover — defensive
+                    logger.debug(
+                        "[ConversationBridge] observer raised, dropping",
+                        exc_info=True,
+                    )
         except Exception:  # pragma: no cover — defensive, covered by error-isolation test
             # Per v1.1 §9: record_turn never propagates. Bump stats and
             # DEBUG-log; the caller (Venom / POSTMORTEM) continues.

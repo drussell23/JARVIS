@@ -37,6 +37,66 @@ _MAX_INTENTS_PER_CYCLE = int(os.environ.get("JARVIS_INTENT_DISCOVERY_MAX_PER_CYC
 _DW_MODEL = os.environ.get("JARVIS_INTENT_DISCOVERY_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
 _DW_MAX_TOKENS = int(os.environ.get("JARVIS_INTENT_DISCOVERY_MAX_TOKENS", "2000"))
 
+
+# ---------------------------------------------------------------------------
+# Gap #4 migration: event-driven mode (consumes ConversationBridge turns)
+# ---------------------------------------------------------------------------
+#
+# When ``JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED=true``, the sensor
+# registers a turn-observer on the active ConversationBridge. Each
+# dialogue turn (user / assistant / postmortem / ask_human) bumps a
+# "last turn seen" timestamp. A silence-window loop fires DW inference
+# only when the human has been quiet for at least SILENCE_S (default
+# 30s) — so we never synthesize intent mid-thought.
+#
+# This is the FIRST gap-#4 sensor whose event source is NOT fs.changed
+# — intent comes from the conversation bus, not the filesystem.
+#
+# Storm guard is layered (unique to this sensor because every trigger
+# is a DW inference call, i.e. a real dollar cost):
+#
+#   1. Silence window (SILENCE_S, default 30s) — only fire after the
+#      human has stopped typing. Prevents mid-sentence triggers.
+#   2. Inference cooldown (COOLDOWN_S, default 300s = 5min) — a hard
+#      floor between two DW inference calls regardless of how chatty
+#      the human is. Caps worst-case latency to ~1 inference / 5min.
+#   3. Hourly ceiling (HOURLY_CAP, default 10) — absolute upper bound
+#      on inference invocations in any 3600s rolling window. Even if
+#      both 1 and 2 say "go", #3 is the last line of defense against
+#      a token-bill disaster.
+#
+# Poll demotes to ``JARVIS_INTENT_DISCOVERY_FALLBACK_INTERVAL_S``
+# (default 14400s = 4h) — the fallback exists only to catch missed
+# observer dispatches; the conversation bus is the primary path.
+#
+# Shadow default = off — flipped only after the full 3-constraint
+# storm-guard is observed to hold under real chat load.
+def events_enabled() -> bool:
+    """Re-read ``JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED`` at call-time."""
+    return os.environ.get(
+        "JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED", "false",
+    ).lower() in ("true", "1", "yes")
+
+
+_INTENT_FALLBACK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_INTENT_DISCOVERY_FALLBACK_INTERVAL_S", "14400")
+)
+_INTENT_SILENCE_S: float = float(
+    os.environ.get("JARVIS_INTENT_DISCOVERY_SILENCE_S", "30")
+)
+_INTENT_COOLDOWN_S: float = float(
+    os.environ.get("JARVIS_INTENT_DISCOVERY_COOLDOWN_S", "300")
+)
+_INTENT_HOURLY_CAP: int = int(
+    os.environ.get("JARVIS_INTENT_DISCOVERY_HOURLY_CAP", "10")
+)
+# How often the silence-window loop wakes. Too short = wasted CPU; too
+# long = latency between silence and fire. 5s is a reasonable default
+# given SILENCE_S=30 (~6 checks per silence window).
+_INTENT_CHECK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_INTENT_DISCOVERY_CHECK_INTERVAL_S", "5")
+)
+
 _SYNTHESIS_SYSTEM = """\
 You are the Intent Discovery Engine for the JARVIS Trinity AI ecosystem.
 Given the developer's strategic vision (Manifesto principles), existing
@@ -116,6 +176,41 @@ class IntentDiscoverySensor:
         self._last_principles_hash: str = ""
         self._cooldown_files: Dict[str, int] = {}  # file → cycle when last submitted
         self._cooldown_cycles: int = 10  # don't re-submit same file for 10 cycles
+
+        # --- Gap #4 event-driven state -------------------------------
+        # Captured at __init__ so a runtime env flip does not
+        # retroactively demote the poll loop; matches every earlier
+        # gap-#4 migration.
+        self._events_mode: bool = events_enabled()
+        self._events_received: int = 0
+        self._events_ignored: int = 0
+        # Most recent turn-observer timestamp (monotonic seconds). Zero
+        # means "no turn seen yet in this sensor lifetime".
+        self._last_turn_ts: float = 0.0
+        # Most recent DW inference fire (monotonic). Used by the
+        # cooldown floor; zero means "never fired".
+        self._last_inference_ts: float = 0.0
+        # Rolling 3600s window of inference timestamps (monotonic).
+        self._hourly_fires: List[float] = []
+        # Storm-guard trip counters for telemetry — each counts the
+        # number of times a silence-window evaluation was REJECTED for
+        # that specific reason. Invariant:
+        #   fires + no_turn_yet + silence_not_met + cooldown_active
+        #         + hourly_cap_hit == total silence-window evaluations.
+        self._sw_fires: int = 0
+        self._sw_no_turn_yet: int = 0
+        self._sw_silence_not_met: int = 0
+        self._sw_cooldown_active: int = 0
+        self._sw_hourly_cap_hit: int = 0
+        # Observer cleanup — holds (bridge, callback) so stop() can
+        # unregister on the original bridge object.
+        self._bridge_ref: Any = None
+        # Background tasks.
+        self._silence_task: Optional[asyncio.Task] = None
+        self._poll_task: Optional[asyncio.Task] = None
+        # Guard against two concurrent scan_once invocations (silence
+        # window racing the fallback poll during demotion).
+        self._scan_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Dependency resolution (lazy, fault-tolerant)
@@ -474,20 +569,200 @@ class IntentDiscoverySensor:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start background discovery loop."""
+        """Start background discovery loop (and silence-window loop)."""
         self._running = True
-        asyncio.create_task(self._poll_loop(), name="intent_discovery_poll")
+        self._poll_task = asyncio.create_task(
+            self._poll_loop(), name="intent_discovery_poll",
+        )
+        if self._events_mode:
+            self._silence_task = asyncio.create_task(
+                self._silence_window_loop(),
+                name="intent_discovery_silence_window",
+            )
+        effective = (
+            _INTENT_FALLBACK_INTERVAL_S
+            if self._events_mode
+            else self._poll_interval_s
+        )
+        mode = (
+            "event-primary (conversation-bridge → silence-window → scan; poll=fallback)"
+            if self._events_mode
+            else "poll-primary"
+        )
         logger.info(
-            "[IntentDiscovery] Started (interval=%.0fs, max_per_cycle=%d, model=%s)",
-            self._poll_interval_s, _MAX_INTENTS_PER_CYCLE, _DW_MODEL,
+            "[IntentDiscovery] Started poll_interval=%ds max_per_cycle=%d "
+            "model=%s mode=%s silence_s=%ds cooldown_s=%ds hourly_cap=%d",
+            int(effective), _MAX_INTENTS_PER_CYCLE, _DW_MODEL, mode,
+            int(_INTENT_SILENCE_S), int(_INTENT_COOLDOWN_S), _INTENT_HOURLY_CAP,
         )
 
     def stop(self) -> None:
-        """Stop the discovery loop."""
+        """Stop the discovery loop + silence-window loop, unregister observer."""
         self._running = False
+        # Unregister from bridge if we were subscribed.
+        bridge = self._bridge_ref
+        if bridge is not None:
+            try:
+                bridge.unregister_turn_observer(self._on_turn)
+            except Exception:
+                logger.debug(
+                    "[IntentDiscovery] bridge unregister failed",
+                    exc_info=True,
+                )
+            self._bridge_ref = None
+        for task in (self._silence_task, self._poll_task):
+            if task is not None and not task.done():
+                task.cancel()
+
+    # ------------------------------------------------------------------
+    # Event-driven path (Manifesto §3: zero polling, conversation-driven)
+    # ------------------------------------------------------------------
+
+    def subscribe_to_bridge(self, bridge: Any) -> None:
+        """Register a turn-observer on the supplied ConversationBridge.
+
+        Gated by ``JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED`` (default
+        OFF). When the flag is off this is a logged no-op so legacy
+        15min-poll behavior is preserved. Unlike the other gap-#4
+        sensors, this method is synchronous — the bridge's observer
+        registry takes sync callables; the async silence-window loop
+        is started separately in ``start()``.
+
+        Registration failures are caught locally — the intake boot must
+        never regress just because the bridge rejected a callback.
+        """
+        if not self._events_mode:
+            logger.debug(
+                "[IntentDiscovery] Bridge subscription skipped "
+                "(JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED=false). "
+                "Poll-primary mode active — no gap #4 resolution.",
+            )
+            return
+
+        try:
+            bridge.register_turn_observer(self._on_turn)
+        except Exception as exc:
+            logger.warning(
+                "[IntentDiscovery] Bridge subscription failed: %s "
+                "(poll-fallback at %ds continues)",
+                exc, int(_INTENT_FALLBACK_INTERVAL_S),
+            )
+            return
+
+        self._bridge_ref = bridge
+        logger.info(
+            "[IntentDiscovery] subscribed to ConversationBridge — "
+            "conversation turns now PRIMARY (poll demoted to %ds fallback, "
+            "silence=%ds, inference_cooldown=%ds, hourly_cap=%d)",
+            int(_INTENT_FALLBACK_INTERVAL_S), int(_INTENT_SILENCE_S),
+            int(_INTENT_COOLDOWN_S), _INTENT_HOURLY_CAP,
+        )
+
+    def _on_turn(self, turn: Any) -> None:
+        """Turn-observer callback — fires on the caller's thread.
+
+        Kept deliberately cheap: just updates the "last turn" monotonic
+        timestamp. The actual inference decision is made by the async
+        silence-window loop. The observer contract requires this to be
+        synchronous and non-raising.
+        """
+        try:
+            self._last_turn_ts = time.monotonic()
+            self._events_received += 1
+        except Exception:
+            # Should be unreachable — updating a float and int cannot
+            # raise — but the observer contract demands we never
+            # propagate, so the try/except is a belt-and-braces guard.
+            self._events_ignored += 1
+
+    async def _silence_window_loop(self) -> None:
+        """Periodic evaluator — fires scan_once only when all three
+        storm-guard constraints are satisfied simultaneously.
+
+        Guard order matters for telemetry: the first failing constraint
+        wins, and the corresponding ``_sw_*`` counter is bumped. The
+        invariant
+            fires + no_turn_yet + silence_not_met
+                  + cooldown_active + hourly_cap_hit
+        equals the total number of evaluations the loop has performed.
+        """
+        # Wait one period before the first evaluation — avoid firing
+        # during the boot settling window.
+        try:
+            await asyncio.sleep(_INTENT_CHECK_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+
+        while self._running:
+            try:
+                await self._evaluate_silence_window()
+            except Exception:
+                logger.exception(
+                    "[IntentDiscovery] silence-window evaluation error",
+                )
+            try:
+                await asyncio.sleep(_INTENT_CHECK_INTERVAL_S)
+            except asyncio.CancelledError:
+                break
+
+    async def _evaluate_silence_window(self) -> bool:
+        """Run the three-constraint check once.
+
+        Returns True if a scan was actually fired. All rejection paths
+        bump the relevant ``_sw_*`` counter and return False.
+        """
+        now = time.monotonic()
+
+        # Constraint 1: we need at least one turn to have been seen.
+        if self._last_turn_ts == 0.0:
+            self._sw_no_turn_yet += 1
+            return False
+
+        # Constraint 2: silence window — time since last turn must meet
+        # threshold. Prevents mid-sentence triggers.
+        silence_elapsed = now - self._last_turn_ts
+        if silence_elapsed < _INTENT_SILENCE_S:
+            self._sw_silence_not_met += 1
+            return False
+
+        # Constraint 3: inference cooldown — hard floor between two
+        # DW calls regardless of how chatty the human is.
+        if self._last_inference_ts > 0.0:
+            cooldown_elapsed = now - self._last_inference_ts
+            if cooldown_elapsed < _INTENT_COOLDOWN_S:
+                self._sw_cooldown_active += 1
+                return False
+
+        # Constraint 4: hourly cap — prune stale entries first, then
+        # check count. Last line of defense against a token-bill blow-out.
+        cutoff = now - 3600.0
+        self._hourly_fires = [t for t in self._hourly_fires if t > cutoff]
+        if len(self._hourly_fires) >= _INTENT_HOURLY_CAP:
+            self._sw_hourly_cap_hit += 1
+            return False
+
+        # All checks passed — fire. Update cooldown + hourly ledger
+        # BEFORE calling scan_once so a concurrent re-entry (fallback
+        # poll during an active scan) still sees the updated state.
+        self._last_inference_ts = now
+        self._hourly_fires.append(now)
+        self._sw_fires += 1
+        logger.info(
+            "[IntentDiscovery] scan trigger=conversation_silence_window "
+            "silence_elapsed=%.1fs hourly_fires=%d",
+            silence_elapsed, len(self._hourly_fires),
+        )
+        async with self._scan_lock:
+            try:
+                await self.scan_once()
+            except Exception:
+                logger.exception(
+                    "[IntentDiscovery] silence-window scan_once failed",
+                )
+        return True
 
     async def _poll_loop(self) -> None:
-        """Background polling loop."""
+        """Background polling loop — primary when events off, fallback when on."""
         # Initial delay — let other subsystems boot first
         try:
             await asyncio.sleep(30.0)
@@ -496,11 +771,21 @@ class IntentDiscoverySensor:
 
         while self._running:
             try:
-                await self.scan_once()
+                logger.debug(
+                    "[IntentDiscovery] scan trigger=%s",
+                    "fallback_poll" if self._events_mode else "poll",
+                )
+                async with self._scan_lock:
+                    await self.scan_once()
             except Exception:
                 logger.exception("[IntentDiscovery] poll error")
+            effective_interval = (
+                _INTENT_FALLBACK_INTERVAL_S
+                if self._events_mode
+                else self._poll_interval_s
+            )
             try:
-                await asyncio.sleep(self._poll_interval_s)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
 
