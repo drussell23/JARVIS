@@ -700,16 +700,33 @@ class GovernedOrchestrator:
         self._subagent_orchestrator = orch
 
     async def _run_review_shadow(self, ctx: Any, best_candidate: Any) -> None:
-        """Phase B Slice 1a — post-VALIDATE REVIEW subagent in OBSERVER MODE.
+        """Phase B — post-VALIDATE REVIEW subagent in OBSERVER MODE.
 
-        Gated by ``JARVIS_REVIEW_SUBAGENT_SHADOW`` (default ``false``). When
-        on, dispatches a REVIEW subagent per candidate file and emits the
-        verdict to telemetry. **The FSM proceeds to GATE regardless of
-        verdict** — no risk-tier change, no retry routing, no state mutation.
+        Gated by ``JARVIS_REVIEW_SUBAGENT_SHADOW`` (default **``true``**,
+        graduated 2026-04-20). When on, dispatches a REVIEW subagent per
+        candidate file and emits the verdict to telemetry. **The FSM
+        proceeds to GATE regardless of verdict** — no risk-tier change,
+        no retry routing, no state mutation. The contract stays
+        observer-only even post-graduation; promoting REVIEW into
+        authority-carrying gate logic is a separate slice with its own
+        graduation arc.
 
-        Mirrors the ExplorationLedger shadow → enforce graduation pattern.
-        Slice 1b will promote this observer into an authority once three
-        consecutive battle-test sessions show verdict sanity.
+        Graduation evidence (2026-04-20):
+          * 28-test regression spine green (test_review_subagent.py +
+            test_review_subagent_correlation.py).
+          * Session 1 live FSM integration: observer hook fired
+            post-VALIDATE at 25ms latency, FSM continued without
+            interruption, aggregate telemetry format proven stable.
+          * Session 2 Path B synthetic reject-proof: aggregate=REJECT
+            emitted correctly for a poisoned candidate carrying the
+            credential_shape_introduced pattern, with findings[0]
+            identifying the triggering pattern precisely. Surfaced and
+            fixed a latent case-mismatch bug in the aggregation logic
+            (pinned by two new regression tests).
+          * Upstream intelligence (Claude sonnet-4-6) refused to generate
+            the credential-shape poison on its own — a complementary
+            safety layer; REVIEW is the net for cases Claude's RLHF
+            guardrails don't catch, not a redundant check.
 
         Must not raise under any condition — the observer contract forbids
         the shadow from breaking the main generation loop.
@@ -719,7 +736,7 @@ class GovernedOrchestrator:
         if self._subagent_orchestrator is None:
             return
         if os.environ.get(
-            "JARVIS_REVIEW_SUBAGENT_SHADOW", "false"
+            "JARVIS_REVIEW_SUBAGENT_SHADOW", "true"
         ).lower() not in ("true", "1"):
             return
 
