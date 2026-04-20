@@ -612,3 +612,342 @@ def test_build_default_plan_factory(tmp_path: Path) -> None:
     f = build_default_plan_factory(tmp_path)
     instance = f()
     assert isinstance(instance, AgenticPlanSubagent)
+
+
+# ---------------------------------------------------------------------------
+# execution_graph 2d.1 shape adapter (Slice 1b)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_plan_payload_carries_execution_graph_2d1_shape(
+    tmp_path: Path,
+) -> None:
+    """Slice 1b adapter pin — AgenticPlanSubagent payload must include an
+    execution_graph key with schema_version=2d.1 + graph_id + planner_id
+    + concurrency_limit + units, matching providers.py's schema.
+    """
+    planner = AgenticPlanSubagent(project_root=tmp_path)
+    req = SubagentRequest(
+        subagent_type=SubagentType.PLAN,
+        goal="plan it",
+        target_files=("a.py", "b.py", "c.py"),
+        plan_target={
+            "op_description": "multi-file refactor",
+            "target_files": ("a.py", "b.py", "c.py"),
+        },
+    )
+    parent_ctx = MagicMock()
+    ctx = SubagentContext(
+        parent_op_id="op-test",
+        parent_ctx=parent_ctx,
+        subagent_id="op-test::sub-01",
+        subagent_type=SubagentType.PLAN,
+        request=req,
+        deadline=datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=30),
+    )
+
+    result = await planner.plan(ctx)
+    assert result.status == SubagentStatus.COMPLETED
+    payload = dict(result.type_payload)
+    assert "execution_graph" in payload, (
+        "payload must carry execution_graph adapter key"
+    )
+    eg = dict(payload["execution_graph"])
+    assert eg["schema_version"] == "2d.1"
+    assert eg["graph_id"] and len(eg["graph_id"]) == 16  # sha256[:16]
+    assert eg["planner_id"] == "AgenticPlanSubagent/deterministic"
+    assert eg["concurrency_limit"] >= 1
+    units = eg["units"]
+    assert len(units) == 3
+    # Every unit has the required keys — dict-convert each tuple unit.
+    for u_tuple in units:
+        u = dict(u_tuple)
+        assert "unit_id" in u
+        assert "dependency_ids" in u
+        assert "owned_paths" in u
+        assert "acceptance_tests" in u
+        assert "barrier_id" in u
+
+
+def test_plan_payload_graph_id_is_deterministic(tmp_path: Path) -> None:
+    """graph_id is a sha256[:16] of the sorted unit_ids + op_description
+    prefix — identical inputs → identical graph_id. Pins the dedup
+    contract the telemetry relies on.
+    """
+    from backend.core.ouroboros.governance.agentic_plan_subagent import (
+        _build_execution_graph_payload,
+    )
+    units = [
+        {
+            "unit_id": "unit_00_a",
+            "dependency_ids": (),
+            "owned_paths": ("a.py",),
+            "acceptance_tests": ("tests/test_a.py",),
+            "barrier_id": "",
+        },
+        {
+            "unit_id": "unit_01_b",
+            "dependency_ids": (),
+            "owned_paths": ("b.py",),
+            "acceptance_tests": (),
+            "barrier_id": "",
+            "no_test_rationale": "fresh file",
+        },
+    ]
+    payload_a = dict(_build_execution_graph_payload(
+        units=units, op_description="refactor X", concurrency_limit=2,
+    ))
+    payload_b = dict(_build_execution_graph_payload(
+        units=units, op_description="refactor X", concurrency_limit=2,
+    ))
+    assert payload_a["graph_id"] == payload_b["graph_id"]
+    # Different description → different graph_id.
+    payload_c = dict(_build_execution_graph_payload(
+        units=units, op_description="rename Y", concurrency_limit=2,
+    ))
+    assert payload_a["graph_id"] != payload_c["graph_id"]
+
+
+# ---------------------------------------------------------------------------
+# _run_plan_shadow — observer-only hook pin (Slice 1b)
+# ---------------------------------------------------------------------------
+
+def _make_plan_shadow_stub(*, ctx_shape, dispatch_result=None,
+                           dispatch_raises=None):
+    """Tiny stub self-surface for Orchestrator._run_plan_shadow.
+
+    Returns (stub, captured_calls) where captured_calls is a list that
+    accumulates (kwargs-dict) entries each time dispatch_plan fires.
+    """
+    import types
+    captured: list = []
+
+    class _StubSubagentOrch:
+        async def dispatch_plan(self, *, parent_ctx, op_description,
+                                target_files, primary_repo,
+                                risk_tier, timeout_s):
+            captured.append({
+                "op_description": op_description,
+                "target_files": target_files,
+                "primary_repo": primary_repo,
+                "risk_tier": risk_tier,
+                "timeout_s": timeout_s,
+            })
+            if dispatch_raises is not None:
+                raise dispatch_raises
+            if dispatch_result is not None:
+                return dispatch_result
+            # Default: a COMPLETED result carrying a minimum viable
+            # execution_graph payload.
+            return SubagentResult(
+                subagent_id=f"{ctx_shape['op_id']}::sub-01",
+                subagent_type=SubagentType.PLAN,
+                status=SubagentStatus.COMPLETED,
+                type_payload=(
+                    ("unit_count", 2),
+                    ("edge_count", 0),
+                    ("root_count", 2),
+                    ("parallel_branches", (("unit_00_a", "unit_01_b"),)),
+                    ("validation_valid", True),
+                    ("validation_errors", ()),
+                    ("execution_graph", (
+                        ("schema_version", "2d.1"),
+                        ("graph_id", "stubgraph00000000"),
+                        ("planner_id", "stub"),
+                        ("concurrency_limit", 2),
+                        ("units", ()),
+                    )),
+                ),
+            )
+
+    stub = types.SimpleNamespace()
+    stub._subagent_orchestrator = _StubSubagentOrch()
+    from backend.core.ouroboros.governance.orchestrator import Orchestrator
+    stub._run_plan_shadow = types.MethodType(
+        Orchestrator._run_plan_shadow, stub,
+    )
+    return stub, captured
+
+
+def _build_ctx(*, op_id="op-plan-shadow-test", target_files=("a.py", "b.py"),
+               description="refactor"):
+    """Real OperationContext with execution_graph=None; lets
+    dataclasses.replace(ctx, execution_graph=...) work. Uses the
+    class factory so all required fields + hash chain are populated."""
+    from backend.core.ouroboros.governance.op_context import OperationContext
+    return OperationContext.create(
+        op_id=op_id,
+        target_files=tuple(target_files),
+        description=description,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_plan_shadow_noop_when_flag_off(
+    monkeypatch, caplog,
+) -> None:
+    """Flag off (default) → dispatch NOT called, no [PLAN-SHADOW] log."""
+    import logging as _logging
+    monkeypatch.delenv("JARVIS_PLAN_SUBAGENT_SHADOW", raising=False)
+
+    ctx = _build_ctx()
+    stub, captured = _make_plan_shadow_stub(ctx_shape={"op_id": ctx.op_id})
+    caplog.set_level(_logging.INFO, logger="Ouroboros.Orchestrator")
+
+    new_ctx = await stub._run_plan_shadow(ctx)
+
+    assert captured == [], "dispatch_plan must not fire when flag is off"
+    assert not any("[PLAN-SHADOW]" in r.getMessage() for r in caplog.records)
+    assert new_ctx is ctx  # ctx unchanged by reference
+    assert new_ctx.execution_graph is None
+
+
+@pytest.mark.asyncio
+async def test_run_plan_shadow_dispatches_and_stashes_when_flag_on(
+    monkeypatch, caplog,
+) -> None:
+    """Flag on + multi-file → dispatch_plan called, execution_graph
+    stashed on ctx, [PLAN-SHADOW] telemetry emitted."""
+    import logging as _logging
+    monkeypatch.setenv("JARVIS_PLAN_SUBAGENT_SHADOW", "true")
+
+    ctx = _build_ctx(target_files=("a.py", "b.py", "c.py"))
+    stub, captured = _make_plan_shadow_stub(ctx_shape={"op_id": ctx.op_id})
+    caplog.set_level(_logging.INFO, logger="Ouroboros.Orchestrator")
+
+    new_ctx = await stub._run_plan_shadow(ctx)
+
+    assert len(captured) == 1
+    assert captured[0]["target_files"] == ("a.py", "b.py", "c.py")
+    assert captured[0]["op_description"] == "refactor"
+
+    shadow_lines = [
+        r.getMessage() for r in caplog.records if "[PLAN-SHADOW]" in r.getMessage()
+    ]
+    assert shadow_lines, "no [PLAN-SHADOW] line emitted"
+    line = shadow_lines[0]
+    assert "dag_units=2" in line
+    assert "edges=0" in line
+    assert "roots=2" in line
+    assert "parallel_pairs=1" in line
+    assert "validation_valid=True" in line
+    assert "graph_id=stubgraph00000000" in line
+    assert "observer — FSM proceeds regardless" in line
+
+    assert new_ctx.execution_graph is not None, (
+        "ctx.execution_graph must be stashed under flag-on"
+    )
+    # implementation_plan NOT touched — it stays at the default empty.
+    assert new_ctx.implementation_plan == ""
+
+
+@pytest.mark.asyncio
+async def test_run_plan_shadow_skips_single_file_op(
+    monkeypatch, caplog,
+) -> None:
+    """Single-file op → no DAG to build → dispatch skipped even when flag on."""
+    import logging as _logging
+    monkeypatch.setenv("JARVIS_PLAN_SUBAGENT_SHADOW", "true")
+
+    ctx = _build_ctx(target_files=("only_one.py",))
+    stub, captured = _make_plan_shadow_stub(ctx_shape={"op_id": ctx.op_id})
+    caplog.set_level(_logging.INFO, logger="Ouroboros.Orchestrator")
+
+    new_ctx = await stub._run_plan_shadow(ctx)
+
+    assert captured == [], "dispatch_plan must skip single-file ops"
+    assert not any("[PLAN-SHADOW]" in r.getMessage() for r in caplog.records)
+    assert new_ctx is ctx
+
+
+@pytest.mark.asyncio
+async def test_run_plan_shadow_dispatch_failure_is_non_fatal(
+    monkeypatch, caplog,
+) -> None:
+    """dispatch_plan raising must be swallowed — FSM never breaks."""
+    import logging as _logging
+    monkeypatch.setenv("JARVIS_PLAN_SUBAGENT_SHADOW", "true")
+
+    ctx = _build_ctx()
+    stub, captured = _make_plan_shadow_stub(
+        ctx_shape={"op_id": ctx.op_id},
+        dispatch_raises=RuntimeError("simulated dispatch failure"),
+    )
+    caplog.set_level(_logging.INFO, logger="Ouroboros.Orchestrator")
+
+    # Must NOT raise:
+    new_ctx = await stub._run_plan_shadow(ctx)
+
+    assert len(captured) == 1  # dispatch was attempted
+    # No [PLAN-SHADOW] INFO line — aggregation bailed on the exception
+    assert not any(
+        "[PLAN-SHADOW]" in r.getMessage() and r.levelno == _logging.INFO
+        for r in caplog.records
+    )
+    # ctx unchanged on failure
+    assert new_ctx.execution_graph is None
+
+
+@pytest.mark.asyncio
+async def test_run_plan_shadow_emits_validation_errors_without_raising(
+    monkeypatch, caplog,
+) -> None:
+    """When dispatch_plan returns an INVALID DAG, telemetry captures
+    validation_valid=False + a follow-up line with validation_errors.
+    Observer contract still holds — no raise."""
+    import logging as _logging
+    monkeypatch.setenv("JARVIS_PLAN_SUBAGENT_SHADOW", "true")
+
+    ctx = _build_ctx()
+    invalid_result = SubagentResult(
+        subagent_id=f"{ctx.op_id}::sub-01",
+        subagent_type=SubagentType.PLAN,
+        status=SubagentStatus.FAILED,
+        type_payload=(
+            ("unit_count", 2),
+            ("edge_count", 1),
+            ("root_count", 0),
+            ("parallel_branches", ()),
+            ("validation_valid", False),
+            ("validation_errors", (
+                "unit 'a' depends on 'missing' which does not exist",
+                "DAG has no roots",
+            )),
+        ),
+    )
+    stub, captured = _make_plan_shadow_stub(
+        ctx_shape={"op_id": ctx.op_id},
+        dispatch_result=invalid_result,
+    )
+    caplog.set_level(_logging.INFO, logger="Ouroboros.Orchestrator")
+
+    new_ctx = await stub._run_plan_shadow(ctx)
+
+    assert len(captured) == 1
+    lines = [r.getMessage() for r in caplog.records if "[PLAN-SHADOW]" in r.getMessage()]
+    assert any("validation_valid=False" in m for m in lines)
+    assert any("validation_errors" in m for m in lines)
+    # Still observer-only — no exception, ctx intact.
+    assert new_ctx is not None
+
+
+@pytest.mark.asyncio
+async def test_run_plan_shadow_noop_when_subagent_orchestrator_missing(
+    monkeypatch,
+) -> None:
+    """If _subagent_orchestrator is None, shadow bails immediately."""
+    import types
+    from backend.core.ouroboros.governance.orchestrator import Orchestrator
+
+    monkeypatch.setenv("JARVIS_PLAN_SUBAGENT_SHADOW", "true")
+
+    stub = types.SimpleNamespace()
+    stub._subagent_orchestrator = None
+    stub._run_plan_shadow = types.MethodType(
+        Orchestrator._run_plan_shadow, stub,
+    )
+
+    ctx = _build_ctx()
+    result_ctx = await stub._run_plan_shadow(ctx)
+    assert result_ctx is ctx  # untouched

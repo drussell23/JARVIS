@@ -55,6 +55,7 @@ Hard-kill discipline (Manifesto §3 Disciplined Concurrency):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -183,6 +184,18 @@ class AgenticPlanSubagent:
             for u in units
             for src in (u.get("dependency_ids", ()) or ())
         )
+        # execution_graph 2d.1 shape (tuple-of-tuple so SubagentResult
+        # stays frozen). This matches the schema producers.py emits for
+        # cross-repo execution graphs (_SCHEMA_VERSION_EXECUTION_GRAPH)
+        # — consumers (orchestrator PLAN-shadow, future GENERATE
+        # consumption) convert via dict() on the way out. Shape:
+        #   schema_version / graph_id / planner_id /
+        #   concurrency_limit / units
+        execution_graph = _build_execution_graph_payload(
+            units=units,
+            op_description=op_description,
+            concurrency_limit=len(validation.parallel_branches) + 1,
+        )
         payload: Tuple[Tuple[str, Any], ...] = (
             ("dag_units", dag_units),
             ("dag_edges", dag_edges),
@@ -192,6 +205,9 @@ class AgenticPlanSubagent:
             ("parallel_branches", validation.parallel_branches),
             ("validation_valid", validation.valid),
             ("validation_errors", validation.errors),
+            # Adapter key — 2d.1-shaped execution_graph for downstream
+            # consumers that expect the schema producers.py defines.
+            ("execution_graph", execution_graph),
         )
 
         # Findings: one per unit for the observability pipeline. The
@@ -394,6 +410,56 @@ def _sanitize_id(s: str) -> str:
     """
     cleaned = _ID_SAFE_RE.sub("", (s or "").lower())[:32]
     return cleaned or "x"
+
+
+_PLANNER_ID = "AgenticPlanSubagent/deterministic"
+
+
+def _build_execution_graph_payload(
+    *,
+    units: List[Dict[str, Any]],
+    op_description: str,
+    concurrency_limit: int,
+) -> Tuple[Tuple[str, Any], ...]:
+    """Build the ``execution_graph 2d.1``-shaped tuple-of-tuple payload.
+
+    Matches the schema ``providers.py`` declares at
+    ``_SCHEMA_VERSION_EXECUTION_GRAPH``. Tuple-of-tuple form (not dict)
+    because ``SubagentResult.type_payload`` is frozen. Consumers that
+    need a dict call ``dict(payload)`` on the way out.
+
+    ``graph_id`` is a deterministic sha256[:16] of the sorted unit_ids
+    plus the op_description prefix — stable across reruns on the same
+    input, useful for dedup and cross-session correlation in telemetry.
+    """
+    unit_id_join = ",".join(sorted(str(u.get("unit_id", "")) for u in units))
+    hash_material = f"{op_description[:200]}|{unit_id_join}".encode("utf-8")
+    graph_id = hashlib.sha256(hash_material).hexdigest()[:16]
+
+    units_payload: Tuple[Tuple[Tuple[str, Any], ...], ...] = tuple(
+        (
+            ("unit_id", str(u.get("unit_id", ""))),
+            ("dependency_ids", tuple(
+                str(d) for d in (u.get("dependency_ids", ()) or ())
+            )),
+            ("owned_paths", tuple(
+                str(p) for p in (u.get("owned_paths", ()) or ())
+            )),
+            ("acceptance_tests", tuple(
+                str(t) for t in (u.get("acceptance_tests", ()) or ())
+            )),
+            ("barrier_id", str(u.get("barrier_id", "") or "")),
+        )
+        for u in units
+    )
+
+    return (
+        ("schema_version", "2d.1"),
+        ("graph_id", graph_id),
+        ("planner_id", _PLANNER_ID),
+        ("concurrency_limit", max(1, int(concurrency_limit))),
+        ("units", units_payload),
+    )
 
 
 def build_default_plan_factory(

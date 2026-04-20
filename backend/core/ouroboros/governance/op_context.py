@@ -863,6 +863,31 @@ class OperationContext:
     # model follows a coherent strategy instead of ad-hoc patching.
     implementation_plan: str = ""
 
+    # ---- PLAN-subagent DAG output (stamped post-PlanGenerator when
+    # JARVIS_PLAN_SUBAGENT_SHADOW=true) ----
+    # execution_graph 2d.1-shaped payload (tuple-of-tuple form so the
+    # dataclass stays hashable/comparable). Produced by
+    # AgenticPlanSubagent and stashed here by
+    # ``orchestrator._run_plan_shadow`` as an observer signal —
+    # **does NOT overwrite implementation_plan**. Present so downstream
+    # telemetry + future GENERATE hooks can compare the legacy flat-list
+    # plan against the DAG without a separate lookup.
+    #
+    # Shape (when set):
+    #   ((("schema_version", "2d.1"),
+    #     ("graph_id", "<hash>"),
+    #     ("planner_id", "AgenticPlanSubagent/deterministic"),
+    #     ("concurrency_limit", N),
+    #     ("units", (
+    #         (("unit_id", ...), ("dependency_ids", (...)),
+    #          ("owned_paths", (...)), ("acceptance_tests", (...)),
+    #          ("barrier_id", "")),
+    #         ...
+    #     ))))
+    # ``None`` = shadow hook was not invoked (flag off, single-file op,
+    # or dispatch failed). Consumers must handle the None case.
+    execution_graph: Optional[Any] = None
+
     # ---- Reasoning chain result (stamped at CLASSIFY if chain is active) ----
     reasoning_chain_result: Optional[Dict[str, Any]] = None
 

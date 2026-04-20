@@ -857,6 +857,138 @@ class GovernedOrchestrator:
                 exc_info=True,
             )
 
+    async def _run_plan_shadow(self, ctx: Any) -> Any:
+        """Phase B PLAN-shadow (Slice 1b) — AgenticPlanSubagent dispatch
+        running alongside the legacy ``PlanGenerator`` as an observer.
+
+        Gated by ``JARVIS_PLAN_SUBAGENT_SHADOW`` (default ``false``). When
+        on, this hook:
+          * Dispatches the PLAN subagent with ctx.target_files + description
+          * Receives an execution_graph 2d.1-shaped payload back
+          * Stashes the payload into ``ctx.execution_graph`` **without
+            touching ``ctx.implementation_plan``** (the legacy flat-list
+            plan remains the authoritative input to GENERATE; the DAG is
+            observer-only this slice)
+          * Emits a stable ``[PLAN-SHADOW]`` telemetry line so the legacy
+            flat list and the subagent DAG can be compared across ops
+
+        Single-file ops and ops with no target files skip — there is no
+        DAG to build. Dispatch failures bump DEBUG logs only; the FSM
+        proceeds regardless. Returns the (possibly updated) context so
+        the caller can chain ``ctx = await self._run_plan_shadow(ctx)``.
+        """
+        if self._subagent_orchestrator is None:
+            return ctx
+        if os.environ.get(
+            "JARVIS_PLAN_SUBAGENT_SHADOW", "false",
+        ).lower() not in ("true", "1"):
+            return ctx
+
+        target_files = tuple(
+            t for t in (getattr(ctx, "target_files", ()) or ()) if t
+        )
+        if len(target_files) < 2:
+            # Single-file or zero-file op → no DAG to build.
+            return ctx
+
+        try:
+            _t0 = time.monotonic()
+            _description = (
+                getattr(ctx, "description", "")
+                or getattr(ctx, "goal", "")
+                or "(no description)"
+            )
+            _primary_repo = getattr(ctx, "primary_repo", "jarvis") or "jarvis"
+            _risk_tier = str(getattr(ctx, "risk_tier", "") or "")
+
+            _result = await self._subagent_orchestrator.dispatch_plan(
+                parent_ctx=ctx,
+                op_description=str(_description),
+                target_files=target_files,
+                primary_repo=str(_primary_repo),
+                risk_tier=_risk_tier,
+                timeout_s=30.0,
+            )
+
+            # Extract the stable metrics from type_payload. Any missing
+            # key falls back to a neutral default — the shadow contract
+            # guarantees no raise.
+            _payload = dict(_result.type_payload or ())
+            _unit_count = int(_payload.get("unit_count", 0) or 0)
+            _edge_count = int(_payload.get("edge_count", 0) or 0)
+            _root_count = int(_payload.get("root_count", 0) or 0)
+            _parallel = _payload.get("parallel_branches", ()) or ()
+            _parallel_pairs = len(_parallel)
+            _validation_valid = bool(_payload.get("validation_valid", False))
+            _validation_errors = _payload.get("validation_errors", ()) or ()
+            _execution_graph = _payload.get("execution_graph")
+            _graph_id = ""
+            if _execution_graph:
+                # execution_graph is a tuple-of-tuple; find ("graph_id", X).
+                for _k, _v in _execution_graph:
+                    if _k == "graph_id":
+                        _graph_id = str(_v)
+                        break
+
+            # Stash the DAG on ctx WITHOUT overwriting implementation_plan.
+            # Uses dataclasses.replace so the immutable-by-convention ctx
+            # is respected; if the field doesn't exist (older ctx shape),
+            # fall through silently.
+            if _execution_graph is not None:
+                try:
+                    ctx = dataclasses.replace(
+                        ctx, execution_graph=_execution_graph,
+                    )
+                except (TypeError, ValueError):
+                    # Older ctx without execution_graph field — log and
+                    # continue; the shadow telemetry still fires.
+                    logger.debug(
+                        "[Orchestrator] PLAN-shadow could not stash "
+                        "execution_graph on ctx — field missing",
+                    )
+
+            _duration_ms = int((time.monotonic() - _t0) * 1000)
+            _status = (
+                _result.status.value
+                if hasattr(_result.status, "value")
+                else str(_result.status)
+            )
+
+            logger.info(
+                "[PLAN-SHADOW] op=%s status=%s dag_units=%d edges=%d "
+                "roots=%d parallel_pairs=%d validation_valid=%s "
+                "graph_id=%s duration_ms=%d "
+                "(observer — FSM proceeds regardless)",
+                getattr(ctx, "op_id", "?"),
+                _status,
+                _unit_count,
+                _edge_count,
+                _root_count,
+                _parallel_pairs,
+                _validation_valid,
+                _graph_id or "<none>",
+                _duration_ms,
+            )
+
+            # If the DAG itself was invalid, surface at INFO so the
+            # graduation-arc telemetry captures validator failures
+            # alongside the shadow dispatch. Still observer-only — no
+            # raise, no FSM mutation.
+            if not _validation_valid and _validation_errors:
+                logger.info(
+                    "[PLAN-SHADOW] op=%s validation_errors=%s",
+                    getattr(ctx, "op_id", "?"),
+                    list(_validation_errors)[:5],
+                )
+        except Exception:
+            # Observer contract: shadow must never break the FSM.
+            logger.debug(
+                "[Orchestrator] PLAN shadow dispatch skipped",
+                exc_info=True,
+            )
+
+        return ctx
+
     def _is_cancel_requested(self, op_id: str) -> bool:
         """Check if REPL /cancel was requested for this operation."""
         _gls = getattr(self._stack, "governed_loop_service", None)
@@ -2063,6 +2195,23 @@ class GovernedOrchestrator:
                 "[Orchestrator] PLAN phase failed for op=%s: %s; "
                 "continuing to GENERATE without plan",
                 ctx.op_id, exc,
+            )
+
+        # Phase B PLAN-shadow (Slice 1b) — observer-only DAG dispatch.
+        # Runs AFTER the legacy PlanGenerator regardless of whether the
+        # legacy plan succeeded or skipped. Gated by
+        # JARVIS_PLAN_SUBAGENT_SHADOW (default false). The shadow never
+        # raises and never blocks the FSM; its only side-effect is
+        # setting ctx.execution_graph + emitting [PLAN-SHADOW] telemetry.
+        try:
+            ctx = await self._run_plan_shadow(ctx)
+        except Exception:
+            # Defense in depth — the hook itself is exception-safe but
+            # an awaitable propagation through asyncio.wait_for etc.
+            # could surface edge-case cancellations. Never propagate.
+            logger.debug(
+                "[Orchestrator] PLAN-shadow wrapper swallowed exception",
+                exc_info=True,
             )
 
         if _plan_review_required_now and (
