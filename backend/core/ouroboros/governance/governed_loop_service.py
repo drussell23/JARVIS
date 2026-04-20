@@ -997,6 +997,31 @@ class GovernedLoopService:
         """DoublewordProvider reference (None if API key not set or build failed)."""
         return getattr(self, "_doubleword_ref", None)
 
+    def _resolve_provider_for_subagent(self, name):
+        """Provider-registry callable passed to GENERAL's LLM driver factory.
+
+        Maps the canonical provider name (as stamped on
+        ``ctx.primary_provider_name`` by ``SubagentOrchestrator.dispatch``)
+        to a live provider instance held on GLS. When the name is
+        unrecognized or the referenced provider isn't wired, falls back
+        to Claude (the "prefrontal cortex" per topology config, the
+        best-fit default for GENERAL's bounded-agentic workloads).
+
+        Called at run time by ``general_driver.run_general_tool_loop``;
+        never cached so a runtime provider swap (e.g. after pool
+        recycle) is picked up on the next dispatch.
+        """
+        lname = (str(name) or "").strip().lower()
+        if "claude" in lname:
+            return getattr(self, "_claude_ref", None)
+        if "doubleword" in lname or lname.startswith("dw") or "qwen" in lname:
+            return getattr(self, "_doubleword_ref", None)
+        # Default: Claude — most GENERAL ops land on NOTIFY_APPLY tier
+        # which routes IMMEDIATE (Claude direct) per topology config.
+        # A None return triggers the driver's ``no_provider_wired``
+        # structured trace — caller handles gracefully.
+        return getattr(self, "_claude_ref", None)
+
     def set_active_brain_set(self, brain_set: FrozenSet[str]) -> None:
         """Update the admitted active brain set.
 
@@ -3383,8 +3408,14 @@ class GovernedLoopService:
                 from backend.core.ouroboros.governance.agentic_plan_subagent import (
                     build_default_plan_factory,
                 )
+                # Phase C Slice 1b Step 0 — swap the default stub factory
+                # for the LLM-driver factory. ``build_llm_general_factory``
+                # itself falls back to the stub factory when
+                # JARVIS_GENERAL_LLM_DRIVER_ENABLED=false, so attaching it
+                # unconditionally here is safe (and byte-identical to the
+                # old wire-in in the flag-off case).
                 from backend.core.ouroboros.governance.agentic_general_subagent import (
-                    build_default_general_factory,
+                    build_llm_general_factory,
                 )
                 from backend.core.ouroboros.governance.subagent_comm_sink import (
                     build_comm_sink_from_gls,
@@ -3404,8 +3435,9 @@ class GovernedLoopService:
                     plan_factory=build_default_plan_factory(
                         self._config.project_root
                     ),
-                    general_factory=build_default_general_factory(
-                        self._config.project_root
+                    general_factory=build_llm_general_factory(
+                        self._config.project_root,
+                        provider_registry=self._resolve_provider_for_subagent,
                     ),
                     comm=_sub_comm,
                     ledger=_sub_ledger,
