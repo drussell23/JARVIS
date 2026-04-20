@@ -75,6 +75,28 @@ class FileWatchConfig:
     patterns: List[str] = field(default_factory=lambda: ["*"])  # Glob patterns
     ignore_patterns: List[str] = field(default_factory=lambda: ["*.tmp", "*.swp", "*.bak", "*~"])
 
+    # ---------------- Narrow scheduling (root-of-scan control) ------------
+    #
+    # ``PollingObserver`` on macOS (the default fallback because native
+    # FSEvents has been observed to crash silently in long sessions per
+    # bt-2026-04-12-005521) does a full tree snapshot O(N) on every tick.
+    # On this repo the root contains ~56K ``.py`` files, ~48K of which live
+    # in ``venv/``, ``.venv/``, and ``venv_py39_backup/``. At that scale,
+    # PollingObserver can't keep up and delivers zero events.
+    #
+    # ``exclude_top_level_dirs`` is applied at the SCHEDULING layer: those
+    # directories are never passed to ``observer.schedule()``, so the
+    # PollingObserver snapshot never walks into them. This fixes the
+    # "OS-to-Organism nervous system severed" failure surfaced by the
+    # TodoScanner graduation arc 2026-04-20. Env override
+    # ``JARVIS_FILE_WATCH_EXCLUDE_DIRS`` accepts a comma-separated list.
+    exclude_top_level_dirs: frozenset = field(default_factory=lambda: frozenset({
+        "venv", ".venv", "venv_py39_backup",
+        "node_modules", ".git", ".worktrees",
+        "__pycache__", ".pytest_cache", ".mypy_cache",
+        "build", "dist", ".ouroboros",
+    }))
+
     # Debouncing
     debounce_seconds: float = 0.1  # Wait before firing event
     batch_timeout_seconds: float = 0.5  # Max wait for batch
@@ -569,13 +591,56 @@ class FileWatchGuard:
         self._backend_name = backend_name
         handler = AsyncEventHandler()
 
-        self._observer.schedule(
-            handler,
-            str(self.watch_dir),
-            recursive=self.config.recursive,
-        )
+        # --- Narrow scheduling: skip venv / worktree / cache noise ------
+        #
+        # Instead of scheduling the repo root recursively (which forces
+        # PollingObserver to snapshot 56K+ files including venvs), we
+        # schedule each top-level subdirectory individually and drop the
+        # high-noise ones. See ``FileWatchConfig.exclude_top_level_dirs``.
+        # When a depth-1 dir has a nested excluded child (e.g.
+        # ``backend/venv``), we schedule its grandchildren recursively
+        # AND the dir itself non-recursively so file-level events at the
+        # parent's depth (e.g. ``backend/_probe.py``) still fire without
+        # dragging the nested venv into the snapshot.
+        excluded = self._resolve_excluded_dirs()
+        scheduled_paths = self._resolve_watch_paths(excluded)
+
+        scheduled_ok: List[Tuple[Path, bool]] = []
+        for path, recursive in scheduled_paths:
+            try:
+                self._observer.schedule(handler, str(path), recursive=recursive)
+                scheduled_ok.append((path, recursive))
+            except Exception as exc:
+                logger.warning(
+                    "[FileWatchGuard] schedule(%s, recursive=%s) failed: %s",
+                    path, recursive, exc,
+                )
+
+        # Also schedule the root NON-recursively so top-level file changes
+        # (e.g. repo-root config files) still fire events without dragging
+        # the venv subtrees into the snapshot.
+        try:
+            self._observer.schedule(
+                handler, str(self.watch_dir), recursive=False,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[FileWatchGuard] non-recursive root schedule failed: %s", exc,
+            )
+
+        self._scheduled_paths: List[Tuple[Path, bool]] = scheduled_ok
+
+        recursive_count = sum(1 for _, r in scheduled_ok if r)
         self._observer.start()
-        logger.info(f"[FileWatchGuard] Observer backend: {backend_name}")
+        logger.info(
+            "[FileWatchGuard] Observer backend: %s, scheduled %d narrow roots "
+            "(%d recursive, %d non-recursive, excluded: %s)",
+            backend_name,
+            len(scheduled_ok),
+            recursive_count,
+            len(scheduled_ok) - recursive_count,
+            sorted(excluded) if excluded else "(none)",
+        )
 
     async def _stop_watchdog(self) -> None:
         """Stop the watchdog observer."""
@@ -583,6 +648,100 @@ class FileWatchGuard:
             self._observer.stop()
             self._observer.join(timeout=5.0)
             self._observer = None
+
+    # ------------------------------------------------------------------
+    # Narrow-scheduling helpers (fixes PollingObserver-at-scale failure)
+    # ------------------------------------------------------------------
+
+    def _resolve_excluded_dirs(self) -> frozenset:
+        """Resolve which top-level directory names to exclude.
+
+        Env override ``JARVIS_FILE_WATCH_EXCLUDE_DIRS`` takes precedence
+        over the config default. A blank value falls back to config.
+        Useful for adding project-specific noise directories (e.g. a
+        build cache under a nonstandard name) without changing code.
+        """
+        env_override = os.environ.get(
+            "JARVIS_FILE_WATCH_EXCLUDE_DIRS", "",
+        ).strip()
+        if env_override:
+            return frozenset(
+                d.strip() for d in env_override.split(",") if d.strip()
+            )
+        return self.config.exclude_top_level_dirs
+
+    def _resolve_watch_paths(
+        self, excluded: frozenset,
+    ) -> List[Tuple[Path, bool]]:
+        """Resolve the narrowed set of directories to schedule for watching.
+
+        Returns a list of ``(path, recursive)`` tuples. Callers pass each
+        to ``observer.schedule(handler, path, recursive=recursive)``.
+
+        Key insight: excluded directory names (``venv``, ``.venv``, ...)
+        can appear at ANY depth, not just the repo root. Specifically,
+        this repo has both ``./venv`` and ``./backend/venv`` — the latter
+        would be dragged in if we scheduled ``./backend`` recursively,
+        undoing the whole point of the narrow-scope fix.
+
+        Algorithm (bounded descent, practical depth only):
+          * Depth 1: iterate ``watch_dir.iterdir()``.
+          * If a depth-1 child's name is excluded, skip entirely.
+          * Else, if that child's immediate children contain ANY excluded
+            names, schedule each NON-excluded grandchild individually
+            **recursively** AND schedule the descended parent
+            **non-recursively** so file-level events at that depth are
+            still delivered. This catches nested venvs like
+            ``backend/venv`` without creating a blind spot for files
+            directly under ``backend/``.
+          * Else, schedule the depth-1 dir recursively (normal case).
+
+        Depth ≥ 3 excluded directories (e.g. ``backend/core/venv``) are
+        NOT handled here — they remain covered by the post-event
+        ``ignore_patterns`` filter. In practice deep nested venvs are
+        vanishingly rare in JARVIS-layout repos.
+
+        Missing root → empty list (caller's observer.start() still
+        succeeds; health loop will notice the missing root and recreate).
+        """
+        paths: List[Tuple[Path, bool]] = []
+        if not self.watch_dir.exists():
+            return paths
+        try:
+            depth1 = sorted(self.watch_dir.iterdir())
+        except OSError as exc:
+            logger.warning(
+                "[FileWatchGuard] iterdir(%s) failed: %s — "
+                "falling back to single-root schedule",
+                self.watch_dir, exc,
+            )
+            return [(self.watch_dir, True)]
+
+        for entry in depth1:
+            if not entry.is_dir() or entry.name in excluded:
+                continue
+            # Peek at depth 2 children to detect nested venvs.
+            try:
+                depth2 = list(entry.iterdir())
+            except (OSError, PermissionError):
+                # Can't peek — safer to include the dir as-is.
+                paths.append((entry, True))
+                continue
+            has_nested_excluded = any(
+                child.is_dir() and child.name in excluded
+                for child in depth2
+            )
+            if has_nested_excluded:
+                # Schedule non-excluded grandchildren recursively
+                # AND the parent itself non-recursively so file-level
+                # events at the parent's depth still fire.
+                paths.append((entry, False))
+                for grand in sorted(depth2):
+                    if grand.is_dir() and grand.name not in excluded:
+                        paths.append((grand, True))
+            else:
+                paths.append((entry, True))
+        return paths
 
     def _queue_event(self, event: FileEvent) -> None:
         """
