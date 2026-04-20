@@ -406,6 +406,11 @@ class GovernedOrchestrator:
         self._config = config
         self._validation_runner = validation_runner
 
+        # Phase B REVIEW subagent — harness-attached post-construction via
+        # set_subagent_orchestrator() so the constructor signature stays
+        # stable. None until governed_loop_service wires it.
+        self._subagent_orchestrator: Any = None
+
         # ── Phase 1 Step 3C: reload-hostile state hoisted to _governance_state ──
         # Every field that would otherwise get re-allocated on
         # ``importlib.reload(orchestrator)`` now lives on an
@@ -684,6 +689,143 @@ class GovernedOrchestrator:
         ``self_critique.CritiqueEngine`` for the expected shape.
         """
         self._critique_engine = engine
+
+    def set_subagent_orchestrator(self, orch: Any) -> None:
+        """Attach the Phase B ``SubagentOrchestrator`` for REVIEW shadow dispatch.
+
+        The orchestrator is the single spawn point for ephemeral REVIEW
+        subagents (see ``subagent_orchestrator.py:dispatch_review``). Passing
+        ``None`` detaches it — the post-VALIDATE shadow hook then no-ops.
+        """
+        self._subagent_orchestrator = orch
+
+    async def _run_review_shadow(self, ctx: Any, best_candidate: Any) -> None:
+        """Phase B Slice 1a — post-VALIDATE REVIEW subagent in OBSERVER MODE.
+
+        Gated by ``JARVIS_REVIEW_SUBAGENT_SHADOW`` (default ``false``). When
+        on, dispatches a REVIEW subagent per candidate file and emits the
+        verdict to telemetry. **The FSM proceeds to GATE regardless of
+        verdict** — no risk-tier change, no retry routing, no state mutation.
+
+        Mirrors the ExplorationLedger shadow → enforce graduation pattern.
+        Slice 1b will promote this observer into an authority once three
+        consecutive battle-test sessions show verdict sanity.
+
+        Must not raise under any condition — the observer contract forbids
+        the shadow from breaking the main generation loop.
+        """
+        if best_candidate is None:
+            return
+        if self._subagent_orchestrator is None:
+            return
+        if os.environ.get(
+            "JARVIS_REVIEW_SUBAGENT_SHADOW", "false"
+        ).lower() not in ("true", "1"):
+            return
+
+        try:
+            _files = best_candidate.get("files") if isinstance(
+                best_candidate.get("files"), list,
+            ) else None
+            _iter = (
+                [
+                    (entry.get("file_path", ""), entry.get("full_content", ""))
+                    for entry in _files
+                    if isinstance(entry, dict)
+                ]
+                if _files
+                else [(
+                    best_candidate.get("file_path", ""),
+                    best_candidate.get("full_content", ""),
+                )]
+            )
+
+            _t0 = time.monotonic()
+            _verdicts: list = []
+            for _path, _new in _iter:
+                if not _path or not isinstance(_new, str):
+                    continue
+                _old = ""
+                try:
+                    _abs = (
+                        self._config.project_root / _path
+                        if not Path(_path).is_absolute()
+                        else Path(_path)
+                    )
+                    if _abs.is_file():
+                        _old = _abs.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    _old = ""
+
+                _result = await self._subagent_orchestrator.dispatch_review(
+                    parent_ctx=ctx,
+                    file_path=_path,
+                    pre_apply_content=_old,
+                    candidate_content=_new,
+                    generation_intent=getattr(ctx, "description", "") or "(no description)",
+                    timeout_s=30.0,
+                )
+
+                _verdict = "unknown"
+                _score = 0.0
+                for _k, _v in (_result.type_payload or ()):
+                    if _k == "verdict":
+                        _verdict = str(_v)
+                    elif _k == "semantic_integrity_score":
+                        try:
+                            _score = float(_v)
+                        except (TypeError, ValueError):
+                            pass
+                _status = (
+                    _result.status.value
+                    if hasattr(_result.status, "value")
+                    else str(_result.status)
+                )
+                _verdicts.append((_path, _verdict, _score, _status))
+
+            _duration_ms = int((time.monotonic() - _t0) * 1000)
+
+            # Aggregate: worst-of across files. REJECT dominates,
+            # APPROVE_WITH_RESERVATIONS dominates APPROVE.
+            _counts = {"approved": 0, "reservations": 0, "rejected": 0, "failed": 0}
+            _aggregate = "APPROVE" if _verdicts else "NO_FILES"
+            for _p, _v, _s, _st in _verdicts:
+                if _st != "completed":
+                    _counts["failed"] += 1
+                    continue
+                if _v == "REJECT":
+                    _counts["rejected"] += 1
+                    _aggregate = "REJECT"
+                elif _v == "APPROVE_WITH_RESERVATIONS":
+                    _counts["reservations"] += 1
+                    if _aggregate != "REJECT":
+                        _aggregate = "APPROVE_WITH_RESERVATIONS"
+                else:
+                    _counts["approved"] += 1
+
+            # Stable structured line — key=value so a simple split("=") parser
+            # can build rollup counters (aggregate-verdict distribution,
+            # approve/reject rates, per-session verdict sanity) across the
+            # graduation arc. Matches the [SemanticGuard] log convention.
+            logger.info(
+                "[REVIEW-SHADOW] op=%s aggregate=%s files_reviewed=%d "
+                "approved=%d reservations=%d rejected=%d failed=%d "
+                "duration_ms=%d (observer — FSM proceeds regardless)",
+                getattr(ctx, "op_id", "?"),
+                _aggregate,
+                len(_verdicts),
+                _counts["approved"],
+                _counts["reservations"],
+                _counts["rejected"],
+                _counts["failed"],
+                _duration_ms,
+            )
+        except Exception:
+            # Observer contract: shadow must never break the FSM.
+            logger.debug(
+                "[Orchestrator] REVIEW shadow dispatch skipped",
+                exc_info=True,
+            )
 
     def _is_cancel_requested(self, op_id: str) -> bool:
         """Check if REPL /cancel was requested for this operation."""
@@ -5053,6 +5195,11 @@ class GovernedOrchestrator:
                     "[Orchestrator] SemanticGuardian skipped",
                     exc_info=True,
                 )
+
+        # ---- REVIEW subagent (Slice 1a — SHADOW MODE observer only) ----
+        # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW. Emits verdict telemetry
+        # only; FSM proceeds to GATE unchanged. See _run_review_shadow.
+        await self._run_review_shadow(ctx, best_candidate)
 
         # ---- MutationGate: APPLY-phase execution boundary (cached) ----
         #

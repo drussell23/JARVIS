@@ -3389,6 +3389,14 @@ class GovernedLoopService:
                 )
                 self._subagent_orchestrator_ref = _sub_orch
                 _backend_ref.set_subagent_orchestrator(_sub_orch)
+                # Phase B Slice 1a: also attach to the governance orchestrator
+                # so the post-VALIDATE REVIEW shadow hook has access. Observer
+                # only — behavior is gated by JARVIS_REVIEW_SUBAGENT_SHADOW.
+                if (
+                    self._orchestrator is not None
+                    and hasattr(self._orchestrator, "set_subagent_orchestrator")
+                ):
+                    self._orchestrator.set_subagent_orchestrator(_sub_orch)
                 logger.info(
                     "[GLS] SubagentOrchestrator wired with Phase 1 EXPLORE + "
                     "Phase B REVIEW/PLAN/GENERAL factories "

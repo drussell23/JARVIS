@@ -37,7 +37,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Protocol, TYPE_CHECKING, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, TYPE_CHECKING, Tuple, runtime_checkable
 
 from backend.core.ouroboros.governance.subagent_contracts import (
     SCHEMA_VERSION,
@@ -66,22 +66,22 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 
-class ExploreExecutor:
-    """Structural protocol — Step 2 will implement this as AgenticExploreSubagent.
+@runtime_checkable
+class ExploreExecutor(Protocol):
+    """Structural protocol — Step 2 implements this as AgenticExploreSubagent.
 
-    Not an abstract base class; Step 2 concrete classes may or may not
-    inherit from it. The orchestrator only needs `.explore(ctx)` to return
-    an awaitable SubagentResult.
+    Typed as ``typing.Protocol`` so concrete implementations satisfy the
+    contract by shape alone — no nominal inheritance required. The
+    ``@runtime_checkable`` decorator allows ``isinstance(obj,
+    ExploreExecutor)`` checks for ledger/telemetry paths that need to
+    distinguish executor kinds without importing the concrete class.
     """
 
-    async def explore(self, ctx: SubagentContext) -> SubagentResult:  # pragma: no cover — interface stub
-        raise NotImplementedError(
-            "ExploreExecutor.explore is Step-2 work. "
-            "Step-1 scaffolding returns NOT_IMPLEMENTED results."
-        )
+    async def explore(self, ctx: SubagentContext) -> SubagentResult: ...
 
 
-class ReviewExecutor:
+@runtime_checkable
+class ReviewExecutor(Protocol):
     """Structural protocol for Phase B REVIEW subagents.
 
     Concrete implementation: ``AgenticReviewSubagent`` in
@@ -103,14 +103,11 @@ class ReviewExecutor:
     ``ctx.request.review_target_candidate``.
     """
 
-    async def review(self, ctx: SubagentContext) -> SubagentResult:  # pragma: no cover — interface stub
-        raise NotImplementedError(
-            "ReviewExecutor.review requires a concrete implementation. "
-            "Use AgenticReviewSubagent from agentic_review_subagent.py."
-        )
+    async def review(self, ctx: SubagentContext) -> SubagentResult: ...
 
 
-class PlanExecutor:
+@runtime_checkable
+class PlanExecutor(Protocol):
     """Structural protocol for Phase B PLAN subagents.
 
     Concrete implementation: ``AgenticPlanSubagent`` in
@@ -132,14 +129,11 @@ class PlanExecutor:
     ``ctx.request.plan_target``.
     """
 
-    async def plan(self, ctx: SubagentContext) -> SubagentResult:  # pragma: no cover — interface stub
-        raise NotImplementedError(
-            "PlanExecutor.plan requires a concrete implementation. "
-            "Use AgenticPlanSubagent from agentic_plan_subagent.py."
-        )
+    async def plan(self, ctx: SubagentContext) -> SubagentResult: ...
 
 
-class GeneralExecutor:
+@runtime_checkable
+class GeneralExecutor(Protocol):
     """Structural protocol for Phase B GENERAL subagents.
 
     Concrete implementation: ``AgenticGeneralSubagent`` in
@@ -166,11 +160,7 @@ class GeneralExecutor:
         GENERAL subagent.
     """
 
-    async def general(self, ctx: SubagentContext) -> SubagentResult:  # pragma: no cover — interface stub
-        raise NotImplementedError(
-            "GeneralExecutor.general requires a concrete implementation. "
-            "Use AgenticGeneralSubagent from agentic_general_subagent.py."
-        )
+    async def general(self, ctx: SubagentContext) -> SubagentResult: ...
 
 
 class CommSink(Protocol):
