@@ -95,11 +95,11 @@ def test_fs_events_enabled_reads_env_fresh(monkeypatch: Any) -> None:
     monkeypatch.setenv("JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED", "false")
     assert om.fs_events_enabled() is False
 
-    # Shadow default — flag absent = False (pure-poll preserved).
+    # Graduated 2026-04-20 — default is now "true" (FS-events primary).
     monkeypatch.delenv(
         "JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED", raising=False,
     )
-    assert om.fs_events_enabled() is False
+    assert om.fs_events_enabled() is True
 
 
 def test_init_captures_fs_events_mode(monkeypatch: Any) -> None:

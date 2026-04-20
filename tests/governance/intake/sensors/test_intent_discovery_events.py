@@ -79,9 +79,9 @@ def test_events_enabled_reads_env_fresh(monkeypatch: Any) -> None:
     monkeypatch.setenv("JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED", "false")
     assert m.events_enabled() is False
 
-    # Shadow default — flag absent = False.
+    # Graduated 2026-04-20 — default is now "true" (event-primary).
     monkeypatch.delenv("JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED", raising=False)
-    assert m.events_enabled() is False
+    assert m.events_enabled() is True
 
 
 def test_init_captures_events_mode(monkeypatch: Any) -> None:

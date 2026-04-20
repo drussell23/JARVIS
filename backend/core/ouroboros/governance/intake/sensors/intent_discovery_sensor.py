@@ -74,7 +74,7 @@ _DW_MAX_TOKENS = int(os.environ.get("JARVIS_INTENT_DISCOVERY_MAX_TOKENS", "2000"
 def events_enabled() -> bool:
     """Re-read ``JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED`` at call-time."""
     return os.environ.get(
-        "JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED", "false",
+        "JARVIS_INTENT_DISCOVERY_EVENTS_ENABLED", "true",
     ).lower() in ("true", "1", "yes")
 
 

@@ -83,9 +83,9 @@ def test_fs_events_enabled_reads_env_fresh(monkeypatch: Any) -> None:
     monkeypatch.setenv("JARVIS_BACKLOG_FS_EVENTS_ENABLED", "false")
     assert bm.fs_events_enabled() is False
 
-    # Shadow default — flag absent = False (pure-poll preserved).
+    # Graduated 2026-04-20 — default is now "true" (FS-events primary).
     monkeypatch.delenv("JARVIS_BACKLOG_FS_EVENTS_ENABLED", raising=False)
-    assert bm.fs_events_enabled() is False
+    assert bm.fs_events_enabled() is True
 
 
 def test_init_captures_fs_events_mode(monkeypatch: Any) -> None:

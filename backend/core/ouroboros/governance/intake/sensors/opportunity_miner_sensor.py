@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 def fs_events_enabled() -> bool:
     """Re-read ``JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED`` at call-time."""
     return os.environ.get(
-        "JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED", "false",
+        "JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED", "true",
     ).lower() in ("true", "1", "yes")
 
 
