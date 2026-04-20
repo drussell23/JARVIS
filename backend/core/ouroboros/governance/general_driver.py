@@ -244,10 +244,17 @@ async def run_general_tool_loop(
     sub_id = str(payload.get("sub_id", "sub-unknown"))
     invocation = dict(payload.get("invocation", {}) or {})
     primary_name = str(payload.get("primary_provider_name", "") or "")
-    max_rounds = int(payload.get("max_rounds", _DEFAULT_MAX_ROUNDS))
-    tool_timeout_s = float(
-        payload.get("tool_timeout_s", _DEFAULT_TOOL_TIMEOUT_S)
-    )
+    # Defensive default-resolution: ``AgenticGeneralSubagent._execute_body``
+    # passes max_rounds/tool_timeout_s/deadline as explicit None when
+    # ctx doesn't carry overrides, signalling "driver picks its own
+    # default". ``dict.get(key, default)`` doesn't fall back when the
+    # key is present with a None value, so we treat-None-as-absent
+    # explicitly here. Caught by Slice 1b live test; prior unit tests
+    # masked it by supplying explicit int/float values.
+    _mr = payload.get("max_rounds")
+    max_rounds = int(_mr) if _mr is not None else _DEFAULT_MAX_ROUNDS
+    _tt = payload.get("tool_timeout_s")
+    tool_timeout_s = float(_tt) if _tt is not None else _DEFAULT_TOOL_TIMEOUT_S
     deadline = payload.get("deadline")  # monotonic float or None
     if deadline is None:
         # Conservative default: now + (max_rounds * tool_timeout_s) + 10s slack.

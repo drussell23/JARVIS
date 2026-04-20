@@ -420,6 +420,56 @@ def test_final_to_exec_trace_maps_completed_status() -> None:
     assert trace["final_mutations_performed"] == 1
 
 
+@pytest.mark.asyncio
+async def test_run_loop_handles_none_valued_payload_knobs(tmp_path) -> None:
+    """Slice 1b live-test regression pin — ``_execute_body`` passes
+    ``max_rounds=None`` / ``tool_timeout_s=None`` / ``deadline=None``
+    when ctx doesn't carry overrides. The driver MUST treat these as
+    'absent' and use defaults. Before this fix, ``int(None)`` raised
+    TypeError and the subagent crashed.
+
+    Caught by /tmp/claude/general_battle_matrix.py on 2026-04-20;
+    unit tests missed it because they supplied explicit values.
+    """
+    def _boom(name: str) -> Any:
+        raise RuntimeError("simulated missing provider")
+
+    # Payload shape matches what AgenticGeneralSubagent._execute_body
+    # actually emits — all three knobs are explicit None.
+    payload_with_nones = {
+        "sub_id": "sub-none-knob-test",
+        "invocation": {
+            "operation_scope": ["src/"],
+            "allowed_tools": ["read_file"],
+            "max_mutations": 0,
+            "parent_op_risk_tier": "NOTIFY_APPLY",
+            "invocation_reason": "none-knob regression pin",
+            "goal": "test",
+            "primary_repo": "jarvis",
+        },
+        "project_root": str(tmp_path),
+        "primary_provider_name": "claude-api",
+        "fallback_provider_name": "",
+        "deadline": None,           # must default
+        "max_rounds": None,         # must default (NOT crash int(None))
+        "tool_timeout_s": None,     # must default
+    }
+
+    from backend.core.ouroboros.governance.general_driver import (
+        run_general_tool_loop,
+    )
+    trace = await run_general_tool_loop(
+        payload_with_nones,
+        project_root=tmp_path,
+        provider_registry=_boom,
+    )
+    # The None knobs must have fallen back to defaults; failure should
+    # be the expected no_provider_wired, NOT a TypeError.
+    assert trace["status"] == "no_provider_wired", (
+        f"None knobs must default, not crash; got {trace['status']!r}"
+    )
+
+
 def test_final_to_exec_trace_non_completed_status_prefixed() -> None:
     """When final.status != 'completed', exec_trace.status is
     ``final_<final_status>`` so downstream consumers can distinguish
