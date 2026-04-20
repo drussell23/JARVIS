@@ -439,10 +439,135 @@ async def check_webhook_http_activation() -> Tuple[bool, str]:
 # Registry
 # ===========================================================================
 
+# ===========================================================================
+# CHECK: fs_event_routing
+# ===========================================================================
+
+async def check_fs_event_routing() -> Tuple[bool, str]:
+    """Full gap #4 proof (Slice 3): real TrinityEventBus publish ->
+    TestFailureSensor.on_fs_event -> handler counter advances.
+
+    Mirrors webhook_http_activation but over the in-process pub-sub
+    transport instead of HTTP. Together the two prove the pattern
+    generalizes across event-source types (HTTP webhook + FS / in-proc
+    bus).
+    """
+    prev_flag = os.environ.get("JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED")
+    prev_mc = os.environ.get("TRINITY_MULTICAST_ENABLED")
+    os.environ["JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED"] = "true"
+    os.environ["TRINITY_MULTICAST_ENABLED"] = "false"  # suppress UDP socket
+
+    try:
+        from backend.core.trinity_event_bus import TrinityEventBus
+        from backend.core.ouroboros.governance.intake.sensors.test_failure_sensor import (
+            TestFailureSensor,
+        )
+
+        class _NoopWatcher:
+            poll_interval_s = 30.0
+
+            async def poll_once(self) -> list:
+                return []
+
+            def stop(self) -> None:
+                pass
+
+            def process_failures(self, failures: Any) -> list:
+                return []
+
+        class _SpyRouter:
+            def __init__(self) -> None:
+                self.envelopes: List[Any] = []
+
+            async def ingest(self, envelope: Any) -> str:
+                self.envelopes.append(envelope)
+                return "enqueued"
+
+        sensor = TestFailureSensor(
+            repo="jarvis", router=_SpyRouter(), test_watcher=_NoopWatcher(),
+        )
+        if not sensor._fs_events_mode:
+            return False, (
+                "_fs_events_mode did not activate under "
+                "JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED=true"
+            )
+
+        bus = await TrinityEventBus.create()
+        try:
+            await sensor.subscribe_to_bus(bus)
+            pre_handled = sensor._fs_events_handled
+            pre_ignored = sensor._fs_events_ignored
+
+            await bus.publish_raw(
+                topic="fs.changed.backend.foo",
+                data={
+                    "payload": {
+                        "relative_path": "backend/foo.py",
+                        "extension": ".py",
+                        "path": "/abs/backend/foo.py",
+                    },
+                },
+                persist=False,
+            )
+
+            # Event processing is via background task — give the loop a
+            # few ticks to deliver.
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                if sensor._fs_events_handled > pre_handled:
+                    break
+
+            if sensor._fs_events_handled != pre_handled + 1:
+                return False, (
+                    f"handler counter did not advance: "
+                    f"before={pre_handled} after={sensor._fs_events_handled}"
+                )
+
+            # Cancel the debounce task the handler scheduled (it sleeps
+            # 2s then runs pytest — we don't want it to fire in a smoke).
+            dt = getattr(sensor, "_debounce_task", None)
+            if dt is not None and not dt.done():
+                dt.cancel()
+
+            return True, (
+                f"PASS — TrinityEventBus publish -> sensor handler "
+                f"(handled={sensor._fs_events_handled}, "
+                f"ignored={sensor._fs_events_ignored})"
+            )
+        finally:
+            # Best-effort bus shutdown. Clean up the debounce task too so
+            # it doesn't linger.
+            dt = getattr(sensor, "_debounce_task", None)
+            if dt is not None and not dt.done():
+                dt.cancel()
+                try:
+                    await dt
+                except (asyncio.CancelledError, Exception):
+                    pass
+            try:
+                await bus.stop()
+            except Exception:
+                pass
+    finally:
+        for key, prev in (
+            ("JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED", prev_flag),
+            ("TRINITY_MULTICAST_ENABLED", prev_mc),
+        ):
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
+# ===========================================================================
+# Registry
+# ===========================================================================
+
 CHECKS: Dict[str, Callable[[], Awaitable[Tuple[bool, str]]]] = {
     "review_shadow": check_review_shadow,
     "webhook_routing": check_webhook_routing,
     "webhook_http_activation": check_webhook_http_activation,
+    "fs_event_routing": check_fs_event_routing,
 }
 
 
