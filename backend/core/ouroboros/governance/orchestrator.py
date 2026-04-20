@@ -787,16 +787,29 @@ class GovernedOrchestrator:
 
             # Aggregate: worst-of across files. REJECT dominates,
             # APPROVE_WITH_RESERVATIONS dominates APPROVE.
+            #
+            # Verdict comparison uses the string constants from
+            # subagent_contracts (values: "reject", "approve_with_reservations",
+            # "approve") — NOT uppercase literals. A prior uppercase comparison
+            # silently reclassified every REJECT as APPROVE in the aggregate
+            # telemetry (caught 2026-04-20 via synthetic reject-proof harness).
+            # The _aggregate output string stays uppercase for stable log
+            # parsing ("aggregate=REJECT"); only the input comparison is
+            # lowercase-matched against the verdict values on the wire.
+            from backend.core.ouroboros.governance.subagent_contracts import (
+                REVIEW_VERDICT_APPROVE_WITH_RESERVATIONS,
+                REVIEW_VERDICT_REJECT,
+            )
             _counts = {"approved": 0, "reservations": 0, "rejected": 0, "failed": 0}
             _aggregate = "APPROVE" if _verdicts else "NO_FILES"
             for _p, _v, _s, _st in _verdicts:
                 if _st != "completed":
                     _counts["failed"] += 1
                     continue
-                if _v == "REJECT":
+                if _v == REVIEW_VERDICT_REJECT:
                     _counts["rejected"] += 1
                     _aggregate = "REJECT"
-                elif _v == "APPROVE_WITH_RESERVATIONS":
+                elif _v == REVIEW_VERDICT_APPROVE_WITH_RESERVATIONS:
                     _counts["reservations"] += 1
                     if _aggregate != "REJECT":
                         _aggregate = "APPROVE_WITH_RESERVATIONS"

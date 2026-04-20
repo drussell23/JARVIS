@@ -409,6 +409,135 @@ async def test_review_mutation_runner_skipped_when_path_not_critical(
     assert payload["mutation_score"] is None
 
 
+@pytest.mark.asyncio
+async def test_run_review_shadow_aggregate_matches_verdict_constants(
+    tmp_path: Path, monkeypatch, caplog,
+) -> None:
+    """Regression pin — bug caught 2026-04-20 in Session 2 (synthetic).
+
+    Orchestrator._run_review_shadow formerly compared verdict values
+    against uppercase string literals ("REJECT", "APPROVE_WITH_RESERVATIONS")
+    while the actual verdict values from subagent_contracts are
+    lowercase ("reject", "approve_with_reservations"). Under that
+    case mismatch, every REJECT silently fell through to
+    ``_counts["approved"] += 1`` — the aggregate telemetry lied.
+
+    This test pins the fix: for a REJECT-verdict SubagentResult, the
+    [REVIEW-SHADOW] emission must log aggregate=REJECT with
+    rejected=1, approved=0.
+    """
+    import logging as _logging
+    import types
+    from backend.core.ouroboros.governance.orchestrator import Orchestrator
+
+    monkeypatch.setenv("JARVIS_REVIEW_SUBAGENT_SHADOW", "true")
+
+    # Craft a SubagentOrchestrator that returns a REJECT verdict without
+    # needing the full AgenticReviewSubagent stack. Keeps the test
+    # focused on the aggregation case-match, not on SemanticGuardian.
+    class _StubSubagentOrchestrator:
+        async def dispatch_review(
+            self, *, parent_ctx, file_path, pre_apply_content,
+            candidate_content, generation_intent, timeout_s,
+        ):
+            return SubagentResult(
+                subagent_id="sub-test-reject",
+                subagent_type=SubagentType.REVIEW,
+                status=SubagentStatus.COMPLETED,
+                type_payload=(
+                    ("verdict", REVIEW_VERDICT_REJECT),
+                    ("semantic_integrity_score", 0.30),
+                    ("reject_reasons", ("test: REJECT aggregation pin",)),
+                ),
+            )
+
+    stub = types.SimpleNamespace()
+    stub._subagent_orchestrator = _StubSubagentOrchestrator()
+    stub._config = types.SimpleNamespace(project_root=tmp_path)
+    stub._run_review_shadow = types.MethodType(
+        Orchestrator._run_review_shadow, stub,
+    )
+
+    parent_ctx = MagicMock()
+    parent_ctx.op_id = "op-aggregate-match-test"
+    parent_ctx.description = "aggregate=REJECT emission test"
+
+    best_candidate = {
+        "file_path": str(tmp_path / "target.py"),
+        "full_content": "def f(): return 1\n",
+    }
+
+    caplog.set_level(_logging.INFO, logger="Ouroboros.Orchestrator")
+    await stub._run_review_shadow(parent_ctx, best_candidate)
+
+    messages = [r.getMessage() for r in caplog.records]
+    shadow_lines = [m for m in messages if "[REVIEW-SHADOW]" in m]
+    assert shadow_lines, (
+        f"no [REVIEW-SHADOW] line emitted; got messages: {messages!r}"
+    )
+    line = shadow_lines[0]
+    assert "aggregate=REJECT" in line, (
+        f"aggregate=REJECT missing from [REVIEW-SHADOW] line: {line!r}"
+    )
+    assert "rejected=1" in line
+    assert "approved=0" in line
+
+
+@pytest.mark.asyncio
+async def test_run_review_shadow_aggregate_with_reservations_matches_verdict_constants(
+    tmp_path: Path, monkeypatch, caplog,
+) -> None:
+    """Counterpart to the REJECT test — APPROVE_WITH_RESERVATIONS must
+    propagate with the correct lowercase constant comparison."""
+    import logging as _logging
+    import types
+    from backend.core.ouroboros.governance.orchestrator import Orchestrator
+
+    monkeypatch.setenv("JARVIS_REVIEW_SUBAGENT_SHADOW", "true")
+
+    class _StubSubagentOrchestrator:
+        async def dispatch_review(
+            self, *, parent_ctx, file_path, pre_apply_content,
+            candidate_content, generation_intent, timeout_s,
+        ):
+            return SubagentResult(
+                subagent_id="sub-test-reservations",
+                subagent_type=SubagentType.REVIEW,
+                status=SubagentStatus.COMPLETED,
+                type_payload=(
+                    ("verdict", REVIEW_VERDICT_APPROVE_WITH_RESERVATIONS),
+                    ("semantic_integrity_score", 0.70),
+                    ("reservations", ("test: middle-band aggregation pin",)),
+                ),
+            )
+
+    stub = types.SimpleNamespace()
+    stub._subagent_orchestrator = _StubSubagentOrchestrator()
+    stub._config = types.SimpleNamespace(project_root=tmp_path)
+    stub._run_review_shadow = types.MethodType(
+        Orchestrator._run_review_shadow, stub,
+    )
+
+    parent_ctx = MagicMock()
+    parent_ctx.op_id = "op-aggregate-reservations-test"
+    parent_ctx.description = "aggregate=APPROVE_WITH_RESERVATIONS emission test"
+
+    caplog.set_level(_logging.INFO, logger="Ouroboros.Orchestrator")
+    await stub._run_review_shadow(parent_ctx, {
+        "file_path": str(tmp_path / "target.py"),
+        "full_content": "def f(): return 1\n",
+    })
+
+    messages = [r.getMessage() for r in caplog.records]
+    shadow_lines = [m for m in messages if "[REVIEW-SHADOW]" in m]
+    assert shadow_lines
+    line = shadow_lines[0]
+    assert "aggregate=APPROVE_WITH_RESERVATIONS" in line
+    assert "reservations=1" in line
+    assert "approved=0" in line
+    assert "rejected=0" in line
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator wiring tests (10-12)
 # ---------------------------------------------------------------------------
