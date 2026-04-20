@@ -3023,10 +3023,44 @@ class GovernedOrchestrator:
                 # Hard timeout — the deadline is advisory to the generator,
                 # but asyncio.wait_for is the Iron Gate (Manifesto §6).
                 try:
-                    generation = await asyncio.wait_for(
-                        self._generator.generate(ctx, deadline),
-                        timeout=_gen_timeout + _OUTER_GATE_GRACE_S,
-                    )
+                    # Phase B parallel-edge exploitation (Manifesto §2 + §3).
+                    # Attempt DAG-driven fan-out first; on ANY fallback
+                    # condition (flag off, no DAG, invalid DAG, edges>0,
+                    # single-unit, BG route, read-only, per-unit error /
+                    # timeout / noop) returns None — legacy single-stream
+                    # path runs byte-identically below.
+                    _parallel_gen = None
+                    try:
+                        from backend.core.ouroboros.governance.plan_exploit import (
+                            try_parallel_generate,
+                        )
+                        _parallel_gen = await try_parallel_generate(
+                            ctx,
+                            deadline,
+                            _gen_timeout,
+                            self._generator,
+                            outer_grace_s=_OUTER_GATE_GRACE_S,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # Observer contract: the exploit hook must NEVER
+                        # break the FSM. Any unexpected failure routes
+                        # straight to the legacy path.
+                        logger.debug(
+                            "[Orchestrator] plan_exploit fan-out raised — "
+                            "falling back to legacy generate",
+                            exc_info=True,
+                        )
+                        _parallel_gen = None
+
+                    if _parallel_gen is not None:
+                        generation = _parallel_gen
+                    else:
+                        generation = await asyncio.wait_for(
+                            self._generator.generate(ctx, deadline),
+                            timeout=_gen_timeout + _OUTER_GATE_GRACE_S,
+                        )
                 finally:
                     # End the stream regardless of success / failure so the
                     # Live widget closes and the observability INFO line
