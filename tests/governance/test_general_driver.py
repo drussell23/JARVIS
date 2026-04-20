@@ -145,6 +145,36 @@ def test_render_prompt_handles_missing_fields_with_sentinels() -> None:
     assert "<EMPTY" in out  # scope / tools sentinels
 
 
+def test_render_prompt_includes_tool_call_schema() -> None:
+    """Ticket 7 (Slice 1b live-test fix) — the rendered prompt must
+    include the 2b.2-tool JSON schema so the model knows HOW to emit
+    tool calls. Without this, models emit prose and the tool loop
+    treats the prose as a malformed final answer.
+
+    Pins: schema_version=2b.2-tool literal, both singular and parallel
+    shapes, a concrete example, and the 'no markdown fences' direction.
+    """
+    inv = {
+        "operation_scope": ["src/"],
+        "allowed_tools": ["read_file"],
+        "max_mutations": 0,
+        "parent_op_risk_tier": "NOTIFY_APPLY",
+        "invocation_reason": "r", "goal": "g",
+    }
+    out = render_general_system_prompt(inv)
+    # Schema version literal — parser at providers.py:2830 matches
+    # data.get("schema_version") == "2b.2-tool" exactly.
+    assert "2b.2-tool" in out
+    # Both call shapes described:
+    assert "tool_call" in out  # singular
+    assert "tool_calls" in out  # plural / parallel
+    # A concrete example so Claude has a template to mimic:
+    assert "read_file" in out
+    assert "Tool Call Format" in out
+    # Prose-prevention: explicit "no prose, no markdown fences"
+    assert "no prose" in out.lower() or "no markdown" in out.lower()
+
+
 def test_render_prompt_read_only_mode_from_max_mutations() -> None:
     """read_only_mode in the prompt is derived from max_mutations — 0
     means the model is told it's in read-only mode explicitly."""
