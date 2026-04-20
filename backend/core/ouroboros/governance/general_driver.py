@@ -366,15 +366,30 @@ async def run_general_tool_loop(
         ``generate(ctx, deadline)`` isn't a fit for the tool loop's
         string-based contract.
 
+        ClaudeProvider lazy-initializes ``_client`` on first access via
+        ``_ensure_client()`` — we call it explicitly here because the
+        driver path never triggers the high-level ``generate()`` that
+        would otherwise force the init as a side effect.
+
         Returns the concatenated text content of all ``TextBlock``s
         in the response. Raises on any SDK error; caller's exception
         handler catches and emits ``status=tool_loop_error``.
         """
+        # Force lazy init if available (ClaudeProvider pattern).
+        ensure = getattr(provider, "_ensure_client", None)
+        if callable(ensure):
+            try:
+                ensure()
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"provider {primary_name!r} _ensure_client failed: "
+                    f"{type(exc).__name__}: {str(exc)[:200]}"
+                ) from exc
         client = getattr(provider, "_client", None)
         if client is None:
             raise RuntimeError(
-                f"provider {primary_name!r} ._client is None — likely "
-                "recycled or uninitialized"
+                f"provider {primary_name!r} ._client is None after "
+                "_ensure_client — likely recycled or uninitialized"
             )
         model_name = str(getattr(provider, "_model", "") or "claude-sonnet-4-5-20250929")
         # GENERAL tool rounds need modest output (tool JSON ~1K tokens;
