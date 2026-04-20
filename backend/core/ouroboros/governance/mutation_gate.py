@@ -272,6 +272,40 @@ def is_path_critical(path: Path, *, allowlist: Optional[Sequence[str]] = None) -
     return False
 
 
+def _is_critical_path(file_path: str) -> bool:
+    """String-accepting alias for ``is_path_critical``.
+
+    The REVIEW subagent (``AgenticReviewSubagent._maybe_run_mutation_testing``)
+    consults this helper before invoking any mutation runner — the
+    allowlist bounds the set of paths on which mutation testing can
+    ever fire, so the budget doesn't get spent on peripheral files.
+
+    Added 2026-04-20 (Slice 1b) after the readiness audit found that
+    `agentic_review_subagent.py:385` imported a symbol that never
+    existed — the ``except Exception`` handler there silently swallowed
+    the resulting ``ImportError`` and suppressed all mutation testing,
+    even when an operator had wired a real mutation_runner. That is
+    exactly the class of silent-failure mode Manifesto §6 refuses to
+    tolerate.
+
+    Accepts ``file_path`` as a string (the shape REVIEW already has on
+    hand from the candidate record) and delegates to the existing
+    ``is_path_critical`` machinery — env allowlist first, YAML fallback.
+    Non-string inputs return False (defensive: a malformed caller must
+    not crash the REVIEW dispatch).
+    """
+    if not isinstance(file_path, str) or not file_path:
+        return False
+    try:
+        return is_path_critical(Path(file_path))
+    except Exception:  # noqa: BLE001 — defensive: never break REVIEW dispatch
+        logger.debug(
+            "[MutationGate] _is_critical_path raised on %r", file_path,
+            exc_info=True,
+        )
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Verdict data type
 # ---------------------------------------------------------------------------

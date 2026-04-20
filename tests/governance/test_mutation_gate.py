@@ -89,6 +89,47 @@ def test_empty_allowlist_rejects_everything():
 
 
 # ---------------------------------------------------------------------------
+# _is_critical_path — string-accepting alias used by AgenticReviewSubagent
+# ---------------------------------------------------------------------------
+#
+# These pin the contract the Slice 1b readiness audit restored. Before
+# the fix, `agentic_review_subagent.py` imported a symbol that never
+# existed and the resulting ImportError was silently swallowed —
+# mutation testing could never fire. Keep all four cases so a future
+# refactor can't regress the alias invisibly.
+
+
+def test_is_critical_path_alias_importable():
+    """Guard against the 2026-04-20 ImportError bug — the symbol must exist."""
+    from backend.core.ouroboros.governance.mutation_gate import _is_critical_path
+    assert callable(_is_critical_path)
+
+
+def test_is_critical_path_respects_env_allowlist(monkeypatch):
+    monkeypatch.setenv(MG._ENV_PATHS, "backend/core/ouroboros/")
+    assert MG._is_critical_path(
+        "backend/core/ouroboros/governance/providers.py"
+    ) is True
+    assert MG._is_critical_path("tests/foo/bar.py") is False
+
+
+def test_is_critical_path_empty_allowlist_returns_false(monkeypatch):
+    """No env, no YAML → no path is critical (conservative default)."""
+    monkeypatch.delenv(MG._ENV_PATHS, raising=False)
+    # Temporarily point YAML path at a nonexistent file so the real
+    # on-disk allowlist (if any) doesn't pollute the test.
+    monkeypatch.setattr(MG, "_YAML_CONFIG_PATH", Path("/nonexistent/x.yml"))
+    assert MG._is_critical_path("backend/core/x.py") is False
+
+
+def test_is_critical_path_defensive_on_bad_input():
+    """None / empty string / non-string must not crash — return False."""
+    assert MG._is_critical_path(None) is False  # type: ignore[arg-type]
+    assert MG._is_critical_path("") is False
+    assert MG._is_critical_path(123) is False   # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
 # Threshold / decision mapping
 # ---------------------------------------------------------------------------
 

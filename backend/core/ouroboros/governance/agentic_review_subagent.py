@@ -16,27 +16,42 @@ Manifesto §6 (Execution Validation) — architectural constraint:
     This implementation wires:
       * SemanticGuardian.inspect() — 10 existing AST/regex patterns
         (removed_import_still_referenced, function_body_collapsed,
-        guard_boolean_inverted, credential_shape_introduced, …)
-      * Function-body-hash diff — detects "refactor that silently
-        stubbed a function" vs "genuine refactor with preserved
-        behavior".
+        guard_boolean_inverted, credential_shape_introduced, …).
+        ``function_body_collapsed`` is the silent-stub detector:
+        it flags same-name functions whose bodies were rewritten to
+        ``pass``/``raise``/single-return (Slice 1b scoping decision —
+        full AST-tree hash diffing is a future enhancement, not a
+        core graduation requirement; empirical telemetry will tell
+        us whether the collapse pattern misses material cases).
+      * Function-name loss — counts functions present in the old
+        file but absent in the new. Catches the trivial "deleted"
+        case; the ``function_body_collapsed`` pattern above catches
+        the "still present but gutted" case. Together these two
+        signals cover the classes of silent stubbing we've actually
+        seen in practice.
       * Import-graph delta — new imports introduced + removed imports
-        still referenced (the latter overlaps with SemanticGuardian
-        but we also count additions for the rationale narrative).
-      * Mutation-testing hook — WIRED AS A STUB in this first cut;
-        callers can inject a real mutation_tester via constructor
-        dependency injection. The hook is hard-kill-wrapped so a
-        pathological source cannot hang REVIEW (same pattern as
-        providers.py:5257 Claude stream hard-kill).
+        still referenced (the latter overlaps with SemanticGuardian's
+        ``removed_import_still_referenced``; additions are narrative
+        only, not a verdict-score input).
+      * Mutation-testing hook — optional, wired via constructor
+        dependency injection. Default factory passes
+        ``mutation_runner=None`` so mutation testing is dormant until
+        explicitly enabled per-site. The hook is hard-kill-wrapped
+        (same shape as providers.py:5257) so a pathological source
+        cannot hang REVIEW. Allowlist is consulted via
+        ``mutation_gate._is_critical_path`` (added 2026-04-20 after
+        the readiness audit found a latent ImportError there).
 
 Verdict derivation (deterministic — no LLM prose opinion):
     1. Start at semantic_integrity_score = 1.0.
     2. For each SemanticGuardian Detection:
        - severity="hard" subtracts 0.35
        - severity="soft" subtracts 0.12
-    3. If function-body-hash diff shows function reduction
-       (new file has fewer function definitions than old), subtract
-       0.20 per missing function (flags silent stubbing).
+    3. If function-name loss is non-zero (new file has fewer
+       function definitions than old, by name), subtract 0.20 per
+       missing function — flags silent deletion. Silent *stubbing*
+       (same name, gutted body) is caught separately by the
+       ``function_body_collapsed`` SemanticGuardian pattern above.
     4. If credential-shape pattern hits, force verdict=REJECT
        regardless of score (security-sensitive).
     5. Verdict mapping:
@@ -69,7 +84,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import hashlib
 import logging
 import time
 from pathlib import Path

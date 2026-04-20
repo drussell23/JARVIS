@@ -346,6 +346,69 @@ async def test_review_mutation_score_none_without_runner(
     assert payload["mutation_score"] is None
 
 
+@pytest.mark.asyncio
+async def test_review_mutation_runner_consulted_when_path_critical(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Slice 1b regression — before the _is_critical_path fix, this
+    test could not be written because the allowlist import crashed
+    silently and the runner was never called.
+
+    With a real runner wired and the allowlist covering the candidate
+    path, the runner MUST fire and its score MUST reach the payload.
+    """
+    monkeypatch.setenv(
+        "JARVIS_MUTATION_GATE_CRITICAL_PATHS", "src/",
+    )
+    calls: list = []
+
+    async def fake_runner(path: str, content: str) -> float:
+        calls.append((path, len(content)))
+        return 0.85
+
+    reviewer = AgenticReviewSubagent(
+        project_root=tmp_path, mutation_runner=fake_runner,
+    )
+    ctx = _make_ctx_with_candidate(
+        pre="def f(): return 1\n", new="def f(): return 2\n",
+        tmp_path=tmp_path,
+        file_path="src/target.py",
+    )
+    result = await reviewer.review(ctx)
+    payload = dict(result.type_payload)
+    assert calls, "mutation_runner was never invoked — allowlist import broken"
+    assert payload["mutation_score"] == 0.85
+
+
+@pytest.mark.asyncio
+async def test_review_mutation_runner_skipped_when_path_not_critical(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Counterpart to the above — off-allowlist paths must NOT trigger
+    the runner. Protects the mutation-testing budget."""
+    monkeypatch.setenv(
+        "JARVIS_MUTATION_GATE_CRITICAL_PATHS", "core/auth/",
+    )
+    calls: list = []
+
+    async def fake_runner(path: str, content: str) -> float:
+        calls.append((path, content))
+        return 0.99
+
+    reviewer = AgenticReviewSubagent(
+        project_root=tmp_path, mutation_runner=fake_runner,
+    )
+    ctx = _make_ctx_with_candidate(
+        pre="def f(): return 1\n", new="def f(): return 2\n",
+        tmp_path=tmp_path,
+        file_path="scripts/helper.py",  # NOT in allowlist
+    )
+    result = await reviewer.review(ctx)
+    payload = dict(result.type_payload)
+    assert not calls, f"mutation_runner fired on off-allowlist path: {calls}"
+    assert payload["mutation_score"] is None
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator wiring tests (10-12)
 # ---------------------------------------------------------------------------
