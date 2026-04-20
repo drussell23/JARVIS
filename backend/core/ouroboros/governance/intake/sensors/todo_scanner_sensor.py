@@ -25,6 +25,30 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_S = float(os.environ.get("JARVIS_TODO_SCAN_INTERVAL_S", "86400"))
 
+# --- Gap #4 migration: FS-event primary mode (Slice 7) ---------------------
+#
+# When ``JARVIS_TODO_FS_EVENTS_ENABLED=true``, the FileSystemEventBridge
+# (``fs.changed.*`` on ``TrinityEventBus``) becomes the primary trigger:
+# a ``.py`` file change → single-file scan at pub/sub latency, not a
+# 24-hour whole-tree sweep. The poll demotes to
+# ``JARVIS_TODO_FALLBACK_INTERVAL_S`` (default 6h — tight enough to
+# catch a dropped FS event without waiting another day, matching the
+# DocStalenessSensor cadence).
+#
+# Shadow pattern: flag defaults OFF so current pure-poll behavior is
+# preserved until a 3-session battle-test arc graduates the flag (same
+# precedent as every other gap-#4 sensor migration).
+_TODO_FALLBACK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_TODO_FALLBACK_INTERVAL_S", "21600")
+)
+
+
+def fs_events_enabled() -> bool:
+    """Re-read ``JARVIS_TODO_FS_EVENTS_ENABLED`` at call-time."""
+    return os.environ.get(
+        "JARVIS_TODO_FS_EVENTS_ENABLED", "false",
+    ).lower() in ("true", "1", "yes")
+
 # Trigger tag: a parenthesized suffix on any marker that elevates that single
 # item to high urgency, max confidence, and bypasses dedup. Used by battle
 # tests and the human seeding workflow to land a deterministic emission that
@@ -140,13 +164,32 @@ class TodoScannerSensor:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._seen: set[str] = set()
+        # Gap #4 migration — captured at __init__ time. When True, the
+        # poll loop demotes to the fallback interval and
+        # ``subscribe_to_bus`` becomes the authoritative trigger.
+        self._fs_events_mode: bool = fs_events_enabled()
+        self._fs_events_handled: int = 0
+        self._fs_events_ignored: int = 0
 
     async def start(self) -> None:
         self._running = True
         self._task = asyncio.create_task(
             self._poll_loop(), name=f"todo_scanner_{self._repo}",
         )
-        logger.info("[TodoScanner] Started for repo=%s", self._repo)
+        effective = (
+            _TODO_FALLBACK_INTERVAL_S
+            if self._fs_events_mode
+            else self._poll_interval_s
+        )
+        mode = (
+            "fs-events-primary (.py change → scan_file; poll=fallback)"
+            if self._fs_events_mode
+            else "poll-primary"
+        )
+        logger.info(
+            "[TodoScanner] Started for repo=%s poll_interval=%ds mode=%s",
+            self._repo, int(effective), mode,
+        )
 
     def stop(self) -> None:
         self._running = False
@@ -158,20 +201,60 @@ class TodoScannerSensor:
     # ------------------------------------------------------------------
 
     async def subscribe_to_bus(self, event_bus: Any) -> None:
-        """Subscribe to file system events for instant TODO detection."""
-        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
-        logger.info("[TodoScanner] Subscribed to fs.changed.* events")
+        """Subscribe to file-system events via ``TrinityEventBus``.
+
+        Gated by ``JARVIS_TODO_FS_EVENTS_ENABLED`` (default OFF). When
+        the flag is off this method is a logged no-op so legacy
+        pure-poll behavior is preserved exactly (no silent regression
+        when the graduation flip lands). Caller contract matches the
+        TestFailureSensor + DocStalenessSensor pattern:
+        ``IntakeLayerService`` unconditionally calls ``subscribe_to_bus``
+        on every sensor that exposes it; the flag check lives here so
+        one sensor's decision doesn't require special-casing at the
+        call site.
+
+        Subscription failures are caught locally — the intake layer
+        must never regress just because TrinityEventBus rejected a
+        subscription.
+        """
+        if not self._fs_events_mode:
+            logger.debug(
+                "[TodoScanner] FS-event subscription skipped "
+                "(JARVIS_TODO_FS_EVENTS_ENABLED=false). "
+                "Poll-primary mode active — no gap #4 resolution.",
+            )
+            return
+
+        try:
+            await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        except Exception as exc:
+            logger.warning(
+                "[TodoScanner] FS-event subscription failed: %s "
+                "(poll-fallback at %ds continues)",
+                exc, int(_TODO_FALLBACK_INTERVAL_S),
+            )
+            return
+
+        logger.info(
+            "[TodoScanner] subscribed to fs.changed.* — "
+            "FS events now PRIMARY (poll demoted to %ds fallback)",
+            int(_TODO_FALLBACK_INTERVAL_S),
+        )
 
     async def _on_fs_event(self, event: Any) -> None:
         """React to file change — scan only the changed file."""
         payload = event.payload
         if payload.get("extension") != ".py":
+            self._fs_events_ignored += 1
             return
         if event.topic == "fs.changed.deleted":
+            self._fs_events_ignored += 1
             return
         file_path = Path(payload["path"])
         if any(skip in file_path.parts for skip in _SKIP_DIRS):
+            self._fs_events_ignored += 1
             return
+        self._fs_events_handled += 1
         try:
             await self.scan_file(file_path)
         except Exception:
@@ -218,8 +301,13 @@ class TodoScannerSensor:
                 break
             except Exception:
                 logger.debug("[TodoScanner] Poll error", exc_info=True)
+            effective_interval = (
+                _TODO_FALLBACK_INTERVAL_S
+                if self._fs_events_mode
+                else self._poll_interval_s
+            )
             try:
-                await asyncio.sleep(self._poll_interval_s)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
 
