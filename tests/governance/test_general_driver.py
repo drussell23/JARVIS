@@ -71,8 +71,18 @@ from backend.core.ouroboros.governance.subagent_contracts import (
 # 1. Flag + factory
 # ---------------------------------------------------------------------------
 
-def test_driver_enabled_default_false(monkeypatch) -> None:
+def test_driver_enabled_default_true_post_graduation(monkeypatch) -> None:
+    """Graduated 2026-04-20 — default is now ``true``. Absent env var
+    → driver_enabled() is True (opt-in replaced by opt-out)."""
     monkeypatch.delenv("JARVIS_GENERAL_LLM_DRIVER_ENABLED", raising=False)
+    assert driver_enabled() is True
+
+
+def test_driver_enabled_explicit_false_opts_out(monkeypatch) -> None:
+    """Operator can still opt out by setting the flag to 'false'
+    explicitly — the Phase B stub path stays available for isolation
+    battle tests or emergency rollbacks."""
+    monkeypatch.setenv("JARVIS_GENERAL_LLM_DRIVER_ENABLED", "false")
     assert driver_enabled() is False
 
 
@@ -84,16 +94,18 @@ def test_driver_enabled_flag_on(monkeypatch) -> None:
 def test_llm_factory_flag_off_returns_stub_factory(
     monkeypatch, tmp_path,
 ) -> None:
-    """Flag off → build_llm_general_factory returns the same shape as
-    build_default_general_factory — driver NOT wired."""
-    monkeypatch.delenv("JARVIS_GENERAL_LLM_DRIVER_ENABLED", raising=False)
+    """Flag explicitly ``false`` → build_llm_general_factory returns
+    the default stub factory (byte-identical to Phase B). Post-
+    graduation this is the opt-out branch — tests use explicit
+    setenv("false") instead of delenv."""
+    monkeypatch.setenv("JARVIS_GENERAL_LLM_DRIVER_ENABLED", "false")
     factory = build_llm_general_factory(
         tmp_path, provider_registry=lambda name: None,
     )
     subagent = factory()
     assert isinstance(subagent, AgenticGeneralSubagent)
     assert subagent._llm_driver is None, (
-        "flag-off factory must not wire a driver — stub path preserved"
+        "flag=false factory must not wire a driver — stub path preserved"
     )
 
 

@@ -68,10 +68,13 @@ _FINAL_SCHEMA_VERSION = "general.final.v1"
 def driver_enabled() -> bool:
     """Re-read ``JARVIS_GENERAL_LLM_DRIVER_ENABLED`` at call-time.
 
-    Default: **false** — the stub body ships in the default factory;
-    this driver is opt-in until its Phase C graduation arc completes.
+    Default: **``true``** (graduated 2026-04-20 after the Phase C
+    Slice 1b live battle test matrix — 3/3 safety properties proven
+    against the real Claude API: allowlist enforcement, scope
+    containment, mutation cap honored). Set the env var explicitly to
+    ``"false"`` to opt back into the Phase B stub path.
     """
-    return os.environ.get(_DRIVER_FLAG, "false").strip().lower() in (
+    return os.environ.get(_DRIVER_FLAG, "true").strip().lower() in (
         "true", "1", "yes",
     )
 
