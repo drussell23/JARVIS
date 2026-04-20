@@ -75,9 +75,9 @@ def test_fs_events_enabled_reads_env_fresh(monkeypatch: Any) -> None:
     monkeypatch.setenv("JARVIS_TODO_FS_EVENTS_ENABLED", "false")
     assert tm.fs_events_enabled() is False
 
-    # Slice 7 ships pre-graduation — default stays "false" (shadow mode).
+    # Graduated 2026-04-20 — default is now "true" (FS-events primary).
     monkeypatch.delenv("JARVIS_TODO_FS_EVENTS_ENABLED", raising=False)
-    assert tm.fs_events_enabled() is False
+    assert tm.fs_events_enabled() is True
 
 
 def test_init_captures_fs_events_mode(monkeypatch: Any) -> None:
@@ -96,7 +96,8 @@ def test_init_captures_fs_events_mode(monkeypatch: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_subscribe_to_bus_noop_when_flag_off(monkeypatch: Any) -> None:
-    monkeypatch.delenv("JARVIS_TODO_FS_EVENTS_ENABLED", raising=False)
+    # Graduated 2026-04-20 — default is now "true"; opt-out must be explicit.
+    monkeypatch.setenv("JARVIS_TODO_FS_EVENTS_ENABLED", "false")
     sensor = _sensor()
     bus = _FakeBus()
 
@@ -221,7 +222,8 @@ async def _never_scan(*_args: Any, **_kwargs: Any) -> list:
 # ---------------------------------------------------------------------------
 
 def test_poll_interval_default_when_flag_off(monkeypatch: Any) -> None:
-    monkeypatch.delenv("JARVIS_TODO_FS_EVENTS_ENABLED", raising=False)
+    # Graduated 2026-04-20 — default is now "true"; opt-out must be explicit.
+    monkeypatch.setenv("JARVIS_TODO_FS_EVENTS_ENABLED", "false")
     sensor = TodoScannerSensor(
         repo="jarvis", router=_SpyRouter(),
         poll_interval_s=86400.0, project_root=Path("."),

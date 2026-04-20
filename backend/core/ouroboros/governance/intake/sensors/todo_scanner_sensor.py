@@ -46,7 +46,7 @@ _TODO_FALLBACK_INTERVAL_S: float = float(
 def fs_events_enabled() -> bool:
     """Re-read ``JARVIS_TODO_FS_EVENTS_ENABLED`` at call-time."""
     return os.environ.get(
-        "JARVIS_TODO_FS_EVENTS_ENABLED", "false",
+        "JARVIS_TODO_FS_EVENTS_ENABLED", "true",
     ).lower() in ("true", "1", "yes")
 
 # Trigger tag: a parenthesized suffix on any marker that elevates that single
