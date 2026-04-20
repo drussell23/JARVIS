@@ -3253,12 +3253,35 @@ class GovernedLoopService:
             logger.debug("[GLS] GovernanceMCPClient skipped: %s", exc)
 
         # ---- Wire EventChannelServer (DW 3-tier: webhook-driven batch) ----
+        #
+        # Phase B Slice 2 coexistence note:
+        #   IntakeLayerService now owns the authoritative EventChannelServer
+        #   activation (see ``IntakeLayerService._maybe_start_event_channel_server``).
+        #   It holds the GitHubIssueSensor reference and starts the HTTP
+        #   receiver when ``JARVIS_GITHUB_WEBHOOK_ENABLED=true``.
+        #
+        #   The GLS path below is kept as a fallback for deployments where
+        #   ``self._intake_router`` is attached externally (legacy DI) — in
+        #   those setups the IntakeLayer flow doesn't execute. If the
+        #   IntakeLayer has already started a server on the same port, we
+        #   short-circuit to avoid a port conflict and a duplicate HTTP
+        #   listener. Detection: check whether ``_intake`` carries an
+        #   ``_event_channel_server`` attribute already (IntakeLayer sets it).
         self._event_channel = None
         try:
             from backend.core.ouroboros.governance.event_channel import EventChannelServer
             _batch_reg = getattr(self, "_batch_registry", None)
             _intake = getattr(self, "_intake_router", None)
-            if _intake is not None:
+            _intake_layer = getattr(self, "_intake_layer", None)
+            _intake_layer_server = getattr(
+                _intake_layer, "_event_channel_server", None,
+            ) if _intake_layer is not None else None
+            if _intake_layer_server is not None:
+                logger.info(
+                    "[GLS] EventChannelServer skipped — IntakeLayer already "
+                    "activated (authoritative owner for webhook receiver)",
+                )
+            elif _intake is not None:
                 _evt_channel = EventChannelServer(
                     router=_intake,
                     batch_registry=_batch_reg,
