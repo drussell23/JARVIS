@@ -100,15 +100,32 @@ class EventChannelServer:
         port: int = _CHANNEL_PORT,
         host: str = _CHANNEL_HOST,
         batch_registry: Any = None,  # Optional[BatchFutureRegistry]
+        github_issue_sensor: Any = None,  # Optional[GitHubIssueSensor]
     ) -> None:
         self._router = router
         self._port = port
         self._host = host
         self._batch_registry = batch_registry
+        # Phase B Slice 1 (gap #4 migration): when wired and
+        # ``JARVIS_GITHUB_WEBHOOK_ENABLED=true``, GitHub ``issues`` events
+        # short-circuit to the sensor's ``ingest_webhook`` so the emitted
+        # envelope is shape-identical to the poll path (source,
+        # evidence.category, evidence fields). Without this, the generic
+        # ``_route_event`` path would emit ``source=runtime_health``
+        # envelopes and downstream consumers (ExhaustionWatcher counters,
+        # orchestrator postmortems keyed on ``github_issue``) would not
+        # recognize them.
+        self._github_issue_sensor = github_issue_sensor
         self._stats = ChannelStats()
         self._rate_tracker: Dict[str, List[float]] = {}
         self._server_task: Optional[asyncio.Task] = None
         self._site: Optional[Any] = None
+        # Gap #4 telemetry — last time a GitHub webhook successfully
+        # short-circuited to the sensor. Used by /channel/health so
+        # operators can tell if the webhook path is live or quiet.
+        self._last_github_webhook_at: float = 0.0
+        self._github_webhooks_emitted: int = 0
+        self._github_webhooks_ignored: int = 0
 
     @property
     def is_enabled(self) -> bool:
@@ -178,6 +195,73 @@ class EventChannelServer:
             return web.Response(status=400, text="Invalid JSON")
 
         event_type = request.headers.get("X-GitHub-Event", "unknown")
+
+        # --- gap #4 short-circuit: route issues events to the sensor ----
+        #
+        # When the sensor is wired AND the master flag is on, the
+        # authoritative handler for ``issues`` events is
+        # ``GitHubIssueSensor.ingest_webhook`` — it emits an envelope
+        # shape-identical to the poll path. Bypasses the generic
+        # ``_route_event`` to prevent double-emission with a mismatched
+        # source. All other GitHub event types (workflow_run, push, ...)
+        # continue through the generic path unchanged.
+        if event_type == "issues" and self._github_issue_sensor is not None:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                    webhook_enabled as _gh_webhook_enabled,
+                )
+                flag_on = _gh_webhook_enabled()
+            except Exception:
+                flag_on = False
+            if flag_on:
+                # §3: bound every agentic thread in time so a pathological
+                # ingest cannot starve the HTTP handler. 30s cap picked so a
+                # slow gh CLI fallback inside the sensor still has room but
+                # no single webhook ties up an aiohttp worker indefinitely.
+                action_hint = str(payload.get("action", "?"))
+                t0 = time.monotonic()
+                try:
+                    emitted = await asyncio.wait_for(
+                        self._github_issue_sensor.ingest_webhook(payload),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[EventChannel] GitHubIssueSensor.ingest_webhook timed "
+                        "out after 30s (action=%s)", action_hint,
+                    )
+                    emitted = False
+                except Exception:
+                    logger.debug(
+                        "[EventChannel] GitHubIssueSensor.ingest_webhook raised",
+                        exc_info=True,
+                    )
+                    emitted = False
+                duration_ms = int((time.monotonic() - t0) * 1000)
+
+                self._stats.total_events += 1
+                self._stats.last_event_at = time.time()
+                self._stats.events_by_source["github"] = (
+                    self._stats.events_by_source.get("github", 0) + 1
+                )
+                self._last_github_webhook_at = time.time()
+                if emitted:
+                    self._stats.events_routed += 1
+                    self._github_webhooks_emitted += 1
+                else:
+                    self._github_webhooks_ignored += 1
+                # Stable key=value telemetry — same convention as
+                # [SemanticGuard] and [REVIEW-SHADOW]. split("=") parses
+                # into rollup counters for "what percent of GitHub
+                # webhooks produced envelopes" dashboards.
+                logger.info(
+                    "[EventChannel] github/issues delivered "
+                    "sensor=GitHubIssueSensor action=%s emitted=%s "
+                    "duration_ms=%d",
+                    action_hint, emitted, duration_ms,
+                )
+                return web.Response(status=200, text="OK")
+
         event = ChannelEvent(
             source="github",
             event_type=event_type,
@@ -302,13 +386,43 @@ class EventChannelServer:
         return web.Response(status=200, text="OK")
 
     async def _handle_health(self, request: Any) -> Any:
-        """Health check endpoint."""
+        """Health check endpoint.
+
+        Gap #4 observability: exposes whether webhook-primary mode is
+        active per sensor, so operators can watch the ``sensors``
+        ratio trend (events by sensor / total events) and catch silent
+        regressions where the webhook stops arriving.
+        """
         from aiohttp import web
+
+        # Ask the sensor itself rather than trusting a cached flag —
+        # ``webhook_enabled()`` re-reads the env so tests and live
+        # reconfigurations stay honest.
+        sensor_wired = self._github_issue_sensor is not None
+        webhook_mode = False
+        if sensor_wired:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                    webhook_enabled as _gh_webhook_enabled,
+                )
+                webhook_mode = bool(_gh_webhook_enabled())
+            except Exception:
+                webhook_mode = False
+
         return web.json_response({
             "status": "healthy",
             "total_events": self._stats.total_events,
             "events_routed": self._stats.events_routed,
+            "events_rejected": self._stats.events_rejected,
+            "events_by_source": dict(self._stats.events_by_source),
             "last_event": self._stats.last_event_at,
+            "github_issue_sensor": {
+                "wired": sensor_wired,
+                "webhook_mode": webhook_mode,
+                "last_webhook_at": self._last_github_webhook_at,
+                "webhooks_emitted": self._github_webhooks_emitted,
+                "webhooks_ignored": self._github_webhooks_ignored,
+            },
         })
 
     # ------------------------------------------------------------------

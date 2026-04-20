@@ -214,6 +214,14 @@ class IntakeLayerService:
         self._voice_sensor: Optional[Any] = None
         self._dead_letter_count: int = 0
         self._per_source_count: Dict[str, int] = {}
+        # Phase B Slice 2 — gap #4 migration (GitHub webhook primary path).
+        # Populated in ``_build_components`` when the sensor construction
+        # succeeds; consumed by ``_maybe_start_event_channel_server`` so the
+        # webhook receiver can short-circuit ``issues`` events directly to
+        # the sensor's ``ingest_webhook`` method (shape-identical envelope
+        # to the poll path).
+        self._github_issue_sensor: Optional[Any] = None
+        self._event_channel_server: Optional[Any] = None
 
     @property
     def state(self) -> IntakeServiceState:
@@ -257,6 +265,17 @@ class IntakeLayerService:
                     await result
             except Exception as exc:
                 logger.warning("[IntakeLayer] Sensor stop error: %s", exc)
+
+        # Stop the event-channel HTTP receiver BEFORE the router so
+        # any in-flight webhook request that calls ``router.ingest``
+        # either completes or is cleanly rejected. Slice 2 activation.
+        if self._event_channel_server is not None:
+            try:
+                await self._event_channel_server.stop()
+                logger.info("[IntakeLayer] EventChannelServer stopped")
+            except Exception as exc:
+                logger.warning("[IntakeLayer] EventChannelServer stop error: %s", exc)
+            self._event_channel_server = None
 
         # Stop reactor consumer
         if hasattr(self, "_reactor_consumer") and self._reactor_consumer is not None:
@@ -612,6 +631,11 @@ class IntakeLayerService:
                     poll_interval_s=_gh_poll_s,
                 )
                 self._sensors.append(_gh_sensor)
+                # Keep a dedicated reference for EventChannelServer wiring
+                # (gap #4 migration, Slice 2). The generic ``_sensors`` list
+                # is for lifecycle management; this ref is for targeted
+                # webhook short-circuit at the HTTP receiver.
+                self._github_issue_sensor = _gh_sensor
                 logger.info("[IntakeLayer] GitHubIssueSensor added (Trinity issue auto-resolution)")
             except Exception as exc:
                 logger.debug("[IntakeLayer] GitHubIssueSensor skipped: %s", exc)
@@ -867,6 +891,92 @@ class IntakeLayerService:
             except Exception as exc:
                 logger.warning("[IntakeLayer] ReactorEventConsumer start failed: %s", exc)
                 self._reactor_consumer = None
+
+        # Phase B Slice 2 — activate the event-channel HTTP receiver so
+        # GitHub (and future) webhooks bypass the poll loop entirely.
+        # Fully defensive: bad port, missing aiohttp, or any other
+        # activation failure is logged and the intake layer continues
+        # operating in poll-only mode (same behavior as before the slice).
+        await self._maybe_start_event_channel_server()
+
+    async def _maybe_start_event_channel_server(self) -> None:
+        """Start the ``EventChannelServer`` when webhook-primary mode is on.
+
+        Activation gates (all must be true):
+          1. ``JARVIS_GITHUB_WEBHOOK_ENABLED=true`` — the Slice 1 flag
+             the sensor itself reads.
+          2. ``JARVIS_EVENT_CHANNELS_ENABLED=true`` (default) — the
+             pre-existing master switch on ``EventChannelServer``.
+          3. A ``GitHubIssueSensor`` was constructed successfully
+             (gh CLI available, Trinity repos resolvable).
+
+        On any activation failure (missing aiohttp, port in use, etc.),
+        log a WARNING and return — the intake layer continues to poll
+        at the existing interval and the organism keeps running. The
+        webhook path is a performance upgrade, not a correctness
+        invariant, so failure-to-start must never take the intake down.
+
+        Manifesto §3 (Asynchronous tendrils): replaces the ``while True:
+        sleep(N): scan()`` hot path with an event-push receiver.
+        Manifesto §8 (Absolute Observability): emits one structured
+        INFO line on activation so operators can grep
+        ``[IntakeLayer] EventChannelServer activated`` to confirm.
+        """
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                webhook_enabled as _gh_webhook_enabled,
+            )
+            if not _gh_webhook_enabled():
+                logger.debug(
+                    "[IntakeLayer] EventChannelServer skipped — "
+                    "JARVIS_GITHUB_WEBHOOK_ENABLED is off (poll-primary mode)",
+                )
+                return
+
+            if self._github_issue_sensor is None:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer skipped — no "
+                    "GitHubIssueSensor wired (gh CLI unavailable?)",
+                )
+                return
+
+            try:
+                from backend.core.ouroboros.governance.event_channel import (
+                    EventChannelServer,
+                )
+            except ImportError as exc:
+                logger.warning(
+                    "[IntakeLayer] EventChannelServer skipped — import failed: %s",
+                    exc,
+                )
+                return
+
+            server = EventChannelServer(
+                router=self._router,
+                github_issue_sensor=self._github_issue_sensor,
+            )
+            if not server.is_enabled:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer skipped — "
+                    "JARVIS_EVENT_CHANNELS_ENABLED is off",
+                )
+                return
+
+            await server.start()
+            self._event_channel_server = server
+            logger.info(
+                "[IntakeLayer] EventChannelServer activated — "
+                "github/issues webhooks now short-circuit to "
+                "GitHubIssueSensor.ingest_webhook "
+                "(poll_interval demoted to %ds fallback)",
+                int(self._github_issue_sensor._poll_interval_s),
+            )
+        except Exception as exc:
+            # Never crash intake because the event channel failed to start.
+            logger.warning(
+                "[IntakeLayer] EventChannelServer activation failed "
+                "(poll-only mode): %s", exc,
+            )
 
     async def _teardown(self) -> None:
         """Best-effort cleanup after failed start."""
