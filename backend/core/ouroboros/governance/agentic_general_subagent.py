@@ -387,10 +387,26 @@ class AgenticGeneralSubagent:
         runner = self._llm_driver
 
         async def _await_driver() -> Dict[str, Any]:
+            # Enrich the payload with provider + budget hints so the
+            # driver can resolve a provider and bound its tool loop
+            # without reaching back into ctx after the call site returns.
+            # Added 2026-04-20 for the Phase C Slice 1a LLM-driver wire-in.
             result = runner({
                 "sub_id": ctx.subagent_id,
                 "invocation": dict(invocation),
                 "project_root": str(self._root),
+                "primary_provider_name": str(
+                    getattr(ctx, "primary_provider_name", "") or ""
+                ),
+                "fallback_provider_name": str(
+                    getattr(ctx, "fallback_provider_name", "") or ""
+                ),
+                # Convert ctx.deadline (datetime | None) to a monotonic
+                # float for the ToolLoopCoordinator. None signals
+                # "driver picks its own budget".
+                "deadline": None,  # driver uses self._llm_budget_s-based default
+                "max_rounds": None,  # let driver read env
+                "tool_timeout_s": None,  # let driver read env
             })
             if asyncio.iscoroutine(result):
                 return await result
@@ -502,9 +518,84 @@ def build_default_general_factory(
     """Factory helper matching the pattern of other build_default_*_factory.
 
     The default factory wires AgenticGeneralSubagent with NO llm_driver
-    — Phase B infrastructure cut is firewall-only. Step-2 will ship a
-    factory that passes ``llm_driver=...`` to enable actual execution.
+    — Phase B infrastructure cut is firewall-only. Use
+    :func:`build_llm_general_factory` when the LLM-driver flag is on
+    and a provider registry is available.
     """
     def _factory() -> AgenticGeneralSubagent:
         return AgenticGeneralSubagent(project_root=project_root)
+    return _factory
+
+
+def build_llm_general_factory(
+    project_root: Path,
+    provider_registry: Callable[[str], Any],
+    *,
+    policy: Optional[Any] = None,
+    llm_budget_s: float = 90.0,
+) -> Callable[[], AgenticGeneralSubagent]:
+    """Phase C Slice 1a factory — wires an LLM driver behind the flag.
+
+    When ``JARVIS_GENERAL_LLM_DRIVER_ENABLED=true``, the returned
+    factory constructs an ``AgenticGeneralSubagent`` with
+    ``llm_driver`` set to a closure over
+    :func:`general_driver.run_general_tool_loop`. When the flag is
+    off, falls back to :func:`build_default_general_factory` (stub
+    path) so operators can attach the factory unconditionally at boot
+    and opt in at runtime via the env var.
+
+    Parameters
+    ----------
+    project_root:
+        Closed over so the driver can construct an
+        ``AsyncProcessToolBackend`` scoped to the repo.
+    provider_registry:
+        Callable ``name -> provider`` mapping. The driver calls this
+        with ``payload["primary_provider_name"]`` at run time.
+        Production uses the governed loop's provider registry;
+        tests pass a stub.
+    policy:
+        Optional global ``GoverningToolPolicy``. When ``None`` the
+        driver builds a default policy scoped to ``project_root``.
+    llm_budget_s:
+        Forwarded to ``AgenticGeneralSubagent.__init__`` for its
+        hard-kill wrapper (``asyncio.wait`` timeout around the
+        llm_driver coroutine).
+
+    Returns
+    -------
+    A zero-arg factory that produces a fresh
+    ``AgenticGeneralSubagent`` per dispatch. The returned subagent
+    has ``llm_driver`` set iff the flag is ``true`` at construction
+    time; runtime flips mid-session are explicitly NOT supported (the
+    flag is read at factory-invocation time to keep dispatch
+    behavior deterministic within a session).
+    """
+    from backend.core.ouroboros.governance.general_driver import (
+        driver_enabled,
+        run_general_tool_loop,
+    )
+
+    if not driver_enabled():
+        # Fallback to stub factory — opt-out semantics. This keeps
+        # every call site byte-identical to the default factory when
+        # the flag is off, so build_llm_general_factory is a safe
+        # drop-in replacement for build_default_general_factory.
+        return build_default_general_factory(project_root)
+
+    async def _driver(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Closed-over driver — resolves provider via registry each call."""
+        return await run_general_tool_loop(
+            payload,
+            project_root=project_root,
+            provider_registry=provider_registry,
+            policy=policy,
+        )
+
+    def _factory() -> AgenticGeneralSubagent:
+        return AgenticGeneralSubagent(
+            project_root=project_root,
+            llm_driver=_driver,
+            llm_budget_s=llm_budget_s,
+        )
     return _factory
