@@ -214,6 +214,21 @@ class IntakeLayerService:
         self._voice_sensor: Optional[Any] = None
         self._dead_letter_count: int = 0
         self._per_source_count: Dict[str, int] = {}
+        # Phase B Slice 2 — gap #4 migration (GitHub webhook primary path).
+        # Populated in ``_build_components`` when the sensor construction
+        # succeeds; consumed by ``_maybe_start_event_channel_server`` so the
+        # webhook receiver can short-circuit ``issues`` events directly to
+        # the sensor's ``ingest_webhook`` method (shape-identical envelope
+        # to the poll path).
+        self._github_issue_sensor: Optional[Any] = None
+        # Slice 4 — dedicated handle for DocStalenessSensor push webhook
+        # wiring. Set inside ``_build_components`` when the sensor is
+        # constructed successfully; passed to the EventChannelServer
+        # constructor alongside ``_github_issue_sensor``.
+        self._doc_staleness_sensor: Optional[Any] = None
+        # Slice 5 — CrossRepoDriftSensor handle for push fan-out.
+        self._cross_repo_drift_sensor: Optional[Any] = None
+        self._event_channel_server: Optional[Any] = None
 
     @property
     def state(self) -> IntakeServiceState:
@@ -257,6 +272,17 @@ class IntakeLayerService:
                     await result
             except Exception as exc:
                 logger.warning("[IntakeLayer] Sensor stop error: %s", exc)
+
+        # Stop the event-channel HTTP receiver BEFORE the router so
+        # any in-flight webhook request that calls ``router.ingest``
+        # either completes or is cleanly rejected. Slice 2 activation.
+        if self._event_channel_server is not None:
+            try:
+                await self._event_channel_server.stop()
+                logger.info("[IntakeLayer] EventChannelServer stopped")
+            except Exception as exc:
+                logger.warning("[IntakeLayer] EventChannelServer stop error: %s", exc)
+            self._event_channel_server = None
 
         # Stop reactor consumer
         if hasattr(self, "_reactor_consumer") and self._reactor_consumer is not None:
@@ -588,6 +614,9 @@ class IntakeLayerService:
                 project_root=self._config.project_root,
             )
             self._sensors.append(_doc_sensor)
+            # Slice 4 — dedicated reference for EventChannelServer push routing.
+            # Mirrors the ``_github_issue_sensor`` slot populated below.
+            self._doc_staleness_sensor = _doc_sensor
             logger.info("[IntakeLayer] DocStalenessSensor added (documentation gap detection)")
         except Exception as exc:
             logger.debug("[IntakeLayer] DocStalenessSensor skipped: %s", exc)
@@ -612,6 +641,11 @@ class IntakeLayerService:
                     poll_interval_s=_gh_poll_s,
                 )
                 self._sensors.append(_gh_sensor)
+                # Keep a dedicated reference for EventChannelServer wiring
+                # (gap #4 migration, Slice 2). The generic ``_sensors`` list
+                # is for lifecycle management; this ref is for targeted
+                # webhook short-circuit at the HTTP receiver.
+                self._github_issue_sensor = _gh_sensor
                 logger.info("[IntakeLayer] GitHubIssueSensor added (Trinity issue auto-resolution)")
             except Exception as exc:
                 logger.debug("[IntakeLayer] GitHubIssueSensor skipped: %s", exc)
@@ -665,6 +699,8 @@ class IntakeLayerService:
                 repo_registry=self._config.repo_registry,
             )
             self._sensors.append(_drift_sensor)
+            # Slice 5 — dedicated reference for EventChannelServer fan-out.
+            self._cross_repo_drift_sensor = _drift_sensor
             logger.info("[IntakeLayer] CrossRepoDriftSensor added (Trinity contract integrity)")
         except Exception as exc:
             logger.debug("[IntakeLayer] CrossRepoDriftSensor skipped: %s", exc)
@@ -867,6 +903,145 @@ class IntakeLayerService:
             except Exception as exc:
                 logger.warning("[IntakeLayer] ReactorEventConsumer start failed: %s", exc)
                 self._reactor_consumer = None
+
+        # Phase B Slice 2 — activate the event-channel HTTP receiver so
+        # GitHub (and future) webhooks bypass the poll loop entirely.
+        # Fully defensive: bad port, missing aiohttp, or any other
+        # activation failure is logged and the intake layer continues
+        # operating in poll-only mode (same behavior as before the slice).
+        await self._maybe_start_event_channel_server()
+
+    async def _maybe_start_event_channel_server(self) -> None:
+        """Start the ``EventChannelServer`` when webhook-primary mode is on.
+
+        Activation gates (all must be true):
+          1. ``JARVIS_GITHUB_WEBHOOK_ENABLED=true`` — the Slice 1 flag
+             the sensor itself reads.
+          2. ``JARVIS_EVENT_CHANNELS_ENABLED=true`` (default) — the
+             pre-existing master switch on ``EventChannelServer``.
+          3. A ``GitHubIssueSensor`` was constructed successfully
+             (gh CLI available, Trinity repos resolvable).
+
+        On any activation failure (missing aiohttp, port in use, etc.),
+        log a WARNING and return — the intake layer continues to poll
+        at the existing interval and the organism keeps running. The
+        webhook path is a performance upgrade, not a correctness
+        invariant, so failure-to-start must never take the intake down.
+
+        Manifesto §3 (Asynchronous tendrils): replaces the ``while True:
+        sleep(N): scan()`` hot path with an event-push receiver.
+        Manifesto §8 (Absolute Observability): emits one structured
+        INFO line on activation so operators can grep
+        ``[IntakeLayer] EventChannelServer activated`` to confirm.
+        """
+        try:
+            # Slice 4: server activates if **any** sensor webhook flag is
+            # on. Different operators enable different sensors at
+            # different times; the server itself is a passive dispatcher.
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                    webhook_enabled as _gh_webhook_enabled,
+                )
+                gh_flag_on = _gh_webhook_enabled()
+            except Exception:
+                gh_flag_on = False
+
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                    webhook_enabled as _doc_webhook_enabled,
+                )
+                doc_flag_on = _doc_webhook_enabled()
+            except Exception:
+                doc_flag_on = False
+
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+                    webhook_enabled as _drift_webhook_enabled,
+                )
+                drift_flag_on = _drift_webhook_enabled()
+            except Exception:
+                drift_flag_on = False
+
+            if not (gh_flag_on or doc_flag_on or drift_flag_on):
+                logger.debug(
+                    "[IntakeLayer] EventChannelServer skipped — no "
+                    "sensor webhook flag is on (GITHUB + DOC_STALENESS + "
+                    "CROSS_REPO_DRIFT all disabled)",
+                )
+                return
+
+            # Decide which sensor references to pass. Passing ``None``
+            # for a sensor whose flag is off keeps that sensor dormant
+            # — the channel's fan-out dispatcher will simply not invoke
+            # it, and if no push-handlers are active the event falls
+            # through to the generic ``_route_event`` path.
+            gh_ref = self._github_issue_sensor if gh_flag_on else None
+            doc_ref = self._doc_staleness_sensor if doc_flag_on else None
+            drift_ref = self._cross_repo_drift_sensor if drift_flag_on else None
+
+            if gh_flag_on and gh_ref is None:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer: GitHub flag is on "
+                    "but no GitHubIssueSensor wired (gh CLI unavailable?)",
+                )
+            if doc_flag_on and doc_ref is None:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer: DocStaleness flag "
+                    "is on but no DocStalenessSensor wired",
+                )
+            if drift_flag_on and drift_ref is None:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer: CrossRepoDrift flag "
+                    "is on but no CrossRepoDriftSensor wired",
+                )
+
+            try:
+                from backend.core.ouroboros.governance.event_channel import (
+                    EventChannelServer,
+                )
+            except ImportError as exc:
+                logger.warning(
+                    "[IntakeLayer] EventChannelServer skipped — import failed: %s",
+                    exc,
+                )
+                return
+
+            server = EventChannelServer(
+                router=self._router,
+                github_issue_sensor=gh_ref,
+                doc_staleness_sensor=doc_ref,
+                cross_repo_drift_sensor=drift_ref,
+            )
+            if not server.is_enabled:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer skipped — "
+                    "JARVIS_EVENT_CHANNELS_ENABLED is off",
+                )
+                return
+
+            await server.start()
+            self._event_channel_server = server
+            active_paths = []
+            if gh_ref is not None:
+                active_paths.append("issues→GitHubIssueSensor")
+            push_sensors = []
+            if doc_ref is not None:
+                push_sensors.append("DocStalenessSensor")
+            if drift_ref is not None:
+                push_sensors.append("CrossRepoDriftSensor")
+            if push_sensors:
+                active_paths.append(f"push→[{','.join(push_sensors)}]")
+            logger.info(
+                "[IntakeLayer] EventChannelServer activated — "
+                "github webhooks now route: %s",
+                ", ".join(active_paths) or "(none)",
+            )
+        except Exception as exc:
+            # Never crash intake because the event channel failed to start.
+            logger.warning(
+                "[IntakeLayer] EventChannelServer activation failed "
+                "(poll-only mode): %s", exc,
+            )
 
     async def _teardown(self) -> None:
         """Best-effort cleanup after failed start."""

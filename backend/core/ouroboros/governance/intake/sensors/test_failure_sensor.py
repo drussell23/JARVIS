@@ -69,6 +69,37 @@ _INFLIGHT_TTL_S: float = float(
     os.environ.get("JARVIS_TEST_FAILURE_INFLIGHT_TTL_S", "300")
 )
 
+# --- Gap #4 migration: FS-event primary mode (Slice 3) --------------------
+#
+# Manifesto §3 (Disciplined Concurrency): test failures are the highest-
+# leverage self-healing signal in the organism. Polling pytest every 30s
+# is thermodynamic waste — pytest runs even when no code has changed.
+# When ``JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED=true``, the FileSystemEvent
+# Bridge (``fs.changed.*`` on ``TrinityEventBus``) becomes the primary
+# trigger and the legacy poll loop demotes to a
+# ``JARVIS_TEST_FAILURE_FALLBACK_INTERVAL_S`` cadence (default 600s = 10min)
+# whose only job is to catch missed FS events.
+#
+# Shadow pattern: flag defaults OFF so current production behavior is
+# pure-poll (30s) with no FS subscription — no silent activation. Operators
+# flip the flag to true, run a graduation arc, then the default flips in a
+# follow-up commit. Matches the GitHubIssueSensor Slice 1/2 precedent.
+_TEST_FAILURE_FALLBACK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_TEST_FAILURE_FALLBACK_INTERVAL_S", "600")
+)
+
+
+def fs_events_enabled() -> bool:
+    """Re-read ``JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED`` at call-time.
+
+    Not cached — tests monkeypatch the env and the sensor's
+    ``subscribe_to_bus`` re-checks on invocation, same pattern as
+    ``github_issue_sensor.webhook_enabled``.
+    """
+    return os.environ.get(
+        "JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED", "true",
+    ).lower() in ("true", "1", "yes")
+
 
 class TestFailureSensor:
     """Adapter that bridges TestWatcher → UnifiedIntakeRouter.
@@ -98,6 +129,14 @@ class TestFailureSensor:
         # In-flight dedup: target_file_path -> monotonic submitted_at
         # See module docstring above ``_INFLIGHT_TTL_S`` for the rationale.
         self._pending_target_keys: Dict[str, float] = {}
+        # Gap #4 migration — captured at __init__ time. When True, the poll
+        # loop runs at the fallback cadence and the FS subscription is the
+        # primary trigger. When False, preserves legacy pure-poll behavior.
+        self._fs_events_mode: bool = fs_events_enabled()
+        # Telemetry counters (exposed via health snapshots; useful for
+        # convergence tracking during the graduation arc).
+        self._fs_events_handled: int = 0
+        self._fs_events_ignored: int = 0
 
     def _prune_stale_pending(self) -> None:
         """Drop pending target entries that have exceeded their TTL.
@@ -223,6 +262,18 @@ class TestFailureSensor:
         self._poll_task = asyncio.create_task(
             self._poll_loop(), name="test_failure_sensor_poll",
         )
+        if self._fs_events_mode:
+            logger.info(
+                "TestFailureSensor: FS-events primary mode — poll demoted to "
+                "%ds fallback (JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED=true)",
+                int(_TEST_FAILURE_FALLBACK_INTERVAL_S),
+            )
+        else:
+            logger.debug(
+                "TestFailureSensor: poll-primary mode (%.0fs interval) — "
+                "FS events disabled (default)",
+                self._watcher.poll_interval_s,
+            )
 
     async def stop(self) -> None:
         """Cancel the poll task and stop the underlying watcher.
@@ -255,16 +306,58 @@ class TestFailureSensor:
     # ------------------------------------------------------------------
 
     async def subscribe_to_bus(self, event_bus: Any) -> None:
-        """Subscribe to file system events.
+        """Subscribe to file-system events via ``TrinityEventBus``.
 
-        Two event paths:
-        1. .jarvis/test_results.json changes → instant structured consumption (Phase 2)
-        2. .py file changes → debounced subprocess pytest run (Phase 1 fallback)
+        Gated by ``JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED`` (default OFF).
+        When the flag is off this method is a logged no-op so the legacy
+        pure-poll behavior is preserved exactly (no silent regression when
+        the graduation flip lands).
+
+        When the flag is on, two event paths become active (Slice 3 gap
+        #4 resolution):
+
+        1. ``.jarvis/test_results.json`` change → structured consumption
+           via the ouroboros_pytest_plugin (no subprocess spawn).
+        2. ``*.py`` change → debounced (2s) subprocess pytest run
+           reusing ``TestWatcher.poll_once``.
+
+        Caller contract: ``IntakeLayerService`` unconditionally calls
+        ``subscribe_to_bus`` on every sensor that exposes it. The flag
+        check lives here so one sensor's decision doesn't require
+        special-casing at the call site.
         """
-        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        # Initialize these attributes unconditionally so the rest of the
+        # class can reference them without AttributeError regardless of
+        # whether the flag flipped subscription on.
         self._debounce_task: Optional[asyncio.Task] = None
-        self._last_plugin_ts: float = 0.0  # monotonic — suppresses redundant runs
-        logger.info("TestFailureSensor: subscribed to fs.changed.* events (Phase 2)")
+        self._last_plugin_ts: float = 0.0
+
+        if not self._fs_events_mode:
+            logger.debug(
+                "TestFailureSensor: FS-event subscription skipped "
+                "(JARVIS_TEST_FAILURE_FS_EVENTS_ENABLED=false). "
+                "Poll-primary mode active — no gap #4 resolution.",
+            )
+            return
+
+        try:
+            await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        except Exception as exc:
+            # Subscription failure must not break intake boot. Falls back
+            # to pure poll (at the demoted fallback interval, since flag
+            # is still on — operator intent preserved).
+            logger.warning(
+                "TestFailureSensor: FS-event subscription failed: %s "
+                "(poll-fallback at %ds continues)",
+                exc, int(_TEST_FAILURE_FALLBACK_INTERVAL_S),
+            )
+            return
+
+        logger.info(
+            "TestFailureSensor: subscribed to fs.changed.* — "
+            "FS events now PRIMARY (poll demoted to %ds fallback)",
+            int(_TEST_FAILURE_FALLBACK_INTERVAL_S),
+        )
 
     async def _on_fs_event(self, event: Any) -> None:
         """Route events: test_results.json → instant consume; .py → debounced pytest."""
@@ -272,12 +365,15 @@ class TestFailureSensor:
 
         # Phase 2: ouroboros_pytest_plugin results file
         if rel_path.endswith("test_results.json") and ".jarvis" in rel_path:
+            self._fs_events_handled += 1
             await self._on_test_results_changed(event)
             return
 
         # Phase 1 fallback: .py changes → debounced subprocess
         if event.payload.get("extension") != ".py":
+            self._fs_events_ignored += 1
             return
+        self._fs_events_handled += 1
         if self._debounce_task is not None and not self._debounce_task.done():
             self._debounce_task.cancel()
         self._debounce_task = asyncio.create_task(
@@ -375,6 +471,14 @@ class TestFailureSensor:
     # ------------------------------------------------------------------
 
     async def _poll_loop(self) -> None:
+        """Poll loop — primary when FS events are disabled, fallback when on.
+
+        Uses the shorter ``TestWatcher.poll_interval_s`` (default 30s)
+        when ``_fs_events_mode`` is False. When the flag is on, demotes
+        to ``JARVIS_TEST_FAILURE_FALLBACK_INTERVAL_S`` (default 600s) so
+        the FS subscription carries the hot path and this loop only
+        catches missed FS events.
+        """
         while self._running and self._watcher is not None:
             try:
                 signals = await self._watcher.poll_once()
@@ -382,7 +486,15 @@ class TestFailureSensor:
                     await self.handle_signals(signals)
             except Exception:
                 logger.exception("TestFailureSensor: poll error")
+            # Resolve the interval per-iteration so a mid-flight flag
+            # flip (restart preferred, but runtime change is safe too)
+            # takes effect on the next wait.
+            effective_interval = (
+                _TEST_FAILURE_FALLBACK_INTERVAL_S
+                if self._fs_events_mode
+                else self._watcher.poll_interval_s
+            )
             try:
-                await asyncio.sleep(self._watcher.poll_interval_s)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break

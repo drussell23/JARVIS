@@ -39,6 +39,35 @@ _POLL_INTERVAL_S = float(
 _MAX_ISSUES_PER_SCAN = int(
     os.environ.get("JARVIS_GITHUB_ISSUE_MAX_PER_SCAN", "10")
 )
+
+# --- Webhook-driven mode (gap #4 migration, Slice 1) ----------------------
+#
+# When ``JARVIS_GITHUB_WEBHOOK_ENABLED=true``, GitHub's native webhook
+# delivery becomes the primary event source for issue signals, and the
+# poll loop demotes to a fallback cadence (``JARVIS_GITHUB_ISSUE_FALLBACK_INTERVAL_S``,
+# default 900s = 15min) whose job is to catch dropped webhooks — not to
+# be the dominant path. When the flag is off (default), nothing changes —
+# the sensor keeps polling at ``_POLL_INTERVAL_S``.
+#
+# Manifesto §3 (Asynchronous tendrils, no polling on the hot path). The
+# shadow pattern applies: flag defaults off; operators opt in; we prove
+# the behavioral match between webhook-delivered and poll-delivered
+# envelopes before flipping the default. See ``ingest_webhook`` below.
+_GITHUB_FALLBACK_INTERVAL_S = float(
+    os.environ.get("JARVIS_GITHUB_ISSUE_FALLBACK_INTERVAL_S", "900")
+)
+
+
+def webhook_enabled() -> bool:
+    """Re-read ``JARVIS_GITHUB_WEBHOOK_ENABLED`` at call-time.
+
+    Intentionally not cached — tests monkeypatch the env and the
+    ``EventChannelServer._handle_github`` short-circuit path re-checks
+    per-request. The check is a string compare + lower(); negligible.
+    """
+    return os.environ.get(
+        "JARVIS_GITHUB_WEBHOOK_ENABLED", "true",
+    ).lower() in ("true", "1", "yes")
 # Circuit breaker: skip scans for N seconds after consecutive failures.
 # Battle test bt-2026-04-13-031119 hit GraphQL TLS cert failures on every
 # scan and burned log volume without any payoff. Tripping at 3 failures
@@ -407,7 +436,18 @@ class GitHubIssueSensor:
     ) -> None:
         self._repo = repo
         self._router = router
-        self._poll_interval_s = poll_interval_s
+        # Gap #4 mitigation: when webhook-primary mode is on, the poll loop
+        # is a fallback for dropped deliveries, not the dominant path. The
+        # caller-supplied ``poll_interval_s`` is honored only when webhooks
+        # are off; otherwise ``_GITHUB_FALLBACK_INTERVAL_S`` (default 900s)
+        # wins. The flag is re-read at __init__ time — sensors are rebuilt
+        # on hot-reload so this matches operator expectations.
+        if webhook_enabled():
+            self._poll_interval_s = _GITHUB_FALLBACK_INTERVAL_S
+            self._webhook_mode = True
+        else:
+            self._poll_interval_s = poll_interval_s
+            self._webhook_mode = False
         self._repos = repos or _TRINITY_REPOS
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -461,9 +501,14 @@ class GitHubIssueSensor:
         self._task = asyncio.create_task(
             self._poll_loop(), name=f"github_issue_sensor_{self._repo}"
         )
+        mode = (
+            "webhook-primary (poll=fallback)"
+            if self._webhook_mode
+            else "poll-primary"
+        )
         logger.info(
-            "[GitHubIssueSensor] Started — monitoring %d repos, poll=%ds",
-            len(self._repos), self._poll_interval_s,
+            "[GitHubIssueSensor] Started — monitoring %d repos, poll=%ds, mode=%s",
+            len(self._repos), self._poll_interval_s, mode,
         )
 
     def stop(self) -> None:
@@ -484,6 +529,173 @@ class GitHubIssueSensor:
                 await asyncio.sleep(self._poll_interval_s)
             except asyncio.CancelledError:
                 break
+
+    async def ingest_webhook(self, payload: Dict[str, Any]) -> bool:
+        """Handle one GitHub ``issues`` webhook delivery.
+
+        Alternative entry point to the poll loop — transforms a webhook
+        payload into an ``IssueFinding`` and runs through the **same**
+        dedup / cooldown / envelope gates as ``scan_once``. The emitted
+        envelope is shape-identical to the poll path, so downstream
+        consumers (UnifiedIntakeRouter filters, orchestrator postmortems,
+        ``ExhaustionWatcher`` counters) cannot tell the two apart —
+        that's the point.
+
+        Only work-relevant actions are honored: ``opened``, ``reopened``,
+        ``labeled``, ``edited``. Close / delete / assign actions return
+        ``False`` without emission — they don't represent new work for
+        the organism.
+
+        Never raises. Returns ``True`` only when an envelope was enqueued;
+        ``False`` for ignored actions, malformed payloads, dedup hits,
+        and cooldown suppressions. Callers (``EventChannelServer._handle_github``)
+        should log the return for observability but must not retry —
+        the next webhook delivery or poll scan will cover missed work.
+
+        Manifesto §3: this is the replacement for ``asyncio.sleep`` on
+        the hot path for this sensor. When
+        ``JARVIS_GITHUB_WEBHOOK_ENABLED=true`` and the server is wired,
+        GitHub pushes events to us in real time — the poll loop remains
+        only as the dropped-webhook safety net.
+        """
+        try:
+            action = str(payload.get("action", ""))
+            if action not in {"opened", "reopened", "labeled", "edited"}:
+                logger.debug(
+                    "[GitHubIssueSensor] webhook action=%s ignored "
+                    "(not work-relevant)", action,
+                )
+                return False
+
+            issue = payload.get("issue")
+            if not isinstance(issue, dict):
+                logger.debug(
+                    "[GitHubIssueSensor] webhook missing 'issue' dict: "
+                    "payload_keys=%s", list(payload.keys())[:8],
+                )
+                return False
+
+            try:
+                issue_number = int(issue.get("number", 0) or 0)
+            except (TypeError, ValueError):
+                issue_number = 0
+            if issue_number <= 0:
+                logger.debug("[GitHubIssueSensor] webhook missing issue number")
+                return False
+
+            title = str(issue.get("title", "") or "")
+            body = str(issue.get("body") or "")
+
+            repository = payload.get("repository")
+            if not isinstance(repository, dict):
+                logger.debug("[GitHubIssueSensor] webhook missing repository dict")
+                return False
+            repo_full = str(repository.get("full_name", "") or "")
+            if not repo_full:
+                logger.debug("[GitHubIssueSensor] webhook missing repo full_name")
+                return False
+
+            # Map webhook repo full_name -> our short repo key. If it
+            # doesn't match any Trinity repo we still emit, just with a
+            # default "jarvis" short key — better than dropping.
+            repo_short = "jarvis"
+            for name, full, _default_path in self._repos:
+                if full == repo_full:
+                    repo_short = name
+                    break
+
+            labels_raw = issue.get("labels") or []
+            labels_list: List[str] = []
+            if isinstance(labels_raw, list):
+                for lbl in labels_raw:
+                    if isinstance(lbl, dict):
+                        labels_list.append(str(lbl.get("name", "") or ""))
+                    else:
+                        labels_list.append(str(lbl))
+            labels: Tuple[str, ...] = tuple(lbl for lbl in labels_list if lbl)
+
+            urgency = self._classify_urgency(labels, title)
+            auto_resolvable = self._is_auto_resolvable(labels, title, body)
+
+            finding = IssueFinding(
+                repo=repo_short,
+                repo_full=repo_full,
+                issue_number=issue_number,
+                title=title,
+                labels=labels,
+                urgency=urgency,
+                auto_resolvable=auto_resolvable,
+                body_excerpt=body[:500],
+                created_at=str(issue.get("created_at", "") or ""),
+                url=str(issue.get("html_url", "") or ""),
+                details={"via": "webhook", "action": action},
+            )
+
+            dedup_key = f"{finding.repo}:{finding.issue_number}"
+            if _issue_cooldown_active(dedup_key):
+                logger.info(
+                    "[GitHubIssueSensor] webhook #%d (%s): suppressed — "
+                    "exhaustion cooldown still active",
+                    finding.issue_number, finding.repo,
+                )
+                return False
+            if dedup_key in self._seen_issues:
+                logger.debug(
+                    "[GitHubIssueSensor] webhook #%d (%s): already seen "
+                    "this session (dedup hit)",
+                    finding.issue_number, finding.repo,
+                )
+                return False
+            self._seen_issues.add(dedup_key)
+
+            envelope = make_envelope(
+                source="github_issue",
+                description=(
+                    f"GitHub Issue #{finding.issue_number} in "
+                    f"{finding.repo_full}: {finding.title}"
+                ),
+                target_files=self._infer_target_files(finding),
+                repo=finding.repo,
+                confidence=0.80,
+                urgency=finding.urgency,
+                evidence={
+                    "category": "github_issue",
+                    "issue_number": finding.issue_number,
+                    "repo_full": finding.repo_full,
+                    "labels": list(finding.labels),
+                    "auto_resolvable": finding.auto_resolvable,
+                    "url": finding.url,
+                    "body_excerpt": finding.body_excerpt[:300],
+                    "recurring": 1,
+                    "sensor": "GitHubIssueSensor",
+                    "via": "webhook",
+                    "webhook_action": action,
+                },
+                requires_human_ack=not finding.auto_resolvable,
+            )
+            result = await self._router.ingest(envelope)
+            if result == "enqueued":
+                logger.info(
+                    "[GitHubIssueSensor] webhook #%d (%s): %s -> enqueued "
+                    "(action=%s, auto=%s, urgency=%s)",
+                    finding.issue_number, finding.repo,
+                    finding.title[:50], action,
+                    finding.auto_resolvable, finding.urgency,
+                )
+                return True
+            logger.debug(
+                "[GitHubIssueSensor] webhook #%d (%s): router returned %r",
+                finding.issue_number, finding.repo, result,
+            )
+            return False
+        except Exception:
+            # Observer contract for event-driven intake: webhook handlers
+            # MUST NOT raise, or one bad payload takes down the entire
+            # EventChannelServer request.
+            logger.debug(
+                "[GitHubIssueSensor] webhook ingest failed", exc_info=True,
+            )
+            return False
 
     async def scan_once(self) -> List[IssueFinding]:
         """Scan all Trinity repos for open issues."""

@@ -100,15 +100,49 @@ class EventChannelServer:
         port: int = _CHANNEL_PORT,
         host: str = _CHANNEL_HOST,
         batch_registry: Any = None,  # Optional[BatchFutureRegistry]
+        github_issue_sensor: Any = None,  # Optional[GitHubIssueSensor]
+        doc_staleness_sensor: Any = None,  # Optional[DocStalenessSensor]
+        cross_repo_drift_sensor: Any = None,  # Optional[CrossRepoDriftSensor]
     ) -> None:
         self._router = router
         self._port = port
         self._host = host
         self._batch_registry = batch_registry
+        # Phase B Slice 1 (gap #4 migration): when wired and
+        # ``JARVIS_GITHUB_WEBHOOK_ENABLED=true``, GitHub ``issues`` events
+        # short-circuit to the sensor's ``ingest_webhook`` so the emitted
+        # envelope is shape-identical to the poll path (source,
+        # evidence.category, evidence fields). Without this, the generic
+        # ``_route_event`` path would emit ``source=runtime_health``
+        # envelopes and downstream consumers (ExhaustionWatcher counters,
+        # orchestrator postmortems keyed on ``github_issue``) would not
+        # recognize them.
+        self._github_issue_sensor = github_issue_sensor
+        # Slice 4 — GitHub push events route to DocStalenessSensor when
+        # wired. Second ``event_type`` handled by the same ``_handle_github``
+        # endpoint, demonstrating the EventChannelServer pattern fanning
+        # out to multiple sensors in parallel. Kept optional so partial
+        # wiring (only issues, or only push) continues to work.
+        self._doc_staleness_sensor = doc_staleness_sensor
         self._stats = ChannelStats()
         self._rate_tracker: Dict[str, List[float]] = {}
         self._server_task: Optional[asyncio.Task] = None
         self._site: Optional[Any] = None
+        # Gap #4 telemetry — last time a GitHub webhook successfully
+        # short-circuited to the sensor. Used by /channel/health so
+        # operators can tell if the webhook path is live or quiet.
+        self._last_github_webhook_at: float = 0.0
+        self._github_webhooks_emitted: int = 0
+        self._github_webhooks_ignored: int = 0
+        # Slice 4 counters for DocStalenessSensor push deliveries
+        self._last_doc_push_at: float = 0.0
+        self._doc_pushes_emitted: int = 0
+        self._doc_pushes_ignored: int = 0
+        # Slice 5 — CrossRepoDriftSensor push deliveries
+        self._cross_repo_drift_sensor = cross_repo_drift_sensor
+        self._last_drift_push_at: float = 0.0
+        self._drift_pushes_emitted: int = 0
+        self._drift_pushes_ignored: int = 0
 
     @property
     def is_enabled(self) -> bool:
@@ -178,6 +212,136 @@ class EventChannelServer:
             return web.Response(status=400, text="Invalid JSON")
 
         event_type = request.headers.get("X-GitHub-Event", "unknown")
+
+        # --- gap #4 short-circuit: route issues events to the sensor ----
+        #
+        # When the sensor is wired AND the master flag is on, the
+        # authoritative handler for ``issues`` events is
+        # ``GitHubIssueSensor.ingest_webhook`` — it emits an envelope
+        # shape-identical to the poll path. Bypasses the generic
+        # ``_route_event`` to prevent double-emission with a mismatched
+        # source. All other GitHub event types (workflow_run, push, ...)
+        # continue through the generic path unchanged.
+        if event_type == "issues" and self._github_issue_sensor is not None:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                    webhook_enabled as _gh_webhook_enabled,
+                )
+                flag_on = _gh_webhook_enabled()
+            except Exception:
+                flag_on = False
+            if flag_on:
+                # §3: bound every agentic thread in time so a pathological
+                # ingest cannot starve the HTTP handler. 30s cap picked so a
+                # slow gh CLI fallback inside the sensor still has room but
+                # no single webhook ties up an aiohttp worker indefinitely.
+                action_hint = str(payload.get("action", "?"))
+                t0 = time.monotonic()
+                try:
+                    emitted = await asyncio.wait_for(
+                        self._github_issue_sensor.ingest_webhook(payload),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[EventChannel] GitHubIssueSensor.ingest_webhook timed "
+                        "out after 30s (action=%s)", action_hint,
+                    )
+                    emitted = False
+                except Exception:
+                    logger.debug(
+                        "[EventChannel] GitHubIssueSensor.ingest_webhook raised",
+                        exc_info=True,
+                    )
+                    emitted = False
+                duration_ms = int((time.monotonic() - t0) * 1000)
+
+                self._stats.total_events += 1
+                self._stats.last_event_at = time.time()
+                self._stats.events_by_source["github"] = (
+                    self._stats.events_by_source.get("github", 0) + 1
+                )
+                self._last_github_webhook_at = time.time()
+                if emitted:
+                    self._stats.events_routed += 1
+                    self._github_webhooks_emitted += 1
+                else:
+                    self._github_webhooks_ignored += 1
+                # Stable key=value telemetry — same convention as
+                # [SemanticGuard] and [REVIEW-SHADOW]. split("=") parses
+                # into rollup counters for "what percent of GitHub
+                # webhooks produced envelopes" dashboards.
+                logger.info(
+                    "[EventChannel] github/issues delivered "
+                    "sensor=GitHubIssueSensor action=%s emitted=%s "
+                    "duration_ms=%d",
+                    action_hint, emitted, duration_ms,
+                )
+                return web.Response(status=200, text="OK")
+
+        # --- Slice 5: push events fan out to all active push sensors ---
+        #
+        # Earlier slices used an ``if/elif`` short-circuit where the
+        # first matching sensor "won" and subsequent handlers never saw
+        # the event. That doesn't scale once two sensors care about the
+        # same event type — both DocStalenessSensor and
+        # CrossRepoDriftSensor have independent reasons to react to a
+        # push. The dispatcher below invokes **every** active sensor
+        # concurrently via ``asyncio.gather`` (each in its own
+        # ``wait_for(30s)`` so one slow sensor can't starve the others).
+        # Falls through to the generic ``_route_event`` path only if
+        # zero sensors are active, preserving pre-Slice-4 behavior.
+        if event_type == "push":
+            push_handlers = await self._collect_active_push_handlers()
+            if push_handlers:
+                ref_hint = str(payload.get("ref", "?"))
+                t0 = time.monotonic()
+                results = await asyncio.gather(
+                    *[
+                        self._invoke_push_handler(name, sensor, payload)
+                        for name, sensor in push_handlers
+                    ],
+                    return_exceptions=False,
+                )
+                duration_ms = int((time.monotonic() - t0) * 1000)
+
+                self._stats.total_events += 1
+                self._stats.last_event_at = time.time()
+                self._stats.events_by_source["github"] = (
+                    self._stats.events_by_source.get("github", 0) + 1
+                )
+
+                fired_names: List[str] = []
+                emitted_names: List[str] = []
+                for (name, _sensor), emitted in zip(push_handlers, results):
+                    fired_names.append(name)
+                    if name == "DocStalenessSensor":
+                        self._last_doc_push_at = time.time()
+                        if emitted:
+                            self._doc_pushes_emitted += 1
+                            emitted_names.append(name)
+                        else:
+                            self._doc_pushes_ignored += 1
+                    elif name == "CrossRepoDriftSensor":
+                        self._last_drift_push_at = time.time()
+                        if emitted:
+                            self._drift_pushes_emitted += 1
+                            emitted_names.append(name)
+                        else:
+                            self._drift_pushes_ignored += 1
+                    if emitted:
+                        self._stats.events_routed += 1
+
+                logger.info(
+                    "[EventChannel] github/push fan-out ref=%s "
+                    "fired=[%s] emitted=[%s] duration_ms=%d",
+                    ref_hint,
+                    ",".join(fired_names),
+                    ",".join(emitted_names) if emitted_names else "none",
+                    duration_ms,
+                )
+                return web.Response(status=200, text="OK")
+
         event = ChannelEvent(
             source="github",
             event_type=event_type,
@@ -186,6 +350,80 @@ class EventChannelServer:
 
         await self._route_event(event)
         return web.Response(status=200, text="OK")
+
+    # ------------------------------------------------------------------
+    # Slice 5 — fan-out dispatcher for GitHub push events
+    # ------------------------------------------------------------------
+
+    async def _collect_active_push_handlers(
+        self,
+    ) -> "List[Tuple[str, Any]]":
+        """Return (name, sensor) for every wired sensor whose webhook
+        flag is currently on.
+
+        Each sensor's flag is re-checked per-request so operators can
+        flip flags at runtime (env change) without needing to restart.
+        Sensors whose import or flag-check raises are silently skipped —
+        the observability contract here is at the per-delivery log line,
+        not at the handler-collection step.
+        """
+        handlers: List[Tuple[str, Any]] = []
+
+        if self._doc_staleness_sensor is not None:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                    webhook_enabled as _doc_webhook_enabled,
+                )
+                if _doc_webhook_enabled():
+                    handlers.append(
+                        ("DocStalenessSensor", self._doc_staleness_sensor),
+                    )
+            except Exception:
+                pass
+
+        if self._cross_repo_drift_sensor is not None:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+                    webhook_enabled as _drift_webhook_enabled,
+                )
+                if _drift_webhook_enabled():
+                    handlers.append(
+                        ("CrossRepoDriftSensor", self._cross_repo_drift_sensor),
+                    )
+            except Exception:
+                pass
+
+        return handlers
+
+    async def _invoke_push_handler(
+        self,
+        name: str,
+        sensor: Any,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Invoke one sensor's ``ingest_webhook`` under a 30s timeout.
+
+        Returns the sensor's emission boolean on clean completion,
+        ``False`` on timeout or any exception (logged at DEBUG/WARNING).
+        Never raises — the fan-out gather relies on this invariant so
+        one sensor cannot poison the batch for the others.
+        """
+        try:
+            return bool(
+                await asyncio.wait_for(sensor.ingest_webhook(payload), timeout=30.0)
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[EventChannel] %s.ingest_webhook timed out after 30s",
+                name,
+            )
+            return False
+        except Exception:
+            logger.debug(
+                "[EventChannel] %s.ingest_webhook raised",
+                name, exc_info=True,
+            )
+            return False
 
     async def _handle_ci(self, request: Any) -> Any:
         """Handle CI system webhook events (Jenkins, GitHub Actions, etc.)."""
@@ -302,13 +540,81 @@ class EventChannelServer:
         return web.Response(status=200, text="OK")
 
     async def _handle_health(self, request: Any) -> Any:
-        """Health check endpoint."""
+        """Health check endpoint.
+
+        Gap #4 observability: exposes whether webhook-primary mode is
+        active per sensor, so operators can watch the ``sensors``
+        ratio trend (events by sensor / total events) and catch silent
+        regressions where the webhook stops arriving.
+        """
         from aiohttp import web
+
+        # Ask the sensor itself rather than trusting a cached flag —
+        # ``webhook_enabled()`` re-reads the env so tests and live
+        # reconfigurations stay honest.
+        sensor_wired = self._github_issue_sensor is not None
+        webhook_mode = False
+        if sensor_wired:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                    webhook_enabled as _gh_webhook_enabled,
+                )
+                webhook_mode = bool(_gh_webhook_enabled())
+            except Exception:
+                webhook_mode = False
+
+        # Slice 4 — expose DocStalenessSensor push-webhook state too.
+        doc_wired = self._doc_staleness_sensor is not None
+        doc_webhook_mode = False
+        if doc_wired:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                    webhook_enabled as _doc_webhook_enabled,
+                )
+                doc_webhook_mode = bool(_doc_webhook_enabled())
+            except Exception:
+                doc_webhook_mode = False
+
+        # Slice 5 — expose CrossRepoDriftSensor push-webhook state.
+        drift_wired = self._cross_repo_drift_sensor is not None
+        drift_webhook_mode = False
+        if drift_wired:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+                    webhook_enabled as _drift_webhook_enabled,
+                )
+                drift_webhook_mode = bool(_drift_webhook_enabled())
+            except Exception:
+                drift_webhook_mode = False
+
         return web.json_response({
             "status": "healthy",
             "total_events": self._stats.total_events,
             "events_routed": self._stats.events_routed,
+            "events_rejected": self._stats.events_rejected,
+            "events_by_source": dict(self._stats.events_by_source),
             "last_event": self._stats.last_event_at,
+            "github_issue_sensor": {
+                "wired": sensor_wired,
+                "webhook_mode": webhook_mode,
+                "last_webhook_at": self._last_github_webhook_at,
+                "webhooks_emitted": self._github_webhooks_emitted,
+                "webhooks_ignored": self._github_webhooks_ignored,
+            },
+            "doc_staleness_sensor": {
+                "wired": doc_wired,
+                "webhook_mode": doc_webhook_mode,
+                "last_push_at": self._last_doc_push_at,
+                "pushes_emitted": self._doc_pushes_emitted,
+                "pushes_ignored": self._doc_pushes_ignored,
+            },
+            "cross_repo_drift_sensor": {
+                "wired": drift_wired,
+                "webhook_mode": drift_webhook_mode,
+                "last_push_at": self._last_drift_push_at,
+                "pushes_emitted": self._drift_pushes_emitted,
+                "pushes_ignored": self._drift_pushes_ignored,
+            },
         })
 
     # ------------------------------------------------------------------
