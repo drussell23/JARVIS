@@ -46,7 +46,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -343,24 +343,66 @@ async def run_general_tool_loop(
         tool_timeout_s=tool_timeout_s,
     )
 
-    # 6. Render system prompt and build the generate_fn that binds it
-    # to the resolved provider.
+    # 6. Render system prompt and build the generate_fn that bridges
+    # the provider's text-in-text-out SDK surface to
+    # ToolLoopCoordinator's (str) -> str contract.
+    #
+    # TECH DEBT — ClaudeProvider doesn't expose a public
+    # generate_text(prompt, system) method; we reach into
+    # ``provider._client`` (the AsyncAnthropic SDK instance) directly.
+    # Tracked in project_phase_b_step2_deferred.md ticket 6.
+    # Signature-drift pin: tests/governance/test_general_driver.py
+    # asserts _client exposes ``.messages.create`` so a provider
+    # refactor that moves the SDK surface elsewhere fails loudly
+    # rather than silently breaking GENERAL.
     system_prompt = render_general_system_prompt(invocation)
-    user_prompt = (
-        f"{system_prompt}\n\n"
-        f"# GENERAL subagent {sub_id}\n"
-        "Your work starts below. Call tools from the allowlist only. "
-        "Emit the final-answer JSON when done."
-    )
 
     async def _generate_fn(prompt: str) -> str:
-        """Thin wrapper — provider.generate(prompt, deadline)."""
-        gen = getattr(provider, "generate", None)
-        if gen is None:
+        """Reach into provider._client for text-in-text-out SDK access.
+
+        Phase B pattern: the existing ``_generate_raw`` closures in
+        providers.py:3712+ use the same inner-client pattern. Here it's
+        a private attribute because ClaudeProvider's high-level
+        ``generate(ctx, deadline)`` isn't a fit for the tool loop's
+        string-based contract.
+
+        Returns the concatenated text content of all ``TextBlock``s
+        in the response. Raises on any SDK error; caller's exception
+        handler catches and emits ``status=tool_loop_error``.
+        """
+        client = getattr(provider, "_client", None)
+        if client is None:
             raise RuntimeError(
-                f"provider {primary_name!r} has no generate() method"
+                f"provider {primary_name!r} ._client is None — likely "
+                "recycled or uninitialized"
             )
-        return await gen(prompt, deadline)
+        model_name = str(getattr(provider, "_model", "") or "claude-sonnet-4-5-20250929")
+        # GENERAL tool rounds need modest output (tool JSON ~1K tokens;
+        # final answer ~2K); cap at 4096 to bound cost.
+        max_output = int(os.environ.get(
+            "JARVIS_GENERAL_LLM_MAX_OUTPUT_TOKENS", "4096",
+        ))
+        msg = await client.messages.create(
+            model=model_name,
+            max_tokens=max_output,
+            system=system_prompt,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        # Extract text from all text content blocks.
+        parts: List[str] = []
+        for block in getattr(msg, "content", []) or []:
+            txt = getattr(block, "text", None)
+            if isinstance(txt, str):
+                parts.append(txt)
+        return "".join(parts)
+
+    user_prompt = (
+        f"# GENERAL subagent {sub_id}\n\n"
+        f"Your work starts below. Call tools from the allowlist only. "
+        f"Emit the final-answer JSON when done.\n\n"
+        f"## Goal (restated)\n"
+        f"{invocation.get('goal', '<missing>')}"
+    )
 
     # 7. Lazy import the canonical tool-call response parser.
     from backend.core.ouroboros.governance.providers import (

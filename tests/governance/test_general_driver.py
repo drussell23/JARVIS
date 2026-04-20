@@ -470,6 +470,102 @@ async def test_run_loop_handles_none_valued_payload_knobs(tmp_path) -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_run_loop_reaches_client_messages_create(
+    tmp_path, monkeypatch,
+) -> None:
+    """Signature-drift pin #1 — the driver's _generate_fn reaches into
+    ``provider._client.messages.create``. If the Anthropic SDK surface
+    moves (e.g. to ``.completions`` or ``.responses.generate``), this
+    test fails loudly BEFORE the live battle test. Mirrors the
+    pattern used by existing _generate_raw closures in providers.py.
+    """
+    # Stub provider with the expected ._client shape.
+    create_calls: list = []
+
+    class _StubTextBlock:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class _StubMessage:
+        def __init__(self, text: str) -> None:
+            self.content = [_StubTextBlock(text)]
+
+    class _StubMessages:
+        async def create(self, **kwargs) -> _StubMessage:
+            create_calls.append(kwargs)
+            # Emit a valid general.final.v1 so the tool loop exits on
+            # round 1 (no tool calls → parse_fn returns None → loop
+            # treats the text as final).
+            return _StubMessage(json.dumps({
+                "schema_version": "general.final.v1",
+                "status": "completed",
+                "summary": "stubbed SDK round-trip",
+                "findings": [],
+                "mutations_performed": 0,
+                "blocked_reason": "",
+            }))
+
+    class _StubClient:
+        messages = _StubMessages()
+
+    class _StubProvider:
+        _client = _StubClient()
+        _model = "claude-test-model"
+
+    from backend.core.ouroboros.governance.general_driver import (
+        run_general_tool_loop,
+    )
+
+    payload = _valid_payload()
+    trace = await run_general_tool_loop(
+        payload,
+        project_root=tmp_path,
+        provider_registry=lambda name: _StubProvider(),
+    )
+
+    assert create_calls, (
+        "driver must call provider._client.messages.create at least once; "
+        "signature drift or wrong SDK surface"
+    )
+    # Verify the SDK shape we rely on:
+    kw = create_calls[0]
+    assert "model" in kw and kw["model"] == "claude-test-model"
+    assert "max_tokens" in kw and isinstance(kw["max_tokens"], int)
+    assert "system" in kw and "Semantic Firewall" in kw["system"]
+    assert "messages" in kw and isinstance(kw["messages"], list)
+    assert kw["messages"][0]["role"] == "user"
+    # And the final answer parsed cleanly — driver returned completed
+    assert trace["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_run_loop_handles_null_client_gracefully(
+    tmp_path,
+) -> None:
+    """Signature-drift pin #2 — when provider._client is None (recycled
+    or uninitialized), the driver must emit a structured
+    ``tool_loop_error`` trace rather than crashing with AttributeError."""
+
+    class _RecycledProvider:
+        _client = None
+        _model = "claude-test-model"
+
+    from backend.core.ouroboros.governance.general_driver import (
+        run_general_tool_loop,
+    )
+
+    payload = _valid_payload()
+    trace = await run_general_tool_loop(
+        payload,
+        project_root=tmp_path,
+        provider_registry=lambda name: _RecycledProvider(),
+    )
+    # Driver wraps the inner RuntimeError into status=tool_loop_error
+    assert trace["status"] == "tool_loop_error"
+    assert "_client is None" in trace["raw_output"]
+
+
 def test_final_to_exec_trace_non_completed_status_prefixed() -> None:
     """When final.status != 'completed', exec_trace.status is
     ``final_<final_status>`` so downstream consumers can distinguish
