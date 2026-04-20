@@ -260,22 +260,46 @@ def _serialize_attachments(
 
         b64 = base64.b64encode(data).decode("ascii")
 
+        _is_pdf = att.mime_type == "application/pdf"
+
         if kind == "claude":
-            # Anthropic Messages API multi-modal image content block.
-            # https://docs.anthropic.com/en/api/messages (image source).
-            blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": att.mime_type,
-                    "data": b64,
-                },
-            })
+            if _is_pdf:
+                # Anthropic Messages API document content block — the
+                # native PDF ingestion path. Model receives the parsed
+                # document, reasons over layout + text simultaneously.
+                # https://docs.anthropic.com/en/docs/build-with-claude/pdf-support
+                blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": b64,
+                    },
+                })
+            else:
+                # Anthropic Messages API image content block.
+                blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": att.mime_type,
+                        "data": b64,
+                    },
+                })
         else:
-            # OpenAI-compatible image_url schema. Both DoubleWord and
-            # J-Prime accept data URIs via this shape. Keeps the
-            # serializer minimal — specialise later if either provider
-            # requires a divergent format.
+            # DoubleWord / J-Prime: OpenAI-compatible image_url schema.
+            # PDFs are NOT supported on this schema — Qwen3-VL-235B is a
+            # vision-language model, not a document model. Drop PDFs with
+            # a WARNING rather than ship malformed payload. Image types
+            # pass through the data-URI shape unchanged.
+            if _is_pdf:
+                logger.warning(
+                    "[providers._serialize_attachments] provider_kind=%s does not "
+                    "support PDF documents (Qwen3-VL image-only); dropping "
+                    "attachment hash8=%s — use Claude for document ingest",
+                    kind, att.hash8,
+                )
+                continue
             blocks.append({
                 "type": "image_url",
                 "image_url": {
@@ -5153,9 +5177,12 @@ class ClaudeProvider:
                 # §8 Absolute Observability — a single INFO line per GENERATE
                 # call that ships pixels. ``bytes`` and ``kinds`` come from
                 # ctx.attachments (not the base64-inflated blocks) so grep
-                # rollups match the on-disk hash/byte footprint.
+                # rollups match the on-disk hash/byte footprint. mime_kinds
+                # distinguishes image-modality from PDF-document ingest so
+                # operators see exactly what reached Anthropic's API.
                 _atts = getattr(context, "attachments", ())
                 _kinds = ",".join(sorted({a.kind for a in _atts})) or "-"
+                _mimes = ",".join(sorted({a.mime_type for a in _atts})) or "-"
                 _hashes = ",".join(a.hash8 for a in _atts) or "-"
                 _bytes = 0
                 for _a in _atts:
@@ -5165,10 +5192,10 @@ class ClaudeProvider:
                         pass
                 logger.info(
                     "[ClaudeProvider] multi_modal op=%s blocks=%d "
-                    "attachments=%d bytes=%d kinds=[%s] hash8s=[%s] "
-                    "route=%s purpose=generate",
+                    "attachments=%d bytes=%d kinds=[%s] mime_kinds=[%s] "
+                    "hash8s=[%s] route=%s purpose=generate",
                     getattr(context, "operation_id", "-"),
-                    len(_image_blocks), len(_atts), _bytes, _kinds, _hashes,
+                    len(_image_blocks), len(_atts), _bytes, _kinds, _mimes, _hashes,
                     (getattr(context, "provider_route", "") or "-"),
                 )
                 user_content = [*_image_blocks, {"type": "text", "text": p}]

@@ -907,6 +907,7 @@ class DoublewordProvider:
                 _user_content: Any = [{"type": "text", "text": p}, *_att_blocks]
                 _atts = getattr(context, "attachments", ())
                 _kinds = ",".join(sorted({a.kind for a in _atts})) or "-"
+                _mimes = ",".join(sorted({a.mime_type for a in _atts})) or "-"
                 _hashes = ",".join(a.hash8 for a in _atts) or "-"
                 _bytes = 0
                 for _a in _atts:
@@ -916,10 +917,10 @@ class DoublewordProvider:
                         pass
                 logger.info(
                     "[DoublewordProvider] multi_modal op=%s blocks=%d "
-                    "attachments=%d bytes=%d kinds=[%s] hash8s=[%s] "
-                    "route=%s purpose=generate",
+                    "attachments=%d bytes=%d kinds=[%s] mime_kinds=[%s] "
+                    "hash8s=[%s] route=%s purpose=generate",
                     getattr(context, "operation_id", "-"),
-                    len(_att_blocks), len(_atts), _bytes, _kinds, _hashes,
+                    len(_att_blocks), len(_atts), _bytes, _kinds, _mimes, _hashes,
                     (getattr(context, "provider_route", "") or "-"),
                 )
             else:

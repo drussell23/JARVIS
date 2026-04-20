@@ -388,8 +388,18 @@ class ShadowResult:
 #      re-checks the hash8 → detects silent file rotation/corruption.
 #   8. OperationContext caps at 8 attachments (MAX_PER_CTX).
 
-_VALID_ATTACHMENT_KINDS: Tuple[str, ...] = ("pre_apply", "post_apply", "sensor_frame")
-_VALID_ATTACHMENT_MIMES: Tuple[str, ...] = ("image/jpeg", "image/png", "image/webp")
+_VALID_ATTACHMENT_KINDS: Tuple[str, ...] = (
+    "pre_apply",     # visual_verify pre-APPLY capture
+    "post_apply",    # visual_verify post-APPLY capture
+    "sensor_frame",  # VisionSensor autonomous capture
+    "user_provided", # Human-initiated /attach upload via SerpentFlow REPL (CC-parity)
+)
+_VALID_ATTACHMENT_MIMES: Tuple[str, ...] = (
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "application/pdf",  # Anthropic Messages API document content block
+)
 _ATTACHMENT_HASH8_PATTERN = re.compile(r"^[0-9a-f]{8}$")
 _ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT = 10 * 1024 * 1024   # 10 MiB per frame
 _ATTACHMENT_MAX_PATH_LEN = 512
@@ -400,6 +410,7 @@ _ATTACHMENT_EXT_TO_MIME: Dict[str, str] = {
     ".jpeg": "image/jpeg",
     ".png": "image/png",
     ".webp": "image/webp",
+    ".pdf": "application/pdf",
 }
 
 
