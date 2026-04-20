@@ -47,9 +47,9 @@ def test_webhook_enabled_reads_env_fresh(monkeypatch: Any) -> None:
     monkeypatch.setenv("JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED", "false")
     assert pm.webhook_enabled() is False
 
-    # Slice 6 is pre-graduation — default stays "false" (shadow mode).
+    # Graduated 2026-04-20 — default is now "true" (CI-webhook-primary).
     monkeypatch.delenv("JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED", raising=False)
-    assert pm.webhook_enabled() is False
+    assert pm.webhook_enabled() is True
 
 
 def test_init_captures_webhook_mode(monkeypatch: Any) -> None:
@@ -227,7 +227,8 @@ async def test_ingest_webhook_never_raises_on_scan_exception() -> None:
 # ---------------------------------------------------------------------------
 
 def test_poll_interval_default_when_flag_off(monkeypatch: Any) -> None:
-    monkeypatch.delenv("JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED", raising=False)
+    # Graduated 2026-04-20 — default is now "true"; opt-out must be explicit.
+    monkeypatch.setenv("JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED", "false")
     sensor = PerformanceRegressionSensor(
         repo="jarvis", router=_SpyRouter(), poll_interval_s=3600.0,
     )

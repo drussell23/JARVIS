@@ -61,7 +61,7 @@ _PERF_REGRESSION_FALLBACK_INTERVAL_S: float = float(
 def webhook_enabled() -> bool:
     """Re-read ``JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED`` at call-time."""
     return os.environ.get(
-        "JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED", "false",
+        "JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED", "true",
     ).lower() in ("true", "1", "yes")
 
 
