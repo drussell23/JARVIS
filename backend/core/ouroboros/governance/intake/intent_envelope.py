@@ -89,11 +89,21 @@ class IntentEnvelope:
             )
         # Vision signals genuinely don't know target files at sensor-emit
         # time — the op is "there is a traceback visible on screen", not
-        # "fix file X". The orchestrator infers actionable targets from
-        # evidence downstream. Other sources still require non-empty
-        # target_files.
-        if not self.target_files and self.source != "vision_sensor":
-            raise EnvelopeValidationError("target_files must be non-empty")
+        # "fix file X". The same is true for operator-initiated /attach
+        # uploads: "reason about this PDF" / "look at this screenshot"
+        # has no pre-determined target path. The orchestrator infers
+        # actionable targets from evidence downstream for both flows.
+        # Other envelopes without either signal type still require a
+        # non-empty target_files tuple.
+        if not self.target_files:
+            _has_user_att = bool(
+                (self.evidence or {}).get("user_attachments")
+            )
+            if self.source != "vision_sensor" and not _has_user_att:
+                raise EnvelopeValidationError(
+                    "target_files must be non-empty "
+                    "(exempt: vision_sensor source, or evidence.user_attachments present)"
+                )
 
     def with_lease(self, lease_id: str) -> "IntentEnvelope":
         """Return a new envelope with the given lease_id set."""
