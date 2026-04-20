@@ -32,6 +32,7 @@ import logging
 import os
 import random
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,71 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Gap #4 migration: FS-event-primary mode
+# ---------------------------------------------------------------------------
+#
+# When ``JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED=true``, TrinityEventBus
+# ``fs.changed.*`` events become the primary trigger: a ``.py`` file change
+# → single-file multi-dim analysis at pub/sub latency, not a 1-hour full
+# rglob sweep. Poll demotes to ``JARVIS_OPPORTUNITY_MINER_FALLBACK_INTERVAL_S``
+# (default 6h) as a safety net for dropped events.
+#
+# Shadow pattern: flag defaults OFF so current pure-poll behavior is
+# preserved until a battle-test graduation arc flips it (same precedent as
+# every earlier gap-#4 sensor migration).
+#
+# Storm-guard (unique to this sensor, not shared with TodoScanner):
+#   - Per-file debounce keeps an ``npm install`` / ``git checkout`` burst
+#     from re-scanning the same file 40 times in 5 seconds.
+#   - Global burst threshold: if incoming events exceed the threshold in a
+#     rolling 1s window, the sensor enters storm mode for a cooldown period
+#     during which ALL events are dropped (counted), trading coverage for
+#     CPU budget. One WARNING per storm; counters expose the drop count.
+#
+# Unlike the standard per-event path, storm mode is expected during normal
+# developer actions — the goal is to avoid a thousand AST parses in two
+# seconds, not to be "accurate" during a bulk mutation.
+def fs_events_enabled() -> bool:
+    """Re-read ``JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED`` at call-time."""
+    return os.environ.get(
+        "JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED", "false",
+    ).lower() in ("true", "1", "yes")
+
+
+_OPP_MINER_FALLBACK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_OPPORTUNITY_MINER_FALLBACK_INTERVAL_S", "21600")
+)
+
+# Per-file debounce: suppress repeat events on the same file within this
+# window. 30s is long enough to absorb an editor's atomic-save spray
+# (save → backup → rename → chmod → fsync) but short enough that a genuine
+# human follow-up edit still triggers a fresh scan.
+_OPP_MINER_DEBOUNCE_S: float = float(
+    os.environ.get("JARVIS_OPPORTUNITY_MINER_DEBOUNCE_S", "30")
+)
+
+# Global burst circuit-breaker. Sized for "normal `git checkout` after a
+# 10-file PR" (≈30 events in a blink) passing through, but "`npm install`
+# touching 8000 files" tripping immediately.
+_OPP_MINER_STORM_THRESHOLD: int = int(
+    os.environ.get("JARVIS_OPPORTUNITY_MINER_STORM_THRESHOLD", "50")
+)
+_OPP_MINER_STORM_COOLDOWN_S: float = float(
+    os.environ.get("JARVIS_OPPORTUNITY_MINER_STORM_COOLDOWN_S", "60")
+)
+
+# Matches TodoScanner's _SKIP_DIRS and FileWatchGuard's default excludes —
+# a change in any of these under repo root cannot produce a real
+# opportunity envelope, so skip before parsing.
+_OPP_SKIP_DIRS: frozenset[str] = frozenset({
+    "venv", ".venv", "venv_py39_backup", "node_modules", ".git",
+    "site-packages", "__pycache__", ".worktrees",
+    ".pytest_cache", ".mypy_cache", "build", "dist",
+    ".ouroboros",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +455,21 @@ class OpportunityMinerSensor:
         self._explore_ratio: float = float(
             os.environ.get("JARVIS_MINER_EXPLORE_RATIO", "0.4")
         )
+
+        # --- Gap #4 FS-event state ------------------------------------
+        # Captured at __init__ so a runtime env flip does not retroactively
+        # demote the poll loop; matches the TodoScanner precedent.
+        self._fs_events_mode: bool = fs_events_enabled()
+        self._fs_events_handled: int = 0
+        self._fs_events_ignored: int = 0
+        self._fs_events_debounced: int = 0
+        self._fs_events_storm_dropped: int = 0
+        # Per-file debounce ledger: path → monotonic timestamp of last scan.
+        self._event_debounce: Dict[str, float] = {}
+        # Global burst-rate circuit breaker state.
+        self._storm_window_start: float = 0.0
+        self._storm_window_count: int = 0
+        self._storm_active_until: float = 0.0
 
     # v350.4: Third-party / non-project directory segments
     _NON_PROJECT_SEGMENTS = frozenset({
@@ -981,6 +1062,20 @@ class OpportunityMinerSensor:
         self._poll_task = asyncio.create_task(
             self._poll_loop(), name="opportunity_miner_poll",
         )
+        effective = (
+            _OPP_MINER_FALLBACK_INTERVAL_S
+            if self._fs_events_mode
+            else self._poll_interval_s
+        )
+        mode = (
+            "fs-events-primary (.py change → scan_file; poll=fallback)"
+            if self._fs_events_mode
+            else "poll-primary"
+        )
+        logger.info(
+            "[OpportunityMiner] Started for repo=%s poll_interval=%ds mode=%s",
+            self._repo, int(effective), mode,
+        )
 
     async def stop(self) -> None:
         self._running = False
@@ -999,25 +1094,137 @@ class OpportunityMinerSensor:
     # ------------------------------------------------------------------
 
     async def subscribe_to_bus(self, event_bus: Any) -> None:
-        """Subscribe to file system events for instant complexity detection."""
-        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
-        logger.info("OpportunityMinerSensor: subscribed to fs.changed.* events")
+        """Subscribe to file-system events via ``TrinityEventBus``.
+
+        Gated by ``JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED`` (default
+        OFF). When the flag is off this method is a logged no-op so the
+        legacy 1h-poll behavior is preserved exactly. Caller contract
+        matches every other gap-#4 sensor: ``IntakeLayerService``
+        unconditionally calls ``subscribe_to_bus`` on every sensor that
+        exposes it; the flag check lives here so one sensor's decision
+        doesn't require special-casing at the call site.
+
+        Subscription failures are caught locally — the intake layer must
+        never regress just because TrinityEventBus rejected a
+        subscription.
+        """
+        if not self._fs_events_mode:
+            logger.debug(
+                "[OpportunityMiner] FS-event subscription skipped "
+                "(JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED=false). "
+                "Poll-primary mode active — no gap #4 resolution.",
+            )
+            return
+
+        try:
+            await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        except Exception as exc:
+            logger.warning(
+                "[OpportunityMiner] FS-event subscription failed: %s "
+                "(poll-fallback at %ds continues)",
+                exc, int(_OPP_MINER_FALLBACK_INTERVAL_S),
+            )
+            return
+
+        logger.info(
+            "[OpportunityMiner] subscribed to fs.changed.* — "
+            "FS events now PRIMARY (poll demoted to %ds fallback, "
+            "debounce=%ds, storm_threshold=%d/s, storm_cooldown=%ds)",
+            int(_OPP_MINER_FALLBACK_INTERVAL_S),
+            int(_OPP_MINER_DEBOUNCE_S),
+            _OPP_MINER_STORM_THRESHOLD,
+            int(_OPP_MINER_STORM_COOLDOWN_S),
+        )
 
     async def _on_fs_event(self, event: Any) -> None:
-        """React to file change — analyze only the changed file."""
-        payload = event.payload
+        """React to file change — multi-dim analysis on the changed file.
+
+        Filter order matters: cheapest checks first, so bulk events are
+        dropped before any AST work.
+          1. Extension + test-file filter (near-free).
+          2. Delete-event state cleanup (near-free).
+          3. Storm-guard: active cooldown → drop.
+          4. Skip-dirs filter (string match on path parts).
+          5. Burst-rate update: may push us into storm mode.
+          6. Per-file debounce: path-keyed monotonic window.
+          7. scan_file (AST parse + multi-dim analysis).
+
+        Each filter increments exactly one counter so the
+        handled/ignored/debounced/storm_dropped totals sum to the event
+        count the bus delivered. Exceptions in scan_file never propagate
+        — the bus must stay subscribed.
+        """
+        try:
+            payload = event.payload
+        except AttributeError:
+            self._fs_events_ignored += 1
+            return
+
         if payload.get("extension") != ".py":
+            self._fs_events_ignored += 1
             return
         if payload.get("is_test_file", False):
+            self._fs_events_ignored += 1
             return
         if event.topic == "fs.changed.deleted":
-            self._seen_file_paths.discard(payload.get("relative_path", ""))
-            self._cooldown_map.pop(payload.get("relative_path", ""), None)
+            rel = payload.get("relative_path", "")
+            if rel:
+                self._seen_file_paths.discard(rel)
+                self._cooldown_map.pop(rel, None)
+                self._event_debounce.pop(rel, None)
+            self._fs_events_ignored += 1
             return
+
+        path_raw = payload.get("path")
+        if not path_raw:
+            self._fs_events_ignored += 1
+            return
+        file_path = Path(path_raw)
+
+        # Storm-guard: if we're in an active cooldown window, drop now.
+        now = time.monotonic()
+        if now < self._storm_active_until:
+            self._fs_events_storm_dropped += 1
+            return
+
+        if any(skip in file_path.parts for skip in _OPP_SKIP_DIRS):
+            self._fs_events_ignored += 1
+            return
+
+        # Burst-rate accounting (post skip-dir so bulk venv thrashing
+        # cannot trip the circuit breaker on already-filtered paths).
+        if now - self._storm_window_start >= 1.0:
+            self._storm_window_start = now
+            self._storm_window_count = 1
+        else:
+            self._storm_window_count += 1
+            if self._storm_window_count > _OPP_MINER_STORM_THRESHOLD:
+                self._storm_active_until = now + _OPP_MINER_STORM_COOLDOWN_S
+                self._fs_events_storm_dropped += 1
+                logger.warning(
+                    "[OpportunityMiner] FS-event storm detected "
+                    "(>%d events/s) — dropping events for %ds",
+                    _OPP_MINER_STORM_THRESHOLD,
+                    int(_OPP_MINER_STORM_COOLDOWN_S),
+                )
+                return
+
+        # Per-file debounce — burst-save sprays.
+        rel_for_debounce = payload.get("relative_path") or str(file_path)
+        last_seen = self._event_debounce.get(rel_for_debounce)
+        if last_seen is not None and (now - last_seen) < _OPP_MINER_DEBOUNCE_S:
+            self._fs_events_debounced += 1
+            return
+        self._event_debounce[rel_for_debounce] = now
+
+        self._fs_events_handled += 1
         try:
-            await self.scan_file(Path(payload["path"]))
+            await self.scan_file(file_path)
         except Exception:
-            logger.debug("OpportunityMinerSensor: event-driven scan error", exc_info=True)
+            logger.debug(
+                "[OpportunityMiner] Event-driven scan error",
+                exc_info=True,
+            )
 
     async def scan_file(self, py_file: Path) -> Optional[StaticCandidate]:
         """Analyze a single file for all dimensions (event-driven path)."""
@@ -1109,7 +1316,12 @@ class OpportunityMinerSensor:
                 await self.scan_once()
             except Exception:
                 logger.exception("OpportunityMinerSensor: poll error")
+            effective_interval = (
+                _OPP_MINER_FALLBACK_INTERVAL_S
+                if self._fs_events_mode
+                else self._poll_interval_s
+            )
             try:
-                await asyncio.sleep(self._poll_interval_s)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
