@@ -667,27 +667,68 @@ class UnifiedIntakeRouter:
         # in the CLASSIFY path authorized to populate ctx.attachments from
         # sensor evidence — per I7, all other readers of ctx.attachments are
         # limited to the VisionSensor / visual_verify pair.
+        #
+        # Two ingress shapes are recognized here:
+        #
+        #   1. evidence["vision_signal"]["frame_path"]
+        #        Autonomous path. VisionSensor-emitted envelopes carry a
+        #        single frame captured from Ferrari. kind="sensor_frame",
+        #        optional app_id from the sensor's Quartz inspection.
+        #
+        #   2. evidence["user_attachments"] = [{"path": ...}, ...]
+        #        Human-initiated path. SerpentFlow /attach REPL command
+        #        builds the envelope with one-or-more operator-supplied
+        #        files. kind="user_provided", no app_id. Accepts the full
+        #        _VALID_ATTACHMENT_MIMES set (images + PDFs).
+        #
+        # Both paths converge on ctx.with_attachments() → the GENERATE
+        # phase sees a uniform ctx.attachments surface regardless of
+        # origin. That's exactly the §1 Unified Organism invariant.
         try:
+            from backend.core.ouroboros.governance.op_context import (
+                Attachment,
+            )
+            _hoisted: List[Any] = []
+
+            # (1) VisionSensor autonomous path.
             _vis_sig = (envelope.evidence or {}).get("vision_signal")
             if isinstance(_vis_sig, dict):
                 _frame_path = _vis_sig.get("frame_path")
                 _app_id = _vis_sig.get("app_id")
                 if isinstance(_frame_path, str) and _frame_path:
-                    from backend.core.ouroboros.governance.op_context import (
-                        Attachment,
-                    )
                     _att = Attachment.from_file(
                         _frame_path,
                         kind="sensor_frame",
                         app_id=_app_id if isinstance(_app_id, str) else None,
                     )
-                    ctx = ctx.with_attachments((_att,))
+                    _hoisted.append(_att)
                     logger.info(
                         "[IntakeRouter] attachments_hoisted op=%s kind=sensor_frame "
-                        "hash8=%s app_id=%s source=%s",
-                        envelope.causal_id, _att.hash8,
+                        "hash8=%s mime=%s app_id=%s source=%s",
+                        envelope.causal_id, _att.hash8, _att.mime_type,
                         (_app_id or "-"), envelope.source,
                     )
+
+            # (2) Operator-initiated /attach path.
+            _user_atts = (envelope.evidence or {}).get("user_attachments")
+            if isinstance(_user_atts, (list, tuple)):
+                for _entry in _user_atts:
+                    if not isinstance(_entry, dict):
+                        continue
+                    _p = _entry.get("path")
+                    if not isinstance(_p, str) or not _p:
+                        continue
+                    _att = Attachment.from_file(_p, kind="user_provided")
+                    _hoisted.append(_att)
+                    logger.info(
+                        "[IntakeRouter] attachments_hoisted op=%s kind=user_provided "
+                        "hash8=%s mime=%s basename=%s source=%s",
+                        envelope.causal_id, _att.hash8, _att.mime_type,
+                        os.path.basename(_p), envelope.source,
+                    )
+
+            if _hoisted:
+                ctx = ctx.with_attachments(tuple(_hoisted))
         except Exception as _exc:
             # Never fail intake on attachment issues — the op can still run
             # text-only. Log at DEBUG so a stale frame_path doesn't spam.

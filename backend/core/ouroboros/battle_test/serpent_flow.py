@@ -3252,6 +3252,9 @@ class SerpentREPL:
                     if line in ("/verify-undemote", "verify-undemote"):
                         self._handle_verify_undemote()
                         continue
+                    if line.startswith("/attach") or line.startswith("attach "):
+                        await self._handle_attach(line)
+                        continue
 
                     # ConversationBridge capture (V1: user turns only).
                     # Any line that fell through the built-in dispatch is
@@ -3427,6 +3430,174 @@ class SerpentREPL:
                 f"  [{_C['death']}]GLS does not support cancel (upgrade needed)[/{_C['death']}]",
                 highlight=False,
             )
+
+    # ── /attach — human-initiated multi-modal ingest (CC-parity) ────
+
+    async def _handle_attach(self, line: str) -> None:
+        """Submit a user-provided image or PDF attachment through intake.
+
+        Syntax:  ``/attach <path> [description]``
+
+        The path MUST be absolute and exist. Extension must be in the
+        Attachment mime allow-list (.jpg/.jpeg/.png/.webp/.pdf). File size
+        must be ≤ 10 MiB. Path is subjected to the full Venom protected-
+        path check (``_is_protected_path``) — the same gate that guards
+        Venom's edit_file/write_file/delete_file so credential files,
+        ``.git/``, ``.env``, etc. cannot be uploaded to a provider.
+
+        On success, an IntentEnvelope with ``source="voice_human"`` and
+        ``evidence["user_attachments"] = [{"path": ...}]`` is built via
+        ``make_envelope()`` and ingested through the same UnifiedIntakeRouter
+        that handles sensor-originated envelopes. The router's hoist
+        logic converts the path into an ``Attachment(kind="user_provided")``
+        and populates ctx.attachments — downstream GENERATE sees the
+        image/PDF bytes in the Claude multi-modal payload (document
+        block for PDFs, image block for images).
+
+        Manifesto §1 Unified Organism: this path converges on the same
+        ``ctx.attachments`` surface as VisionSensor's autonomous path.
+        Manifesto §6 Iron Gate: reuses Venom's deny-path set (hardcoded +
+        JARVIS_VENOM_PROTECTED_PATHS env + UserPreference FORBIDDEN_PATH
+        memories) — no new security perimeter to audit.
+        """
+        # Parse "/attach <path> [description...]"
+        parts = line.split(None, 2)
+        # parts[0] is "/attach" (or "attach"); parts[1] is path; parts[2] is description
+        if len(parts) < 2 or not parts[1].strip():
+            self._flow.console.print(
+                f"  [{_C['death']}]Usage: /attach <absolute_path> [description][/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        path = parts[1].strip()
+        description = parts[2].strip() if len(parts) >= 3 else f"user-attached {os.path.basename(path)}"
+
+        # ── Security + validation perimeter ─────────────────────────
+        # Step 1: absolute path required (matches Attachment.from_file).
+        if not os.path.isabs(path):
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach requires absolute path; got {path!r}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        # Step 2: file must exist and be a regular file.
+        if not os.path.isfile(path):
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: file not found or not regular: {path}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        # Step 3: extension must be in the mime allow-list.
+        try:
+            from backend.core.ouroboros.governance.op_context import (
+                _ATTACHMENT_EXT_TO_MIME,
+                _ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: op_context unavailable: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        _ext = os.path.splitext(path)[1].lower()
+        if _ext not in _ATTACHMENT_EXT_TO_MIME:
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: unsupported extension {_ext!r}; allowed: "
+                f"{sorted(_ATTACHMENT_EXT_TO_MIME)}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        # Step 4: size cap (matches per-attachment budget).
+        try:
+            _size = os.path.getsize(path)
+        except OSError as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: cannot stat {path}: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        if _size > _ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT:
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: file is {_size} bytes; cap is "
+                f"{_ATTACHMENT_MAX_IMAGE_BYTES_DEFAULT} (10 MiB)[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        # Step 5: Venom protected-path check (§6 Iron Gate reuse).
+        try:
+            from backend.core.ouroboros.governance.tool_executor import (
+                _is_protected_path,
+            )
+            _reason = _is_protected_path(path)
+            if _reason:
+                self._flow.console.print(
+                    f"  [{_C['death']}]/attach: protected path — {_reason}[/{_C['death']}]",
+                    highlight=False,
+                )
+                return
+        except Exception:  # noqa: BLE001
+            # If the Venom helper is unavailable for any reason, fail
+            # closed rather than skip the check.
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: protected-path check unavailable; refusing[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        # ── Build envelope + submit via intake router ───────────────
+        try:
+            from backend.core.ouroboros.governance.intake.intent_envelope import (
+                make_envelope,
+            )
+            envelope = make_envelope(
+                source="voice_human",  # human-initiated op; same as /resume
+                description=description,
+                target_files=(),  # user-attached ops don't pre-target files
+                repo="jarvis",
+                confidence=0.9,
+                urgency="normal",
+                evidence={
+                    "user_attachments": [
+                        {"path": path, "kind": "user_provided"},
+                    ],
+                    "attach_source": "tui_repl",
+                },
+                requires_human_ack=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: envelope build failed: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        _router = getattr(self._gls, "_intake_router", None)
+        if _router is None:
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: GLS._intake_router unavailable[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        try:
+            verdict = await _router.ingest(envelope)
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/attach: router.ingest raised: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+
+        _env_id = getattr(envelope, "causal_id", "") or getattr(envelope, "signal_id", "")
+        self._flow.console.print(
+            f"  [{_C['evolved']}]✓ /attach submitted: op={_env_id} path={os.path.basename(path)} "
+            f"size={_size}B mime={_ATTACHMENT_EXT_TO_MIME[_ext]} verdict={verdict}[/{_C['evolved']}]",
+            highlight=False,
+        )
 
     # ── Runtime configuration commands ──────────────────────────
 
