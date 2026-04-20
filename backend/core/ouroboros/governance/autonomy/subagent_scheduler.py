@@ -82,22 +82,39 @@ class GenerationSubagentExecutor:
                 raise RuntimeError(f"unknown_repo_root:{unit.repo}")
 
             # --- Worktree isolation: create isolated copy for this unit ---
+            # Manifesto §1 (Boundary) + §6 (Iron Gate): if we promised a
+            # sandbox and cannot obtain it, refuse to execute in the shared
+            # tree. A silent fallback lets parallel units collide on the
+            # main working copy while the contract still promises isolation.
             if self._worktree_manager is not None:
                 _branch = f"unit-{unit.unit_id}-{graph.graph_id}"
                 try:
-                    _worktree_path = await self._worktree_manager.create(_branch)
+                    _created = await self._worktree_manager.create(_branch)
+                    _worktree_path = _created
                     logger.info(
                         "[SubagentExecutor] Worktree created: %s -> %s",
-                        _branch, _worktree_path,
+                        _branch, _created,
                     )
                     # Override repo_root to the isolated worktree
-                    repo_root = _worktree_path
+                    repo_root = _created
                 except Exception as wt_exc:
-                    logger.warning(
-                        "[SubagentExecutor] Worktree creation failed: %s — falling back to shared repo",
-                        wt_exc,
+                    logger.error(
+                        "[SubagentExecutor] Worktree creation failed for %s: %s "
+                        "— unit fails (isolation promised, not obtained)",
+                        _branch, wt_exc,
                     )
-                    _worktree_path = None
+                    return WorkUnitResult(
+                        unit_id=unit.unit_id,
+                        repo=unit.repo,
+                        status=WorkUnitState.FAILED,
+                        patch=None,
+                        attempt_count=1,
+                        started_at_ns=started_at_ns,
+                        finished_at_ns=time.monotonic_ns(),
+                        failure_class="infra",
+                        error=f"worktree_create_failed:{type(wt_exc).__name__}:{wt_exc}",
+                        causal_parent_id=causal_parent_id,
+                    )
 
             op_id = f"{graph.op_id}:{unit.unit_id}"
             subctx = OperationContext.create(

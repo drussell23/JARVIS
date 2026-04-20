@@ -3067,6 +3067,27 @@ class GovernedLoopService:
                         worktree_base=_wt_base,
                     )
                     logger.info("[GovernedLoop] WorktreeManager wired: base=%s", _wt_base)
+
+                    # §2 Progressive Awakening: reap orphan worktrees from any
+                    # prior SIGKILL/OOM/power-loss. finally-block cleanup covers
+                    # normal exits; this covers the rest. Same pattern as
+                    # JARVIS_BATTLE_REAP_ZOMBIES in the battle-test harness.
+                    if os.environ.get(
+                        "JARVIS_WORKTREE_REAP_ORPHANS", "true"
+                    ).lower() in ("true", "1"):
+                        try:
+                            _reaped = await _wt_manager.reap_orphans()
+                            if _reaped > 0:
+                                logger.info(
+                                    "[GovernedLoop] WorktreeManager reaped %d orphan worktree(s) at boot",
+                                    _reaped,
+                                )
+                        except Exception as _reap_exc:  # noqa: BLE001
+                            # Reaper must never break boot.
+                            logger.warning(
+                                "[GovernedLoop] WorktreeManager.reap_orphans failed: %s",
+                                _reap_exc,
+                            )
                 except ImportError:
                     logger.debug("[GovernedLoop] WorktreeManager not available — shared repo mode")
 
