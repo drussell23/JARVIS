@@ -392,10 +392,15 @@ async def run_general_tool_loop(
                 "_ensure_client — likely recycled or uninitialized"
             )
         model_name = str(getattr(provider, "_model", "") or "claude-sonnet-4-5-20250929")
-        # GENERAL tool rounds need modest output (tool JSON ~1K tokens;
-        # final answer ~2K); cap at 4096 to bound cost.
+        # GENERAL tool rounds vary widely. Most tool calls (read_file /
+        # search_code args) are ~1K tokens. But ``edit_file`` ships the
+        # FULL file content in its arguments — a 500-line file is easily
+        # 6-8K tokens. Slice 1b live Test 2 hit truncation at 4096 mid-
+        # edit_file JSON; bump the default to 8192 so typical full-file
+        # writes complete. Still bounded to keep cost predictable;
+        # operators can tune via env.
         max_output = int(os.environ.get(
-            "JARVIS_GENERAL_LLM_MAX_OUTPUT_TOKENS", "4096",
+            "JARVIS_GENERAL_LLM_MAX_OUTPUT_TOKENS", "8192",
         ))
         msg = await client.messages.create(
             model=model_name,
@@ -476,14 +481,21 @@ async def run_general_tool_loop(
     final = parse_general_final_answer(final_text)
     if final is None:
         logger.info(
-            "[GeneralDriver] malformed-final sub=%s final_text_head=%.200s",
-            sub_id, final_text or "",
+            "[GeneralDriver] malformed-final sub=%s tool_calls=%d "
+            "final_text_head=%.200s",
+            sub_id, tool_calls_made, final_text or "",
         )
-        return _failure_exec_trace(
+        # Preserve tool-loop metrics even on malformed final so operator
+        # observability survives parse failure. _failure_exec_trace
+        # defaults tool_calls_made to 0; override here.
+        trace = _failure_exec_trace(
             status="malformed_final",
             raw_output=final_text or "",
             provider_used=primary_name,
         )
+        trace["tool_calls_made"] = tool_calls_made
+        trace["tool_diversity"] = tool_diversity
+        return trace
 
     # 11. Map to exec_trace and return.
     return final_answer_to_exec_trace(
