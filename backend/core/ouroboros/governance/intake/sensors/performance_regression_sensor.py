@@ -41,6 +41,29 @@ _QUALITY_DROP_THRESHOLD = float(
     os.environ.get("JARVIS_PERF_QUALITY_DROP_THRESHOLD", "0.10")
 )
 
+# --- Gap #4 migration: CI webhook primary path (Slice 6) -------------------
+#
+# When ``JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED=true``, CI systems push
+# completion events to ``POST /webhook/ci`` and the EventChannelServer
+# short-circuits relevant ones (failures + explicit benchmark payloads)
+# to ``ingest_webhook`` → ``scan_once``. The 1h poll demotes to a 4h
+# fallback that only catches dropped CI webhooks.
+#
+# Shadow pattern: flag defaults OFF so current poll-every-1h behavior
+# is preserved exactly until a 3-session battle-test arc graduates this
+# flag (matches the CrossRepoDriftSensor Slice 5 precedent rather than
+# the graduated-4 pattern — this is the first CI-surface sensor).
+_PERF_REGRESSION_FALLBACK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_PERF_REGRESSION_FALLBACK_INTERVAL_S", "14400")
+)
+
+
+def webhook_enabled() -> bool:
+    """Re-read ``JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED`` at call-time."""
+    return os.environ.get(
+        "JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED", "false",
+    ).lower() in ("true", "1", "yes")
+
 
 @dataclass
 class RegressionFinding:
@@ -77,15 +100,31 @@ class PerformanceRegressionSensor:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._seen_findings: set[str] = set()
+        # Gap #4 migration captured at __init__. When True, the poll
+        # loop demotes to the fallback interval and CI webhook deliveries
+        # become the reactive hot path. FS/other paths are unchanged.
+        self._webhook_mode: bool = webhook_enabled()
+        self._webhooks_handled: int = 0
+        self._webhooks_ignored: int = 0
 
     async def start(self) -> None:
         self._running = True
         self._task = asyncio.create_task(
             self._poll_loop(), name=f"perf_regression_sensor_{self._repo}"
         )
+        effective = (
+            _PERF_REGRESSION_FALLBACK_INTERVAL_S
+            if self._webhook_mode
+            else self._poll_interval_s
+        )
+        mode = (
+            "ci-webhook-primary (CI completion → scan_once; poll=fallback)"
+            if self._webhook_mode
+            else "poll-primary"
+        )
         logger.info(
-            "[PerfSensor] Started for repo=%s poll_interval=%ds",
-            self._repo, self._poll_interval_s,
+            "[PerfSensor] Started for repo=%s poll_interval=%ds mode=%s",
+            self._repo, int(effective), mode,
         )
 
     def stop(self) -> None:
@@ -104,10 +143,91 @@ class PerformanceRegressionSensor:
                 break
             except Exception:
                 logger.exception("[PerfSensor] Poll error")
+            effective_interval = (
+                _PERF_REGRESSION_FALLBACK_INTERVAL_S
+                if self._webhook_mode
+                else self._poll_interval_s
+            )
             try:
-                await asyncio.sleep(self._poll_interval_s)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
+
+    async def ingest_webhook(self, payload: Dict[str, Any]) -> bool:
+        """Handle one CI system webhook delivery.
+
+        Alternative entry point to the poll loop. Reacts to CI completion
+        events that might indicate a performance regression. Triggers
+        ``scan_once()`` only for **interesting** events:
+
+          * ``status`` (or ``conclusion``) ∈ ``{failure, failed, error}`` —
+            the CI run didn't pass, which by itself is worth re-scanning
+            performance data against (the failure may have produced
+            partial benchmark results, or the broken build may have
+            aborted the suite mid-run).
+          * Payload carries ``benchmark`` / ``metrics`` / ``perf_data``
+            — explicit performance signal sent by a CI job that ran a
+            benchmark suite.
+          * GitHub Actions-as-CI: embedded ``workflow_run.conclusion``
+            is ``failure``.
+
+        Benign events (passing run, no perf data) return ``False`` without
+        triggering a scan — polling the local ``PerformanceRecordPersistence``
+        on every passing build would be as wasteful as the 1h poll it
+        replaces.
+
+        Never raises. Returns ``True`` iff the triggered scan produced
+        at least one new regression finding.
+        """
+        try:
+            if not isinstance(payload, dict):
+                self._webhooks_ignored += 1
+                return False
+
+            status = str(
+                payload.get("status", payload.get("conclusion", "") or "")
+            ).lower()
+            has_benchmark = bool(
+                payload.get("benchmark")
+                or payload.get("metrics")
+                or payload.get("perf_data")
+            )
+
+            # GitHub Actions wraps job state under workflow_run.conclusion
+            workflow_run = payload.get("workflow_run")
+            if isinstance(workflow_run, dict):
+                wr_conclusion = str(
+                    workflow_run.get("conclusion", "") or ""
+                ).lower()
+                if wr_conclusion and not status:
+                    status = wr_conclusion
+
+            is_failure = status in {"failure", "failed", "error"}
+            interesting = is_failure or has_benchmark
+
+            if not interesting:
+                self._webhooks_ignored += 1
+                logger.debug(
+                    "[PerfSensor] CI webhook ignored — status=%s "
+                    "has_benchmark=%s (not regression-relevant)",
+                    status or "(n/a)", has_benchmark,
+                )
+                return False
+
+            self._webhooks_handled += 1
+            logger.info(
+                "[PerfSensor] CI webhook status=%s benchmark=%s — "
+                "triggering scan_once",
+                status or "(n/a)", has_benchmark,
+            )
+            findings = await self.scan_once()
+            return bool(findings)
+        except Exception:
+            logger.debug(
+                "[PerfSensor] CI webhook ingest failed", exc_info=True,
+            )
+            self._webhooks_ignored += 1
+            return False
 
     async def scan_once(self) -> List[RegressionFinding]:
         """Analyze performance records for regressions."""

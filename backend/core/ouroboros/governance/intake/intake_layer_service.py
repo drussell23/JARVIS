@@ -228,6 +228,8 @@ class IntakeLayerService:
         self._doc_staleness_sensor: Optional[Any] = None
         # Slice 5 — CrossRepoDriftSensor handle for push fan-out.
         self._cross_repo_drift_sensor: Optional[Any] = None
+        # Slice 6 — PerformanceRegressionSensor handle for CI webhook route.
+        self._performance_regression_sensor: Optional[Any] = None
         self._event_channel_server: Optional[Any] = None
 
     @property
@@ -595,6 +597,8 @@ class IntakeLayerService:
                 poll_interval_s=_perf_poll_s,
             )
             self._sensors.append(_perf_sensor)
+            # Slice 6 — dedicated reference for EventChannelServer CI routing.
+            self._performance_regression_sensor = _perf_sensor
             logger.info("[IntakeLayer] PerformanceRegressionSensor added (continuous benchmarking)")
         except Exception as exc:
             logger.debug("[IntakeLayer] PerformanceRegressionSensor skipped: %s", exc)
@@ -962,11 +966,19 @@ class IntakeLayerService:
             except Exception:
                 drift_flag_on = False
 
-            if not (gh_flag_on or doc_flag_on or drift_flag_on):
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.performance_regression_sensor import (
+                    webhook_enabled as _perf_webhook_enabled,
+                )
+                perf_flag_on = _perf_webhook_enabled()
+            except Exception:
+                perf_flag_on = False
+
+            if not (gh_flag_on or doc_flag_on or drift_flag_on or perf_flag_on):
                 logger.debug(
                     "[IntakeLayer] EventChannelServer skipped — no "
                     "sensor webhook flag is on (GITHUB + DOC_STALENESS + "
-                    "CROSS_REPO_DRIFT all disabled)",
+                    "CROSS_REPO_DRIFT + PERF_REGRESSION all disabled)",
                 )
                 return
 
@@ -978,6 +990,7 @@ class IntakeLayerService:
             gh_ref = self._github_issue_sensor if gh_flag_on else None
             doc_ref = self._doc_staleness_sensor if doc_flag_on else None
             drift_ref = self._cross_repo_drift_sensor if drift_flag_on else None
+            perf_ref = self._performance_regression_sensor if perf_flag_on else None
 
             if gh_flag_on and gh_ref is None:
                 logger.info(
@@ -993,6 +1006,11 @@ class IntakeLayerService:
                 logger.info(
                     "[IntakeLayer] EventChannelServer: CrossRepoDrift flag "
                     "is on but no CrossRepoDriftSensor wired",
+                )
+            if perf_flag_on and perf_ref is None:
+                logger.info(
+                    "[IntakeLayer] EventChannelServer: PerformanceRegression "
+                    "flag is on but no PerformanceRegressionSensor wired",
                 )
 
             try:
@@ -1011,6 +1029,7 @@ class IntakeLayerService:
                 github_issue_sensor=gh_ref,
                 doc_staleness_sensor=doc_ref,
                 cross_repo_drift_sensor=drift_ref,
+                performance_regression_sensor=perf_ref,
             )
             if not server.is_enabled:
                 logger.info(
@@ -1031,9 +1050,11 @@ class IntakeLayerService:
                 push_sensors.append("CrossRepoDriftSensor")
             if push_sensors:
                 active_paths.append(f"push→[{','.join(push_sensors)}]")
+            if perf_ref is not None:
+                active_paths.append("ci→PerformanceRegressionSensor")
             logger.info(
                 "[IntakeLayer] EventChannelServer activated — "
-                "github webhooks now route: %s",
+                "webhooks now route: %s",
                 ", ".join(active_paths) or "(none)",
             )
         except Exception as exc:

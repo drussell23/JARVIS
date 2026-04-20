@@ -850,6 +850,130 @@ async def check_push_fan_out() -> Tuple[bool, str]:
 # Registry
 # ===========================================================================
 
+# ===========================================================================
+# CHECK: perf_regression_ci_webhook
+# ===========================================================================
+
+async def check_perf_regression_ci_webhook() -> Tuple[bool, str]:
+    """Slice 6 proof: HTTP POST /webhook/ci with a 'failed' status routes
+    to PerformanceRegressionSensor.ingest_webhook, which triggers scan_once.
+    Full HTTP round-trip on an ephemeral port with verified health-endpoint
+    telemetry for the new performance_regression_sensor sub-object.
+    """
+    import json
+    try:
+        import aiohttp
+    except ImportError:
+        return False, "aiohttp not available"
+
+    prev_perf = os.environ.get("JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED")
+    prev_ch = os.environ.get("JARVIS_EVENT_CHANNELS_ENABLED")
+    os.environ["JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED"] = "true"
+    os.environ["JARVIS_EVENT_CHANNELS_ENABLED"] = "true"
+
+    try:
+        from backend.core.ouroboros.governance.event_channel import EventChannelServer
+        from backend.core.ouroboros.governance.intake.sensors.performance_regression_sensor import (
+            PerformanceRegressionSensor,
+        )
+
+        class _SpyRouter:
+            def __init__(self) -> None:
+                self.envelopes: List[Any] = []
+
+            async def ingest(self, envelope: Any) -> str:
+                self.envelopes.append(envelope)
+                return "enqueued"
+
+        router = _SpyRouter()
+        sensor = PerformanceRegressionSensor(
+            repo="jarvis", router=router, poll_interval_s=3600.0,
+        )
+
+        scan_calls: List[int] = []
+
+        async def _spy_scan() -> list:
+            scan_calls.append(1)
+            return []
+
+        sensor.scan_once = _spy_scan  # type: ignore[assignment]
+
+        server = EventChannelServer(
+            router=router, port=0, host="127.0.0.1",
+            performance_regression_sensor=sensor,
+        )
+
+        await server.start()
+        try:
+            site = server._site
+            if site is None:
+                return False, "server failed to start"
+            sock = site._server.sockets[0]  # type: ignore[attr-defined]
+            port = int(sock.getsockname()[1])
+
+            payload = {
+                "status": "failed",
+                "name": "ov-smoke-pipeline",
+                "message": "benchmark stage failed on latency threshold",
+            }
+
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    f"http://127.0.0.1:{port}/webhook/ci",
+                    data=json.dumps(payload),
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status != 200:
+                        return False, f"HTTP POST returned {resp.status}"
+                async with client.get(
+                    f"http://127.0.0.1:{port}/channel/health",
+                ) as hresp:
+                    if hresp.status != 200:
+                        return False, f"health endpoint returned {hresp.status}"
+                    health = await hresp.json()
+
+            if len(scan_calls) != 1:
+                return False, (
+                    f"expected scan_once() once, got {len(scan_calls)}"
+                )
+            if sensor._webhooks_handled != 1:
+                return False, (
+                    f"sensor._webhooks_handled expected 1, got "
+                    f"{sensor._webhooks_handled}"
+                )
+
+            perf = health.get("performance_regression_sensor", {})
+            if not perf.get("webhook_mode"):
+                return False, "health.performance_regression_sensor.webhook_mode must be True"
+            if perf.get("ci_ignored") != 1:
+                # Scan returned [] -> emitted False -> counted as ignored
+                return False, (
+                    f"ci_ignored expected 1 (empty scan), got "
+                    f"{perf.get('ci_ignored')}"
+                )
+
+            return True, (
+                f"PASS — HTTP CI webhook routed to PerformanceRegression "
+                f"port={port} scan_calls={len(scan_calls)} "
+                f"ci_ignored={perf.get('ci_ignored')}"
+            )
+        finally:
+            await server.stop()
+    finally:
+        for key, prev in (
+            ("JARVIS_PERF_REGRESSION_WEBHOOK_ENABLED", prev_perf),
+            ("JARVIS_EVENT_CHANNELS_ENABLED", prev_ch),
+        ):
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
+# ===========================================================================
+# Registry
+# ===========================================================================
+
 CHECKS: Dict[str, Callable[[], Awaitable[Tuple[bool, str]]]] = {
     "review_shadow": check_review_shadow,
     "webhook_routing": check_webhook_routing,
@@ -857,6 +981,7 @@ CHECKS: Dict[str, Callable[[], Awaitable[Tuple[bool, str]]]] = {
     "fs_event_routing": check_fs_event_routing,
     "doc_staleness_push_webhook": check_doc_staleness_push_webhook,
     "push_fan_out": check_push_fan_out,
+    "perf_regression_ci_webhook": check_perf_regression_ci_webhook,
 }
 
 

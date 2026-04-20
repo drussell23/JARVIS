@@ -103,6 +103,7 @@ class EventChannelServer:
         github_issue_sensor: Any = None,  # Optional[GitHubIssueSensor]
         doc_staleness_sensor: Any = None,  # Optional[DocStalenessSensor]
         cross_repo_drift_sensor: Any = None,  # Optional[CrossRepoDriftSensor]
+        performance_regression_sensor: Any = None,  # Optional[PerformanceRegressionSensor]
     ) -> None:
         self._router = router
         self._port = port
@@ -143,6 +144,15 @@ class EventChannelServer:
         self._last_drift_push_at: float = 0.0
         self._drift_pushes_emitted: int = 0
         self._drift_pushes_ignored: int = 0
+        # Slice 6 — PerformanceRegressionSensor CI webhook deliveries.
+        # First CI-surface sensor; uses the single-short-circuit pattern
+        # from Slices 1/2 (vs the fan-out Slice 5 uses for multi-sensor
+        # push). If a second CI-reactive sensor lands, refactor to the
+        # same fan-out dispatcher pattern.
+        self._performance_regression_sensor = performance_regression_sensor
+        self._last_perf_ci_at: float = 0.0
+        self._perf_ci_emitted: int = 0
+        self._perf_ci_ignored: int = 0
 
     @property
     def is_enabled(self) -> bool:
@@ -441,6 +451,66 @@ class EventChannelServer:
         except json.JSONDecodeError:
             return web.Response(status=400, text="Invalid JSON")
 
+        # --- Slice 6 short-circuit — CI → PerformanceRegressionSensor ---
+        #
+        # First CI-surface sensor to migrate. Uses a single-sensor
+        # short-circuit (pre-Slice-5 pattern). When a second
+        # CI-reactive sensor lands, refactor to a fan-out dispatcher
+        # identical to the push-handler pattern in `_handle_github`.
+        # Falls through to the generic ``_route_event`` path when the
+        # sensor isn't wired or the flag is off — preserves pre-Slice-6
+        # behavior so operators who haven't opted in see no change.
+        if self._performance_regression_sensor is not None:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.performance_regression_sensor import (
+                    webhook_enabled as _perf_webhook_enabled,
+                )
+                perf_flag_on = _perf_webhook_enabled()
+            except Exception:
+                perf_flag_on = False
+            if perf_flag_on:
+                status_hint = str(
+                    payload.get("status", payload.get("conclusion", "?"))
+                )
+                t0 = time.monotonic()
+                try:
+                    emitted = await asyncio.wait_for(
+                        self._performance_regression_sensor.ingest_webhook(payload),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[EventChannel] PerformanceRegressionSensor.ingest_webhook "
+                        "timed out after 30s (status=%s)", status_hint,
+                    )
+                    emitted = False
+                except Exception:
+                    logger.debug(
+                        "[EventChannel] PerformanceRegressionSensor.ingest_webhook raised",
+                        exc_info=True,
+                    )
+                    emitted = False
+                duration_ms = int((time.monotonic() - t0) * 1000)
+
+                self._stats.total_events += 1
+                self._stats.last_event_at = time.time()
+                self._stats.events_by_source["ci"] = (
+                    self._stats.events_by_source.get("ci", 0) + 1
+                )
+                self._last_perf_ci_at = time.time()
+                if emitted:
+                    self._stats.events_routed += 1
+                    self._perf_ci_emitted += 1
+                else:
+                    self._perf_ci_ignored += 1
+                logger.info(
+                    "[EventChannel] ci/event delivered "
+                    "sensor=PerformanceRegressionSensor status=%s "
+                    "emitted=%s duration_ms=%d",
+                    status_hint, emitted, duration_ms,
+                )
+                return web.Response(status=200, text="OK")
+
         event = ChannelEvent(
             source="ci",
             event_type=payload.get("event", payload.get("action", "unknown")),
@@ -587,6 +657,18 @@ class EventChannelServer:
             except Exception:
                 drift_webhook_mode = False
 
+        # Slice 6 — expose PerformanceRegressionSensor CI-webhook state.
+        perf_wired = self._performance_regression_sensor is not None
+        perf_webhook_mode = False
+        if perf_wired:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.performance_regression_sensor import (
+                    webhook_enabled as _perf_webhook_enabled,
+                )
+                perf_webhook_mode = bool(_perf_webhook_enabled())
+            except Exception:
+                perf_webhook_mode = False
+
         return web.json_response({
             "status": "healthy",
             "total_events": self._stats.total_events,
@@ -614,6 +696,13 @@ class EventChannelServer:
                 "last_push_at": self._last_drift_push_at,
                 "pushes_emitted": self._drift_pushes_emitted,
                 "pushes_ignored": self._drift_pushes_ignored,
+            },
+            "performance_regression_sensor": {
+                "wired": perf_wired,
+                "webhook_mode": perf_webhook_mode,
+                "last_ci_at": self._last_perf_ci_at,
+                "ci_emitted": self._perf_ci_emitted,
+                "ci_ignored": self._perf_ci_ignored,
             },
         })
 
