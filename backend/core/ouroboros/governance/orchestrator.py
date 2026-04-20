@@ -858,11 +858,11 @@ class GovernedOrchestrator:
             )
 
     async def _run_plan_shadow(self, ctx: Any) -> Any:
-        """Phase B PLAN-shadow (Slice 1b) — AgenticPlanSubagent dispatch
-        running alongside the legacy ``PlanGenerator`` as an observer.
+        """Phase B PLAN-shadow — AgenticPlanSubagent dispatch running
+        alongside the legacy ``PlanGenerator`` as an observer.
 
-        Gated by ``JARVIS_PLAN_SUBAGENT_SHADOW`` (default ``false``). When
-        on, this hook:
+        Gated by ``JARVIS_PLAN_SUBAGENT_SHADOW`` (default **``true``**,
+        graduated 2026-04-20). When on, this hook:
           * Dispatches the PLAN subagent with ctx.target_files + description
           * Receives an execution_graph 2d.1-shaped payload back
           * Stashes the payload into ``ctx.execution_graph`` **without
@@ -880,7 +880,7 @@ class GovernedOrchestrator:
         if self._subagent_orchestrator is None:
             return ctx
         if os.environ.get(
-            "JARVIS_PLAN_SUBAGENT_SHADOW", "false",
+            "JARVIS_PLAN_SUBAGENT_SHADOW", "true",
         ).lower() not in ("true", "1"):
             return ctx
 

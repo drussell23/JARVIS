@@ -787,9 +787,12 @@ def _build_ctx(*, op_id="op-plan-shadow-test", target_files=("a.py", "b.py"),
 async def test_run_plan_shadow_noop_when_flag_off(
     monkeypatch, caplog,
 ) -> None:
-    """Flag off (default) → dispatch NOT called, no [PLAN-SHADOW] log."""
+    """Flag explicitly ``false`` → dispatch NOT called, no [PLAN-SHADOW] log.
+
+    Post-graduation (2026-04-20) the shadow default is ``true``, so this
+    test pins the opt-out branch via explicit setenv("false")."""
     import logging as _logging
-    monkeypatch.delenv("JARVIS_PLAN_SUBAGENT_SHADOW", raising=False)
+    monkeypatch.setenv("JARVIS_PLAN_SUBAGENT_SHADOW", "false")
 
     ctx = _build_ctx()
     stub, captured = _make_plan_shadow_stub(ctx_shape={"op_id": ctx.op_id})
