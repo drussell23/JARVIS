@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,34 @@ from typing import Any, Dict, List, Optional
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope, IntentEnvelope
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Gap #4 migration: FS-event-primary mode
+# ---------------------------------------------------------------------------
+#
+# When ``JARVIS_BACKLOG_FS_EVENTS_ENABLED=true``, TrinityEventBus
+# ``fs.changed.*`` events become the primary trigger: a write to
+# ``.jarvis/backlog.json`` → instant rescan at pub/sub latency, not a
+# 60s poll cycle. Poll demotes to ``JARVIS_BACKLOG_FALLBACK_INTERVAL_S``
+# (default 3600s = 1h) as a safety net for dropped events.
+#
+# Shadow pattern: flag defaults OFF so current 60s-poll behavior is
+# preserved until a behavioral graduation arc flips it. backlog.json is
+# a single operator-edited file, so no storm-guard is needed — the path
+# filter on "backlog.json" suffix is tight enough that a bulk mutation
+# cannot hit this handler more than once per write.
+def fs_events_enabled() -> bool:
+    """Re-read ``JARVIS_BACKLOG_FS_EVENTS_ENABLED`` at call-time."""
+    return os.environ.get(
+        "JARVIS_BACKLOG_FS_EVENTS_ENABLED", "false",
+    ).lower() in ("true", "1", "yes")
+
+
+_BACKLOG_FALLBACK_INTERVAL_S: float = float(
+    os.environ.get("JARVIS_BACKLOG_FALLBACK_INTERVAL_S", "3600")
+)
+
 
 _PRIORITY_URGENCY: Dict[int, str] = {
     5: "high",
@@ -80,6 +109,12 @@ class BacklogSensor:
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
         self._seen_task_ids: set[str] = set()
+        # --- Gap #4 FS-event state (captured once so a runtime env flip
+        # does not retroactively demote the poll loop; matches every
+        # earlier sensor migration) ----------------------------------
+        self._fs_events_mode: bool = fs_events_enabled()
+        self._fs_events_handled: int = 0
+        self._fs_events_ignored: int = 0
 
     async def scan_once(self) -> List[IntentEnvelope]:
         """Run one scan. Returns list of envelopes produced and ingested."""
@@ -139,6 +174,20 @@ class BacklogSensor:
         self._poll_task = asyncio.create_task(
             self._poll_loop(), name="backlog_sensor_poll",
         )
+        effective = (
+            _BACKLOG_FALLBACK_INTERVAL_S
+            if self._fs_events_mode
+            else self._poll_interval_s
+        )
+        mode = (
+            "fs-events-primary (backlog.json change → scan_once; poll=fallback)"
+            if self._fs_events_mode
+            else "poll-primary"
+        )
+        logger.info(
+            "[BacklogSensor] Started poll_interval=%ds mode=%s backlog_path=%s",
+            int(effective), mode, self._backlog_path,
+        )
 
     async def stop(self) -> None:
         self._running = False
@@ -157,20 +206,74 @@ class BacklogSensor:
     # ------------------------------------------------------------------
 
     async def subscribe_to_bus(self, event_bus: Any) -> None:
-        """Subscribe to file system events for instant backlog detection."""
-        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
-        logger.info("BacklogSensor: subscribed to fs.changed.* events")
+        """Subscribe to file-system events via ``TrinityEventBus``.
+
+        Gated by ``JARVIS_BACKLOG_FS_EVENTS_ENABLED`` (default OFF). When
+        the flag is off this method is a logged no-op so legacy 60s-poll
+        behavior is preserved exactly. Caller contract matches every
+        other gap-#4 sensor: ``IntakeLayerService`` unconditionally calls
+        ``subscribe_to_bus`` on every sensor that exposes it; the flag
+        check lives here so one sensor's decision doesn't require
+        special-casing at the call site.
+
+        Subscription failures are caught locally — the intake layer must
+        never regress just because TrinityEventBus rejected a
+        subscription.
+        """
+        if not self._fs_events_mode:
+            logger.debug(
+                "[BacklogSensor] FS-event subscription skipped "
+                "(JARVIS_BACKLOG_FS_EVENTS_ENABLED=false). "
+                "Poll-primary mode active — no gap #4 resolution.",
+            )
+            return
+
+        try:
+            await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        except Exception as exc:
+            logger.warning(
+                "[BacklogSensor] FS-event subscription failed: %s "
+                "(poll-fallback at %ds continues)",
+                exc, int(_BACKLOG_FALLBACK_INTERVAL_S),
+            )
+            return
+
+        logger.info(
+            "[BacklogSensor] subscribed to fs.changed.* — "
+            "FS events now PRIMARY (poll demoted to %ds fallback)",
+            int(_BACKLOG_FALLBACK_INTERVAL_S),
+        )
 
     async def _on_fs_event(self, event: Any) -> None:
-        """React to file change — rescan if backlog.json was modified."""
-        rel_path = event.payload.get("relative_path", "")
-        if not rel_path.endswith("backlog.json"):
+        """React to file change — rescan if backlog.json was modified.
+
+        The filter on ``backlog.json`` suffix is tight enough that bulk
+        mutations elsewhere in the tree can never reach scan_once — no
+        storm-guard is required. Non-matching events bump the
+        ``_fs_events_ignored`` counter; matching events bump
+        ``_fs_events_handled`` and log the explicit FS-event origin so
+        operators can distinguish it from the fallback poll.
+        """
+        try:
+            payload = event.payload
+        except AttributeError:
+            self._fs_events_ignored += 1
             return
-        logger.debug("BacklogSensor: backlog.json changed, rescanning")
+        rel_path = payload.get("relative_path", "") if payload else ""
+        if not rel_path.endswith("backlog.json"):
+            self._fs_events_ignored += 1
+            return
+        self._fs_events_handled += 1
+        logger.info(
+            "[BacklogSensor] scan trigger=fs_event path=%s topic=%s",
+            rel_path, getattr(event, "topic", "<unknown>"),
+        )
         try:
             await self.scan_once()
         except Exception:
-            logger.debug("BacklogSensor: event-driven scan error", exc_info=True)
+            logger.debug(
+                "[BacklogSensor] event-driven scan error", exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Poll fallback (safety net when event spine is unavailable)
@@ -179,10 +282,19 @@ class BacklogSensor:
     async def _poll_loop(self) -> None:
         while self._running:
             try:
+                logger.debug(
+                    "[BacklogSensor] scan trigger=%s",
+                    "fallback_poll" if self._fs_events_mode else "poll",
+                )
                 await self.scan_once()
             except Exception:
                 logger.exception("BacklogSensor: poll error")
+            effective_interval = (
+                _BACKLOG_FALLBACK_INTERVAL_S
+                if self._fs_events_mode
+                else self._poll_interval_s
+            )
             try:
-                await asyncio.sleep(self._poll_interval_s)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
