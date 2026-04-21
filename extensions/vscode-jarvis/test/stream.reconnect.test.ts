@@ -78,7 +78,13 @@ test('backoff uses jitter and respects max cap', async () => {
       return new Response('x', { status: 503 });
     },
     jitterFn: () => 0.5,
-    sleepFn: async (ms) => { sleepsObserved.push(ms); },
+    sleepFn: async (ms) => {
+      sleepsObserved.push(ms);
+      // Yield to the macrotask queue so the outer `waitUntil` can
+      // observe progress. A pure-microtask sleepFn would starve
+      // setTimeout callbacks and never exit the loop.
+      await new Promise<void>((r) => setImmediate(r));
+    },
   });
   consumer.start();
   await waitUntil(() => sleepsObserved.length >= 2, 2000);
@@ -105,7 +111,9 @@ test('Last-Event-ID header sent on reconnect', async () => {
       return mkStreamResponse([], { never: true });
     }) as unknown as typeof fetch,
     jitterFn: () => 0.01,
-    sleepFn: async () => { /* no wait */ },
+    sleepFn: async () => {
+      await new Promise<void>((r) => setImmediate(r));
+    },
   });
   consumer.start();
   await waitUntil(() => urlsAndHeaders.length >= 2, 2000);
