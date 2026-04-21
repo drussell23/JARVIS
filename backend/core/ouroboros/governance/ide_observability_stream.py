@@ -135,6 +135,16 @@ EVENT_TYPE_CONTEXT_PINNED = "context_pinned"
 EVENT_TYPE_CONTEXT_UNPINNED = "context_unpinned"
 EVENT_TYPE_CONTEXT_PIN_EXPIRED = "context_pin_expired"
 
+# Session Browser extension arc Slice 3 — session history stream vocab.
+# Fired by session_stream_bridge.py bridging SessionIndex / BookmarkStore
+# listeners onto the broker. Pure observability — no authority surface.
+EVENT_TYPE_SESSION_ADDED = "session_added"
+EVENT_TYPE_SESSION_RESCAN = "session_rescan"
+EVENT_TYPE_SESSION_BOOKMARKED = "session_bookmarked"
+EVENT_TYPE_SESSION_UNBOOKMARKED = "session_unbookmarked"
+EVENT_TYPE_SESSION_PINNED = "session_pinned"
+EVENT_TYPE_SESSION_UNPINNED = "session_unpinned"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -162,6 +172,12 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CONTEXT_PINNED,
     EVENT_TYPE_CONTEXT_UNPINNED,
     EVENT_TYPE_CONTEXT_PIN_EXPIRED,
+    EVENT_TYPE_SESSION_ADDED,
+    EVENT_TYPE_SESSION_RESCAN,
+    EVENT_TYPE_SESSION_BOOKMARKED,
+    EVENT_TYPE_SESSION_UNBOOKMARKED,
+    EVENT_TYPE_SESSION_PINNED,
+    EVENT_TYPE_SESSION_UNPINNED,
 })
 
 

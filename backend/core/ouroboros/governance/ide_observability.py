@@ -150,6 +150,11 @@ def assert_loopback_only(host: str) -> None:
 # at the URL boundary: disallow anything outside [-_A-Za-z0-9].
 _OP_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 
+# Session ids include ``:`` and ``.`` (timestamp format). Match the
+# session_browser module's regex so this surface accepts the same
+# ids the browser does.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-:.]{1,128}$")
+
 
 class IDEObservabilityRouter:
     """Mounts the GET /observability/* routes on a caller-supplied
@@ -184,6 +189,14 @@ class IDEObservabilityRouter:
         )
         app.router.add_get(
             "/observability/plans/{op_id}", self._handle_plan_detail,
+        )
+        # Session History Browser extension arc Slice 4 — sessions surface.
+        app.router.add_get(
+            "/observability/sessions", self._handle_session_list,
+        )
+        app.router.add_get(
+            "/observability/sessions/{session_id}",
+            self._handle_session_detail,
         )
 
     # --- request-path helpers ---------------------------------------------
@@ -290,7 +303,9 @@ class IDEObservabilityRouter:
             {
                 "enabled": True,
                 "api_version": IDE_OBSERVABILITY_SCHEMA_VERSION,
-                "surface": "tasks",  # which data domains are live
+                # Which data domains are live — documented surface
+                # contract IDE clients feature-detect against.
+                "surface": "tasks,plans,sessions",
                 "now_mono": time.monotonic(),
             },
         )
@@ -468,3 +483,185 @@ class IDEObservabilityRouter:
                 request, 404, "ide_observability.unknown_op_id",
             )
         return self._json_response(request, 200, snap)
+
+    # ------------------------------------------------------------------
+    # Session Browser routes (extension arc Slice 4)
+    # ------------------------------------------------------------------
+
+    def _projected_session(
+        self, rec: Any, bookmark: Optional[Any],
+    ) -> Dict[str, Any]:
+        """Compose the session projection shipped over the wire.
+
+        Extends :meth:`SessionRecord.project` with the three
+        operator-owned bits BookmarkStore holds: ``bookmarked``,
+        ``pinned``, ``bookmark_note``, ``bookmark_ts``.
+        """
+        p = dict(rec.project())
+        p["bookmarked"] = bookmark is not None
+        p["pinned"] = bool(bookmark is not None and bookmark.pinned)
+        p["bookmark_note"] = bookmark.note if bookmark is not None else None
+        p["bookmark_ts"] = (
+            bookmark.created_at_iso if bookmark is not None else None
+        )
+        return p
+
+    def _parse_bool_query(
+        self, value: Optional[str],
+    ) -> Optional[bool]:
+        """Lenient bool parser for query strings.
+
+        Accepts ``"true"`` / ``"false"`` (case-insensitive); anything
+        else → ``None`` (treat as "filter not applied").
+        """
+        if value is None:
+            return None
+        v = value.strip().lower()
+        if v == "true":
+            return True
+        if v == "false":
+            return False
+        return None
+
+    async def _handle_session_list(self, request: "web.Request") -> Any:
+        """GET /observability/sessions — list of session projections.
+
+        Query params (all optional):
+          * ``ok``          — ``true``/``false``  filter by ok_outcome
+          * ``bookmarked``  — ``true``/``false``  only bookmarked / not
+          * ``pinned``      — ``true``/``false``  only pinned / not
+          * ``has_replay``  — ``true``/``false``  has replay.html or not
+          * ``parse_error`` — ``true``/``false``  corrupt records only / not
+          * ``prefix``      — session_id prefix (regex-bound)
+          * ``limit``       — 1..1000 (default 100)
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "sessions": [<projection>, ...],
+              "count": N
+            }
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        # Parse limit
+        try:
+            limit = int(request.query.get("limit", "100"))
+        except ValueError:
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        if limit < 1 or limit > 1000:
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        # Parse filters
+        filters: Dict[str, Any] = {}
+        ok_flag = self._parse_bool_query(request.query.get("ok"))
+        if ok_flag is not None:
+            filters["ok_outcome"] = ok_flag
+        has_replay_flag = self._parse_bool_query(
+            request.query.get("has_replay"),
+        )
+        if has_replay_flag is not None:
+            filters["has_replay"] = has_replay_flag
+        parse_error_flag = self._parse_bool_query(
+            request.query.get("parse_error"),
+        )
+        if parse_error_flag is not None:
+            filters["parse_error"] = parse_error_flag
+        prefix = request.query.get("prefix", "").strip()
+        if prefix:
+            if not _SESSION_ID_RE.match(prefix):
+                return self._error_response(
+                    request, 400,
+                    "ide_observability.malformed_prefix",
+                )
+            filters["session_id_prefix"] = prefix
+        # These two post-filter on bookmark state, not on index fields.
+        bookmarked_flag = self._parse_bool_query(
+            request.query.get("bookmarked"),
+        )
+        pinned_flag = self._parse_bool_query(request.query.get("pinned"))
+
+        # Lazy import to avoid a module-load cycle.
+        from backend.core.ouroboros.governance.session_browser import (
+            get_default_session_browser,
+        )
+        browser = get_default_session_browser()
+        browser.index.scan()
+        if filters:
+            records = browser.index.filter(**filters)
+        else:
+            records = browser.index.all_records()
+        bookmarks_by_id = {
+            bm.session_id: bm for bm in browser.bookmarks.list_all()
+        }
+
+        sessions: List[Dict[str, Any]] = []
+        for r in records:
+            bm = bookmarks_by_id.get(r.session_id)
+            is_bookmarked = bm is not None
+            is_pinned = is_bookmarked and bm.pinned
+            if bookmarked_flag is True and not is_bookmarked:
+                continue
+            if bookmarked_flag is False and is_bookmarked:
+                continue
+            if pinned_flag is True and not is_pinned:
+                continue
+            if pinned_flag is False and is_pinned:
+                continue
+            sessions.append(self._projected_session(r, bm))
+            if len(sessions) >= limit:
+                break
+        return self._json_response(
+            request, 200,
+            {"sessions": sessions, "count": len(sessions)},
+        )
+
+    async def _handle_session_detail(self, request: "web.Request") -> Any:
+        """GET /observability/sessions/{session_id} — full projection.
+
+        404 on unknown session id; 400 on malformed. The shape mirrors
+        the list-item projection with the same ``bookmarked`` /
+        ``pinned`` / ``bookmark_note`` / ``bookmark_ts`` overlay.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        session_id = request.match_info.get("session_id", "")
+        if not _SESSION_ID_RE.match(session_id):
+            return self._error_response(
+                request, 400,
+                "ide_observability.malformed_session_id",
+            )
+        from backend.core.ouroboros.governance.session_browser import (
+            get_default_session_browser,
+        )
+        browser = get_default_session_browser()
+        rec = browser.show(session_id)
+        if rec is None:
+            return self._error_response(
+                request, 404,
+                "ide_observability.unknown_session_id",
+            )
+        bookmarks_by_id = {
+            bm.session_id: bm for bm in browser.bookmarks.list_all()
+        }
+        bm = bookmarks_by_id.get(session_id)
+        return self._json_response(
+            request, 200,
+            self._projected_session(rec, bm),
+        )

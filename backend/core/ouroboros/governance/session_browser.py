@@ -296,6 +296,11 @@ class Bookmark:
     session_id: str
     note: str = ""
     created_at_iso: str = ""
+    # Extension arc Slice 2: a bookmark can additionally be "pinned" —
+    # pinned bookmarks surface at the top of the REPL default view and
+    # in IDE observability filters. Backward-compat: the deserializer
+    # tolerates legacy JSON without this key.
+    pinned: bool = False
 
 
 class BookmarkStore:
@@ -315,6 +320,10 @@ class BookmarkStore:
         self._path = Path(base) / _BOOKMARK_FILENAME
         self._lock = threading.Lock()
         self._bookmarks: Dict[str, Bookmark] = {}
+        # Extension arc Slice 3: listener hook — extension bridge
+        # subscribes here to project bookmark/pin transitions onto the
+        # IDE stream broker.
+        self._listeners: List[Callable[[Dict[str, Any]], None]] = []
         self._load()
 
     # --- persistence ----------------------------------------------------
@@ -353,6 +362,7 @@ class BookmarkStore:
                 session_id=sid,
                 note=str(item.get("note", "") or "")[:500],
                 created_at_iso=str(item.get("created_at_iso", "") or ""),
+                pinned=bool(item.get("pinned", False)),
             )
             self._bookmarks[sid] = bm
 
@@ -364,6 +374,7 @@ class BookmarkStore:
                     "session_id": bm.session_id,
                     "note": bm.note,
                     "created_at_iso": bm.created_at_iso,
+                    "pinned": bm.pinned,
                 }
                 for bm in self._bookmarks.values()
             ]
@@ -379,6 +390,16 @@ class BookmarkStore:
 
     # --- public API -----------------------------------------------------
 
+    def _emit(self, payload: Dict[str, Any]) -> None:
+        """Fire listeners best-effort (never raises)."""
+        for l in list(self._listeners):
+            try:
+                l(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[BookmarkStore] listener raise: %s", exc,
+                )
+
     def add(self, session_id: str, *, note: str = "") -> Bookmark:
         if not _SESSION_ID_RX.match(session_id):
             raise SessionBrowserError(
@@ -387,14 +408,26 @@ class BookmarkStore:
         iso = datetime.now(timezone.utc).replace(
             microsecond=0,
         ).isoformat()
-        bm = Bookmark(
-            session_id=session_id,
-            note=(note or "").strip()[:500],
-            created_at_iso=iso,
-        )
         with self._lock:
+            existing = self._bookmarks.get(session_id)
+            bm = Bookmark(
+                session_id=session_id,
+                note=(note or "").strip()[:500],
+                created_at_iso=(
+                    existing.created_at_iso if existing else iso
+                ),
+                # Preserve pinned state across re-add; add alone does
+                # not flip it.
+                pinned=existing.pinned if existing else False,
+            )
             self._bookmarks[session_id] = bm
             self._persist()
+        self._emit({
+            "event_type": "bookmark_added",
+            "session_id": session_id,
+            "note": bm.note,
+            "pinned": bm.pinned,
+        })
         return bm
 
     def remove(self, session_id: str) -> bool:
@@ -403,7 +436,108 @@ class BookmarkStore:
             self._bookmarks.pop(session_id, None)
             if existed:
                 self._persist()
+        if existed:
+            self._emit({
+                "event_type": "bookmark_removed",
+                "session_id": session_id,
+            })
         return existed
+
+    # --- pin / unpin — extension arc Slice 2 ----------------------------
+
+    def pin(self, session_id: str, *, note: str = "") -> Bookmark:
+        """Pin a session. Promotes an existing bookmark or creates one.
+
+        Raises :class:`SessionBrowserError` on malformed session id.
+        A pinned bookmark survives :meth:`unpin` — it keeps the
+        bookmark but clears the pinned flag. Use :meth:`remove` to
+        delete entirely.
+        """
+        if not _SESSION_ID_RX.match(session_id):
+            raise SessionBrowserError(
+                f"invalid session id: {session_id!r}"
+            )
+        iso = datetime.now(timezone.utc).replace(
+            microsecond=0,
+        ).isoformat()
+        with self._lock:
+            existing = self._bookmarks.get(session_id)
+            effective_note = (note or "").strip()[:500]
+            if not effective_note and existing is not None:
+                effective_note = existing.note
+            bm = Bookmark(
+                session_id=session_id,
+                note=effective_note,
+                created_at_iso=(
+                    existing.created_at_iso if existing else iso
+                ),
+                pinned=True,
+            )
+            self._bookmarks[session_id] = bm
+            self._persist()
+        self._emit({
+            "event_type": "bookmark_pinned",
+            "session_id": session_id,
+            "note": bm.note,
+        })
+        return bm
+
+    def unpin(self, session_id: str) -> bool:
+        """Clear the pinned flag on an existing bookmark.
+
+        Returns True iff the bookmark existed AND was pinned.
+        """
+        changed = False
+        with self._lock:
+            existing = self._bookmarks.get(session_id)
+            if existing is not None and existing.pinned:
+                self._bookmarks[session_id] = Bookmark(
+                    session_id=existing.session_id,
+                    note=existing.note,
+                    created_at_iso=existing.created_at_iso,
+                    pinned=False,
+                )
+                self._persist()
+                changed = True
+        if changed:
+            self._emit({
+                "event_type": "bookmark_unpinned",
+                "session_id": session_id,
+            })
+        return changed
+
+    def is_pinned(self, session_id: str) -> bool:
+        with self._lock:
+            bm = self._bookmarks.get(session_id)
+            return bm is not None and bm.pinned
+
+    def list_pinned(self) -> List[Bookmark]:
+        with self._lock:
+            return sorted(
+                [bm for bm in self._bookmarks.values() if bm.pinned],
+                key=lambda bm: bm.created_at_iso, reverse=True,
+            )
+
+    # --- listener hook --------------------------------------------------
+
+    def on_change(
+        self, listener: Callable[[Dict[str, Any]], None],
+    ) -> Callable[[], None]:
+        """Subscribe to bookmark transitions.
+
+        Event types: ``bookmark_added``, ``bookmark_removed``,
+        ``bookmark_pinned``, ``bookmark_unpinned``. Payload carries
+        ``session_id`` and (for add/pin) ``note`` / ``pinned``.
+        """
+        with self._lock:
+            self._listeners.append(listener)
+
+        def _unsub() -> None:
+            with self._lock:
+                if listener in self._listeners:
+                    self._listeners.remove(listener)
+
+        return _unsub
 
     def has(self, session_id: str) -> bool:
         with self._lock:
@@ -419,6 +553,7 @@ class BookmarkStore:
     def reset(self) -> None:
         with self._lock:
             self._bookmarks.clear()
+            self._listeners.clear()
             try:
                 if self._path.exists():
                     self._path.unlink()
@@ -517,6 +652,48 @@ class SessionBrowser:
             return None
         return Path(record.replay_html_path)
 
+    # --- pinned bookmarks — extension arc Slice 2 ----------------------
+
+    def pin(self, session_id: str, *, note: str = "") -> Bookmark:
+        return self._bookmarks.pin(session_id, note=note)
+
+    def unpin(self, session_id: str) -> bool:
+        return self._bookmarks.unpin(session_id)
+
+    def is_pinned(self, session_id: str) -> bool:
+        return self._bookmarks.is_pinned(session_id)
+
+    def list_pinned_with_records(
+        self, *, rescan: bool = True,
+    ) -> List[Tuple[Bookmark, Optional[SessionRecord]]]:
+        if rescan:
+            self._index.scan()
+        return [
+            (bm, self._index.get(bm.session_id))
+            for bm in self._bookmarks.list_pinned()
+        ]
+
+    # --- cross-session diff — extension arc Slice 1 --------------------
+
+    def diff(
+        self, left_session_id: str, right_session_id: str,
+        *, rescan: bool = True,
+    ) -> Optional[Any]:
+        """Diff two sessions by id. Returns None if either id is
+        unknown (caller renders the appropriate REPL error)."""
+        if rescan:
+            self._index.scan()
+        left = self._index.get(left_session_id)
+        right = self._index.get(right_session_id)
+        if left is None or right is None:
+            return None
+        # Late import to keep base arc's module-graph unchanged if the
+        # extension's diff module is later split into a plugin package.
+        from backend.core.ouroboros.governance.session_diff import (
+            diff_records,
+        )
+        return diff_records(left, right)
+
 
 # ===========================================================================
 # Module singletons
@@ -599,15 +776,22 @@ _SESSION_HELP = textwrap.dedent(
     """
     Session history browser
     -----------------------
-      /session                         — recent sessions (default 10)
+      /session                         — recent sessions (default 10);
+                                         pinned sessions surface first
       /session list [--limit N] [--ok] [--bad] [--has-replay]
+                    [--pinned] [--prefix=<p>]
                                        — full list with filters
       /session show <session-id>       — detail for one session
       /session recent [N]              — N most recent sessions
+      /session diff <a> <b>            — structural delta between two sessions
       /session bookmark <session-id> [note...]
                                        — bookmark a session
       /session unbookmark <session-id> — remove a bookmark
       /session bookmarks               — list bookmarked sessions
+      /session pin <session-id> [note...]
+                                       — pin a bookmark (surfaces at top)
+      /session unpin <session-id>      — clear the pinned flag
+      /session pinned                  — list pinned sessions
       /session replay <session-id>     — print replay.html path (if any)
       /session rescan                  — force re-scan of sessions root
       /session help                    — this text
@@ -691,6 +875,27 @@ def dispatch_session_command(
         return SessionDispatchResult(
             ok=True, text=f"  /session rescan: {n} record(s) now in index",
         )
+    if head == "diff":
+        if len(args) < 3:
+            return SessionDispatchResult(
+                ok=False, text="  /session diff <a> <b>",
+            )
+        return _session_diff(b, args[1], args[2])
+    if head == "pin":
+        if len(args) < 2:
+            return SessionDispatchResult(
+                ok=False, text="  /session pin <session-id> [note...]",
+            )
+        note = " ".join(args[2:]).strip()
+        return _session_pin(b, args[1], note)
+    if head == "unpin":
+        if len(args) < 2:
+            return SessionDispatchResult(
+                ok=False, text="  /session unpin <session-id>",
+            )
+        return _session_unpin(b, args[1])
+    if head == "pinned":
+        return _session_pinned(b)
     if head == "help":
         return SessionDispatchResult(ok=True, text=_SESSION_HELP)
     # Short form: /session <session-id> → show
@@ -702,6 +907,7 @@ def _session_list(
 ) -> SessionDispatchResult:
     limit: Optional[int] = None
     filters: Dict[str, Any] = {}
+    pinned_only = False
     i = 0
     while i < len(args):
         tok = args[i]
@@ -731,6 +937,10 @@ def _session_list(
             filters["parse_error"] = True
             i += 1
             continue
+        if tok == "--pinned":
+            pinned_only = True
+            i += 1
+            continue
         if tok.startswith("--prefix=") and len(tok) > 9:
             filters["session_id_prefix"] = tok[9:]
             i += 1
@@ -740,15 +950,29 @@ def _session_list(
             ok=False, text=f"  /session list: unknown flag {tok!r}",
         )
     records = browser.list_records(limit=limit, filters=filters)
+    if pinned_only:
+        records = [r for r in records if browser.is_pinned(r.session_id)]
     if not records:
         return SessionDispatchResult(
             ok=True, text="  (no sessions match)",
         )
     lines: List[str] = [f"  {len(records)} session(s):"]
     for r in records:
-        marker = "★ " if browser.bookmarks.has(r.session_id) else "  "
+        marker = _list_marker(browser, r.session_id)
         lines.append(f"  {marker}{r.one_line_summary()}")
     return SessionDispatchResult(ok=True, text="\n".join(lines))
+
+
+def _list_marker(browser: SessionBrowser, session_id: str) -> str:
+    """Return the list-row prefix for a session.
+
+    Legend: ``P `` pinned, ``* `` bookmarked (not pinned), ``  `` plain.
+    """
+    if browser.is_pinned(session_id):
+        return "P "
+    if browser.bookmarks.has(session_id):
+        return "* "
+    return "  "
 
 
 def _session_show(
@@ -793,14 +1017,108 @@ def _session_recent(
     browser: SessionBrowser, *, limit: int,
 ) -> SessionDispatchResult:
     records = browser.recent(limit=limit)
-    if not records:
+    # Extension arc Slice 2: surface pinned bookmarks at the top when
+    # the operator hits /session with no args (default entry). Skip
+    # the pinned block when the operator explicitly says /session
+    # recent N — they asked for a count, not a digest.
+    pinned_pairs = browser.list_pinned_with_records(rescan=False)
+    if not records and not pinned_pairs:
         return SessionDispatchResult(
             ok=True, text="  (no sessions found)",
         )
-    lines = [f"  {len(records)} recent session(s):"]
-    for r in records:
-        marker = "★ " if browser.bookmarks.has(r.session_id) else "  "
-        lines.append(f"  {marker}{r.one_line_summary()}")
+    lines: List[str] = []
+    if pinned_pairs:
+        lines.append(f"  Pinned session(s) ({len(pinned_pairs)}):")
+        for bm, rec in pinned_pairs:
+            note_part = f"  — {bm.note}" if bm.note else ""
+            if rec is None:
+                lines.append(
+                    f"  ★ {bm.session_id} (not in index){note_part}"
+                )
+            else:
+                lines.append(
+                    f"  ★ {rec.one_line_summary()}{note_part}"
+                )
+        if records:
+            lines.append("")
+    if records:
+        lines.append(f"  {len(records)} recent session(s):")
+        for r in records:
+            # Keep existing '★' marker semantics: bookmarked/pinned
+            # both render with a star so base-arc tests still pass.
+            marker = "★ " if browser.bookmarks.has(r.session_id) else "  "
+            lines.append(f"  {marker}{r.one_line_summary()}")
+    return SessionDispatchResult(ok=True, text="\n".join(lines))
+
+
+def _session_diff(
+    browser: SessionBrowser, left_id: str, right_id: str,
+) -> SessionDispatchResult:
+    """/session diff <a> <b> — structural delta between two records."""
+    diff = browser.diff(left_id, right_id)
+    if diff is None:
+        return SessionDispatchResult(
+            ok=False,
+            text=(
+                "  /session diff: unknown session id(s) — "
+                "try /session rescan"
+            ),
+        )
+    from backend.core.ouroboros.governance.session_diff import (
+        render_session_diff,
+    )
+    return SessionDispatchResult(
+        ok=True, text=render_session_diff(diff),
+    )
+
+
+def _session_pin(
+    browser: SessionBrowser, session_id: str, note: str,
+) -> SessionDispatchResult:
+    try:
+        bm = browser.pin(session_id, note=note)
+    except SessionBrowserError as exc:
+        return SessionDispatchResult(
+            ok=False, text=f"  /session pin: {exc}",
+        )
+    note_part = f" ({bm.note})" if bm.note else ""
+    return SessionDispatchResult(
+        ok=True, text=f"  pinned: {bm.session_id}{note_part}",
+    )
+
+
+def _session_unpin(
+    browser: SessionBrowser, session_id: str,
+) -> SessionDispatchResult:
+    if not browser.unpin(session_id):
+        return SessionDispatchResult(
+            ok=False,
+            text=f"  /session unpin: not pinned: {session_id}",
+        )
+    return SessionDispatchResult(
+        ok=True, text=f"  unpinned: {session_id}",
+    )
+
+
+def _session_pinned(
+    browser: SessionBrowser,
+) -> SessionDispatchResult:
+    pairs = browser.list_pinned_with_records()
+    if not pairs:
+        return SessionDispatchResult(
+            ok=True, text="  (no pinned sessions)",
+        )
+    lines: List[str] = [f"  {len(pairs)} pinned session(s):"]
+    for bm, rec in pairs:
+        note_part = f" — {bm.note}" if bm.note else ""
+        if rec is None:
+            lines.append(
+                f"  ★ {bm.session_id} (not in index){note_part}"
+            )
+        else:
+            lines.append(
+                f"  ★ {rec.one_line_summary()}{note_part}"
+            )
     return SessionDispatchResult(ok=True, text="\n".join(lines))
 
 
@@ -888,5 +1206,9 @@ __all__ = [
     "reset_default_session_singletons",
     "set_default_session_browser",
 ]
+
+# Extension arc Slice 2 symbols — re-exported from SessionBrowser /
+# BookmarkStore for REPL + IDE consumers.
+
 
 _ = (FrozenSet, enum)  # silence unused-import guards
