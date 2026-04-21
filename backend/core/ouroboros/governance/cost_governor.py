@@ -70,7 +70,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +466,14 @@ class CostGovernor:
         return max(0.0, entry.cap_usd - entry.cumulative_usd)
 
     def finish(self, op_id: str) -> Optional[Mapping[str, object]]:
-        """Finalize and remove the op entry. Returns summary or None."""
+        """Finalize and remove the op entry. Returns summary or None.
+
+        Per-Phase Cost Drill-Down arc (Slice 3): after building the
+        summary, dispatch it to every registered finalize observer
+        (see :func:`register_finalize_observer`). Observers see the
+        authoritative per-phase breakdown before the entry is pruned —
+        SessionRecorder persists it into ``summary.json``.
+        """
         if not self._config.enabled:
             return None
         entry = self._entries.pop(op_id, None)
@@ -477,6 +484,7 @@ class CostGovernor:
             "[CostGovernor] op=%s finished: $%.4f / $%.4f (%d calls)",
             op_id[:12], entry.cumulative_usd, entry.cap_usd, entry.call_count,
         )
+        _dispatch_finalize_observers(op_id, summary)
         return summary
 
     def summary(self, op_id: str) -> Optional[Mapping[str, object]]:
@@ -596,6 +604,61 @@ class CostGovernor:
     def active_op_count(self) -> int:
         """Return the number of currently tracked ops (for tests/diagnostics)."""
         return len(self._entries)
+
+
+# -----------------------------------------------------------------------------
+# Finalize observer registry (Per-Phase Cost Drill-Down arc Slice 3)
+# -----------------------------------------------------------------------------
+
+# Module-level list — observers are process-global. SessionRecorder is
+# the canonical consumer; future surfaces (IDE observability, telemetry
+# exporters) can register additional observers. Observers are called
+# inside :meth:`CostGovernor.finish` with ``(op_id, summary_mapping)``.
+# Exceptions are swallowed — the finalize path is authoritative and
+# must never fail because a listener raised.
+_finalize_observers: List[
+    Callable[[str, Mapping[str, object]], None]
+] = []
+
+
+def register_finalize_observer(
+    observer: Callable[[str, Mapping[str, object]], None],
+) -> Callable[[], None]:
+    """Subscribe to ``CostGovernor.finish`` completion events.
+
+    Returns an unsubscribe callable. Idempotent — the same observer
+    may be registered once; subsequent registrations are no-ops.
+    Observers receive the authoritative per-phase breakdown
+    (``phase_totals`` / ``phase_by_provider`` / ``unknown_phase_usd``)
+    embedded in the summary mapping.
+    """
+    if observer not in _finalize_observers:
+        _finalize_observers.append(observer)
+
+    def _unsub() -> None:
+        try:
+            _finalize_observers.remove(observer)
+        except ValueError:
+            pass
+
+    return _unsub
+
+
+def _dispatch_finalize_observers(
+    op_id: str, summary: Mapping[str, object],
+) -> None:
+    for obs in list(_finalize_observers):
+        try:
+            obs(op_id, summary)
+        except Exception:  # noqa: BLE001 — must never escape finalize path
+            logger.debug(
+                "[CostGovernor] finalize observer raised", exc_info=True,
+            )
+
+
+def reset_finalize_observers() -> None:
+    """Test helper — drop every registered observer."""
+    _finalize_observers.clear()
 
 
 # -----------------------------------------------------------------------------

@@ -94,6 +94,19 @@ class SessionRecorder:
         self._ops_digest: Dict[str, Any] = {}
         self._ops_digest_saw_apply: bool = False
 
+        # Per-Phase Cost Drill-Down arc (Slice 3) — accumulates per-op
+        # phase breakdowns as they flow through CostGovernor.finish().
+        # save_summary() rolls these into two summary.json keys:
+        #   cost_by_op_phase: {op_id: {phase: usd}}
+        #   cost_by_phase:    session-wide rollup {phase: usd}
+        self._cost_by_op_phase: Dict[str, Dict[str, float]] = {}
+        self._cost_by_op_phase_provider: Dict[
+            str, Dict[str, Dict[str, float]]
+        ] = {}
+        self._cost_unknown_phase_by_op: Dict[str, float] = {}
+        self._cost_finalize_unsub: Optional[Any] = None
+        self._attach_cost_finalize_observer()
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -118,6 +131,92 @@ class SessionRecorder:
         (matches the ``write()`` omit-when-empty rule).
         """
         return dict(self._ops_digest) if self._ops_digest_saw_apply else {}
+
+    # ------------------------------------------------------------------
+    # Per-Phase Cost Drill-Down arc — CostGovernor finalize observer
+    # ------------------------------------------------------------------
+
+    def _attach_cost_finalize_observer(self) -> None:
+        """Subscribe to CostGovernor finalize events. Safe to call
+        multiple times — registry dedups."""
+        try:
+            from backend.core.ouroboros.governance.cost_governor import (
+                register_finalize_observer,
+            )
+            self._cost_finalize_unsub = register_finalize_observer(
+                self._on_cost_finalize,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            self._cost_finalize_unsub = None
+
+    def _on_cost_finalize(
+        self, op_id: str, summary: Any,
+    ) -> None:
+        """Ingest a ``CostGovernor.finish()`` summary into the
+        recorder's per-op phase accumulator.
+
+        Tolerates malformed summaries — missing keys default to empty
+        dicts and the method never raises.
+        """
+        try:
+            clean_op_id = str(op_id or "")[:MAX_OP_ID_LEN]
+            if not clean_op_id:
+                return
+            phase_totals = dict(
+                summary.get("phase_totals") or {}
+            ) if hasattr(summary, "get") else {}
+            phase_by_provider_raw = (
+                summary.get("phase_by_provider") or {}
+            ) if hasattr(summary, "get") else {}
+            unknown_phase_usd = float(
+                (summary.get("unknown_phase_usd") or 0.0)
+                if hasattr(summary, "get") else 0.0
+            )
+            self._cost_by_op_phase[clean_op_id] = {
+                k: float(v) for k, v in phase_totals.items()
+                if v and float(v) > 0
+            }
+            self._cost_by_op_phase_provider[clean_op_id] = {
+                phase: {
+                    p: float(v) for p, v in (providers or {}).items()
+                    if v and float(v) > 0
+                }
+                for phase, providers in phase_by_provider_raw.items()
+                if providers
+            }
+            if unknown_phase_usd > 0:
+                self._cost_unknown_phase_by_op[clean_op_id] = unknown_phase_usd
+        except Exception:  # noqa: BLE001 — best-effort telemetry
+            pass
+
+    def detach_cost_finalize_observer(self) -> None:
+        """Unsubscribe from CostGovernor finalize events.
+
+        Idempotent. Called automatically at session end via harness;
+        tests call it explicitly to avoid cross-test leakage.
+        """
+        if self._cost_finalize_unsub is not None:
+            try:
+                self._cost_finalize_unsub()
+            except Exception:  # noqa: BLE001
+                pass
+            self._cost_finalize_unsub = None
+
+    @property
+    def cost_by_op_phase(self) -> Dict[str, Dict[str, float]]:
+        """Snapshot of per-op per-phase cost accumulator."""
+        return {
+            op_id: dict(phases)
+            for op_id, phases in self._cost_by_op_phase.items()
+        }
+
+    def _compose_cost_by_phase(self) -> Dict[str, float]:
+        """Session-wide rollup ``{phase: total_usd}``."""
+        rollup: Dict[str, float] = {}
+        for phases in self._cost_by_op_phase.values():
+            for phase, usd in phases.items():
+                rollup[phase] = rollup.get(phase, 0.0) + float(usd)
+        return {k: round(v, 6) for k, v in rollup.items()}
 
     # ------------------------------------------------------------------
     # OpsDigestObserver protocol — see ops_digest_observer.py
@@ -395,6 +494,38 @@ class SessionRecorder:
         # shape unchanged (no ``apply=none/0 verify=0/0`` noise).
         if self._ops_digest_saw_apply and self._ops_digest:
             summary["ops_digest"] = dict(self._ops_digest)
+
+        # Per-Phase Cost Drill-Down arc (Slice 3) — emit ``cost_by_phase``
+        # (session rollup) + ``cost_by_op_phase`` (per-op per-phase) only
+        # when the finalize observer received at least one op. Additive
+        # keys: consumers that predate this arc ignore unknown keys and
+        # the schema_version stamp is unchanged (v2).
+        if self._cost_by_op_phase:
+            session_phase_rollup = self._compose_cost_by_phase()
+            if session_phase_rollup:
+                summary["cost_by_phase"] = session_phase_rollup
+            summary["cost_by_op_phase"] = {
+                op_id: {p: round(u, 6) for p, u in phases.items()}
+                for op_id, phases in self._cost_by_op_phase.items()
+                if phases
+            }
+            if self._cost_by_op_phase_provider:
+                summary["cost_by_op_phase_provider"] = {
+                    op_id: {
+                        phase: {p: round(v, 6) for p, v in providers.items()}
+                        for phase, providers in op_data.items()
+                    }
+                    for op_id, op_data in (
+                        self._cost_by_op_phase_provider.items()
+                    )
+                    if op_data
+                }
+            if self._cost_unknown_phase_by_op:
+                summary["cost_unknown_phase_by_op"] = {
+                    op_id: round(v, 6)
+                    for op_id, v in self._cost_unknown_phase_by_op.items()
+                    if v > 0
+                }
 
         summary_path = output_dir / "summary.json"
         summary_path.write_text(json.dumps(summary, indent=2))

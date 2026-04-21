@@ -175,6 +175,15 @@ class SessionRecord:
     # --- debug.log preview ----------------------------------------------
     debug_log_head_lines: Tuple[str, ...] = ()
 
+    # --- Per-Phase Cost Drill-Down arc (Slice 3) -----------------------
+    # Parsed from summary.json's optional ``cost_by_phase`` +
+    # ``cost_by_op_phase`` keys. Empty when the session didn't emit
+    # per-phase cost data (pre-Slice-3 summaries, ops that never charged).
+    cost_by_phase: Mapping[str, float] = field(default_factory=dict)
+    cost_by_op_phase: Mapping[str, Mapping[str, float]] = field(
+        default_factory=dict,
+    )
+
     schema_version: str = SESSION_RECORD_SCHEMA_VERSION
 
     # --- convenience ----------------------------------------------------
@@ -226,6 +235,15 @@ class SessionRecord:
             "has_replay_html": self.has_replay_html,
             "ok_outcome": self.ok_outcome,
             "debug_log_head_lines_count": len(self.debug_log_head_lines),
+            # Slice 3: per-phase cost drill-down projection
+            "cost_by_phase": dict(self.cost_by_phase),
+            "cost_by_op_phase": {
+                op_id: dict(phases)
+                for op_id, phases in self.cost_by_op_phase.items()
+            },
+            "has_phase_cost_data": bool(
+                self.cost_by_phase or self.cost_by_op_phase
+            ),
         }
 
     # --- narrative ------------------------------------------------------
@@ -384,6 +402,9 @@ def parse_session_dir(
     cost_budget_usd: Optional[float] = None
     commit_hash = ""
     schema_version_summary = ""
+    # Slice 3: per-phase cost drill-down fields
+    cost_by_phase: Dict[str, float] = {}
+    cost_by_op_phase: Dict[str, Dict[str, float]] = {}
 
     if summary is not None:
         stop_reason = _sanitise_str(summary.get("stop_reason"), max_len=120)
@@ -424,6 +445,47 @@ def parse_session_dir(
         schema_version_summary = _sanitise_str(
             summary.get("schema_version"), max_len=64,
         )
+        # Per-Phase Cost Drill-Down arc (Slice 3) — additive keys.
+        # Tolerate missing / malformed values: any non-mapping or bad
+        # numeric coerces to an empty dict so downstream consumers
+        # always see a safe shape.
+        raw_by_phase = summary.get("cost_by_phase")
+        if isinstance(raw_by_phase, Mapping):
+            cleaned_by_phase: Dict[str, float] = {}
+            for k, v in raw_by_phase.items():
+                if not isinstance(k, str) or not k:
+                    continue
+                try:
+                    vf = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if vf <= 0:
+                    continue
+                cleaned_by_phase[k] = vf
+            cost_by_phase = cleaned_by_phase
+        raw_by_op_phase = summary.get("cost_by_op_phase")
+        if isinstance(raw_by_op_phase, Mapping):
+            cleaned_by_op_phase: Dict[str, Dict[str, float]] = {}
+            for op_id_key, phases in raw_by_op_phase.items():
+                if (
+                    not isinstance(op_id_key, str) or not op_id_key
+                    or not isinstance(phases, Mapping)
+                ):
+                    continue
+                bucket: Dict[str, float] = {}
+                for phase_key, usd in phases.items():
+                    if not isinstance(phase_key, str) or not phase_key:
+                        continue
+                    try:
+                        uf = float(usd)
+                    except (TypeError, ValueError):
+                        continue
+                    if uf <= 0:
+                        continue
+                    bucket[phase_key] = uf
+                if bucket:
+                    cleaned_by_op_phase[op_id_key[:128]] = bucket
+            cost_by_op_phase = cleaned_by_op_phase
 
     # debug.log head (best-effort)
     head_lines: Tuple[str, ...] = ()
@@ -468,6 +530,8 @@ def parse_session_dir(
         has_replay_html=has_replay_html,
         replay_html_path=replay_html_path,
         debug_log_head_lines=head_lines,
+        cost_by_phase=cost_by_phase,
+        cost_by_op_phase=cost_by_op_phase,
     )
 
 
