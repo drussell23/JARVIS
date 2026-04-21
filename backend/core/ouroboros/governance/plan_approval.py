@@ -445,7 +445,12 @@ class PlanApprovalController:
                         pass
                 t = p._timeout_task
                 if t is not None and not t.done():
-                    t.cancel()
+                    try:
+                        t.cancel()
+                    except RuntimeError:
+                        # Loop already closed (test-tearndown race).
+                        # The task will be cleaned up with the loop.
+                        pass
             self._pending.clear()
             self._history.clear()
             self._listeners.clear()
