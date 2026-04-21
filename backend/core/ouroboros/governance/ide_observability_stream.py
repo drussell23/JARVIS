@@ -130,10 +130,20 @@ _VALID_EVENT_TYPES = frozenset({
 
 
 def stream_enabled() -> bool:
-    """Master switch. **Default false** — deny-by-default per Gap #6
-    authorization. Operators flip to ``"true"`` to enable."""
+    """Master switch.
+
+    Default: **``true``** (graduated 2026-04-20 via Gap #6 Slice 4
+    alongside Slice 1 flag flip; Slice 2 ships the SSE surface itself,
+    Slice 3 the VS Code client, Slice 4 the graduation + Cursor-compat
+    confirmation). Explicit ``"false"`` reverts to the Slice 2 deny-
+    by-default posture — the structural caps (subscriber cap, queue
+    cap, history cap, heartbeat cadence, subscribe-rate limiter) and
+    authority-invariant grep pin all remain in force regardless of
+    this flag. When the flag is explicitly ``"false"``, the stream
+    route returns 403 so port scanners see no signal.
+    """
     return os.environ.get(
-        "JARVIS_IDE_STREAM_ENABLED", "false",
+        "JARVIS_IDE_STREAM_ENABLED", "true",
     ).strip().lower() == "true"
 
 

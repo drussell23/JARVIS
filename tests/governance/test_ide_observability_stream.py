@@ -102,16 +102,23 @@ def _make_request(
 # --------------------------------------------------------------------------
 
 
-def test_stream_disabled_by_default():
-    assert stream_enabled() is False
+def test_stream_default_post_graduation_is_true():
+    """Gap #6 Slice 4 graduation (2026-04-20): the SSE stream flag
+    defaults ``true`` after Slice 3 proved the VS Code client
+    consumes this surface safely. Explicit ``=false`` remains the
+    kill switch."""
+    assert stream_enabled() is True
 
 
 def test_stream_env_false_string_opts_out(monkeypatch):
+    """Explicit ``=false`` reverts to the pre-graduation deny-by-
+    default posture — the runtime kill switch."""
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "false")
     assert stream_enabled() is False
 
 
-def test_stream_env_explicit_true_enables(monkeypatch):
+def test_stream_env_explicit_true_still_enables(monkeypatch):
+    """Explicit ``=true`` matches the graduated default — idempotent."""
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "true")
     assert stream_enabled() is True
 
@@ -119,6 +126,8 @@ def test_stream_env_explicit_true_enables(monkeypatch):
 def test_stream_env_case_insensitive(monkeypatch):
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "TRUE")
     assert stream_enabled() is True
+    monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "FALSE")
+    assert stream_enabled() is False
 
 
 # --------------------------------------------------------------------------
@@ -499,8 +508,12 @@ def test_stream_handler_cache_control_no_store_on_error(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_publish_task_event_silent_no_op_when_disabled():
-    # Default: stream_enabled == False
+def test_publish_task_event_silent_no_op_when_explicitly_disabled(monkeypatch):
+    """Post-Slice-4 graduation: the disabled path is exercised by
+    setting ``=false`` explicitly (the runtime kill switch). When
+    off, publish_task_event returns None and leaves the broker
+    history empty."""
+    monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "false")
     eid = publish_task_event(EVENT_TYPE_TASK_CREATED, "op-x", {})
     assert eid is None
     assert get_default_broker().history_size == 0
@@ -679,3 +692,133 @@ def test_monotonic_event_ids_are_strictly_increasing():
     assert ids == sorted(ids)
     # Unique.
     assert len(set(ids)) == len(ids)
+
+
+# --------------------------------------------------------------------------
+# Gap #6 Slice 4 graduation pins (2026-04-20)
+# --------------------------------------------------------------------------
+#
+# Pin the properties that MUST NOT drift when
+# ``JARVIS_IDE_STREAM_ENABLED`` flips default false→true.
+# Same discipline as prior graduations: graduation flips opt-in
+# friction, NEVER authority surface.
+
+
+def test_slice4_stream_graduation_default_is_true():
+    """Anchor: unset env → stream is enabled."""
+    # The autouse fixture clears the flag — so this observes the
+    # graduated default without extra setup.
+    assert stream_enabled() is True
+
+
+def test_slice4_stream_graduation_explicit_false_is_kill_switch(monkeypatch):
+    """``=false`` fully reverts to pre-graduation behavior — the
+    handler returns 403 with the stable reason_code and the
+    publish hook no-ops silently."""
+    monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "false")
+    # Handler returns 403.
+    router = IDEStreamRouter(broker=_capacity_broker())
+    req = _make_request()
+    resp = _run_async(router._handle_stream(req))
+    assert resp.status == 403
+    assert json.loads(resp.body.decode())["reason_code"] == "ide_stream.disabled"
+    # publish_task_event no-ops.
+    reset_default_broker()
+    monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "false")
+    assert publish_task_event(EVENT_TYPE_TASK_CREATED, "op-x", {}) is None
+    assert get_default_broker().history_size == 0
+
+
+def test_slice4_stream_graduation_authority_invariant_preserved():
+    """Grep pin — no gate-module imports were added during
+    graduation. Mirrors the Slice 2 authority invariant test."""
+    path = Path(stream_mod.__file__)
+    src = path.read_text()
+    forbidden = [
+        "iron_gate", "risk_tier_floor", "semantic_guardian",
+        "semantic_firewall", "policy_engine",
+    ]
+    for name in forbidden:
+        assert f"import {name}" not in src, f"post-grad: imports {name}"
+        assert f"from backend.core.ouroboros.governance.{name}" not in src
+    # orchestrator + tool_executor bans.
+    assert "from backend.core.ouroboros.governance.orchestrator" not in src
+    assert "from backend.core.ouroboros.governance.tool_executor" not in src
+
+
+def test_slice4_stream_graduation_bounds_unchanged(monkeypatch):
+    """Graduation must NOT have relaxed the structural caps.
+    Sanity-check the broker constructor defaults."""
+    # Clear ALL cap env overrides so the broker reads its
+    # compiled-in defaults via the _*() helpers.
+    for k in [
+        "JARVIS_IDE_STREAM_MAX_SUBSCRIBERS",
+        "JARVIS_IDE_STREAM_QUEUE_MAXSIZE",
+        "JARVIS_IDE_STREAM_HISTORY_MAXLEN",
+        "JARVIS_IDE_STREAM_HEARTBEAT_S",
+    ]:
+        monkeypatch.delenv(k, raising=False)
+    b = StreamEventBroker()
+    # Private fields read via attribute access — pin values.
+    assert b._max_subscribers == 8, b._max_subscribers
+    assert b._default_queue_maxsize == 64, b._default_queue_maxsize
+    assert b._history_maxlen == 512, b._history_maxlen
+
+
+def test_slice4_stream_graduation_unidirectional_transport():
+    """Gap #6 Slice 4 pin — the stream route is registered as GET
+    only. A POST/PUT/DELETE addition would constitute a covert
+    command surface and violate §1. Inspect the router's internal
+    registration to confirm only `add_get` is called on the
+    `/observability/stream` path."""
+    from unittest.mock import MagicMock
+    app = MagicMock()
+    app.router = MagicMock()
+    r = IDEStreamRouter()
+    r.register_routes(app)
+    # Exactly one add_get call, no add_post/put/delete/patch.
+    app.router.add_get.assert_called_once()
+    path, handler = app.router.add_get.call_args[0]
+    assert path == "/observability/stream", path
+    assert handler == r._handle_stream
+    app.router.add_post.assert_not_called()
+    app.router.add_put.assert_not_called()
+    app.router.add_delete.assert_not_called()
+    app.router.add_patch.assert_not_called()
+
+
+def test_slice4_stream_graduation_docstring_references_graduation():
+    """Docstring bit-rot guard: the master-switch docstring must
+    name the Slice 4 graduation so future readers know the
+    current default is graduated, not drifted."""
+    doc = stream_enabled.__doc__ or ""
+    assert "graduated" in doc.lower(), doc
+    assert "2026-04-20" in doc, doc
+
+
+def test_slice4_stream_graduation_full_revert_matrix(monkeypatch):
+    """Explicit off → disabled. Unset → enabled. Explicit on →
+    enabled."""
+    monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "false")
+    assert stream_enabled() is False
+    monkeypatch.delenv("JARVIS_IDE_STREAM_ENABLED", raising=False)
+    assert stream_enabled() is True
+    monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "true")
+    assert stream_enabled() is True
+
+
+def test_slice4_stream_graduation_mounts_beside_slice1(monkeypatch):
+    """Post-graduation: when BOTH flags are at their graduated
+    defaults, EventChannelServer should happily mount both routers
+    (Slice 1 GET + Slice 2 SSE) alongside the existing webhook
+    routes. Verifies the import path is still live.
+    """
+    # Keep both flags at their graduated defaults (clear any stubs).
+    monkeypatch.delenv("JARVIS_IDE_OBSERVABILITY_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_IDE_STREAM_ENABLED", raising=False)
+    # Both enable-helpers should agree.
+    from backend.core.ouroboros.governance.ide_observability import (
+        ide_observability_enabled as get_obs,
+    )
+    assert get_obs() is True
+    assert stream_enabled() is True

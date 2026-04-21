@@ -64,13 +64,22 @@ IDE_OBSERVABILITY_SCHEMA_VERSION = "1.0"
 
 
 def ide_observability_enabled() -> bool:
-    """Master switch. **Default false** — deny-by-default per Gap #6
-    authorization. Operators flip to ``"true"`` to enable the GET
-    surface; until then, every route returns 403 (even the health
-    endpoint, so port scanners see zero signal about what's behind
-    the listener)."""
+    """Master switch.
+
+    Default: **``true``** (graduated 2026-04-20 via Gap #6 Slice 4 after
+    Slices 1-3 shipped the GET surface + SSE stream + VS Code extension
+    with 72 governance tests + 35 extension tests green plus a live-fire
+    proof of the end-to-end stack). Explicit ``"false"`` reverts to the
+    Slice 1 deny-by-default posture so operators retain a runtime kill
+    switch. The loopback-binding assertion + rate-limit caps + CORS
+    allowlist + authority-invariant grep pin all remain in force
+    regardless of this flag — graduation flips opt-in friction, NOT
+    authority surface. When the flag is explicitly ``"false"``, every
+    route still returns 403 (port scanners see no signal about what's
+    behind the listener).
+    """
     return os.environ.get(
-        "JARVIS_IDE_OBSERVABILITY_ENABLED", "false",
+        "JARVIS_IDE_OBSERVABILITY_ENABLED", "true",
     ).strip().lower() == "true"
 
 

@@ -98,20 +98,24 @@ def _make_request(
 # ---------------------------------------------------------------------------
 
 
-def test_ide_observability_disabled_by_default(monkeypatch):
-    """Slice 1 test 1 (CRITICAL): ``JARVIS_IDE_OBSERVABILITY_ENABLED``
-    defaults ``false``. Operators on a fresh install see no GET
-    surface until they explicitly opt in."""
+def test_ide_observability_default_post_graduation_is_true(monkeypatch):
+    """Gap #6 Slice 4 graduation (2026-04-20): the master switch
+    defaults ``true`` now that Slices 1-3 have shipped the full
+    read-only GET + SSE + VS Code consumer stack. Explicit
+    ``=false`` remains the kill switch."""
     monkeypatch.delenv("JARVIS_IDE_OBSERVABILITY_ENABLED", raising=False)
-    assert ide_observability_enabled() is False
+    assert ide_observability_enabled() is True
 
 
 def test_env_false_string_opts_out(monkeypatch):
+    """Explicit ``=false`` reverts to the pre-graduation deny-by-
+    default posture. This is the runtime kill switch."""
     monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "false")
     assert ide_observability_enabled() is False
 
 
-def test_env_explicit_true_enables(monkeypatch):
+def test_env_explicit_true_still_enables(monkeypatch):
+    """Explicit ``=true`` matches the graduated default — idempotent."""
     monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "true")
     assert ide_observability_enabled() is True
 
@@ -207,11 +211,12 @@ def _run_async(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
-def test_health_returns_403_when_disabled(monkeypatch):
-    """Slice 1 test 13 (CRITICAL): when disabled, health returns
-    403 — NOT 200 with ``{enabled: false}``. Port scanners see no
-    signal about what's behind the listener."""
-    monkeypatch.delenv("JARVIS_IDE_OBSERVABILITY_ENABLED", raising=False)
+def test_health_returns_403_when_explicitly_disabled(monkeypatch):
+    """Post-Slice-4 graduation: the disabled path is exercised by
+    setting ``=false`` explicitly (the runtime kill switch). When
+    off, health returns 403 — NOT 200 with ``{enabled: false}``.
+    Port scanners see no signal about what's behind the listener."""
+    monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "false")
     router = IDEObservabilityRouter()
     req = _make_request("/observability/health")
     resp = _run_async(router._handle_health(req))
@@ -221,16 +226,16 @@ def test_health_returns_403_when_disabled(monkeypatch):
     assert body["schema_version"] == IDE_OBSERVABILITY_SCHEMA_VERSION
 
 
-def test_tasks_list_returns_403_when_disabled(monkeypatch):
-    monkeypatch.delenv("JARVIS_IDE_OBSERVABILITY_ENABLED", raising=False)
+def test_tasks_list_returns_403_when_explicitly_disabled(monkeypatch):
+    monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "false")
     router = IDEObservabilityRouter()
     req = _make_request("/observability/tasks")
     resp = _run_async(router._handle_task_list(req))
     assert resp.status == 403
 
 
-def test_task_detail_returns_403_when_disabled(monkeypatch):
-    monkeypatch.delenv("JARVIS_IDE_OBSERVABILITY_ENABLED", raising=False)
+def test_task_detail_returns_403_when_explicitly_disabled(monkeypatch):
+    monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "false")
     router = IDEObservabilityRouter()
     req = _make_request(
         "/observability/tasks/op-x",
@@ -543,3 +548,164 @@ def test_cors_patterns_helper_default(monkeypatch):
     # Must include localhost; must NOT include a wildcard.
     assert any("localhost" in p for p in patterns)
     assert not any(p == "*" or p == ".*" for p in patterns)
+
+
+# ---------------------------------------------------------------------------
+# Gap #6 Slice 4 graduation pins (2026-04-20)
+# ---------------------------------------------------------------------------
+#
+# These 10 tests pin the properties that MUST NOT drift after
+# flipping ``JARVIS_IDE_OBSERVABILITY_ENABLED`` default false→true.
+# They mirror the discipline from Gap #5 Slice 4 + Gap #4 Slice 4 +
+# Phase B subagent graduations: graduation flips opt-in friction,
+# NEVER authority surface.
+
+
+def test_slice4_graduation_default_is_true(monkeypatch):
+    """Anchor: the source-of-truth flag check reads ``true`` when
+    nothing is set. This is the single bit that distinguishes
+    "graduated" from "deny-by-default"."""
+    monkeypatch.delenv("JARVIS_IDE_OBSERVABILITY_ENABLED", raising=False)
+    assert ide_observability_enabled() is True
+
+
+def test_slice4_graduation_explicit_false_is_full_revert(monkeypatch):
+    """The ``=false`` opt-out is the operator's runtime kill switch.
+    Every handler returns 403 with the canonical reason_code, and
+    the schema_version stamp is still present. Matches the pre-
+    graduation behavior bit-for-bit."""
+    monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "false")
+    router = IDEObservabilityRouter()
+    for path, handler in [
+        ("/observability/health", router._handle_health),
+        ("/observability/tasks", router._handle_task_list),
+    ]:
+        req = _make_request(path)
+        resp = _run_async(handler(req))
+        assert resp.status == 403, path
+        body = json.loads(resp.body.decode("utf-8"))
+        assert body["reason_code"] == "ide_observability.disabled"
+        assert body["schema_version"] == IDE_OBSERVABILITY_SCHEMA_VERSION
+    # Plus task detail with a valid op_id.
+    req = _make_request(
+        "/observability/tasks/op-x", match_info={"op_id": "op-x"},
+    )
+    resp = _run_async(router._handle_task_detail(req))
+    assert resp.status == 403
+
+
+def test_slice4_graduation_authority_invariant_preserved():
+    """Graduation must NOT have added imports of gate / policy /
+    orchestrator modules. Re-run the Slice 1 grep pin as a smoke
+    check that the module still respects the boundary principle."""
+    path = Path(__file__).resolve().parent.parent.parent / (
+        "backend/core/ouroboros/governance/ide_observability.py"
+    )
+    src = path.read_text(encoding="utf-8")
+    forbidden = [
+        "from backend.core.ouroboros.governance.orchestrator",
+        "from backend.core.ouroboros.governance.tool_executor",
+        "from backend.core.ouroboros.governance.iron_gate",
+        "from backend.core.ouroboros.governance.risk_tier_floor",
+        "from backend.core.ouroboros.governance.semantic_guardian",
+        "from backend.core.ouroboros.governance.semantic_firewall",
+        "from backend.core.ouroboros.governance.policy_engine",
+    ]
+    for f in forbidden:
+        assert f not in src, (
+            "ide_observability.py still must not import "
+            + f + " post-graduation"
+        )
+
+
+def test_slice4_graduation_loopback_assert_still_strict():
+    """Graduation must NOT relax the loopback-only pin. Same
+    accept/reject matrix as Slice 1."""
+    assert_loopback_only("127.0.0.1")
+    assert_loopback_only("::1")
+    assert_loopback_only("localhost")
+    for host in ["0.0.0.0", "::", "*", "", "203.0.113.7", "2001:db8::1"]:
+        try:
+            assert_loopback_only(host)
+        except ValueError:
+            continue
+        raise AssertionError(
+            "expected ValueError for non-loopback host " + repr(host)
+        )
+
+
+def test_slice4_graduation_rate_limit_still_enforced(monkeypatch):
+    """Graduation must NOT lift the per-client rate limit. Setting
+    the limit to 2/min and burning through it still trips the 429
+    path, as in Slice 1."""
+    monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_RATE_LIMIT_PER_MIN", "2")
+    router = IDEObservabilityRouter()
+    ok = 0
+    limited = 0
+    for _ in range(4):
+        # Manual rate-limit check (public surface has this via handlers,
+        # but we test the helper directly for a single-signal pin).
+        if router._check_rate_limit("client-a"):
+            ok += 1
+        else:
+            limited += 1
+    assert ok == 2
+    assert limited == 2
+
+
+def test_slice4_graduation_cors_still_no_wildcard(monkeypatch):
+    """Graduation must NOT widen CORS to ``*`` or add a
+    credentials wildcard. Defaults stay narrow (localhost +
+    127.0.0.1 + vscode-webview)."""
+    patterns = _cors_origin_patterns()
+    assert not any(p == "*" for p in patterns), patterns
+    assert not any(p == ".*" for p in patterns), patterns
+
+
+def test_slice4_graduation_malformed_op_id_still_400(monkeypatch):
+    """Graduation must NOT relax op_id validation at the URL
+    boundary. A space in the op_id still yields 400 with the
+    stable reason_code."""
+    monkeypatch.delenv("JARVIS_IDE_OBSERVABILITY_ENABLED", raising=False)
+    router = IDEObservabilityRouter()
+    req = _make_request(
+        "/observability/tasks/bad id",
+        match_info={"op_id": "bad id"},
+    )
+    resp = _run_async(router._handle_task_detail(req))
+    assert resp.status == 400
+    body = json.loads(resp.body.decode("utf-8"))
+    assert body["reason_code"] == "ide_observability.malformed_op_id"
+
+
+def test_slice4_graduation_docstring_references_graduation():
+    """Docstring bit-rot guard: the master-switch docstring must
+    name the Slice 4 graduation so future readers know the current
+    default is graduated, not drifted."""
+    doc = ide_observability_enabled.__doc__ or ""
+    assert "graduated" in doc.lower(), doc
+    assert "2026-04-20" in doc, doc
+
+
+def test_slice4_graduation_full_revert_matrix(monkeypatch):
+    """Explicit off → disabled. Unset → enabled. Explicit on →
+    enabled. One test, three conditions — the full revert matrix
+    in a single assertion block."""
+    monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "false")
+    assert ide_observability_enabled() is False
+    monkeypatch.delenv("JARVIS_IDE_OBSERVABILITY_ENABLED", raising=False)
+    assert ide_observability_enabled() is True
+    monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "true")
+    assert ide_observability_enabled() is True
+
+
+def test_slice4_graduation_cursor_compat_shape():
+    """Gap #6 Slice 4 Cursor compat: the CORS default allowlist
+    accepts Cursor's webview origin scheme. Cursor is a VS Code
+    fork and uses the same ``vscode-webview://`` scheme, so the
+    existing regex matches without any server-side change.
+    Pinning this invariant prevents a future CORS tightening
+    from accidentally breaking Cursor consumers."""
+    patterns = _cors_origin_patterns()
+    joined = " | ".join(patterns)
+    assert "vscode-webview" in joined, joined
