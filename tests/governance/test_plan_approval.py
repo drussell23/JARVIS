@@ -50,7 +50,7 @@ from backend.core.ouroboros.governance.plan_approval import (
 
 
 _ENV_KEYS = [
-    "JARVIS_PLAN_APPROVAL_ENABLED",
+    "JARVIS_PLAN_APPROVAL_MODE",
     "JARVIS_PLAN_APPROVAL_TIMEOUT_S",
     "JARVIS_PLAN_APPROVAL_MAX_PENDING",
     "JARVIS_PLAN_APPROVAL_REASON_MAX_LEN",
@@ -95,38 +95,38 @@ def test_plan_approval_disabled_by_default():
 
 
 def test_env_false_string_opts_out(monkeypatch):
-    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_MODE", "false")
     assert plan_approval_enabled() is False
 
 
 def test_env_explicit_true_enables(monkeypatch):
-    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_MODE", "true")
     assert plan_approval_enabled() is True
 
 
 def test_needs_approval_defers_to_env_flag(monkeypatch):
-    monkeypatch.delenv("JARVIS_PLAN_APPROVAL_ENABLED", raising=False)
+    monkeypatch.delenv("JARVIS_PLAN_APPROVAL_MODE", raising=False)
     assert needs_approval() is False
-    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_MODE", "true")
     assert needs_approval() is True
 
 
 def test_needs_approval_per_op_override_forces_false(monkeypatch):
-    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_MODE", "true")
     ctx = MagicMock()
     ctx.plan_approval_override = False
     assert needs_approval(ctx) is False
 
 
 def test_needs_approval_per_op_override_forces_true(monkeypatch):
-    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_MODE", "false")
     ctx = MagicMock()
     ctx.plan_approval_override = True
     assert needs_approval(ctx) is True
 
 
 def test_needs_approval_ignores_non_bool_override(monkeypatch):
-    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_PLAN_APPROVAL_MODE", "true")
     ctx = MagicMock()
     ctx.plan_approval_override = "yes"  # not a bool
     assert needs_approval(ctx) is True  # defers to env

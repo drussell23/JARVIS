@@ -20,7 +20,7 @@ approve/reject decision. The two are complementary.
   operator surfaces (SerpentFlow REPL, IDE approval endpoint in a
   later slice). The orchestrator itself never calls approve().
   Manifesto §1 Boundary Principle.
-- **Deny-by-default.** ``JARVIS_PLAN_APPROVAL_ENABLED`` defaults
+- **Deny-by-default.** ``JARVIS_PLAN_APPROVAL_MODE`` defaults
   ``false``; while Slices 1-4 ship, the PLAN phase runs as-is and
   GENERATE proceeds without pause. Slice 5 graduates the default.
 - **Single source of truth.** Every pending plan lives in this
@@ -70,10 +70,10 @@ logger = logging.getLogger(__name__)
 # --- Env knobs -------------------------------------------------------------
 
 
-def plan_approval_enabled() -> bool:
+def plan_approval_mode_enabled() -> bool:
     """Master switch. Default ``false`` until Slice 5 graduation."""
     return os.environ.get(
-        "JARVIS_PLAN_APPROVAL_ENABLED", "false",
+        "JARVIS_PLAN_APPROVAL_MODE", "false",
     ).strip().lower() == "true"
 
 
@@ -454,6 +454,38 @@ class PlanApprovalController:
         with self._lock:
             return list(self._history)
 
+    async def await_outcome(
+        self, op_id: str, timeout_s: Optional[float] = None,
+    ) -> PlanApprovalOutcome:
+        """Await the terminal outcome for ``op_id``. Returns the
+        same :class:`PlanApprovalOutcome` that `approve()` /
+        `reject()` / timeout produce.
+
+        Raises :class:`PlanApprovalStateError` on unknown op_id.
+        ``timeout_s`` is an upper-bound wall-clock timeout — if the
+        controller's own timeout is longer, the returned outcome
+        has ``state=STATE_EXPIRED`` with reason ``await_timeout``.
+        """
+        with self._lock:
+            p = self._pending.get(op_id)
+            if p is None:
+                raise PlanApprovalStateError(
+                    "no pending plan for op_id=" + op_id,
+                )
+            future = p.future
+        if timeout_s is None:
+            return await future
+        try:
+            return await asyncio.wait_for(future, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return PlanApprovalOutcome(
+                approved=False,
+                state=STATE_EXPIRED,
+                reason="await_timeout",
+                reviewer="await_outcome",
+                elapsed_s=float(timeout_s),
+            )
+
 
 # --- Module singleton ------------------------------------------------------
 
@@ -500,7 +532,11 @@ def needs_approval(ctx: Any = None) -> bool:
             return False
         if override is True:
             return True
-    return plan_approval_enabled()
+    return plan_approval_mode_enabled()
+
+
+# Back-compat alias for callers that want the older name.
+plan_approval_enabled = plan_approval_mode_enabled
 
 
 async def await_approval(
@@ -513,3 +549,186 @@ async def await_approval(
     controller = get_default_controller()
     future = controller.request_approval(op_id, plan, timeout_s=timeout_s)
     return await future
+
+
+def should_force_plan_review(ctx: Any = None) -> bool:
+    """Orchestrator hook: when plan-approval-mode is on, force the
+    existing plan-approval hard gate to engage on **every** op
+    regardless of the complexity heuristic.
+
+    Equivalent to :func:`needs_approval` but named differently to
+    match the orchestrator-side semantic: "is this plan-mode ON?"
+    The orchestrator OR's this into its ``_should_gate`` predicate so
+    the existing per-complexity wiring stays intact; plan mode
+    simply widens the coverage.
+    """
+    return needs_approval(ctx)
+
+
+# --- ApprovalProvider adapter ---------------------------------------------
+
+
+# Late import: the adapter translates between the approval_provider
+# protocol (ApprovalStatus / ApprovalResult with datetime + approver
+# fields) and this module's PlanApprovalController. Late import also
+# avoids a cycle if approval_provider ever pulls something in that
+# eventually imports plan_approval (it doesn't today, but future
+# refactors are cheap to break without discipline).
+
+
+class PlanApprovalProviderAdapter:
+    """Adapter that implements a subset of the ``ApprovalProvider``
+    protocol by delegating to :class:`PlanApprovalController`.
+
+    Methods mirrored:
+      * ``request_plan(context, plan_text)`` — registers a pending
+        plan keyed on ``context.op_id``. Returns the
+        ``<op_id>::plan`` request id used by the existing orchestrator
+        wiring. ``plan_text`` is stored as the plan payload's
+        ``markdown`` field so REPL/IDE renderers have a human-
+        readable view.
+      * ``approve(request_id, approver)`` — resolves the matching
+        plan with APPROVED.
+      * ``reject(request_id, approver, reason)`` — resolves with
+        REJECTED.
+      * ``await_decision(request_id, timeout_s)`` — awaits the
+        controller's Future and maps the outcome into
+        :class:`ApprovalResult`.
+
+    The adapter does NOT own any state — everything lives in the
+    controller. Instantiating multiple adapters against the same
+    controller is safe.
+
+    NOT implemented (intentionally):
+      * ``request(context)`` (code-approval path — unrelated to
+        plan approval; callers that need it still use the
+        existing ``InMemoryApprovalProvider``).
+      * ``elicit(...)`` — scope for a later slice.
+    """
+
+    _PLAN_SUFFIX = "::plan"
+
+    def __init__(
+        self,
+        controller: Optional["PlanApprovalController"] = None,
+    ) -> None:
+        self._controller = controller or get_default_controller()
+
+    @classmethod
+    def _strip_suffix(cls, request_id: str) -> str:
+        if request_id.endswith(cls._PLAN_SUFFIX):
+            return request_id[: -len(cls._PLAN_SUFFIX)]
+        return request_id
+
+    @staticmethod
+    def _format_request_id(op_id: str) -> str:
+        return op_id + PlanApprovalProviderAdapter._PLAN_SUFFIX
+
+    @staticmethod
+    def is_plan_request(request_id: str) -> bool:
+        return request_id.endswith(
+            PlanApprovalProviderAdapter._PLAN_SUFFIX,
+        )
+
+    async def request_plan(self, context: Any, plan_text: str) -> str:
+        """Submit an op's plan for approval. Idempotent on op_id."""
+        op_id = getattr(context, "op_id", None)
+        if not isinstance(op_id, str) or not op_id:
+            raise PlanApprovalStateError(
+                "context.op_id must be a non-empty string",
+            )
+        # Idempotency: if a pending record already exists, return the
+        # existing request id without re-registering.
+        if self._controller.snapshot(op_id) is not None:
+            return self._format_request_id(op_id)
+        plan_payload: Dict[str, Any] = {
+            "markdown": plan_text,
+            "description": getattr(context, "description", ""),
+            "target_files": list(
+                getattr(context, "target_files", []) or [],
+            ),
+        }
+        self._controller.request_approval(op_id, plan_payload)
+        return self._format_request_id(op_id)
+
+    async def approve(self, request_id: str, approver: str) -> Any:
+        """Resolve the matching plan with APPROVED. Returns an
+        ApprovalResult-compatible object (lazily imported)."""
+        from backend.core.ouroboros.governance.approval_provider import (
+            ApprovalResult,
+            ApprovalStatus,
+        )
+        from datetime import datetime, timezone
+
+        op_id = self._strip_suffix(request_id)
+        self._controller.approve(op_id, reviewer=approver)
+        return ApprovalResult(
+            status=ApprovalStatus.APPROVED,
+            approver=approver,
+            reason=None,
+            decided_at=datetime.now(tz=timezone.utc),
+            request_id=request_id,
+        )
+
+    async def reject(
+        self, request_id: str, approver: str, reason: str,
+    ) -> Any:
+        from backend.core.ouroboros.governance.approval_provider import (
+            ApprovalResult,
+            ApprovalStatus,
+        )
+        from datetime import datetime, timezone
+
+        op_id = self._strip_suffix(request_id)
+        outcome = self._controller.reject(
+            op_id, reason=reason, reviewer=approver,
+        )
+        return ApprovalResult(
+            status=ApprovalStatus.REJECTED,
+            approver=approver,
+            reason=outcome.reason,
+            decided_at=datetime.now(tz=timezone.utc),
+            request_id=request_id,
+        )
+
+    async def await_decision(
+        self, request_id: str, timeout_s: float,
+    ) -> Any:
+        """Block until a decision is made. Maps the controller's
+        :class:`PlanApprovalOutcome` to :class:`ApprovalResult`.
+
+        On timeout: the controller's own timeout task auto-rejects
+        with ``plan_expired`` — this method observes that via the
+        shared Future and maps to ``ApprovalStatus.EXPIRED``.
+        """
+        from backend.core.ouroboros.governance.approval_provider import (
+            ApprovalResult,
+            ApprovalStatus,
+        )
+        from datetime import datetime, timezone
+
+        op_id = self._strip_suffix(request_id)
+        try:
+            outcome = await self._controller.await_outcome(
+                op_id, timeout_s=timeout_s,
+            )
+        except PlanApprovalStateError:
+            return ApprovalResult(
+                status=ApprovalStatus.EXPIRED,
+                approver=None, reason="unknown_request_id",
+                decided_at=datetime.now(tz=timezone.utc),
+                request_id=request_id,
+            )
+        status_map = {
+            STATE_APPROVED: ApprovalStatus.APPROVED,
+            STATE_REJECTED: ApprovalStatus.REJECTED,
+            STATE_EXPIRED: ApprovalStatus.EXPIRED,
+        }
+        mapped = status_map.get(outcome.state, ApprovalStatus.EXPIRED)
+        return ApprovalResult(
+            status=mapped,
+            approver=outcome.reviewer or None,
+            reason=outcome.reason or None,
+            decided_at=datetime.now(tz=timezone.utc),
+            request_id=request_id,
+        )
