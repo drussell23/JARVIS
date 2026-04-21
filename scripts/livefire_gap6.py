@@ -222,9 +222,25 @@ async def _run(journal: Journal) -> int:
     reader_thread = threading.Thread(target=reader.run, daemon=True)
     reader_thread.start()
 
-    # Give the SSE connection a moment to establish BEFORE emitting
-    # events — otherwise the first few frames race the connect.
-    await asyncio.sleep(0.5)
+    # Wait for the SSE reader's subscribe() to register in the
+    # broker before emitting any events. Polling is cheaper than
+    # a blind sleep and makes the harness robust against slow CI.
+    from backend.core.ouroboros.governance.ide_observability_stream import (
+        get_default_broker,
+    )
+    broker = get_default_broker()
+    deadline = time.monotonic() + 5.0
+    while broker.subscriber_count == 0 and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    if broker.subscriber_count == 0:
+        journal.fail(
+            "SSE reader never registered as broker subscriber "
+            "within 5s — aborting event emission",
+        )
+        await server.stop()
+        return 1
+    journal.step("sse_subscriber_connected",
+                 broker_subscribers=broker.subscriber_count)
 
     op_id = "livefire-gap6"
     board = get_or_create_task_board(op_id)
@@ -241,21 +257,28 @@ async def _run(journal: Journal) -> int:
     task_created = board.create(title="live fire smoke", body="end-to-end")
     _emit("task_created", task_created)
     journal.step("emitted_task_created", task_id=task_created.task_id)
+    await asyncio.sleep(0.05)
 
     task_started = board.start(task_created.task_id)
     _emit("task_started", task_started)
     journal.step("emitted_task_started")
+    await asyncio.sleep(0.05)
 
     task_completed = board.complete(task_created.task_id)
     _emit("task_completed", task_completed)
     journal.step("emitted_task_completed")
+    await asyncio.sleep(0.05)
 
     # Board close publishes board_closed through close_task_board.
     close_task_board(op_id, reason="livefire complete")
     journal.step("board_closed")
+    await asyncio.sleep(0.2)
 
-    # Let the reader drain.
-    reader_thread.join(timeout=3.0)
+    # Let the reader drain — offload the blocking join to a thread
+    # executor so the aiohttp event loop keeps servicing the SSE
+    # reader's socket reads.
+    loop0 = asyncio.get_event_loop()
+    await loop0.run_in_executor(None, reader_thread.join, 3.0)
     reader.stop()
 
     # --- GET endpoint verification ---------------------------------------
