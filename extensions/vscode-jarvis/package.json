@@ -1,0 +1,134 @@
+{
+  "name": "jarvis-observability",
+  "displayName": "JARVIS Observability",
+  "description": "Read-only sidebar + live event stream for JARVIS Ouroboros governance loop. Part of the Gap #6 IDE-integration surface (Slice 3).",
+  "version": "0.1.0",
+  "publisher": "drussell23",
+  "private": true,
+  "engines": {
+    "vscode": "^1.80.0",
+    "node": ">=18.0.0"
+  },
+  "license": "UNLICENSED",
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "jarvisObservability.ops",
+          "name": "JARVIS Ops",
+          "icon": "$(pulse)",
+          "contextualTitle": "JARVIS Observability"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "jarvisObservability.connect",
+        "title": "JARVIS: Connect Observability Stream",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "jarvisObservability.disconnect",
+        "title": "JARVIS: Disconnect Observability Stream",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "jarvisObservability.refresh",
+        "title": "JARVIS: Refresh Ops",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "jarvisObservability.showOp",
+        "title": "JARVIS: Show Op Detail"
+      },
+      {
+        "command": "jarvisObservability.showLog",
+        "title": "JARVIS: Show Output Log"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "jarvisObservability.refresh",
+          "when": "view == jarvisObservability.ops",
+          "group": "navigation@1"
+        },
+        {
+          "command": "jarvisObservability.connect",
+          "when": "view == jarvisObservability.ops && !jarvisObservability.connected",
+          "group": "navigation@2"
+        },
+        {
+          "command": "jarvisObservability.disconnect",
+          "when": "view == jarvisObservability.ops && jarvisObservability.connected",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "JARVIS Observability",
+      "properties": {
+        "jarvisObservability.endpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765",
+          "description": "Base URL for JARVIS EventChannelServer (must be loopback on the agent side)."
+        },
+        "jarvisObservability.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch for this extension. Disable to silence polling and streams entirely."
+        },
+        "jarvisObservability.autoReconnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically reconnect with exponential backoff when the SSE stream drops."
+        },
+        "jarvisObservability.reconnectMaxBackoffMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "maximum": 600000,
+          "description": "Upper bound on the reconnect backoff timer."
+        },
+        "jarvisObservability.pollIntervalMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 1000,
+          "maximum": 60000,
+          "description": "Fallback polling interval when the SSE stream is unavailable."
+        },
+        "jarvisObservability.opIdFilter": {
+          "type": "string",
+          "default": "",
+          "description": "Optional op_id filter — when set, the stream and tree show only this single op."
+        },
+        "jarvisObservability.maxOpsCached": {
+          "type": "number",
+          "default": 256,
+          "minimum": 8,
+          "maximum": 4096,
+          "description": "Bounded LRU cache size for op detail data. Older ops are evicted first."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint --ext .ts src",
+    "test": "tsc -p ./tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "clean": "rm -rf dist dist-test"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.4.0"
+  }
+}
