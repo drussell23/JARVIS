@@ -178,6 +178,13 @@ class IDEObservabilityRouter:
         app.router.add_get(
             "/observability/tasks/{op_id}", self._handle_task_detail,
         )
+        # Problem #7 Slice 4 — plan approval surface.
+        app.router.add_get(
+            "/observability/plans", self._handle_plan_list,
+        )
+        app.router.add_get(
+            "/observability/plans/{op_id}", self._handle_plan_detail,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -377,3 +384,87 @@ class IDEObservabilityRouter:
                 "board_size": len(snap),
             },
         )
+
+    # ------------------------------------------------------------------
+    # Plan Approval routes (problem #7 Slice 4)
+    # ------------------------------------------------------------------
+
+    async def _handle_plan_list(self, request: "web.Request") -> Any:
+        """GET /observability/plans — list op_ids with registered plans.
+
+        Same deny-by-default + rate-limit + CORS discipline as the
+        task routes. Returns an array of projections, one per plan
+        (pending + terminal), sorted by op_id.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "plans": [
+                {"op_id": "op-a", "state": "pending",
+                 "expires_ts": 14123.4, "reviewer": "", "reason": ""},
+                ...
+              ],
+              "count": N
+            }
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        from backend.core.ouroboros.governance.plan_approval import (
+            get_default_controller,
+        )
+        controller = get_default_controller()
+        summaries = []
+        for snap in controller.snapshot_all():
+            # Summary only — full plan JSON lives at /plans/{op_id}.
+            summaries.append({
+                "op_id": snap["op_id"],
+                "state": snap["state"],
+                "created_ts": snap["created_ts"],
+                "expires_ts": snap["expires_ts"],
+                "reviewer": snap["reviewer"],
+                "reason": snap["reason"],
+            })
+        summaries.sort(key=lambda s: s["op_id"])
+        return self._json_response(
+            request, 200,
+            {"plans": summaries, "count": len(summaries)},
+        )
+
+    async def _handle_plan_detail(self, request: "web.Request") -> Any:
+        """GET /observability/plans/{op_id} — full plan projection.
+
+        Returns 404 on unknown op_id; 400 on malformed. Echoes the
+        full controller projection including the plan payload so
+        IDE clients can render the same schema-plan.1 structure
+        that the REPL shows.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        op_id = request.match_info.get("op_id", "")
+        if not _OP_ID_RE.match(op_id):
+            return self._error_response(
+                request, 400, "ide_observability.malformed_op_id",
+            )
+        from backend.core.ouroboros.governance.plan_approval import (
+            get_default_controller,
+        )
+        controller = get_default_controller()
+        snap = controller.snapshot(op_id)
+        if snap is None:
+            return self._error_response(
+                request, 404, "ide_observability.unknown_op_id",
+            )
+        return self._json_response(request, 200, snap)

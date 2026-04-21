@@ -71,7 +71,33 @@ logger = logging.getLogger(__name__)
 
 
 def plan_approval_mode_enabled() -> bool:
-    """Master switch. Default ``false`` until Slice 5 graduation."""
+    """Master switch for plan-approval-as-operator-modality.
+
+    Default: **``false``** by deliberate design, NOT by lack of
+    graduation. Unlike Gap #6 (where graduated defaults made sense
+    because observability is safe), plan-approval mode HALTS every
+    operation until a human approves — turning it on globally would
+    make the agent stop being autonomous.
+
+    Slice 5 graduation notes (2026-04-21):
+      * The primitive + adapter + REPL + IDE surface (Slices 1-4)
+        are all shipped and test-green (100+ tests total).
+      * The *default* stays ``false`` because "halt every op" is an
+        OPERATOR CHOICE, not a default posture. Operators toggle it
+        via ``/plan mode on`` or by setting
+        ``JARVIS_PLAN_APPROVAL_MODE=true`` in their environment.
+      * The existing orchestrator complexity gate (`_should_gate`
+        predicate) still applies to complex/architectural/heavy_code
+        ops regardless of this flag — that safety net is unchanged.
+      * Explicit ``"true"`` engages plan mode for EVERY op.
+      * Explicit ``"false"`` or unset leaves the complexity gate
+        alone.
+
+    This flag is the operator-visible modality toggle. Graduation of
+    a feature doesn't always mean "flip the default" — here it means
+    "the mechanism is proven and always ready when the operator
+    turns it on."
+    """
     return os.environ.get(
         "JARVIS_PLAN_APPROVAL_MODE", "false",
     ).strip().lower() == "true"

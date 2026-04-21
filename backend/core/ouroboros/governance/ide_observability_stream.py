@@ -80,6 +80,7 @@ from datetime import datetime, timezone
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Deque,
     Dict,
     List,
@@ -112,6 +113,12 @@ EVENT_TYPE_STREAM_LAG = "stream_lag"
 EVENT_TYPE_REPLAY_START = "replay_start"
 EVENT_TYPE_REPLAY_END = "replay_end"
 
+# Problem #7 Slice 4 — plan approval stream vocabulary.
+EVENT_TYPE_PLAN_PENDING = "plan_pending"
+EVENT_TYPE_PLAN_APPROVED = "plan_approved"
+EVENT_TYPE_PLAN_REJECTED = "plan_rejected"
+EVENT_TYPE_PLAN_EXPIRED = "plan_expired"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -123,6 +130,10 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_STREAM_LAG,
     EVENT_TYPE_REPLAY_START,
     EVENT_TYPE_REPLAY_END,
+    EVENT_TYPE_PLAN_PENDING,
+    EVENT_TYPE_PLAN_APPROVED,
+    EVENT_TYPE_PLAN_REJECTED,
+    EVENT_TYPE_PLAN_EXPIRED,
 })
 
 
@@ -811,3 +822,72 @@ class IDEStreamRouter:
             broker.unsubscribe(sub)
 
         return resp
+
+
+# ---------------------------------------------------------------------------
+# PlanApproval → broker bridge (problem #7 Slice 4)
+# ---------------------------------------------------------------------------
+
+
+def bridge_plan_approval_to_broker(
+    controller: Optional[Any] = None,
+    broker: Optional[StreamEventBroker] = None,
+) -> Callable[[], None]:
+    """Wire the PlanApprovalController's transition hook to the
+    SSE StreamEventBroker.
+
+    Every plan_pending / plan_approved / plan_rejected / plan_expired
+    transition becomes a typed SSE frame with the projection as the
+    payload. Works with both the default controller/broker singletons
+    and explicit instances (tests inject their own).
+
+    Returns an unsubscribe callable. Idempotent: calling again with
+    the same pair returns a fresh subscription without disturbing
+    older ones — callers that need exactly-one subscription should
+    track their own unsubscribe.
+
+    Authority invariant: this is a read-only adapter. The controller's
+    state is the source of truth; the broker never mutates it. The
+    bridge runs purely in the push direction (controller → broker).
+    """
+    if controller is None:
+        # Late import to avoid a cycle at module-load: plan_approval
+        # doesn't import this module, and this module doesn't import
+        # plan_approval at top level.
+        from backend.core.ouroboros.governance.plan_approval import (
+            get_default_controller as _get_default_controller,
+        )
+        controller = _get_default_controller()
+    if broker is None:
+        broker = get_default_broker()
+
+    def _publish(payload: Dict[str, Any]) -> None:
+        """Translate a controller transition into a broker publish."""
+        event_type = payload.get("event_type")
+        projection = payload.get("projection") or {}
+        op_id = projection.get("op_id") or ""
+        # Whitelist: only plan_* event types pass through. If the
+        # controller ever fires a new event type, this bridge stays
+        # silent on it rather than emitting malformed frames.
+        if event_type not in (
+            EVENT_TYPE_PLAN_PENDING,
+            EVENT_TYPE_PLAN_APPROVED,
+            EVENT_TYPE_PLAN_REJECTED,
+            EVENT_TYPE_PLAN_EXPIRED,
+        ):
+            return
+        # The plan payload can be large (full schema plan.1). Strip
+        # to a summary projection to keep each SSE frame bounded.
+        summary = {
+            "state": projection.get("state"),
+            "created_ts": projection.get("created_ts"),
+            "expires_ts": projection.get("expires_ts"),
+            "reviewer": projection.get("reviewer"),
+            "reason": projection.get("reason"),
+        }
+        # IDE clients fetch the full plan via
+        # GET /observability/plans/{op_id} — the SSE frame only
+        # needs enough metadata to prompt the fetch.
+        broker.publish(event_type, op_id, summary)
+
+    return controller.on_transition(_publish)
