@@ -192,6 +192,9 @@ export class StreamConsumer {
       signal,
     });
     if (!response.ok) {
+      // Drain/cancel the body so Node.js doesn't hold the
+      // connection open waiting for us to consume it.
+      await safeDiscardBody(response);
       throw new Error(`stream returned ${response.status}`);
     }
     if (response.body === null) {
@@ -313,6 +316,16 @@ export class StreamConsumer {
 
 function trimTrailingSlash(url: string): string {
   return url.endsWith('/') ? url.slice(0, -1) : url;
+}
+
+async function safeDiscardBody(response: Response): Promise<void> {
+  try {
+    if (response.body !== null) {
+      await response.body.cancel();
+    }
+  } catch {
+    /* already closed or not cancelable — fine */
+  }
 }
 
 function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
