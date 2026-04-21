@@ -1,0 +1,30 @@
+{
+  "steps": [
+    {
+      "name": "server_started",
+      "ts": 1776754347.825241,
+      "host": "127.0.0.1",
+      "port": 54942
+    },
+    {
+      "name": "emitted_task_created",
+      "ts": 1776754348.3566442,
+      "task_id": "task-livefire-gap6-0001"
+    },
+    {
+      "name": "emitted_task_started",
+      "ts": 1776754348.357007
+    },
+    {
+      "name": "emitted_task_completed",
+      "ts": 1776754348.357197
+    },
+    {
+      "name": "board_closed",
+      "ts": 1776754348.357354
+    }
+  ],
+  "failures": [
+    "health GET failed: timed out"
+  ]
+}
