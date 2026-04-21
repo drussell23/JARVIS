@@ -1,0 +1,53 @@
+{
+  "steps": [
+    {
+      "name": "server_started",
+      "ts": 1776756042.9503832,
+      "port": 56896
+    },
+    {
+      "name": "vscode_dist_found",
+      "ts": 1776756042.96952,
+      "path": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/extensions/vscode-jarvis/dist/api/stream.js"
+    },
+    {
+      "name": "subscribers_connected",
+      "ts": 1776756044.1304672,
+      "count": 2,
+      "expected": 2
+    },
+    {
+      "name": "events_emitted",
+      "ts": 1776756044.3073,
+      "types": [
+        "task_created",
+        "task_started",
+        "task_completed",
+        "board_closed"
+      ]
+    },
+    {
+      "name": "sublime_summary",
+      "ts": 1776756048.3541381,
+      "events": [
+        "task_created",
+        "task_started",
+        "board_closed",
+        "task_completed"
+      ],
+      "count": 4
+    },
+    {
+      "name": "vscode_summary",
+      "ts": 1776756048.3545449,
+      "events": [
+        "task_created",
+        "task_started",
+        "board_closed",
+        "task_completed"
+      ],
+      "count": 4
+    }
+  ],
+  "failures": []
+}

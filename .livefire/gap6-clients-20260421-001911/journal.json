@@ -1,0 +1,50 @@
+{
+  "steps": [
+    {
+      "name": "server_started",
+      "ts": 1776755952.159714,
+      "port": 56789
+    },
+    {
+      "name": "vscode_dist_found",
+      "ts": 1776755952.166473,
+      "path": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/extensions/vscode-jarvis/dist/api/stream.js"
+    },
+    {
+      "name": "subscribers_connected",
+      "ts": 1776755953.108515,
+      "count": 2,
+      "expected": 2
+    },
+    {
+      "name": "events_emitted",
+      "ts": 1776755953.299413,
+      "types": [
+        "task_created",
+        "task_started",
+        "task_completed",
+        "board_closed"
+      ]
+    },
+    {
+      "name": "sublime_summary",
+      "ts": 1776755957.3404338,
+      "events": [],
+      "count": 0
+    },
+    {
+      "name": "vscode_summary",
+      "ts": 1776755957.3409238,
+      "events": [
+        "task_started",
+        "board_closed",
+        "task_created",
+        "task_completed"
+      ],
+      "count": 4
+    }
+  ],
+  "failures": [
+    "Sublime client missing events: ['board_closed', 'task_completed', 'task_created', 'task_started']"
+  ]
+}

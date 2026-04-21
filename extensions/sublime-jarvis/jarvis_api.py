@@ -411,8 +411,15 @@ class StreamConsumer:
         Code extension parser: accumulate into a text buffer, split
         on the ``\\n\\n`` delimiter, parse each frame."""
         buffer = ""
+        # ``http.client.HTTPResponse.read(n)`` blocks until ``n``
+        # bytes have arrived OR the connection closes. For a
+        # long-lived SSE stream that behavior stalls the loop. Use
+        # ``read1(n)`` (available in CPython 3.5+ and Sublime's
+        # 3.8 interpreter) which returns as soon as ANY chunk is
+        # available.
+        read = getattr(resp, "read1", resp.read)
         while not self._stop_event.is_set():
-            chunk = resp.read(4096)
+            chunk = read(4096)
             if not chunk:
                 return
             buffer += chunk.decode("utf-8", errors="replace")
