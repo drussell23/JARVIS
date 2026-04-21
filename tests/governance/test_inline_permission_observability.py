@@ -217,6 +217,10 @@ def test_observability_does_not_import_authority_modules():
 
 @pytest.mark.asyncio
 async def test_prompts_list_disabled_returns_403(monkeypatch):
+    """Kill switch: explicit =false returns 403 even post-graduation."""
+    monkeypatch.setenv(
+        "JARVIS_IDE_INLINE_PERMISSION_OBSERVABILITY_ENABLED", "false",
+    )
     router = InlinePermissionObservabilityRouter()
     req = _make_request("/observability/permissions/prompts")
     status, body = await _resolve(router._handle_prompts_list(req))
