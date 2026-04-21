@@ -95,13 +95,18 @@ logger = logging.getLogger(__name__)
 def task_tools_enabled() -> bool:
     """Master switch for the three task-tool handlers.
 
-    Default: **``false``** — deny-by-default. Matches the Ticket #4
-    Slice 2 Monitor tool discipline. Slice 4 will flip this default
-    to ``true`` after graduation; until then, operators opt in
-    explicitly.
+    Default: **``true``** (graduated 2026-04-20 via Gap #5 Slice 4
+    after Slices 1-3 shipped the primitive + policy-gated Venom tools
+    + advisory prompt injection with 90/90 tests green plus a
+    live-fire proof under graduated defaults). Explicit ``"false"``
+    reverts to the Slice 2 deny-by-default posture so operators
+    retain a runtime kill switch. The per-call structural validation
+    (``classify_task_args``) + bounded-capacity caps + empty capability
+    set all remain in force regardless of this flag — graduation flips
+    opt-in friction, NOT authority surface.
     """
     return os.environ.get(
-        "JARVIS_TOOL_TASK_BOARD_ENABLED", "false",
+        "JARVIS_TOOL_TASK_BOARD_ENABLED", "true",
     ).strip().lower() == "true"
 
 

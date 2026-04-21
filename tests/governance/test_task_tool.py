@@ -138,10 +138,12 @@ def test_task_tools_allowed_under_read_only_scope():
 # ===========================================================================
 
 
-def test_policy_denies_when_master_switch_absent(monkeypatch):
-    """Slice 2 test 4 (CRITICAL): with JARVIS_TOOL_TASK_BOARD_ENABLED
-    not set, every task tool is DENIED. Deny-by-default posture
-    mirrors Ticket #4 Slice 2."""
+def test_policy_denies_when_master_switch_explicitly_off(monkeypatch):
+    """Slice 2 test 4 (CRITICAL, post-Slice-4 graduation): explicit
+    JARVIS_TOOL_TASK_BOARD_ENABLED=false (operator opt-out) DENIES
+    every task tool. Proves the runtime kill-switch survives the
+    graduation flip."""
+    monkeypatch.setenv("JARVIS_TOOL_TASK_BOARD_ENABLED", "false")
     policy = GoverningToolPolicy(repo_roots={"jarvis": Path("/tmp")})
     for name, args in [
         ("task_create", {"title": "work"}),
@@ -149,7 +151,9 @@ def test_policy_denies_when_master_switch_absent(monkeypatch):
         ("task_complete", {"task_id": "task-x"}),
     ]:
         result = policy.evaluate(_call(name, **args), _pctx())
-        assert result.decision == PolicyDecision.DENY, f"{name} allowed while master off"
+        assert result.decision == PolicyDecision.DENY, (
+            name + " allowed while master explicit-false"
+        )
         assert result.reason_code == "tool.denied.task_tools_disabled"
 
 
@@ -600,9 +604,13 @@ def test_classify_update_accepts_content_update():
     ) is None
 
 
-def test_classify_task_tools_enabled_default_false(monkeypatch):
+def test_classify_task_tools_enabled_default_post_graduation_is_true(monkeypatch):
+    """Slice 4 graduation pin (renamed from default-false test): the
+    env helper returns True when JARVIS_TOOL_TASK_BOARD_ENABLED is
+    absent, reflecting the Slice 4 graduation flip. Opt-out via
+    explicit "false" is pinned separately."""
     monkeypatch.delenv("JARVIS_TOOL_TASK_BOARD_ENABLED", raising=False)
-    assert task_tools_enabled() is False
+    assert task_tools_enabled() is True
 
 
 def test_classify_task_tools_enabled_true(monkeypatch):
