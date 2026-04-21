@@ -85,8 +85,8 @@ def _run_async(coro):
 
 def _make_request(
     path: str = "/observability/stream",
-    headers: Dict[str, str] = None,
-    query: Dict[str, str] = None,
+    headers=None,
+    query=None,
     remote: str = "127.0.0.1",
 ) -> web.Request:
     if query:
@@ -452,17 +452,25 @@ def test_stream_handler_returns_400_on_malformed_op_id(monkeypatch):
     assert body["reason_code"] == "ide_stream.malformed_op_id"
 
 
+def _capacity_broker():
+    """Broker stub whose subscribe() always returns None — simulates
+    a subscriber-cap-exceeded condition without actually entering the
+    streaming response path."""
+    class _FullBroker:
+        def subscribe(self, op_id_filter=None, last_event_id=None):
+            return None
+    return _FullBroker()
+
+
 def test_stream_handler_returns_429_on_rate_limit(monkeypatch):
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "true")
     monkeypatch.setenv("JARVIS_IDE_STREAM_RATE_LIMIT_PER_MIN", "2")
-    # But also cap subscribers at 0 to short-circuit the actual stream
-    # — we only want to exercise the 429 path and can't easily
-    # simulate a successful streaming response in a unit test.
-    monkeypatch.setenv("JARVIS_IDE_STREAM_MAX_SUBSCRIBERS", "0")
-    router = IDEStreamRouter()
-    # Burn through the 2/min budget with 503s, then hit 429.
+    # Use a capacity-stub broker so each allowed call returns 503
+    # immediately without opening a real stream.
+    router = IDEStreamRouter(broker=_capacity_broker())
     for _ in range(2):
-        _run_async(router._handle_stream(_make_request()))
+        r = _run_async(router._handle_stream(_make_request()))
+        assert r.status == 503
     resp = _run_async(router._handle_stream(_make_request()))
     assert resp.status == 429
     body = json.loads(resp.body.decode())
@@ -471,8 +479,7 @@ def test_stream_handler_returns_429_on_rate_limit(monkeypatch):
 
 def test_stream_handler_returns_503_when_subscriber_cap_hit(monkeypatch):
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "true")
-    monkeypatch.setenv("JARVIS_IDE_STREAM_MAX_SUBSCRIBERS", "0")
-    router = IDEStreamRouter()
+    router = IDEStreamRouter(broker=_capacity_broker())
     resp = _run_async(router._handle_stream(_make_request()))
     assert resp.status == 503
     body = json.loads(resp.body.decode())
@@ -523,34 +530,28 @@ def test_task_tool_handlers_publish_on_each_transition(monkeypatch):
     reset_default_broker()
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "true")
 
-    policy_ctx = PolicyContext(op_id="op-abc", generation_attempt=1)
+    policy_ctx = PolicyContext(
+        repo="test", repo_root=Path("/tmp"),
+        op_id="op-abc", call_id="op-abc:r0:task_create", round_index=0,
+    )
 
     async def _run():
-        # create
         r1 = await run_task_tool(
-            ToolCall(
-                tool_call_id="tc1", name="task_create",
-                arguments={"title": "do a thing"},
-            ),
+            ToolCall(name="task_create", arguments={"title": "do a thing"}),
             policy_ctx, timeout=5.0, cap=10_000,
         )
         assert r1.status == ToolExecStatus.SUCCESS
         task_id = json.loads(r1.output)["task_id"]
-        # start
         r2 = await run_task_tool(
             ToolCall(
-                tool_call_id="tc2", name="task_update",
+                name="task_update",
                 arguments={"task_id": task_id, "action": "start"},
             ),
             policy_ctx, timeout=5.0, cap=10_000,
         )
         assert r2.status == ToolExecStatus.SUCCESS
-        # complete
         r3 = await run_task_tool(
-            ToolCall(
-                tool_call_id="tc3", name="task_complete",
-                arguments={"task_id": task_id},
-            ),
+            ToolCall(name="task_complete", arguments={"task_id": task_id}),
             policy_ctx, timeout=5.0, cap=10_000,
         )
         assert r3.status == ToolExecStatus.SUCCESS
@@ -612,18 +613,19 @@ def test_stream_cors_rejects_unmatched_origin(monkeypatch):
 
 
 def test_every_error_response_carries_schema_version(monkeypatch):
-    router = IDEStreamRouter()
     # Disabled → 403
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "false")
+    router = IDEStreamRouter()
     r1 = _run_async(router._handle_stream(_make_request()))
     assert json.loads(r1.body.decode())["schema_version"] == STREAM_SCHEMA_VERSION
-    # Capacity → 503
+    # Capacity → 503 (stub broker)
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "true")
-    monkeypatch.setenv("JARVIS_IDE_STREAM_MAX_SUBSCRIBERS", "0")
-    r2 = _run_async(router._handle_stream(_make_request()))
+    router2 = IDEStreamRouter(broker=_capacity_broker())
+    r2 = _run_async(router2._handle_stream(_make_request()))
     assert json.loads(r2.body.decode())["schema_version"] == STREAM_SCHEMA_VERSION
     # Malformed → 400
-    r3 = _run_async(router._handle_stream(_make_request(query={"op_id": "bad space"})))
+    router3 = IDEStreamRouter(broker=_capacity_broker())
+    r3 = _run_async(router3._handle_stream(_make_request(query={"op_id": "bad space"})))
     assert json.loads(r3.body.decode())["schema_version"] == STREAM_SCHEMA_VERSION
 
 
