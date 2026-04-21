@@ -3249,8 +3249,15 @@ class GovernedOrchestrator:
                     _cost_this_call = float(getattr(generation, "cost_usd", 0.0) or 0.0)
                     _prov_name = getattr(generation, "provider_name", "") or ""
                     if _cost_this_call > 0.0:
+                        # Slice 2 of Per-Phase Cost Drill-Down arc:
+                        # tag charge with current phase so the operator
+                        # can answer "why did this op cost $X" per-phase.
+                        _phase_tag = getattr(
+                            getattr(ctx, "phase", None), "name", "",
+                        ) or ""
                         self._cost_governor.charge(
                             ctx.op_id, _cost_this_call, _prov_name,
+                            phase=_phase_tag,
                         )
                         await self._emit_route_cost_heartbeat(
                             ctx,
@@ -4042,8 +4049,13 @@ class GovernedOrchestrator:
                                     _dem_cost = float(getattr(generation, "cost_usd", 0.0) or 0.0)
                                     _dem_prov = getattr(generation, "provider_name", "") or ""
                                     if _dem_cost > 0.0:
+                                        _dem_phase = getattr(
+                                            getattr(ctx, "phase", None),
+                                            "name", "",
+                                        ) or ""
                                         self._cost_governor.charge(
                                             ctx.op_id, _dem_cost, _dem_prov,
+                                            phase=_dem_phase,
                                         )
                                         await self._emit_route_cost_heartbeat(
                                             ctx,

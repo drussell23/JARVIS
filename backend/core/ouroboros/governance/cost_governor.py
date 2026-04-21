@@ -70,7 +70,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +215,17 @@ class _OpCostEntry:
     route_factor: float = 1.0
     complexity_factor: float = 1.0
     retry_headroom: float = 1.0
+    # Per-phase cost instrumentation — drill-down arc Slice 2.
+    # phase_totals: {phase_name: cumulative_usd} rolling per-phase.
+    # phase_by_provider: {phase_name: {provider: cumulative_usd}}.
+    # unknown_phase_usd: charges that arrived without a phase tag —
+    # preserved separately so the budget-cap path stays oblivious to
+    # phase data (cumulative_usd remains the sole budget axis).
+    phase_totals: Dict[str, float] = field(default_factory=dict)
+    phase_by_provider: Dict[str, Dict[str, float]] = field(
+        default_factory=dict,
+    )
+    unknown_phase_usd: float = 0.0
 
 
 # -----------------------------------------------------------------------------
@@ -357,6 +368,7 @@ class CostGovernor:
         op_id: str,
         cost_usd: float,
         provider: str = "",
+        phase: Optional[str] = None,
     ) -> float:
         """Charge a provider call to the op's ledger. Returns cumulative_usd.
 
@@ -365,6 +377,21 @@ class CostGovernor:
 
         If ``start()`` was never called for ``op_id``, a default-cap entry
         is created on the fly so cost tracking never silently drops data.
+
+        Per-Phase Cost Drill-Down arc (Slice 2)
+        ---------------------------------------
+
+        The optional ``phase`` argument tags this charge with the
+        orchestrator phase that produced it (e.g. ``"GENERATE"`` /
+        ``"VALIDATE"`` / ``"VERIFY"``). When supplied the amount is
+        also added to ``entry.phase_totals[phase]`` and
+        ``entry.phase_by_provider[phase][provider]`` so
+        :meth:`get_phase_breakdown` can render a per-op drill-down.
+
+        **Budget contract:** phase tagging is pure accounting — it
+        does NOT change ``entry.cumulative_usd`` or the cap-check
+        logic. Callers that omit ``phase`` see byte-for-byte the
+        pre-Slice-2 behavior (grep-pinned at graduation).
         """
         if not self._config.enabled:
             return 0.0
@@ -387,6 +414,19 @@ class CostGovernor:
         entry.call_count += 1
         key = provider or "unknown"
         entry.provider_totals[key] = entry.provider_totals.get(key, 0.0) + float(cost_usd)
+        # Per-phase accounting (additive, never affects budget enforcement).
+        phase_tag = (phase or "").strip()
+        if phase_tag:
+            entry.phase_totals[phase_tag] = (
+                entry.phase_totals.get(phase_tag, 0.0) + float(cost_usd)
+            )
+            entry.phase_by_provider.setdefault(phase_tag, {})
+            entry.phase_by_provider[phase_tag][key] = (
+                entry.phase_by_provider[phase_tag].get(key, 0.0)
+                + float(cost_usd)
+            )
+        else:
+            entry.unknown_phase_usd += float(cost_usd)
 
         if entry.cumulative_usd >= entry.cap_usd and not entry.exceeded:
             entry.exceeded = True
@@ -474,6 +514,60 @@ class CostGovernor:
                 "complexity_factor": round(entry.complexity_factor, 4),
                 "retry_headroom": round(entry.retry_headroom, 4),
             },
+            # Slice 2 additive keys — consumers that don't know about
+            # them safely ignore unknown mapping entries.
+            "phase_totals": {
+                k: round(v, 6) for k, v in entry.phase_totals.items()
+            },
+            "phase_by_provider": {
+                phase: {p: round(v, 6) for p, v in providers.items()}
+                for phase, providers in entry.phase_by_provider.items()
+            },
+            "unknown_phase_usd": round(entry.unknown_phase_usd, 6),
+        }
+
+    # --------------------------------------------------------------
+    # Phase drill-down (Per-Phase Cost Drill-Down arc Slice 2)
+    # --------------------------------------------------------------
+
+    def get_phase_breakdown(self, op_id: str) -> Optional[Any]:
+        """Project an op's current cost state into a
+        :class:`PhaseCostBreakdown`. Returns ``None`` when the op
+        is not tracked.
+
+        The projection is a snapshot — it does not remove the entry.
+        Safe to call multiple times during an op's lifecycle.
+        """
+        entry = self._entries.get(op_id)
+        if entry is None:
+            return None
+        # Late import avoids a module-load cycle — phase_cost is a
+        # leaf module; cost_governor is a prod-critical one.
+        from backend.core.ouroboros.governance.phase_cost import (
+            breakdown_from_mappings,
+        )
+        return breakdown_from_mappings(
+            op_id=op_id,
+            phase_totals=dict(entry.phase_totals),
+            phase_by_provider={
+                phase: dict(providers)
+                for phase, providers in entry.phase_by_provider.items()
+            },
+            call_count=entry.call_count,
+            unknown_phase_usd=entry.unknown_phase_usd,
+        )
+
+    def snapshot_all_phase_breakdowns(self) -> Dict[str, Any]:
+        """Snapshot every live op's phase breakdown.
+
+        Returns a ``{op_id: PhaseCostBreakdown}`` dict. Empty dict when
+        governor is disabled or no ops are active.
+        """
+        if not self._config.enabled:
+            return {}
+        return {
+            op_id: self.get_phase_breakdown(op_id)  # type: ignore[misc]
+            for op_id in list(self._entries.keys())
         }
 
     def _prune_stale(self) -> int:
