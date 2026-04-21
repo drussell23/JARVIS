@@ -75,11 +75,34 @@ logger = logging.getLogger("Ouroboros.InlinePrompt")
 
 
 def inline_permission_enabled() -> bool:
-    """Master switch for the ToolExecutor hook. Default OFF (Slice 5 graduates).
+    """Master switch for the ToolExecutor hook.
 
-    Slices 1–4 ship the primitive. The operator opts in by setting
-    ``JARVIS_INLINE_PERMISSION_ENABLED=true``. Slice 5 flips the default
-    after a ``3-clean-session`` graduation arc.
+    Default: **``false``** by DELIBERATE DESIGN, not by lack of
+    graduation. Slice 5 graduation (2026-04-21) shipped the full stack
+    — primitive + middleware + REPL + memory store + IDE observability
+    + battle-test proof — but the tool-hook default stays off because:
+
+      1. :class:`OpApprovedScope` is currently populated by test /
+         battle-harness injection. The production orchestrator has not
+         yet been wired to populate it per-op from the
+         :class:`OperationContext`. Graduating with an empty scope
+         resolver would prompt on *every* unscoped edit / write /
+         bash call — operator-hostile.
+      2. Mirrors Problem #7's Slice 5 posture ("halt every op" is an
+         operator choice, not a default).
+      3. Operators who want the inline-prompt experience set this to
+         ``=true`` explicitly. When they do, every Slice 2 interaction
+         pin (NOTIFY_APPLY / PlanApproval / ask_human double-ask
+         suppression via :class:`BlessedShapeLedger`) applies.
+
+    The observability half (:func:`inline_permission_observability_enabled`)
+    DID graduate to default-on because a read-only view of what the
+    middleware *would* do is a pure safety benefit with no friction
+    cost. See that docstring for rationale.
+
+    A future slice will (a) wire per-op scope from the orchestrator and
+    (b) re-evaluate graduating this flag's default with a fresh live-fire
+    arc at that point.
     """
     return os.environ.get(
         "JARVIS_INLINE_PERMISSION_ENABLED", "false",

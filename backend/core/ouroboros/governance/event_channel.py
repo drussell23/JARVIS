@@ -217,6 +217,64 @@ class EventChannelServer:
                     "[EventChannel] IDE stream wiring failed: %s", stream_exc,
                 )
 
+            # Inline Permission Slice 5 — observability router + bridge.
+            # Loopback + CORS invariants mirror the existing IDE surface;
+            # authority invariant (no orchestrator / gate imports) is
+            # grep-pinned by
+            # tests/governance/test_inline_permission_observability.py.
+            inline_perm_mounted = False
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (
+                    assert_loopback_only as _assert_loopback_inline,
+                )
+                from backend.core.ouroboros.governance.inline_permission_observability import (  # noqa: E501
+                    InlinePermissionObservabilityRouter,
+                    bridge_inline_permission_to_broker,
+                    inline_permission_observability_enabled,
+                )
+                if inline_permission_observability_enabled():
+                    _assert_loopback_inline(self._host)
+                    InlinePermissionObservabilityRouter().register_routes(app)
+                    inline_perm_mounted = True
+                    # Bridge controller + store → SSE broker. Best-effort:
+                    # stream_enabled() is rechecked inside the bridge's
+                    # publish path, so when stream is off we still keep
+                    # the listeners wired but drop publishes silently.
+                    try:
+                        from pathlib import Path as _P
+                        from backend.core.ouroboros.governance.inline_permission_prompt import (  # noqa: E501
+                            get_default_controller as _get_inline_ctrl,
+                        )
+                        from backend.core.ouroboros.governance.inline_permission_memory import (  # noqa: E501
+                            get_store_for_repo as _get_inline_store,
+                        )
+                        # Per-repo store defaults to current working
+                        # directory. Servers that need a specific repo
+                        # scope can override via injection in a future
+                        # slice; the current contract mirrors the
+                        # lazy-resolution in the observability router.
+                        self._inline_perm_unsub = (
+                            bridge_inline_permission_to_broker(
+                                controller=_get_inline_ctrl(),
+                                store=_get_inline_store(_P.cwd()),
+                            )
+                        )
+                    except Exception as bridge_exc:  # noqa: BLE001
+                        logger.warning(
+                            "[EventChannel] inline-permission bridge "
+                            "attach failed: %s", bridge_exc,
+                        )
+            except ValueError as inline_loopback_exc:
+                logger.warning(
+                    "[EventChannel] inline-permission observability "
+                    "refused: %s", inline_loopback_exc,
+                )
+            except Exception as inline_exc:
+                logger.warning(
+                    "[EventChannel] inline-permission wiring failed: %s",
+                    inline_exc,
+                )
+
             runner = web.AppRunner(app)
             await runner.setup()
             self._site = web.TCPSite(runner, self._host, self._port)

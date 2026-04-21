@@ -3281,6 +3281,33 @@ class SerpentREPL:
                             )
                             continue
 
+                    # Inline Permission Slice 5 — /allow /deny /always
+                    # /pause /prompts /permissions dispatcher. Routes
+                    # per-tool-call inline-permission operator actions
+                    # (CC-parity "is this OK?" inline). matched=False
+                    # falls through. Never raises into the REPL.
+                    if line.startswith((
+                        "/allow", "/deny", "/always", "/pause",
+                        "/prompts", "/permissions",
+                    )):
+                        try:
+                            from backend.core.ouroboros.governance.inline_permission_repl import (  # noqa: E501
+                                dispatch_inline_command,
+                            )
+                            _ip_result = dispatch_inline_command(line)
+                            if _ip_result.matched:
+                                self._flow.console.print(
+                                    _ip_result.text, highlight=False,
+                                )
+                                continue
+                        except Exception as exc:  # noqa: BLE001
+                            self._flow.console.print(
+                                f"  [{_C['death']}]inline-permission "
+                                f"dispatch error: {exc}[/{_C['death']}]",
+                                highlight=False,
+                            )
+                            continue
+
                     # ConversationBridge capture (V1: user turns only).
                     # Any line that fell through the built-in dispatch is
                     # either free-text for the external handler or an

@@ -342,7 +342,72 @@ class RememberedAllowStore:
         self._revoked: set = set()
         self._gate = gate or InlinePermissionGate()
         self._path = self._repo_root / ".jarvis" / JSONL_FILE_NAME
+        self._listeners: List[Callable[[Dict[str, Any]], None]] = []
         self._load()
+
+    # --- listener hooks --------------------------------------------------
+
+    def on_change(
+        self, listener: Callable[[Dict[str, Any]], None],
+    ) -> Callable[[], None]:
+        """Subscribe to store-change events. Returns an unsubscribe callback.
+
+        Event payload shape::
+
+            {
+              "event_type": "inline_grant_created" | "inline_grant_revoked",
+              "grant_id": "ga-...",
+              "projection": { ...sanitized grant fields... },
+            }
+
+        Listeners run synchronously on the caller's thread. Exceptions
+        are logged but never propagate back into grant()/revoke().
+        """
+        with self._lock:
+            self._listeners.append(listener)
+
+        def _unsub() -> None:
+            with self._lock:
+                if listener in self._listeners:
+                    self._listeners.remove(listener)
+
+        return _unsub
+
+    def _fire(self, event_type: str, projection: Dict[str, Any]) -> None:
+        payload = {
+            "event_type": event_type,
+            "grant_id": projection.get("grant_id", ""),
+            "projection": projection,
+        }
+        for l in list(self._listeners):
+            try:
+                l(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[RememberedAllow] listener exception on %s: %s",
+                    event_type, exc,
+                )
+
+    @staticmethod
+    def project_for_stream(g: "RememberedAllowGrant") -> Dict[str, Any]:
+        """Sanitized projection safe for SSE / IDE transports.
+
+        NEVER emits the raw ``pattern`` field — use ``sanitized_pattern``
+        which has already passed through :func:`sanitize_for_firewall`.
+        Defense-in-depth: the firewall rejects credential-shaped grants
+        at write time, but if anything slipped through we don't want
+        SSE consumers to be the attacker's exfil channel.
+        """
+        return {
+            "grant_id": g.grant_id,
+            "tool": g.tool,
+            "match_mode": g.match_mode,
+            "pattern_preview": g.sanitized_pattern or g.pattern[:200],
+            "granted_at_iso": g.granted_at_iso,
+            "expires_at_iso": g.expires_at_iso,
+            "granted_from_prompt_id": g.granted_from_prompt_id,
+            "operator_note": g.operator_note[:200],
+        }
 
     # --- IO --------------------------------------------------------------
 
@@ -495,6 +560,7 @@ class RememberedAllowStore:
             len(pattern), prompt_id or "-",
             operator_note[:60] if operator_note else "",
         )
+        self._fire("inline_grant_created", self.project_for_stream(g))
         return g
 
     # --- revoke ----------------------------------------------------------
@@ -503,6 +569,7 @@ class RememberedAllowStore:
         with self._lock:
             if grant_id not in self._grants and grant_id not in self._revoked:
                 return False
+            existing = self._grants.get(grant_id)
             self._append({
                 "op": "revoke",
                 "grant_id": grant_id,
@@ -511,6 +578,12 @@ class RememberedAllowStore:
             self._grants.pop(grant_id, None)
             self._revoked.add(grant_id)
         logger.info("[RememberedAllow] revoked id=%s", grant_id)
+        projection: Dict[str, Any]
+        if existing is not None:
+            projection = self.project_for_stream(existing)
+        else:
+            projection = {"grant_id": grant_id}
+        self._fire("inline_grant_revoked", projection)
         return True
 
     def revoke_all(self) -> int:
