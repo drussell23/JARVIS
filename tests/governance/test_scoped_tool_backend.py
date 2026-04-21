@@ -188,22 +188,26 @@ async def test_explicit_deny_takes_precedence_over_allowlist() -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_allowlist_is_permissive() -> None:
+async def test_empty_allowlist_is_permissive_for_type_gate() -> None:
     """Test 5: ToolScope() with no allowed_tools/denied_tools/read_only
-    is fully permissive — every tool passes through to the inner backend.
-
-    This matches the existing ``worker`` / ``lead`` scope defaults.
+    is TYPE-gate permissive — every tool passes the ScopedToolGate
+    check. Under the Epoch 1 / Ticket 8 COUNT gate, mutation tools
+    still require an explicit ``max_mutations > 0`` budget; callers
+    that want the old ``worker`` / ``lead`` "unlimited mutations"
+    semantics must opt in via a high budget.
     """
     gate = ScopedToolGate(ToolScope())
     inner = _RecordingBackend()
-    backend = ScopedToolBackend(inner=inner, gate=gate)
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=99,
+    )
 
     for tool in ("read_file", "bash", "edit_file", "search_code"):
         result = await backend.execute_async(
             ToolCall(name=tool), _pctx(), deadline=10.0,
         )
         assert result.status == ToolExecStatus.SUCCESS, (
-            f"permissive scope must allow {tool}"
+            f"permissive scope + unlimited budget must allow {tool}"
         )
 
 
@@ -275,19 +279,23 @@ async def test_mutation_tool_with_allowlist_and_not_readonly() -> None:
     boundary validation already enforced the cross-field consistency
     (can't have max_mutations>0 without mutating tools AND
     parent_op_risk_tier >= NOTIFY_APPLY), so this layer just honors
-    the resulting scope.
+    the resulting scope — provided the COUNT gate is opened with a
+    matching ``max_mutations`` budget (Epoch 1 / Ticket 8).
     """
     gate = ScopedToolGate(ToolScope(
         allowed_tools=frozenset({"read_file", "edit_file"}),
         read_only=False,  # mutating invocation
     ))
     inner = _RecordingBackend()
-    backend = ScopedToolBackend(inner=inner, gate=gate)
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1,
+    )
 
     call = ToolCall(name="edit_file", arguments={"path": "a.py", "content": "..."})
     result = await backend.execute_async(call, _pctx(), deadline=10.0)
     assert result.status == ToolExecStatus.SUCCESS
     assert len(inner.calls) == 1
+    assert backend.mutations_count == 1
 
 
 @pytest.mark.asyncio

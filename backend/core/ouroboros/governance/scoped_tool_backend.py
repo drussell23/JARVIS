@@ -50,7 +50,11 @@ Usage::
         read_only=(invocation["max_mutations"] == 0),
     )
     gate = ScopedToolGate(scope)
-    backend = ScopedToolBackend(inner=real_backend, gate=gate)
+    backend = ScopedToolBackend(
+        inner=real_backend,
+        gate=gate,
+        max_mutations=invocation["max_mutations"],
+    )
     # Drop-in replacement for the inner backend in ToolLoopCoordinator.
 
 Safety invariants:
