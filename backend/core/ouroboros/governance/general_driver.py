@@ -33,10 +33,11 @@ escape as ``_internal_failure_result``, but the driver itself converts
 every expected failure into a structured exec_trace so the observer
 pipeline produces a normal-shaped record.
 
-Flag: ``JARVIS_GENERAL_LLM_DRIVER_ENABLED`` (default false) controls
-whether the factory ships this driver or leaves the stub path
-active. When false, ``AgenticGeneralSubagent.llm_driver`` stays None
-and ``_execute_body`` returns the existing
+Flag: ``JARVIS_GENERAL_LLM_DRIVER_ENABLED`` (default **true** after
+2026-04-20 Slice 1b graduation) controls whether the factory ships
+this driver or leaves the stub path active. Explicit ``false`` opts
+back into the Phase B stub path: ``AgenticGeneralSubagent.llm_driver``
+stays None and ``_execute_body`` returns the existing
 ``NOT_IMPLEMENTED_NEEDS_LLM_WIRING`` placeholder.
 """
 from __future__ import annotations

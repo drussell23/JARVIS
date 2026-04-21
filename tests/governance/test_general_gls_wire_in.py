@@ -92,8 +92,10 @@ def test_factory_flag_off_returns_stub_subagent(
 ) -> None:
     """Flag off → factory returns stub subagent (llm_driver=None). This
     is the byte-identical-to-Phase-B-default behavior that makes the
-    wire-in safe to attach unconditionally."""
-    monkeypatch.delenv("JARVIS_GENERAL_LLM_DRIVER_ENABLED", raising=False)
+    wire-in safe to attach unconditionally. Post-graduation (2026-04-20)
+    the default is ``true``, so opt-out now requires an explicit
+    ``setenv("false")`` — a bare ``delenv`` would enable the driver."""
+    monkeypatch.setenv("JARVIS_GENERAL_LLM_DRIVER_ENABLED", "false")
 
     claude = SimpleNamespace(name="claude")
     gls = _make_gls_surface(claude_ref=claude)

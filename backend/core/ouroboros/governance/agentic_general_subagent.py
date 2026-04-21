@@ -536,13 +536,12 @@ def build_llm_general_factory(
 ) -> Callable[[], AgenticGeneralSubagent]:
     """Phase C Slice 1a factory — wires an LLM driver behind the flag.
 
-    When ``JARVIS_GENERAL_LLM_DRIVER_ENABLED=true``, the returned
-    factory constructs an ``AgenticGeneralSubagent`` with
-    ``llm_driver`` set to a closure over
-    :func:`general_driver.run_general_tool_loop`. When the flag is
-    off, falls back to :func:`build_default_general_factory` (stub
-    path) so operators can attach the factory unconditionally at boot
-    and opt in at runtime via the env var.
+    Graduated 2026-04-20 — ``JARVIS_GENERAL_LLM_DRIVER_ENABLED``
+    defaults to ``true``. The returned factory constructs an
+    ``AgenticGeneralSubagent`` with ``llm_driver`` set to a closure
+    over :func:`general_driver.run_general_tool_loop`. Explicit
+    ``false`` falls back to :func:`build_default_general_factory`
+    (stub path) so operators can opt out at runtime via the env var.
 
     Parameters
     ----------
