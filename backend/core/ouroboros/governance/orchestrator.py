@@ -1152,6 +1152,24 @@ class GovernedOrchestrator:
                 logger.debug(
                     "[Orchestrator] CostGovernor.finish failed", exc_info=True,
                 )
+            # Close the per-op TaskBoard registry entry (Gap #5 Slice 3).
+            # Idempotent + safe on ops that never touched a task tool
+            # (returns False cleanly). Single canonical shutdown hook
+            # per the Gap #5 Slice 2 authorization. Authority-free —
+            # just a scratchpad cleanup.
+            try:
+                from backend.core.ouroboros.governance.task_tool import (
+                    close_task_board,
+                )
+                close_task_board(
+                    ctx.op_id,
+                    reason="op terminal phase=" + ctx.phase.name,
+                )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] TaskBoard close failed",
+                    exc_info=True,
+                )
             # Finalize the forward-progress detector entry. Safe to call
             # whether or not the op actually observed anything.
             try:
@@ -1512,6 +1530,46 @@ class GovernedOrchestrator:
             logger.debug(
                 "[Orchestrator] SemanticIndex injection skipped",
                 exc_info=True,
+            )
+
+        # ---- TaskBoard advisory prompt injection (Gap #5 Slice 3) ----
+        #
+        # Read-only + authority-free. We do NOT lazily create a board
+        # here — only render when the model has already touched a task
+        # tool during this op (i.e. a board exists in the registry).
+        # Avoids injecting an empty "Current tasks" section on every
+        # op. Per authorization: NEVER gates Iron Gate / policy /
+        # approval (Manifesto §1 + §6). Tier -1 sanitation inside
+        # TaskBoard.render_prompt_section() handles model content
+        # safety — we don't fight the sanitizer here.
+        try:
+            from backend.core.ouroboros.governance.task_tool import (
+                _BOARDS,
+            )
+            _tb = _BOARDS.get(ctx.op_id)
+            if _tb is not None:
+                _tb_prompt = _tb.render_prompt_section()
+                if _tb_prompt:
+                    _tb_existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=(
+                            ctx.strategic_intent_id or "task-board-v1"
+                        ),
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=(
+                            _tb_existing + "\n\n" + _tb_prompt
+                            if _tb_existing else _tb_prompt
+                        ),
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.info(
+                        "[TaskBoard] op=%s inject_site=context_expansion "
+                        "prompt_chars=%d",
+                        ctx.op_id, len(_tb_prompt),
+                    )
+        except Exception:
+            logger.debug(
+                "[Orchestrator] TaskBoard injection skipped", exc_info=True,
             )
 
         # ---- TDD directive (Feature 1 V1 — prompt contract, NOT red-green) ----

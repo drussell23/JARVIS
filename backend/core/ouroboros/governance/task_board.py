@@ -115,6 +115,46 @@ def _max_body_len() -> int:
         return 2000
 
 
+# Slice 3 — advisory prompt injection.
+
+
+def _prompt_injection_enabled() -> bool:
+    """Master switch for TaskBoard's advisory CONTEXT_EXPANSION
+    subsection. Default **true** — unlike the Venom tool flag (which
+    is deny-by-default per Slice 2), prompt injection is pure
+    observability and authority-free, so defaults on. Operators can
+    disable via ``=false`` if the subsection is noisy in their
+    workflow.
+    """
+    return os.environ.get(
+        "JARVIS_TASK_BOARD_PROMPT_INJECTION_ENABLED", "true",
+    ).strip().lower() == "true"
+
+
+def _prompt_max_tasks() -> int:
+    """How many pending tasks to list in the advisory prompt
+    subsection. Default 5 — enough for a focused step list without
+    drowning the CONTEXT_EXPANSION prompt in stale backlog."""
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_TASK_BOARD_PROMPT_MAX_TASKS", "5",
+        )))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _prompt_title_preview_len() -> int:
+    """Per-task title preview length in the advisory prompt subsection.
+    Default 120 chars — enough to identify, short enough to keep the
+    prompt compact."""
+    try:
+        return max(16, int(os.environ.get(
+            "JARVIS_TASK_BOARD_PROMPT_TITLE_PREVIEW", "120",
+        )))
+    except (TypeError, ValueError):
+        return 120
+
+
 # --- Data types ------------------------------------------------------------
 
 
@@ -426,6 +466,107 @@ class TaskBoard:
             self._op_id, task_id, ",".join(fields_changed),
         )
         return updated
+
+    # --- Slice 3: advisory prompt injection --------------------------------
+
+    def render_prompt_section(self) -> Optional[str]:
+        """Return an advisory ``## Current tasks (advisory)`` subsection
+        for CONTEXT_EXPANSION, or ``None``.
+
+        Authority-free — consumed ONLY by StrategicDirection (orchestrator
+        at CONTEXT_EXPANSION). Never gates Iron Gate, risk tier, tool
+        policy, approval, or merge correctness (Manifesto §1 + §6).
+
+        Lists the single active (in_progress) task + up to
+        ``JARVIS_TASK_BOARD_PROMPT_MAX_TASKS`` (default 5) pending
+        tasks. Completed / cancelled tasks are NOT rendered — those
+        live in the §8 audit log via per-transition INFO lines, not
+        in the model-visible prompt.
+
+        Returns ``None`` when:
+          * Prompt injection disabled via env
+          * Board is closed
+          * Board has no active + no pending tasks (all terminal / empty)
+
+        Sanitization: each title is passed through ``sanitize_for_log``
+        to match the Tier -1 discipline the ConversationBridge applies
+        (strip control chars, cap length). If the sanitizer strips
+        title text to empty, the task is rendered as ``<redacted>``
+        rather than omitted — the task ID + state remain visible so
+        the audit story stays coherent. This is the locked
+        "don't fight the sanitizer blindly" posture.
+        """
+        if not _prompt_injection_enabled():
+            return None
+        with self._lock:
+            if self._closed:
+                return None
+            # Copy the small subsets we care about while holding the lock.
+            active = (
+                self._tasks.get(self._active_task_id)
+                if self._active_task_id is not None
+                else None
+            )
+            pending = [
+                self._tasks[tid]
+                for tid in self._insertion_order
+                if self._tasks[tid].state == STATE_PENDING
+            ]
+
+        if active is None and not pending:
+            return None
+
+        # Lazy import to avoid tight coupling at module load.
+        try:
+            from backend.core.secure_logging import sanitize_for_log
+        except Exception:
+            # If the sanitizer is somehow unavailable, render with
+            # a minimal in-module fallback: strip control chars only.
+            def sanitize_for_log(s: str, max_len: int = 512) -> str:  # type: ignore
+                cleaned = "".join(
+                    c for c in (s or "") if c.isprintable() or c == " "
+                )
+                return cleaned[:max_len]
+
+        preview_len = _prompt_title_preview_len()
+        max_pending = _prompt_max_tasks()
+
+        def _sanitize_title(raw: str) -> str:
+            cleaned = sanitize_for_log(raw or "", max_len=preview_len)
+            return cleaned if cleaned.strip() else "<redacted>"
+
+        parts: List[str] = [
+            "## Current tasks (advisory)",
+            "",
+            "Model's per-op scratchpad. **Not authoritative** — does "
+            "not gate Iron Gate, validation, tool policy, or approval. "
+            "The self-declared work-in-progress view.",
+            "",
+        ]
+
+        if active is not None:
+            parts.append("### Active (in_progress)")
+            parts.append(
+                "- [" + active.task_id + "] "
+                + _sanitize_title(active.title)
+            )
+            parts.append("")
+
+        if pending:
+            parts.append("### Pending")
+            for task in pending[:max_pending]:
+                parts.append(
+                    "- [" + task.task_id + "] "
+                    + _sanitize_title(task.title)
+                )
+            if len(pending) > max_pending:
+                remaining = len(pending) - max_pending
+                parts.append(
+                    "- ... (+" + str(remaining) + " more pending)"
+                )
+            parts.append("")
+
+        return "\n".join(parts).rstrip()
 
     # --- close -------------------------------------------------------------
 
