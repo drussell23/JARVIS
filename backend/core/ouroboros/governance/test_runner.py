@@ -20,7 +20,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,70 @@ _TEST_RETRY_ENABLED = os.environ.get(
 _TEST_MAX_FILES = int(os.environ.get("JARVIS_TEST_MAX_FILES", "50"))
 _TEST_DIR_NAMES: FrozenSet[str] = frozenset(
     os.environ.get("JARVIS_TEST_DIR_NAMES", "tests,test").split(",")
+)
+
+
+# Ticket #4 Slice 3 — TestRunner streaming path env knobs. All
+# default-off; legacy `_exec_with_timeout` remains the production
+# path until Slice 4 graduation. Structural TestResult contract is
+# IDENTICAL across paths — parity tests enforce this.
+
+
+def _streaming_enabled() -> bool:
+    """Master switch for the streaming path (default **false**).
+
+    When false, ``_run_pytest`` uses the legacy
+    ``_exec_with_timeout`` → ``proc.communicate()`` path. When true,
+    routes through ``_exec_with_streaming`` which consumes the
+    Slice 1 :class:`BackgroundMonitor` primitive for line-granular
+    live feedback. Structural ``TestResult`` fields (passed / total
+    / failed / failed_tests / flake_suspected) are identical across
+    paths by design.
+    """
+    return os.environ.get(
+        "JARVIS_TEST_RUNNER_STREAMING_ENABLED", "false",
+    ).strip().lower() == "true"
+
+
+def _early_exit_on_fail() -> bool:
+    """Explicit opt-in for streaming-mode early-exit on first failure.
+
+    Default **false** — legacy "run everything" semantics preserved.
+    Only honored when ``_streaming_enabled()`` is also true; irrelevant
+    on the legacy path (which has no event stream to early-exit from).
+    """
+    return os.environ.get(
+        "JARVIS_TEST_RUNNER_EARLY_EXIT_ON_FAIL", "false",
+    ).strip().lower() == "true"
+
+
+def _parity_mode() -> bool:
+    """Runtime dual-path parity check. Default **false**.
+
+    When true AND streaming is enabled, ``_run_pytest`` runs BOTH
+    paths against the same test_paths, compares structural
+    TestResult fields, and emits a WARNING with divergence details
+    on mismatch. Lets operators enable streaming cautiously in
+    production by proving parity live; otherwise Slice 3 ships the
+    same invariant via unit-test parity harnesses. Off by default to
+    avoid doubling pytest cost in normal operation.
+    """
+    return os.environ.get(
+        "JARVIS_TEST_RUNNER_PARITY_MODE", "false",
+    ).strip().lower() == "true"
+
+
+# Streaming-mode pytest event regex. pytest -v output format:
+#   "tests/foo.py::test_bar PASSED                     [ 25%]"
+#   "tests/foo.py::test_bar FAILED                     [ 25%]"
+#   "tests/foo.py::test_bar ERROR                      [ 25%]"
+#   "tests/foo.py::test_bar SKIPPED                    [ 25%]"
+# We don't anchor to start-of-line because pytest sometimes prefixes
+# a progress indicator on continuation output.
+import re as _re
+
+_PYTEST_EVENT_RE = _re.compile(
+    r"(?P<node>\S+::\S+)\s+(?P<status>PASSED|FAILED|ERROR|SKIPPED)\b",
 )
 
 
@@ -712,11 +776,28 @@ class TestRunner:
         Absolute path to the repository root.
     timeout:
         Per-invocation timeout in seconds (default 120).
+    event_callback:
+        Optional callable invoked with a dict per streamed pytest
+        event when the streaming path is active. Event shape:
+        ``{"kind": "test_passed"|"test_failed"|"test_errored"|"test_skipped",
+           "node_id": str, "ts_mono": float, "sequence": int,
+           "raw_line": str}``. The callback runs in the event loop
+        thread; implementations MUST NOT block. Exceptions from the
+        callback are caught + logged at DEBUG so a buggy consumer
+        cannot break the TestRunner. Default ``None`` — no callback,
+        legacy behavior byte-identical.
     """
 
-    def __init__(self, repo_root: Path, timeout: float = _TEST_TIMEOUT_S) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        timeout: float = _TEST_TIMEOUT_S,
+        *,
+        event_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    ) -> None:
         self._repo_root = repo_root.resolve()
         self._timeout = timeout
+        self._event_callback = event_callback
 
     # -- public API ---------------------------------------------------------
 
@@ -958,6 +1039,16 @@ class TestRunner:
         )
         os.close(fd)
 
+        # Streaming path uses ``-v`` for line-granular per-test feedback
+        # (pytest -q batches dots on one line, defeating per-event parsing).
+        # The JSON report is authoritative for structural TestResult
+        # fields — parity tests validate that path choice doesn't alter
+        # {passed, total, failed, failed_tests, flake_suspected}. Only
+        # ``stdout`` differs in diagnostic formatting, which is not a
+        # parity-tested field.
+        streaming_on = _streaming_enabled()
+        verbosity_flag = "-v" if streaming_on else "-q"
+
         cmd = [
             "python3", "-m", "pytest",
             "-o", "addopts=",
@@ -966,7 +1057,7 @@ class TestRunner:
             "--timeout-method=thread",
             "--json-report",
             "--json-report-file=" + report_path,
-            "-q",
+            verbosity_flag,
             "--tb=short",
             "--no-header",
         ] + test_paths
@@ -975,7 +1066,14 @@ class TestRunner:
         start = time.monotonic()
 
         try:
-            result = await self._exec_with_timeout(cmd, effective_cwd, report_path)
+            if streaming_on:
+                result = await self._exec_with_streaming(
+                    cmd, effective_cwd, report_path,
+                )
+            else:
+                result = await self._exec_with_timeout(
+                    cmd, effective_cwd, report_path,
+                )
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - start
             return TestResult(
@@ -998,10 +1096,29 @@ class TestRunner:
 
         # Try to parse JSON report
         if isinstance(raw_report, dict):
-            return self._parse_json_report(raw_report, elapsed, stdout_text)
+            streaming_result = self._parse_json_report(
+                raw_report, elapsed, stdout_text,
+            )
+        else:
+            # Fallback: exit-code heuristic
+            streaming_result = self._fallback_parse(
+                returncode, elapsed, stdout_text,
+            )
 
-        # Fallback: exit-code heuristic
-        return self._fallback_parse(returncode, elapsed, stdout_text)
+        # Ticket #4 Slice 3 runtime parity check. Operators opt in via
+        # JARVIS_TEST_RUNNER_PARITY_MODE=true + streaming on. Runs the
+        # legacy path against the same test_paths + compares structural
+        # fields. Divergence emits a WARNING with a structured payload
+        # so operators can grep debug.log for
+        # ``[TestRunner] parity_divergence`` and investigate before
+        # graduating streaming in Slice 4. Parity mode doubles pytest
+        # cost — off by default.
+        if streaming_on and _parity_mode():
+            await self._compare_paths_loudly(
+                cmd, effective_cwd, streaming_result,
+            )
+
+        return streaming_result
 
     async def _exec_with_timeout(
         self,
@@ -1056,6 +1173,275 @@ class TestRunner:
             "returncode": proc.returncode,
             "report_data": report_data,
         }
+
+    # -- Ticket #4 Slice 3 — streaming path -----------------------------------
+
+    async def _exec_with_streaming(
+        self,
+        cmd: List[str],
+        cwd: str,
+        report_path: str,
+    ) -> Dict[str, object]:
+        """Streaming counterpart to ``_exec_with_timeout``.
+
+        Consumes the Slice 1 ``BackgroundMonitor`` primitive DIRECTLY
+        (no Venom tool layer) — TestRunner is infra, not a
+        model-facing surface. The return shape is identical to
+        ``_exec_with_timeout``: ``{stdout, returncode, report_data}``.
+
+        Behavior differences vs. the legacy path:
+
+          * Per-test events are parsed from pytest -v output and
+            emitted via the INFO logger + optional ``event_callback``.
+          * When ``_early_exit_on_fail()`` is true, the first
+            ``FAILED`` or ``ERROR`` line terminates the subprocess
+            via BackgroundMonitor's async context manager semantics.
+          * Timeout is enforced by ``asyncio.wait_for`` around the
+            event-drain loop, matching legacy ``proc.communicate()``
+            timeout semantics.
+
+        Structural invariants (enforced by parity tests):
+
+          * JSON report is loaded identically (same report_path).
+          * ``returncode`` is the subprocess exit code (int or None
+            on hard-kill).
+          * ``stdout`` is the concatenation of all emitted stream
+            events' ``data`` + newline. Diagnostic formatting only;
+            not a parity-tested field.
+        """
+        # Local import to keep module load cheap for callers that never
+        # exercise the streaming path.
+        from backend.core.ouroboros.governance.background_monitor import (
+            BackgroundMonitor,
+            KIND_STDERR,
+            KIND_STDOUT,
+        )
+
+        early_exit = _early_exit_on_fail()
+        collected_lines: List[str] = []
+        early_exit_triggered = False
+        early_exit_node = ""
+
+        # Event emission helper — logs at INFO + invokes the optional
+        # callback. Catches callback exceptions so a buggy consumer
+        # can never break the TestRunner.
+        def _emit_event(
+            kind: str, node_id: str, ts_mono: float,
+            sequence: int, raw_line: str,
+        ) -> None:
+            logger.info(
+                "[TestRunner] streaming %s node=%s sequence=%d",
+                kind, node_id, sequence,
+            )
+            if self._event_callback is not None:
+                try:
+                    self._event_callback({
+                        "kind": kind,
+                        "node_id": node_id,
+                        "ts_mono": ts_mono,
+                        "sequence": sequence,
+                        "raw_line": raw_line,
+                    })
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[TestRunner] event_callback raised", exc_info=True,
+                    )
+
+        returncode: Optional[int] = None
+
+        try:
+            async with BackgroundMonitor(
+                cmd=tuple(cmd),
+                op_id=f"testrunner-{int(time.monotonic() * 1000)}",
+                cwd=cwd,
+                ring_capacity=4096,
+                # Keep terminate_grace small — tests that need to be
+                # killed on early-exit shouldn't hang the loop.
+                terminate_grace_s=1.0,
+                event_bus=None,  # Slice 3 scope — no bus coupling.
+            ) as mon:
+                async def _drive() -> None:
+                    nonlocal early_exit_triggered, early_exit_node
+                    async for ev in mon.events():
+                        if ev.kind in (KIND_STDOUT, KIND_STDERR):
+                            collected_lines.append(ev.data)
+                            match = _PYTEST_EVENT_RE.search(ev.data)
+                            if match is not None:
+                                status = match.group("status")
+                                node_id = match.group("node")
+                                kind_map = {
+                                    "PASSED": "test_passed",
+                                    "FAILED": "test_failed",
+                                    "ERROR": "test_errored",
+                                    "SKIPPED": "test_skipped",
+                                }
+                                _emit_event(
+                                    kind=kind_map.get(status, "test_other"),
+                                    node_id=node_id,
+                                    ts_mono=ev.ts_mono,
+                                    sequence=ev.sequence,
+                                    raw_line=ev.data,
+                                )
+                                if (
+                                    early_exit
+                                    and status in ("FAILED", "ERROR")
+                                    and not early_exit_triggered
+                                ):
+                                    early_exit_triggered = True
+                                    early_exit_node = node_id
+                                    logger.info(
+                                        "[TestRunner] streaming "
+                                        "early_exit_triggered status=%s "
+                                        "node=%s",
+                                        status, node_id,
+                                    )
+                                    return  # break out → __aexit__ kills subprocess
+
+                await asyncio.wait_for(_drive(), timeout=self._timeout)
+                returncode = mon.exit_code
+        except asyncio.TimeoutError:
+            # Mirror legacy path's behavior — surface TimeoutError so
+            # _run_pytest's outer handler produces the standard
+            # "pytest timed out" TestResult.
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[TestRunner] streaming exec failure", exc_info=True,
+            )
+            # Still try to load the JSON report + return a dict so
+            # _run_pytest can fall through to _fallback_parse.
+
+        stdout_text = "\n".join(collected_lines)
+
+        report_data = None
+        if os.path.isfile(report_path):
+            try:
+                with open(report_path, "r") as f:
+                    report_data = json.load(f)
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Failed to parse pytest JSON report: %s", exc)
+
+        # Terminal log line — stable grep contract for operators.
+        if report_data is not None and isinstance(report_data, dict):
+            summary = report_data.get("summary", {}) or {}
+            logger.info(
+                "[TestRunner] streaming completed total=%s passed=%s "
+                "failed=%s early_exit=%s returncode=%s",
+                summary.get("total", "?"),
+                summary.get("passed", "?"),
+                summary.get("failed", "?"),
+                early_exit_triggered,
+                returncode,
+            )
+
+        return {
+            "stdout": stdout_text,
+            "returncode": returncode,
+            "report_data": report_data,
+            # Extra signal for tests + parity checks; ignored by
+            # _run_pytest's structural parsing.
+            "early_exit_triggered": early_exit_triggered,
+            "early_exit_node": early_exit_node,
+        }
+
+    async def _compare_paths_loudly(
+        self,
+        streaming_cmd: List[str],
+        cwd: str,
+        streaming_result: TestResult,
+    ) -> None:
+        """Runtime parity check — run the legacy path + WARN on divergence.
+
+        Only invoked when both streaming and parity-mode are on.
+        Rebuilds the cmd with ``-q`` (matching the legacy path's
+        pytest flags) so the comparison is like-for-like on structural
+        fields. Never raises — parity failures are observability,
+        not enforcement. Operators see the divergence in debug.log
+        and can decide whether to graduate streaming in Slice 4.
+        """
+        # Rebuild cmd with the legacy verbosity flag. We swap the
+        # verbosity token in place to avoid re-threading test_paths.
+        legacy_cmd = [("-q" if tok == "-v" else tok) for tok in streaming_cmd]
+        # Use a fresh tmp report file so the streaming + legacy runs
+        # don't stomp each other's JSON reports.
+        import tempfile as _tempfile
+        fd, legacy_report_path = _tempfile.mkstemp(
+            suffix=".json", prefix="pytest_parity_",
+        )
+        os.close(fd)
+        # Swap the --json-report-file arg in place.
+        legacy_cmd = [
+            (legacy_report_path if tok.startswith("--json-report-file=")
+             else tok)
+            for tok in legacy_cmd
+        ]
+        # Rebuild again since startswith-replacement loses the flag:
+        legacy_cmd = [
+            (f"--json-report-file={legacy_report_path}"
+             if tok.startswith("--json-report-file=") else tok)
+            for tok in legacy_cmd
+        ]
+        legacy_start = time.monotonic()
+        try:
+            legacy_raw = await self._exec_with_timeout(
+                legacy_cmd, cwd, legacy_report_path,
+            )
+            legacy_elapsed = time.monotonic() - legacy_start
+            raw_report = legacy_raw.get("report_data")
+            if isinstance(raw_report, dict):
+                legacy_result = self._parse_json_report(
+                    raw_report, legacy_elapsed, str(legacy_raw.get("stdout", "")),
+                )
+            else:
+                returncode = legacy_raw.get("returncode")
+                rc = int(returncode) if isinstance(returncode, (int, float, str)) else None
+                legacy_result = self._fallback_parse(
+                    rc, legacy_elapsed, str(legacy_raw.get("stdout", "")),
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[TestRunner] parity_mode legacy_run_failed — "
+                "skipping parity check for this invocation",
+                exc_info=True,
+            )
+            return
+        finally:
+            self._cleanup_report(legacy_report_path)
+
+        # Structural comparison. Order-insensitive on failed_tests.
+        divergences: List[str] = []
+        if streaming_result.passed != legacy_result.passed:
+            divergences.append(
+                f"passed streaming={streaming_result.passed} "
+                f"legacy={legacy_result.passed}"
+            )
+        if streaming_result.total != legacy_result.total:
+            divergences.append(
+                f"total streaming={streaming_result.total} "
+                f"legacy={legacy_result.total}"
+            )
+        if streaming_result.failed != legacy_result.failed:
+            divergences.append(
+                f"failed streaming={streaming_result.failed} "
+                f"legacy={legacy_result.failed}"
+            )
+        s_set = set(streaming_result.failed_tests)
+        l_set = set(legacy_result.failed_tests)
+        if s_set != l_set:
+            divergences.append(
+                f"failed_tests streaming_only={sorted(s_set - l_set)} "
+                f"legacy_only={sorted(l_set - s_set)}"
+            )
+        if divergences:
+            logger.warning(
+                "[TestRunner] parity_divergence fields=%s",
+                "; ".join(divergences),
+            )
+        else:
+            logger.info(
+                "[TestRunner] parity_ok total=%d failed=%d",
+                streaming_result.total, streaming_result.failed,
+            )
 
     @staticmethod
     def _parse_json_report(
