@@ -321,7 +321,11 @@ async def run_general_tool_loop(
                 f"{type(exc).__name__}: {str(exc)[:200]}"
             ),
         )
-    scoped_backend = ScopedToolBackend(inner=inner_backend, gate=gate)
+    scoped_backend = ScopedToolBackend(
+        inner=inner_backend,
+        gate=gate,
+        max_mutations=max_mutations,
+    )
 
     # 4. Build a policy if caller didn't supply one (test-only path).
     effective_policy = policy

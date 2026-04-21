@@ -291,6 +291,212 @@ async def test_mutation_tool_with_allowlist_and_not_readonly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_max_mutations_count_gate_denies_second_edit_under_cap_1() -> None:
+    """Test 11 (Epoch 1 / Ticket 8 — structural COUNT gate):
+
+    Model dispatched with ``max_mutations=1`` and
+    ``allowed_tools=("read_file", "edit_file")``. The first
+    ``edit_file`` call is authorized and delegated to the inner
+    backend. The second ``edit_file`` call must be refused with
+    ``POLICY_DENIED`` at the adapter layer — BEFORE the inner backend
+    runs — even though the tool TYPE is still in the allowlist.
+
+    This pins the Phase C Slice 1b graduation follow-through: the
+    live battle test proved Claude cooperatively respected
+    ``max_mutations=1``, but cooperation is weaker than structural
+    enforcement. A hallucinating or adversarial model that emits a
+    second ``edit_file`` tool call MUST be caught here.
+    """
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file", "edit_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1,
+    )
+
+    # First edit_file — authorized, slot consumed.
+    result_1 = await backend.execute_async(
+        ToolCall(name="edit_file", arguments={"path": "a.py", "content": "x = 1"}),
+        _pctx(), deadline=10.0,
+    )
+    assert result_1.status == ToolExecStatus.SUCCESS
+    assert backend.mutations_count == 1
+    assert len(inner.calls) == 1
+
+    # Second edit_file — MUST be refused. Inner backend must NOT see it.
+    result_2 = await backend.execute_async(
+        ToolCall(name="edit_file", arguments={"path": "b.py", "content": "y = 2"}),
+        _pctx(), deadline=10.0,
+    )
+    assert result_2.status == ToolExecStatus.POLICY_DENIED, (
+        "CRITICAL: second edit_file under max_mutations=1 must be "
+        "structurally refused — the cooperative cap is now a "
+        "mechanical one"
+    )
+    err = result_2.error or ""
+    assert "max_mutations" in err.lower()
+    assert "budget" in err.lower()
+    assert "1/1" in err or "exhausted" in err.lower()
+    assert "non-negotiable" in err.lower()
+    assert len(inner.calls) == 1, (
+        "CRITICAL: inner backend must NOT be awaited on the refused "
+        "second mutation — the slot was consumed by call #1, call #2 "
+        "is rejected pre-linguistically"
+    )
+    # Counter does NOT advance on the refused call — the slot was
+    # already consumed by call #1; a refused call is not a mutation.
+    assert backend.mutations_count == 1
+
+
+@pytest.mark.asyncio
+async def test_count_gate_allows_unlimited_read_tools_under_cap() -> None:
+    """Test 12: the COUNT gate ONLY counts tools in ``_MUTATION_TOOLS``.
+
+    A subagent with ``max_mutations=1`` can still call ``read_file``
+    N times without ever consuming its mutation slot. This pins the
+    TYPE vs COUNT separation — read_file is not a mutation, so it
+    does not touch the budget.
+    """
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file", "search_code", "edit_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1,
+    )
+
+    # 10 read_file calls — none consume mutation slots.
+    for i in range(10):
+        result = await backend.execute_async(
+            ToolCall(name="read_file", arguments={"path": f"f{i}.py"}),
+            _pctx(), deadline=10.0,
+        )
+        assert result.status == ToolExecStatus.SUCCESS
+    assert backend.mutations_count == 0, (
+        "read_file must never consume a mutation slot"
+    )
+
+    # Now the single authorized edit_file consumes the slot.
+    result = await backend.execute_async(
+        ToolCall(name="edit_file", arguments={"path": "a.py"}),
+        _pctx(), deadline=10.0,
+    )
+    assert result.status == ToolExecStatus.SUCCESS
+    assert backend.mutations_count == 1
+    assert len(inner.calls) == 11  # 10 reads + 1 edit
+
+
+@pytest.mark.asyncio
+async def test_count_gate_default_max_mutations_zero_denies_all_mutations() -> None:
+    """Test 13: ``ScopedToolBackend(inner, gate)`` without an explicit
+    ``max_mutations`` defaults to 0 — no mutations permitted.
+
+    This is the read-only default; even if the gate is permissive
+    (empty allowlist, read_only=False), the COUNT gate alone denies
+    every mutation tool. Layered with the read-only gate in typical
+    use, this is belt-and-suspenders.
+    """
+    gate = ScopedToolGate(ToolScope())  # permissive
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(inner=inner, gate=gate)  # max_mutations default = 0
+
+    assert backend.max_mutations == 0
+
+    result = await backend.execute_async(
+        ToolCall(name="edit_file"), _pctx(), deadline=10.0,
+    )
+    assert result.status == ToolExecStatus.POLICY_DENIED
+    assert "max_mutations" in (result.error or "").lower()
+    assert inner.calls == []
+
+    # read_file still flows — the COUNT gate only sees mutations.
+    result = await backend.execute_async(
+        ToolCall(name="read_file"), _pctx(), deadline=10.0,
+    )
+    assert result.status == ToolExecStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_count_gate_consumes_slot_even_on_inner_failure() -> None:
+    """Test 14: a mutation slot is consumed at AUTHORIZATION time, not
+    at inner-call success. An inner backend exception on the first
+    edit_file still burns the slot; the second edit_file is refused.
+
+    Deliberate design: a model cannot retry a failing mutation to
+    eventually exceed the budget. If the first attempt was
+    structurally authorized, the slot is gone.
+    """
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"edit_file"}),
+        read_only=False,
+    ))
+    inner = _ExceptionBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1,
+    )
+
+    # First edit_file — inner raises, but the slot is already committed.
+    with pytest.raises(RuntimeError, match="inner backend failure"):
+        await backend.execute_async(
+            ToolCall(name="edit_file"), _pctx(), deadline=10.0,
+        )
+    assert backend.mutations_count == 1
+
+    # Second edit_file — refused, budget exhausted.
+    result = await backend.execute_async(
+        ToolCall(name="edit_file"), _pctx(), deadline=10.0,
+    )
+    assert result.status == ToolExecStatus.POLICY_DENIED
+    assert "budget" in (result.error or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_count_gate_logs_with_budget_state(caplog) -> None:
+    """Test 15: mutation-budget refusals log at INFO with the
+    current/max state. Operators can grep
+    ``reason=mutation_budget_exhausted`` in shadow-arc telemetry to
+    detect models testing the cage."""
+    import logging as _logging
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"edit_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1,
+    )
+
+    caplog.set_level(
+        _logging.INFO,
+        logger="backend.core.ouroboros.governance.scoped_tool_backend",
+    )
+    # Consume the slot.
+    await backend.execute_async(
+        ToolCall(name="edit_file"), _pctx(), deadline=10.0,
+    )
+    # Attempt the refused second call.
+    await backend.execute_async(
+        ToolCall(name="edit_file"), _pctx(), deadline=10.0,
+    )
+
+    budget_hits = [
+        r for r in caplog.records
+        if "mutation_budget_exhausted" in r.getMessage()
+    ]
+    assert budget_hits, (
+        f"expected mutation_budget_exhausted INFO line; "
+        f"got {[r.getMessage() for r in caplog.records]}"
+    )
+    msg = budget_hits[0].getMessage()
+    assert "mutations_count=1" in msg
+    assert "max_mutations=1" in msg
+    assert "edit_file" in msg
+
+
+@pytest.mark.asyncio
 async def test_logged_at_info_level_on_rejection(caplog) -> None:
     """Test 10 (bonus): scope rejection emits an INFO-level log line
     with tool name, reason, op_id, and call_id — operators can grep for
