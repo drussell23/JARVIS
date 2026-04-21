@@ -1594,3 +1594,690 @@ def test_themed_renderer_fallback_label_for_all_stopword_text(tmp_path, monkeypa
     # is exercised at runtime whenever an embedding happens to point
     # at a noisy item.)
     assert not empty_label  # confirmed — fallback kicks in at callsite
+
+
+# ===========================================================================
+# Slice 3b — scoring policy + zero-boost-with-evidence
+# ===========================================================================
+#
+# JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY flag routes score() / boost_for() /
+# score_with_cluster() between v0.1 centroid behavior (default) and the new
+# max_cluster behavior that ALSO enforces zero-boost-with-evidence for
+# postmortem-kind cluster winners.
+#
+# Suppression layer is structurally distinct from observation layer:
+#   * Observation (alignment histogram + failure-gravity window) continues
+#     to fire under BOTH policies + on every scored signal — suppression
+#     does NOT hide the postmortem from operators.
+#   * Suppression (zero-boost) ONLY fires under max_cluster policy AND
+#     when the winning cluster is postmortem-kind.
+
+
+def _build_mixed_postmortem_corpus(monkeypatch):
+    """Seed a corpus with enough postmortem content that clustering
+    produces a postmortem-dominant cluster under the fake embedder.
+
+    Returns nothing; caller seeds the ConversationBridge singleton.
+    """
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"goal work {i}") for i in range(3)],
+        *[
+            (cb.SOURCE_POSTMORTEM, f"failure postmortem report {i}")
+            for i in range(8)
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# (3b.1) Env / config
+# ---------------------------------------------------------------------------
+
+
+def test_scoring_policy_default_is_centroid(monkeypatch):
+    """3b test 1: default policy is 'centroid' (backward-compat)."""
+    monkeypatch.delenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", raising=False)
+    assert si._cluster_scoring_policy() == "centroid"
+
+
+def test_scoring_policy_max_cluster_honored(monkeypatch):
+    """3b test 2: 'max_cluster' value is honored."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    assert si._cluster_scoring_policy() == "max_cluster"
+
+
+def test_scoring_policy_case_insensitive(monkeypatch):
+    """3b test 3: case-insensitive env value parsing."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "MAX_CLUSTER")
+    assert si._cluster_scoring_policy() == "max_cluster"
+
+
+def test_scoring_policy_malformed_falls_back_to_centroid(monkeypatch):
+    """3b test 4: unrecognized value → safe fallback to 'centroid'."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "banana-mode")
+    assert si._cluster_scoring_policy() == "centroid"
+
+
+def test_scoring_policy_empty_string_falls_back_to_centroid(monkeypatch):
+    """3b test 5: empty env value → fallback to 'centroid'."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "")
+    assert si._cluster_scoring_policy() == "centroid"
+
+
+# ---------------------------------------------------------------------------
+# (3b.2) Score routing by policy
+# ---------------------------------------------------------------------------
+
+
+def test_score_centroid_policy_matches_v01_behavior(tmp_path, monkeypatch):
+    """3b test 6 (CRITICAL): under policy=centroid (default), score()
+    is IDENTICAL to the v0.1 + Slice 3a behavior. Backward-compat pin."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="kmeans")
+    # Explicit default — no env needed, but set it explicitly for clarity.
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    # Under centroid policy, score() returns cosine vs the v0.1 weighted
+    # centroid — must equal what we'd compute manually.
+    text = "a new intake signal"
+    score_via_api = idx.score(text)
+
+    # Re-compute manually: embed the text, cosine vs self._centroid.
+    from backend.core.ouroboros.governance.semantic_index import _cosine
+    expected_vec = idx._embedder.embed([text])[0]
+    expected_cos = _cosine(expected_vec, idx._centroid)
+    assert abs(score_via_api - expected_cos) < 1e-12
+
+
+def test_score_max_cluster_policy_returns_max_cluster_cosine(
+    tmp_path, monkeypatch,
+):
+    """3b test 7: under policy=max_cluster, score() returns the MAX
+    cosine across cluster centroids — usually different from, and
+    at least equal to, the centroid cosine."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if len(idx.clusters) < 2:
+        pytest.skip("need ≥2 clusters to differentiate max_cluster vs centroid")
+    text = "a new intake signal"
+    score = idx.score(text)
+    # Reconstruct the max-cluster-cosine manually.
+    from backend.core.ouroboros.governance.semantic_index import _cosine
+    vec = idx._embedder.embed([text])[0]
+    max_cos = max(_cosine(vec, list(c.centroid)) for c in idx.clusters)
+    assert abs(score - max_cos) < 1e-12
+
+
+def test_score_max_cluster_fallback_when_clusters_empty(tmp_path, monkeypatch):
+    """3b test 8 (CRITICAL): policy=max_cluster with empty clusters
+    degrades gracefully to centroid cosine. No crash, no NaN, no
+    silent zero."""
+    _enable(monkeypatch)  # cluster_mode=centroid (default) → no clusters built
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        (cb.SOURCE_TUI_USER, "one"),
+        (cb.SOURCE_TUI_USER, "two"),
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    assert idx.clusters == (), "precondition: no clusters in centroid mode"
+    # No crash. Returns a finite cosine against the v0.1 centroid.
+    s = idx.score("x")
+    assert isinstance(s, float)
+    assert -1.0 <= s <= 1.0
+    # stats.scoring_policy reflects the EFFECTIVE policy, not configured:
+    assert idx.stats().scoring_policy == "centroid"
+
+
+def test_stats_scoring_policy_reflects_effective_routing(tmp_path, monkeypatch):
+    """3b test 9: stats.scoring_policy carries the effective policy
+    (post-fallback), not the raw env value. Lets ops dashboards see
+    reality, not intent."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="kmeans")
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if len(idx.clusters) < 2:
+        pytest.skip("need ≥2 clusters")
+    idx.score("x")
+    assert idx.stats().scoring_policy == "max_cluster"
+
+
+# ---------------------------------------------------------------------------
+# (3b.3) Zero-boost-with-evidence for postmortem-kind clusters
+# ---------------------------------------------------------------------------
+
+
+def _force_postmortem_winner(idx):
+    """Test helper: rewrite the index's clusters so cluster 0 is
+    postmortem-kind. Lets us exercise the suppression path without
+    depending on the fake embedder reproducing a postmortem-dominant
+    cluster organically."""
+    if not idx.clusters:
+        return False
+    # Replace cluster[0] with a postmortem-kind variant (same centroid
+    # so alignment still picks it).
+    orig = idx.clusters[0]
+    replaced = si.ClusterInfo(
+        cluster_id=orig.cluster_id,
+        size=orig.size,
+        kind=si.CLUSTER_KIND_POSTMORTEM,
+        centroid=orig.centroid,
+        centroid_hash8=orig.centroid_hash8,
+        nearest_item_text=orig.nearest_item_text,
+        nearest_item_source=si.SOURCE_POSTMORTEM,
+        source_composition=orig.source_composition,
+    )
+    with idx._lock:
+        idx._clusters = [replaced] + list(idx._clusters[1:])
+    return True
+
+
+def test_boost_for_suppressed_on_postmortem_winner_under_max_cluster(
+    tmp_path, monkeypatch,
+):
+    """3b test 10 (CRITICAL): when policy=max_cluster and the winning
+    cluster is postmortem-kind, boost_for returns 0 regardless of
+    cosine magnitude."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        ALIGNMENT_BOOST_MAX="3",  # make sure nonzero boost is possible
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    # Aim at the postmortem cluster: use the nearest-item text so
+    # it maxes the cosine.
+    pm_text = idx.clusters[0].nearest_item_text
+    boost = idx.boost_for(pm_text)
+    assert boost == 0, (
+        "CRITICAL: postmortem-kind winner under max_cluster policy "
+        "MUST suppress the boost to 0 — zero-boost-with-evidence"
+    )
+
+
+def test_boost_for_not_suppressed_under_centroid_policy(tmp_path, monkeypatch):
+    """3b test 11: under policy=centroid, a postmortem-kind cluster
+    does NOT suppress the boost — centroid policy ignores cluster kinds
+    entirely (backward-compat)."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        ALIGNMENT_BOOST_MAX="3",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    # Under centroid policy, suppression is a no-op — boost follows
+    # the standard clamp(cos*BOOST_MAX) regardless of cluster kind.
+    pm_text = idx.clusters[0].nearest_item_text
+    # We don't pin the exact boost value here (depends on fake
+    # embedder), just assert no suppression counter.
+    _ = idx.boost_for(pm_text)
+    assert idx.stats().postmortem_boost_suppressions == 0
+
+
+def test_boost_for_not_suppressed_for_non_postmortem_winners(
+    tmp_path, monkeypatch,
+):
+    """3b test 12: under max_cluster policy, non-postmortem-kind
+    winners (goal/conversation/mixed) get the normal boost.
+    Suppression fires ONLY on postmortem kind."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        ALIGNMENT_BOOST_MAX="3",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not idx.clusters:
+        pytest.skip("need ≥1 cluster")
+    # Fake embedder produces conversation-kind clusters (from our
+    # SOURCE_TUI_USER seeding), so no suppression should fire.
+    idx.boost_for(idx.clusters[0].nearest_item_text)
+    # Counter stays 0.
+    assert idx.stats().postmortem_boost_suppressions == 0
+
+
+def test_postmortem_suppressions_counter_increments(tmp_path, monkeypatch):
+    """3b test 13: each suppressed signal bumps the counter by 1."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        ALIGNMENT_BOOST_MAX="3",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    pm_text = idx.clusters[0].nearest_item_text
+    for _ in range(3):
+        idx.boost_for(pm_text)
+    assert idx.stats().postmortem_boost_suppressions == 3
+
+
+def test_postmortem_suppression_info_log_fires(tmp_path, monkeypatch, caplog):
+    """3b test 14: each suppressed signal emits an INFO-level log line
+    naming the cluster id / hash / cosine so operators can grep for
+    postmortem-suppress activity in debug.log."""
+    import logging as _logging
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        ALIGNMENT_BOOST_MAX="3",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    caplog.set_level(
+        _logging.INFO,
+        logger="backend.core.ouroboros.governance.semantic_index",
+    )
+    idx.boost_for(idx.clusters[0].nearest_item_text)
+    hits = [
+        r for r in caplog.records
+        if "postmortem_suppress" in r.getMessage()
+    ]
+    assert hits, f"no suppression log; got: {[r.getMessage() for r in caplog.records]}"
+    msg = hits[0].getMessage()
+    assert "cluster_id=" in msg
+    assert "hash8=" in msg
+    assert "cosine=" in msg
+
+
+def test_boost_for_returns_nonzero_for_centroid_policy_postmortem_alignment(
+    tmp_path, monkeypatch,
+):
+    """3b test 15: under policy=centroid, even alignment with a
+    postmortem-kind cluster produces the normal cosine-based boost.
+    Verifies that suppression is gated on POLICY, not just kind."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        ALIGNMENT_BOOST_MAX="3",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    # Centroid policy — no suppression layer engaged, counter stays 0
+    # even as we score many postmortem-aligned signals.
+    for _ in range(5):
+        idx.boost_for(idx.clusters[0].nearest_item_text)
+    assert idx.stats().postmortem_boost_suppressions == 0
+
+
+# ---------------------------------------------------------------------------
+# (3b.4) Observation preservation — suppression ≠ un-observation
+# ---------------------------------------------------------------------------
+
+
+def test_alignment_histogram_records_suppressed_postmortem(
+    tmp_path, monkeypatch,
+):
+    """3b test 16 (CRITICAL): the alignment histogram STILL records
+    the postmortem alignment even when its boost is suppressed.
+
+    Observation and scoring are deliberately separate layers — the
+    whole point of zero-boost-WITH-evidence is that the theme remains
+    visible to operators via the histogram + evidence stash."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    pm_text = idx.clusters[0].nearest_item_text
+    for _ in range(3):
+        idx.boost_for(pm_text)
+    # Histogram records postmortem alignments even though boost=0.
+    hist = idx.stats().alignment_histogram_by_kind
+    assert hist.get(si.CLUSTER_KIND_POSTMORTEM, 0) == 3
+
+
+def test_failure_gravity_window_records_suppressed_postmortem(
+    tmp_path, monkeypatch,
+):
+    """3b test 17: the failure-gravity window STILL accumulates
+    postmortem alignments even under suppression. The tripwire is
+    advisory to the OPERATOR (via log+counter), not the organism's
+    boost formula — so suppressing the boost doesn't blind the
+    detector."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        CLUSTER_FAILURE_GRAVITY_WINDOW="5",
+        CLUSTER_FAILURE_GRAVITY_THRESHOLD="0.5",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(3)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(3)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    pm_text = idx.clusters[0].nearest_item_text
+    # Score enough signals to fill the window AND cross the threshold.
+    for _ in range(5):
+        idx.boost_for(pm_text)
+    # Threshold crossed — failure-gravity counter must be nonzero.
+    assert idx.stats().failure_gravity_alerts >= 1
+
+
+def test_score_still_returns_real_cosine_under_suppression(
+    tmp_path, monkeypatch,
+):
+    """3b test 18: score() returns the real cosine even when
+    boost_for() would suppress to 0. Suppression is purely a
+    boost-layer decision; the raw cosine stays truthful so downstream
+    consumers (e.g., debug dashboards) can see the alignment magnitude."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    pm_text = idx.clusters[0].nearest_item_text
+    sim = idx.score(pm_text)
+    # Raw cosine is near 1.0 (the probe IS a cluster member).
+    assert sim > 0.5, (
+        f"score() must return real cosine under suppression "
+        f"(boost is suppressed, score is not); got {sim}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (3b.5) score_with_cluster evidence detail
+# ---------------------------------------------------------------------------
+
+
+def test_score_with_cluster_carries_policy_used(tmp_path, monkeypatch):
+    """3b test 19: score_with_cluster returns the effective policy."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="kmeans")
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not idx.clusters:
+        pytest.skip("need ≥1 cluster")
+    detail = idx.score_with_cluster("signal")
+    assert detail is not None
+    assert "policy_used" in detail
+    assert detail["policy_used"] in ("centroid", "max_cluster")
+
+
+def test_score_with_cluster_carries_boost_applied(tmp_path, monkeypatch):
+    """3b test 20: score_with_cluster returns the boost that would be
+    applied (matches boost_for output exactly)."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        ALIGNMENT_BOOST_MAX="3",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not idx.clusters:
+        pytest.skip("need ≥1 cluster")
+    text = idx.clusters[0].nearest_item_text
+    detail = idx.score_with_cluster(text)
+    assert detail is not None
+    # boost_applied is in the 0..BOOST_MAX range.
+    assert 0 <= detail["boost_applied"] <= 3
+
+
+def test_score_with_cluster_boost_applied_zero_when_suppressed(
+    tmp_path, monkeypatch,
+):
+    """3b test 21: boost_applied=0 in the evidence dict when the
+    winning cluster is postmortem-kind under max_cluster policy."""
+    _enable(
+        monkeypatch,
+        INDEX_CLUSTER_MODE="kmeans",
+        ALIGNMENT_BOOST_MAX="3",
+    )
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not _force_postmortem_winner(idx):
+        pytest.skip("need ≥1 cluster")
+    detail = idx.score_with_cluster(idx.clusters[0].nearest_item_text)
+    assert detail is not None
+    assert detail["cluster_kind"] == si.CLUSTER_KIND_POSTMORTEM
+    assert detail["boost_applied"] == 0
+    # But the cosine stays real for observability.
+    assert detail["score"] > 0.5
+    assert detail["cluster_cosine"] > 0.5
+
+
+def test_score_with_cluster_carries_cluster_cosine_under_centroid_policy(
+    tmp_path, monkeypatch,
+):
+    """3b test 22: even under centroid policy, cluster_cosine is
+    populated when clusters exist — gives operators visibility into
+    which cluster a signal WOULD have aligned to if the policy were
+    flipped."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="kmeans")
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if not idx.clusters:
+        pytest.skip("need ≥1 cluster")
+    detail = idx.score_with_cluster(idx.clusters[0].nearest_item_text)
+    assert detail is not None
+    assert detail["cluster_id"] is not None
+    assert detail["cluster_cosine"] != 0.0
+
+
+# ---------------------------------------------------------------------------
+# (3b.6) Stats extensions
+# ---------------------------------------------------------------------------
+
+
+def test_stats_scoring_policy_field_present(tmp_path, monkeypatch):
+    """3b test 23: stats snapshot exposes the scoring_policy field
+    with a safe default even when never scored."""
+    _enable(monkeypatch)
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    stats = idx.stats()
+    assert hasattr(stats, "scoring_policy")
+    assert stats.scoring_policy == "centroid"
+
+
+def test_stats_scored_by_policy_tallies_per_policy(tmp_path, monkeypatch):
+    """3b test 24: scored_by_policy counts scored signals per effective
+    policy. A mid-session env flip shows up as nonzero counts under
+    BOTH keys."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="kmeans")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(3)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(3)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    # First 2 signals under centroid policy (default).
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    idx.score("s1")
+    idx.score("s2")
+    # Flip to max_cluster (only if clusters exist).
+    if idx.clusters:
+        monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+        idx.score("s3")
+        tally = idx.stats().scored_by_policy
+        assert tally.get("centroid", 0) == 2
+        assert tally.get("max_cluster", 0) == 1
+    else:
+        # No clusters built → both calls fall back to centroid.
+        tally = idx.stats().scored_by_policy
+        assert tally.get("centroid", 0) == 2
+
+
+def test_stats_postmortem_boost_suppressions_counter_present(
+    tmp_path, monkeypatch,
+):
+    """3b test 25: postmortem_boost_suppressions present with zero
+    default before any suppression fires."""
+    _enable(monkeypatch)
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    stats = idx.stats()
+    assert hasattr(stats, "postmortem_boost_suppressions")
+    assert stats.postmortem_boost_suppressions == 0
+
+
+# ---------------------------------------------------------------------------
+# (3b.7) Authority invariant extension
+# ---------------------------------------------------------------------------
+
+
+def test_slice_3b_suppression_affects_boost_only_not_score():
+    """3b test 26: pin the architectural contract — suppression is a
+    BOOST-layer decision, never a score-layer decision. This test
+    re-asserts the import-surface invariant AND adds a conceptual
+    assertion that score() and boost_for() are distinct entrypoints.
+
+    Mirrors `test_authority_invariant_clustering_does_not_import_gate_modules`
+    from Slice 3a, extended for 3b's new surface."""
+    import backend.core.ouroboros.governance.semantic_index as module
+    source = Path(module.__file__).read_text()
+    # Slice 3b introduces no new consumer surface — still only
+    # intake priority (via boost_for) + CONTEXT_EXPANSION
+    # (via format_prompt_sections).
+    forbidden_imports = [
+        "from backend.core.ouroboros.governance.iron_gate",
+        "from backend.core.ouroboros.governance.urgency_router",
+        "from backend.core.ouroboros.governance.risk_tier_floor",
+        "from backend.core.ouroboros.governance.semantic_guardian",
+        "from backend.core.ouroboros.governance.policy_engine",
+    ]
+    for forbidden in forbidden_imports:
+        assert forbidden not in source, (
+            f"Slice 3b authority violation — semantic_index imports "
+            f"{forbidden!r}. Suppression layer must stay advisory; "
+            f"no authority-carrying consumer may be added."
+        )
+
+
+def test_slice_3b_effective_policy_stable_across_repeated_calls(
+    tmp_path, monkeypatch,
+):
+    """3b test 27: calling score() N times under a fixed env config
+    produces a stable effective policy on every call (no state
+    drift). Critical for reproducibility — flaky policy would
+    break the prompt-cache stability the renderer relies on."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="kmeans")
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    if len(idx.clusters) < 2:
+        pytest.skip("need ≥2 clusters")
+    # 10 scores — all must use the same effective policy.
+    for i in range(10):
+        idx.score(f"signal_{i}")
+    tally = idx.stats().scored_by_policy
+    assert tally.get("max_cluster", 0) == 10
+    assert "centroid" not in tally

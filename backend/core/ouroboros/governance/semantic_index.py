@@ -220,6 +220,32 @@ def _cluster_failure_gravity_window() -> int:
     )
 
 
+# Slice 3b — scoring-policy flag.
+
+
+def _cluster_scoring_policy() -> str:
+    """Slice 3b — how ``score()`` aggregates across cluster centroids.
+
+    ``"centroid"`` (default): use the single v0.1 weighted centroid
+    (Slice 3a shadow-mode behavior preserved — backward-compatible).
+
+    ``"max_cluster"``: use the max cosine over cluster centroids.
+    **Zero-boost-with-evidence** for postmortem-kind clusters — when
+    the winning cluster is classified ``"postmortem"``, ``boost_for()``
+    returns 0 regardless of cosine magnitude, but the alignment is
+    still observed (evidence stash + failure-gravity window still fire).
+    Operators see the theme; the organism is denied the fast-path
+    priority boost.
+
+    Unrecognized values fall back to ``"centroid"``. Case-insensitive.
+    """
+    raw = os.environ.get("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    mode = raw.strip().lower()
+    if mode in ("centroid", "max_cluster"):
+        return mode
+    return "centroid"
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -315,6 +341,13 @@ class IndexStats:
     # Failure-gravity tripwire state.
     failure_gravity_alerts: int = 0
     failure_gravity_window_rate: float = 0.0
+    # Slice 3b — policy-routing telemetry.
+    scoring_policy: str = "centroid"
+    postmortem_boost_suppressions: int = 0
+    # Cumulative counts by policy of signals scored under that policy.
+    # Lets operators see a session's policy distribution — a mid-session
+    # env flip will show up as a nonzero count under both keys.
+    scored_by_policy: Dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1434,26 +1467,81 @@ class SemanticIndex:
     # Score
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Slice 3b — policy-routed scoring core
+    # ------------------------------------------------------------------
+
+    def _score_and_align(
+        self, vec: Sequence[float],
+    ) -> Tuple[float, Optional[ClusterInfo], str]:
+        """Given an embedded vector, return (score, winning_cluster, policy).
+
+        Single source of truth for every public scoring entrypoint. Routes
+        by ``JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY``:
+
+          * ``"centroid"`` (default, v0.1 + Slice 3a shadow): score is
+            cosine against the weighted centroid; ``winning_cluster`` is
+            the shadow-best cluster (None if clustering empty).
+          * ``"max_cluster"`` (Slice 3b): score is the MAX cosine over
+            cluster centroids; ``winning_cluster`` is that cluster.
+            Fall back to centroid path if clusters empty (defensive —
+            never crashes on misconfiguration).
+
+        The winning_cluster is returned under BOTH policies so downstream
+        code (``boost_for``, ``score_with_cluster``) can apply
+        kind-aware suppression uniformly. Under centroid policy the
+        winning_cluster is informational only — the ``score`` value
+        reflects the centroid, not the cluster.
+        """
+        policy = _cluster_scoring_policy()
+        with self._lock:
+            centroid = list(self._centroid)
+            clusters = list(self._clusters)
+
+        # Find the winning cluster (max cosine) regardless of policy —
+        # needed for evidence stash + kind-aware suppression in 3b.
+        winner: Optional[ClusterInfo] = None
+        best_cluster_cos = -2.0
+        for c in clusters:
+            cs = _cosine(vec, list(c.centroid))
+            if cs > best_cluster_cos:
+                best_cluster_cos = cs
+                winner = c
+
+        if policy == "max_cluster" and winner is not None:
+            return (best_cluster_cos, winner, "max_cluster")
+        # Fall back to centroid path — either policy=centroid OR
+        # policy=max_cluster-with-empty-clusters (defensive).
+        score_centroid = _cosine(vec, centroid) if centroid else 0.0
+        # If we fell back because clusters were empty under max_cluster
+        # policy, report the actual effective policy ("centroid") to
+        # stats — operators see the real behavior, not the configured
+        # intent.
+        effective = "centroid"
+        return (score_centroid, winner, effective)
+
     def score(self, text: str) -> float:
-        """Cosine similarity of ``text`` against the active centroid.
+        """Cosine similarity of ``text`` against the active scoring source.
 
-        Returns 0.0 when disabled, no centroid, or embedder fails.
-        Range is [-1, 1] but for intake callers we clamp to [0, 1] at
-        :meth:`boost_for` — negative values mean "orthogonal to active
-        theme" and shouldn't produce negative priority boost.
+        Range is [-1, 1]. Intake clamps to [0, 1] at :meth:`boost_for` —
+        orthogonal signals don't produce negative boost.
 
-        Slice 3a invariant: ``score()`` still returns the v0.1
-        centroid cosine regardless of ``cluster_mode``. Cluster
-        alignment is SHADOW-OBSERVED here (histogram + failure-gravity
-        window are updated) but NOT used in the return value. Slice 3b
-        introduces ``CLUSTER_SCORING_POLICY=max_cluster`` to flip the
-        return source.
+        Routing:
+          * Policy=centroid: returns cosine(text, v0.1 weighted centroid).
+            v0.1 + Slice 3a behavior (backward-compatible default).
+          * Policy=max_cluster (Slice 3b): returns max cosine over
+            cluster centroids, degrading to the centroid path when
+            clusters are empty.
+
+        Returns 0.0 when disabled / no centroid / embed fails. Always
+        updates the shadow-observer state (histogram + failure-gravity
+        window) regardless of policy.
         """
         if not _is_enabled():
             return 0.0
         with self._lock:
-            centroid = list(self._centroid)
-        if not centroid:
+            have_centroid = bool(self._centroid)
+        if not have_centroid:
             return 0.0
         cleaned = _sanitize_corpus_text(text)
         if not cleaned:
@@ -1461,87 +1549,79 @@ class SemanticIndex:
         vec = self._embedder.embed([cleaned])
         if not vec:
             return 0.0
-        sim = _cosine(vec[0], centroid)
-        # Slice 3a shadow observation — never changes ``sim``.
+        sim, _winner, policy_used = self._score_and_align(vec[0])
+        # Shadow observation (unchanged from 3a) — histogram + failure
+        # gravity window still advance under BOTH policies, because
+        # observation and scoring are deliberately separate layers.
         self._observe_cluster_alignment(vec[0])
         with self._lock:
             self._stats.signals_scored += 1
+            self._stats.scoring_policy = policy_used
+            self._stats.scored_by_policy[policy_used] = (
+                self._stats.scored_by_policy.get(policy_used, 0) + 1
+            )
         return sim
 
-    def score_with_cluster(self, text: str) -> Optional[Dict[str, Any]]:
-        """Debug / evidence-stash API — returns scoring detail.
-
-        Returns a dict with:
-          * ``score``: v0.1 centroid cosine (same as :meth:`score`)
-          * ``cluster_id``: int or None
-          * ``cluster_kind``: str or None
-          * ``cluster_cosine``: cosine to the winning cluster centroid
-          * ``cluster_size``: size of the winning cluster
-
-        Returns ``None`` when disabled / empty / embed fails. Intended
-        for the intake router to stash in ``envelope.evidence`` so
-        operators can audit which cluster the signal aligned to without
-        the stats having to expose per-signal detail.
-
-        Slice 3a parity: calling this updates the same shadow-observer
-        state as :meth:`score`, and the ``score`` field is authoritative
-        for intake priority. The cluster fields are informational.
-        """
-        if not _is_enabled():
-            return None
-        with self._lock:
-            centroid = list(self._centroid)
-        if not centroid:
-            return None
-        cleaned = _sanitize_corpus_text(text)
-        if not cleaned:
-            return None
-        vec = self._embedder.embed([cleaned])
-        if not vec:
-            return None
-        sim = _cosine(vec[0], centroid)
-        # Observation also populates histogram / failure-gravity window.
-        alignment = self._observe_cluster_alignment(vec[0])
-        with self._lock:
-            self._stats.signals_scored += 1
-            clusters = list(self._clusters)
-        payload: Dict[str, Any] = {
-            "score": sim,
-            "cluster_id": None,
-            "cluster_kind": None,
-            "cluster_cosine": 0.0,
-            "cluster_size": 0,
-        }
-        if alignment is not None:
-            cid, kind, cos = alignment
-            # Find size from the immutable snapshot taken above.
-            size = next(
-                (c.size for c in clusters if c.cluster_id == cid), 0,
-            )
-            payload.update({
-                "cluster_id": cid,
-                "cluster_kind": kind,
-                "cluster_cosine": cos,
-                "cluster_size": size,
-            })
-        return payload
-
-    @property
-    def clusters(self) -> Tuple[ClusterInfo, ...]:
-        """Immutable snapshot of the current cluster set. Empty under
-        centroid mode or when clustering hasn't been built."""
-        with self._lock:
-            return tuple(self._clusters)
-
     def boost_for(self, text: str) -> int:
-        """Clamp the cosine score to a non-negative integer priority boost.
+        """Clamp the score to a non-negative integer priority boost.
+
+        Slice 3b zero-boost-with-evidence policy: when
+        ``CLUSTER_SCORING_POLICY=max_cluster`` AND the winning cluster
+        is postmortem-kind, the boost is **structurally zeroed**
+        regardless of cosine magnitude. The alignment is still
+        recorded (histogram + failure-gravity window fire in
+        ``_observe_cluster_alignment``), and the suppression itself
+        bumps a counter + emits an INFO log — operators SEE the
+        postmortem theme activating, the organism is denied the
+        fast-path priority boost.
+
+        Under ``policy=centroid``, no suppression — behaves identically
+        to v0.1 + Slice 3a.
 
         Stays strictly subordinate to ``goal_alignment_boost`` because
-        ``BOOST_MAX=1`` by default (§12.2).
+        ``BOOST_MAX`` defaults to 1 (§12.2).
         """
         if not _is_enabled():
             return 0
-        sim = self.score(text)
+        with self._lock:
+            have_centroid = bool(self._centroid)
+        if not have_centroid:
+            return 0
+        cleaned = _sanitize_corpus_text(text)
+        if not cleaned:
+            return 0
+        vec = self._embedder.embed([cleaned])
+        if not vec:
+            return 0
+        sim, winner, policy_used = self._score_and_align(vec[0])
+        # Shadow observation fires regardless — preserves 3a invariants.
+        self._observe_cluster_alignment(vec[0])
+        with self._lock:
+            self._stats.signals_scored += 1
+            self._stats.scoring_policy = policy_used
+            self._stats.scored_by_policy[policy_used] = (
+                self._stats.scored_by_policy.get(policy_used, 0) + 1
+            )
+
+        # Slice 3b zero-boost-with-evidence gate. Only fires when:
+        #   1. Policy=max_cluster was actually used (not centroid fallback).
+        #   2. A winning cluster was identified.
+        #   3. Winner's kind is CLUSTER_KIND_POSTMORTEM.
+        if (
+            policy_used == "max_cluster"
+            and winner is not None
+            and winner.kind == CLUSTER_KIND_POSTMORTEM
+        ):
+            with self._lock:
+                self._stats.postmortem_boost_suppressions += 1
+            logger.info(
+                "[SemanticIndex] postmortem_suppress cluster_id=%d "
+                "hash8=%s cosine=%.4f size=%d (boost zeroed; alignment "
+                "still observed — Slice 3b zero-boost-with-evidence)",
+                winner.cluster_id, winner.centroid_hash8, sim, winner.size,
+            )
+            return 0
+
         if sim <= 0.0:
             return 0
         boost_max = _boost_max()
@@ -1549,6 +1629,104 @@ class SemanticIndex:
             return 0
         raw = int(round(sim * boost_max))
         return max(0, min(boost_max, raw))
+
+    def score_with_cluster(self, text: str) -> Optional[Dict[str, Any]]:
+        """Debug / evidence-stash API — returns full scoring detail.
+
+        Returns a dict with:
+          * ``score``: cosine per active policy
+            (centroid cosine under ``centroid`` policy; max-cluster
+            cosine under ``max_cluster`` policy with fallback)
+          * ``cluster_id`` / ``cluster_kind`` / ``cluster_size``:
+            winning cluster attribution (None when clustering empty)
+          * ``cluster_cosine``: cosine to winning cluster (max across
+            clusters — always populated when clusters exist, even under
+            ``centroid`` policy for observability)
+          * ``policy_used``: ``"centroid"`` or ``"max_cluster"`` —
+            the EFFECTIVE policy (``max_cluster`` degrades to
+            ``centroid`` on empty clusters; this field reflects reality)
+          * ``boost_applied``: what ``boost_for()`` would return — 0
+            for postmortem-kind-suppressed signals, clamp(cosine *
+            BOOST_MAX) otherwise
+
+        Returns ``None`` when disabled / empty / embed fails. Intended
+        for intake routers to stash in ``envelope.evidence`` so the
+        intake pipeline can audit cluster attribution AND the applied
+        boost delta (enables failure-gravity-aware debugging without
+        needing per-signal stats access).
+        """
+        if not _is_enabled():
+            return None
+        with self._lock:
+            have_centroid = bool(self._centroid)
+        if not have_centroid:
+            return None
+        cleaned = _sanitize_corpus_text(text)
+        if not cleaned:
+            return None
+        vec = self._embedder.embed([cleaned])
+        if not vec:
+            return None
+        sim, winner, policy_used = self._score_and_align(vec[0])
+        # Observation updates histogram / failure-gravity window.
+        self._observe_cluster_alignment(vec[0])
+        with self._lock:
+            self._stats.signals_scored += 1
+            self._stats.scoring_policy = policy_used
+            self._stats.scored_by_policy[policy_used] = (
+                self._stats.scored_by_policy.get(policy_used, 0) + 1
+            )
+
+        # Compute what boost_for would return, matching its suppression
+        # logic exactly. Duplication is intentional — keeps
+        # score_with_cluster side-effect-consistent without forcing a
+        # second _score_and_align call through boost_for.
+        boost_applied = 0
+        suppressed = (
+            policy_used == "max_cluster"
+            and winner is not None
+            and winner.kind == CLUSTER_KIND_POSTMORTEM
+        )
+        if suppressed:
+            with self._lock:
+                self._stats.postmortem_boost_suppressions += 1
+            logger.info(
+                "[SemanticIndex] postmortem_suppress cluster_id=%d "
+                "hash8=%s cosine=%.4f size=%d (via score_with_cluster)",
+                winner.cluster_id, winner.centroid_hash8, sim, winner.size,
+            )
+            boost_applied = 0
+        elif sim > 0.0:
+            boost_max = _boost_max()
+            if boost_max > 0:
+                boost_applied = max(0, min(boost_max, int(round(sim * boost_max))))
+
+        cluster_cosine = 0.0
+        cluster_id: Optional[int] = None
+        cluster_kind: Optional[str] = None
+        cluster_size = 0
+        if winner is not None:
+            cluster_id = winner.cluster_id
+            cluster_kind = winner.kind
+            cluster_size = winner.size
+            cluster_cosine = _cosine(vec[0], list(winner.centroid))
+
+        return {
+            "score": sim,
+            "cluster_id": cluster_id,
+            "cluster_kind": cluster_kind,
+            "cluster_cosine": cluster_cosine,
+            "cluster_size": cluster_size,
+            "policy_used": policy_used,
+            "boost_applied": boost_applied,
+        }
+
+    @property
+    def clusters(self) -> Tuple[ClusterInfo, ...]:
+        """Immutable snapshot of the current cluster set. Empty under
+        centroid mode or when clustering hasn't been built."""
+        with self._lock:
+            return tuple(self._clusters)
 
     # ------------------------------------------------------------------
     # Prompt rendering — untrusted-context epistemic stance (beef #5)
@@ -1764,6 +1942,12 @@ class SemanticIndex:
                 failure_gravity_window_rate=(
                     self._stats.failure_gravity_window_rate
                 ),
+                # Slice 3b extensions.
+                scoring_policy=self._stats.scoring_policy,
+                postmortem_boost_suppressions=(
+                    self._stats.postmortem_boost_suppressions
+                ),
+                scored_by_policy=dict(self._stats.scored_by_policy),
             )
 
     def reset(self) -> None:
