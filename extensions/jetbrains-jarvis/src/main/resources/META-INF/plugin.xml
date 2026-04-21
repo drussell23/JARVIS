@@ -1,0 +1,68 @@
+<idea-plugin>
+  <id>com.drussell23.jarvis.observability</id>
+  <name>JARVIS Observability</name>
+  <vendor url="https://github.com/drussell23/JARVIS-AI-Agent">Derek J. Russell</vendor>
+
+  <description><![CDATA[
+    <p><b>Read-only observability surface for the JARVIS Ouroboros
+    governance loop.</b></p>
+
+    <p>Provides a <code>JARVIS Ops</code> tool window that subscribes
+    to the agent's Server-Sent Events stream and shows a live view of
+    per-op TaskBoard state. Companion to the VS&nbsp;Code / Cursor
+    extension (Slice 3) and Sublime Text plugin (Slice 5) — all
+    three clients consume the same schema-v1.0 HTTP GET + SSE
+    surface.</p>
+
+    <p><b>Authority invariant:</b> this plugin is read-only. It
+    never POSTs to the agent. Mirrors the server-side §1 Boundary
+    Principle on the client side.</p>
+
+    <p>Requires a locally-running JARVIS EventChannelServer with
+    <code>JARVIS_IDE_OBSERVABILITY_ENABLED</code> and
+    <code>JARVIS_IDE_STREAM_ENABLED</code> at their graduated (2026-04-20)
+    defaults.</p>
+  ]]></description>
+
+  <change-notes><![CDATA[
+    <b>0.1.0</b>: Initial release — Slice 6 of Gap #6.
+    Tool window + tree + status bar + action group. Kotlin
+    coroutines-driven SSE consumer with exponential backoff and
+    Last-Event-ID resume.
+  ]]></change-notes>
+
+  <depends>com.intellij.modules.platform</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <toolWindow
+      id="JARVIS Ops"
+      secondary="true"
+      anchor="right"
+      factoryClass="com.drussell23.jarvis.OpsToolWindowFactory"/>
+    <applicationService
+      serviceImplementation="com.drussell23.jarvis.JarvisSettings"/>
+    <applicationConfigurable
+      parentId="tools"
+      instance="com.drussell23.jarvis.JarvisSettingsConfigurable"
+      id="com.drussell23.jarvis.settings"
+      displayName="JARVIS Observability"/>
+  </extensions>
+
+  <actions>
+    <group id="com.drussell23.jarvis.Group" text="JARVIS" description="JARVIS observability">
+      <action id="com.drussell23.jarvis.Connect"
+              class="com.drussell23.jarvis.actions.ConnectAction"
+              text="Connect"
+              description="Start the JARVIS observability stream"/>
+      <action id="com.drussell23.jarvis.Disconnect"
+              class="com.drussell23.jarvis.actions.DisconnectAction"
+              text="Disconnect"
+              description="Stop the JARVIS observability stream"/>
+      <action id="com.drussell23.jarvis.Refresh"
+              class="com.drussell23.jarvis.actions.RefreshAction"
+              text="Refresh Ops"
+              description="Re-fetch the op list"/>
+      <add-to-group group-id="ToolsMenu" anchor="last"/>
+    </group>
+  </actions>
+</idea-plugin>
