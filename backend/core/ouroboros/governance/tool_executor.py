@@ -201,6 +201,49 @@ _INLINE_FILE_ARG_KEYS: Tuple[str, ...] = (
 )
 
 
+_TOOL_CHUNK_PATH_RX = re.compile(
+    r"""
+    (?P<path>
+      (?:[A-Za-z0-9_\-./]+/[A-Za-z0-9_\-./]+
+       | [A-Za-z0-9_\-]+
+         \.
+         (?:py|pyi|ts|tsx|js|jsx|rs|go|kt|java|c|cc|cpp|h|hpp|md|yaml|yml|json|toml|sh|rb|ex|exs))
+    )
+    """,
+    re.VERBOSE,
+)
+
+_TOOL_CHUNK_TOOL_RX = re.compile(
+    r"\n?tool:\s*([A-Za-z0-9_\-]+)",
+)
+
+
+def _extract_paths_from_tool_chunk(chunk: str) -> List[str]:
+    """Cheap regex extraction for auto-feeding intent from tool chunks."""
+    out: List[str] = []
+    seen = set()
+    for m in _TOOL_CHUNK_PATH_RX.finditer(chunk or ""):
+        p = m.group("path")
+        if len(p) < 4 or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _extract_tools_from_tool_chunk(chunk: str) -> List[str]:
+    """Cheap regex extraction of 'tool: <name>' headers from a chunk."""
+    out: List[str] = []
+    seen = set()
+    for m in _TOOL_CHUNK_TOOL_RX.finditer(chunk or ""):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def _inline_extract_target_path(tc: "ToolCall") -> str:
     """Return the repo-relative target path for a file-scoped tool, or ''."""
     args = tc.arguments or {}
@@ -4304,6 +4347,118 @@ class ToolLoopCoordinator:
         # raises ``tool_loop_context_overflow`` on prompt overflow.
 
     # ── Live context auto-compaction (Gap #8) ────────────────────────
+    async def _maybe_score_tool_chunks(
+        self,
+        *,
+        chunks: List[str],
+        op_id: str,
+        recent_count: int,
+    ) -> Tuple[List[str], List[str]]:
+        """Return (old_chunks_for_summary, recent_chunks_kept_verbatim).
+
+        When ``JARVIS_TOOL_LOOP_SCORER_ENABLED=true`` AND the preservation
+        stack is importable, pick the ``recent_count`` highest-scoring
+        chunks (by intent match + recency + structural signal) as the
+        verbatim-preserved set. Everything else becomes "old" and is
+        handed to :meth:`_summarize_old_chunks` — matching the legacy
+        shape so downstream code is unchanged.
+
+        When disabled OR the preservation stack fails to import OR the
+        scorer raises, fall back to the legacy recency-only split.
+        """
+        legacy = (chunks[:-recent_count], chunks[-recent_count:])
+        enabled = os.environ.get(
+            "JARVIS_TOOL_LOOP_SCORER_ENABLED", "false",
+        ).strip().lower() == "true"
+        if not enabled:
+            return legacy
+        try:
+            from backend.core.ouroboros.governance.context_intent import (
+                ChunkCandidate,
+                PreservationScorer,
+                intent_tracker_for,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[ToolLoop] scorer import failed; legacy split: %s", exc,
+            )
+            return legacy
+        try:
+            tracker = intent_tracker_for(op_id)
+            # Auto-feed intent from every chunk's visible tool-name / paths.
+            # Non-authoritative: ingest_ledger_entry doesn't advance the
+            # turn clock, only strengthens path/tool signals.
+            for chunk in chunks:
+                for path in _extract_paths_from_tool_chunk(chunk):
+                    tracker.ingest_ledger_entry({
+                        "kind": "file_read", "file_path": path,
+                    })
+                for tool in _extract_tools_from_tool_chunk(chunk):
+                    tracker.ingest_ledger_entry({
+                        "kind": "tool_call", "tool": tool,
+                    })
+            scorer = PreservationScorer()
+            candidates = [
+                ChunkCandidate(
+                    chunk_id=f"tool-chunk-{i}",
+                    text=c,
+                    index_in_sequence=i,
+                    role="tool",
+                )
+                for i, c in enumerate(chunks)
+            ]
+            result = scorer.select_preserved(
+                candidates,
+                tracker.current_intent(),
+                max_chunks=recent_count,
+                keep_ratio=1.0,  # Everything not kept goes to summary pool.
+            )
+            kept_chunk_texts = [chunks[s.index_in_sequence] for s in result.kept]
+            # Old chunks = compacted (for summary) + dropped.
+            old_chunks = [
+                chunks[s.index_in_sequence] for s in result.compacted
+            ] + [
+                chunks[s.index_in_sequence] for s in result.dropped
+            ]
+            # Scorer may have selected chunks out of order; preserve the
+            # original chronology on the kept set so the output prompt
+            # still reads naturally.
+            kept_indices = sorted(
+                s.index_in_sequence for s in result.kept
+            )
+            kept_chunk_texts = [chunks[i] for i in kept_indices]
+            # old_chunks similarly chronological
+            kept_set = set(kept_indices)
+            old_chunks = [
+                chunks[i] for i in range(len(chunks)) if i not in kept_set
+            ]
+            logger.info(
+                "[ToolLoop] scorer path op=%s kept=%d compacted=%d dropped=%d",
+                op_id[:12] if op_id else "?",
+                len(result.kept),
+                len(result.compacted),
+                len(result.dropped),
+            )
+            # Record manifest (best-effort).
+            try:
+                from backend.core.ouroboros.governance.context_manifest import (
+                    manifest_for,
+                )
+                manifest_for(op_id).record_pass(
+                    preservation_result=result,
+                    intent_snapshot=tracker.current_intent(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[ToolLoop] manifest record failed: %s", exc,
+                )
+            return old_chunks, kept_chunk_texts
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[ToolLoop] scorer path raised; legacy fallback: %s", exc,
+            )
+            return legacy
+
     async def _compact_prompt(
         self,
         base_prompt: str,
@@ -4345,9 +4500,13 @@ class ToolLoopCoordinator:
         if len(chunks) <= _PRESERVE_RECENT:
             return current_prompt  # Not enough to compact
 
-        # Older chunks → summary. Recent N chunks are always kept verbatim.
-        old_chunks = chunks[:-_PRESERVE_RECENT]
-        recent_chunks = chunks[-_PRESERVE_RECENT:]
+        # Slice 2 Production Integration: intent-aware selection when
+        # ``JARVIS_TOOL_LOOP_SCORER_ENABLED=true``. Default-off: the
+        # recency-only split stays authoritative until the operator opts in.
+        old_chunks, recent_chunks = await self._maybe_score_tool_chunks(
+            chunks=chunks, op_id=op_id,
+            recent_count=_PRESERVE_RECENT,
+        )
 
         total_chars = sum(len(c) for c in old_chunks)
 

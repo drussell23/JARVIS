@@ -92,14 +92,24 @@ CONTEXT_OBSERVABILITY_SCHEMA_VERSION: str = "1.0"
 
 
 def context_observability_enabled() -> bool:
-    """Slice 4 default: OFF. Slice 5 graduates.
+    """Master switch.
 
-    Mirror of the Gap #6 / inline-permission pattern — expose the
-    surface behind an explicit opt-in until the end-to-end stack is
-    proved.
+    Default: **``true``** (graduated in Slice 5 after Slices 1–4
+    shipped the ledger + intent + pin + manifest stack with 149
+    governance tests green plus a live-fire proof
+    (``scripts/livefire_context_preservation.py``) that exercises the
+    complete intent-aware preservation pipeline end-to-end).
+
+    Explicit ``"false"`` reverts to the pre-graduation deny-by-default
+    posture — this is the runtime kill switch that makes the context
+    observability surface return 403 so port scanners see no signal.
+
+    The loopback-binding assertion, rate-limit cap, CORS allowlist, and
+    authority-invariant grep pin all remain in force regardless of
+    this flag — graduation flips opt-in friction, NOT authority surface.
     """
     return os.environ.get(
-        "JARVIS_CONTEXT_OBSERVABILITY_ENABLED", "false",
+        "JARVIS_CONTEXT_OBSERVABILITY_ENABLED", "true",
     ).strip().lower() == "true"
 
 

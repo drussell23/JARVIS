@@ -34,9 +34,31 @@ import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.ContextCompaction")
+
+
+# ---------------------------------------------------------------------------
+# Intent-aware scorer integration (Slice 1 of Production Integration arc)
+# ---------------------------------------------------------------------------
+
+
+def context_compactor_scorer_enabled() -> bool:
+    """Master switch for intent-aware compaction path.
+
+    Default **``false``** deliberately during the rollout — flipping the
+    default would silently change compaction behavior in every op. The
+    operator opts in by setting ``=true``; Slice 5 of this arc
+    re-evaluates the default after a live-fire proof.
+
+    Explicit ``=false`` always falls back to the legacy regex +
+    last-N partition regardless of whether a scorer is attached. This
+    is the runtime kill switch.
+    """
+    return os.environ.get(
+        "JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", "false",
+    ).strip().lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Default configuration from environment
@@ -145,10 +167,48 @@ class ContextCompactor:
     is the Phase 0 hook for the Functions-not-Agents reseating (Manifesto §5).
     """
 
-    def __init__(self, semantic_strategy: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        semantic_strategy: Optional[Any] = None,
+        *,
+        preservation_scorer: Optional[Any] = None,
+        intent_tracker_lookup: Optional[Callable[[str], Any]] = None,
+        pin_registry_lookup: Optional[Callable[[str], Any]] = None,
+        manifest_lookup: Optional[Callable[[str], Any]] = None,
+    ) -> None:
         # Compiled patterns cache: pattern string -> compiled regex
         self._pattern_cache: Dict[str, re.Pattern[str]] = {}
         self._semantic_strategy = semantic_strategy
+
+        # Slice 1 Production Integration: optional intent-aware path.
+        # ALL four are optional; when any is missing the compactor falls
+        # back to its legacy regex + last-N partition. The flag
+        # ``JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED`` gates this path;
+        # explicit ``=false`` forces legacy even when attached.
+        self._preservation_scorer = preservation_scorer
+        self._intent_tracker_lookup = intent_tracker_lookup
+        self._pin_registry_lookup = pin_registry_lookup
+        self._manifest_lookup = manifest_lookup
+
+    def attach_preservation_scorer(
+        self,
+        *,
+        scorer: Any,
+        intent_tracker_lookup: Optional[Callable[[str], Any]] = None,
+        pin_registry_lookup: Optional[Callable[[str], Any]] = None,
+        manifest_lookup: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        """Late-bind the scorer + its lookups. Used when the compactor is
+        constructed before the preservation-stack singletons are wired.
+        ``None`` on any lookup falls back to module default singletons
+        inside :meth:`_partition_via_scorer`."""
+        self._preservation_scorer = scorer
+        if intent_tracker_lookup is not None:
+            self._intent_tracker_lookup = intent_tracker_lookup
+        if pin_registry_lookup is not None:
+            self._pin_registry_lookup = pin_registry_lookup
+        if manifest_lookup is not None:
+            self._manifest_lookup = manifest_lookup
 
     # -- Public API ---------------------------------------------------------
 
@@ -165,6 +225,8 @@ class ContextCompactor:
         self,
         dialogue_entries: List[Dict[str, Any]],
         config: Optional[CompactionConfig] = None,
+        *,
+        op_id: Optional[str] = None,
     ) -> CompactionResult:
         """Compact *dialogue_entries* according to *config*.
 
@@ -211,9 +273,43 @@ class ContextCompactor:
                 )
 
         # --- Partition entries ---
-        preserved, compactable, preserved_keys = self._partition(
-            dialogue_entries, cfg,
-        )
+        # Slice 1 Production Integration: intent-aware path when enabled
+        # and fully-wired. Falls back silently to legacy path on ANY
+        # missing prerequisite (op_id / scorer / env flag).
+        preserved: List[Dict[str, Any]] = []
+        compactable: List[Dict[str, Any]] = []
+        preserved_keys: List[str] = []
+        used_scorer_path = False
+        if (
+            op_id
+            and self._preservation_scorer is not None
+            and context_compactor_scorer_enabled()
+        ):
+            try:
+                preserved, compactable, preserved_keys = \
+                    self._partition_via_scorer(
+                        dialogue_entries, cfg, op_id,
+                    )
+                used_scorer_path = True
+                logger.info(
+                    "[ContextCompaction] scorer path op=%s entries=%d "
+                    "preserved=%d compactable=%d",
+                    op_id, entries_before,
+                    len(preserved), len(compactable),
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Fail-closed: never lose data. Fall back to legacy.
+                logger.warning(
+                    "[ContextCompaction] scorer path raised; falling back "
+                    "to legacy partition: %s", exc,
+                )
+                preserved, compactable, preserved_keys = self._partition(
+                    dialogue_entries, cfg,
+                )
+        else:
+            preserved, compactable, preserved_keys = self._partition(
+                dialogue_entries, cfg,
+            )
 
         if not compactable:
             logger.debug(
@@ -267,6 +363,122 @@ class ContextCompactor:
         return result
 
     # -- Internal -----------------------------------------------------------
+
+    def _partition_via_scorer(
+        self,
+        entries: List[Dict[str, Any]],
+        config: CompactionConfig,
+        op_id: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+        """Intent-aware partition via :class:`PreservationScorer`.
+
+        Maps each dialogue entry to a :class:`ChunkCandidate`, scores
+        against the op's current intent + pin state, and partitions
+        into (preserved, compactable, preserved_keys) shapes identical
+        to the legacy :meth:`_partition` output so downstream code
+        paths are untouched.
+
+        The safety-critical preserve patterns from the legacy config
+        still apply — chunks matching them are treated as ``pinned``
+        for scoring purposes, so the new path is strictly additive to
+        the existing safety floor.
+        """
+        # Lazy imports — the preservation stack is optional.
+        from backend.core.ouroboros.governance.context_intent import (
+            ChunkCandidate,
+            PreservationScorer as _PScorer,
+            intent_tracker_for,
+        )
+        from backend.core.ouroboros.governance.context_pins import (
+            pin_registry_for,
+        )
+
+        tracker_lookup = self._intent_tracker_lookup or intent_tracker_for
+        pin_lookup = self._pin_registry_lookup or pin_registry_for
+        tracker = tracker_lookup(op_id)
+        pins = pin_lookup(op_id)
+
+        scorer = self._preservation_scorer
+        if not isinstance(scorer, _PScorer):
+            # Construction / wiring mismatch — caller injected something
+            # that isn't a PreservationScorer. Fall through by raising;
+            # compact() catches and uses legacy.
+            raise TypeError(
+                "preservation_scorer must be a PreservationScorer instance; "
+                f"got {type(scorer).__name__}"
+            )
+
+        # Build ChunkCandidates from entries. Pins are looked up per
+        # chunk_id. Safety-critical regex pins are merged into the pin
+        # signal so legacy safety floor is preserved.
+        compiled_safety = self._compile_patterns(config.preserve_patterns)
+        intent_snapshot = tracker.current_intent()
+        candidates: List[ChunkCandidate] = []
+        chunk_to_entry: Dict[str, Dict[str, Any]] = {}
+        for idx, entry in enumerate(entries):
+            chunk_id = _deterministic_chunk_id(entry, idx)
+            text = _entry_to_text(entry)
+            role = str(
+                entry.get("type")
+                or entry.get("phase")
+                or entry.get("role")
+                or "unknown"
+            )
+            # Safety-floor: a chunk matching any preserve_pattern or
+            # explicitly pinned via the pin registry is treated as
+            # pinned for score purposes.
+            is_pinned = (
+                self._matches_any(text, compiled_safety)
+                or pins.is_pinned(chunk_id)
+            )
+            candidates.append(ChunkCandidate(
+                chunk_id=chunk_id,
+                text=text,
+                index_in_sequence=idx,
+                role=role,
+                pinned=is_pinned,
+            ))
+            chunk_to_entry[chunk_id] = entry
+
+        # Preserve count → max_chunks budget for the scorer.
+        result = scorer.select_preserved(
+            candidates,
+            intent_snapshot,
+            max_chunks=config.preserve_count,
+            keep_ratio=0.5,
+        )
+
+        kept_entries = [
+            chunk_to_entry[s.chunk_id] for s in result.kept
+        ]
+        compactable_entries = [
+            chunk_to_entry[s.chunk_id] for s in result.compacted
+        ] + [
+            chunk_to_entry[s.chunk_id] for s in result.dropped
+        ]
+        preserved_keys = [
+            f"chunk_id={s.chunk_id}" for s in result.kept
+        ]
+
+        # Record manifest (best-effort — never block partitioning).
+        try:
+            manifest_lookup = self._manifest_lookup
+            if manifest_lookup is None:
+                from backend.core.ouroboros.governance.context_manifest import (
+                    manifest_for,
+                )
+                manifest_lookup = manifest_for
+            manifest = manifest_lookup(op_id)
+            manifest.record_pass(
+                preservation_result=result,
+                intent_snapshot=intent_snapshot,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[ContextCompaction] manifest record failed: %s", exc,
+            )
+
+        return kept_entries, compactable_entries, preserved_keys
 
     def _partition(
         self,
@@ -423,6 +635,21 @@ class ContextCompactor:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _deterministic_chunk_id(entry: Dict[str, Any], index: int) -> str:
+    """Derive a stable chunk_id for a dialogue entry.
+
+    Preference order: explicit ``id`` / ``message_id`` field → type+phase+index
+    composite → index-only fallback. Deterministic so the scorer's
+    per-chunk lookups are stable within a single pass.
+    """
+    for key in ("id", "message_id", "entry_id", "chunk_id"):
+        val = entry.get(key)
+        if val is not None and str(val):
+            return f"chunk-{val}"
+    typ = entry.get("type") or entry.get("phase") or entry.get("role") or "e"
+    return f"chunk-{typ}-{index}"
 
 
 def _entry_to_text(entry: Dict[str, Any]) -> str:
