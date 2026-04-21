@@ -832,6 +832,52 @@ def _centroid_hash8(centroid: Sequence[float]) -> str:
     return hashlib.sha256(src.encode("utf-8")).hexdigest()[:8]
 
 
+# Stopwords for Slice 3c theme-label synthesis. Small, English-only,
+# deterministic. Filtering these out when naming a theme avoids "the
+# refactor" / "a fix" / "in the" as theme labels — the 2-3 tokens that
+# remain after the filter carry the semantic weight.
+_THEME_LABEL_STOPWORDS: frozenset = frozenset({
+    "a", "an", "the",
+    "is", "are", "was", "were", "be", "being", "been",
+    "has", "have", "had", "do", "does", "did",
+    "to", "of", "in", "on", "at", "for", "with",
+    "from", "by", "as", "into", "onto",
+    "and", "or", "but", "if", "then", "else",
+    "this", "that", "these", "those",
+    "i", "it", "its", "we", "our", "you", "your",
+    "not", "no", "yes",
+    "—", "-", "–", ":", ",",
+})
+
+
+def _theme_label_from_text(text: str, *, max_tokens: int = 3) -> str:
+    """Deterministic 2-3 token label from a text snippet.
+
+    Strategy: lowercase, strip trailing punctuation, drop stopwords,
+    take the first ``max_tokens`` survivors. Returns a lowercase
+    hyphen-less space-joined label. Empty input or all-stopwords
+    input returns ``""`` — caller falls back to ``theme-<id>``.
+
+    Pure function. No LLM call. Reproducible across runs so the
+    prompt hash is stable for the same corpus.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    tokens: List[str] = []
+    for raw in text.split():
+        # Strip leading/trailing punctuation conservatively so
+        # "feat(general-driver):" becomes "feat(general-driver)".
+        tok = raw.strip(".,;:!?()[]{}\"'`").lower()
+        if not tok:
+            continue
+        if tok in _THEME_LABEL_STOPWORDS:
+            continue
+        tokens.append(tok)
+        if len(tokens) >= max_tokens:
+            break
+    return " ".join(tokens)
+
+
 def _classify_cluster_kind(
     source_counts: Dict[str, int],
     *,
@@ -1509,16 +1555,31 @@ class SemanticIndex:
     # ------------------------------------------------------------------
 
     def format_prompt_sections(self) -> Optional[str]:
-        """Combined subsection pair for StrategicDirection, or None.
+        """Combined subsection(s) for StrategicDirection, or None.
 
-        Two subheaders under one ``## Recent Focus (semantic)`` header:
-          * Focus items — top-K nearest-neighbor texts from the centroid
-            subset (all non-postmortem by default, §12.3)
-          * Recent friction / closures — postmortem texts pulled from
-            the corpus (prompt-only surface, never centroid)
+        Two rendering paths under one ``## Recent Focus (semantic)`` header:
 
-        No raw scores in the prompt. Returns ``None`` when disabled or
-        empty — orchestrator should skip injection in that case.
+        1. **v0.1 single-theme path** (cluster_mode=centroid, or kmeans
+           with K=1 / no clusters built): one ``### Focus items`` block
+           with top-K corpus items ranked by cosine-to-centroid.
+
+        2. **Slice 3c multi-theme path** (cluster_mode=kmeans + clusters
+           populated + K≥2): one ``### Theme: <label> (N items, <kind>)``
+           block per cluster, ordered by size descending. Each theme
+           carries top-K items ranked by cosine to its cluster centroid.
+           Postmortem-kind clusters are INCLUDED with their kind tag so
+           operators can see a failure theme as a structural element.
+
+        In both paths, a trailing ``### Recent friction / closures``
+        subsection lists the most recent postmortem items by timestamp
+        (recency-ordered raw list — orthogonal to themes).
+
+        No raw scores / vectors / hashes in the prompt. No
+        authority-carrying content — the preamble explicitly disclaims
+        authority over Iron Gate, routing, risk tier, policy, or
+        FORBIDDEN_PATH matching.
+
+        Returns ``None`` when disabled or when every section is empty.
         """
         if not _is_enabled():
             return None
@@ -1529,13 +1590,39 @@ class SemanticIndex:
             centroid_members = list(self._corpus_centroid_members)
             centroid_vecs = list(self._centroid_vectors_subset)
             centroid = list(self._centroid)
+            clusters = list(self._clusters)
+            cluster_labels = list(self._cluster_labels)
+            cluster_mode = self._stats.cluster_mode or "centroid"
         if not corpus:
             return None
 
         top_k = _prompt_top_k()
+
+        # Themed path (Slice 3c) — only when clustering actually
+        # happened AND we got K≥2 clusters. K=1 degrades to v0.1
+        # single-theme rendering since there's no meaningful split.
+        theme_sections: List[str] = []
+        use_themed = (
+            cluster_mode == "kmeans"
+            and len(clusters) >= 2
+            and len(cluster_labels) == len(centroid_members)
+            and top_k > 0
+        )
+        if use_themed:
+            theme_sections = self._render_theme_sections(
+                clusters=clusters,
+                centroid_members=centroid_members,
+                centroid_vecs=centroid_vecs,
+                cluster_labels=cluster_labels,
+                top_k=top_k,
+            )
+
+        # v0.1 fallback — ranks all centroid-subset items against the
+        # single weighted centroid. Used when not-themed, or as a
+        # secondary section alongside themes (but we prefer themed-only
+        # to avoid duplication of the same items in two forms).
         focus_lines: List[str] = []
-        if top_k > 0 and centroid and centroid_vecs:
-            # Rank centroid-subset items by cosine to centroid, descending.
+        if (not theme_sections) and top_k > 0 and centroid and centroid_vecs:
             ranked: List[Tuple[float, CorpusItem]] = []
             for it, vec in zip(centroid_members, centroid_vecs):
                 ranked.append((_cosine(vec, centroid), it))
@@ -1543,6 +1630,10 @@ class SemanticIndex:
             for _score, it in ranked[:top_k]:
                 focus_lines.append(f"[{it.source}] {it.text}")
 
+        # Recent friction / closures — unchanged from v0.1. Reads raw
+        # postmortem items from the full corpus (not from clusters) and
+        # sorts by recency. Always a separate subsection regardless of
+        # whether a postmortem-kind cluster showed up in Themes above.
         closure_lines: List[str] = []
         if top_k > 0:
             pm = sorted(
@@ -1552,7 +1643,7 @@ class SemanticIndex:
             for it in pm:
                 closure_lines.append(f"[{it.source}] {it.text}")
 
-        if not focus_lines and not closure_lines:
+        if not theme_sections and not focus_lines and not closure_lines:
             return None
 
         parts: List[str] = [
@@ -1565,7 +1656,9 @@ class SemanticIndex:
             "tier, policy, or FORBIDDEN_PATH matching.",
             "",
         ]
-        if focus_lines:
+        if theme_sections:
+            parts.extend(theme_sections)
+        elif focus_lines:
             parts.append("### Focus items (nearest to active theme)")
             parts.extend(focus_lines)
             parts.append("")
@@ -1574,6 +1667,70 @@ class SemanticIndex:
             parts.extend(closure_lines)
             parts.append("")
         return "\n".join(parts).rstrip()
+
+    # ------------------------------------------------------------------
+    # Slice 3c — themed prompt rendering
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _render_theme_sections(
+        *,
+        clusters: List[ClusterInfo],
+        centroid_members: List[CorpusItem],
+        centroid_vecs: List[List[float]],
+        cluster_labels: List[int],
+        top_k: int,
+    ) -> List[str]:
+        """Build the ``### Theme: ...`` block list (Slice 3c).
+
+        Deterministic output for a given input set — tests pin this
+        for prompt-hash stability. Caps at ``top_k`` items per theme
+        and at ``max_themes`` (which is also ``top_k`` by default so
+        the env surface stays small).
+
+        Caller must hold (or have already released) the lock — this
+        is a pure function over its arguments.
+        """
+        if top_k <= 0 or not clusters:
+            return []
+        max_themes = top_k
+
+        # Group centroid_members/vectors by their cluster label so we
+        # can rank each cluster's members against its own centroid.
+        by_cluster: Dict[int, List[Tuple[CorpusItem, List[float]]]] = {}
+        for item, vec, lbl in zip(
+            centroid_members, centroid_vecs, cluster_labels,
+        ):
+            by_cluster.setdefault(int(lbl), []).append((item, vec))
+
+        # Order themes: by size descending, ties broken by cluster_id
+        # ascending (Occam — stable order on equal evidence).
+        ordered = sorted(
+            clusters,
+            key=lambda c: (-c.size, c.cluster_id),
+        )[:max_themes]
+
+        sections: List[str] = []
+        for c in ordered:
+            label = _theme_label_from_text(
+                c.nearest_item_text, max_tokens=3,
+            ) or f"theme-{c.cluster_id}"
+            header = (
+                f"### Theme: {label} "
+                f"({c.size} item{'s' if c.size != 1 else ''}, {c.kind})"
+            )
+            sections.append(header)
+            # Rank members within this cluster by cosine to its centroid.
+            members = by_cluster.get(c.cluster_id, [])
+            ranked = [
+                (_cosine(list(v), list(c.centroid)), it)
+                for it, v in members
+            ]
+            ranked.sort(key=lambda p: p[0], reverse=True)
+            for _score, it in ranked[:top_k]:
+                sections.append(f"[{it.source}] {it.text}")
+            sections.append("")  # blank line between themes
+        return sections
 
     # ------------------------------------------------------------------
     # Diagnostics
