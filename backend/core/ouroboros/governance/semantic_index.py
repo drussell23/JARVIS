@@ -141,6 +141,86 @@ def _git_log_limit() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Epoch 3 Slice 3a — cluster-mode env knobs
+# ---------------------------------------------------------------------------
+#
+# CLUSTER_MODE is the master switch for the v1.0 cluster-based goal
+# alignment path. ``"centroid"`` (default) preserves v0.1 behavior
+# exactly — no k-means computed, no cluster state populated. ``"kmeans"``
+# builds clusters in parallel to the v0.1 centroid, populates telemetry,
+# and observes (but does NOT change) scoring. Policy-changing behavior
+# (max-cluster scoring + postmortem-cluster zero-boost) is deferred to
+# Slice 3b behind a separate ``CLUSTER_SCORING_POLICY`` env flag.
+
+
+def _cluster_mode() -> str:
+    raw = os.environ.get("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", "centroid")
+    mode = raw.strip().lower()
+    if mode in ("centroid", "kmeans"):
+        return mode
+    # Unrecognized value → safe default.
+    return "centroid"
+
+
+def _cluster_k_min() -> int:
+    return max(1, _env_int("JARVIS_SEMANTIC_CLUSTER_K_MIN", 1, minimum=1))
+
+
+def _cluster_k_max() -> int:
+    return max(1, _env_int("JARVIS_SEMANTIC_CLUSTER_K_MAX", 5, minimum=1))
+
+
+def _cluster_kmeans_seed() -> int:
+    return _env_int("JARVIS_SEMANTIC_CLUSTER_KMEANS_SEED", 42, minimum=0)
+
+
+def _cluster_kmeans_max_iter() -> int:
+    return max(1, _env_int("JARVIS_SEMANTIC_CLUSTER_KMEANS_MAX_ITER", 30, minimum=1))
+
+
+def _cluster_kmeans_tol() -> float:
+    return _env_float("JARVIS_SEMANTIC_CLUSTER_KMEANS_TOL", 1e-4, minimum=0.0)
+
+
+def _cluster_postmortem_dominance() -> float:
+    """Source-composition threshold for labeling a cluster ``"postmortem"``.
+
+    Default 0.6 — a cluster is postmortem-dominant when ≥60% of its
+    items come from ``SOURCE_POSTMORTEM``. Lower values classify more
+    aggressively (risks over-labeling); higher values reserve the
+    ``"postmortem"`` label for very concentrated failure themes.
+    """
+    raw = _env_float(
+        "JARVIS_SEMANTIC_CLUSTER_POSTMORTEM_DOMINANCE", 0.6, minimum=0.0,
+    )
+    return min(1.0, raw)
+
+
+def _cluster_failure_gravity_threshold() -> float:
+    """Fraction of signals aligning to a postmortem cluster that trips
+    the failure-gravity WARN.
+
+    Default 0.3 — if ≥30% of recent scored signals align to a
+    postmortem-dominant cluster, the organism is in a failure-gravity
+    attractor and operators should investigate. Advisory only in
+    Slice 3a; policy effect deferred to Slice 3b.
+    """
+    raw = _env_float(
+        "JARVIS_SEMANTIC_CLUSTER_FAILURE_GRAVITY_THRESHOLD",
+        0.3, minimum=0.0,
+    )
+    return min(1.0, raw)
+
+
+def _cluster_failure_gravity_window() -> int:
+    return max(
+        1,
+        _env_int("JARVIS_SEMANTIC_CLUSTER_FAILURE_GRAVITY_WINDOW", 50,
+                 minimum=1),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
 
@@ -168,6 +248,47 @@ class CorpusItem:
     halflife_days: float = 14.0
 
 
+# Cluster-kind labels (§Slice 3a). Source-composition-derived.
+CLUSTER_KIND_GOAL = "goal"           # ≥60% git_commit + goal
+CLUSTER_KIND_CONVERSATION = "conversation"  # ≥60% conversation
+CLUSTER_KIND_POSTMORTEM = "postmortem"      # ≥60% postmortem
+CLUSTER_KIND_MIXED = "mixed"         # no single-source ≥60%
+
+_VALID_CLUSTER_KINDS = (
+    CLUSTER_KIND_GOAL,
+    CLUSTER_KIND_CONVERSATION,
+    CLUSTER_KIND_POSTMORTEM,
+    CLUSTER_KIND_MIXED,
+)
+
+
+@dataclass(frozen=True)
+class ClusterInfo:
+    """One cluster produced by the v1.0 k-means path. Immutable.
+
+    Carries everything downstream surfaces need — per-cluster centroid
+    (for max-cluster scoring in Slice 3b), hash (for churn tracking),
+    source composition (for kind classification), and a nearest-item
+    preview (for prompt rendering in Slice 3c). Never carries raw
+    per-item vectors — those live on the SemanticIndex for cosine math.
+
+    ``centroid_hash8`` is a stable 8-char hash of the cluster centroid
+    (first 16 float components quantized to 6 decimals). Rebuilds that
+    produce the same clusters produce the same hashes; rebuilds that
+    re-shape the clustering produce different hashes — the delta
+    against the prior build feeds the ``cluster_churn`` counter.
+    """
+
+    cluster_id: int
+    size: int
+    kind: str  # one of _VALID_CLUSTER_KINDS
+    centroid: Tuple[float, ...]
+    centroid_hash8: str
+    nearest_item_text: str
+    nearest_item_source: str
+    source_composition: Tuple[Tuple[str, int], ...]  # [(source, count), ...]
+
+
 @dataclass
 class IndexStats:
     """Counters snapshot. Never contains content or vectors."""
@@ -180,6 +301,20 @@ class IndexStats:
     signals_scored: int = 0
     embed_failures: int = 0
     by_source: Dict[str, int] = field(default_factory=dict)
+    # Slice 3a extensions — always populated, zero when cluster_mode=centroid.
+    cluster_mode: str = "centroid"
+    cluster_count: int = 0
+    clusters: List[Dict[str, Any]] = field(default_factory=list)
+    cluster_churn: int = 0  # hashes changed vs prior build
+    kmeans_silhouette: float = 0.0
+    kmeans_inertia: float = 0.0
+    kmeans_converged: bool = False
+    kmeans_iter_count: int = 0
+    # Shadow-mode observation histograms (cumulative over index lifetime).
+    alignment_histogram_by_kind: Dict[str, int] = field(default_factory=dict)
+    # Failure-gravity tripwire state.
+    failure_gravity_alerts: int = 0
+    failure_gravity_window_rate: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +476,396 @@ def _recency_weight(age_s: float, halflife_days: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Slice 3a — k-means + silhouette + auto-K (hand-rolled on NumPy)
+# ---------------------------------------------------------------------------
+#
+# Design decisions (locked by authorization of Slice 3a):
+#
+#   * k-means only, no DBSCAN. Eps tuning in 384-dim cosine space is
+#     fragile at sub-100-item scale.
+#   * Hand-rolled on NumPy. sklearn is ~100MB; scipy.cluster.vq is
+#     unnecessary at this scale. NumPy is already transitive via
+#     fastembed + our .npz cache.
+#   * Seeded init via ``np.random.RandomState(seed)`` (the reproducible
+#     legacy API — deterministic regardless of the global random state).
+#   * Shuffled-indices init — first K indices of a seeded permutation
+#     become the initial centroids. Simpler than k-means++ at this scale
+#     and determinism trumps marginal init-quality gains.
+#   * Cosine distance (1 - cosine_similarity). Embeddings from
+#     bge-small-en-v1.5 are already L2-normalized, so cosine distance on
+#     them is equivalent to scaled Euclidean distance — but cosine is
+#     the semantically correct metric and keeps the algebra honest.
+#   * Silhouette K-discovery over K ∈ [K_MIN, K_MAX ∩ N]. K=1 always
+#     gets a tie-break silhouette of 0.0; any K≥2 with silhouette ≤ 0
+#     loses to K=1. Degrades gracefully to v0.1 when the corpus is
+#     coherent enough to not cluster.
+
+
+def _cosine_distance_matrix(vectors: "Any") -> "Any":
+    """Dense cosine-distance matrix. Returns NumPy array or raises.
+
+    Caller must have already verified NumPy is available (this helper
+    is only invoked from paths that already depend on NumPy for the
+    k-means lift). Vectors assumed shape (N, D); returns (N, N).
+    """
+    import numpy as np
+    arr = np.asarray(vectors, dtype="float64")
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    # Avoid divide-by-zero: zero-vector rows get treated as maximally
+    # distant (cosine dist = 1.0) from everything — they produce an
+    # orthogonal-zero row/col in the final matrix.
+    safe_norms = np.where(norms > 0, norms, 1.0)
+    normed = arr / safe_norms
+    # Cosine similarity is the dot-product of normalized vectors.
+    sim = normed @ normed.T
+    # Numerical clean-up: clip to [-1, 1] before converting to distance.
+    sim = np.clip(sim, -1.0, 1.0)
+    dist = 1.0 - sim
+    # Zero out any row/col for zero-norm vectors (they were set to 1.0
+    # above; revert to explicit 1.0 for consistency — a zero vector is
+    # maximally distant from everything, including itself, by convention).
+    zero_mask = (norms.squeeze(-1) <= 0)
+    if np.any(zero_mask):
+        dist[zero_mask, :] = 1.0
+        dist[:, zero_mask] = 1.0
+    # Force the diagonal to exactly 0 — every point is at distance 0
+    # from itself, regardless of floating-point roundoff.
+    np.fill_diagonal(dist, 0.0)
+    return dist
+
+
+def _kmeans_numpy(
+    vectors: Sequence[Sequence[float]],
+    k: int,
+    *,
+    seed: int,
+    max_iter: int,
+    tol: float,
+) -> Tuple[List[int], List[List[float]], int, bool, float]:
+    """Hand-rolled k-means on cosine distance over L2-normalized vectors.
+
+    Returns ``(labels, centroids, iter_count, converged, inertia)``.
+
+    ``labels`` is a length-N list of int cluster IDs in ``[0, k)``.
+    ``centroids`` is a list of k vectors (plain Python lists, not
+    NumPy arrays — for API consistency with the rest of the module).
+    ``iter_count`` is how many Lloyd iterations actually ran.
+    ``converged`` is True when centroid movement dropped below ``tol``
+    before ``max_iter`` was hit.
+    ``inertia`` is the sum of squared cosine distances from each
+    point to its assigned centroid — lower is tighter.
+
+    Determinism: for a given ``(vectors, k, seed)`` tuple, the labels
+    and centroids are bit-exact reproducible. Callers get seeded init
+    via ``np.random.RandomState(seed).permutation(N)[:k]``.
+
+    Edge cases:
+      * ``k == 1`` — trivially returns all labels=0, centroid = mean
+        of all vectors, converged=True, iter=0. Inertia is the total
+        variance.
+      * ``k >= N`` — caller should clamp; this function still works
+        by assigning each point its own cluster (some centroids may
+        collapse to identical positions if N < k).
+      * Empty cluster mid-iteration — reassigned the point currently
+        farthest from its own centroid. Prevents k-means from silently
+        collapsing to fewer clusters.
+    """
+    import numpy as np
+    arr = np.asarray(vectors, dtype="float64")
+    n, dim = arr.shape
+    if n == 0 or k <= 0:
+        return ([], [], 0, False, 0.0)
+    if k == 1:
+        mean = arr.mean(axis=0)
+        # Cosine distance from each point to the mean (which is our
+        # single centroid). For L2-normalized inputs this is the
+        # standard k=1 inertia.
+        mean_norm = np.linalg.norm(mean)
+        if mean_norm > 0:
+            normed_mean = mean / mean_norm
+        else:
+            normed_mean = mean
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        safe_norms = np.where(norms > 0, norms, 1.0)
+        normed = arr / safe_norms
+        sims = np.clip(normed @ normed_mean, -1.0, 1.0)
+        dists = 1.0 - sims
+        inertia = float(np.sum(dists ** 2))
+        return ([0] * n, [list(map(float, mean))], 0, True, inertia)
+
+    # Seeded shuffled-indices init.
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(n)
+    init_idx = perm[:k]
+    centroids = arr[init_idx].copy()
+
+    # Lloyd iteration.
+    labels = np.zeros(n, dtype="int64")
+    iter_count = 0
+    converged = False
+
+    def _assign(pts: "Any", cents: "Any") -> "Any":
+        """Return an int64 label array via cosine distance argmin."""
+        # Normalize both sides for cosine. For zero-norm rows, the
+        # normalization is a no-op — they match nothing well, which is
+        # the correct behavior.
+        pn = np.linalg.norm(pts, axis=1, keepdims=True)
+        cn = np.linalg.norm(cents, axis=1, keepdims=True)
+        pts_n = pts / np.where(pn > 0, pn, 1.0)
+        cents_n = cents / np.where(cn > 0, cn, 1.0)
+        sim = np.clip(pts_n @ cents_n.T, -1.0, 1.0)
+        return np.argmin(1.0 - sim, axis=1)
+
+    for it in range(max_iter):
+        iter_count = it + 1
+        new_labels = _assign(arr, centroids)
+
+        # Recompute centroids as cluster means.
+        new_centroids = np.zeros_like(centroids)
+        for c in range(k):
+            members = arr[new_labels == c]
+            if len(members) > 0:
+                new_centroids[c] = members.mean(axis=0)
+            else:
+                # Empty-cluster repair: take the point farthest from
+                # its currently-assigned centroid and reseed this
+                # cluster there. Keeps K structurally honest.
+                pn = np.linalg.norm(arr, axis=1, keepdims=True)
+                cn = np.linalg.norm(centroids, axis=1, keepdims=True)
+                pts_n = arr / np.where(pn > 0, pn, 1.0)
+                cents_n = centroids / np.where(cn > 0, cn, 1.0)
+                sim_all = np.clip(pts_n @ cents_n.T, -1.0, 1.0)
+                dist_all = 1.0 - sim_all
+                per_point_own_dist = dist_all[
+                    np.arange(n), new_labels,
+                ]
+                worst_idx = int(np.argmax(per_point_own_dist))
+                new_centroids[c] = arr[worst_idx]
+                # Also relabel that point into this cluster.
+                new_labels[worst_idx] = c
+
+        # Convergence check — summed centroid movement.
+        movement = float(np.linalg.norm(new_centroids - centroids))
+        centroids = new_centroids
+        labels = new_labels
+        if movement <= tol:
+            converged = True
+            break
+
+    # Final inertia = Σ cos_dist² from each point to its assigned centroid.
+    pn = np.linalg.norm(arr, axis=1, keepdims=True)
+    cn = np.linalg.norm(centroids, axis=1, keepdims=True)
+    pts_n = arr / np.where(pn > 0, pn, 1.0)
+    cents_n = centroids / np.where(cn > 0, cn, 1.0)
+    sim = np.clip(pts_n @ cents_n.T, -1.0, 1.0)
+    dist = 1.0 - sim
+    per_point = dist[np.arange(n), labels]
+    inertia = float(np.sum(per_point ** 2))
+
+    return (
+        [int(x) for x in labels],
+        [list(map(float, c)) for c in centroids],
+        iter_count,
+        converged,
+        inertia,
+    )
+
+
+def _silhouette_cosine(
+    vectors: Sequence[Sequence[float]],
+    labels: Sequence[int],
+) -> float:
+    """Mean silhouette score in cosine-distance space. Range [-1, 1].
+
+    silhouette = mean over i of (b_i - a_i) / max(a_i, b_i) where
+      a_i = mean cosine dist from i to other points in its cluster
+      b_i = min over other clusters c' of
+            (mean cosine dist from i to all points in c')
+
+    For a single-cluster labeling or an empty/degenerate input, returns
+    0.0 — undefined silhouettes are treated as neutral, not negative.
+    This lets ``_auto_k`` use K=1's 0.0 silhouette as a tie-break floor
+    that any K≥2 must beat.
+    """
+    import numpy as np
+    arr = np.asarray(vectors, dtype="float64")
+    lbl = np.asarray(labels, dtype="int64")
+    n = arr.shape[0]
+    if n == 0:
+        return 0.0
+    unique_labels = sorted(set(int(l) for l in lbl))
+    if len(unique_labels) < 2:
+        return 0.0  # undefined
+
+    dist = _cosine_distance_matrix(arr)
+
+    scores = np.zeros(n, dtype="float64")
+    for i in range(n):
+        own = int(lbl[i])
+        own_mask = (lbl == own)
+        own_mask[i] = False  # exclude self
+        if not np.any(own_mask):
+            # Singleton cluster — silhouette defined as 0.
+            scores[i] = 0.0
+            continue
+        a_i = float(np.mean(dist[i, own_mask]))
+        b_i = float("inf")
+        for other in unique_labels:
+            if other == own:
+                continue
+            other_mask = (lbl == other)
+            if not np.any(other_mask):
+                continue
+            mean_other = float(np.mean(dist[i, other_mask]))
+            if mean_other < b_i:
+                b_i = mean_other
+        if b_i == float("inf"):
+            scores[i] = 0.0
+            continue
+        denom = max(a_i, b_i)
+        if denom <= 0:
+            scores[i] = 0.0
+        else:
+            scores[i] = (b_i - a_i) / denom
+
+    return float(np.mean(scores))
+
+
+@dataclass(frozen=True)
+class _AutoKResult:
+    """Return shape for :func:`_auto_k_kmeans`."""
+    k: int
+    labels: Tuple[int, ...]
+    centroids: Tuple[Tuple[float, ...], ...]
+    silhouette: float
+    inertia: float
+    converged: bool
+    iter_count: int
+    # K → silhouette map for diagnostic logging (full sweep).
+    silhouette_by_k: Tuple[Tuple[int, float], ...]
+
+
+def _auto_k_kmeans(
+    vectors: Sequence[Sequence[float]],
+    *,
+    k_min: int,
+    k_max: int,
+    seed: int,
+    max_iter: int,
+    tol: float,
+) -> Optional[_AutoKResult]:
+    """Sweep K ∈ [k_min, k_max ∩ N], pick max-silhouette K. None on empty.
+
+    K=1 always gets silhouette 0.0 (sentinel — undefined). Any K≥2
+    whose silhouette ≤ 0 loses to K=1 — the data is coherent enough
+    to not benefit from splitting. This is the "graceful degradation
+    to v0.1" path.
+
+    Tie-breaking: higher silhouette wins; ties go to smaller K (Occam).
+
+    Returns ``None`` when ``vectors`` is empty or NumPy import fails.
+    """
+    try:
+        import numpy as np  # noqa: F401 — presence check only
+    except Exception:
+        logger.debug(
+            "[SemanticIndex] numpy unavailable — cluster auto-K skipped",
+        )
+        return None
+    n = len(vectors)
+    if n == 0:
+        return None
+    effective_max = min(k_max, n)
+    effective_min = max(1, min(k_min, effective_max))
+
+    best: Optional[_AutoKResult] = None
+    silhouette_by_k: List[Tuple[int, float]] = []
+
+    for k in range(effective_min, effective_max + 1):
+        labels, centroids, iter_count, converged, inertia = _kmeans_numpy(
+            vectors, k, seed=seed, max_iter=max_iter, tol=tol,
+        )
+        if not labels:
+            continue
+        sil = _silhouette_cosine(vectors, labels) if k > 1 else 0.0
+        silhouette_by_k.append((k, sil))
+        candidate = _AutoKResult(
+            k=k,
+            labels=tuple(labels),
+            centroids=tuple(tuple(c) for c in centroids),
+            silhouette=sil,
+            inertia=inertia,
+            converged=converged,
+            iter_count=iter_count,
+            silhouette_by_k=tuple(silhouette_by_k),
+        )
+        if best is None:
+            best = candidate
+            continue
+        # Higher silhouette wins; ties go to smaller K.
+        if sil > best.silhouette + 1e-12:
+            best = candidate
+        elif abs(sil - best.silhouette) <= 1e-12 and k < best.k:
+            best = candidate
+
+    if best is None:
+        return None
+    # Re-materialize with the full silhouette_by_k so even the winning
+    # K's result carries the complete sweep log for observability.
+    return _AutoKResult(
+        k=best.k,
+        labels=best.labels,
+        centroids=best.centroids,
+        silhouette=best.silhouette,
+        inertia=best.inertia,
+        converged=best.converged,
+        iter_count=best.iter_count,
+        silhouette_by_k=tuple(silhouette_by_k),
+    )
+
+
+def _centroid_hash8(centroid: Sequence[float]) -> str:
+    """Deterministic 8-char hash of a centroid vector's first 16 dims."""
+    if not centroid:
+        return ""
+    src = ",".join(f"{x:.6f}" for x in list(centroid)[:16])
+    return hashlib.sha256(src.encode("utf-8")).hexdigest()[:8]
+
+
+def _classify_cluster_kind(
+    source_counts: Dict[str, int],
+    *,
+    dominance_threshold: float,
+) -> str:
+    """Map a source-composition histogram to a cluster-kind label.
+
+    Special rule: git_commit and goal are both treated as ``"goal"``
+    sources — they're the "forward momentum" corpus. A cluster with
+    ≥threshold of its items from (git_commit ∪ goal) is a goal cluster
+    even if neither source alone crosses threshold.
+    """
+    total = sum(source_counts.values())
+    if total <= 0:
+        return CLUSTER_KIND_MIXED
+    thr = dominance_threshold
+    # Goal cluster: git_commit + goal combined ≥ threshold.
+    goalish = (
+        source_counts.get(SOURCE_GIT_COMMIT, 0)
+        + source_counts.get(SOURCE_GOAL, 0)
+    )
+    if goalish / total >= thr:
+        return CLUSTER_KIND_GOAL
+    # Otherwise look for any single-source dominance.
+    for src in (SOURCE_CONVERSATION, SOURCE_POSTMORTEM):
+        if source_counts.get(src, 0) / total >= thr:
+            if src == SOURCE_CONVERSATION:
+                return CLUSTER_KIND_CONVERSATION
+            if src == SOURCE_POSTMORTEM:
+                return CLUSTER_KIND_POSTMORTEM
+    return CLUSTER_KIND_MIXED
+
+
+# ---------------------------------------------------------------------------
 # Corpus assembler (deterministic, zero model inference)
 # ---------------------------------------------------------------------------
 
@@ -477,6 +1002,13 @@ class SemanticIndex:
         self._centroid_vectors_subset: List[List[float]] = []  # matches centroid-members
         self._centroid: List[float] = []
         self._built_at: float = 0.0
+        # Slice 3a — cluster state. Empty under cluster_mode=centroid.
+        self._clusters: List[ClusterInfo] = []
+        self._cluster_labels: List[int] = []  # one label per centroid_members entry
+        self._prev_cluster_hashes: frozenset = frozenset()  # for churn detection
+        # Rolling window of cluster-kinds for observed scoring signals
+        # (failure-gravity tripwire). Resets on each rebuild.
+        self._failure_gravity_window: List[str] = []
 
     # ------------------------------------------------------------------
     # Build
@@ -550,6 +1082,38 @@ class SemanticIndex:
             for it in items:
                 by_source[it.source] = by_source.get(it.source, 0) + 1
 
+            # -----------------------------------------------------------
+            # Slice 3a — cluster computation (shadow under kmeans mode).
+            # -----------------------------------------------------------
+            cluster_mode = _cluster_mode()
+            new_clusters: List[ClusterInfo] = []
+            new_cluster_labels: List[int] = []
+            kmeans_silhouette = 0.0
+            kmeans_inertia = 0.0
+            kmeans_converged = False
+            kmeans_iter_count = 0
+            cluster_churn = 0
+            if cluster_mode == "kmeans" and len(centroid_vectors) >= 1:
+                new_clusters, new_cluster_labels = (
+                    self._compute_clusters_for_build(
+                        centroid_members, centroid_vectors,
+                    )
+                )
+                if new_clusters:
+                    # Populate the rich telemetry fields from the result.
+                    # silhouette / inertia / converged / iter come from the
+                    # _AutoKResult; we cache them via method output.
+                    telemetry = self._last_cluster_telemetry
+                    kmeans_silhouette = telemetry.get("silhouette", 0.0)
+                    kmeans_inertia = telemetry.get("inertia", 0.0)
+                    kmeans_converged = bool(telemetry.get("converged", False))
+                    kmeans_iter_count = int(telemetry.get("iter_count", 0))
+                    # Cluster-churn: count of new cluster hashes not in the
+                    # previous build's set.
+                    new_hashes = frozenset(c.centroid_hash8 for c in new_clusters)
+                    prev_hashes = self._prev_cluster_hashes
+                    cluster_churn = len(new_hashes - prev_hashes)
+
             with self._lock:
                 self._corpus = items
                 self._vectors = vectors
@@ -557,20 +1121,60 @@ class SemanticIndex:
                 self._centroid_vectors_subset = centroid_vectors
                 self._centroid = centroid
                 self._built_at = now
+                self._clusters = new_clusters
+                self._cluster_labels = new_cluster_labels
+                # Reset failure-gravity window on each rebuild — stale
+                # alignments from a prior clustering shape don't carry
+                # over into the new one.
+                self._failure_gravity_window = []
+                if new_clusters:
+                    self._prev_cluster_hashes = frozenset(
+                        c.centroid_hash8 for c in new_clusters
+                    )
+                # Stats update.
                 self._stats.built_at = now
                 self._stats.corpus_n = len(items)
                 self._stats.build_ms = (time.monotonic() - t0) * 1000.0
                 self._stats.centroid_hash8 = hash8
                 self._stats.refreshes += 1
                 self._stats.by_source = by_source
+                self._stats.cluster_mode = cluster_mode
+                self._stats.cluster_count = len(new_clusters)
+                self._stats.clusters = [
+                    self._cluster_info_to_summary_dict(c)
+                    for c in new_clusters
+                ]
+                self._stats.cluster_churn = cluster_churn
+                self._stats.kmeans_silhouette = kmeans_silhouette
+                self._stats.kmeans_inertia = kmeans_inertia
+                self._stats.kmeans_converged = kmeans_converged
+                self._stats.kmeans_iter_count = kmeans_iter_count
+                self._stats.failure_gravity_window_rate = 0.0
 
             logger.info(
                 "[SemanticIndex] built_at=%.0f corpus_n=%d embedder=%s "
-                "centroid_hash8=%s halflife_days=%.1f build_ms=%.0f",
+                "centroid_hash8=%s halflife_days=%.1f build_ms=%.0f "
+                "cluster_mode=%s cluster_count=%d",
                 now, len(items),
                 f"fastembed-{self._embedder.model_name.split('/')[-1]}",
                 hash8, _halflife_days(), self._stats.build_ms,
+                cluster_mode, len(new_clusters),
             )
+            if new_clusters:
+                logger.info(
+                    "[SemanticIndex] kmeans k=%d silhouette=%.4f "
+                    "inertia=%.4f converged=%s iter=%d churn=%d",
+                    len(new_clusters),
+                    kmeans_silhouette, kmeans_inertia,
+                    kmeans_converged, kmeans_iter_count, cluster_churn,
+                )
+                for c in new_clusters:
+                    logger.info(
+                        "[SemanticIndex] cluster id=%d size=%d kind=%s "
+                        "hash8=%s nearest_src=%s nearest=%.80s",
+                        c.cluster_id, c.size, c.kind, c.centroid_hash8,
+                        c.nearest_item_source, c.nearest_item_text,
+                    )
 
             if _cache_enabled():
                 self._persist_cache_safe()
@@ -578,6 +1182,181 @@ class SemanticIndex:
         except Exception:
             logger.debug("[SemanticIndex] build failed", exc_info=True)
             return False
+
+    # ------------------------------------------------------------------
+    # Slice 3a — cluster build helpers
+    # ------------------------------------------------------------------
+
+    # Scratch dict populated by :meth:`_compute_clusters_for_build` so the
+    # build() caller can pull kmeans metrics without threading them
+    # through multiple return values. Overwritten on each build.
+    _last_cluster_telemetry: Dict[str, Any] = {}
+
+    def _compute_clusters_for_build(
+        self,
+        centroid_members: List[CorpusItem],
+        centroid_vectors: List[List[float]],
+    ) -> Tuple[List[ClusterInfo], List[int]]:
+        """Run auto-K k-means + build ClusterInfo records.
+
+        Returns ``(clusters, per_member_labels)``. ``per_member_labels``
+        is a length-N list of int cluster IDs parallel to
+        ``centroid_members`` — used by downstream scoring paths.
+
+        Never raises — any failure returns ``([], [])`` so build()
+        continues with centroid-only behavior. Populates
+        ``self._last_cluster_telemetry`` with kmeans-run metrics.
+        """
+        self._last_cluster_telemetry = {}
+        if not centroid_vectors:
+            return ([], [])
+        try:
+            result = _auto_k_kmeans(
+                centroid_vectors,
+                k_min=_cluster_k_min(),
+                k_max=_cluster_k_max(),
+                seed=_cluster_kmeans_seed(),
+                max_iter=_cluster_kmeans_max_iter(),
+                tol=_cluster_kmeans_tol(),
+            )
+        except Exception:
+            logger.debug(
+                "[SemanticIndex] cluster computation raised", exc_info=True,
+            )
+            return ([], [])
+        if result is None:
+            return ([], [])
+
+        self._last_cluster_telemetry = {
+            "silhouette": result.silhouette,
+            "inertia": result.inertia,
+            "converged": result.converged,
+            "iter_count": result.iter_count,
+            "silhouette_by_k": list(result.silhouette_by_k),
+        }
+
+        # Build per-cluster composition + nearest-item + kind.
+        dominance = _cluster_postmortem_dominance()
+        clusters: List[ClusterInfo] = []
+        labels = list(result.labels)
+        for cid in range(result.k):
+            members_mask = [i for i, l in enumerate(labels) if l == cid]
+            if not members_mask:
+                continue
+            centroid = result.centroids[cid]
+            # Source composition.
+            comp: Dict[str, int] = {}
+            for idx in members_mask:
+                src = centroid_members[idx].source
+                comp[src] = comp.get(src, 0) + 1
+            kind = _classify_cluster_kind(
+                comp, dominance_threshold=dominance,
+            )
+            # Nearest member to the cluster centroid (cosine).
+            best_idx = members_mask[0]
+            best_sim = -2.0
+            for idx in members_mask:
+                sim = _cosine(centroid_vectors[idx], centroid)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_idx = idx
+            nearest = centroid_members[best_idx]
+            clusters.append(ClusterInfo(
+                cluster_id=cid,
+                size=len(members_mask),
+                kind=kind,
+                centroid=tuple(centroid),
+                centroid_hash8=_centroid_hash8(centroid),
+                nearest_item_text=nearest.text,
+                nearest_item_source=nearest.source,
+                source_composition=tuple(sorted(comp.items())),
+            ))
+        return (clusters, labels)
+
+    @staticmethod
+    def _cluster_info_to_summary_dict(c: ClusterInfo) -> Dict[str, Any]:
+        """Compact, serializable per-cluster summary for IndexStats.
+
+        Never carries raw centroid vectors — the full vector lives on
+        the ClusterInfo itself for in-process cosine math, but stats
+        snapshots are used for logging / ops surfaces and MUST stay
+        content-light per the §8 observability invariant.
+        """
+        return {
+            "cluster_id": c.cluster_id,
+            "size": c.size,
+            "kind": c.kind,
+            "centroid_hash8": c.centroid_hash8,
+            "nearest_item_source": c.nearest_item_source,
+            "source_composition": list(c.source_composition),
+        }
+
+    def _observe_cluster_alignment(
+        self, vec: Optional[Sequence[float]],
+    ) -> Optional[Tuple[int, str, float]]:
+        """Shadow-observe which cluster ``vec`` aligns to.
+
+        Returns ``(cluster_id, cluster_kind, cosine)`` or ``None`` when
+        clustering is disabled or empty. Never changes ``score()``'s
+        return value — Slice 3a is shadow-mode only. Updates the
+        alignment histogram and the failure-gravity window; may emit
+        a WARN when the window trips the threshold.
+        """
+        if not vec:
+            return None
+        with self._lock:
+            clusters = list(self._clusters)
+        if not clusters:
+            return None
+
+        # Find the best-cluster match (max cosine).
+        best = clusters[0]
+        best_sim = _cosine(vec, best.centroid)
+        for c in clusters[1:]:
+            s = _cosine(vec, c.centroid)
+            if s > best_sim:
+                best = c
+                best_sim = s
+
+        with self._lock:
+            # Alignment histogram (cumulative).
+            hist = self._stats.alignment_histogram_by_kind
+            hist[best.kind] = hist.get(best.kind, 0) + 1
+            # Failure-gravity rolling window.
+            window_size = _cluster_failure_gravity_window()
+            self._failure_gravity_window.append(best.kind)
+            if len(self._failure_gravity_window) > window_size:
+                # Drop oldest.
+                self._failure_gravity_window = (
+                    self._failure_gravity_window[-window_size:]
+                )
+            # Compute postmortem-rate only once the window is full —
+            # half-full windows produce unstable rates that would
+            # false-alarm on normal postmortem traffic early in a session.
+            pm_rate = 0.0
+            window_full = len(self._failure_gravity_window) >= window_size
+            if window_full:
+                pm_count = sum(
+                    1 for k in self._failure_gravity_window
+                    if k == CLUSTER_KIND_POSTMORTEM
+                )
+                pm_rate = pm_count / float(window_size)
+                self._stats.failure_gravity_window_rate = pm_rate
+                threshold = _cluster_failure_gravity_threshold()
+                if pm_rate >= threshold:
+                    self._stats.failure_gravity_alerts += 1
+                    logger.warning(
+                        "[SemanticIndex] failure_gravity_detected "
+                        "rate=%.3f threshold=%.3f window=%d "
+                        "postmortem_cluster_count=%d (shadow observation — "
+                        "no policy effect in Slice 3a; Slice 3b introduces "
+                        "postmortem-cluster zero-boost)",
+                        pm_rate, threshold, window_size, pm_count,
+                    )
+            else:
+                self._stats.failure_gravity_window_rate = pm_rate
+
+        return (best.cluster_id, best.kind, best_sim)
 
     def _persist_cache_safe(self) -> None:
         """Best-effort cache to .jarvis/semantic_index.npz."""
@@ -616,6 +1395,13 @@ class SemanticIndex:
         Range is [-1, 1] but for intake callers we clamp to [0, 1] at
         :meth:`boost_for` — negative values mean "orthogonal to active
         theme" and shouldn't produce negative priority boost.
+
+        Slice 3a invariant: ``score()`` still returns the v0.1
+        centroid cosine regardless of ``cluster_mode``. Cluster
+        alignment is SHADOW-OBSERVED here (histogram + failure-gravity
+        window are updated) but NOT used in the return value. Slice 3b
+        introduces ``CLUSTER_SCORING_POLICY=max_cluster`` to flip the
+        return source.
         """
         if not _is_enabled():
             return 0.0
@@ -630,9 +1416,76 @@ class SemanticIndex:
         if not vec:
             return 0.0
         sim = _cosine(vec[0], centroid)
+        # Slice 3a shadow observation — never changes ``sim``.
+        self._observe_cluster_alignment(vec[0])
         with self._lock:
             self._stats.signals_scored += 1
         return sim
+
+    def score_with_cluster(self, text: str) -> Optional[Dict[str, Any]]:
+        """Debug / evidence-stash API — returns scoring detail.
+
+        Returns a dict with:
+          * ``score``: v0.1 centroid cosine (same as :meth:`score`)
+          * ``cluster_id``: int or None
+          * ``cluster_kind``: str or None
+          * ``cluster_cosine``: cosine to the winning cluster centroid
+          * ``cluster_size``: size of the winning cluster
+
+        Returns ``None`` when disabled / empty / embed fails. Intended
+        for the intake router to stash in ``envelope.evidence`` so
+        operators can audit which cluster the signal aligned to without
+        the stats having to expose per-signal detail.
+
+        Slice 3a parity: calling this updates the same shadow-observer
+        state as :meth:`score`, and the ``score`` field is authoritative
+        for intake priority. The cluster fields are informational.
+        """
+        if not _is_enabled():
+            return None
+        with self._lock:
+            centroid = list(self._centroid)
+        if not centroid:
+            return None
+        cleaned = _sanitize_corpus_text(text)
+        if not cleaned:
+            return None
+        vec = self._embedder.embed([cleaned])
+        if not vec:
+            return None
+        sim = _cosine(vec[0], centroid)
+        # Observation also populates histogram / failure-gravity window.
+        alignment = self._observe_cluster_alignment(vec[0])
+        with self._lock:
+            self._stats.signals_scored += 1
+            clusters = list(self._clusters)
+        payload: Dict[str, Any] = {
+            "score": sim,
+            "cluster_id": None,
+            "cluster_kind": None,
+            "cluster_cosine": 0.0,
+            "cluster_size": 0,
+        }
+        if alignment is not None:
+            cid, kind, cos = alignment
+            # Find size from the immutable snapshot taken above.
+            size = next(
+                (c.size for c in clusters if c.cluster_id == cid), 0,
+            )
+            payload.update({
+                "cluster_id": cid,
+                "cluster_kind": kind,
+                "cluster_cosine": cos,
+                "cluster_size": size,
+            })
+        return payload
+
+    @property
+    def clusters(self) -> Tuple[ClusterInfo, ...]:
+        """Immutable snapshot of the current cluster set. Empty under
+        centroid mode or when clustering hasn't been built."""
+        with self._lock:
+            return tuple(self._clusters)
 
     def boost_for(self, text: str) -> int:
         """Clamp the cosine score to a non-negative integer priority boost.
@@ -738,6 +1591,22 @@ class SemanticIndex:
                 signals_scored=self._stats.signals_scored,
                 embed_failures=self._stats.embed_failures,
                 by_source=dict(self._stats.by_source),
+                # Slice 3a extensions.
+                cluster_mode=self._stats.cluster_mode,
+                cluster_count=self._stats.cluster_count,
+                clusters=[dict(c) for c in self._stats.clusters],
+                cluster_churn=self._stats.cluster_churn,
+                kmeans_silhouette=self._stats.kmeans_silhouette,
+                kmeans_inertia=self._stats.kmeans_inertia,
+                kmeans_converged=self._stats.kmeans_converged,
+                kmeans_iter_count=self._stats.kmeans_iter_count,
+                alignment_histogram_by_kind=dict(
+                    self._stats.alignment_histogram_by_kind,
+                ),
+                failure_gravity_alerts=self._stats.failure_gravity_alerts,
+                failure_gravity_window_rate=(
+                    self._stats.failure_gravity_window_rate
+                ),
             )
 
     def reset(self) -> None:
@@ -749,6 +1618,10 @@ class SemanticIndex:
             self._centroid_vectors_subset = []
             self._centroid = []
             self._built_at = 0.0
+            self._clusters = []
+            self._cluster_labels = []
+            self._prev_cluster_hashes = frozenset()
+            self._failure_gravity_window = []
             self._stats = IndexStats()
 
 
