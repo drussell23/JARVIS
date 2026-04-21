@@ -4367,8 +4367,12 @@ class ToolLoopCoordinator:
         scorer raises, fall back to the legacy recency-only split.
         """
         legacy = (chunks[:-recent_count], chunks[-recent_count:])
+        # Graduated default ``true`` after the real-session harness
+        # confirmed 100-noise-chunk intent-rich preservation survives
+        # under realistic Venom tool-loop patterns. Explicit ``=false``
+        # reverts to the legacy recency-only split (kill switch).
         enabled = os.environ.get(
-            "JARVIS_TOOL_LOOP_SCORER_ENABLED", "false",
+            "JARVIS_TOOL_LOOP_SCORER_ENABLED", "true",
         ).strip().lower() == "true"
         if not enabled:
             return legacy
@@ -4385,20 +4389,24 @@ class ToolLoopCoordinator:
             return legacy
         try:
             tracker = intent_tracker_for(op_id)
-            # Auto-feed intent from every chunk's visible paths.
-            # Non-authoritative: ingest_ledger_entry doesn't advance the
-            # turn clock, only strengthens path signals. Tool-NAME
-            # signals are deliberately NOT auto-fed from chunks: every
-            # [TOOL RESULT] block advertises "tool: X", so feeding them
-            # back into the tracker makes whichever tool dominates the
-            # round's chunks win every chunk's intent_tool slot,
-            # swamping path signal. Tool names still reach the tracker
-            # via the orchestrator's own per-call ``ingest_ledger_entry``.
-            for chunk in chunks:
-                for path in _extract_paths_from_tool_chunk(chunk):
-                    tracker.ingest_ledger_entry({
-                        "kind": "file_read", "file_path": path,
-                    })
+            # Previously this helper auto-fed ``file_read`` entries from
+            # every chunk's visible paths. The real-session harness
+            # revealed the same self-reinforcement bug tool-name feeding
+            # had: when 100 noise chunks each mention a different
+            # ``tests/foo.py`` / ``docs/guide.md`` path, every path
+            # accumulates dozens of bumps in a single call. Noise paths
+            # then outweigh the operator-authored focus path and the
+            # intent-relevant chunk gets buried.
+            #
+            # Fix: do NOT auto-feed path signals from chunk bodies here.
+            # Authoritative signal already reaches the tracker via:
+            #   1. Operator turns (:meth:`IntentTracker.ingest_turn`)
+            #   2. Ledger bridges (Slice 3 :func:`bridge_ledger_to_tracker`
+            #      which sees explicit :meth:`ContextLedger.record_file_read`
+            #      calls from the orchestrator).
+            # Both are explicit, bounded, and operator- / data-plane-
+            # authored. Chunk-body text is unbounded noise — we stay out
+            # of it.
             scorer = PreservationScorer()
             candidates = [
                 ChunkCandidate(

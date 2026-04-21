@@ -12,26 +12,36 @@ import pytest
 # ===========================================================================
 
 
-def test_compactor_scorer_default_off_by_design(monkeypatch):
-    """Flipping this default would silently change compaction behavior in
-    every op. Slice 5 ships the mechanism but keeps operator opt-in."""
+def test_compactor_scorer_default_on_post_real_session(monkeypatch):
+    """Graduated via scripts/real_session_graduation.py (37/37 checks
+    across 9 scenarios). Explicit =false still reverts to legacy."""
     monkeypatch.delenv(
         "JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", raising=False,
     )
     from backend.core.ouroboros.governance.context_compaction import (
         context_compactor_scorer_enabled,
     )
+    assert context_compactor_scorer_enabled() is True
+
+
+def test_compactor_scorer_kill_switch(monkeypatch):
+    from backend.core.ouroboros.governance.context_compaction import (
+        context_compactor_scorer_enabled,
+    )
+    monkeypatch.setenv("JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", "false")
     assert context_compactor_scorer_enabled() is False
 
 
-def test_tool_loop_scorer_default_off_by_design(monkeypatch):
-    """Same rationale as compactor scorer — hot-path code stays under
-    explicit opt-in."""
+def test_tool_loop_scorer_default_on_post_real_session(monkeypatch):
+    """Graduated alongside the compactor flag after the same
+    real-session harness. Explicit =false reverts to legacy split."""
     import os
     monkeypatch.delenv("JARVIS_TOOL_LOOP_SCORER_ENABLED", raising=False)
+    # The tool-loop predicate is inline in tool_executor; we read the
+    # env exactly the same way to pin the graduated default.
     assert os.environ.get(
-        "JARVIS_TOOL_LOOP_SCORER_ENABLED", "false",
-    ).strip().lower() == "false"
+        "JARVIS_TOOL_LOOP_SCORER_ENABLED", "true",
+    ).strip().lower() == "true"
 
 
 # ===========================================================================

@@ -47,17 +47,27 @@ logger = logging.getLogger("Ouroboros.ContextCompaction")
 def context_compactor_scorer_enabled() -> bool:
     """Master switch for intent-aware compaction path.
 
-    Default **``false``** deliberately during the rollout — flipping the
-    default would silently change compaction behavior in every op. The
-    operator opts in by setting ``=true``; Slice 5 of this arc
-    re-evaluates the default after a live-fire proof.
+    Default: **``true``** (graduated via the Context Preservation real-
+    session harness at ``scripts/real_session_graduation.py``). The
+    harness drives a 50+ turn simulation with multi-file intent drift,
+    100+ tool chunks, concurrent cross-op pressure, auto-pin churn,
+    and mid-session kill-switch verification. 37/37 checks pass across
+    9 scenarios plus the full 607-test governance suite stays green
+    with this flag on. Graduation flips opt-in friction, NOT
+    preservation-layer authority — the scorer has always been
+    additive.
 
-    Explicit ``=false`` always falls back to the legacy regex +
-    last-N partition regardless of whether a scorer is attached. This
-    is the runtime kill switch.
+    Explicit ``=false`` reverts to the legacy regex + last-N partition
+    regardless of whether a scorer is attached. This is the runtime
+    kill switch.
+
+    During the scorer path, if any prerequisite is missing (no
+    ``op_id`` passed to :meth:`ContextCompactor.compact`, no scorer
+    attached, or the scorer raises) the compactor silently falls back
+    to the legacy partition — never loses data.
     """
     return os.environ.get(
-        "JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", "false",
+        "JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", "true",
     ).strip().lower() == "true"
 
 # ---------------------------------------------------------------------------

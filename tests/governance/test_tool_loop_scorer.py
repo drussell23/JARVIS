@@ -186,14 +186,15 @@ async def test_flag_on_with_no_intent_keeps_recent_ish(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_flag_on_auto_feeds_path_signals(monkeypatch):
-    """Every chunk's visible PATHS feed the intent tracker.
+async def test_flag_on_does_not_auto_feed_chunk_text(monkeypatch):
+    """Chunk body paths AND tool names are NOT auto-fed.
 
-    Tool names are deliberately NOT auto-fed: every [TOOL RESULT]
-    chunk advertises 'tool: X', so auto-feeding them makes whichever
-    tool dominates the round swamp every chunk's intent_tool slot.
-    Path signal is genuinely selective (only some chunks mention
-    specific paths) so auto-feeding paths is safe.
+    Real-session testing surfaced a self-reinforcement bug: 100 noise
+    chunks each mentioning a different path would collectively swamp
+    the operator-authored focus path, burying genuinely-intent-rich
+    content. Fix: don't feed from chunk bodies. Authoritative signal
+    arrives via operator turns + Slice-3 ledger bridges (which see
+    explicit record_file_read calls from the orchestrator).
     """
     monkeypatch.setenv("JARVIS_TOOL_LOOP_SCORER_ENABLED", "true")
     coord = _build_coord()
@@ -207,9 +208,8 @@ async def test_flag_on_auto_feeds_path_signals(monkeypatch):
     )
     tracker = intent_tracker_for("op-feed")
     intent = tracker.current_intent()
-    assert "backend/auth.py" in intent.recent_paths
-    assert "tests/test_x.py" in intent.recent_paths
-    # Tool names deliberately NOT captured from chunks (see docstring)
+    # Neither paths nor tools are auto-captured from chunk bodies
+    assert intent.recent_paths == ()
     assert intent.recent_tools == ()
 
 

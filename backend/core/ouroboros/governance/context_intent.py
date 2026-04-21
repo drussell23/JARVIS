@@ -345,8 +345,16 @@ class IntentTracker:
                 if t:
                     self._bump(self._tools, t, now_turn)
             elif kind == "error":
+                # Scan message AND error_class — error_class is often the
+                # strongest signal ("ImportError", "TimeoutError") so
+                # ignoring it was a missed signal. Both paths feed the
+                # same ``recent_error_terms`` bucket; same-term bumps
+                # compose normally via the shared decay curve.
                 msg = projection.get("message", "") or ""
+                error_class = projection.get("error_class", "") or ""
                 for term in extract_error_terms(msg):
+                    self._bump(self._errors, term, now_turn)
+                for term in extract_error_terms(error_class):
                     self._bump(self._errors, term, now_turn)
                 where = projection.get("where", "") or ""
                 for path in extract_paths(where):
