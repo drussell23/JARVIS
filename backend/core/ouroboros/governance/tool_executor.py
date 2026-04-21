@@ -576,6 +576,47 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"write"}),
     ),
+    # ---- Observability tools (Ticket #4: CC-parity stdout streaming) ----
+    "monitor": ToolManifest(
+        name="monitor", version="1.0",
+        description=(
+            "Stream stdout/stderr from an argv-spawned subprocess "
+            "(NO SHELL). Deny-by-default — gated by "
+            "JARVIS_TOOL_MONITOR_ENABLED + a binary allowlist. "
+            "Read-only observability: does NOT grant the model a "
+            "generic 'run anything' escape hatch. Supports optional "
+            "early-exit on a regex pattern match against output lines. "
+            "Returns structured JSON: {exit_code, duration_s, events[], "
+            "early_exit, timed_out, truncated}."
+        ),
+        arg_schema={
+            "cmd": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Argv vector. cmd[0]'s basename must be in the "
+                    "binary allowlist (JARVIS_TOOL_MONITOR_ALLOWED_BINARIES)."
+                ),
+            },
+            "pattern": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "Optional regex; when a stdout/stderr line matches, "
+                    "the tool stops reading + terminates the subprocess."
+                ),
+            },
+            "timeout_s": {
+                "type": "number",
+                "default": 60.0,
+                "description": (
+                    "Per-invocation timeout. Capped by "
+                    "JARVIS_TOOL_MONITOR_TIMEOUT_S."
+                ),
+            },
+        },
+        capabilities=frozenset({"subprocess"}),  # read-only; no "write"
+    ),
     "ask_human": ToolManifest(
         name="ask_human", version="1.0",
         description=(
@@ -2167,6 +2208,49 @@ class GoverningToolPolicy:
                     ),
                 )
 
+        # Rule 16: monitor — Ticket #4 Slice 2 CC-parity stdout streaming.
+        # **Deny-by-default** (env flag defaults false, NOT true).
+        # Additional binary-allowlist gate: even when the master switch
+        # is on, cmd[0]'s basename must be in
+        # JARVIS_TOOL_MONITOR_ALLOWED_BINARIES. This keeps the tool an
+        # observability surface over authorized binaries, not a generic
+        # run-anything escape hatch. Manifesto §1 Boundary Principle.
+        elif name == "monitor":
+            from backend.core.ouroboros.governance.monitor_tool import (
+                classify_cmd,
+                extract_binary_basename,
+                monitor_allowed_binaries,
+                monitor_enabled,
+            )
+            if not monitor_enabled():
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.monitor_disabled",
+                    detail=(
+                        "JARVIS_TOOL_MONITOR_ENABLED must be 'true' "
+                        "(deny-by-default)"
+                    ),
+                )
+            cmd = call.arguments.get("cmd")
+            shape_err = classify_cmd(cmd)
+            if shape_err is not None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.monitor_bad_args",
+                    detail=shape_err,
+                )
+            binary = extract_binary_basename(cmd)  # type: ignore[arg-type]
+            allowed = monitor_allowed_binaries()
+            if binary not in allowed:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.monitor_binary_not_allowed",
+                    detail=(
+                        f"binary {binary!r} not in "
+                        "JARVIS_TOOL_MONITOR_ALLOWED_BINARIES"
+                    ),
+                )
+
         return PolicyResult(decision=PolicyDecision.ALLOW, reason_code="")
 
 
@@ -2352,6 +2436,7 @@ class AsyncProcessToolBackend:
                 "ask_human",
                 "delegate_to_agent",
                 "dispatch_subagent",
+                "monitor",  # Ticket #4 Slice 2 — BackgroundMonitor-backed
             ):
                 return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
             return await self._run_sync_tool_async(
@@ -2525,6 +2610,19 @@ class AsyncProcessToolBackend:
                 # Returns structured SubagentResult JSON with Iron Gate
                 # diversity enforcement and typed findings.
                 return await self._run_dispatch_subagent(
+                    call, policy_ctx, timeout, cap,
+                )
+
+            elif call.name == "monitor":
+                # Ticket #4 Slice 2 — BackgroundMonitor-backed subprocess
+                # observer. Deny-by-default + binary-allowlist policy
+                # gate already fired at GoverningToolPolicy.evaluate()
+                # before we got here; the handler re-validates args
+                # defensively + caps the effective timeout.
+                from backend.core.ouroboros.governance.monitor_tool import (
+                    run_monitor_tool,
+                )
+                return await run_monitor_tool(
                     call, policy_ctx, timeout, cap,
                 )
 
