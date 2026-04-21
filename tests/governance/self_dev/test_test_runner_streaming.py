@@ -97,11 +97,22 @@ def _reset_streaming_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_streaming_disabled_by_default(monkeypatch):
-    """Slice 3 test 1 (CRITICAL): streaming is OFF by default — no
-    ambient enablement on a fresh operator install. Operators flip
-    the env to opt in; Slice 4 flips the default later."""
+def test_streaming_default_post_graduation_is_true(monkeypatch):
+    """Slice 4 graduation pin: after the Ticket #4 graduation,
+    ``JARVIS_TEST_RUNNER_STREAMING_ENABLED`` defaults to ``"true"``.
+    Operators on a fresh install see the streaming path active.
+    Legacy ``_exec_with_timeout`` remains available via explicit
+    ``"false"`` opt-out."""
     monkeypatch.delenv("JARVIS_TEST_RUNNER_STREAMING_ENABLED", raising=False)
+    assert _streaming_enabled() is True
+
+
+def test_streaming_explicit_false_opts_out(monkeypatch):
+    """Slice 4 opt-out pin: operators can revert to the legacy
+    blocking ``proc.communicate()`` path by explicitly setting
+    ``JARVIS_TEST_RUNNER_STREAMING_ENABLED=false``. Guarantees the
+    graduation flip is reversible at the env layer."""
+    monkeypatch.setenv("JARVIS_TEST_RUNNER_STREAMING_ENABLED", "false")
     assert _streaming_enabled() is False
 
 

@@ -46,18 +46,22 @@ _TEST_DIR_NAMES: FrozenSet[str] = frozenset(
 
 
 def _streaming_enabled() -> bool:
-    """Master switch for the streaming path (default **false**).
+    """Master switch for the TestRunner streaming path.
 
-    When false, ``_run_pytest`` uses the legacy
-    ``_exec_with_timeout`` → ``proc.communicate()`` path. When true,
-    routes through ``_exec_with_streaming`` which consumes the
-    Slice 1 :class:`BackgroundMonitor` primitive for line-granular
-    live feedback. Structural ``TestResult`` fields (passed / total
-    / failed / failed_tests / flake_suspected) are identical across
-    paths by design.
+    Default: **``true``** (graduated 2026-04-20 via Ticket #4 Slice 4
+    after Slice 3's 18 tests proved structural TestResult parity on
+    representative fixtures). When false (explicit opt-out),
+    ``_run_pytest`` uses the legacy
+    ``_exec_with_timeout`` → ``proc.communicate()`` path.
+
+    Structural ``TestResult`` fields (passed / total / failed /
+    failed_tests / flake_suspected) are IDENTICAL across paths —
+    parity integration tests FAIL LOUDLY on any divergence.
+    Graduation doesn't remove that contract; it only flips which
+    path runs by default.
     """
     return os.environ.get(
-        "JARVIS_TEST_RUNNER_STREAMING_ENABLED", "false",
+        "JARVIS_TEST_RUNNER_STREAMING_ENABLED", "true",
     ).strip().lower() == "true"
 
 

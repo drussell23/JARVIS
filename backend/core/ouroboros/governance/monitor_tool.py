@@ -78,14 +78,20 @@ _DEFAULT_TERMINATE_GRACE_S = 1.0
 
 
 def monitor_enabled() -> bool:
-    """Master switch. **Default false** — tool is deny-by-default.
+    """Master switch for the Venom ``monitor`` tool.
 
-    Flip to ``"true"`` to make the policy engine start allowing
-    ``monitor`` tool calls. Even when flipped, per-call binary
-    allowlist + timeout cap still apply.
+    Default: **``true``** (graduated 2026-04-20 via Ticket #4 Slice 4
+    after Slices 1-3 shipped the primitive, the policy-gated tool,
+    and the TestRunner streaming path under opt-in flags with 21 +
+    30 + 18 tests green). Explicit ``"false"`` reverts to the Slice 2
+    deny-by-default behavior so operators retain a runtime kill
+    switch. The per-call binary allowlist + timeout cap still apply
+    regardless of this flag — graduation does NOT remove the
+    structural safeguards, only the opt-in requirement on the model's
+    access to the tool.
     """
     return os.environ.get(
-        "JARVIS_TOOL_MONITOR_ENABLED", "false",
+        "JARVIS_TOOL_MONITOR_ENABLED", "true",
     ).strip().lower() == "true"
 
 

@@ -150,13 +150,14 @@ def test_monitor_allowed_under_read_only_scope():
 # ===========================================================================
 
 
-def test_policy_denies_when_master_switch_off(monkeypatch):
-    """Slice 2 test 4 (CRITICAL): when JARVIS_TOOL_MONITOR_ENABLED is
-    not 'true', policy DENIES monitor. Proves the deny-by-default
-    posture — the model cannot get a new execution primitive without
-    operator opt-in."""
-    # Master switch absent (_reset fixture cleared it). Even a
-    # well-formed call with an allowed binary must be denied.
+def test_policy_denies_when_master_switch_explicitly_off(monkeypatch):
+    """Slice 2 test 4 (CRITICAL, post-Slice-4): when
+    JARVIS_TOOL_MONITOR_ENABLED is explicitly ``"false"`` (operator
+    opt-out after Slice 4 graduation), policy DENIES monitor. Proves
+    the opt-out path remains intact — operators retain a runtime
+    kill switch even after the graduation flip made the default
+    ``"true"``."""
+    monkeypatch.setenv("JARVIS_TOOL_MONITOR_ENABLED", "false")
     monkeypatch.setenv("JARVIS_TOOL_MONITOR_ALLOWED_BINARIES", PYTHON_BASENAME)
     policy = GoverningToolPolicy(repo_roots={"jarvis": Path("/tmp")})
     result = policy.evaluate(
@@ -468,10 +469,20 @@ def test_monitor_allowed_binaries_parses_csv(monkeypatch):
     assert "" not in allowed
 
 
-def test_monitor_enabled_default_is_false(monkeypatch):
-    """Slice 2 test pin for deny-by-default env default — the value
-    operators see on a fresh install must be False."""
+def test_monitor_enabled_default_post_graduation_is_true(monkeypatch):
+    """Slice 4 graduation pin: after the Ticket #4 graduation,
+    ``JARVIS_TOOL_MONITOR_ENABLED`` defaults to ``"true"``.
+    Operators on a fresh install see the tool enabled. Explicit
+    ``"false"`` is the runtime kill switch (pinned separately)."""
     monkeypatch.delenv("JARVIS_TOOL_MONITOR_ENABLED", raising=False)
+    assert monitor_enabled() is True
+
+
+def test_monitor_enabled_explicit_false_opts_out(monkeypatch):
+    """Slice 4 opt-out pin: explicit ``"false"`` reverts to the
+    Slice 2 deny-by-default posture. Guarantees the graduation flip
+    is reversible at the env layer."""
+    monkeypatch.setenv("JARVIS_TOOL_MONITOR_ENABLED", "false")
     assert monitor_enabled() is False
 
 
