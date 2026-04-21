@@ -108,13 +108,19 @@ def test_new_modules_have_no_authority_imports(rel_path: str):
 # ===========================================================================
 
 
-def test_compactor_scorer_switch_docstring_explains_kept_off():
+def test_compactor_scorer_switch_docstring_pins_graduation():
+    """Post-graduation the docstring must describe the graduated
+    default (``true``) and reference the real-session harness that
+    proved the flip safe."""
     from backend.core.ouroboros.governance.context_compaction import (
         context_compactor_scorer_enabled,
     )
     doc = context_compactor_scorer_enabled.__doc__ or ""
-    assert "default" in doc.lower()
-    assert "deliberate" in doc.lower()
+    assert "graduated" in doc.lower()
+    assert "``true``" in doc
+    # Reference the harness so future edits surface in review
+    assert "real_session_graduation" in doc.lower() \
+        or "real-session" in doc.lower()
 
 
 # ===========================================================================

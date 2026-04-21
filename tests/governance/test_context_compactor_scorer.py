@@ -78,11 +78,12 @@ def _dialogue_with_intent_rich_oldest() -> List[Dict[str, Any]]:
 # ===========================================================================
 
 
-def test_env_flag_default_is_false(monkeypatch):
+def test_env_flag_default_is_true_post_graduation(monkeypatch):
+    """Graduated via real-session harness. Explicit =false still reverts."""
     monkeypatch.delenv(
         "JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", raising=False,
     )
-    assert context_compactor_scorer_enabled() is False
+    assert context_compactor_scorer_enabled() is True
 
 
 def test_env_flag_explicit_true(monkeypatch):
@@ -99,28 +100,32 @@ def test_env_flag_malformed_reads_as_false(monkeypatch):
     assert context_compactor_scorer_enabled() is False
 
 
+def test_env_flag_explicit_false_kill_switch(monkeypatch):
+    monkeypatch.setenv(
+        "JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", "false",
+    )
+    assert context_compactor_scorer_enabled() is False
+
+
 # ===========================================================================
 # 2. Backward-compat defaults
 # ===========================================================================
 
 
 @pytest.mark.asyncio
-async def test_legacy_path_when_flag_off():
-    """With flag off, scorer path MUST NOT run even if scorer attached."""
+async def test_legacy_path_when_flag_off(monkeypatch):
+    """Kill switch: explicit =false forces legacy even with scorer attached."""
+    monkeypatch.setenv("JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", "false")
     entries = _dialogue_with_intent_rich_oldest()
     compactor = ContextCompactor(
         preservation_scorer=PreservationScorer(),
     )
     cfg = CompactionConfig(max_context_entries=5, preserve_count=3)
-    # intent tracker has a strong backend/hot.py signal — ignored by legacy
     intent_tracker_for("op-legacy").ingest_turn(
         "backend/hot.py", source=TurnSource.USER,
     )
     result = await compactor.compact(entries, cfg, op_id="op-legacy")
-    # Legacy produces a result (count-only verification — actual key
-    # format uses _entry_key which picks 'type=user' first, not the id)
     assert result.entries_compacted > 0
-    # Crucially: no manifest because scorer path didn't run.
     from backend.core.ouroboros.governance.context_manifest import (
         get_default_manifest_registry,
     )

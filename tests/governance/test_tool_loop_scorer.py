@@ -131,7 +131,9 @@ def _build_coord() -> ToolLoopCoordinator:
 
 
 @pytest.mark.asyncio
-async def test_default_flag_off_returns_legacy_split():
+async def test_kill_switch_returns_legacy_split(monkeypatch):
+    """Explicit =false reverts to legacy split (post-graduation kill switch)."""
+    monkeypatch.setenv("JARVIS_TOOL_LOOP_SCORER_ENABLED", "false")
     coord = _build_coord()
     chunks = [f"chunk-{i}" for i in range(10)]
     old, recent = await coord._maybe_score_tool_chunks(
