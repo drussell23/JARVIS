@@ -95,9 +95,13 @@ export interface StreamEventFrame extends Envelope {
  * Returns false for payloads we cannot safely render — consumers
  * should fall back to a conservative display.
  */
-export function isSupportedSchema(env: Envelope | null | undefined): boolean {
+export function isSupportedSchema(
+  env: { schema_version?: string } | null | undefined,
+): boolean {
   return (
-    env !== null && env !== undefined && env.schema_version === SUPPORTED_SCHEMA_VERSION
+    env !== null &&
+    env !== undefined &&
+    env.schema_version === SUPPORTED_SCHEMA_VERSION
   );
 }
 

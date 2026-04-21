@@ -9,7 +9,7 @@ import {
   escapeHtml,
   renderErrorHtml,
   renderHtml,
-} from '../src/panel/opDetailPanel';
+} from '../src/panel/renderers';
 import { TaskDetailResponse } from '../src/api/types';
 
 const sampleDetail: TaskDetailResponse = {
