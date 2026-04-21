@@ -1,0 +1,803 @@
+"""IDE observability stream — Gap #6 Slice 2.
+
+Server-Sent Events (SSE) channel exposing live agent state to
+operator-side IDE extensions. Mounts alongside the Slice 1 GET
+endpoints on :class:`EventChannelServer`; same host, same loopback
+discipline, same CORS allowlist, same deny-by-default env gate.
+
+## Why SSE (not WebSocket)
+
+- **Unidirectional.** Server → client only. No bidirectional channel
+  = no covert command surface. Authority invariant (Manifesto §1) is
+  enforced by the transport, not by discipline alone.
+- **Standard HTTP GET.** No protocol upgrade; works through proxies,
+  flows through the same aiohttp app, plays nicely with
+  ``Last-Event-ID`` reconnection semantics that browsers / VS Code
+  ``EventSource`` already implement.
+- **Text frames with explicit ``event:`` / ``id:`` / ``data:``
+  headers** — natural fit for structured JSON payloads.
+
+## Authority posture (locked by authorization)
+
+- **Read-only.** The stream transport is unidirectional — clients
+  cannot push anything back through it. Observability answers *"what
+  is the loop doing"*, never *"what should the loop do"*.
+- **Deny-by-default.** ``JARVIS_IDE_STREAM_ENABLED`` defaults
+  ``false``; disabled returns 403 (port scanners see no signal).
+- **Loopback-only.** Same :func:`assert_loopback_only` gate from
+  Slice 1 — the stream route can only mount when the server binds a
+  loopback host.
+- **No imports from gate modules.** The same grep-pin as Slice 1:
+  this module never imports orchestrator / policy / iron_gate /
+  risk_tier / gate modules. A test enforces the invariant.
+- **Bounded everything.** Subscriber cap, per-subscriber queue cap,
+  history ring-buffer cap, heartbeat cadence — all env-tunable, all
+  defaulted to sane values that cannot DoS the agent.
+- **Drop-oldest on back-pressure.** A slow IDE client cannot slow
+  down event production. Its queue silently discards old events and
+  emits a ``stream_lag`` control frame so the client knows to reset
+  its view (via the Slice 1 GET endpoints).
+
+## Integration surface
+
+Task-tool handlers (Gap #5 Slice 2) publish transitions via
+:func:`publish_task_event`; :func:`close_task_board` publishes
+``board_closed``. The hook is best-effort — a failed publish never
+crashes the handler or breaks the per-transition INFO audit log
+(which remains the authoritative history per Manifesto §8).
+
+## Schema
+
+Every frame is a JSON payload with a stable shape::
+
+    {
+      "schema_version": "1.0",
+      "event_id":       "<monotonic-seq-hex>",
+      "event_type":     "task_created" | "task_started" | ...
+                        | "heartbeat" | "stream_lag" | "replay_start"
+                        | "replay_end",
+      "op_id":          str,
+      "timestamp":      str (ISO-8601 UTC),
+      "payload":        object
+    }
+
+The ``event_id`` is monotonic within a process lifetime; clients may
+pass it back via the ``Last-Event-ID`` header on reconnect to replay
+any events still in the ring-buffer history.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import (
+    Any,
+    AsyncIterator,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    TYPE_CHECKING,
+)
+
+if TYPE_CHECKING:
+    from aiohttp import web
+
+
+logger = logging.getLogger(__name__)
+
+
+# --- Schema / version ------------------------------------------------------
+
+
+STREAM_SCHEMA_VERSION = "1.0"
+
+# Event-type vocabulary — frozen so clients can hard-code an expected set.
+EVENT_TYPE_TASK_CREATED = "task_created"
+EVENT_TYPE_TASK_STARTED = "task_started"
+EVENT_TYPE_TASK_UPDATED = "task_updated"
+EVENT_TYPE_TASK_COMPLETED = "task_completed"
+EVENT_TYPE_TASK_CANCELLED = "task_cancelled"
+EVENT_TYPE_BOARD_CLOSED = "board_closed"
+EVENT_TYPE_HEARTBEAT = "heartbeat"
+EVENT_TYPE_STREAM_LAG = "stream_lag"
+EVENT_TYPE_REPLAY_START = "replay_start"
+EVENT_TYPE_REPLAY_END = "replay_end"
+
+_VALID_EVENT_TYPES = frozenset({
+    EVENT_TYPE_TASK_CREATED,
+    EVENT_TYPE_TASK_STARTED,
+    EVENT_TYPE_TASK_UPDATED,
+    EVENT_TYPE_TASK_COMPLETED,
+    EVENT_TYPE_TASK_CANCELLED,
+    EVENT_TYPE_BOARD_CLOSED,
+    EVENT_TYPE_HEARTBEAT,
+    EVENT_TYPE_STREAM_LAG,
+    EVENT_TYPE_REPLAY_START,
+    EVENT_TYPE_REPLAY_END,
+})
+
+
+# --- Env knobs -------------------------------------------------------------
+
+
+def stream_enabled() -> bool:
+    """Master switch. **Default false** — deny-by-default per Gap #6
+    authorization. Operators flip to ``"true"`` to enable."""
+    return os.environ.get(
+        "JARVIS_IDE_STREAM_ENABLED", "false",
+    ).strip().lower() == "true"
+
+
+def _max_subscribers() -> int:
+    """Concurrent SSE connection cap. Default 8 — one or two IDE
+    windows per operator is the expected load; 8 leaves generous
+    slack without unbounded connection growth."""
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_IDE_STREAM_MAX_SUBSCRIBERS", "8",
+        )))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _queue_maxsize() -> int:
+    """Per-subscriber queue cap. Default 64 — a slow client can buffer
+    ~64 events before drop-oldest kicks in and a ``stream_lag``
+    control frame is emitted."""
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_IDE_STREAM_QUEUE_MAXSIZE", "64",
+        )))
+    except (TypeError, ValueError):
+        return 64
+
+
+def _history_maxlen() -> int:
+    """Ring-buffer size for ``Last-Event-ID`` replay. Default 512 —
+    covers ~5 minutes of typical event rate on a busy op."""
+    try:
+        return max(1, int(os.environ.get(
+            "JARVIS_IDE_STREAM_HISTORY_MAXLEN", "512",
+        )))
+    except (TypeError, ValueError):
+        return 512
+
+
+def _heartbeat_seconds() -> float:
+    """Heartbeat cadence in seconds. Default 15 — tuned to sit well
+    below typical HTTP idle timeouts. 0 disables heartbeats (useful
+    in tests)."""
+    try:
+        return max(0.0, float(os.environ.get(
+            "JARVIS_IDE_STREAM_HEARTBEAT_S", "15",
+        )))
+    except (TypeError, ValueError):
+        return 15.0
+
+
+# --- Event dataclass -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StreamEvent:
+    """One event on the wire.
+
+    Immutable, JSON-serializable via :meth:`to_dict`. Produces SSE
+    frame bytes via :meth:`to_sse_frame`.
+    """
+
+    event_id: str
+    event_type: str
+    op_id: str
+    timestamp: str  # ISO-8601 UTC
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    schema_version: str = STREAM_SCHEMA_VERSION
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "event_id": self.event_id,
+            "event_type": self.event_type,
+            "op_id": self.op_id,
+            "timestamp": self.timestamp,
+            "payload": dict(self.payload),
+        }
+
+    def to_sse_frame(self) -> bytes:
+        """SSE wire encoding. See:
+        https://html.spec.whatwg.org/multipage/server-sent-events.html
+
+        Format::
+
+            id: <event_id>
+            event: <event_type>
+            data: <json>
+            <blank line>
+        """
+        data_json = json.dumps(self.to_dict(), ensure_ascii=False)
+        # Escape any embedded newlines per spec (split across multiple
+        # data: lines). json.dumps won't emit raw newlines but be
+        # defensive about payload strings that contain them.
+        data_lines = data_json.replace("\r\n", "\n").split("\n")
+        lines = ["id: " + self.event_id,
+                 "event: " + self.event_type]
+        for line in data_lines:
+            lines.append("data: " + line)
+        # Trailing blank line terminates the event.
+        return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
+# --- Helpers ----------------------------------------------------------------
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+# --- Subscriber -------------------------------------------------------------
+
+
+@dataclass
+class _Subscriber:
+    """Internal — one connected SSE client.
+
+    Owns a bounded asyncio.Queue of pending events. The broker only
+    holds a reference while the client is connected; on disconnect,
+    :meth:`close` drops the reference and any in-flight events.
+    """
+
+    sub_id: int
+    op_id_filter: Optional[str]
+    queue: "asyncio.Queue[StreamEvent]"
+    loop: asyncio.AbstractEventLoop
+    maxsize: int
+    drop_count: int = 0
+    created_mono: float = field(default_factory=time.monotonic)
+    _lag_pending: bool = False  # suppress duplicate lag frames
+    _closed: bool = False
+
+    def matches(self, event: StreamEvent) -> bool:
+        """Does this event pass the op_id filter?
+
+        Control-frame event types always pass (heartbeat / stream_lag
+        are per-subscriber metadata and are produced targeted).
+        """
+        if event.event_type in (
+            EVENT_TYPE_HEARTBEAT, EVENT_TYPE_STREAM_LAG,
+            EVENT_TYPE_REPLAY_START, EVENT_TYPE_REPLAY_END,
+        ):
+            return True
+        if self.op_id_filter is None or self.op_id_filter == "":
+            return True
+        return event.op_id == self.op_id_filter
+
+
+# --- Broker -----------------------------------------------------------------
+
+
+class StreamEventBroker:
+    """Thread-safe in-process publish/subscribe with bounded history.
+
+    One broker instance per process (module-level singleton via
+    :func:`get_default_broker`). Tests reset the singleton via
+    :func:`reset_default_broker`.
+
+    Publish is sync + non-blocking — safe to call from tool handlers,
+    close hooks, or anywhere without awaiting. Subscribers are
+    coroutine-based async iterators, used exclusively by the SSE
+    handler.
+    """
+
+    def __init__(
+        self,
+        *,
+        history_maxlen: Optional[int] = None,
+        max_subscribers: Optional[int] = None,
+        queue_maxsize: Optional[int] = None,
+    ) -> None:
+        self._history_maxlen = history_maxlen or _history_maxlen()
+        self._max_subscribers = max_subscribers or _max_subscribers()
+        self._default_queue_maxsize = queue_maxsize or _queue_maxsize()
+        # History is append-only; deque with maxlen does eviction
+        # automatically when capacity is reached.
+        self._history: Deque[StreamEvent] = deque(maxlen=self._history_maxlen)
+        self._subscribers: Dict[int, _Subscriber] = {}
+        self._next_sub_id: int = 0
+        self._next_event_seq: int = 0
+        self._lock = threading.Lock()
+        self._published_count: int = 0
+        self._dropped_count: int = 0
+
+    # --- introspection (test + /observability/health future) --------------
+
+    @property
+    def subscriber_count(self) -> int:
+        with self._lock:
+            return len(self._subscribers)
+
+    @property
+    def history_size(self) -> int:
+        with self._lock:
+            return len(self._history)
+
+    @property
+    def published_count(self) -> int:
+        return self._published_count  # informational; race-tolerant
+
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped_count
+
+    # --- publish -----------------------------------------------------------
+
+    def publish(
+        self,
+        event_type: str,
+        op_id: str,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[str]:
+        """Emit one event. Returns the assigned ``event_id``, or None
+        if the event_type is invalid (drop silently — the caller is
+        typically a best-effort hook in tool handlers).
+
+        Never raises. Never blocks. Safe to call even when no
+        subscribers are connected (event lands in history only).
+        """
+        if event_type not in _VALID_EVENT_TYPES:
+            logger.debug(
+                "[Stream] publish rejected unknown event_type=%r", event_type,
+            )
+            return None
+        if not isinstance(op_id, str):
+            op_id = str(op_id or "")
+
+        with self._lock:
+            self._next_event_seq += 1
+            seq = self._next_event_seq
+            event_id = format(seq, "012x")
+            event = StreamEvent(
+                event_id=event_id,
+                event_type=event_type,
+                op_id=op_id,
+                timestamp=_iso_now(),
+                payload=dict(payload or {}),
+            )
+            # Ring-buffer append — deque.maxlen handles eviction.
+            self._history.append(event)
+            self._published_count += 1
+            # Snapshot subscribers under lock; fan-out happens below.
+            targets = list(self._subscribers.values())
+
+        # Fan-out OUTSIDE the lock so put_nowait + call_soon_threadsafe
+        # can't deadlock against an async consumer.
+        for sub in targets:
+            if sub._closed:
+                continue
+            if not sub.matches(event):
+                continue
+            self._deliver(sub, event)
+
+        return event_id
+
+    def _deliver(self, sub: _Subscriber, event: StreamEvent) -> None:
+        """Best-effort enqueue on a subscriber's queue.
+
+        On queue-full: drop the event, mark the subscriber lagging,
+        and schedule a ``stream_lag`` control frame. The subscriber
+        sees the lag frame and can reset its view via the REST
+        endpoints.
+        """
+        try:
+            # asyncio.Queue.put_nowait raises asyncio.QueueFull when
+            # the queue is at maxsize. Wrap in try/except — we're
+            # intentionally dropping oldest via the lag signal.
+            sub.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self._dropped_count += 1
+            sub.drop_count += 1
+            if not sub._lag_pending:
+                sub._lag_pending = True
+                # Attempt to inject a lag frame. If THAT also fails,
+                # the subscriber is thoroughly wedged and we just
+                # drop silently — the disconnect path will clean up.
+                lag_event = StreamEvent(
+                    event_id=event.event_id + ":lag",
+                    event_type=EVENT_TYPE_STREAM_LAG,
+                    op_id=event.op_id,
+                    timestamp=_iso_now(),
+                    payload={
+                        "dropped_since_last_ack": sub.drop_count,
+                        "first_missed_event_id": event.event_id,
+                    },
+                )
+                try:
+                    sub.queue.put_nowait(lag_event)
+                except asyncio.QueueFull:
+                    logger.debug(
+                        "[Stream] lag frame also dropped sub=%d", sub.sub_id,
+                    )
+        except Exception:  # noqa: BLE001 — defensive, must not raise
+            logger.debug(
+                "[Stream] deliver exception sub=%d", sub.sub_id,
+                exc_info=True,
+            )
+
+    # --- subscribe ---------------------------------------------------------
+
+    def subscribe(
+        self,
+        op_id_filter: Optional[str] = None,
+        last_event_id: Optional[str] = None,
+    ) -> "Optional[_Subscriber]":
+        """Register a new subscriber.
+
+        Returns ``None`` if the subscriber cap is exceeded. Callers
+        must pass the returned subscriber to :meth:`stream_iter` and
+        release it via :meth:`unsubscribe` in a ``finally`` block.
+        """
+        with self._lock:
+            if len(self._subscribers) >= self._max_subscribers:
+                return None
+            self._next_sub_id += 1
+            sub_id = self._next_sub_id
+            loop = asyncio.get_event_loop()
+            queue: "asyncio.Queue[StreamEvent]" = asyncio.Queue(
+                maxsize=self._default_queue_maxsize,
+            )
+            sub = _Subscriber(
+                sub_id=sub_id,
+                op_id_filter=op_id_filter or None,
+                queue=queue,
+                loop=loop,
+                maxsize=self._default_queue_maxsize,
+            )
+            self._subscribers[sub_id] = sub
+        logger.info(
+            "[Stream] subscriber_connected sub=%d op_filter=%r total=%d",
+            sub_id, op_id_filter or "*", len(self._subscribers),
+        )
+        # Seed replay if Last-Event-ID provided. Under lock-free read —
+        # history is effectively append-only for this check.
+        self._seed_replay(sub, last_event_id)
+        return sub
+
+    def _seed_replay(
+        self, sub: _Subscriber, last_event_id: Optional[str],
+    ) -> None:
+        """Inject a replay_start marker, the events since
+        last_event_id (filtered), and a replay_end marker.
+
+        If last_event_id is unknown (evicted from history or never
+        seen), replay begins from the oldest event still in history —
+        the client sees a lag-style gap which the replay_start
+        ``missed_from_id`` field makes visible.
+        """
+        if not last_event_id:
+            return
+        with self._lock:
+            hist = list(self._history)
+        # Linear scan — history is bounded by history_maxlen.
+        start_idx = 0
+        known = False
+        for i, ev in enumerate(hist):
+            if ev.event_id == last_event_id:
+                known = True
+                start_idx = i + 1
+                break
+        tail = hist[start_idx:] if known else hist
+        # Filter by op_id and by event type.
+        replay_events = [ev for ev in tail if sub.matches(ev)]
+        start_marker = StreamEvent(
+            event_id="replay:" + (last_event_id or "0"),
+            event_type=EVENT_TYPE_REPLAY_START,
+            op_id=sub.op_id_filter or "",
+            timestamp=_iso_now(),
+            payload={
+                "last_event_id": last_event_id,
+                "known": known,
+                "replay_count": len(replay_events),
+            },
+        )
+        end_marker = StreamEvent(
+            event_id="replay:end:" + (last_event_id or "0"),
+            event_type=EVENT_TYPE_REPLAY_END,
+            op_id=sub.op_id_filter or "",
+            timestamp=_iso_now(),
+            payload={"replayed": len(replay_events)},
+        )
+        for ev in [start_marker, *replay_events, end_marker]:
+            self._deliver(sub, ev)
+
+    async def stream_iter(
+        self, sub: _Subscriber, heartbeat_s: Optional[float] = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Async iterator yielding events for one subscriber.
+
+        Emits a :data:`EVENT_TYPE_HEARTBEAT` frame every
+        ``heartbeat_s`` seconds when the queue is idle, so dead
+        connections surface promptly to the handler's write path.
+        ``heartbeat_s=0`` disables heartbeats (tests).
+        """
+        hb = _heartbeat_seconds() if heartbeat_s is None else heartbeat_s
+        try:
+            while not sub._closed:
+                try:
+                    if hb > 0:
+                        event = await asyncio.wait_for(
+                            sub.queue.get(), timeout=hb,
+                        )
+                    else:
+                        event = await sub.queue.get()
+                    # Clear lag-pending flag when the queue drains past
+                    # the lag frame itself.
+                    if event.event_type == EVENT_TYPE_STREAM_LAG:
+                        sub._lag_pending = False
+                    yield event
+                except asyncio.TimeoutError:
+                    yield StreamEvent(
+                        event_id="hb:" + format(int(time.monotonic() * 1000), "x"),
+                        event_type=EVENT_TYPE_HEARTBEAT,
+                        op_id=sub.op_id_filter or "",
+                        timestamp=_iso_now(),
+                        payload={"subscriber_count": self.subscriber_count},
+                    )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self.unsubscribe(sub)
+
+    def unsubscribe(self, sub: "_Subscriber") -> None:
+        """Remove a subscriber and release its queue. Idempotent."""
+        if sub._closed:
+            return
+        sub._closed = True
+        with self._lock:
+            self._subscribers.pop(sub.sub_id, None)
+            total = len(self._subscribers)
+        logger.info(
+            "[Stream] subscriber_disconnected sub=%d drops=%d total=%d",
+            sub.sub_id, sub.drop_count, total,
+        )
+
+    # --- test helpers ------------------------------------------------------
+
+    def reset(self) -> None:
+        """Drop every subscriber + clear history. Test-only — prod
+        code never calls this."""
+        with self._lock:
+            for sub in list(self._subscribers.values()):
+                sub._closed = True
+            self._subscribers.clear()
+            self._history.clear()
+            self._next_event_seq = 0
+            self._next_sub_id = 0
+            self._published_count = 0
+            self._dropped_count = 0
+
+
+# --- Module singleton ------------------------------------------------------
+
+
+_default_broker: Optional[StreamEventBroker] = None
+_default_broker_lock = threading.Lock()
+
+
+def get_default_broker() -> StreamEventBroker:
+    global _default_broker
+    with _default_broker_lock:
+        if _default_broker is None:
+            _default_broker = StreamEventBroker()
+        return _default_broker
+
+
+def reset_default_broker() -> None:
+    """Test helper — reset the singleton."""
+    global _default_broker
+    with _default_broker_lock:
+        if _default_broker is not None:
+            _default_broker.reset()
+        _default_broker = None
+
+
+def publish_task_event(
+    event_type: str,
+    op_id: str,
+    payload: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Public hook for task_tool handlers. Best-effort, never raises.
+
+    Returns the event_id on successful publish, None on any failure
+    (stream disabled, invalid event_type, or broker exception).
+    """
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(event_type, op_id, payload)
+    except Exception:  # noqa: BLE001 — best-effort hook
+        logger.debug("[Stream] publish_task_event exception", exc_info=True)
+        return None
+
+
+# --- Stream route handler ---------------------------------------------------
+
+
+# Same op_id discipline as Slice 1.
+_OP_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+
+
+class IDEStreamRouter:
+    """Mounts ``GET /observability/stream`` on an aiohttp app.
+
+    Usage::
+
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            IDEStreamRouter, stream_enabled,
+        )
+        if stream_enabled():
+            IDEStreamRouter().register_routes(app)
+
+    Rate-tracker is separate from the Slice 1 router's — different
+    trust boundary (a stream is a long-lived connection; Slice 1
+    routes are short polls).
+    """
+
+    def __init__(
+        self,
+        broker: Optional[StreamEventBroker] = None,
+    ) -> None:
+        self._broker = broker
+        self._rate_tracker: Dict[str, List[float]] = {}
+
+    def _get_broker(self) -> StreamEventBroker:
+        return self._broker or get_default_broker()
+
+    def register_routes(self, app: "web.Application") -> None:
+        app.router.add_get("/observability/stream", self._handle_stream)
+
+    def _client_key(self, request: "web.Request") -> str:
+        peer = getattr(request, "remote", "") or "unknown"
+        return str(peer)
+
+    def _check_subscribe_rate(self, client_key: str) -> bool:
+        """Subscribe-rate limiter. Lower cap than the Slice 1 polls —
+        expect ≤1 (re)connect per minute per client under normal
+        operation; 10/min gives burst headroom for flaky network
+        without allowing an open-close storm."""
+        try:
+            limit = max(1, int(os.environ.get(
+                "JARVIS_IDE_STREAM_RATE_LIMIT_PER_MIN", "10",
+            )))
+        except (TypeError, ValueError):
+            limit = 10
+        now = time.monotonic()
+        window_start = now - 60.0
+        hist = self._rate_tracker.setdefault(client_key, [])
+        while hist and hist[0] < window_start:
+            hist.pop(0)
+        if len(hist) >= limit:
+            return False
+        hist.append(now)
+        return True
+
+    def _cors_headers(self, request: "web.Request") -> Dict[str, str]:
+        # Reuse Slice 1's allowlist so both surfaces share a CORS story.
+        from backend.core.ouroboros.governance.ide_observability import (
+            _cors_origin_patterns,
+        )
+        origin = request.headers.get("Origin", "") or ""
+        if not origin:
+            return {}
+        for pattern in _cors_origin_patterns():
+            try:
+                if re.match(pattern, origin):
+                    return {
+                        "Access-Control-Allow-Origin": origin,
+                        "Vary": "Origin",
+                        "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    }
+            except re.error:
+                continue
+        return {}
+
+    async def _handle_stream(self, request: "web.Request") -> Any:
+        """The SSE handler.
+
+        Emits:
+          - 403 when ``JARVIS_IDE_STREAM_ENABLED`` is not true
+          - 400 when the ``op_id`` query is malformed
+          - 429 when the subscribe-rate cap is exceeded
+          - 503 when the subscriber cap is exceeded
+          - streaming ``text/event-stream`` otherwise
+        """
+        from aiohttp import web
+
+        if not stream_enabled():
+            return web.json_response(
+                {"schema_version": STREAM_SCHEMA_VERSION,
+                 "error": True, "reason_code": "ide_stream.disabled"},
+                status=403, headers={"Cache-Control": "no-store"},
+            )
+
+        # Parse + validate ?op_id=... (optional).
+        op_id_filter = request.query.get("op_id", "").strip() or None
+        if op_id_filter is not None and not _OP_ID_RE.match(op_id_filter):
+            return web.json_response(
+                {"schema_version": STREAM_SCHEMA_VERSION,
+                 "error": True, "reason_code": "ide_stream.malformed_op_id"},
+                status=400, headers={"Cache-Control": "no-store"},
+            )
+
+        client_key = self._client_key(request)
+        if not self._check_subscribe_rate(client_key):
+            return web.json_response(
+                {"schema_version": STREAM_SCHEMA_VERSION,
+                 "error": True, "reason_code": "ide_stream.rate_limited"},
+                status=429, headers={"Cache-Control": "no-store"},
+            )
+
+        broker = self._get_broker()
+        last_event_id = request.headers.get("Last-Event-ID", "").strip() or None
+        sub = broker.subscribe(
+            op_id_filter=op_id_filter, last_event_id=last_event_id,
+        )
+        if sub is None:
+            return web.json_response(
+                {"schema_version": STREAM_SCHEMA_VERSION,
+                 "error": True, "reason_code": "ide_stream.capacity"},
+                status=503, headers={
+                    "Cache-Control": "no-store", "Retry-After": "30",
+                },
+            )
+
+        # Successful subscribe — switch to streaming response.
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-store",
+                # Disable proxy buffering (nginx-ism, harmless elsewhere).
+                "X-Accel-Buffering": "no",
+                # Reject connection caching — each reconnect gets a
+                # fresh subscribe path.
+                "Connection": "keep-alive",
+            },
+        )
+        for k, v in self._cors_headers(request).items():
+            resp.headers[k] = v
+        await resp.prepare(request)
+
+        try:
+            # Optional initial comment line — some SSE clients drop the
+            # first empty read; a comment frame kicks the parser.
+            await resp.write(b": ok\n\n")
+            async for event in broker.stream_iter(sub):
+                try:
+                    await resp.write(event.to_sse_frame())
+                except (ConnectionResetError, asyncio.CancelledError):
+                    raise
+                except Exception:  # noqa: BLE001 — client write path
+                    logger.debug(
+                        "[Stream] write exception sub=%d", sub.sub_id,
+                        exc_info=True,
+                    )
+                    break
+        except asyncio.CancelledError:
+            # Client disconnected — stream_iter's finally will call
+            # unsubscribe(). Re-raise so aiohttp can complete the
+            # response lifecycle.
+            raise
+        except ConnectionResetError:
+            pass
+        finally:
+            broker.unsubscribe(sub)
+
+        return resp

@@ -158,7 +158,42 @@ def close_task_board(op_id: str, reason: str = "") -> bool:
             "[TaskTool] close_task_board raised for op=%s", op_id,
             exc_info=True,
         )
+    _publish_stream_event("board_closed", op_id, {"reason": reason or ""})
     return True
+
+
+# --- Gap #6 Slice 2 hook — best-effort IDE stream publisher ---------------
+
+
+def _publish_stream_event(
+    event_type: str,
+    op_id: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort IDE stream publish. Never raises. Silently no-ops
+    when the stream is disabled or the module isn't importable (e.g.,
+    during early bootstrap)."""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            publish_task_event,
+        )
+        publish_task_event(event_type, op_id, payload or {})
+    except Exception:  # noqa: BLE001 — hook must not affect tool flow
+        logger.debug("[TaskTool] stream publish failed", exc_info=True)
+
+
+def _stream_payload_for_task(task: Task) -> Dict[str, Any]:
+    """Projection matching the Slice 1 GET /observability/tasks/{op_id}
+    task shape. Keeps both surfaces emitting the same keys so IDE
+    clients can cross-reference push + poll without field mapping."""
+    return {
+        "task_id": task.task_id,
+        "state": task.state,
+        "title": task.title,
+        "body": task.body,
+        "sequence": task.sequence,
+        "cancel_reason": task.cancel_reason,
+    }
 
 
 def reset_task_board_registry() -> None:
@@ -313,21 +348,26 @@ async def run_task_tool(
             status=ToolExecStatus.EXEC_ERROR,
         )
 
+    stream_event_type: Optional[str] = None
     try:
         board = get_or_create_task_board(policy_ctx.op_id)
         if name == "task_create":
             task = board.create(
                 title=args["title"], body=args.get("body", ""),
             )
+            stream_event_type = "task_created"
         elif name == "task_complete":
             task = board.complete(args["task_id"])
+            stream_event_type = "task_completed"
         elif name == "task_update":
             task_id = args["task_id"]
             action = args.get("action")
             if action == "start":
                 task = board.start(task_id)
+                stream_event_type = "task_started"
             elif action == "cancel":
                 task = board.cancel(task_id, reason=args.get("reason", ""))
+                stream_event_type = "task_cancelled"
             else:
                 # No action → content update path.
                 task = board.update(
@@ -335,6 +375,7 @@ async def run_task_tool(
                     title=args.get("title"),
                     body=args.get("body"),
                 )
+                stream_event_type = "task_updated"
         else:
             return ToolResult(
                 tool_call=call, output="",
@@ -374,6 +415,11 @@ async def run_task_tool(
             tool_call=call, output="",
             error=name + ": " + type(exc).__name__ + ": " + str(exc)[:200],
             status=ToolExecStatus.EXEC_ERROR,
+        )
+
+    if stream_event_type is not None:
+        _publish_stream_event(
+            stream_event_type, task.op_id, _stream_payload_for_task(task),
         )
 
     payload = _serialize_result(task, board)

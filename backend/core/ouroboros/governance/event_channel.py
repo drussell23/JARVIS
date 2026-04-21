@@ -175,6 +175,7 @@ class EventChannelServer:
             app.router.add_get("/channel/health", self._handle_health)
 
             ide_router_mounted = False
+            ide_stream_mounted = False
             try:
                 from backend.core.ouroboros.governance.ide_observability import (
                     IDEObservabilityRouter,
@@ -194,16 +195,43 @@ class EventChannelServer:
                     "[EventChannel] IDE observability wiring failed: %s", ide_exc,
                 )
 
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (
+                    assert_loopback_only as _assert_loopback_stream,
+                )
+                from backend.core.ouroboros.governance.ide_observability_stream import (
+                    IDEStreamRouter,
+                    stream_enabled,
+                )
+                if stream_enabled():
+                    _assert_loopback_stream(self._host)
+                    IDEStreamRouter().register_routes(app)
+                    ide_stream_mounted = True
+            except ValueError as stream_loopback_exc:
+                logger.warning(
+                    "[EventChannel] IDE stream refused: %s",
+                    stream_loopback_exc,
+                )
+            except Exception as stream_exc:
+                logger.warning(
+                    "[EventChannel] IDE stream wiring failed: %s", stream_exc,
+                )
+
             runner = web.AppRunner(app)
             await runner.setup()
             self._site = web.TCPSite(runner, self._host, self._port)
             await self._site.start()
 
+            extras = []
+            if ide_router_mounted:
+                extras.append("/observability/*")
+            if ide_stream_mounted:
+                extras.append("/observability/stream")
+            extras_str = (", " + ", ".join(extras)) if extras else ""
             logger.info(
                 "[EventChannel] Server started on %s:%d "
                 "(endpoints: /webhook/github, /webhook/ci, /webhook/generic%s)",
-                self._host, self._port,
-                ", /observability/*" if ide_router_mounted else "",
+                self._host, self._port, extras_str,
             )
         except Exception as exc:
             logger.warning("[EventChannel] Failed to start: %s", exc)
