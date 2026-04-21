@@ -174,6 +174,26 @@ class EventChannelServer:
             app.router.add_post("/webhook/doubleword", self._handle_doubleword)
             app.router.add_get("/channel/health", self._handle_health)
 
+            ide_router_mounted = False
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (
+                    IDEObservabilityRouter,
+                    assert_loopback_only,
+                    ide_observability_enabled,
+                )
+                if ide_observability_enabled():
+                    assert_loopback_only(self._host)
+                    IDEObservabilityRouter().register_routes(app)
+                    ide_router_mounted = True
+            except ValueError as loopback_exc:
+                logger.warning(
+                    "[EventChannel] IDE observability refused: %s", loopback_exc,
+                )
+            except Exception as ide_exc:
+                logger.warning(
+                    "[EventChannel] IDE observability wiring failed: %s", ide_exc,
+                )
+
             runner = web.AppRunner(app)
             await runner.setup()
             self._site = web.TCPSite(runner, self._host, self._port)
@@ -181,8 +201,9 @@ class EventChannelServer:
 
             logger.info(
                 "[EventChannel] Server started on %s:%d "
-                "(endpoints: /webhook/github, /webhook/ci, /webhook/generic)",
+                "(endpoints: /webhook/github, /webhook/ci, /webhook/generic%s)",
                 self._host, self._port,
+                ", /observability/*" if ide_router_mounted else "",
             )
         except Exception as exc:
             logger.warning("[EventChannel] Failed to start: %s", exc)

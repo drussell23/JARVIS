@@ -167,7 +167,8 @@ backend/core/ouroboros/
     mcp_tool_client.py          # MCP external tool client (Gap #7)
     context_compaction.py       # Live context auto-compaction (Gap #8)
     batch_future_registry.py    # Zero-poll webhook batch futures (DW Tier 1)
-    event_channel.py            # Webhook receiver (DW + GitHub + CI)
+    event_channel.py            # Webhook receiver (DW + GitHub + CI) + /observability/* (Gap #6)
+    ide_observability.py        # Read-only GET /observability/{health,tasks,tasks/{op_id}} — loopback-only, rate-limited, authority-free (Gap #6 Slice 1)
     repair_engine.py            # L2 self-repair
     consciousness_bridge.py     # Consciousness integration
     strategic_direction.py      # Manifesto injection
