@@ -154,12 +154,20 @@ def _git_log_limit() -> int:
 
 
 def _cluster_mode() -> str:
-    raw = os.environ.get("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", "centroid")
+    """Re-read ``JARVIS_SEMANTIC_INDEX_CLUSTER_MODE`` at call-time.
+
+    Default: **``kmeans``** (graduated 2026-04-20 via Slice 3d after
+    Slices 3a+3c shipped the math, telemetry, and themed prompt
+    rendering). Explicit ``"centroid"`` reverts to v0.1 behavior
+    (no clustering computed). Case-insensitive; unrecognized values
+    fall back to the new default ``"kmeans"``.
+    """
+    raw = os.environ.get("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", "kmeans")
     mode = raw.strip().lower()
     if mode in ("centroid", "kmeans"):
         return mode
-    # Unrecognized value → safe default.
-    return "centroid"
+    # Unrecognized value → safe default (now kmeans post-3d graduation).
+    return "kmeans"
 
 
 def _cluster_k_min() -> int:
@@ -224,10 +232,11 @@ def _cluster_failure_gravity_window() -> int:
 
 
 def _cluster_scoring_policy() -> str:
-    """Slice 3b — how ``score()`` aggregates across cluster centroids.
+    """How ``score()`` aggregates across cluster centroids.
 
-    ``"centroid"`` (default): use the single v0.1 weighted centroid
-    (Slice 3a shadow-mode behavior preserved — backward-compatible).
+    Default: **``"max_cluster"``** (graduated 2026-04-20 via Slice 3d
+    after Slice 3b shipped the policy-routing + zero-boost-with-evidence
+    machinery). Explicit ``"centroid"`` reverts to v0.1 behavior.
 
     ``"max_cluster"``: use the max cosine over cluster centroids.
     **Zero-boost-with-evidence** for postmortem-kind clusters — when
@@ -237,13 +246,19 @@ def _cluster_scoring_policy() -> str:
     Operators see the theme; the organism is denied the fast-path
     priority boost.
 
-    Unrecognized values fall back to ``"centroid"``. Case-insensitive.
+    ``"centroid"``: use the single v0.1 weighted centroid — no
+    cluster-kind suppression; backward-compatible with pre-Slice-3b
+    behavior. Case-insensitive; unrecognized values fall back to the
+    new default ``"max_cluster"``.
     """
-    raw = os.environ.get("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    raw = os.environ.get(
+        "JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster",
+    )
     mode = raw.strip().lower()
     if mode in ("centroid", "max_cluster"):
         return mode
-    return "centroid"
+    # Unrecognized → new graduated default.
+    return "max_cluster"
 
 
 # ---------------------------------------------------------------------------

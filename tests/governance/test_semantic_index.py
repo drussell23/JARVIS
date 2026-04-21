@@ -888,10 +888,12 @@ def _seed_conversation(monkeypatch, *turns):
         bridge.record_turn("user", text, source=source)
 
 
-def test_cluster_mode_centroid_default_keeps_clusters_empty(tmp_path, monkeypatch):
-    """3a test 28: default cluster_mode=centroid → no clustering run,
-    stats.cluster_count=0, stats.clusters=[]. v0.1 backward-compat pin."""
-    _enable(monkeypatch)
+def test_cluster_mode_explicit_centroid_keeps_clusters_empty(tmp_path, monkeypatch):
+    """3a test 28 (post-3d): explicit ``INDEX_CLUSTER_MODE=centroid``
+    (opt-out after 3d graduation) → no clustering run. v0.1 backward-
+    compat pin — ensures operators can always revert to the pre-3a
+    single-centroid behavior."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="centroid")
     _seed_conversation(
         monkeypatch,
         (cb.SOURCE_TUI_USER, "text one"),
@@ -1078,9 +1080,10 @@ def test_score_with_cluster_returns_none_when_disabled(tmp_path, monkeypatch):
 def test_score_with_cluster_empty_clusters_returns_detail_with_none_fields(
     tmp_path, monkeypatch,
 ):
-    """3a test 36: when clustering is off (centroid mode), score_with_cluster
-    still returns a result dict but with None cluster fields."""
-    _enable(monkeypatch)  # default cluster_mode=centroid
+    """3a test 36 (post-3d): when clustering is off (explicit
+    centroid opt-out), score_with_cluster still returns a result dict
+    but with None cluster fields."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="centroid")
     _seed_conversation(
         monkeypatch,
         (cb.SOURCE_TUI_USER, "one"),
@@ -1145,10 +1148,12 @@ def test_failure_gravity_alert_counter_present(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_cluster_mode_malformed_env_falls_back_to_centroid(monkeypatch):
-    """3a test 39: unrecognized JARVIS_SEMANTIC_INDEX_CLUSTER_MODE → centroid."""
+def test_cluster_mode_malformed_env_falls_back_to_graduated_default(monkeypatch):
+    """3a test 39 (post-3d): unrecognized JARVIS_SEMANTIC_INDEX_CLUSTER_MODE
+    falls back to the current default, which is ``kmeans`` after the
+    3d graduation (was ``centroid`` pre-graduation)."""
     monkeypatch.setenv("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", "banana-mode")
-    assert si._cluster_mode() == "centroid"
+    assert si._cluster_mode() == "kmeans"
 
 
 def test_cluster_mode_case_insensitive(monkeypatch):
@@ -1318,9 +1323,9 @@ def test_themed_renderer_falls_back_to_v01_when_only_one_cluster(tmp_path, monke
 
 
 def test_themed_renderer_falls_back_to_v01_under_centroid_mode(tmp_path, monkeypatch):
-    """3c test 9: cluster_mode=centroid (v0.1 default) → no themed
-    rendering regardless of corpus structure."""
-    _enable(monkeypatch)  # default cluster_mode=centroid
+    """3c test 9 (post-3d): explicit cluster_mode=centroid (v0.1
+    opt-out) → no themed rendering regardless of corpus structure."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="centroid")
     _seed_conversation(
         monkeypatch,
         *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
@@ -1634,10 +1639,12 @@ def _build_mixed_postmortem_corpus(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_scoring_policy_default_is_centroid(monkeypatch):
-    """3b test 1: default policy is 'centroid' (backward-compat)."""
+def test_scoring_policy_default_post_graduation_is_max_cluster(monkeypatch):
+    """3b test 1 (post-3d): default policy is 'max_cluster' after the
+    3d graduation (was 'centroid' pre-graduation). Operators opt back
+    into v0.1 centroid behavior with an explicit ``=centroid`` override."""
     monkeypatch.delenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", raising=False)
-    assert si._cluster_scoring_policy() == "centroid"
+    assert si._cluster_scoring_policy() == "max_cluster"
 
 
 def test_scoring_policy_max_cluster_honored(monkeypatch):
@@ -1652,16 +1659,18 @@ def test_scoring_policy_case_insensitive(monkeypatch):
     assert si._cluster_scoring_policy() == "max_cluster"
 
 
-def test_scoring_policy_malformed_falls_back_to_centroid(monkeypatch):
-    """3b test 4: unrecognized value → safe fallback to 'centroid'."""
+def test_scoring_policy_malformed_falls_back_to_graduated_default(monkeypatch):
+    """3b test 4 (post-3d): unrecognized value falls back to the
+    current default, which is ``max_cluster`` after the 3d graduation."""
     monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "banana-mode")
-    assert si._cluster_scoring_policy() == "centroid"
+    assert si._cluster_scoring_policy() == "max_cluster"
 
 
-def test_scoring_policy_empty_string_falls_back_to_centroid(monkeypatch):
-    """3b test 5: empty env value → fallback to 'centroid'."""
+def test_scoring_policy_empty_string_falls_back_to_graduated_default(monkeypatch):
+    """3b test 5 (post-3d): empty env value → current default
+    ``max_cluster``."""
     monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "")
-    assert si._cluster_scoring_policy() == "centroid"
+    assert si._cluster_scoring_policy() == "max_cluster"
 
 
 # ---------------------------------------------------------------------------
@@ -1724,10 +1733,14 @@ def test_score_max_cluster_policy_returns_max_cluster_cosine(
 
 
 def test_score_max_cluster_fallback_when_clusters_empty(tmp_path, monkeypatch):
-    """3b test 8 (CRITICAL): policy=max_cluster with empty clusters
-    degrades gracefully to centroid cosine. No crash, no NaN, no
-    silent zero."""
-    _enable(monkeypatch)  # cluster_mode=centroid (default) → no clusters built
+    """3b test 8 (CRITICAL, post-3d): policy=max_cluster with EXPLICIT
+    cluster_mode=centroid (empty clusters precondition) degrades
+    gracefully to centroid cosine. No crash, no NaN, no silent zero.
+
+    Post-3d the default cluster_mode is ``kmeans`` which produces
+    clusters, so we must set the explicit opt-out to exercise the
+    empty-clusters branch of the fallback logic."""
+    _enable(monkeypatch, INDEX_CLUSTER_MODE="centroid")  # explicit opt-out
     monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "max_cluster")
     _seed_conversation(
         monkeypatch,
@@ -2255,6 +2268,127 @@ def test_slice_3b_suppression_affects_boost_only_not_score():
             f"{forbidden!r}. Suppression layer must stay advisory; "
             f"no authority-carrying consumer may be added."
         )
+
+
+# ===========================================================================
+# Slice 3d — two-flag graduation tests
+# ===========================================================================
+#
+# 3d flipped both cluster-mode and scoring-policy defaults from the
+# opt-in shadow values to the active defaults. Pin the new behavior
+# + confirm the opt-out path still works.
+
+
+def test_3d_cluster_mode_default_post_graduation_is_kmeans(monkeypatch):
+    """Slice 3d / graduation pin: ``JARVIS_SEMANTIC_INDEX_CLUSTER_MODE``
+    default is ``kmeans`` — no env var set → clustering computed."""
+    monkeypatch.delenv("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", raising=False)
+    assert si._cluster_mode() == "kmeans"
+
+
+def test_3d_cluster_mode_explicit_centroid_opts_out(monkeypatch):
+    """Slice 3d opt-out pin: operators can revert to v0.1 behavior
+    by explicitly setting ``INDEX_CLUSTER_MODE=centroid``. Guarantees
+    the graduation is reversible at the env layer."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", "centroid")
+    assert si._cluster_mode() == "centroid"
+
+
+def test_3d_scoring_policy_default_post_graduation_is_max_cluster(monkeypatch):
+    """Slice 3d / graduation pin: ``JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY``
+    default is ``max_cluster`` — no env var set → cluster-aware routing
+    + postmortem zero-boost-with-evidence active."""
+    monkeypatch.delenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", raising=False)
+    assert si._cluster_scoring_policy() == "max_cluster"
+
+
+def test_3d_scoring_policy_explicit_centroid_opts_out(monkeypatch):
+    """Slice 3d opt-out pin: operators can revert to pre-3b behavior
+    by explicitly setting ``CLUSTER_SCORING_POLICY=centroid``. Pairs
+    with the cluster-mode opt-out to fully restore v0.1 semantics."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    assert si._cluster_scoring_policy() == "centroid"
+
+
+def test_3d_full_v01_revert_requires_both_opt_outs(monkeypatch):
+    """Slice 3d architecture pin: a full revert to pre-3a behavior
+    requires BOTH opt-outs set — ``INDEX_CLUSTER_MODE=centroid`` AND
+    ``CLUSTER_SCORING_POLICY=centroid``. Either one alone leaves
+    partial 3a/3b behavior in place. Documents the operator contract."""
+    # Both opt-outs together = v0.1 behavior.
+    monkeypatch.setenv("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", "centroid")
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    assert si._cluster_mode() == "centroid"
+    assert si._cluster_scoring_policy() == "centroid"
+
+    # Only cluster_mode opt-out, scoring_policy still graduated default.
+    monkeypatch.setenv("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", "centroid")
+    monkeypatch.delenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", raising=False)
+    assert si._cluster_mode() == "centroid"
+    assert si._cluster_scoring_policy() == "max_cluster"
+
+    # Only scoring_policy opt-out, cluster_mode still graduated default.
+    monkeypatch.delenv("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", raising=False)
+    monkeypatch.setenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", "centroid")
+    assert si._cluster_mode() == "kmeans"
+    assert si._cluster_scoring_policy() == "centroid"
+
+
+def test_3d_clean_defaults_produce_clusters_and_max_cluster_routing(
+    tmp_path, monkeypatch,
+):
+    """Slice 3d end-to-end pin: with no cluster-related env vars set
+    (simulating a fresh operator install), ``build()`` produces
+    clusters AND ``score()`` routes through max_cluster policy —
+    proves the graduated defaults are wired end-to-end."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_INFERENCE_ENABLED", "true")
+    monkeypatch.delenv("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", raising=False)
+    monkeypatch.delenv("JARVIS_SEMANTIC_CLUSTER_SCORING_POLICY", raising=False)
+    _seed_conversation(
+        monkeypatch,
+        *[(cb.SOURCE_TUI_USER, f"alpha {i}") for i in range(5)],
+        *[(cb.SOURCE_TUI_USER, f"beta {i}") for i in range(5)],
+    )
+    idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
+    idx.build(force=True)
+    # Clusters were built under graduated cluster_mode=kmeans default.
+    assert idx.stats().cluster_mode == "kmeans"
+    assert len(idx.clusters) >= 1
+    # A scored signal routes through max_cluster policy.
+    idx.score("x")
+    assert idx.stats().scoring_policy == "max_cluster"
+
+
+def test_3d_graduation_preserves_authority_invariant():
+    """Slice 3d / Manifesto §1 pin: flipping the defaults does NOT add
+    any new consumer surface. The import-surface test from 3a + 3b
+    MUST still hold — clustering + max_cluster policy stay advisory."""
+    import backend.core.ouroboros.governance.semantic_index as module
+    source = Path(module.__file__).read_text()
+    forbidden_imports = [
+        "from backend.core.ouroboros.governance.iron_gate",
+        "from backend.core.ouroboros.governance.urgency_router",
+        "from backend.core.ouroboros.governance.risk_tier_floor",
+        "from backend.core.ouroboros.governance.semantic_guardian",
+        "from backend.core.ouroboros.governance.policy_engine",
+    ]
+    for forbidden in forbidden_imports:
+        assert forbidden not in source, (
+            f"Slice 3d graduation broke authority invariant: "
+            f"semantic_index now imports {forbidden!r}. The graduation "
+            f"flips defaults — it does NOT grant new authority surface."
+        )
+
+
+def test_3d_docstrings_document_graduation_date():
+    """Slice 3d contract pin: the two flipped defaults carry graduation
+    language in their docstrings so future readers know the flag was
+    active / inactive at a specific point in time. Fights bit-rot —
+    the flip becomes self-documenting."""
+    assert "graduated" in (si._cluster_mode.__doc__ or "").lower()
+    assert "kmeans" in (si._cluster_mode.__doc__ or "").lower()
+    assert "graduated" in (si._cluster_scoring_policy.__doc__ or "").lower()
+    assert "max_cluster" in (si._cluster_scoring_policy.__doc__ or "").lower()
 
 
 def test_slice_3b_effective_policy_stable_across_repeated_calls(
