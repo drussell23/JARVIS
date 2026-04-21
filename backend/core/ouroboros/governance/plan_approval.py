@@ -415,9 +415,21 @@ class PlanApprovalController:
         )
         if not future_to_resolve.done():
             # Schedule on the future's loop — safe from any thread.
-            future_to_resolve.get_loop().call_soon_threadsafe(
-                future_to_resolve.set_result, outcome,
-            )
+            # If that loop has already closed (typical in test
+            # tear-down where the caller drops an event loop and
+            # then resolves plans from sync code), fall back to a
+            # direct set_result — the future won't await anything
+            # anyway because its loop is dead.
+            _loop = future_to_resolve.get_loop()
+            try:
+                _loop.call_soon_threadsafe(
+                    future_to_resolve.set_result, outcome,
+                )
+            except RuntimeError:
+                try:
+                    future_to_resolve.set_result(outcome)
+                except Exception:  # noqa: BLE001
+                    pass
         self._fire(event_type, p)
         return outcome
 
