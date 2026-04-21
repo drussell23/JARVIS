@@ -104,12 +104,16 @@ class Journal:
 
 
 class _SSEReader:
-    """Simple streaming SSE reader built on urllib — mirrors the
-    Sublime plugin's parser. Collects frames into a list until
-    ``stop()`` is called or ``max_frames`` is reached."""
+    """Raw-socket SSE reader. urllib buffers chunked bodies until
+    the read(n) buffer fills up — unusable for real-time SSE. We
+    open a socket directly, send the HTTP request, parse the
+    status + header block, then consume each chunked frame."""
 
-    def __init__(self, url: str, max_frames: int = 16, timeout_s: float = 15.0):
-        self.url = url
+    def __init__(self, host: str, port: int, path: str = "/observability/stream",
+                 max_frames: int = 16, timeout_s: float = 15.0):
+        self.host = host
+        self.port = port
+        self.path = path
         self.max_frames = max_frames
         self.timeout_s = timeout_s
         self.frames: List[Dict[str, Any]] = []
@@ -120,35 +124,77 @@ class _SSEReader:
         self._stop = True
 
     def run(self) -> None:
-        req = urllib.request.Request(
-            self.url,
-            headers={
-                "Accept": "text/event-stream",
-                "Cache-Control": "no-store",
-            },
-        )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                buf = ""
-                deadline = time.monotonic() + self.timeout_s
-                while not self._stop and time.monotonic() < deadline:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        return
-                    buf += chunk.decode("utf-8", errors="replace")
-                    while True:
-                        sep = buf.find("\n\n")
-                        if sep < 0:
-                            break
-                        raw = buf[:sep]
-                        buf = buf[sep + 2:]
-                        parsed = _parse_sse_frame(raw)
-                        if parsed is not None:
-                            self.frames.append(parsed)
-                            if len(self.frames) >= self.max_frames:
-                                return
+            sock = socket.create_connection(
+                (self.host, self.port), timeout=self.timeout_s,
+            )
         except BaseException as exc:  # noqa: BLE001
             self._error = exc
+            return
+        try:
+            req = (
+                "GET " + self.path + " HTTP/1.1\r\n"
+                "Host: " + self.host + ":" + str(self.port) + "\r\n"
+                "Accept: text/event-stream\r\n"
+                "Cache-Control: no-store\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            sock.sendall(req)
+            sock.settimeout(self.timeout_s)
+            buf = b""
+            deadline = time.monotonic() + self.timeout_s
+            # Skip HTTP response headers.
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            _hdrs, rest = buf.split(b"\r\n\r\n", 1)
+            text_buf = rest.decode("utf-8", errors="replace")
+            # We read past headers. Body is chunked-transfer-encoded.
+            # Strip chunk-size lines (hex length + \r\n prefix) before
+            # each frame. Simpler: drop anything that looks like a
+            # bare hex line on its own — the real SSE frames all
+            # start with `id: ` / `event: ` / `data: ` / `:`.
+            while not self._stop and time.monotonic() < deadline and len(self.frames) < self.max_frames:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                text_buf += chunk.decode("utf-8", errors="replace")
+                while True:
+                    sep = text_buf.find("\n\n")
+                    if sep < 0:
+                        break
+                    raw = text_buf[:sep]
+                    text_buf = text_buf[sep + 2:]
+                    # Strip HTTP chunk-size line that precedes each
+                    # frame (it's a hex line ending in \r\n before
+                    # the actual frame body).
+                    clean_lines: List[str] = []
+                    for line in raw.split("\n"):
+                        stripped = line.strip("\r")
+                        # Chunk-size line: pure hex digits, optional
+                        # trailing \r. Drop it.
+                        if stripped and all(
+                            c in "0123456789abcdefABCDEF" for c in stripped
+                        ):
+                            continue
+                        clean_lines.append(stripped)
+                    parsed = _parse_sse_frame("\n".join(clean_lines))
+                    if parsed is not None:
+                        self.frames.append(parsed)
+                        if len(self.frames) >= self.max_frames:
+                            return
+        except BaseException as exc:  # noqa: BLE001
+            self._error = exc
+        finally:
+            try:
+                sock.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _parse_sse_frame(raw: str) -> Optional[Dict[str, Any]]:
@@ -213,8 +259,11 @@ async def _run(journal: Journal) -> int:
     journal.step("server_started", host="127.0.0.1", port=port)
     base = "http://127.0.0.1:" + str(port)
 
-    stream_url = base + "/observability/stream"
-    reader = _SSEReader(stream_url, max_frames=16, timeout_s=10.0)
+    reader = _SSEReader(
+        host="127.0.0.1", port=port,
+        path="/observability/stream",
+        max_frames=16, timeout_s=10.0,
+    )
 
     # Run the SSE reader on a background thread so the main thread
     # can emit TaskBoard events and make GET calls.

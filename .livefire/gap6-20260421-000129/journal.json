@@ -1,0 +1,64 @@
+{
+  "steps": [
+    {
+      "name": "server_started",
+      "ts": 1776754889.295717,
+      "host": "127.0.0.1",
+      "port": 55638
+    },
+    {
+      "name": "sse_subscriber_connected",
+      "ts": 1776754889.34863,
+      "broker_subscribers": 1
+    },
+    {
+      "name": "emitted_task_created",
+      "ts": 1776754889.349016,
+      "task_id": "task-livefire-gap6-0001"
+    },
+    {
+      "name": "emitted_task_started",
+      "ts": 1776754889.399816
+    },
+    {
+      "name": "emitted_task_completed",
+      "ts": 1776754889.467277
+    },
+    {
+      "name": "board_closed",
+      "ts": 1776754889.541638
+    },
+    {
+      "name": "health_body",
+      "ts": 1776754892.935353,
+      "body": {
+        "schema_version": "1.0",
+        "enabled": true,
+        "api_version": "1.0",
+        "surface": "tasks",
+        "now_mono": 14.365421666
+      }
+    },
+    {
+      "name": "tasks_list",
+      "ts": 1776754892.950339,
+      "body": {
+        "schema_version": "1.0",
+        "op_ids": [],
+        "count": 0
+      }
+    },
+    {
+      "name": "sse_frames_received",
+      "ts": 1776754892.950936,
+      "count": 4,
+      "types": [
+        "task_created",
+        "task_started",
+        "task_completed",
+        "board_closed"
+      ]
+    }
+  ],
+  "failures": []
+}

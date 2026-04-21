@@ -1,0 +1,61 @@
+{
+  "steps": [
+    {
+      "name": "server_started",
+      "ts": 1776754687.626118,
+      "host": "127.0.0.1",
+      "port": 55356
+    },
+    {
+      "name": "sse_subscriber_connected",
+      "ts": 1776754687.9997592,
+      "broker_subscribers": 1
+    },
+    {
+      "name": "emitted_task_created",
+      "ts": 1776754688.0000472,
+      "task_id": "task-livefire-gap6-0001"
+    },
+    {
+      "name": "emitted_task_started",
+      "ts": 1776754688.0558872
+    },
+    {
+      "name": "emitted_task_completed",
+      "ts": 1776754688.117793
+    },
+    {
+      "name": "board_closed",
+      "ts": 1776754688.251464
+    },
+    {
+      "name": "health_body",
+      "ts": 1776754691.554175,
+      "body": {
+        "schema_version": "1.0",
+        "enabled": true,
+        "api_version": "1.0",
+        "surface": "tasks",
+        "now_mono": 27.554085291
+      }
+    },
+    {
+      "name": "tasks_list",
+      "ts": 1776754691.59307,
+      "body": {
+        "schema_version": "1.0",
+        "op_ids": [],
+        "count": 0
+      }
+    },
+    {
+      "name": "sse_frames_received",
+      "ts": 1776754691.612967,
+      "count": 0,
+      "types": []
+    }
+  ],
+  "failures": [
+    "missing event types: ['board_closed', 'task_completed', 'task_created', 'task_started']"
+  ]
+}
