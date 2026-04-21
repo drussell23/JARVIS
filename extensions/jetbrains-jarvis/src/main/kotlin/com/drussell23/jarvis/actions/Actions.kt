@@ -5,8 +5,8 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.wm.ToolWindowManager
 import com.drussell23.jarvis.JarvisSettings
 import com.drussell23.jarvis.OpsController
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.launch
+// Note: actions dispatch to the tool window controller via
+// IntelliJ service APIs — no top-level coroutine launch needed.
 
 /**
  * Action group entries — Connect / Disconnect / Refresh.
@@ -40,10 +40,7 @@ class RefreshAction : AnAction("JARVIS: Refresh") {
         // No-op placeholder — the real controller reference lives
         // on the tool window content. A future slice adds a small
         // application-level service to bridge actions ↔ controller
-        // without coupling.
-        GlobalScope.launch {
-            // Intentionally empty; refresh already happens on demand
-            // as the user switches the tool window view.
-        }
+        // without coupling. Refresh already happens on demand as
+        // the user switches the tool window view.
     }
 }

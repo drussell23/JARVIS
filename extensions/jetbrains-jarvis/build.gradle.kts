@@ -24,6 +24,11 @@ repositories {
 
 dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    // kotlin.test + JUnit 4 backend — matches the standalone
+    // `run_tests.sh` harness so both routes run the same test code.
+    testImplementation("org.jetbrains.kotlin:kotlin-test")
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit")
+    testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
 }
@@ -51,7 +56,10 @@ tasks {
     }
 
     test {
-        useJUnitPlatform()
+        // JUnit 4 runner picks up kotlin.test + kotlin-test-junit
+        // bindings — same tests run under `./gradlew test` and the
+        // standalone `bash run_tests.sh` harness.
+        useJUnit()
     }
 
     // Disable the verification tasks that require a live IDE
