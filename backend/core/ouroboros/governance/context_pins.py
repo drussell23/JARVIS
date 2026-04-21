@@ -234,7 +234,10 @@ class ContextPinRegistry:
             datetime.now(timezone.utc)
             + timedelta(seconds=effective_ttl)
         ).replace(microsecond=0).isoformat()
-        pin_id = f"pin-{abs(hash((chunk_id, now_iso))) & 0xFFFFFFFF:08x}"
+        pin_id = (
+            f"pin-"
+            f"{abs(hash((chunk_id, now_iso, time.time_ns()))) & 0xFFFFFFFF:08x}"
+        )
         entry = PinEntry(
             pin_id=pin_id,
             op_id=self._op_id,
