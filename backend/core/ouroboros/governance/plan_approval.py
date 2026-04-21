@@ -396,7 +396,12 @@ class PlanApprovalController:
             )
             t = p._timeout_task
             if t is not None and not t.done():
-                t.cancel()
+                try:
+                    t.cancel()
+                except RuntimeError:
+                    # Loop already closed — the timeout task is
+                    # effectively dead; nothing further to do.
+                    pass
             self._history.append({
                 "op_id": op_id, "state": state, "reviewer": reviewer,
                 "reason": reason, "elapsed_s": elapsed,

@@ -171,17 +171,11 @@ def test_plan_pending_excludes_terminal():
     c.approve("op-a", reviewer="x")
     r = dispatch_plan_command("/plan pending", controller=c)
     assert r.ok is True
+    # op-b (still pending) should appear.
     assert "op-b" in r.text
-    # op-a is terminal — should not appear in "pending" list.
-    # (may still appear in history command)
-    pending_only = [
-        line for line in r.text.splitlines()
-        if line.strip().startswith(("op-a", "  op-a"))
-        or line.strip().startswith(("op-b", "  op-b"))
-    ]
-    # Only op-b should be in the pending display.
-    assert any("op-b" in ln for ln in pending_only)
-    assert not any("op-a" in ln for ln in pending_only)
+    # op-a (terminal) should NOT appear in the /plan pending listing.
+    # (it may still appear in /plan history)
+    assert "op-a" not in r.text
 
 
 # --------------------------------------------------------------------------
