@@ -1,0 +1,23 @@
+{
+    // Base URL of the JARVIS EventChannelServer. Must be loopback
+    // (127.0.0.1, ::1, localhost) — the plugin refuses to talk to
+    // anything else.
+    "endpoint": "http://127.0.0.1:8765",
+
+    // Master switch for the plugin. false = no polling, no SSE,
+    // no status bar updates. Matches the server-side deny-by-
+    // default posture for paranoid operators.
+    "enabled": true,
+
+    // Auto-reconnect with exponential backoff + full jitter.
+    // Disable to fail fast on first stream drop.
+    "auto_reconnect": true,
+
+    // Upper bound on the reconnect backoff timer, in seconds.
+    "reconnect_max_backoff_s": 30.0,
+
+    // Optional op_id filter. When set, the SSE stream only
+    // delivers events for this single op. Leave empty to see
+    // events from every op the agent is running.
+    "op_id_filter": ""
+}

@@ -1,0 +1,22 @@
+[
+    {
+        "caption": "JARVIS: Connect",
+        "command": "jarvis_connect"
+    },
+    {
+        "caption": "JARVIS: Disconnect",
+        "command": "jarvis_disconnect"
+    },
+    {
+        "caption": "JARVIS: Refresh Ops",
+        "command": "jarvis_refresh"
+    },
+    {
+        "caption": "JARVIS: Show Ops",
+        "command": "jarvis_show_ops"
+    },
+    {
+        "caption": "JARVIS: Show Log",
+        "command": "jarvis_show_log"
+    }
+]
