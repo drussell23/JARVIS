@@ -130,7 +130,9 @@ async def scenario_compactor_legacy_drops_intent() -> Scenario:
     """Legacy compactor drops the intent-rich oldest entry."""
     s = Scenario("ContextCompactor legacy drops intent-rich oldest")
     _clean_state()
-    os.environ.pop("JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", None)
+    # Post-graduation the default is ON; explicitly disable to exercise
+    # the legacy path.
+    os.environ["JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED"] = "false"
     compactor = ContextCompactor(preservation_scorer=PreservationScorer())
     entries = [
         {"type": "user", "content": "focus on backend/hot.py", "id": "m0"},

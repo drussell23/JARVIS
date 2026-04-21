@@ -679,28 +679,36 @@ async def scenario_manifest_audit_completeness() -> Scenario:
     return s
 
 
-async def scenario_backward_compat_with_flags_off() -> Scenario:
-    """With both flags OFF, the legacy paths are the ONLY ones running."""
-    s = Scenario("Backward-compat: flags off → pure legacy behavior")
+async def scenario_backward_compat_with_flags_explicit_false() -> Scenario:
+    """Explicit =false kill switches force pure legacy behavior."""
+    s = Scenario("Kill switches (=false) force pure legacy behavior")
     _clean_state()
-    os.environ.pop("JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", None)
-    os.environ.pop("JARVIS_TOOL_LOOP_SCORER_ENABLED", None)
-
-    compactor = ContextCompactor(preservation_scorer=PreservationScorer())
-    entries = [
-        {"type": "user", "content": f"t{i}", "id": f"m{i}"} for i in range(20)
-    ]
-    cfg = CompactionConfig(max_context_entries=5, preserve_count=3)
-    result = await compactor.compact(entries, cfg, op_id="op-compat")
-    s.check(
-        "compactor result returned",
-        result.entries_before == 20 and result.entries_compacted > 0,
-    )
-    s.check(
-        "no manifest recorded (scorer path inactive)",
-        manifest_for("op-compat").latest() is None,
-    )
-    _clean_state()
+    # Post-graduation: defaults are on. Must set =false explicitly to
+    # exercise the kill-switch path.
+    os.environ["JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED"] = "false"
+    os.environ["JARVIS_TOOL_LOOP_SCORER_ENABLED"] = "false"
+    try:
+        compactor = ContextCompactor(
+            preservation_scorer=PreservationScorer(),
+        )
+        entries = [
+            {"type": "user", "content": f"t{i}", "id": f"m{i}"}
+            for i in range(20)
+        ]
+        cfg = CompactionConfig(max_context_entries=5, preserve_count=3)
+        result = await compactor.compact(entries, cfg, op_id="op-compat")
+        s.check(
+            "compactor result returned",
+            result.entries_before == 20 and result.entries_compacted > 0,
+        )
+        s.check(
+            "no manifest recorded (scorer path kill-switched off)",
+            manifest_for("op-compat").latest() is None,
+        )
+    finally:
+        os.environ.pop("JARVIS_CONTEXT_COMPACTOR_SCORER_ENABLED", None)
+        os.environ.pop("JARVIS_TOOL_LOOP_SCORER_ENABLED", None)
+        _clean_state()
     return s
 
 
@@ -772,7 +780,7 @@ ALL_SCENARIOS = [
     scenario_pin_lifecycle_under_session,
     scenario_semantic_dedup_under_load,
     scenario_manifest_audit_completeness,
-    scenario_backward_compat_with_flags_off,
+    scenario_backward_compat_with_flags_explicit_false,
     scenario_repeated_compaction_stability,
     scenario_authority_invariant_sanity,
 ]
