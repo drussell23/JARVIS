@@ -576,6 +576,96 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"write"}),
     ),
+    # ---- Scratchpad tools (Gap #5: structured to-do lists) --------------
+    # Three deny-by-default tools wrapping the per-op TaskBoard
+    # primitive. Read-only capability set (empty frozenset) — these
+    # ONLY mutate ephemeral in-process state; never touch repo,
+    # subprocess, or network. Authority posture: observability +
+    # scratchpad only. NOTHING branches on task state.
+    "task_create": ToolManifest(
+        name="task_create", version="1.0",
+        description=(
+            "Create a new task on the per-op TaskBoard (pending state). "
+            "Deny-by-default — gated by JARVIS_TOOL_TASK_BOARD_ENABLED. "
+            "Read-only w.r.t. repo/subprocess/network; only touches "
+            "ephemeral in-process state. Returns structured JSON: "
+            "{task_id, op_id, state, title, body, sequence, "
+            "active_task_id, board_size}."
+        ),
+        arg_schema={
+            "title": {
+                "type": "string",
+                "description": (
+                    "Short non-empty one-liner describing the task. "
+                    "Bounded by JARVIS_TASK_BOARD_MAX_TITLE_LEN (200)."
+                ),
+            },
+            "body": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "Optional longer description. Bounded by "
+                    "JARVIS_TASK_BOARD_MAX_BODY_LEN (2000)."
+                ),
+            },
+        },
+        capabilities=frozenset(),  # read-only, no side effects on any surface
+    ),
+    "task_update": ToolManifest(
+        name="task_update", version="1.0",
+        description=(
+            "Update title/body OR transition state of an existing task. "
+            "Two shapes: (1) content update via title/body (no action "
+            "field); (2) state transition via action ∈ {start, cancel} "
+            "(no title/body). Terminal-state tasks cannot be updated. "
+            "Deny-by-default — gated by JARVIS_TOOL_TASK_BOARD_ENABLED."
+        ),
+        arg_schema={
+            "task_id": {
+                "type": "string",
+                "description": "ID returned by task_create (task-{op_id}-NNNN)",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["start", "cancel"],
+                "description": (
+                    "State transition. 'start' takes pending → in_progress "
+                    "(single-focus: only one active at a time). 'cancel' "
+                    "moves any non-terminal state → cancelled. Mutually "
+                    "exclusive with title/body fields."
+                ),
+            },
+            "title": {
+                "type": "string",
+                "description": "Updated title. Only valid without action.",
+            },
+            "body": {
+                "type": "string",
+                "description": "Updated body. Only valid without action.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional reason, meaningful only with action=cancel",
+            },
+        },
+        capabilities=frozenset(),
+    ),
+    "task_complete": ToolManifest(
+        name="task_complete", version="1.0",
+        description=(
+            "Mark a task as completed. Valid from pending (quick-win "
+            "path) or in_progress. Terminal-state tasks cannot be "
+            "re-completed. Deny-by-default — gated by "
+            "JARVIS_TOOL_TASK_BOARD_ENABLED."
+        ),
+        arg_schema={
+            "task_id": {
+                "type": "string",
+                "description": "ID returned by task_create",
+            },
+        },
+        capabilities=frozenset(),
+    ),
     # ---- Observability tools (Ticket #4: CC-parity stdout streaming) ----
     "monitor": ToolManifest(
         name="monitor", version="1.0",
@@ -2251,6 +2341,36 @@ class GoverningToolPolicy:
                     ),
                 )
 
+        # Rule 17: task_create / task_update / task_complete
+        # — Gap #5 Slice 2 scratchpad tools. **Deny-by-default** via
+        # JARVIS_TOOL_TASK_BOARD_ENABLED. Structural arg validation
+        # shared with the handler (defense in depth). These tools
+        # have NO side effects on the repo / subprocess / network —
+        # they only mutate per-op ephemeral TaskBoard state. Authority
+        # posture: scratchpad + observability only; nothing
+        # downstream branches on task state (Manifesto §1, §6).
+        elif name in ("task_create", "task_update", "task_complete"):
+            from backend.core.ouroboros.governance.task_tool import (
+                classify_task_args,
+                task_tools_enabled,
+            )
+            if not task_tools_enabled():
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.task_tools_disabled",
+                    detail=(
+                        "JARVIS_TOOL_TASK_BOARD_ENABLED must be 'true' "
+                        "(deny-by-default)"
+                    ),
+                )
+            args_err = classify_task_args(name, call.arguments)
+            if args_err is not None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.task_bad_args",
+                    detail=args_err,
+                )
+
         return PolicyResult(decision=PolicyDecision.ALLOW, reason_code="")
 
 
@@ -2436,7 +2556,10 @@ class AsyncProcessToolBackend:
                 "ask_human",
                 "delegate_to_agent",
                 "dispatch_subagent",
-                "monitor",  # Ticket #4 Slice 2 — BackgroundMonitor-backed
+                "monitor",         # Ticket #4 Slice 2
+                "task_create",     # Gap #5 Slice 2 — TaskBoard-backed
+                "task_update",     # Gap #5 Slice 2
+                "task_complete",   # Gap #5 Slice 2
             ):
                 return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
             return await self._run_sync_tool_async(
@@ -2623,6 +2746,19 @@ class AsyncProcessToolBackend:
                     run_monitor_tool,
                 )
                 return await run_monitor_tool(
+                    call, policy_ctx, timeout, cap,
+                )
+
+            elif call.name in ("task_create", "task_update", "task_complete"):
+                # Gap #5 Slice 2 — TaskBoard-backed scratchpad tools.
+                # Deny-by-default master env gate + structural arg
+                # validation already fired at GoverningToolPolicy.evaluate();
+                # the handler re-validates args defensively and dispatches
+                # to the single canonical TaskBoard API.
+                from backend.core.ouroboros.governance.task_tool import (
+                    run_task_tool,
+                )
+                return await run_task_tool(
                     call, policy_ctx, timeout, cap,
                 )
 
