@@ -1,8 +1,8 @@
 {
   "name": "jarvis-observability",
   "displayName": "JARVIS Observability",
-  "description": "Read-only sidebar + live event stream for JARVIS Ouroboros governance loop. Part of the Gap #6 IDE-integration surface (Slice 3).",
-  "version": "0.1.0",
+  "description": "Read-only sidebar + live event stream for JARVIS Ouroboros governance loop. Part of the Gap #6 IDE-integration surface (Slice 3 VS Code / Cursor + Slice 4 graduation).",
+  "version": "0.2.0",
   "publisher": "drussell23",
   "private": true,
   "engines": {
@@ -12,6 +12,16 @@
   "license": "UNLICENSED",
   "categories": [
     "Other"
+  ],
+  "keywords": [
+    "jarvis",
+    "ouroboros",
+    "observability",
+    "agent",
+    "cursor",
+    "vscode",
+    "sse",
+    "readonly"
   ],
   "activationEvents": [
     "onStartupFinished"
