@@ -2340,8 +2340,24 @@ class GovernedOrchestrator:
             # task_complexity, plan_result.complexity) matches the filters.
             # plan_result.complexity takes precedence because the model
             # has just reasoned about the actual scope during PLAN phase.
+            # Problem #7 Slice 2: plan-mode force-review override.
+            # When JARVIS_PLAN_APPROVAL_MODE=true (or ctx opt-in)
+            # the operator has explicitly asked to halt EVERY op
+            # for review, regardless of the complexity heuristic.
+            # Late import keeps plan_approval optional — if the
+            # module is unavailable for any reason, plan mode is
+            # treated as off. Never raises.
+            _plan_mode_force = False
+            try:
+                from backend.core.ouroboros.governance.plan_approval import (
+                    should_force_plan_review as _should_force_plan_review,
+                )
+                _plan_mode_force = _should_force_plan_review(ctx)
+            except Exception:  # noqa: BLE001 — optional dep
+                _plan_mode_force = False
             _should_gate = (
                 _plan_review_required_now
+                or _plan_mode_force
                 or _route in _gate_routes
                 or _task_cx in _gate_complexities
                 or _plan_cx in _gate_complexities
@@ -2410,6 +2426,60 @@ class GovernedOrchestrator:
                 except Exception:
                     pass
 
+                # Problem #7 Slice 2: shadow-register this plan with
+                # the PlanApprovalController so REPL (/plan pending,
+                # /plan show) and IDE observability (/observability/
+                # plans, SSE plan_* events) surface it. The primary
+                # approval authority stays with self._approval_provider;
+                # this is a read-only mirror for operator visibility.
+                # Best-effort: any failure (module unavailable,
+                # duplicate op_id, etc.) silently no-ops — the actual
+                # approval path is unaffected.
+                _plan_mirror_registered = False
+                try:
+                    from backend.core.ouroboros.governance.plan_approval import (
+                        get_default_controller as _get_pa_controller,
+                    )
+                    _pa_controller = _get_pa_controller()
+                    if _pa_controller.snapshot(ctx.op_id) is None:
+                        _pa_controller.request_approval(
+                            ctx.op_id,
+                            {
+                                "markdown": _plan_markdown,
+                                "description": getattr(ctx, "description", ""),
+                                "target_files": list(
+                                    getattr(ctx, "target_files", []) or [],
+                                ),
+                                "approach": getattr(
+                                    _plan_result, "approach", "",
+                                ) or "",
+                                "complexity": getattr(
+                                    _plan_result, "complexity", "",
+                                ) or "",
+                                "ordered_changes": list(
+                                    getattr(
+                                        _plan_result, "ordered_changes", [],
+                                    ) or [],
+                                ),
+                                "risk_factors": list(
+                                    getattr(
+                                        _plan_result, "risk_factors", [],
+                                    ) or [],
+                                ),
+                                "test_strategy": getattr(
+                                    _plan_result, "test_strategy", "",
+                                ) or "",
+                            },
+                            timeout_s=_plan_gate_timeout,
+                        )
+                        _plan_mirror_registered = True
+                except Exception:  # noqa: BLE001 — best-effort mirror
+                    logger.debug(
+                        "[Orchestrator] PlanApproval mirror register "
+                        "best-effort failed for op=%s", ctx.op_id,
+                        exc_info=True,
+                    )
+
                 try:
                     _plan_req_id = await self._approval_provider.request_plan(
                         ctx, _plan_markdown,
@@ -2450,6 +2520,48 @@ class GovernedOrchestrator:
                     _plan_decision = None  # type: ignore[assignment]
 
                 if _plan_decision is not None:
+                    # Problem #7 Slice 2: mirror the decision onto
+                    # the PlanApprovalController shadow so REPL /
+                    # IDE views see the terminal transition. Best-
+                    # effort; never raises.
+                    if _plan_mirror_registered:
+                        try:
+                            from backend.core.ouroboros.governance.plan_approval import (
+                                get_default_controller as _get_pa_ctrl,
+                                PlanApprovalStateError as _PAStateError,
+                            )
+                            _pa_mirror_ctrl = _get_pa_ctrl()
+                            _mirror_approver = (
+                                getattr(_plan_decision, "approver", None)
+                                or "orchestrator"
+                            )
+                            try:
+                                if _plan_decision.status is ApprovalStatus.APPROVED:
+                                    _pa_mirror_ctrl.approve(
+                                        ctx.op_id, reviewer=_mirror_approver,
+                                    )
+                                elif _plan_decision.status is ApprovalStatus.REJECTED:
+                                    _pa_mirror_ctrl.reject(
+                                        ctx.op_id,
+                                        reason=getattr(
+                                            _plan_decision, "reason", "",
+                                        ) or "",
+                                        reviewer=_mirror_approver,
+                                    )
+                                # EXPIRED path: the controller's own
+                                # timeout already auto-rejects; no
+                                # additional mirror call needed.
+                            except _PAStateError:
+                                # Already terminal — the controller's
+                                # timeout_task may have expired the
+                                # shadow first. Harmless; skip.
+                                pass
+                        except Exception:  # noqa: BLE001 — best-effort
+                            logger.debug(
+                                "[Orchestrator] PlanApproval mirror terminal "
+                                "propagation best-effort failed for op=%s",
+                                ctx.op_id, exc_info=True,
+                            )
                     if _plan_decision.status is ApprovalStatus.REJECTED:
                         _reject_reason = (
                             getattr(_plan_decision, "reason", "") or ""

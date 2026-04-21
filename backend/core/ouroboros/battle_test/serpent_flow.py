@@ -3256,6 +3256,31 @@ class SerpentREPL:
                         await self._handle_attach(line)
                         continue
 
+                    # Problem #7 Slice 3 — /plan dispatcher (plan
+                    # approval operator modality). Routes /plan
+                    # subcommands (mode / pending / show / approve /
+                    # reject / history / help) through the pure
+                    # dispatcher. matched=False falls through to the
+                    # next handler. Never raises into the REPL.
+                    if line.startswith("/plan"):
+                        try:
+                            from backend.core.ouroboros.governance.plan_approval_repl import (
+                                dispatch_plan_command,
+                            )
+                            _pa_result = dispatch_plan_command(line)
+                            if _pa_result.matched:
+                                self._flow.console.print(
+                                    _pa_result.text, highlight=False,
+                                )
+                                continue
+                        except Exception as exc:  # noqa: BLE001
+                            self._flow.console.print(
+                                f"  [{_C['death']}]/plan dispatch error: "
+                                f"{exc}[/{_C['death']}]",
+                                highlight=False,
+                            )
+                            continue
+
                     # ConversationBridge capture (V1: user turns only).
                     # Any line that fell through the built-in dispatch is
                     # either free-text for the external handler or an

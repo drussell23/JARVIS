@@ -1,0 +1,103 @@
+{
+  "steps": [
+    {
+      "name": "env_pinned_on",
+      "ts": 1776764418.061074,
+      "mode_enabled": true
+    },
+    {
+      "name": "bridge_installed",
+      "ts": 1776764418.061173,
+      "subscriber": true
+    },
+    {
+      "name": "op_plan_pending",
+      "ts": 1776764418.061331,
+      "op_id": "op-happy",
+      "pending_count": 1
+    },
+    {
+      "name": "repl_approve_dispatched",
+      "ts": 1776764418.209555,
+      "op_id": "op-happy",
+      "ok": true,
+      "matched": true
+    },
+    {
+      "name": "op_plan_resolved",
+      "ts": 1776764418.210461,
+      "op_id": "op-happy",
+      "state": "approved",
+      "reviewer": "repl",
+      "approved": true,
+      "reason": ""
+    },
+    {
+      "name": "op_happy_completed",
+      "ts": 1776764418.2105012,
+      "op_id": "op-happy",
+      "generated": true,
+      "reviewed": true,
+      "outcome": "approved"
+    },
+    {
+      "name": "op_plan_pending",
+      "ts": 1776764418.2107542,
+      "op_id": "op-reject",
+      "pending_count": 1
+    },
+    {
+      "name": "repl_reject_dispatched",
+      "ts": 1776764418.386283,
+      "op_id": "op-reject",
+      "ok": true,
+      "matched": true
+    },
+    {
+      "name": "op_plan_resolved",
+      "ts": 1776764418.3943381,
+      "op_id": "op-reject",
+      "state": "rejected",
+      "reviewer": "repl",
+      "approved": false,
+      "reason": "live-fire-wrong-approach"
+    },
+    {
+      "name": "op_reject_blocked",
+      "ts": 1776764418.3944042,
+      "op_id": "op-reject",
+      "generated": false,
+      "reviewed": true,
+      "outcome": "rejected",
+      "reason": "live-fire-wrong-approach"
+    },
+    {
+      "name": "broker_frames_captured",
+      "ts": 1776764418.3944268,
+      "count": 4,
+      "types": [
+        "plan_pending",
+        "plan_approved",
+        "plan_pending",
+        "plan_rejected"
+      ],
+      "ops": [
+        "op-happy",
+        "op-happy",
+        "op-reject",
+        "op-reject"
+      ]
+    },
+    {
+      "name": "plan_history_ok",
+      "ts": 1776764418.399838,
+      "text_len": 202
+    },
+    {
+      "name": "plan_pending_clean",
+      "ts": 1776764418.400007,
+      "text_excerpt": "[dim]No pending plans.[/dim]"
+    }
+  ],
+  "failures": []
+}
