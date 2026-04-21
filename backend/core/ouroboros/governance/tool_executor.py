@@ -188,6 +188,49 @@ class ToolBackend(Protocol):
     # ToolLoopCoordinator accesses it via getattr with a None fallback.
 
 
+# ---------------------------------------------------------------------------
+# Inline-permission hook helpers (Slice 2 of inline-permission arc)
+# ---------------------------------------------------------------------------
+# These helpers translate a ToolCall into the structured inputs the
+# InlinePermissionMiddleware expects. Kept at module scope so they have
+# zero per-instance state and can be unit-tested without constructing a
+# ToolLoopCoordinator.
+
+_INLINE_FILE_ARG_KEYS: Tuple[str, ...] = (
+    "file_path", "path", "target", "target_path", "dest", "destination",
+)
+
+
+def _inline_extract_target_path(tc: "ToolCall") -> str:
+    """Return the repo-relative target path for a file-scoped tool, or ''."""
+    args = tc.arguments or {}
+    for k in _INLINE_FILE_ARG_KEYS:
+        v = args.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def _inline_extract_fingerprint(tc: "ToolCall") -> str:
+    """Return a deterministic short-ish summary of arguments.
+
+    * ``bash`` → the command string.
+    * file-scoped tools → the target path.
+    * fallback → sorted-keys JSON dump (truncated).
+    """
+    args = tc.arguments or {}
+    if tc.name == "bash":
+        cmd = args.get("command") or args.get("cmd") or ""
+        return str(cmd)
+    target = _inline_extract_target_path(tc)
+    if target:
+        return target
+    try:
+        return json.dumps(args, sort_keys=True)[:1000]
+    except Exception:  # noqa: BLE001
+        return str(args)[:1000]
+
+
 def _format_denial(tool_name: str, policy_result: PolicyResult) -> str:
     safe_name = tool_name.replace("\n", "\\n").replace("\r", "\\r")
     safe_reason = policy_result.reason_code.replace("\n", "\\n").replace("\r", "\\r")
@@ -3658,6 +3701,90 @@ class ToolLoopCoordinator:
             final_write_reserve_s=self._final_write_reserve_s,
         )
 
+    async def _maybe_inline_permission_check(
+        self,
+        tc: "ToolCall",
+        policy_ctx: "PolicyContext",
+        call_id: str,
+    ) -> Optional[Tuple[str, str]]:
+        """Slice 2 hook: evaluate inline permission for one tool call.
+
+        Returns ``None`` when the call should proceed (master switch off,
+        gate SAFE, or operator ALLOW). Returns ``(reason_code, detail)``
+        when the call must be DENIED by the outer loop — the caller turns
+        this into a synthetic :class:`PolicyResult` and records a
+        ``POLICY_DENIED`` ToolExecutionRecord, mirroring the existing
+        upstream-DENY path shape for observability parity.
+
+        Fails closed on any unexpected error: if the middleware itself
+        raises, we deny the call rather than silently allowing. §7.
+        """
+        try:
+            from backend.core.ouroboros.governance.inline_permission_prompt import (  # noqa: E501
+                get_default_middleware,
+                inline_permission_enabled,
+                posture_for_route,
+            )
+            from backend.core.ouroboros.governance.inline_permission import (
+                UpstreamPolicy,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[ToolLoop] inline_permission unavailable: %s", exc,
+            )
+            return None
+        if not inline_permission_enabled():
+            return None
+        middleware = getattr(self, "_inline_middleware_override", None)
+        if middleware is None:
+            try:
+                middleware = get_default_middleware()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[ToolLoop] default middleware unavailable; failing closed: %s",
+                    exc,
+                )
+                return (
+                    "inline_permission:init_error",
+                    f"default middleware unavailable: {type(exc).__name__}",
+                )
+
+        arg_fp = _inline_extract_fingerprint(tc)
+        target = _inline_extract_target_path(tc)
+        # ToolLoopCoordinator runs only under IMMEDIATE/STANDARD/COMPLEX
+        # routes (BG/SPEC skip the tool loop — see CLAUDE.md). Hardcode
+        # INTERACTIVE; update when BG/SPEC gain a tool path.
+        route = posture_for_route("standard")
+        try:
+            outcome = await middleware.check(
+                op_id=policy_ctx.op_id,
+                call_id=call_id,
+                tool=tc.name,
+                arg_fingerprint=arg_fp,
+                target_path=target,
+                route=route,
+                upstream_decision=UpstreamPolicy.SAFE_AUTO,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[ToolLoop] inline_permission middleware raised; denying: %s",
+                exc,
+            )
+            return (
+                "inline_permission:middleware_error",
+                f"check raised: {type(exc).__name__}",
+            )
+        if outcome.proceed:
+            return None
+        return (
+            f"inline_permission:{outcome.source.value}",
+            outcome.reason or outcome.rule_id or "inline denied",
+        )
+
+    def set_inline_middleware_override(self, middleware: Any) -> None:
+        """Test / orchestrator seam. None restores default singleton."""
+        self._inline_middleware_override = middleware
+
     async def run(
         self,
         prompt: str,
@@ -3888,6 +4015,45 @@ class ToolLoopCoordinator:
                         status="denied",
                     )
                 else:
+                    # --- Slice 2: inline-permission middleware (env-gated) ---
+                    # Runs AFTER PolicyEngine ALLOW, BEFORE pending_execs.
+                    # Defaults OFF via JARVIS_INLINE_PERMISSION_ENABLED; when
+                    # enabled, synthesises a PolicyResult.DENY if the operator
+                    # denies, the prompt times out, or the gate BLOCKs a shape
+                    # upstream policy missed. Never weakens an upstream DENY
+                    # (that branch returned earlier).
+                    inline_deny = await self._maybe_inline_permission_check(
+                        tc, policy_ctx, call_id,
+                    )
+                    if inline_deny is not None:
+                        reason_code, detail = inline_deny
+                        records.append(ToolExecutionRecord(
+                            schema_version="tool.exec.v1",
+                            op_id=op_id, call_id=call_id,
+                            round_index=round_index,
+                            tool_name=tc.name, tool_version=tool_version,
+                            arguments_hash=_compute_args_hash(tc.arguments),
+                            repo=repo,
+                            policy_decision=PolicyDecision.DENY.value,
+                            policy_reason_code=reason_code,
+                            started_at_ns=None, ended_at_ns=None,
+                            duration_ms=None,
+                            output_bytes=0, error_class=None,
+                            status=ToolExecStatus.POLICY_DENIED,
+                        ))
+                        synth = PolicyResult(
+                            decision=PolicyDecision.DENY,
+                            reason_code=reason_code, detail=detail,
+                        )
+                        prompt_appendix += _format_denial(tc.name, synth)
+                        self._notify_tool_call(
+                            op_id=op_id, tool_name=tc.name,
+                            round_index=round_index,
+                            args_summary=self._args_summary_for(tc),
+                            result_preview=f"policy_denied: {reason_code}",
+                            status="denied",
+                        )
+                        continue
                     # Pre-execution notification (status="" → "start" event)
                     self._notify_tool_call(
                         op_id=op_id,
