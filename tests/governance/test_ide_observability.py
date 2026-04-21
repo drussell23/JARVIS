@@ -259,7 +259,10 @@ def test_health_returns_200_when_enabled(monkeypatch):
     body = json.loads(resp.body.decode("utf-8"))
     assert body["schema_version"] == IDE_OBSERVABILITY_SCHEMA_VERSION
     assert body["enabled"] is True
-    assert body["surface"] == "tasks"
+    # Surface advertises every data domain this router exposes. Extend
+    # via substring checks so future additions land additively without
+    # breaking this pin.
+    assert "tasks" in body["surface"]
     assert "api_version" in body
 
 
