@@ -142,16 +142,6 @@ class OpsController(
     }
 }
 
-/**
- * Placeholder — real implementation would open a tool-window
- * content tab or an editor preview. Exposed as an object so
- * tests can swap it for a capture-on-call double.
- */
-object OpDetailRenderer {
-    @Volatile
-    var sink: (TaskDetail) -> Unit = { /* plugin.xml wiring */ }
-
-    fun render(detail: TaskDetail) {
-        sink(detail)
-    }
-}
+// OpDetailRenderer is defined in OpDetailRenderer.kt — a separate
+// object so the pure HTML renderer can be exercised by the test
+// suite without booting the IntelliJ Platform.

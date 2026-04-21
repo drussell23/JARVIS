@@ -13,28 +13,37 @@ import javax.swing.JPanel
 import javax.swing.ListSelectionModel
 
 /**
- * Tool window factory — registers the "JARVIS Ops" sidebar.
+ * Tool window factory — registers the "JARVIS Ops" sidebar with
+ * two content tabs:
  *
- * The sidebar renders a live list of op IDs backed by the
- * [OpsController]. Selecting an op dispatches to
- * [OpDetailRenderer] to show the task projection in a dedicated
- * content tab.
+ *   * **Ops**    — live list of op IDs backed by [OpsController]
+ *   * **Detail** — HTML-rendered [TaskDetail] for the selected op
  *
  * All UI updates dispatch onto the EDT via
  * [ApplicationManager.invokeLater] so the SSE consumer thread
- * never touches Swing directly.
+ * never touches Swing directly. [OpDetailRenderer.sink] is
+ * installed by [OpDetailPanel] — the controller calls
+ * `OpDetailRenderer.render(detail)` and the panel updates on its
+ * own.
  */
 class OpsToolWindowFactory : ToolWindowFactory {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
-        val panel = JPanel(BorderLayout())
+        val opsPanel = JPanel(BorderLayout())
         val listModel = DefaultListModel<String>()
         val opList = JList(listModel).apply {
             selectionMode = ListSelectionModel.SINGLE_SELECTION
         }
-        panel.add(JBScrollPane(opList), BorderLayout.CENTER)
+        opsPanel.add(JBScrollPane(opList), BorderLayout.CENTER)
 
-        val content = ContentFactory.getInstance().createContent(panel, "Ops", false)
-        toolWindow.contentManager.addContent(content)
+        val detailPanel = OpDetailPanel()
+
+        val contentFactory = ContentFactory.getInstance()
+        toolWindow.contentManager.addContent(
+            contentFactory.createContent(opsPanel, "Ops", false)
+        )
+        toolWindow.contentManager.addContent(
+            contentFactory.createContent(detailPanel, "Detail", false)
+        )
 
         val controller = OpsController(
             settings = JarvisSettings.getInstance(),
@@ -50,7 +59,6 @@ class OpsToolWindowFactory : ToolWindowFactory {
                 opList.selectedValue?.let { controller.openOp(it) }
             }
         }
-        // Autostart if the plugin is enabled in settings.
         if (JarvisSettings.getInstance().enabled) {
             controller.start()
         }
