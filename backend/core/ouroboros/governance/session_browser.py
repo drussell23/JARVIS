@@ -526,7 +526,9 @@ class SessionBrowser:
 _default_index: Optional[SessionIndex] = None
 _default_bookmarks: Optional[BookmarkStore] = None
 _default_browser: Optional[SessionBrowser] = None
-_singleton_lock = threading.Lock()
+# RLock so `get_default_session_browser` can call `get_default_session_index`
+# / `get_default_bookmark_store` without deadlocking on the singleton lock.
+_singleton_lock = threading.RLock()
 
 
 def get_default_session_index() -> SessionIndex:
@@ -858,6 +860,8 @@ def _session_bookmarks(
 def _session_replay(
     browser: SessionBrowser, session_id: str,
 ) -> SessionDispatchResult:
+    # REPL expects fresh state — rescan before lookup.
+    browser.index.scan()
     path = browser.replay_html_path(session_id)
     if path is None:
         return SessionDispatchResult(
