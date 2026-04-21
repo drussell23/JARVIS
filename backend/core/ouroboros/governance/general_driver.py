@@ -42,6 +42,7 @@ stays None and ``_execute_body`` returns the existing
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -168,7 +169,14 @@ def final_answer_to_exec_trace(
 def _failure_exec_trace(
     *, status: str, raw_output: str, provider_used: str = "llm_driver",
 ) -> Dict[str, Any]:
-    """Uniform shape for driver-side failures."""
+    """Uniform shape for driver-side failures that occur BEFORE any
+    tool activity (provider resolution, backend init, policy init).
+
+    For failures that occur AFTER the tool loop has started running,
+    use ``_build_partial_trace`` inside ``run_general_tool_loop`` — it
+    enriches this baseline shape with whatever records the
+    ``ScopedToolBackend`` captured before the failure.
+    """
     return {
         "status": status,
         "raw_output": raw_output[:2048],
@@ -177,6 +185,14 @@ def _failure_exec_trace(
         "cost_usd": 0.0,
         "provider_used": provider_used,
         "fallback_triggered": False,
+        # Epoch 2 records-preservation fields — always present with
+        # zero defaults so the shape is uniform across every failure
+        # path. Downstream observers can count on these keys.
+        "mutations_count": 0,
+        "max_mutations": 0,
+        "mutation_records": [],
+        "call_records": [],
+        "tool_names": [],
     }
 
 
@@ -321,11 +337,26 @@ async def run_general_tool_loop(
                 f"{type(exc).__name__}: {str(exc)[:200]}"
             ),
         )
+    # Epoch 2: if the executor provided a state_mirror dict in the
+    # payload, the backend pushes live counters into it on every
+    # execute_async call. The executor's hard-kill wrapper reads this
+    # mirror to build a complete exec_trace even when the driver task
+    # is cancelled mid-loop — records never get zeroed.
+    state_mirror = payload.get("state_mirror")
+    if state_mirror is not None and not isinstance(state_mirror, dict):
+        state_mirror = None  # defensive — malformed payload
     scoped_backend = ScopedToolBackend(
         inner=inner_backend,
         gate=gate,
         max_mutations=max_mutations,
+        state_mirror=state_mirror,
     )
+    # Attach the backend reference to the mirror so the executor can
+    # also query it directly (belt-and-suspenders — the mirror dict
+    # carries the primitives, the ref lets the executor read anything
+    # else it might need later without a driver signature change).
+    if state_mirror is not None:
+        state_mirror["_scoped_backend_ref"] = scoped_backend
 
     # 4. Build a policy if caller didn't supply one (test-only path).
     effective_policy = policy
@@ -437,6 +468,71 @@ async def run_general_tool_loop(
         _parse_tool_call_response,
     )
 
+    # Epoch 2: uniform partial-trace builder. Every post-tool-loop
+    # failure path feeds through this so the exec_trace shape is
+    # identical regardless of where things went wrong — records
+    # preservation is structural, not ad-hoc. Closed over
+    # ``scoped_backend``/``primary_name``/``max_mutations`` so callers
+    # only supply status + raw_output + optional records.
+    def _build_partial_trace(
+        *,
+        status: str,
+        raw_output: str,
+        records: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build an exec_trace enriched with whatever the backend
+        observed before the failure point.
+
+        When ``records`` is provided (from a completed
+        ``ToolLoopCoordinator.run`` return), uses coordinator-side
+        counts. When ``records`` is None (tool loop was cancelled or
+        raised), falls back to the ``ScopedToolBackend.call_records``
+        authoritative log — those are captured at authorization time,
+        so they survive inner-backend hangs and CancelledError.
+        """
+        if records is not None:
+            _tcm = len(records)
+            _tnames = tuple(
+                getattr(r, "tool_name", "") for r in records
+                if getattr(r, "tool_name", "")
+            )
+        else:
+            # Backend's own log is authoritative when the coordinator
+            # didn't return. Count only authorized calls.
+            _tcm = sum(
+                1 for _n, _cid, status_s, _ts in scoped_backend.call_records
+                if status_s == "authorized"
+            )
+            _tnames = scoped_backend.tool_names
+        try:
+            from backend.core.ouroboros.governance.subagent_contracts import (
+                classify_tools,
+            )
+            _tdiv = len(classify_tools(_tnames))
+        except Exception:
+            _tdiv = len(set(_tnames))
+        return {
+            "status": status,
+            "raw_output": (raw_output or "")[:2048],
+            "tool_calls_made": _tcm,
+            "tool_diversity": _tdiv,
+            "cost_usd": 0.0,
+            "provider_used": primary_name,
+            "fallback_triggered": False,
+            # Epoch 2 records-preservation:
+            "mutations_count": scoped_backend.mutations_count,
+            "max_mutations": scoped_backend.max_mutations,
+            "mutation_records": [
+                {"tool": t, "call_id": c, "t_mono": ts}
+                for t, c, ts in scoped_backend.mutation_records
+            ],
+            "call_records": [
+                {"tool": n, "call_id": c, "status": s, "t_mono": ts}
+                for n, c, s, ts in scoped_backend.call_records
+            ],
+            "tool_names": list(_tnames),
+        }
+
     # 8. Run the tool loop.
     repo = str(invocation.get("primary_repo", "jarvis") or "jarvis")
 
@@ -451,21 +547,52 @@ async def run_general_tool_loop(
             risk_tier=None,  # GENERAL ignores risk_tier (scope is the gate)
             is_read_only=(max_mutations == 0),
         )
+    except asyncio.CancelledError:
+        # Epoch 2 / Ticket 9: the hard-kill wrapper at the executor
+        # is cancelling us. Emit a final audit-log line with the
+        # complete partial state BEFORE re-raising so the cancel
+        # propagates cleanly. The executor's state_mirror already
+        # carries everything operators need; this log is the
+        # secondary record in debug.log for post-mortem.
+        logger.warning(
+            "[GeneralDriver] CANCELLED sub=%s tool_calls=%d mutations=%d/%d "
+            "tool_names=%s mutation_records=%d call_records=%d "
+            "(hard-kill in progress — partial state preserved via state_mirror)",
+            sub_id,
+            sum(
+                1 for _n, _cid, s, _ts in scoped_backend.call_records
+                if s == "authorized"
+            ),
+            scoped_backend.mutations_count,
+            scoped_backend.max_mutations,
+            list(scoped_backend.tool_names),
+            len(scoped_backend.mutation_records),
+            len(scoped_backend.call_records),
+        )
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.info(
-            "[GeneralDriver] tool-loop error sub=%s exc=%s msg=%.200s",
-            sub_id, type(exc).__name__, str(exc),
+            "[GeneralDriver] tool-loop error sub=%s exc=%s mutations=%d/%d "
+            "tool_calls=%d msg=%.200s",
+            sub_id, type(exc).__name__,
+            scoped_backend.mutations_count, scoped_backend.max_mutations,
+            sum(
+                1 for _n, _cid, s, _ts in scoped_backend.call_records
+                if s == "authorized"
+            ),
+            str(exc),
         )
-        return _failure_exec_trace(
+        return _build_partial_trace(
             status="tool_loop_error",
             raw_output=(
                 f"ToolLoopCoordinator.run raised "
                 f"{type(exc).__name__}: {str(exc)[:512]}"
             ),
-            provider_used=primary_name,
+            records=None,  # coordinator.run didn't return — pull from backend
         )
 
-    # 9. Aggregate tool-loop metrics.
+    # 9. Aggregate tool-loop metrics (coordinator-side, authoritative
+    # on success path).
     tool_calls_made = len(records) if records else 0
     tool_names = tuple(
         getattr(r, "tool_name", "") for r in (records or ())
@@ -490,23 +617,21 @@ async def run_general_tool_loop(
     if final is None:
         logger.info(
             "[GeneralDriver] malformed-final sub=%s tool_calls=%d "
-            "final_text_head=%.200s",
-            sub_id, tool_calls_made, final_text or "",
+            "mutations=%d/%d final_text_head=%.200s",
+            sub_id, tool_calls_made,
+            scoped_backend.mutations_count, scoped_backend.max_mutations,
+            final_text or "",
         )
-        # Preserve tool-loop metrics even on malformed final so operator
-        # observability survives parse failure. _failure_exec_trace
-        # defaults tool_calls_made to 0; override here.
-        trace = _failure_exec_trace(
+        # Every field populated via the uniform helper — including
+        # mutation_records + call_records for post-mortem audit.
+        return _build_partial_trace(
             status="malformed_final",
             raw_output=final_text or "",
-            provider_used=primary_name,
+            records=list(records) if records else None,
         )
-        trace["tool_calls_made"] = tool_calls_made
-        trace["tool_diversity"] = tool_diversity
-        return trace
 
     # 11. Map to exec_trace and return.
-    return final_answer_to_exec_trace(
+    trace = final_answer_to_exec_trace(
         final,
         tool_calls_made=tool_calls_made,
         tool_diversity=tool_diversity,
@@ -514,3 +639,19 @@ async def run_general_tool_loop(
         provider_used=primary_name,
         raw_text=final_text,
     )
+    # Enrich the success-path trace with the same Epoch 2 records
+    # fields so downstream observers see a uniform shape regardless
+    # of status. Source of truth is the backend (authoritative across
+    # all paths).
+    trace["mutations_count"] = scoped_backend.mutations_count
+    trace["max_mutations"] = scoped_backend.max_mutations
+    trace["mutation_records"] = [
+        {"tool": t, "call_id": c, "t_mono": ts}
+        for t, c, ts in scoped_backend.mutation_records
+    ]
+    trace["call_records"] = [
+        {"tool": n, "call_id": c, "status": s, "t_mono": ts}
+        for n, c, s, ts in scoped_backend.call_records
+    ]
+    trace["tool_names"] = list(tool_names)
+    return trace

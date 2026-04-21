@@ -72,7 +72,8 @@ Safety invariants:
 from __future__ import annotations
 
 import logging
-from typing import Any, TYPE_CHECKING
+import time
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from backend.core.ouroboros.governance.scoped_tool_access import (
     _MUTATION_TOOLS,
@@ -111,6 +112,7 @@ class ScopedToolBackend:
         gate: ScopedToolGate,
         *,
         max_mutations: int = 0,
+        state_mirror: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Wrap ``inner`` backend with ``gate`` and a mutation budget.
 
@@ -129,11 +131,38 @@ class ScopedToolBackend:
             read-only semantics typically also set ``gate`` with
             ``read_only=True`` — both mechanisms layered give
             defense-in-depth.
+        state_mirror:
+            Optional shared-state dict the adapter pushes live
+            counters into on every ``execute_async``. The executor's
+            hard-kill wrapper reads this dict to build a partial
+            exec_trace on cancellation (Epoch 2 / Ticket 9). The
+            mirror is authoritative only for the executor's
+            post-cancel snapshot — the adapter's own properties are
+            always authoritative for in-process readers. Fields
+            populated: ``tool_calls_made``, ``tool_names``,
+            ``mutations_count``, ``max_mutations``,
+            ``mutation_records``, ``call_records``,
+            ``last_activity_mono``.
         """
         self._inner = inner
         self._gate = gate
         self._max_mutations = max(0, int(max_mutations))
         self._mutations_count = 0
+        # Per-mutation audit trail — each authorized mutation appends
+        # ``(tool_name, call_id, t_authorized_mono)``. Captures WHICH
+        # mutations happened under the budget, not just HOW MANY.
+        self._mutation_records: List[Tuple[str, str, float]] = []
+        # Every execute_async attempt (authorized or denied) appends
+        # ``(tool_name, call_id, status, t_mono)`` — status ∈
+        # {"authorized", "type_denied", "count_denied"}. Operators grep
+        # this on hard_kill to reconstruct the full authorization log.
+        self._call_records: List[Tuple[str, str, str, float]] = []
+        self._state_mirror = state_mirror
+        # Seed the mirror with our static config so readers see a
+        # well-formed dict even before the first tool call.
+        self._sync_state_mirror()
+
+    # --- properties -----------------------------------------------------
 
     @property
     def mutations_count(self) -> int:
@@ -141,7 +170,7 @@ class ScopedToolBackend:
 
         Exposed for exec_trace bookkeeping — the driver reads this on
         the hard_kill path so partial mutation records survive timeout
-        (Ticket 9 seam).
+        (Ticket 9 / Epoch 2).
         """
         return self._mutations_count
 
@@ -149,6 +178,66 @@ class ScopedToolBackend:
     def max_mutations(self) -> int:
         """Configured mutation budget (immutable after construction)."""
         return self._max_mutations
+
+    @property
+    def mutation_records(self) -> Tuple[Tuple[str, str, float], ...]:
+        """Immutable snapshot of authorized mutation records.
+
+        Each entry is ``(tool_name, call_id, t_authorized_mono)`` —
+        the timestamp is the ``time.monotonic()`` value at
+        authorization, not inner-call success. Returned as a tuple
+        to prevent accidental mutation via the snapshot.
+        """
+        return tuple(self._mutation_records)
+
+    @property
+    def call_records(self) -> Tuple[Tuple[str, str, str, float], ...]:
+        """Immutable snapshot of every authorization decision.
+
+        Each entry is ``(tool_name, call_id, status, t_mono)`` with
+        ``status`` ∈ ``{"authorized", "type_denied",
+        "count_denied"}``. Captures the full audit trail including
+        refused calls — critical for detecting adversarial models
+        that probe the cage.
+        """
+        return tuple(self._call_records)
+
+    @property
+    def tool_names(self) -> Tuple[str, ...]:
+        """Unique tool names seen in authorized calls (insertion order)."""
+        seen: Dict[str, None] = {}
+        for tool_name, _call_id, status, _ts in self._call_records:
+            if status == "authorized" and tool_name not in seen:
+                seen[tool_name] = None
+        return tuple(seen.keys())
+
+    # --- internals ------------------------------------------------------
+
+    def _sync_state_mirror(self) -> None:
+        """Push the current adapter state into ``self._state_mirror``
+        if one was provided. Idempotent — safe to call from every
+        execute_async. Uses a fresh list / tuple each time so
+        concurrent readers see a consistent snapshot."""
+        if self._state_mirror is None:
+            return
+        self._state_mirror["tool_calls_made"] = sum(
+            1 for _n, _cid, status, _ts in self._call_records
+            if status == "authorized"
+        )
+        self._state_mirror["tool_names"] = list(self.tool_names)
+        self._state_mirror["mutations_count"] = self._mutations_count
+        self._state_mirror["max_mutations"] = self._max_mutations
+        self._state_mirror["mutation_records"] = [
+            {"tool": t, "call_id": c, "t_mono": ts}
+            for t, c, ts in self._mutation_records
+        ]
+        self._state_mirror["call_records"] = [
+            {"tool": n, "call_id": c, "status": s, "t_mono": ts}
+            for n, c, s, ts in self._call_records
+        ]
+        self._state_mirror["last_activity_mono"] = (
+            self._call_records[-1][3] if self._call_records else 0.0
+        )
 
     async def execute_async(
         self,
@@ -174,6 +263,7 @@ class ScopedToolBackend:
         ``output``. The caller (``ToolLoopCoordinator``) will surface
         this back to the model via the normal denial-formatting path.
         """
+        t_now = time.monotonic()
         # Layer 1: type gate (allowlist / denylist / read-only).
         allowed, reason = self._gate.can_use(call.name)
         if not allowed:
@@ -184,6 +274,10 @@ class ScopedToolBackend:
                 ToolExecStatus,
                 ToolResult,
             )
+            self._call_records.append(
+                (call.name, policy_ctx.call_id, "type_denied", t_now),
+            )
+            self._sync_state_mirror()
             logger.info(
                 "[ScopedToolBackend] BLOCKED tool=%s reason=%s "
                 "op=%s call_id=%s (subagent-scope pre-linguistic gate)",
@@ -208,6 +302,10 @@ class ScopedToolBackend:
                     ToolExecStatus,
                     ToolResult,
                 )
+                self._call_records.append(
+                    (call.name, policy_ctx.call_id, "count_denied", t_now),
+                )
+                self._sync_state_mirror()
                 logger.info(
                     "[ScopedToolBackend] BLOCKED tool=%s reason=mutation_budget_exhausted "
                     "mutations_count=%d max_mutations=%d op=%s call_id=%s "
@@ -234,6 +332,18 @@ class ScopedToolBackend:
             # deliberate. It prevents a model from retrying a failing
             # mutation to eventually exceed the budget.
             self._mutations_count += 1
+            self._mutation_records.append(
+                (call.name, policy_ctx.call_id, t_now),
+            )
+
+        # Record the authorized call BEFORE delegating so if the inner
+        # backend hangs or raises, the audit trail still reflects that
+        # this call was authorized. Epoch 2: this is the single
+        # authoritative record the hard_kill path reads from.
+        self._call_records.append(
+            (call.name, policy_ctx.call_id, "authorized", t_now),
+        )
+        self._sync_state_mirror()
 
         return await self._inner.execute_async(call, policy_ctx, deadline)
 

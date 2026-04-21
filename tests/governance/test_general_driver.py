@@ -626,3 +626,301 @@ def test_final_to_exec_trace_non_completed_status_prefixed() -> None:
     )
     assert trace["status"] == "final_blocked_by_tools"
     assert trace["final_blocked_reason"] == "need edit_file but not allowed"
+
+
+# ---------------------------------------------------------------------------
+# Epoch 2 / Ticket 9 — records preservation across failure paths
+# ---------------------------------------------------------------------------
+
+def _epoch2_payload(tmp_path, *, state_mirror=None, max_mutations=0):
+    """Minimal payload for Epoch 2 driver tests. Populates allowed_tools
+    with a mix so the driver's ScopedToolBackend can distinguish
+    type/count paths."""
+    payload = {
+        "sub_id": "sub-epoch2-test",
+        "invocation": {
+            "operation_scope": ["src/"],
+            "allowed_tools": ["read_file", "edit_file"],
+            "max_mutations": max_mutations,
+            "parent_op_risk_tier": "NOTIFY_APPLY",
+            "invocation_reason": "epoch 2 records preservation test",
+            "goal": "describe something",
+            "primary_repo": "jarvis",
+        },
+        "project_root": str(tmp_path),
+        "primary_provider_name": "claude-api",
+        "fallback_provider_name": "",
+        "deadline": None,
+        "max_rounds": None,
+        "tool_timeout_s": None,
+    }
+    if state_mirror is not None:
+        payload["state_mirror"] = state_mirror
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_epoch2_failure_trace_carries_records_fields_uniformly(
+    tmp_path,
+) -> None:
+    """Epoch 2 driver test 1: even provider-resolution failures produce
+    an exec_trace with all records-preservation fields present and
+    zero-valued. Downstream observers can count on the keys."""
+    def _none_registry(name: str):
+        return None
+
+    trace = await run_general_tool_loop(
+        _epoch2_payload(tmp_path),
+        project_root=tmp_path,
+        provider_registry=_none_registry,
+    )
+    assert trace["status"] == "no_provider_wired"
+    # Records fields MUST be present with zero defaults.
+    for key in (
+        "mutations_count", "max_mutations",
+        "mutation_records", "call_records", "tool_names",
+    ):
+        assert key in trace, f"failure trace missing key {key!r}"
+    assert trace["mutations_count"] == 0
+    assert trace["max_mutations"] == 0
+    assert trace["mutation_records"] == []
+    assert trace["call_records"] == []
+    assert trace["tool_names"] == []
+
+
+@pytest.mark.asyncio
+async def test_epoch2_tool_loop_error_preserves_backend_records(
+    tmp_path, monkeypatch,
+) -> None:
+    """Epoch 2 driver test 2: when ToolLoopCoordinator.run raises, the
+    returned trace still carries whatever the ScopedToolBackend saw
+    before the failure. Mutation records + call records are NOT lost.
+
+    Implementation: patch ToolLoopCoordinator.run to simulate the
+    coordinator authorizing several backend calls then raising. We
+    do this by pre-populating the scoped_backend via a mock that
+    records N tool calls before the coordinator.run method itself
+    explodes. Since the driver constructs its own backend internally,
+    we monkey-patch the constructor instead to inject pre-seeded
+    records.
+    """
+    # Simpler path: intercept ToolLoopCoordinator.run to raise AFTER
+    # feeding a few authorized calls directly into the backend via
+    # the backend reference we stash on state_mirror.
+    state_mirror: dict = {}
+    payload = _epoch2_payload(
+        tmp_path, state_mirror=state_mirror, max_mutations=2,
+    )
+
+    # Provider resolves but the coordinator raises.
+    class _FakeProvider:
+        _client = object()
+        _model = "claude-sonnet-4-5-20250929"
+
+        def _ensure_client(self):
+            return None
+
+    def _registry(name: str):
+        return _FakeProvider()
+
+    from backend.core.ouroboros.governance import tool_executor as te
+
+    original_run = te.ToolLoopCoordinator.run
+
+    async def _fake_run(self, *args, **kwargs):
+        # Simulate mid-loop activity by directly dispatching through
+        # the backend (the driver has already constructed it; we get
+        # at it via the state_mirror the driver attached).
+        backend = state_mirror.get("_scoped_backend_ref")
+        assert backend is not None, (
+            "driver must attach _scoped_backend_ref before tool loop runs"
+        )
+        from backend.core.ouroboros.governance.tool_executor import (
+            PolicyContext, ToolCall,
+        )
+        from pathlib import Path as _P
+        pctx = PolicyContext(
+            repo="jarvis", repo_root=_P(tmp_path),
+            op_id="sub-epoch2-test",
+            call_id="sub-epoch2-test:r0:t0",
+            round_index=0, risk_tier=None, is_read_only=False,
+        )
+        # Authorize 1 read + 1 mutation through the real backend.
+        # The real inner backend is AsyncProcessToolBackend — but we
+        # want to avoid actually executing. So skip inner: just call
+        # into the backend's own record-append path by directly
+        # invoking the gate + state bookkeeping. Easiest: just
+        # construct fake call records via private attributes (test
+        # fixture — not production pattern).
+        import time as _time
+        backend._call_records.append(
+            ("read_file", "sub-epoch2-test:r0:t0", "authorized", _time.monotonic()),
+        )
+        backend._call_records.append(
+            ("edit_file", "sub-epoch2-test:r0:t1", "authorized", _time.monotonic()),
+        )
+        backend._mutations_count += 1
+        backend._mutation_records.append(
+            ("edit_file", "sub-epoch2-test:r0:t1", _time.monotonic()),
+        )
+        backend._sync_state_mirror()
+        # Now raise, simulating mid-loop failure.
+        raise RuntimeError("simulated mid-loop failure")
+
+    monkeypatch.setattr(te.ToolLoopCoordinator, "run", _fake_run)
+
+    trace = await run_general_tool_loop(
+        payload,
+        project_root=tmp_path,
+        provider_registry=_registry,
+    )
+    monkeypatch.setattr(te.ToolLoopCoordinator, "run", original_run)
+
+    assert trace["status"] == "tool_loop_error"
+    # Records preserved:
+    assert trace["tool_calls_made"] == 2
+    assert trace["mutations_count"] == 1
+    assert trace["max_mutations"] == 2
+    assert len(trace["mutation_records"]) == 1
+    assert trace["mutation_records"][0]["tool"] == "edit_file"
+    assert len(trace["call_records"]) == 2
+    assert "read_file" in trace["tool_names"]
+    assert "edit_file" in trace["tool_names"]
+
+
+@pytest.mark.asyncio
+async def test_epoch2_cancelled_error_reraises_after_logging(
+    tmp_path, monkeypatch, caplog,
+) -> None:
+    """Epoch 2 driver test 3: when the hard-kill wrapper cancels the
+    driver, the driver catches asyncio.CancelledError, emits a
+    WARNING-level audit log with the partial state, then re-raises.
+    The executor reads state_mirror to build the final exec_trace."""
+    import asyncio as _asyncio
+    import logging as _logging
+
+    state_mirror: dict = {}
+    payload = _epoch2_payload(
+        tmp_path, state_mirror=state_mirror, max_mutations=3,
+    )
+
+    class _FakeProvider:
+        _client = object()
+        _model = "claude-sonnet-4-5-20250929"
+
+        def _ensure_client(self):
+            return None
+
+    def _registry(name: str):
+        return _FakeProvider()
+
+    from backend.core.ouroboros.governance import tool_executor as te
+
+    async def _fake_run(self, *args, **kwargs):
+        backend = state_mirror.get("_scoped_backend_ref")
+        import time as _time
+        backend._call_records.append(
+            ("read_file", "c1", "authorized", _time.monotonic()),
+        )
+        backend._mutations_count += 1
+        backend._mutation_records.append(
+            ("edit_file", "c2", _time.monotonic()),
+        )
+        backend._call_records.append(
+            ("edit_file", "c2", "authorized", _time.monotonic()),
+        )
+        backend._sync_state_mirror()
+        raise _asyncio.CancelledError()
+
+    monkeypatch.setattr(te.ToolLoopCoordinator, "run", _fake_run)
+    caplog.set_level(
+        _logging.WARNING,
+        logger="backend.core.ouroboros.governance.general_driver",
+    )
+
+    with pytest.raises(_asyncio.CancelledError):
+        await run_general_tool_loop(
+            payload,
+            project_root=tmp_path,
+            provider_registry=_registry,
+        )
+
+    # State mirror carries the partial state for the executor.
+    assert state_mirror["tool_calls_made"] == 2
+    assert state_mirror["mutations_count"] == 1
+    assert len(state_mirror["call_records"]) == 2
+    # Audit log fired with the partial state.
+    cancel_lines = [
+        r for r in caplog.records
+        if "CANCELLED" in r.getMessage() and "GeneralDriver" in r.getMessage()
+    ]
+    assert cancel_lines, (
+        f"expected CANCELLED WARNING; got {[r.getMessage() for r in caplog.records]}"
+    )
+    msg = cancel_lines[0].getMessage()
+    assert "mutations=1/3" in msg
+    assert "tool_calls=2" in msg
+
+
+@pytest.mark.asyncio
+async def test_epoch2_success_trace_also_carries_records_fields(
+    tmp_path, monkeypatch,
+) -> None:
+    """Epoch 2 driver test 4: the success path (completed final
+    answer) also populates the Epoch 2 records fields. Shape is
+    uniform across every exit path — downstream observers never have
+    to handle two different schemas."""
+    state_mirror: dict = {}
+    payload = _epoch2_payload(
+        tmp_path, state_mirror=state_mirror, max_mutations=1,
+    )
+
+    class _FakeProvider:
+        _client = object()
+        _model = "claude-sonnet-4-5-20250929"
+
+        def _ensure_client(self):
+            return None
+
+    def _registry(name: str):
+        return _FakeProvider()
+
+    from backend.core.ouroboros.governance import tool_executor as te
+
+    async def _fake_run(self, *args, **kwargs):
+        backend = state_mirror.get("_scoped_backend_ref")
+        import time as _time
+        backend._call_records.append(
+            ("read_file", "c1", "authorized", _time.monotonic()),
+        )
+        backend._sync_state_mirror()
+        # Return a valid final-answer payload + empty records list
+        # (coordinator returns (final_text, records))
+        final_text = (
+            '{"schema_version":"general.final.v1",'
+            '"status":"completed","summary":"done",'
+            '"findings":[],"mutations_performed":0,"blocked_reason":""}'
+        )
+        # The tool loop's internal record type — a minimal shim.
+        class _R:
+            tool_name = "read_file"
+        return final_text, [_R()]
+
+    monkeypatch.setattr(te.ToolLoopCoordinator, "run", _fake_run)
+
+    trace = await run_general_tool_loop(
+        payload,
+        project_root=tmp_path,
+        provider_registry=_registry,
+    )
+    assert trace["status"] == "completed"
+    # Records fields MUST be present even on success.
+    assert "mutations_count" in trace
+    assert "max_mutations" in trace
+    assert "mutation_records" in trace
+    assert "call_records" in trace
+    assert "tool_names" in trace
+    assert trace["max_mutations"] == 1
+    assert trace["mutations_count"] == 0  # only a read
+    assert len(trace["call_records"]) == 1
+    assert trace["call_records"][0]["tool"] == "read_file"

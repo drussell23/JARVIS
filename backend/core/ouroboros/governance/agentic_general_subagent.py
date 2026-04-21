@@ -379,12 +379,25 @@ class AgenticGeneralSubagent:
         # LLM-driven mode (Step 2). Wrap in hard-kill pattern — GENERAL
         # must never hang the orchestrator.
         #
-        # Since the driver signature is future-defined and we're in the
-        # infrastructure cut, the wiring here is deliberately minimal:
-        # call llm_driver with the sanitized invocation, enforce the
-        # hard-kill budget, return whatever shape the driver produces
-        # (which the executor normalizes through the exec_trace dict).
+        # Epoch 2 / Ticket 9 — records preservation across hard-kill:
+        # a mutable ``state_mirror`` dict is shared with the driver
+        # (passed via payload). The ScopedToolBackend inside the
+        # driver pushes live counters into this dict on every tool
+        # call, so when the hard-kill wrapper fires we can snapshot
+        # the partial state BEFORE the task is cancelled. The
+        # previous implementation returned zeroed counters — every
+        # authorized tool call and every authorized mutation was
+        # lost. Now the post-mortem has the complete audit trail.
         runner = self._llm_driver
+        state_mirror: Dict[str, Any] = {
+            "tool_calls_made": 0,
+            "tool_names": [],
+            "mutations_count": 0,
+            "max_mutations": int(invocation.get("max_mutations", 0) or 0),
+            "mutation_records": [],
+            "call_records": [],
+            "last_activity_mono": 0.0,
+        }
 
         async def _await_driver() -> Dict[str, Any]:
             # Enrich the payload with provider + budget hints so the
@@ -407,6 +420,8 @@ class AgenticGeneralSubagent:
                 "deadline": None,  # driver uses self._llm_budget_s-based default
                 "max_rounds": None,  # let driver read env
                 "tool_timeout_s": None,  # let driver read env
+                # Epoch 2: shared-state mirror for hard-kill records.
+                "state_mirror": state_mirror,
             })
             if asyncio.iscoroutine(result):
                 return await result
@@ -420,19 +435,71 @@ class AgenticGeneralSubagent:
             if pending:
                 for t in pending:
                     t.cancel()
+                # Snapshot partial state BEFORE the task cancellation
+                # propagates (state_mirror is mutated in-place by the
+                # backend, so these reads are stable even as the driver
+                # task is being torn down).
+                snap_tool_calls = int(
+                    state_mirror.get("tool_calls_made", 0) or 0
+                )
+                snap_tool_names = list(
+                    state_mirror.get("tool_names", []) or []
+                )
+                snap_mutations_count = int(
+                    state_mirror.get("mutations_count", 0) or 0
+                )
+                snap_max_mutations = int(
+                    state_mirror.get("max_mutations", 0) or 0
+                )
+                snap_mutation_records = list(
+                    state_mirror.get("mutation_records", []) or []
+                )
+                snap_call_records = list(
+                    state_mirror.get("call_records", []) or []
+                )
+                # Compute tool_diversity from captured tool_names
+                # (cheap, deterministic — same classify_tools helper
+                # the success path uses).
+                try:
+                    from backend.core.ouroboros.governance.subagent_contracts import (
+                        classify_tools,
+                    )
+                    snap_tool_diversity = len(
+                        classify_tools(tuple(snap_tool_names))
+                    )
+                except Exception:
+                    snap_tool_diversity = len(set(snap_tool_names))
                 logger.error(
                     "[AgenticGeneralSubagent] HARD-KILL llm_driver after "
-                    "%.1fs sub=%s — driver wedged",
-                    self._llm_budget_s + 30.0, ctx.subagent_id,
+                    "%.1fs sub=%s tool_calls=%d mutations=%d/%d "
+                    "tool_names=%s — driver wedged (partial state preserved)",
+                    self._llm_budget_s + 30.0,
+                    ctx.subagent_id,
+                    snap_tool_calls,
+                    snap_mutations_count,
+                    snap_max_mutations,
+                    snap_tool_names,
                 )
                 return {
                     "status": "hard_kill",
-                    "raw_output": "",
-                    "tool_calls_made": 0,
-                    "tool_diversity": 0,
+                    "raw_output": (
+                        f"driver hard-killed after "
+                        f"{self._llm_budget_s + 30.0:.1f}s; partial "
+                        f"state snapshot: tool_calls={snap_tool_calls} "
+                        f"mutations={snap_mutations_count}/"
+                        f"{snap_max_mutations}"
+                    ),
+                    "tool_calls_made": snap_tool_calls,
+                    "tool_diversity": snap_tool_diversity,
                     "cost_usd": 0.0,
                     "provider_used": "hard_kill",
                     "fallback_triggered": False,
+                    # Epoch 2 preservation fields:
+                    "mutations_count": snap_mutations_count,
+                    "max_mutations": snap_max_mutations,
+                    "mutation_records": snap_mutation_records,
+                    "call_records": snap_call_records,
+                    "tool_names": snap_tool_names,
                 }
             result = await task
             if not isinstance(result, dict):
@@ -444,6 +511,24 @@ class AgenticGeneralSubagent:
                     "cost_usd": 0.0,
                     "provider_used": "malformed",
                     "fallback_triggered": False,
+                    # Epoch 2 preservation fields populated from the
+                    # mirror even if the driver returned garbage — the
+                    # backend's own log is still authoritative.
+                    "mutations_count": int(
+                        state_mirror.get("mutations_count", 0) or 0
+                    ),
+                    "max_mutations": int(
+                        state_mirror.get("max_mutations", 0) or 0
+                    ),
+                    "mutation_records": list(
+                        state_mirror.get("mutation_records", []) or []
+                    ),
+                    "call_records": list(
+                        state_mirror.get("call_records", []) or []
+                    ),
+                    "tool_names": list(
+                        state_mirror.get("tool_names", []) or []
+                    ),
                 }
             # Normalize expected keys.
             result.setdefault("status", "completed")
@@ -453,6 +538,14 @@ class AgenticGeneralSubagent:
             result.setdefault("cost_usd", 0.0)
             result.setdefault("provider_used", "llm_driver")
             result.setdefault("fallback_triggered", False)
+            # Epoch 2: every success-path trace also carries records
+            # fields — driver already populates them, but defensive
+            # defaults in case a legacy driver is wired.
+            result.setdefault("mutations_count", 0)
+            result.setdefault("max_mutations", 0)
+            result.setdefault("mutation_records", [])
+            result.setdefault("call_records", [])
+            result.setdefault("tool_names", [])
             return result
         except asyncio.CancelledError:
             raise

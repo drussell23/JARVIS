@@ -75,12 +75,12 @@ class _ExceptionBackend:
         raise RuntimeError(f"inner backend failure for {call.name}")
 
 
-def _pctx() -> PolicyContext:
+def _pctx(call_id: str = "op-scoped-test:r0:tool") -> PolicyContext:
     return PolicyContext(
         repo="jarvis",
         repo_root=Path("/tmp"),
         op_id="op-scoped-test",
-        call_id="op-scoped-test:r0:tool",
+        call_id=call_id,
         round_index=0,
         risk_tier=None,
         is_read_only=False,
@@ -531,3 +531,352 @@ async def test_logged_at_info_level_on_rejection(caplog) -> None:
     assert blocked, f"expected BLOCKED INFO line; got {[r.getMessage() for r in caplog.records]}"
     assert "bash" in blocked[0].getMessage()
     assert "op-scoped-test" in blocked[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# Epoch 2 / Ticket 9 — records preservation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mutation_records_capture_tool_and_call_id() -> None:
+    """Epoch 2 test 1: each authorized mutation pushes
+    ``(tool_name, call_id, t_mono)`` into ``mutation_records``.
+
+    The records survive even if the inner backend later hangs or is
+    cancelled — they're appended at AUTHORIZATION time, before the
+    inner backend sees the call. This is the primary records
+    preservation primitive."""
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file", "edit_file", "write_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=3,
+    )
+
+    # A mix of reads + mutations.
+    await backend.execute_async(
+        ToolCall(name="read_file", arguments={"path": "a.py"}),
+        _pctx("call-1"), deadline=10.0,
+    )
+    await backend.execute_async(
+        ToolCall(name="edit_file", arguments={"path": "b.py"}),
+        _pctx("call-2"), deadline=10.0,
+    )
+    await backend.execute_async(
+        ToolCall(name="write_file", arguments={"path": "c.py"}),
+        _pctx("call-3"), deadline=10.0,
+    )
+    await backend.execute_async(
+        ToolCall(name="read_file", arguments={"path": "d.py"}),
+        _pctx("call-4"), deadline=10.0,
+    )
+
+    # Only the two mutation calls are in mutation_records.
+    records = backend.mutation_records
+    assert len(records) == 2
+    assert records[0][0] == "edit_file"
+    assert records[0][1] == "call-2"
+    assert isinstance(records[0][2], float)  # t_mono
+    assert records[1][0] == "write_file"
+    assert records[1][1] == "call-3"
+    # Snapshot is a tuple — immutable to external callers.
+    assert isinstance(records, tuple)
+
+
+@pytest.mark.asyncio
+async def test_call_records_capture_all_authorization_decisions() -> None:
+    """Epoch 2 test 2: every execute_async attempt (authorized +
+    type_denied + count_denied) lands in ``call_records``. This is
+    the full audit trail — critical for detecting adversarial models
+    that probe the cage."""
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file", "edit_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1,
+    )
+
+    # 1. authorized read
+    await backend.execute_async(
+        ToolCall(name="read_file"), _pctx("call-1"), deadline=10.0,
+    )
+    # 2. type_denied — bash not in allowlist
+    await backend.execute_async(
+        ToolCall(name="bash"), _pctx("call-2"), deadline=10.0,
+    )
+    # 3. authorized edit (consumes mutation slot)
+    await backend.execute_async(
+        ToolCall(name="edit_file"), _pctx("call-3"), deadline=10.0,
+    )
+    # 4. count_denied — second edit over budget
+    await backend.execute_async(
+        ToolCall(name="edit_file"), _pctx("call-4"), deadline=10.0,
+    )
+
+    records = backend.call_records
+    assert len(records) == 4
+    # Unpacked tuples: (tool_name, call_id, status, t_mono)
+    assert records[0][:3] == ("read_file", "call-1", "authorized")
+    assert records[1][:3] == ("bash", "call-2", "type_denied")
+    assert records[2][:3] == ("edit_file", "call-3", "authorized")
+    assert records[3][:3] == ("edit_file", "call-4", "count_denied")
+    # Timestamps are monotonic-nondecreasing.
+    timestamps = [r[3] for r in records]
+    assert all(timestamps[i] <= timestamps[i + 1]
+               for i in range(len(timestamps) - 1))
+
+
+@pytest.mark.asyncio
+async def test_tool_names_property_returns_unique_authorized_tools_only() -> None:
+    """Epoch 2 test 3: ``tool_names`` property is the unique set of
+    authorized tool names (insertion order preserved). Denied calls
+    do NOT surface here — this is the "what actually ran" view."""
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file", "search_code", "edit_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1,
+    )
+
+    # authorized: read_file, read_file, search_code, edit_file
+    # denied: bash (type), edit_file (count)
+    for name, cid in [
+        ("read_file", "c1"), ("bash", "c2"),
+        ("read_file", "c3"), ("search_code", "c4"),
+        ("edit_file", "c5"), ("edit_file", "c6"),
+    ]:
+        await backend.execute_async(
+            ToolCall(name=name), _pctx(cid), deadline=10.0,
+        )
+
+    # Insertion order, dedup, authorized-only:
+    assert backend.tool_names == ("read_file", "search_code", "edit_file")
+
+
+@pytest.mark.asyncio
+async def test_state_mirror_updates_live_on_every_execute_async() -> None:
+    """Epoch 2 test 4: when ``state_mirror`` is passed, the adapter
+    pushes live counters into it on every execute_async call. This
+    is the hard-kill preservation mechanism — the executor reads
+    this dict on cancellation to build a complete exec_trace."""
+    mirror: dict = {}
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file", "edit_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=2,
+        state_mirror=mirror,
+    )
+
+    # Immediately after construction, mirror should carry static config.
+    assert mirror["max_mutations"] == 2
+    assert mirror["mutations_count"] == 0
+    assert mirror["tool_calls_made"] == 0
+    assert mirror["mutation_records"] == []
+    assert mirror["call_records"] == []
+    assert mirror["tool_names"] == []
+
+    # First call — read_file. Mirror updates.
+    await backend.execute_async(
+        ToolCall(name="read_file"), _pctx("c1"), deadline=10.0,
+    )
+    assert mirror["tool_calls_made"] == 1
+    assert mirror["mutations_count"] == 0
+    assert mirror["tool_names"] == ["read_file"]
+    assert len(mirror["call_records"]) == 1
+    assert mirror["call_records"][0]["status"] == "authorized"
+
+    # Second call — edit_file. Mutations counter bumps.
+    await backend.execute_async(
+        ToolCall(name="edit_file"), _pctx("c2"), deadline=10.0,
+    )
+    assert mirror["tool_calls_made"] == 2
+    assert mirror["mutations_count"] == 1
+    assert mirror["tool_names"] == ["read_file", "edit_file"]
+    assert len(mirror["mutation_records"]) == 1
+    assert mirror["mutation_records"][0]["tool"] == "edit_file"
+    assert mirror["mutation_records"][0]["call_id"] == "c2"
+    assert isinstance(mirror["mutation_records"][0]["t_mono"], float)
+
+    # Third call — denied mutation. Only call_records grows.
+    await backend.execute_async(
+        ToolCall(name="bash"), _pctx("c3"), deadline=10.0,
+    )
+    assert mirror["tool_calls_made"] == 2  # unchanged — denied
+    assert mirror["mutations_count"] == 1  # unchanged — type_denied
+    assert len(mirror["call_records"]) == 3
+    assert mirror["call_records"][2]["status"] == "type_denied"
+
+
+@pytest.mark.asyncio
+async def test_state_mirror_survives_inner_backend_exception() -> None:
+    """Epoch 2 test 5 (CRITICAL): when the inner backend raises
+    mid-execute, the mirror STILL carries the authorization record.
+
+    This pins the core hard-kill preservation invariant: the record
+    is written at AUTHORIZATION time, before the inner backend is
+    awaited. A hang / exception / cancellation of the inner path
+    cannot un-write the record."""
+    mirror: dict = {}
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"edit_file"}),
+        read_only=False,
+    ))
+    inner = _ExceptionBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=5,
+        state_mirror=mirror,
+    )
+
+    with pytest.raises(RuntimeError):
+        await backend.execute_async(
+            ToolCall(name="edit_file"),
+            _pctx("c-crashed"),
+            deadline=10.0,
+        )
+
+    # Despite the inner exception, the record IS in the mirror.
+    assert mirror["mutations_count"] == 1
+    assert mirror["tool_calls_made"] == 1
+    assert mirror["mutation_records"][0]["tool"] == "edit_file"
+    assert mirror["mutation_records"][0]["call_id"] == "c-crashed"
+    assert mirror["call_records"][0]["status"] == "authorized"
+
+
+@pytest.mark.asyncio
+async def test_state_mirror_snapshot_isolation_across_reads() -> None:
+    """Epoch 2 test 6: each mirror update writes a FRESH list, so a
+    reader that captures mirror["call_records"] gets a stable
+    snapshot. Subsequent execute_async calls don't mutate the
+    previously-snapshotted list (the adapter writes a new list each
+    time instead of appending in-place).
+
+    This is important on the hard-kill path: the executor captures
+    ``list(mirror["call_records"])`` and expects it to be a
+    point-in-time snapshot, not a live view that changes as
+    concurrent driver activity continues.
+    """
+    mirror: dict = {}
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=0,
+        state_mirror=mirror,
+    )
+
+    await backend.execute_async(
+        ToolCall(name="read_file"), _pctx("c1"), deadline=10.0,
+    )
+    snapshot_t1 = mirror["call_records"]
+    snapshot_t1_copy = list(snapshot_t1)  # defensive copy
+    assert len(snapshot_t1_copy) == 1
+
+    await backend.execute_async(
+        ToolCall(name="read_file"), _pctx("c2"), deadline=10.0,
+    )
+    # Explicit-copy reader sees 1 record; direct mirror["call_records"]
+    # reader sees 2.
+    assert len(snapshot_t1_copy) == 1
+    assert len(mirror["call_records"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_state_mirror_none_is_safe_default() -> None:
+    """Epoch 2 test 7: passing ``state_mirror=None`` (or omitting it
+    entirely) is safe — the adapter takes the same internal bookkeeping
+    path, just without pushing to an external dict. All the existing
+    Epoch 1 behavior is preserved."""
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file", "edit_file"}),
+        read_only=False,
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1,
+        # state_mirror omitted — should be exactly the same as None
+    )
+
+    await backend.execute_async(
+        ToolCall(name="read_file"), _pctx("c1"), deadline=10.0,
+    )
+    await backend.execute_async(
+        ToolCall(name="edit_file"), _pctx("c2"), deadline=10.0,
+    )
+
+    # Properties still work.
+    assert backend.mutations_count == 1
+    assert len(backend.mutation_records) == 1
+    assert len(backend.call_records) == 2
+
+
+@pytest.mark.asyncio
+async def test_scoped_backend_ref_attachable_via_caller_dict() -> None:
+    """Epoch 2 test 8: callers can stash the backend itself on an
+    external dict (e.g. the driver attaches to state_mirror) so the
+    executor has a direct reference for anything beyond the mirrored
+    primitives. This is the belt-and-suspenders path alongside the
+    mirror."""
+    mirror: dict = {}
+    gate = ScopedToolGate(ToolScope(
+        allowed_tools=frozenset({"read_file"}),
+    ))
+    inner = _RecordingBackend()
+    backend = ScopedToolBackend(
+        inner=inner, gate=gate, state_mirror=mirror,
+    )
+
+    # Driver-style attach (matches general_driver.py):
+    mirror["_scoped_backend_ref"] = backend
+
+    await backend.execute_async(
+        ToolCall(name="read_file"), _pctx("c1"), deadline=10.0,
+    )
+
+    # External reader uses the ref to query beyond the mirrored fields.
+    ref = mirror["_scoped_backend_ref"]
+    assert ref is backend
+    assert ref.mutations_count == 0
+    assert len(ref.call_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_state_mirror_malformed_type_does_not_crash_adapter() -> None:
+    """Epoch 2 test 9: the adapter treats state_mirror defensively —
+    passing something weird at construction time may raise a TypeError
+    on the first attempt to write, but the ``None`` contract (no
+    mirror) is the only guaranteed-safe shape. Verify that the actual
+    expected ``None`` / ``dict`` contract holds cleanly.
+    """
+    # None — pure no-op path.
+    gate = ScopedToolGate(ToolScope())
+    inner = _RecordingBackend()
+    backend_none = ScopedToolBackend(
+        inner=inner, gate=gate, max_mutations=1, state_mirror=None,
+    )
+    await backend_none.execute_async(
+        ToolCall(name="read_file"), _pctx(), deadline=10.0,
+    )
+    # No crash — that's the assertion.
+
+    # Empty dict — seeded + updated.
+    mirror: dict = {}
+    backend_dict = ScopedToolBackend(
+        inner=_RecordingBackend(), gate=gate, max_mutations=1,
+        state_mirror=mirror,
+    )
+    assert "max_mutations" in mirror  # seeded at construction
+    await backend_dict.execute_async(
+        ToolCall(name="read_file"), _pctx(), deadline=10.0,
+    )
+    assert mirror["tool_calls_made"] == 1

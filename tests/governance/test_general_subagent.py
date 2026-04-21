@@ -678,3 +678,240 @@ def test_quarantine_wrap_round_trip() -> None:
     assert 'sub_id=\'sub-01\'' in wrapped
     assert "hello world" in wrapped
     assert wrapped.endswith(QUARANTINE_FENCE_CLOSE)
+
+
+# ---------------------------------------------------------------------------
+# Epoch 2 / Ticket 9 — hard-kill records preservation (subagent level)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_epoch2_hard_kill_preserves_partial_records(
+    tmp_path: Path,
+) -> None:
+    """Epoch 2 / Ticket 9 critical pin: when the driver task hangs
+    past ``llm_budget_s + 30s``, the hard-kill wrapper reads the
+    shared state_mirror dict to build a complete exec_trace —
+    mutation_count, mutation_records, tool_calls_made all survive
+    the cancellation instead of getting zeroed.
+
+    Simulated hang: a driver that bumps counters via state_mirror
+    then sleeps forever. The wrapper cancels it; we inspect the
+    returned exec_trace.
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    async def _hanging_driver(payload):
+        # Simulate mid-loop activity by pushing into the mirror
+        # directly — matches what the real ScopedToolBackend would do.
+        mirror = payload.get("state_mirror")
+        assert mirror is not None, (
+            "executor must pass state_mirror into driver payload"
+        )
+        t = _time.monotonic()
+        mirror["tool_calls_made"] = 3
+        mirror["tool_names"] = ["read_file", "search_code", "edit_file"]
+        mirror["mutations_count"] = 1
+        # max_mutations should already be set by the executor at seed.
+        mirror["mutation_records"] = [
+            {"tool": "edit_file", "call_id": "c3", "t_mono": t},
+        ]
+        mirror["call_records"] = [
+            {"tool": "read_file",  "call_id": "c1",
+             "status": "authorized", "t_mono": t - 2.0},
+            {"tool": "search_code", "call_id": "c2",
+             "status": "authorized", "t_mono": t - 1.0},
+            {"tool": "edit_file",  "call_id": "c3",
+             "status": "authorized", "t_mono": t},
+        ]
+        mirror["last_activity_mono"] = t
+        # Now hang.
+        await _asyncio.sleep(100.0)
+        return {"status": "unreachable"}  # never reached
+
+    # Very short budget so the test finishes fast; the hard-kill
+    # wrapper fires at llm_budget_s + 30s, so using negative-ish
+    # budget wouldn't work — set a small positive and wait.
+    # Actually: the wrapper uses llm_budget_s + 30.0, so with
+    # llm_budget_s=0 we'd wait 30s. Instead, monkey-pattern the
+    # wait timeout via the subagent instance attribute.
+    sub = AgenticGeneralSubagent(
+        project_root=tmp_path,
+        llm_driver=_hanging_driver,
+        llm_budget_s=0.1,  # wrapper timeout = 30.1s — still too long
+    )
+    # Override the wrapper timeout directly so the test is fast.
+    # The hard-kill path reads self._llm_budget_s + 30.0 — we need
+    # a smaller effective value. Monkey-patch the attribute lookup
+    # via a subclass approach would be cleaner, but since
+    # _llm_budget_s is already settable, just use a negative
+    # offset by patching asyncio.wait's timeout argument through
+    # a different route: directly call _execute_body with a
+    # constructed invocation, and inject via a fast-wait shim.
+    #
+    # Simplest: use unittest.mock to patch asyncio.wait inside
+    # agentic_general_subagent to a fast-timeout call.
+    from unittest.mock import patch
+
+    real_wait = _asyncio.wait
+
+    async def _fast_wait(*args, **kwargs):
+        # Force a 0.2s timeout regardless of caller's request.
+        kwargs["timeout"] = 0.2
+        return await real_wait(*args, **kwargs)
+
+    invocation = {
+        "operation_scope": ["src/"],
+        "allowed_tools": ["read_file", "search_code", "edit_file"],
+        "max_mutations": 2,
+        "parent_op_risk_tier": "NOTIFY_APPLY",
+        "invocation_reason": "hard-kill records preservation smoke test",
+        "goal": "describe something — will hang",
+        "primary_repo": "jarvis",
+    }
+
+    ctx_obj = MagicMock()
+    ctx_obj.subagent_id = "sub-hk-test"
+    ctx_obj.primary_provider_name = "claude-api"
+    ctx_obj.fallback_provider_name = ""
+    ctx_obj.deadline = None
+
+    with patch(
+        "backend.core.ouroboros.governance.agentic_general_subagent.asyncio.wait",
+        side_effect=_fast_wait,
+    ):
+        trace = await sub._execute_body(ctx_obj, invocation)
+
+    # status is hard_kill, and the records are PRESERVED.
+    assert trace["status"] == "hard_kill"
+    assert trace["tool_calls_made"] == 3, (
+        "CRITICAL: hard-kill exec_trace must preserve the tool-call "
+        "count from the state_mirror — the previous implementation "
+        "zeroed it"
+    )
+    assert trace["mutations_count"] == 1
+    assert trace["max_mutations"] == 2
+    assert len(trace["mutation_records"]) == 1
+    assert trace["mutation_records"][0]["tool"] == "edit_file"
+    assert len(trace["call_records"]) == 3
+    assert "edit_file" in trace["tool_names"]
+    # raw_output carries a human-readable partial summary.
+    assert "hard-killed" in trace["raw_output"]
+    assert "tool_calls=3" in trace["raw_output"]
+    assert "mutations=1/2" in trace["raw_output"]
+
+
+@pytest.mark.asyncio
+async def test_epoch2_malformed_driver_output_preserves_mirror(
+    tmp_path: Path,
+) -> None:
+    """Epoch 2 subagent test 2: even when the driver returns a
+    non-dict (malformed_driver_output path), the executor still
+    pulls mutation_count / tool_calls_made from state_mirror so the
+    telemetry is complete."""
+
+    async def _nondict_driver(payload):
+        # Log some activity then return garbage.
+        mirror = payload["state_mirror"]
+        import time as _time
+        mirror["tool_calls_made"] = 5
+        mirror["tool_names"] = ["read_file"]
+        mirror["mutations_count"] = 0
+        mirror["call_records"] = [
+            {"tool": "read_file", "call_id": f"c{i}",
+             "status": "authorized", "t_mono": _time.monotonic()}
+            for i in range(5)
+        ]
+        return "this is not a dict"  # triggers malformed_driver_output
+
+    sub = AgenticGeneralSubagent(
+        project_root=tmp_path,
+        llm_driver=_nondict_driver,
+        llm_budget_s=30.0,
+    )
+
+    invocation = {
+        "operation_scope": ["src/"],
+        "allowed_tools": ["read_file"],
+        "max_mutations": 0,
+        "parent_op_risk_tier": "NOTIFY_APPLY",
+        "invocation_reason": "malformed driver output preservation test",
+        "goal": "test malformed output",
+        "primary_repo": "jarvis",
+    }
+    ctx_obj = MagicMock()
+    ctx_obj.subagent_id = "sub-malformed-test"
+    ctx_obj.primary_provider_name = "claude-api"
+    ctx_obj.fallback_provider_name = ""
+    ctx_obj.deadline = None
+
+    trace = await sub._execute_body(ctx_obj, invocation)
+
+    assert trace["status"] == "malformed_driver_output"
+    # Despite the malformed return, the mirror-captured records survive.
+    assert trace["mutations_count"] == 0
+    assert trace["max_mutations"] == 0
+    assert len(trace["call_records"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_epoch2_well_formed_driver_preserves_records_in_result(
+    tmp_path: Path,
+) -> None:
+    """Epoch 2 subagent test 3: well-formed driver output already
+    carrying records fields passes through the executor untouched.
+    The executor's setdefault calls don't clobber real data."""
+
+    async def _good_driver(payload):
+        mirror = payload["state_mirror"]
+        import time as _time
+        t = _time.monotonic()
+        mirror["tool_calls_made"] = 2
+        return {
+            "status": "completed",
+            "raw_output": "ok",
+            "tool_calls_made": 2,
+            "tool_diversity": 1,
+            "cost_usd": 0.0,
+            "provider_used": "claude-api",
+            "fallback_triggered": False,
+            "mutations_count": 0,
+            "max_mutations": 0,
+            "mutation_records": [],
+            "call_records": [
+                {"tool": "read_file", "call_id": "c1",
+                 "status": "authorized", "t_mono": t},
+                {"tool": "read_file", "call_id": "c2",
+                 "status": "authorized", "t_mono": t},
+            ],
+            "tool_names": ["read_file"],
+        }
+
+    sub = AgenticGeneralSubagent(
+        project_root=tmp_path,
+        llm_driver=_good_driver,
+        llm_budget_s=30.0,
+    )
+    invocation = {
+        "operation_scope": ["src/"],
+        "allowed_tools": ["read_file"],
+        "max_mutations": 0,
+        "parent_op_risk_tier": "NOTIFY_APPLY",
+        "invocation_reason": "success-path records preservation test",
+        "goal": "read something",
+        "primary_repo": "jarvis",
+    }
+    ctx_obj = MagicMock()
+    ctx_obj.subagent_id = "sub-good-test"
+    ctx_obj.primary_provider_name = "claude-api"
+    ctx_obj.fallback_provider_name = ""
+    ctx_obj.deadline = None
+
+    trace = await sub._execute_body(ctx_obj, invocation)
+
+    assert trace["status"] == "completed"
+    # Driver-supplied records fields passed through untouched.
+    assert trace["tool_calls_made"] == 2
+    assert trace["mutations_count"] == 0
+    assert len(trace["call_records"]) == 2
+    assert trace["tool_names"] == ["read_file"]
