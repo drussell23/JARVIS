@@ -1,7 +1,7 @@
 package com.drussell23.jarvis
 
-import org.junit.jupiter.api.Assertions.*
-import org.junit.jupiter.api.Test
+import kotlin.test.*
+import kotlin.test.Test
 
 class BackoffTest {
 

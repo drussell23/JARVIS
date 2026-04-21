@@ -1,7 +1,7 @@
 package com.drussell23.jarvis
 
-import org.junit.jupiter.api.Assertions.*
-import org.junit.jupiter.api.Test
+import kotlin.test.*
+import kotlin.test.Test
 
 class ApiTypesTest {
 
@@ -36,13 +36,13 @@ class ApiTypesTest {
 
     @Test
     fun validateOpIdRejectsMalformed() {
-        assertThrows(ObservabilityException::class.java) {
+        assertFailsWith<ObservabilityException> {
             validateOpId("bad space")
         }
-        assertThrows(ObservabilityException::class.java) {
+        assertFailsWith<ObservabilityException> {
             validateOpId("")
         }
-        assertThrows(ObservabilityException::class.java) {
+        assertFailsWith<ObservabilityException> {
             validateOpId("A".repeat(129))
         }
     }

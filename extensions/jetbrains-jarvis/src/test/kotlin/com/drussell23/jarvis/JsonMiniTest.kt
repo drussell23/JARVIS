@@ -1,7 +1,7 @@
 package com.drussell23.jarvis
 
-import org.junit.jupiter.api.Assertions.*
-import org.junit.jupiter.api.Test
+import kotlin.test.*
+import kotlin.test.Test
 
 class JsonMiniTest {
 
@@ -43,14 +43,14 @@ class JsonMiniTest {
 
     @Test
     fun rejectsTrailingGarbage() {
-        assertThrows(JsonParseException::class.java) {
+        assertFailsWith<JsonParseException> {
             JsonMini.parse("""{"k":"v"} extra""")
         }
     }
 
     @Test
     fun rejectsUnterminatedString() {
-        assertThrows(JsonParseException::class.java) {
+        assertFailsWith<JsonParseException> {
             JsonMini.parse("""{"k":"no end""")
         }
     }
