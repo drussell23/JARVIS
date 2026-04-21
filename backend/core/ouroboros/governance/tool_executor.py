@@ -4385,17 +4385,19 @@ class ToolLoopCoordinator:
             return legacy
         try:
             tracker = intent_tracker_for(op_id)
-            # Auto-feed intent from every chunk's visible tool-name / paths.
+            # Auto-feed intent from every chunk's visible paths.
             # Non-authoritative: ingest_ledger_entry doesn't advance the
-            # turn clock, only strengthens path/tool signals.
+            # turn clock, only strengthens path signals. Tool-NAME
+            # signals are deliberately NOT auto-fed from chunks: every
+            # [TOOL RESULT] block advertises "tool: X", so feeding them
+            # back into the tracker makes whichever tool dominates the
+            # round's chunks win every chunk's intent_tool slot,
+            # swamping path signal. Tool names still reach the tracker
+            # via the orchestrator's own per-call ``ingest_ledger_entry``.
             for chunk in chunks:
                 for path in _extract_paths_from_tool_chunk(chunk):
                     tracker.ingest_ledger_entry({
                         "kind": "file_read", "file_path": path,
-                    })
-                for tool in _extract_tools_from_tool_chunk(chunk):
-                    tracker.ingest_ledger_entry({
-                        "kind": "tool_call", "tool": tool,
                     })
             scorer = PreservationScorer()
             candidates = [

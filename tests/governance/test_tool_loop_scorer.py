@@ -186,8 +186,15 @@ async def test_flag_on_with_no_intent_keeps_recent_ish(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_flag_on_auto_feeds_intent_tracker(monkeypatch):
-    """Every chunk's visible path / tool name feeds the intent tracker."""
+async def test_flag_on_auto_feeds_path_signals(monkeypatch):
+    """Every chunk's visible PATHS feed the intent tracker.
+
+    Tool names are deliberately NOT auto-fed: every [TOOL RESULT]
+    chunk advertises 'tool: X', so auto-feeding them makes whichever
+    tool dominates the round swamp every chunk's intent_tool slot.
+    Path signal is genuinely selective (only some chunks mention
+    specific paths) so auto-feeding paths is safe.
+    """
     monkeypatch.setenv("JARVIS_TOOL_LOOP_SCORER_ENABLED", "true")
     coord = _build_coord()
     chunks = [
@@ -195,8 +202,6 @@ async def test_flag_on_auto_feeds_intent_tracker(monkeypatch):
         "\n[TOOL RESULT]\ntool: edit_file\nbackend/auth.py edited\n",
         "\n[TOOL RESULT]\ntool: read_file\ntests/test_x.py content\n",
     ]
-    # Too few chunks to compact under legacy (len ≤ recent_count);
-    # but our helper still runs and feeds the tracker.
     await coord._maybe_score_tool_chunks(
         chunks=chunks, op_id="op-feed", recent_count=2,
     )
@@ -204,9 +209,8 @@ async def test_flag_on_auto_feeds_intent_tracker(monkeypatch):
     intent = tracker.current_intent()
     assert "backend/auth.py" in intent.recent_paths
     assert "tests/test_x.py" in intent.recent_paths
-    # Tool names also captured
-    assert "read_file" in intent.recent_tools
-    assert "edit_file" in intent.recent_tools
+    # Tool names deliberately NOT captured from chunks (see docstring)
+    assert intent.recent_tools == ()
 
 
 @pytest.mark.asyncio
