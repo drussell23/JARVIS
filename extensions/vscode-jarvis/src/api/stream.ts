@@ -208,6 +208,20 @@ export class StreamConsumer {
     const reader = body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
+    // Wire abort → reader.cancel(), so reader.read() resolves with
+    // {done: true} promptly when the consumer is stopping. Without
+    // this, a pending read() against a mocked/hung stream would sit
+    // forever and .stop() would appear to hang.
+    const onAbort = (): void => {
+      reader.cancel().catch(() => {
+        /* cancel may race with natural close — swallow */
+      });
+    };
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
     try {
       for (;;) {
         if (signal.aborted) {
@@ -227,6 +241,7 @@ export class StreamConsumer {
         }
       }
     } finally {
+      signal.removeEventListener('abort', onAbort);
       try {
         reader.releaseLock();
       } catch {
