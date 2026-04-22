@@ -1,0 +1,73 @@
+{
+  "slice": 1,
+  "feature": "SensorGovernor + 16-sensor seed",
+  "timestamp": 1776823349.914293,
+  "all_pass": true,
+  "total_checks": 16,
+  "checks": [
+    {
+      "name": "is_enabled() default False (Slice 1)",
+      "pass": true
+    },
+    {
+      "name": "seed installed 16 sensors",
+      "pass": true
+    },
+    {
+      "name": "SEED_SPECS count matches governor",
+      "pass": true
+    },
+    {
+      "name": "TestFailure HARDEN cap = 36 (20 * 1.8)",
+      "pass": true
+    },
+    {
+      "name": "OpportunityMiner EXPLORE cap = 22 (15 * 1.5)",
+      "pass": true
+    },
+    {
+      "name": "OpportunityMiner HARDEN cap = 4 (15 * 0.3)",
+      "pass": true
+    },
+    {
+      "name": "DocStaleness CONSOLIDATE cap = 7 (6 * 1.3)",
+      "pass": true
+    },
+    {
+      "name": "emergency brake activates on cost_burn 0.95",
+      "pass": true
+    },
+    {
+      "name": "cost-brake cap reduced to 4",
+      "pass": true
+    },
+    {
+      "name": "emergency brake activates on postmortem 0.75",
+      "pass": true
+    },
+    {
+      "name": "global cap exhausted denies cross-sensor request",
+      "pass": true
+    },
+    {
+      "name": "rolling window evicts 2 of 3 old timestamps",
+      "pass": true
+    },
+    {
+      "name": "Wave 1 #2 bridge: 6 flags auto-registered",
+      "pass": true
+    },
+    {
+      "name": "Wave 1 #1 bridge: TestFailure uses HARDEN posture",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/sensor_governor.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/sensor_governor_seed.py",
+      "pass": true
+    }
+  ]
+}
