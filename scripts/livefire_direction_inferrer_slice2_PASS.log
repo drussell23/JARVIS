@@ -1,0 +1,76 @@
+{
+  "slice": 2,
+  "feature": "DirectionInferrer + PostureObserver + StrategicDirection",
+  "timestamp": 1776819300.540985,
+  "all_pass": true,
+  "checks": [
+    {
+      "name": "SignalCollector.build_bundle produces schema v1.0",
+      "pass": true
+    },
+    {
+      "name": "all ratios in [0,1]",
+      "pass": true
+    },
+    {
+      "name": "first cycle produced a reading",
+      "pass": true
+    },
+    {
+      "name": "PostureStore.load_current returns reading",
+      "pass": true
+    },
+    {
+      "name": "posture_current.json exists on disk",
+      "pass": true
+    },
+    {
+      "name": "posture_current.json has schema_version='1.0'",
+      "pass": true
+    },
+    {
+      "name": "history accumulates across cycles",
+      "pass": true
+    },
+    {
+      "name": "hysteresis holds current under low-confidence swap",
+      "pass": true
+    },
+    {
+      "name": "high-confidence bypass flips current",
+      "pass": true
+    },
+    {
+      "name": "override expiry emits 'expired' audit record",
+      "pass": true
+    },
+    {
+      "name": "StrategicDirection omits posture when master flag off",
+      "pass": true
+    },
+    {
+      "name": "StrategicDirection includes posture when master flag on",
+      "pass": true
+    },
+    {
+      "name": "posture block contains advisory",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/posture_store.py",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/posture_prompt.py",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/posture_observer.py",
+      "pass": true
+    },
+    {
+      "name": "rendered section under 600 chars",
+      "pass": true
+    }
+  ]
+}

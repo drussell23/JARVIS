@@ -127,10 +127,17 @@ class StrategicDirectionService:
         return self._loaded
 
     def format_for_prompt(self) -> str:
-        """Format the digest for injection into strategic_memory_prompt."""
+        """Format the digest for injection into strategic_memory_prompt.
+
+        Appends the current ``StrategicPosture`` section when
+        ``JARVIS_DIRECTION_INFERRER_ENABLED`` and
+        ``JARVIS_POSTURE_PROMPT_INJECTION_ENABLED`` are both on and the
+        PostureStore has a current reading. Advisory-only — the posture
+        block never carries execution authority (§1 Boundary Principle).
+        """
         if not self._digest:
             return ""
-        return (
+        body = (
             "## Strategic Direction (Manifesto v4)\n\n"
             "You are generating code for the JARVIS Trinity AI Ecosystem — "
             "an autonomous, self-evolving AI Operating System. Every change "
@@ -140,6 +147,34 @@ class StrategicDirectionService:
             "without diagnosis. No hardcoded routing. If a subsystem fails, "
             "dismantle the flawed assumption and rebuild — do not bypass."
         )
+        posture_block = self._render_posture_section()
+        if posture_block:
+            body = f"{body}\n\n{posture_block}"
+        return body
+
+    @staticmethod
+    def _render_posture_section() -> str:
+        """Compose the optional posture block. Fails silently — an
+        authority-free advisory surface must never break prompt
+        composition when the store is unavailable."""
+        try:
+            from backend.core.ouroboros.governance.posture_prompt import (
+                compose_posture_section,
+                prompt_injection_enabled,
+            )
+            from backend.core.ouroboros.governance.posture_observer import (
+                get_default_store,
+            )
+        except ImportError:
+            return ""
+        if not prompt_injection_enabled():
+            return ""
+        try:
+            store = get_default_store()
+            reading = store.load_current()
+        except Exception:
+            return ""
+        return compose_posture_section(reading)
 
     # ------------------------------------------------------------------
     # Internal extraction helpers
