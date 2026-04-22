@@ -1389,6 +1389,7 @@ class GovernedOrchestrator:
             from backend.core.ouroboros.governance.phase_dispatcher import (
                 dispatch_pipeline as _dispatch_pipeline,
             )
+            logger.info("[PhaseRunnerDelegate] DISPATCHER → pipeline op=%s", ctx.op_id[:16])
             return await _dispatch_pipeline(self, _serpent, ctx)
 
         # Wave 2 (5) Slice 2 - CLASSIFYRunner delegation gate.
@@ -1402,6 +1403,7 @@ class GovernedOrchestrator:
             from backend.core.ouroboros.governance.phase_runners.classify_runner import (
                 CLASSIFYRunner,
             )
+            logger.info("[PhaseRunnerDelegate] CLASSIFY → runner op=%s", ctx.op_id[:16])
             _classify_runner = CLASSIFYRunner(self, _serpent)
             _classify_result = await _classify_runner.run(ctx)
             # Rebind CLASSIFY locals that downstream phases read:
@@ -2195,6 +2197,7 @@ class GovernedOrchestrator:
                 PLANRunner,
                 ROUTERunner,
             )
+            logger.info("[PhaseRunnerDelegate] ROUTE+CTX+PLAN → runners op=%s", ctx.op_id[:16])
             # ROUTE: runs the routing body + either advance(CTX) or advance(PLAN)
             _route_result = await ROUTERunner(self, _serpent).run(ctx)
             ctx = _route_result.next_ctx
@@ -3183,6 +3186,7 @@ class GovernedOrchestrator:
             from backend.core.ouroboros.governance.phase_runners.generate_runner import (
                 GENERATERunner,
             )
+            logger.info("[PhaseRunnerDelegate] GENERATE → runner op=%s", ctx.op_id[:16])
             _generate_runner = GENERATERunner(self, _serpent, _consciousness_bridge)
             _generate_result = await _generate_runner.run(ctx)
             generation = _generate_result.artifacts.get("generation")
@@ -4820,6 +4824,7 @@ class GovernedOrchestrator:
             from backend.core.ouroboros.governance.phase_runners.validate_runner import (
                 VALIDATERunner,
             )
+            logger.info("[PhaseRunnerDelegate] VALIDATE → runner op=%s", ctx.op_id[:16])
             _validate_runner = VALIDATERunner(
                 self, _serpent, generation,
                 generate_retries_remaining, _episodic_memory,
@@ -5608,6 +5613,7 @@ class GovernedOrchestrator:
             from backend.core.ouroboros.governance.phase_runners.gate_runner import (
                 GATERunner,
             )
+            logger.info("[PhaseRunnerDelegate] GATE → runner op=%s", ctx.op_id[:16])
             _gate_runner = GATERunner(self, _serpent, best_candidate, risk_tier)
             _gate_result = await _gate_runner.run(ctx)
             # Rebind risk_tier (GATE mutates it). best_candidate unchanged
@@ -6234,6 +6240,7 @@ class GovernedOrchestrator:
             from backend.core.ouroboros.governance.phase_runners.slice4b_runner import (
                 Slice4bRunner,
             )
+            logger.info("[PhaseRunnerDelegate] APPROVE+APPLY+VERIFY → Slice4bRunner op=%s", ctx.op_id[:16])
             _slice4b_runner = Slice4bRunner(self, _serpent, best_candidate, risk_tier)
             _slice4b_result = await _slice4b_runner.run(ctx)
             # Rebind _t_apply (consumed by COMPLETERunner downstream).
@@ -7404,6 +7411,7 @@ class GovernedOrchestrator:
             from backend.core.ouroboros.governance.phase_runners.complete_runner import (
                 COMPLETERunner,
             )
+            logger.info("[PhaseRunnerDelegate] COMPLETE → runner op=%s", ctx.op_id[:16])
             _complete_runner = COMPLETERunner(self, _serpent, _t_apply)
             _complete_result = await _complete_runner.run(ctx)
             return _complete_result.next_ctx
