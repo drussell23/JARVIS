@@ -119,6 +119,11 @@ EVENT_TYPE_PLAN_APPROVED = "plan_approved"
 EVENT_TYPE_PLAN_REJECTED = "plan_rejected"
 EVENT_TYPE_PLAN_EXPIRED = "plan_expired"
 
+# DirectionInferrer Slice 3 — strategic posture stream vocabulary.
+# Single event type: the trigger (inference vs override) is carried in
+# the payload so clients render from one handler.
+EVENT_TYPE_POSTURE_CHANGED = "posture_changed"
+
 # Inline Permission Slice 4 — per-tool-call prompt + grant stream vocab.
 EVENT_TYPE_INLINE_PROMPT_PENDING = "inline_prompt_pending"
 EVENT_TYPE_INLINE_PROMPT_ALLOWED = "inline_prompt_allowed"
@@ -178,6 +183,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SESSION_UNBOOKMARKED,
     EVENT_TYPE_SESSION_PINNED,
     EVENT_TYPE_SESSION_UNPINNED,
+    EVENT_TYPE_POSTURE_CHANGED,
 })
 
 
@@ -935,3 +941,138 @@ def bridge_plan_approval_to_broker(
         broker.publish(event_type, op_id, summary)
 
     return controller.on_transition(_publish)
+
+
+# ---------------------------------------------------------------------------
+# Posture → broker bridge (DirectionInferrer Slice 3)
+# ---------------------------------------------------------------------------
+
+
+def publish_posture_event(
+    trigger: str,
+    reading: Optional[Any] = None,
+    previous: Optional[Any] = None,
+    *,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Best-effort publisher for ``posture_changed`` SSE frames.
+
+    ``trigger`` ∈ {``"inference"``, ``"override_set"``,
+    ``"override_cleared"``, ``"override_expired"``}. Returns the
+    event_id on success, None when the stream is disabled / broker
+    missing / publish raised. Never raises into the observer hot path.
+
+    Since posture is a per-organism property (no op_id), we key the
+    event by the trigger + posture value so ``?op_id=posture`` filters
+    cleanly (the broker keys off op_id position 2 of the frame — we
+    use the constant string ``"posture"`` so the filter vocabulary
+    stays stable).
+    """
+    if not stream_enabled():
+        return None
+    try:
+        payload: Dict[str, Any] = {"trigger": trigger}
+        if reading is not None:
+            try:
+                payload["posture"] = reading.posture.value
+                payload["confidence"] = reading.confidence
+                payload["inferred_at"] = reading.inferred_at
+                payload["signal_bundle_hash"] = reading.signal_bundle_hash
+            except Exception:  # noqa: BLE001
+                pass
+        if previous is not None:
+            try:
+                payload["previous_posture"] = previous.posture.value
+            except Exception:  # noqa: BLE001
+                pass
+        if extra:
+            for k, v in extra.items():
+                if k not in payload:
+                    payload[k] = v
+        return get_default_broker().publish(
+            EVENT_TYPE_POSTURE_CHANGED, "posture", payload,
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.debug("[Stream] publish_posture_event exception", exc_info=True)
+        return None
+
+
+def bridge_posture_to_broker(
+    observer: Optional[Any] = None,
+    broker: Optional[StreamEventBroker] = None,
+) -> Callable[[], None]:
+    """Wire a PostureObserver's ``on_change`` hook into the SSE broker.
+
+    Every inference-driven posture flip becomes a ``posture_changed``
+    SSE frame. Override-driven transitions are published via
+    :func:`publish_posture_event` from the REPL / override handler
+    rather than through this bridge (two sources, single publisher).
+
+    Returns a no-op unsubscribe callable — the observer's hook is a
+    simple callable attached at construction; to detach, replace
+    ``observer._on_change`` with ``None``.
+
+    Authority invariant: this is a read-only adapter — the broker
+    never mutates the observer. Purely push-direction.
+    """
+    if observer is None:
+        try:
+            from backend.core.ouroboros.governance.posture_observer import (
+                get_default_observer,
+            )
+            observer = get_default_observer()
+        except Exception:  # noqa: BLE001
+            logger.debug("[Stream] bridge_posture_to_broker: no observer", exc_info=True)
+            return lambda: None
+    resolved_broker = broker or get_default_broker()
+
+    def _publish(new_reading: Any, prev_reading: Any) -> None:
+        if not stream_enabled():
+            return
+        try:
+            payload: Dict[str, Any] = {
+                "trigger": "inference",
+                "posture": new_reading.posture.value,
+                "confidence": new_reading.confidence,
+                "inferred_at": new_reading.inferred_at,
+                "signal_bundle_hash": new_reading.signal_bundle_hash,
+            }
+            if prev_reading is not None:
+                try:
+                    payload["previous_posture"] = prev_reading.posture.value
+                except Exception:  # noqa: BLE001
+                    pass
+            resolved_broker.publish(
+                EVENT_TYPE_POSTURE_CHANGED, "posture", payload,
+            )
+        except Exception:  # noqa: BLE001 — never raise into observer
+            logger.debug("[Stream] posture bridge publish failed", exc_info=True)
+
+    # Install as the observer's change hook. Preserve any existing hook
+    # by chaining — tests that already wired a hook will get both calls.
+    try:
+        prev_hook = getattr(observer, "_on_change", None)
+    except Exception:  # noqa: BLE001
+        prev_hook = None
+
+    def _chained(new_reading: Any, prev_reading: Any) -> None:
+        _publish(new_reading, prev_reading)
+        if prev_hook is not None:
+            try:
+                prev_hook(new_reading, prev_reading)
+            except Exception:  # noqa: BLE001
+                logger.debug("[Stream] prev posture hook raised", exc_info=True)
+
+    try:
+        observer._on_change = _chained  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        logger.debug("[Stream] cannot install posture hook", exc_info=True)
+        return lambda: None
+
+    def _unsubscribe() -> None:
+        try:
+            observer._on_change = prev_hook  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _unsubscribe

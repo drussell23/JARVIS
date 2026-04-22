@@ -1,0 +1,116 @@
+{
+  "slice": 3,
+  "feature": "/posture REPL + IDE observability + SSE",
+  "timestamp": 1776820119.22399,
+  "all_pass": true,
+  "checks": [
+    {
+      "name": "REPL //posture status returns 'EXPLORE'",
+      "pass": true
+    },
+    {
+      "name": "REPL //posture returns 'EXPLORE'",
+      "pass": true
+    },
+    {
+      "name": "REPL //posture explain returns 'feat_ratio'",
+      "pass": true
+    },
+    {
+      "name": "REPL //posture history returns 'reading'",
+      "pass": true
+    },
+    {
+      "name": "REPL //posture signals returns 'raw values'",
+      "pass": true
+    },
+    {
+      "name": "REPL //posture help returns 'Strategic posture'",
+      "pass": true
+    },
+    {
+      "name": "REPL override sets posture",
+      "pass": true
+    },
+    {
+      "name": "REPL override writes audit record",
+      "pass": true
+    },
+    {
+      "name": "REPL clear-override drops active",
+      "pass": true
+    },
+    {
+      "name": "REPL clear-override writes audit",
+      "pass": true
+    },
+    {
+      "name": "EventChannelServer responding on /channel/health",
+      "pass": true
+    },
+    {
+      "name": "GET /observability/posture returns 200",
+      "pass": true
+    },
+    {
+      "name": "GET posture payload has schema_version=1.0",
+      "pass": true
+    },
+    {
+      "name": "GET posture payload has posture field",
+      "pass": true
+    },
+    {
+      "name": "GET posture payload has evidence (12 entries)",
+      "pass": true
+    },
+    {
+      "name": "GET posture/history returns 200",
+      "pass": true
+    },
+    {
+      "name": "GET posture/history has readings list",
+      "pass": true
+    },
+    {
+      "name": "GET posture/history respects limit",
+      "pass": true
+    },
+    {
+      "name": "SSE posture_changed frame received",
+      "pass": true
+    },
+    {
+      "name": "SSE frame payload has posture field",
+      "pass": true
+    },
+    {
+      "name": "SSE frame trigger=inference",
+      "pass": true
+    },
+    {
+      "name": "SSE frame schema_version='1.0'",
+      "pass": true
+    },
+    {
+      "name": "SSE override_set frame from REPL",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/posture_repl.py",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/posture_store.py",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/posture_prompt.py",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/posture_observer.py",
+      "pass": true
+    }
+  ]
+}

@@ -198,6 +198,14 @@ class IDEObservabilityRouter:
             "/observability/sessions/{session_id}",
             self._handle_session_detail,
         )
+        # DirectionInferrer Slice 3 — strategic posture surface.
+        app.router.add_get(
+            "/observability/posture", self._handle_posture_current,
+        )
+        app.router.add_get(
+            "/observability/posture/history",
+            self._handle_posture_history,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -664,4 +672,140 @@ class IDEObservabilityRouter:
         return self._json_response(
             request, 200,
             self._projected_session(rec, bm),
+        )
+
+    # --- DirectionInferrer Slice 3 — posture surface ----------------------
+
+    @staticmethod
+    def _posture_master_enabled() -> bool:
+        """Authority-free gate — the posture surface inherits the
+        DirectionInferrer master switch. When the switch is off we 403
+        so port scanners see no signal about what's behind the route."""
+        try:
+            from backend.core.ouroboros.governance.direction_inferrer import (
+                is_enabled,
+            )
+        except ImportError:
+            return False
+        return is_enabled()
+
+    @staticmethod
+    def _project_reading(reading: Any) -> Dict[str, Any]:
+        """Bounded projection of a PostureReading — no internal fields
+        beyond the documented public surface."""
+        return {
+            "posture": reading.posture.value,
+            "confidence": reading.confidence,
+            "inferred_at": reading.inferred_at,
+            "signal_bundle_hash": reading.signal_bundle_hash,
+            "all_scores": [
+                {"posture": p.value, "score": s}
+                for p, s in reading.all_scores
+            ],
+            "evidence": [
+                {
+                    "signal_name": c.signal_name,
+                    "raw_value": c.raw_value,
+                    "normalized": c.normalized,
+                    "weight": c.weight,
+                    "contribution_score": c.contribution_score,
+                }
+                for c in reading.evidence
+            ],
+        }
+
+    async def _handle_posture_current(self, request: "web.Request") -> Any:
+        """GET /observability/posture — current StrategicPosture reading.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "posture": "EXPLORE|CONSOLIDATE|HARDEN|MAINTAIN",
+              "confidence": 0.96,
+              "inferred_at": 1745263489.12,
+              "signal_bundle_hash": "2a291ca2",
+              "all_scores": [{"posture": "EXPLORE", "score": 0.73}, ...],
+              "evidence": [{"signal_name": "feat_ratio",
+                            "raw_value": 0.78, "normalized": 0.78,
+                            "weight": 1.0, "contribution_score": 0.78}, ...]
+            }
+
+        204 when the store has no current reading (observer hasn't
+        cycled yet) — distinguished from 403 (flag off) and 404 (never
+        used — posture has no ``{id}`` path variant).
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._posture_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.posture_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.posture_observer import (
+                get_default_store,
+            )
+            store = get_default_store()
+            reading = store.load_current()
+        except Exception:  # noqa: BLE001 — defensive: no reading rather than 500
+            logger.debug("[IDEObservability] posture_current failed", exc_info=True)
+            reading = None
+
+        if reading is None:
+            return self._json_response(
+                request, 200,
+                {"reading": None, "reason_code": "posture.no_current"},
+            )
+        return self._json_response(
+            request, 200, self._project_reading(reading),
+        )
+
+    async def _handle_posture_history(self, request: "web.Request") -> Any:
+        """GET /observability/posture/history?limit=N — ring-buffer tail.
+
+        ``limit`` defaults to 20, clamped to ``[1, 256]``. Readings are
+        returned oldest-first so clients can append new entries without
+        reordering.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._posture_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.posture_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        raw_limit = request.query.get("limit", "20")
+        try:
+            limit = max(1, min(256, int(raw_limit)))
+        except (TypeError, ValueError):
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        try:
+            from backend.core.ouroboros.governance.posture_observer import (
+                get_default_store,
+            )
+            store = get_default_store()
+            readings = store.load_history(limit=limit)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug("[IDEObservability] posture_history failed", exc_info=True)
+            readings = []
+        return self._json_response(
+            request, 200,
+            {
+                "readings": [self._project_reading(r) for r in readings],
+                "count": len(readings),
+                "limit": limit,
+            },
         )
