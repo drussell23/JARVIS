@@ -114,6 +114,23 @@ _OUTER_GATE_GRACE_S = float(os.environ.get("JARVIS_OUTER_GATE_GRACE_S", "15"))
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
+def _phase_runner_complete_extracted() -> bool:
+    """Slice 1 of Wave 2 (5) — COMPLETE phase extraction gate.
+
+    Reads ``JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED`` (default ``false``).
+    When ``true``, ``_run_pipeline`` delegates the COMPLETE block at
+    line ~7073 to
+    :class:`backend.core.ouroboros.governance.phase_runners.complete_runner.COMPLETERunner`.
+    When ``false`` (default), the inline block runs unchanged. Parity
+    tests (tests/governance/phase_runner/test_complete_runner_parity.py)
+    pin byte-identical observable output across both paths.
+    """
+    return (
+        os.environ.get("JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED", "false")
+        .strip().lower() in _TRUTHY
+    )
+
+
 def _inject_last_session_summary_impl(
     project_root: Path,
     ctx: OperationContext,
@@ -7069,6 +7086,18 @@ class GovernedOrchestrator:
                 "[Orchestrator] Visual VERIFY dispatch error: %s: %s",
                 type(_vv_exc).__name__, _vv_exc,
             )
+
+        # Wave 2 (5) Slice 1 — COMPLETERunner delegation gate.
+        # Flag JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED (default false) routes
+        # the COMPLETE block through the extracted PhaseRunner. Parity
+        # tests pin byte-identical observable output across both paths.
+        if _phase_runner_complete_extracted():
+            from backend.core.ouroboros.governance.phase_runners.complete_runner import (
+                COMPLETERunner,
+            )
+            _complete_runner = COMPLETERunner(self, _serpent, _t_apply)
+            _complete_result = await _complete_runner.run(ctx)
+            return _complete_result.next_ctx
 
         if _serpent: _serpent.update_phase("COMPLETE")
         ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")
