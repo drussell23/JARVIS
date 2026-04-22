@@ -1,0 +1,137 @@
+{
+  "slice": 4,
+  "feature": "FlagRegistry GRADUATION + Full-Revert Matrix",
+  "timestamp": 1776822755.6139379,
+  "all_pass": true,
+  "total_checks": 32,
+  "checks": [
+    {
+      "name": "is_enabled() True post-graduation",
+      "pass": true
+    },
+    {
+      "name": "dispatcher_enabled() True post-graduation",
+      "pass": true
+    },
+    {
+      "name": "seed installed (52 flags)",
+      "pass": true
+    },
+    {
+      "name": "/help top-index ok",
+      "pass": true
+    },
+    {
+      "name": "/help lists 7 verbs + 52 flags",
+      "pass": true
+    },
+    {
+      "name": "/help flags --posture HARDEN (Wave 1 #1 consumer) \u2192 \u22655 flags",
+      "pass": true
+    },
+    {
+      "name": "/help flag detail ok",
+      "pass": true
+    },
+    {
+      "name": "/help unregistered finds typo",
+      "pass": true
+    },
+    {
+      "name": "GET /observability/flags \u2192 200 on defaults",
+      "pass": true
+    },
+    {
+      "name": "GET flags schema=1.0",
+      "pass": true
+    },
+    {
+      "name": "GET flags payload count \u2264 5 (limit respected)",
+      "pass": true
+    },
+    {
+      "name": "GET /observability/verbs \u2192 200",
+      "pass": true
+    },
+    {
+      "name": "GET verbs count \u2265 7",
+      "pass": true
+    },
+    {
+      "name": "GET flags?posture=HARDEN 200",
+      "pass": true
+    },
+    {
+      "name": "GET posture filter non-empty",
+      "pass": true
+    },
+    {
+      "name": "SSE flag_typo_detected on defaults",
+      "pass": true
+    },
+    {
+      "name": "SSE flag_registered on defaults",
+      "pass": true
+    },
+    {
+      "name": "master=false: is_enabled() False",
+      "pass": true
+    },
+    {
+      "name": "master=false: dispatcher_enabled() False",
+      "pass": true
+    },
+    {
+      "name": "Surface 1 REPL: /help flags rejected",
+      "pass": true
+    },
+    {
+      "name": "Surface 1 REPL: /help help still works (discoverability)",
+      "pass": true
+    },
+    {
+      "name": "Surface 2 GET: /flags 403",
+      "pass": true
+    },
+    {
+      "name": "Surface 2 GET: /flags/{name} 403",
+      "pass": true
+    },
+    {
+      "name": "Surface 2 GET: /flags/unregistered 403",
+      "pass": true
+    },
+    {
+      "name": "Surface 2 GET: /verbs 403",
+      "pass": true
+    },
+    {
+      "name": "Surface 3: typo_warn_enabled() False",
+      "pass": true
+    },
+    {
+      "name": "re-default: is_enabled() back to True",
+      "pass": true
+    },
+    {
+      "name": "re-default: GET /flags back to 200",
+      "pass": true
+    },
+    {
+      "name": "re-default: /help flags back to ok",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/flag_registry.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/flag_registry_seed.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/help_dispatcher.py",
+      "pass": true
+    }
+  ]
+}
