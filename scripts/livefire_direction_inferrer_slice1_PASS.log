@@ -1,0 +1,85 @@
+{
+  "slice": 1,
+  "feature": "DirectionInferrer",
+  "timestamp": 1776818792.629594,
+  "all_pass": true,
+  "elapsed_ms": 7.171417000000346,
+  "posture": "EXPLORE",
+  "confidence": 0.9590163934426229,
+  "signal_bundle_hash": "2a291ca2",
+  "all_scores": [
+    [
+      "EXPLORE",
+      0.732
+    ],
+    [
+      "MAINTAIN",
+      0.03
+    ],
+    [
+      "HARDEN",
+      -0.09600000000000002
+    ],
+    [
+      "CONSOLIDATE",
+      -0.146
+    ]
+  ],
+  "commit_ratios": {
+    "feat": 0.78,
+    "fix": 0.04,
+    "refactor": 0.06,
+    "test": 0.04,
+    "docs": 0.06
+  },
+  "checks": [
+    {
+      "name": "posture in enum",
+      "pass": true
+    },
+    {
+      "name": "confidence in [0,1]",
+      "pass": true
+    },
+    {
+      "name": "evidence list has 12 entries",
+      "pass": true
+    },
+    {
+      "name": "all_scores has 4 entries (one per posture)",
+      "pass": true
+    },
+    {
+      "name": "signal_bundle_hash is 8-char hex",
+      "pass": true
+    },
+    {
+      "name": "schema_version is literal string '1.0'",
+      "pass": true
+    },
+    {
+      "name": "inference under 10ms (\u00a75 Tier 0 budget)",
+      "pass": true
+    },
+    {
+      "name": "idempotence: same bundle \u2192 same hash",
+      "pass": true
+    },
+    {
+      "name": "idempotence: same bundle \u2192 same posture",
+      "pass": true
+    },
+    {
+      "name": "DEFAULT_WEIGHTS covers 12 signals",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/direction_inferrer.py",
+      "pass": true
+    },
+    {
+      "name": "authority-import-free: backend/core/ouroboros/governance/posture.py",
+      "pass": true
+    }
+  ]
+}
