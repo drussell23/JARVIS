@@ -568,7 +568,7 @@ def _own_flag_specs() -> List[Any]:
     return [
         FlagSpec(
             name="JARVIS_MEMORY_PRESSURE_GATE_ENABLED",
-            type=FlagType.BOOL, default=False,
+            type=FlagType.BOOL, default=True,
             description=(
                 "Master kill switch for the MemoryPressureGate — advisory "
                 "signal for worktree fan-out and other memory-intensive "

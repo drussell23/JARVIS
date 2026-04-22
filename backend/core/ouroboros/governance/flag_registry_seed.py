@@ -750,7 +750,7 @@ SEED_SPECS: list = [
     # ====================================================================
     FlagSpec(
         name="JARVIS_FLAG_REGISTRY_ENABLED",
-        type=FlagType.BOOL, default=False,
+        type=FlagType.BOOL, default=True,
         description=(
             "Master kill switch for the FlagRegistry + /help dispatcher "
             "surfaces (REPL, GET, SSE, typo warnings). Registry data "

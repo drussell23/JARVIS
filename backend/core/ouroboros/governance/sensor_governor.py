@@ -637,7 +637,7 @@ def _own_flag_specs() -> List[Any]:
     return [
         FlagSpec(
             name="JARVIS_SENSOR_GOVERNOR_ENABLED",
-            type=FlagType.BOOL, default=False,
+            type=FlagType.BOOL, default=True,
             description=(
                 "Master kill switch for the SensorGovernor — posture-"
                 "weighted op-emission cap across the 16 sensors."
