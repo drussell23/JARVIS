@@ -70,13 +70,30 @@ def _env_float(name: str, default: float) -> float:
 
 
 def is_enabled() -> bool:
-    """Master switch. Default ``false`` at Slice 1 — Slice 4 graduates.
+    """Master switch.
 
-    When ``False``, callers must treat ``DirectionInferrer`` as if the
-    module didn't exist: no inference, no observer, no prompt injection,
-    no REPL, no GET, no SSE. One flag kills every surface.
+    Default: **``true``** (graduated 2026-04-21 via Slice 4 after
+    Slices 1-3 shipped the primitive + observer/store/prompt injection +
+    /posture REPL + IDE GET + SSE bridge with 165 governance tests +
+    3 live-fire proofs on real repo state). Explicit ``"false"`` reverts
+    to the Slice 1 deny-by-default posture so operators retain a
+    runtime kill switch — when the flag is explicitly ``"false"`` every
+    surface disables in lockstep:
+
+      * PostureObserver.start() becomes a no-op
+      * StrategicDirection.format_for_prompt() omits the posture section
+      * GET /observability/posture returns 403 (port scanners see no
+        signal about what's behind the route)
+      * /posture REPL rejects operational verbs (help still works)
+      * SSE publish_posture_event() returns None (drops silently)
+
+    The authority invariants (grep-pinned zero imports of
+    orchestrator/policy/iron_gate/risk_tier/change_engine/candidate_generator),
+    loopback-only GET binding, rate-limit caps, CORS allowlist, and
+    confidence-floor fallback all remain in force regardless of this
+    flag — graduation flips opt-in friction, NOT authority surface.
     """
-    return _env_bool("JARVIS_DIRECTION_INFERRER_ENABLED", False)
+    return _env_bool("JARVIS_DIRECTION_INFERRER_ENABLED", True)
 
 
 def confidence_floor() -> float:

@@ -220,7 +220,8 @@ class TestPosturePrompt:
         monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "true")
         assert compose_posture_section(None) == ""
 
-    def test_master_off_returns_empty_string(self):
+    def test_master_off_returns_empty_string(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "false")
         assert compose_posture_section(_explore_reading()) == ""
 
     def test_master_on_injection_off_returns_empty(self, monkeypatch):
@@ -267,6 +268,7 @@ class TestPosturePrompt:
         assert len(block) < 600, f"posture block too large: {len(block)} chars"
 
     def test_prompt_injection_enabled_gated_by_master(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "false")
         assert prompt_injection_enabled() is False
         monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "true")
         assert prompt_injection_enabled() is True
@@ -571,7 +573,8 @@ class TestPostureObserverCycle:
         assert any(c[0] is Posture.HARDEN for c in calls)
 
     @pytest.mark.asyncio
-    async def test_start_noop_when_master_flag_off(self, tmp_store: PostureStore):
+    async def test_start_noop_when_master_flag_off(self, tmp_store: PostureStore, monkeypatch):
+        monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "false")
         observer = PostureObserver(
             Path("."), tmp_store, collector=_StubCollector(_explore_bundle()),
         )

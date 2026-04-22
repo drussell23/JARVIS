@@ -480,8 +480,9 @@ class TestEdgeCases:
 
 class TestMasterSwitch:
 
-    def test_default_off(self):
-        assert is_enabled() is False
+    def test_default_on_post_graduation(self):
+        """Post-Slice-4 graduation: default flipped false→true."""
+        assert is_enabled() is True
 
     def test_enable_via_true_string(self, monkeypatch):
         monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "true")

@@ -1,0 +1,142 @@
+{
+  "slice": 4,
+  "feature": "DirectionInferrer GRADUATION + Full-Revert Matrix",
+  "timestamp": 1776820929.731458,
+  "all_pass": true,
+  "total_checks": 33,
+  "passed": 33,
+  "checks": [
+    {
+      "name": "is_enabled() defaults to True post-graduation",
+      "pass": true
+    },
+    {
+      "name": "prompt_injection_enabled() True on defaults",
+      "pass": true
+    },
+    {
+      "name": "SignalCollector.build_bundle on real repo",
+      "pass": true
+    },
+    {
+      "name": "Observer cycle produces reading",
+      "pass": true
+    },
+    {
+      "name": "PostureStore current populated",
+      "pass": true
+    },
+    {
+      "name": "compose_posture_section non-empty on defaults",
+      "pass": true
+    },
+    {
+      "name": "Prompt block under 600 char budget",
+      "pass": true
+    },
+    {
+      "name": "StrategicDirection.format_for_prompt includes posture section on defaults",
+      "pass": true
+    },
+    {
+      "name": "REPL /posture status works on defaults",
+      "pass": true
+    },
+    {
+      "name": "REPL status includes posture value",
+      "pass": true
+    },
+    {
+      "name": "GET /observability/posture returns 200 on defaults",
+      "pass": true
+    },
+    {
+      "name": "GET posture payload schema_version=1.0",
+      "pass": true
+    },
+    {
+      "name": "GET posture has 12 evidence entries",
+      "pass": true
+    },
+    {
+      "name": "GET posture has 4 all_scores entries",
+      "pass": true
+    },
+    {
+      "name": "SSE posture_changed frame received on defaults",
+      "pass": true
+    },
+    {
+      "name": "REPL override returns ok",
+      "pass": true
+    },
+    {
+      "name": "REPL override writes audit record",
+      "pass": true
+    },
+    {
+      "name": "REPL override publishes SSE override_set",
+      "pass": true
+    },
+    {
+      "name": "master=false: is_enabled() False",
+      "pass": true
+    },
+    {
+      "name": "master=false: prompt_injection_enabled() False",
+      "pass": true
+    },
+    {
+      "name": "Surface 1 prompt: posture section removed",
+      "pass": true
+    },
+    {
+      "name": "Surface 2 REPL: status rejected",
+      "pass": true
+    },
+    {
+      "name": "Surface 2 REPL: error cites master flag",
+      "pass": true
+    },
+    {
+      "name": "Surface 3 GET: 403 on master=false",
+      "pass": true
+    },
+    {
+      "name": "help still works master=false (discoverability)",
+      "pass": true
+    },
+    {
+      "name": "master re-default: is_enabled() back to True",
+      "pass": true
+    },
+    {
+      "name": "master re-default: GET back to 200",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/direction_inferrer.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/posture.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/posture_store.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/posture_prompt.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/posture_observer.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/posture_repl.py",
+      "pass": true
+    }
+  ]
+}

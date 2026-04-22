@@ -106,7 +106,8 @@ class TestDispatcherBasics:
         r = _run("/posture ?")
         assert "Strategic posture" in r.text
 
-    def test_master_off_rejects_operational_verbs(self, tmp_store: PostureStore):
+    def test_master_off_rejects_operational_verbs(self, tmp_store: PostureStore, monkeypatch):
+        monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "false")
         r = _run("/posture status", store=tmp_store)
         assert r.ok is False
         assert "DirectionInferrer disabled" in r.text
@@ -436,7 +437,8 @@ class TestIDEObservabilityPosture:
     @pytest.mark.asyncio
     async def test_current_returns_403_when_master_off(self, tmp_path: Path, monkeypatch):
         monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "true")
-        # Master flag not set → posture disabled
+        # Explicit master=false reverts the surface post-graduation
+        monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "false")
         from backend.core.ouroboros.governance.ide_observability import (
             IDEObservabilityRouter,
         )
