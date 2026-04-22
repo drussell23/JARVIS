@@ -1,0 +1,287 @@
+{
+  "schema_version": "1.0",
+  "probe_at": 1776825601.427941,
+  "sections": {
+    "posture": {
+      "posture": "EXPLORE",
+      "confidence": 0.9835092445327791,
+      "source": "inferred from live git log (no persisted .jarvis/posture_current.json)",
+      "bundle_hash": "faf6761e",
+      "top_contributors": [
+        {
+          "signal": "feat_ratio",
+          "raw": 0.88,
+          "contrib": 0.88
+        },
+        {
+          "signal": "time_since_last_graduation_inv",
+          "raw": 0.7850688077488949,
+          "contrib": 0.23552064232466846
+        },
+        {
+          "signal": "test_docs_ratio",
+          "raw": 0.06,
+          "contrib": -0.012
+        }
+      ],
+      "all_scores": [
+        [
+          "EXPLORE",
+          1.0915206423246684
+        ],
+        [
+          "MAINTAIN",
+          0.018
+        ],
+        [
+          "HARDEN",
+          -0.14400000000000002
+        ],
+        [
+          "CONSOLIDATE",
+          -0.5380275230995579
+        ]
+      ]
+    },
+    "sensor_matrix": {
+      "TestFailureSensor": {
+        "EXPLORE": 16,
+        "CONSOLIDATE": 20,
+        "HARDEN": 36,
+        "MAINTAIN": 20
+      },
+      "RuntimeHealthSensor": {
+        "EXPLORE": 5,
+        "CONSOLIDATE": 5,
+        "HARDEN": 7,
+        "MAINTAIN": 5
+      },
+      "PerformanceRegressionSensor": {
+        "EXPLORE": 10,
+        "CONSOLIDATE": 10,
+        "HARDEN": 15,
+        "MAINTAIN": 10
+      },
+      "OpportunityMinerSensor": {
+        "EXPLORE": 22,
+        "CONSOLIDATE": 7,
+        "HARDEN": 4,
+        "MAINTAIN": 15
+      },
+      "ProactiveExplorationSensor": {
+        "EXPLORE": 4,
+        "CONSOLIDATE": 1,
+        "HARDEN": 1,
+        "MAINTAIN": 3
+      },
+      "IntentDiscoverySensor": {
+        "EXPLORE": 14,
+        "CONSOLIDATE": 8,
+        "HARDEN": 5,
+        "MAINTAIN": 10
+      },
+      "CapabilityGapSensor": {
+        "EXPLORE": 6,
+        "CONSOLIDATE": 5,
+        "HARDEN": 4,
+        "MAINTAIN": 5
+      },
+      "WebIntelligenceSensor": {
+        "EXPLORE": 5,
+        "CONSOLIDATE": 4,
+        "HARDEN": 2,
+        "MAINTAIN": 4
+      },
+      "DocStalenessSensor": {
+        "EXPLORE": 4,
+        "CONSOLIDATE": 7,
+        "HARDEN": 3,
+        "MAINTAIN": 6
+      },
+      "TodoScannerSensor": {
+        "EXPLORE": 8,
+        "CONSOLIDATE": 11,
+        "HARDEN": 6,
+        "MAINTAIN": 8
+      },
+      "BacklogSensor": {
+        "EXPLORE": 4,
+        "CONSOLIDATE": 7,
+        "HARDEN": 3,
+        "MAINTAIN": 6
+      },
+      "CrossRepoDriftSensor": {
+        "EXPLORE": 4,
+        "CONSOLIDATE": 4,
+        "HARDEN": 4,
+        "MAINTAIN": 4
+      },
+      "GitHubIssueSensor": {
+        "EXPLORE": 30,
+        "CONSOLIDATE": 30,
+        "HARDEN": 36,
+        "MAINTAIN": 30
+      },
+      "VoiceCommandSensor": {
+        "EXPLORE": 60,
+        "CONSOLIDATE": 60,
+        "HARDEN": 60,
+        "MAINTAIN": 60
+      },
+      "VisionSensor": {
+        "EXPLORE": 12,
+        "CONSOLIDATE": 8,
+        "HARDEN": 10,
+        "MAINTAIN": 10
+      },
+      "ScheduledSensor": {
+        "EXPLORE": 24,
+        "CONSOLIDATE": 24,
+        "HARDEN": 24,
+        "MAINTAIN": 24
+      }
+    },
+    "urgency_sweep": {
+      "sensor": "TestFailureSensor",
+      "posture": "EXPLORE",
+      "caps": {
+        "immediate": 32,
+        "standard": 16,
+        "complex": 12,
+        "background": 8,
+        "speculative": 4
+      }
+    },
+    "memory_probe": {
+      "source": "psutil",
+      "free_pct": 24.639129638671875,
+      "total_gib": 16,
+      "level": "warn",
+      "fanout_matrix": [
+        {
+          "n_requested": 1,
+          "n_allowed": 1,
+          "level": "warn",
+          "reason_code": "memory_pressure_gate.capped_to_8_at_warn"
+        },
+        {
+          "n_requested": 3,
+          "n_allowed": 3,
+          "level": "warn",
+          "reason_code": "memory_pressure_gate.capped_to_8_at_warn"
+        },
+        {
+          "n_requested": 8,
+          "n_allowed": 8,
+          "level": "warn",
+          "reason_code": "memory_pressure_gate.capped_to_8_at_warn"
+        },
+        {
+          "n_requested": 16,
+          "n_allowed": 8,
+          "level": "warn",
+          "reason_code": "memory_pressure_gate.capped_to_8_at_warn"
+        }
+      ]
+    },
+    "emergency_brake": [
+      {
+        "case": "baseline (no brake)",
+        "bundle": {
+          "cost_burn_normalized": 0.0,
+          "postmortem_failure_rate": 0.0
+        },
+        "emergency_brake": false,
+        "test_failure_cap": 16,
+        "opportunity_miner_cap": 22,
+        "doc_staleness_cap": 4,
+        "global_cap": 200
+      },
+      {
+        "case": "cost_burn=0.95",
+        "bundle": {
+          "cost_burn_normalized": 0.95,
+          "postmortem_failure_rate": 0.0
+        },
+        "emergency_brake": true,
+        "test_failure_cap": 3,
+        "opportunity_miner_cap": 4,
+        "doc_staleness_cap": 1,
+        "global_cap": 40
+      },
+      {
+        "case": "postmortem=0.75",
+        "bundle": {
+          "cost_burn_normalized": 0.0,
+          "postmortem_failure_rate": 0.75
+        },
+        "emergency_brake": true,
+        "test_failure_cap": 3,
+        "opportunity_miner_cap": 4,
+        "doc_staleness_cap": 1,
+        "global_cap": 40
+      },
+      {
+        "case": "both high",
+        "bundle": {
+          "cost_burn_normalized": 0.95,
+          "postmortem_failure_rate": 0.75
+        },
+        "emergency_brake": true,
+        "test_failure_cap": 3,
+        "opportunity_miner_cap": 4,
+        "doc_staleness_cap": 1,
+        "global_cap": 40
+      }
+    ],
+    "posture_relevant_flags": {
+      "posture": "EXPLORE",
+      "count": 6,
+      "flags": [
+        {
+          "name": "JARVIS_DIRECTION_INFERRER_ENABLED",
+          "category": "safety",
+          "relevance": "critical",
+          "default": true
+        },
+        {
+          "name": "JARVIS_FLAG_REGISTRY_ENABLED",
+          "category": "safety",
+          "relevance": "critical",
+          "default": false
+        },
+        {
+          "name": "JARVIS_MEMORY_PRESSURE_GATE_ENABLED",
+          "category": "safety",
+          "relevance": "critical",
+          "default": false
+        },
+        {
+          "name": "JARVIS_SEMANTIC_GUARD_ENABLED",
+          "category": "safety",
+          "relevance": "critical",
+          "default": true
+        },
+        {
+          "name": "JARVIS_SEMANTIC_INFERENCE_ENABLED",
+          "category": "experimental",
+          "relevance": "critical",
+          "default": false
+        },
+        {
+          "name": "JARVIS_SENSOR_GOVERNOR_ENABLED",
+          "category": "safety",
+          "relevance": "critical",
+          "default": false
+        }
+      ]
+    },
+    "analysis": [
+      "emergency brake ratio ok: True (brake_cap/baseline_cap = 0.19, expected ~0.2)",
+      "EXPLORE weight direction ok: True (OpportunityMiner cap=22 > TestFailure cap=16)",
+      "memory probe ok: True (source='psutil', ok=True)",
+      "all 4 master kill switches surface for posture=EXPLORE: True"
+    ]
+  },
+  "all_checks_pass": true
+}
