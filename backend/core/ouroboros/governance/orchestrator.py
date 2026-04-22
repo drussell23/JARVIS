@@ -131,6 +131,28 @@ def _phase_runner_complete_extracted() -> bool:
     )
 
 
+def _phase_runner_classify_extracted() -> bool:
+    """Slice 2 of Wave 2 (5) — CLASSIFY phase extraction gate.
+
+    Reads ``JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED`` (default ``false``).
+    When ``true``, ``_run_pipeline`` delegates the 760-line CLASSIFY
+    block (emergency check + advisor + risk classification + 8 prompt
+    injections + advance to ROUTE + narrator/dialogue start +
+    ClassifyClarify) to
+    :class:`backend.core.ouroboros.governance.phase_runners.classify_runner.CLASSIFYRunner`.
+    The ``_advisory`` local leaks downstream (Tier 6 personality voice
+    line reads ``_advisory.chronic_entropy``) and is threaded back
+    through ``PhaseResult.artifacts`` to preserve the data flow.
+    When ``false`` (default), the inline block runs unchanged. Parity
+    tests (tests/governance/phase_runner/test_classify_runner_parity.py)
+    pin observable output across both paths.
+    """
+    return (
+        os.environ.get("JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED", "false")
+        .strip().lower() in _TRUTHY
+    )
+
+
 def _inject_last_session_summary_impl(
     project_root: Path,
     ctx: OperationContext,
@@ -1232,766 +1254,784 @@ class GovernedOrchestrator:
         except Exception:
             pass
 
-        # ── JARVIS Tier 2: Emergency Protocol Check ──────────────────────
-        # If emergency level is ORANGE or higher, block autonomous operations
-        try:
-            from backend.core.ouroboros.governance.emergency_protocols import (
-                EmergencyProtocolEngine, AlertLevel,
+        # Wave 2 (5) Slice 2 - CLASSIFYRunner delegation gate.
+        # Flag JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED (default false) routes
+        # the 760-line CLASSIFY block through the extracted PhaseRunner.
+        # Parity tests pin identical observable output across both paths.
+        # _advisory is the only local that leaks downstream (line ~2779
+        # Tier 6 personality voice line reads .chronic_entropy) - we
+        # thread it through result.artifacts to preserve the data flow.
+        if _phase_runner_classify_extracted():
+            from backend.core.ouroboros.governance.phase_runners.classify_runner import (
+                CLASSIFYRunner,
             )
-            _emergency = getattr(self._stack, "_emergency_engine", None)
-            if _emergency is not None and not _emergency.can_proceed():
-                state = _emergency.get_state()
-                logger.warning(
-                    "[Orchestrator] Emergency level %s — operation blocked (op=%s)",
-                    state.level.name, ctx.op_id,
-                )
-                if _serpent:
-                    await _serpent.stop(success=False)
-                ctx = ctx.advance(
-                    OperationPhase.CANCELLED,
-                    terminal_reason_code=f"emergency_{state.level.name.lower()}",
-                )
-                return ctx
-        except ImportError:
-            pass
-        except Exception:
-            pass
-
-        # ── JARVIS Tier 1: Operation Advisor ────────────────────────────
-        # "Sir, I wouldn't recommend that."
-        _advisory = None
-        try:
-            from backend.core.ouroboros.governance.operation_advisor import (
-                OperationAdvisor, AdvisoryDecision, infer_read_only_intent,
-            )
-            # Stamp read-only intent onto the hash-chained context BEFORE
-            # advising. The Advisor's bypass of blast_radius + test_coverage
-            # is mathematically safe only because ctx.is_read_only is
-            # enforced downstream by tool_executor (mutating tools refused)
-            # and the orchestrator's APPLY short-circuit.
-            if not ctx.is_read_only:
-                _inferred_ro = infer_read_only_intent(ctx.description)
-                if _inferred_ro:
-                    ctx = ctx.with_read_only_intent(True)
-                    logger.info(
-                        "[Orchestrator] Read-only intent inferred op=%s "
-                        "— Advisor blast/coverage bypass active; tool_executor "
-                        "will refuse mutations; APPLY phase will short-circuit",
-                        ctx.op_id,
-                    )
-            _advisor = OperationAdvisor(self._config.project_root)
-            _advisory = _advisor.advise(
-                ctx.target_files, ctx.description, ctx.op_id,
-                is_read_only=ctx.is_read_only,
-            )
-
-            if _advisory.decision == AdvisoryDecision.BLOCK:
-                logger.warning(
-                    "[Orchestrator] Advisor BLOCKED operation: %s (op=%s)",
-                    "; ".join(_advisory.reasons), ctx.op_id,
-                )
-                if _serpent:
-                    await _serpent.stop(success=False)
-                ctx = ctx.advance(
-                    OperationPhase.CANCELLED,
-                    terminal_reason_code="advisor_blocked",
-                )
-                return ctx
-
-            if _advisory.decision != AdvisoryDecision.RECOMMEND:
-                # Inject advisory into context for generation awareness
-                _adv_prompt = _advisor.format_for_prompt(_advisory)
-                if _adv_prompt:
-                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                    ctx = ctx.with_strategic_memory_context(
-                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
-                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                        strategic_memory_prompt=_existing + "\n\n" + _adv_prompt,
-                        strategic_memory_digest=ctx.strategic_memory_digest,
-                    )
-
-                # Voice the warning
-                if _advisory.voice_message and self._reasoning_narrator is not None:
-                    try:
-                        self._reasoning_narrator.record_classify(
-                            ctx.op_id, _advisory.decision.value,
-                            _advisory.voice_message,
-                        )
-                    except Exception:
-                        pass
-
-                logger.info(
-                    "[Orchestrator] Advisor: %s (risk=%.2f) — %s",
-                    _advisory.decision.value, _advisory.risk_score,
-                    _advisory.reasons[0] if _advisory.reasons else "no specific reason",
-                )
-        except ImportError:
-            pass
-        except Exception:
-            logger.debug("[Orchestrator] Advisor failed", exc_info=True)
-
-        # ---- Phase 1: CLASSIFY ----
-        profile = self._build_profile(ctx)
-        classification = self._stack.risk_engine.classify(profile)
-        risk_tier = classification.tier
-
-        # ---- Complexity + Persistence classification (Assimilation Gate) ----
-        _complexity_result = None
-        try:
-            from backend.core.ouroboros.governance.complexity_classifier import (
-                OperationComplexityClassifier,
-            )
-            _classifier = OperationComplexityClassifier(
-                topology=getattr(self._stack, "topology", None),
-                ledger=getattr(self._stack, "ledger", None),
-            )
-            _complexity_result = _classifier.classify(
-                description=ctx.description,
-                target_files=list(ctx.target_files),
-            )
-            # Stamp complexity on context for downstream routing decisions.
-            # task_complexity is a declared field on OperationContext, so
-            # object.__setattr__ values survive dataclasses.replace() in
-            # advance() and all with_*() methods.
-            object.__setattr__(ctx, "task_complexity", _complexity_result.complexity.value)
-
-            logger.info(
-                "[Orchestrator] \U0001f4ca Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",
-                _complexity_result.complexity.value,
-                _complexity_result.persistence.value,
-                _complexity_result.auto_approve_eligible,
-                _complexity_result.fast_path_eligible,
-                ctx.op_id,
-            )
-        except Exception:
-            logger.debug("[Orchestrator] ComplexityClassifier not available", exc_info=True)
-
-        # ---- Consciousness regression detection (ProphecyEngine + MemoryEngine) ----
-        _consciousness_bridge = getattr(self._stack, "consciousness_bridge", None)
-        if _consciousness_bridge is None:
-            # Check if GLS has the bridge (wired by Zone 6.12)
-            _gls = getattr(self._stack, "governed_loop_service", None)
-            if _gls is not None:
-                _consciousness_bridge = getattr(_gls, "_consciousness_bridge", None)
-        if _consciousness_bridge is not None:
+            _classify_runner = CLASSIFYRunner(self, _serpent)
+            _classify_result = await _classify_runner.run(ctx)
+            _advisory = _classify_result.artifacts.get("advisory")
+            if _classify_result.next_phase is None:
+                return _classify_result.next_ctx
+            ctx = _classify_result.next_ctx
+        else:
+            # ── JARVIS Tier 2: Emergency Protocol Check ──────────────────────
+            # If emergency level is ORANGE or higher, block autonomous operations
             try:
-                _regression = await _consciousness_bridge.assess_regression_risk(
-                    list(ctx.target_files)
+                from backend.core.ouroboros.governance.emergency_protocols import (
+                    EmergencyProtocolEngine, AlertLevel,
                 )
-                if _regression and _regression.get("risk_level") in ("high", "critical"):
+                _emergency = getattr(self._stack, "_emergency_engine", None)
+                if _emergency is not None and not _emergency.can_proceed():
+                    state = _emergency.get_state()
                     logger.warning(
-                        "[Orchestrator] Consciousness regression alert: %s risk for %s — %s [%s]",
-                        _regression["risk_level"],
-                        ctx.target_files,
-                        _regression.get("reasoning", ""),
-                        ctx.op_id,
+                        "[Orchestrator] Emergency level %s — operation blocked (op=%s)",
+                        state.level.name, ctx.op_id,
                     )
+                    if _serpent:
+                        await _serpent.stop(success=False)
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code=f"emergency_{state.level.name.lower()}",
+                    )
+                    return ctx
+            except ImportError:
+                pass
             except Exception:
-                logger.debug("[Orchestrator] Consciousness regression check failed", exc_info=True)
+                pass
 
-        # ---- Goal Memory injection (cross-session learning via ChromaDB) ----
-        _goal_memory_bridge = None
-        _gls_for_gmb = getattr(self._stack, "governed_loop_service", None)
-        if _gls_for_gmb is not None:
-            _goal_memory_bridge = getattr(_gls_for_gmb, "_goal_memory_bridge", None)
-        if _goal_memory_bridge is not None:
+            # ── JARVIS Tier 1: Operation Advisor ────────────────────────────
+            # "Sir, I wouldn't recommend that."
+            _advisory = None
             try:
-                _goal_ctx = await _goal_memory_bridge.get_relevant_context(
-                    description=ctx.description,
-                    target_files=ctx.target_files,
+                from backend.core.ouroboros.governance.operation_advisor import (
+                    OperationAdvisor, AdvisoryDecision, infer_read_only_intent,
                 )
-                if _goal_ctx:
-                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                    ctx = ctx.with_strategic_memory_context(
-                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
-                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                        strategic_memory_prompt=_existing + "\n\n" + _goal_ctx,
-                        strategic_memory_digest=ctx.strategic_memory_digest,
-                    )
-            except Exception:
-                logger.debug("[Orchestrator] Goal memory injection failed", exc_info=True)
-
-        # ---- Strategic Direction injection (Manifesto + architecture docs) ----
-        _strategic_svc = None
-        if _gls_for_gmb is not None:
-            _strategic_svc = getattr(_gls_for_gmb, "_strategic_direction", None)
-        if _strategic_svc is not None and getattr(_strategic_svc, "is_loaded", False):
-            try:
-                _strat_prompt = _strategic_svc.format_for_prompt()
-                if _strat_prompt:
-                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                    ctx = ctx.with_strategic_memory_context(
-                        strategic_intent_id="manifesto-v4",
-                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                        strategic_memory_prompt=_strat_prompt + "\n\n" + _existing,
-                        strategic_memory_digest=(
-                            ctx.strategic_memory_digest
-                            or _strategic_svc.digest[:500]
-                        ),
-                    )
-                    logger.debug(
-                        "[Orchestrator] Strategic direction injected (%d principles)",
-                        len(_strategic_svc.principles),
-                    )
-            except Exception:
-                logger.debug("[Orchestrator] Strategic direction injection failed", exc_info=True)
-
-        # ---- ConversationBridge (v0.1): TUI dialogue as untrusted soft bias ----
-        # Injects the user's recent TUI turns BETWEEN the trusted manifesto
-        # block (above) and the trusted goals + user-preferences blocks
-        # (below). Untrusted-in-the-middle ordering preserves attention-
-        # mechanism dominance for FORBIDDEN_PATH / style prefs (which come
-        # last) while still surfacing conversational intent to the model.
-        #
-        # Authority invariant (plan v0.1 §9): this block has zero authority
-        # over Iron Gate, UrgencyRouter, risk tier, policy engine,
-        # FORBIDDEN_PATH, tool protected-path checks, or approval gating.
-        # Consumed ONLY by StrategicDirection at this injection site.
-        try:
-            from backend.core.ouroboros.governance.conversation_bridge import (
-                get_default_bridge,
-            )
-            _bridge = get_default_bridge()
-            (
-                _bridge_enabled,
-                _n_turns,
-                _n_user,
-                _n_assistant,
-                _n_postmortem,
-                _chars_in,
-                _redacted,
-                _hash8,
-            ) = _bridge.inject_metrics()
-            if _bridge_enabled:
-                _conv_prompt = _bridge.format_for_prompt()
-                if _conv_prompt:
-                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                    ctx = ctx.with_strategic_memory_context(
-                        strategic_intent_id=ctx.strategic_intent_id or "conv-bridge-v1",
-                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                        strategic_memory_prompt=(
-                            _existing + "\n\n" + _conv_prompt
-                            if _existing else _conv_prompt
-                        ),
-                        strategic_memory_digest=ctx.strategic_memory_digest,
-                    )
-                # §8 one-line observability contract (v1.1 source breakdown).
-                # Logged whether or not there were turns to inject —
-                # operators need to see that the wiring fired.
-                logger.info(
-                    "[ConversationBridge] op=%s enabled=true n_turns=%d "
-                    "n_user=%d n_assistant=%d n_postmortem=%d chars_in=%d "
-                    "inject_site=context_expansion redacted=%s hash8=%s",
-                    ctx.op_id, _n_turns, _n_user, _n_assistant, _n_postmortem,
-                    _chars_in, _redacted, _hash8,
-                )
-            else:
-                # §8 §7-tweak: DEBUG line at inject site when master switch
-                # is off so "is wiring live?" is answerable without content.
-                logger.debug(
-                    "[ConversationBridge] op=%s enabled=false "
-                    "inject_site=context_expansion",
-                    ctx.op_id,
-                )
-        except Exception:
-            logger.debug(
-                "[Orchestrator] ConversationBridge injection skipped",
-                exc_info=True,
-            )
-
-        # ---- SemanticIndex v0.1: recency-weighted focus + closures ----
-        # Soft semantic prior drawn from the recency-weighted centroid
-        # over recent commits + active goals + recent conversation.
-        # Injected BETWEEN the ConversationBridge block (above) and the
-        # Goals block (below) so the ordering reads top-to-bottom as:
-        # Strategic → Bridge (untrusted dialogue) → Semantic (untrusted
-        # prior) → Goals (trusted) → UserPreferences (highest trust).
-        #
-        # Authority invariant: this block has **zero** authority over
-        # Iron Gate, UrgencyRouter, risk tier, policy engine, FORBIDDEN_PATH,
-        # or approval gating. It affects ONLY the prompt surface the model
-        # reads at CONTEXT_EXPANSION — §4 (data sovereignty, local
-        # embedder) + §8 (hashes + counts, no raw vectors in logs).
-        try:
-            from backend.core.ouroboros.governance.semantic_index import (
-                get_default_index,
-            )
-            _semi = get_default_index(self._config.project_root)
-            # Lazy build (hits interval gate on repeat).
-            _semi.build()
-            _semi_prompt = _semi.format_prompt_sections()
-            if _semi_prompt:
-                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=ctx.strategic_intent_id or "semantic-v1",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=(
-                        _existing + "\n\n" + _semi_prompt
-                        if _existing else _semi_prompt
-                    ),
-                    strategic_memory_digest=ctx.strategic_memory_digest,
-                )
-                _semi_stats = _semi.stats()
-                logger.info(
-                    "[SemanticIndex] op=%s corpus_n=%d centroid_hash8=%s "
-                    "inject_site=context_expansion prompt_chars=%d",
-                    ctx.op_id, _semi_stats.corpus_n,
-                    _semi_stats.centroid_hash8, len(_semi_prompt),
-                )
-            else:
-                logger.debug(
-                    "[SemanticIndex] op=%s no prompt section (disabled or empty)",
-                    ctx.op_id,
-                )
-        except Exception:
-            logger.debug(
-                "[Orchestrator] SemanticIndex injection skipped",
-                exc_info=True,
-            )
-
-        # ---- TaskBoard advisory prompt injection (Gap #5 Slice 3) ----
-        #
-        # Read-only + authority-free. We do NOT lazily create a board
-        # here — only render when the model has already touched a task
-        # tool during this op (i.e. a board exists in the registry).
-        # Avoids injecting an empty "Current tasks" section on every
-        # op. Per authorization: NEVER gates Iron Gate / policy /
-        # approval (Manifesto §1 + §6). Tier -1 sanitation inside
-        # TaskBoard.render_prompt_section() handles model content
-        # safety — we don't fight the sanitizer here.
-        try:
-            from backend.core.ouroboros.governance.task_tool import (
-                _BOARDS,
-            )
-            _tb = _BOARDS.get(ctx.op_id)
-            if _tb is not None:
-                _tb_prompt = _tb.render_prompt_section()
-                if _tb_prompt:
-                    _tb_existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                    ctx = ctx.with_strategic_memory_context(
-                        strategic_intent_id=(
-                            ctx.strategic_intent_id or "task-board-v1"
-                        ),
-                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                        strategic_memory_prompt=(
-                            _tb_existing + "\n\n" + _tb_prompt
-                            if _tb_existing else _tb_prompt
-                        ),
-                        strategic_memory_digest=ctx.strategic_memory_digest,
-                    )
-                    logger.info(
-                        "[TaskBoard] op=%s inject_site=context_expansion "
-                        "prompt_chars=%d",
-                        ctx.op_id, len(_tb_prompt),
-                    )
-        except Exception:
-            logger.debug(
-                "[Orchestrator] TaskBoard injection skipped", exc_info=True,
-            )
-
-        # ---- TDD directive (Feature 1 V1 — prompt contract, NOT red-green) ----
-        #
-        # When the intent envelope carries evidence["tdd_mode"]=True,
-        # prepend a prompt directive instructing the model to emit
-        # tests + impl together (test file first in files: [...]).
-        # Honest scope: this is a prompt contract, not a red-green
-        # proof. True test-first orchestration (run tests → confirm
-        # fail → generate impl → run tests → confirm pass) is a
-        # separate multi-commit project scoped for V1.1. The V1
-        # module ships the declarative layer so ops can be marked
-        # TDD now; V1.1 flips the flag from "prompt hint" to
-        # "pipeline sub-phase trigger" without client-side changes.
-        try:
-            from backend.core.ouroboros.governance.tdd_directive import (
-                is_tdd_op,
-                tdd_prompt_directive,
-            )
-            if is_tdd_op(ctx):
-                _tdd_text = tdd_prompt_directive()
-                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=ctx.strategic_intent_id or "tdd-v1",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=(
-                        _existing + "\n\n" + _tdd_text
-                        if _existing else _tdd_text
-                    ),
-                    strategic_memory_digest=ctx.strategic_memory_digest,
-                )
-                logger.info(
-                    "[TDDDirective] op=%s tdd_mode=true directive_chars=%d "
-                    "scope=prompt_contract_not_red_green",
-                    ctx.op_id, len(_tdd_text),
-                )
-        except Exception:
-            logger.debug(
-                "[Orchestrator] TDD directive injection skipped",
-                exc_info=True,
-            )
-
-        # ---- Goal inference — hypothesized direction from multi-signal cross-corr ----
-        #
-        # Closes the "read the room" gap: watch commits, REPL inputs,
-        # memory, completed ops, file hotspots, and declared goals;
-        # synthesize ranked hypotheses about where the operator is
-        # headed. Injected as a clearly-labeled "Inferred Direction
-        # (hypotheses — not declared goals)" section so the model
-        # weights it BELOW explicit goals. Default OFF, fail-closed.
-        #
-        # Authority invariant: hypotheses inform prompt surface only.
-        # They NEVER affect risk tier, route, guardian findings, gate
-        # verdicts, or approval. Operator accepts/rejects via /infer.
-        try:
-            from backend.core.ouroboros.governance.goal_inference import (
-                GoalInferenceEngine,
-                get_default_engine,
-                inference_enabled,
-                render_prompt_section,
-            )
-            if inference_enabled():
-                _engine = get_default_engine(self._config.project_root)
-                if _engine is None:
-                    _engine = GoalInferenceEngine(
-                        repo_root=self._config.project_root,
-                    )
-                _inf_result = _engine.build()
-                _inf_text = render_prompt_section(_inf_result)
-                if _inf_text:
-                    _existing = getattr(
-                        ctx, "strategic_memory_prompt", "",
-                    ) or ""
-                    ctx = ctx.with_strategic_memory_context(
-                        strategic_intent_id=(
-                            ctx.strategic_intent_id or "goal-inference-v1"
-                        ),
-                        strategic_memory_fact_ids=(
-                            ctx.strategic_memory_fact_ids
-                        ),
-                        strategic_memory_prompt=(
-                            _existing + "\n\n" + _inf_text
-                            if _existing else _inf_text
-                        ),
-                        strategic_memory_digest=(
-                            ctx.strategic_memory_digest
-                        ),
-                    )
-                    logger.info(
-                        "[GoalInference] op=%s injected hypotheses=%d "
-                        "top_conf=%.2f chars=%d",
-                        ctx.op_id,
-                        min(
-                            len(_inf_result.inferred),
-                            # top_k applied inside render
-                            5,
-                        ),
-                        (_inf_result.inferred[0].confidence
-                         if _inf_result.inferred else 0.0),
-                        len(_inf_text),
-                    )
-        except Exception:
-            logger.debug(
-                "[Orchestrator] Goal inference injection skipped",
-                exc_info=True,
-            )
-
-        # ---- LastSessionSummary v0.1: session-to-session episodic continuity ----
-        # Read-only structured summary of past session(s), rendered as
-        # a dense untrusted block. Injected between SemanticIndex (above)
-        # and Goals (below) so the untrusted stack stays contiguous:
-        # Strategic → Bridge → Semantic → LastSession → Goals → UserPrefs.
-        # Helper extracted for integration-test coverage of the composed
-        # CONTEXT_EXPANSION prompt (see test_last_session_summary_composition).
-        ctx = _inject_last_session_summary_impl(self._config.project_root, ctx)
-
-        # ---- P2.4 + Week 2: Goal-directed context injection ----
-        # Append the *most relevant* active user goals to the strategic
-        # memory prompt so the generation model aligns its decisions with
-        # current priorities. Scoped by target_files + description so a
-        # noisy goal tracker doesn't hijack unrelated ops.
-        #
-        # Increment 3: after prompt injection, compute the full activity
-        # entry set (direct matches + descendant credits + optional
-        # sibling bumps) and append to the GoalActivityLedger. Every op
-        # that reaches CLASSIFY writes at least one row so the session-end
-        # drift aggregator sees it as "reached CLASSIFY", even when no
-        # goal scored.
-        try:
-            from backend.core.ouroboros.governance.strategic_direction import (
-                GoalActivityLedger,
-                GoalTracker,
-                get_active_session_id,
-            )
-            _goal_tracker = GoalTracker(self._config.project_root)
-            _goal_prompt = _goal_tracker.format_for_prompt(
-                target_files=list(ctx.target_files),
-                description=ctx.description or "",
-            )
-            if _goal_prompt:
-                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=ctx.strategic_intent_id or "goals-v1",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=_existing + "\n\n" + _goal_prompt if _existing else _goal_prompt,
-                    strategic_memory_digest=ctx.strategic_memory_digest,
-                )
-                logger.debug(
-                    "[Orchestrator] Goal context injected (%d active / scoped)",
-                    len(_goal_tracker.active_goals),
-                )
-
-            # Activity ledger append (Increment 3). Ledger-only — does
-            # not feed intake priority math. Zero-match ops still get a
-            # marker row so the drift denominator counts them.
-            _session_id = get_active_session_id() or ""
-            if _session_id:
-                try:
-                    _activity_entries = _goal_tracker.compute_activity_entries(
-                        description=ctx.description or "",
-                        target_files=list(ctx.target_files),
-                    )
-                    GoalActivityLedger(self._config.project_root).append(
-                        session_id=_session_id,
-                        op_id=ctx.op_id,
-                        entries=_activity_entries,
-                    )
-                    logger.debug(
-                        "[Orchestrator] GoalActivity ledger: wrote %d entries for op=%s",
-                        len(_activity_entries) or 1,  # 1 marker row on zero-match
-                        ctx.op_id,
-                    )
-                except Exception:
-                    logger.debug(
-                        "[Orchestrator] GoalActivity ledger append failed",
-                        exc_info=True,
-                    )
-        except Exception:
-            logger.debug("[Orchestrator] Goal injection skipped", exc_info=True)
-
-        # ---- Task #195: User Preference Memory injection ----
-        # Append typed user-preference memories (facts about the user,
-        # feedback rules, forbidden paths, style choices) scoped by
-        # relevance to the current op. Zero model inference — pure
-        # deterministic scoring. Empty when no memory matches the op
-        # shape, so silent on fresh repos.
-        try:
-            from backend.core.ouroboros.governance.user_preference_memory import (
-                get_default_store,
-            )
-            _user_prefs = get_default_store(self._config.project_root)
-            _pref_prompt = _user_prefs.format_for_prompt(
-                target_files=list(ctx.target_files),
-                description=ctx.description,
-                risk_tier=str(getattr(ctx, "risk_tier", "") or ""),
-            )
-            if _pref_prompt:
-                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=ctx.strategic_intent_id or "user-prefs-v1",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=(
-                        _existing + "\n\n" + _pref_prompt if _existing else _pref_prompt
-                    ),
-                    strategic_memory_digest=ctx.strategic_memory_digest,
-                )
-                logger.debug(
-                    "[Orchestrator] User preferences injected (%d chars)",
-                    len(_pref_prompt),
-                )
-        except Exception:
-            logger.debug("[Orchestrator] User preference injection skipped", exc_info=True)
-
-        # ---- Policy engine check (declarative YAML rules) ----
-        # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
-        # explicit deny rules in policy files can override the risk engine.
-        # Wrapped in hasattr + try/except so the pipeline is never broken
-        # by a missing or misconfigured policy_engine attribute.
-        if hasattr(self._stack, "policy_engine") and self._stack.policy_engine is not None:
-            try:
-                _policy_engine: PolicyEngine = self._stack.policy_engine
-                for _tf in ctx.target_files:
-                    _policy_decision = _policy_engine.classify(tool="edit", target=str(_tf))
-                    if _policy_decision is PolicyDecision.BLOCKED:
+                # Stamp read-only intent onto the hash-chained context BEFORE
+                # advising. The Advisor's bypass of blast_radius + test_coverage
+                # is mathematically safe only because ctx.is_read_only is
+                # enforced downstream by tool_executor (mutating tools refused)
+                # and the orchestrator's APPLY short-circuit.
+                if not ctx.is_read_only:
+                    _inferred_ro = infer_read_only_intent(ctx.description)
+                    if _inferred_ro:
+                        ctx = ctx.with_read_only_intent(True)
                         logger.info(
-                            "[Orchestrator] PolicyEngine BLOCKED op=%s target=%r",
-                            ctx.op_id, _tf,
+                            "[Orchestrator] Read-only intent inferred op=%s "
+                            "— Advisor blast/coverage bypass active; tool_executor "
+                            "will refuse mutations; APPLY phase will short-circuit",
+                            ctx.op_id,
                         )
-                        risk_tier = RiskTier.BLOCKED
-                        break
-            except Exception:
-                logger.warning(
-                    "[Orchestrator] PolicyEngine raised during CLASSIFY for op=%s; continuing",
-                    ctx.op_id, exc_info=True,
+                _advisor = OperationAdvisor(self._config.project_root)
+                _advisory = _advisor.advise(
+                    ctx.target_files, ctx.description, ctx.op_id,
+                    is_read_only=ctx.is_read_only,
                 )
 
-        if risk_tier is RiskTier.BLOCKED:
-            ctx = ctx.advance(
-                OperationPhase.CANCELLED,
-                risk_tier=risk_tier,
-                terminal_reason_code=classification.reason_code,
-            )
-            await self._record_ledger(
-                ctx,
-                OperationState.BLOCKED,
-                {
-                    "reason_code": classification.reason_code,
-                    "risk_tier": risk_tier.name,
-                },
-            )
-            return ctx
+                if _advisory.decision == AdvisoryDecision.BLOCK:
+                    logger.warning(
+                        "[Orchestrator] Advisor BLOCKED operation: %s (op=%s)",
+                        "; ".join(_advisory.reasons), ctx.op_id,
+                    )
+                    if _serpent:
+                        await _serpent.stop(success=False)
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="advisor_blocked",
+                    )
+                    return ctx
 
-        # Announce operation start — VoiceNarrator fires here (INTENT type)
-        try:
-            await self._stack.comm.emit_intent(
-                op_id=ctx.op_id,
-                goal=ctx.description,
-                target_files=list(ctx.target_files),
-                risk_tier=risk_tier.name,
-                blast_radius=len(ctx.target_files),
-            )
-        except Exception:
-            logger.debug("emit_intent failed for op=%s", ctx.op_id, exc_info=True)
+                if _advisory.decision != AdvisoryDecision.RECOMMEND:
+                    # Inject advisory into context for generation awareness
+                    _adv_prompt = _advisor.format_for_prompt(_advisory)
+                    if _adv_prompt:
+                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                            strategic_memory_prompt=_existing + "\n\n" + _adv_prompt,
+                            strategic_memory_digest=ctx.strategic_memory_digest,
+                        )
 
-        # ---- Reasoning chain classification (optional, pre-routing) ----
-        reasoning_result = None
-        if self._reasoning_bridge and self._reasoning_bridge.is_active:
-            try:
-                reasoning_result = await self._reasoning_bridge.classify_with_reasoning(
-                    command=ctx.description,
-                    op_id=ctx.op_id,
-                )
-            except Exception:
-                logger.debug("Reasoning chain bridge error", exc_info=True)
+                    # Voice the warning
+                    if _advisory.voice_message and self._reasoning_narrator is not None:
+                        try:
+                            self._reasoning_narrator.record_classify(
+                                ctx.op_id, _advisory.decision.value,
+                                _advisory.voice_message,
+                            )
+                        except Exception:
+                            pass
 
-        # P3.1: Emit intent chain heartbeat — full reasoning chain for the
-        # SerpentFlow display.  Deterministic: all data already computed.
-        try:
-            _chain_payload: Dict[str, Any] = {
-                "phase": "intent_chain",
-                "risk_tier": risk_tier.name,
-                "complexity": (
-                    _complexity_result.complexity.value
-                    if _complexity_result is not None else ""
-                ),
-                "auto_approve": (
-                    _complexity_result.auto_approve_eligible
-                    if _complexity_result is not None else False
-                ),
-                "fast_path": (
-                    _complexity_result.fast_path_eligible
-                    if _complexity_result is not None else False
-                ),
-            }
-            await self._stack.comm.emit_heartbeat(
-                op_id=ctx.op_id, phase="intent_chain", progress_pct=10.0,
-                **_chain_payload,
-            )
-        except Exception:
-            pass  # Intent chain visibility is best-effort
-
-        # Advance to ROUTE with risk_tier set (and optional reasoning result)
-        if _serpent: _serpent.update_phase("ROUTE")
-        ctx = ctx.advance(
-            OperationPhase.ROUTE,
-            risk_tier=risk_tier,
-            reasoning_chain_result=reasoning_result,
-        )
-
-        # ── P0 Wiring: Start ReasoningNarrator + OperationDialogue ──────
-        if self._reasoning_narrator is not None:
-            try:
-                self._reasoning_narrator.start_trace(ctx.op_id)
-                self._reasoning_narrator.record_classify(
-                    ctx.op_id,
-                    risk_tier.value if hasattr(risk_tier, "value") else str(risk_tier),
-                    f"files={list(ctx.target_files)[:3]}, "
-                    f"complexity={getattr(_complexity_result, 'complexity', 'unknown')}",
-                )
-            except Exception:
+                    logger.info(
+                        "[Orchestrator] Advisor: %s (risk=%.2f) — %s",
+                        _advisory.decision.value, _advisory.risk_score,
+                        _advisory.reasons[0] if _advisory.reasons else "no specific reason",
+                    )
+            except ImportError:
                 pass
+            except Exception:
+                logger.debug("[Orchestrator] Advisor failed", exc_info=True)
 
-        if self._dialogue_store is not None:
+            # ---- Phase 1: CLASSIFY ----
+            profile = self._build_profile(ctx)
+            classification = self._stack.risk_engine.classify(profile)
+            risk_tier = classification.tier
+
+            # ---- Complexity + Persistence classification (Assimilation Gate) ----
+            _complexity_result = None
             try:
-                from backend.core.ouroboros.governance.entropy_calculator import extract_domain_key
-                _dk = extract_domain_key(ctx.target_files, ctx.description)
-                self._dialogue_store.start_dialogue(
-                    op_id=ctx.op_id,
-                    domain_key=_dk,
+                from backend.core.ouroboros.governance.complexity_classifier import (
+                    OperationComplexityClassifier,
+                )
+                _classifier = OperationComplexityClassifier(
+                    topology=getattr(self._stack, "topology", None),
+                    ledger=getattr(self._stack, "ledger", None),
+                )
+                _complexity_result = _classifier.classify(
                     description=ctx.description,
-                    target_files=ctx.target_files,
+                    target_files=list(ctx.target_files),
                 )
-                _dialogue = self._dialogue_store.get_active(ctx.op_id)
-                if _dialogue:
-                    _dialogue.add_entry(
-                        "CLASSIFY",
-                        f"Risk={risk_tier}, complexity={getattr(_complexity_result, 'complexity', 'unknown')}",
+                # Stamp complexity on context for downstream routing decisions.
+                # task_complexity is a declared field on OperationContext, so
+                # object.__setattr__ values survive dataclasses.replace() in
+                # advance() and all with_*() methods.
+                object.__setattr__(ctx, "task_complexity", _complexity_result.complexity.value)
+
+                logger.info(
+                    "[Orchestrator] \U0001f4ca Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",
+                    _complexity_result.complexity.value,
+                    _complexity_result.persistence.value,
+                    _complexity_result.auto_approve_eligible,
+                    _complexity_result.fast_path_eligible,
+                    ctx.op_id,
+                )
+            except Exception:
+                logger.debug("[Orchestrator] ComplexityClassifier not available", exc_info=True)
+
+            # ---- Consciousness regression detection (ProphecyEngine + MemoryEngine) ----
+            _consciousness_bridge = getattr(self._stack, "consciousness_bridge", None)
+            if _consciousness_bridge is None:
+                # Check if GLS has the bridge (wired by Zone 6.12)
+                _gls = getattr(self._stack, "governed_loop_service", None)
+                if _gls is not None:
+                    _consciousness_bridge = getattr(_gls, "_consciousness_bridge", None)
+            if _consciousness_bridge is not None:
+                try:
+                    _regression = await _consciousness_bridge.assess_regression_risk(
+                        list(ctx.target_files)
+                    )
+                    if _regression and _regression.get("risk_level") in ("high", "critical"):
+                        logger.warning(
+                            "[Orchestrator] Consciousness regression alert: %s risk for %s — %s [%s]",
+                            _regression["risk_level"],
+                            ctx.target_files,
+                            _regression.get("reasoning", ""),
+                            ctx.op_id,
+                        )
+                except Exception:
+                    logger.debug("[Orchestrator] Consciousness regression check failed", exc_info=True)
+
+            # ---- Goal Memory injection (cross-session learning via ChromaDB) ----
+            _goal_memory_bridge = None
+            _gls_for_gmb = getattr(self._stack, "governed_loop_service", None)
+            if _gls_for_gmb is not None:
+                _goal_memory_bridge = getattr(_gls_for_gmb, "_goal_memory_bridge", None)
+            if _goal_memory_bridge is not None:
+                try:
+                    _goal_ctx = await _goal_memory_bridge.get_relevant_context(
+                        description=ctx.description,
+                        target_files=ctx.target_files,
+                    )
+                    if _goal_ctx:
+                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                            strategic_memory_prompt=_existing + "\n\n" + _goal_ctx,
+                            strategic_memory_digest=ctx.strategic_memory_digest,
+                        )
+                except Exception:
+                    logger.debug("[Orchestrator] Goal memory injection failed", exc_info=True)
+
+            # ---- Strategic Direction injection (Manifesto + architecture docs) ----
+            _strategic_svc = None
+            if _gls_for_gmb is not None:
+                _strategic_svc = getattr(_gls_for_gmb, "_strategic_direction", None)
+            if _strategic_svc is not None and getattr(_strategic_svc, "is_loaded", False):
+                try:
+                    _strat_prompt = _strategic_svc.format_for_prompt()
+                    if _strat_prompt:
+                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id="manifesto-v4",
+                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                            strategic_memory_prompt=_strat_prompt + "\n\n" + _existing,
+                            strategic_memory_digest=(
+                                ctx.strategic_memory_digest
+                                or _strategic_svc.digest[:500]
+                            ),
+                        )
+                        logger.debug(
+                            "[Orchestrator] Strategic direction injected (%d principles)",
+                            len(_strategic_svc.principles),
+                        )
+                except Exception:
+                    logger.debug("[Orchestrator] Strategic direction injection failed", exc_info=True)
+
+            # ---- ConversationBridge (v0.1): TUI dialogue as untrusted soft bias ----
+            # Injects the user's recent TUI turns BETWEEN the trusted manifesto
+            # block (above) and the trusted goals + user-preferences blocks
+            # (below). Untrusted-in-the-middle ordering preserves attention-
+            # mechanism dominance for FORBIDDEN_PATH / style prefs (which come
+            # last) while still surfacing conversational intent to the model.
+            #
+            # Authority invariant (plan v0.1 §9): this block has zero authority
+            # over Iron Gate, UrgencyRouter, risk tier, policy engine,
+            # FORBIDDEN_PATH, tool protected-path checks, or approval gating.
+            # Consumed ONLY by StrategicDirection at this injection site.
+            try:
+                from backend.core.ouroboros.governance.conversation_bridge import (
+                    get_default_bridge,
+                )
+                _bridge = get_default_bridge()
+                (
+                    _bridge_enabled,
+                    _n_turns,
+                    _n_user,
+                    _n_assistant,
+                    _n_postmortem,
+                    _chars_in,
+                    _redacted,
+                    _hash8,
+                ) = _bridge.inject_metrics()
+                if _bridge_enabled:
+                    _conv_prompt = _bridge.format_for_prompt()
+                    if _conv_prompt:
+                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id=ctx.strategic_intent_id or "conv-bridge-v1",
+                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                            strategic_memory_prompt=(
+                                _existing + "\n\n" + _conv_prompt
+                                if _existing else _conv_prompt
+                            ),
+                            strategic_memory_digest=ctx.strategic_memory_digest,
+                        )
+                    # §8 one-line observability contract (v1.1 source breakdown).
+                    # Logged whether or not there were turns to inject —
+                    # operators need to see that the wiring fired.
+                    logger.info(
+                        "[ConversationBridge] op=%s enabled=true n_turns=%d "
+                        "n_user=%d n_assistant=%d n_postmortem=%d chars_in=%d "
+                        "inject_site=context_expansion redacted=%s hash8=%s",
+                        ctx.op_id, _n_turns, _n_user, _n_assistant, _n_postmortem,
+                        _chars_in, _redacted, _hash8,
+                    )
+                else:
+                    # §8 §7-tweak: DEBUG line at inject site when master switch
+                    # is off so "is wiring live?" is answerable without content.
+                    logger.debug(
+                        "[ConversationBridge] op=%s enabled=false "
+                        "inject_site=context_expansion",
+                        ctx.op_id,
                     )
             except Exception:
-                pass
-
-        # ---- ClassifyClarify: one operator question at the CLASSIFY→ROUTE boundary ----
-        #
-        # Closes the "intake description is ambiguous" gap. Narrow
-        # ambiguity heuristic (short desc + no target files, or generic
-        # target list, or no goal-keyword match). On trigger, ask the
-        # operator ONE concise question with a bounded timeout. The
-        # answer enriches ctx.description + evidence only — it has NO
-        # authority over risk classification, routing law, SemanticGuardian
-        # findings, or any deterministic engine input (Manifesto §1
-        # Boundary Principle).
-        #
-        # Default OFF (JARVIS_CLASSIFY_CLARIFY_ENABLED=0). Opt-in means
-        # no session is interrupted until the operator explicitly
-        # enables the feature + the heuristic actually fires.
-        try:
-            from backend.core.ouroboros.governance.classify_clarify import (
-                ask_operator as _clarify_ask,
-                merge_into_context as _clarify_merge,
-                clarify_enabled as _clarify_enabled,
-            )
-            if _clarify_enabled():
-                # Extract goal keywords from the active GoalTracker so
-                # the heuristic can check "no goal keyword match".
-                _goal_keywords: tuple = ()
-                try:
-                    from backend.core.ouroboros.governance.strategic_direction import (
-                        GoalTracker,
-                    )
-                    _kws: list = []
-                    for _g in GoalTracker(
-                        self._config.project_root,
-                    ).active_goals:
-                        _kws.extend(getattr(_g, "keywords", ()) or ())
-                    _goal_keywords = tuple(_kws)
-                except Exception:
-                    _goal_keywords = ()
-                _clarify_response = await _clarify_ask(
-                    op_id=ctx.op_id,
-                    description=ctx.description or "",
-                    target_files=tuple(ctx.target_files or ()),
-                    goal_keywords=_goal_keywords,
+                logger.debug(
+                    "[Orchestrator] ConversationBridge injection skipped",
+                    exc_info=True,
                 )
-                if _clarify_response.outcome == "answered":
-                    # Merge the sanitized answer into the description.
-                    # The risk classifier has ALREADY run above — we do
-                    # not re-classify. The clarification only affects
-                    # downstream prompt content (description + evidence).
-                    _new_desc, _patch = _clarify_merge(
-                        original_description=ctx.description or "",
-                        response=_clarify_response,
+
+            # ---- SemanticIndex v0.1: recency-weighted focus + closures ----
+            # Soft semantic prior drawn from the recency-weighted centroid
+            # over recent commits + active goals + recent conversation.
+            # Injected BETWEEN the ConversationBridge block (above) and the
+            # Goals block (below) so the ordering reads top-to-bottom as:
+            # Strategic → Bridge (untrusted dialogue) → Semantic (untrusted
+            # prior) → Goals (trusted) → UserPreferences (highest trust).
+            #
+            # Authority invariant: this block has **zero** authority over
+            # Iron Gate, UrgencyRouter, risk tier, policy engine, FORBIDDEN_PATH,
+            # or approval gating. It affects ONLY the prompt surface the model
+            # reads at CONTEXT_EXPANSION — §4 (data sovereignty, local
+            # embedder) + §8 (hashes + counts, no raw vectors in logs).
+            try:
+                from backend.core.ouroboros.governance.semantic_index import (
+                    get_default_index,
+                )
+                _semi = get_default_index(self._config.project_root)
+                # Lazy build (hits interval gate on repeat).
+                _semi.build()
+                _semi_prompt = _semi.format_prompt_sections()
+                if _semi_prompt:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=ctx.strategic_intent_id or "semantic-v1",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=(
+                            _existing + "\n\n" + _semi_prompt
+                            if _existing else _semi_prompt
+                        ),
+                        strategic_memory_digest=ctx.strategic_memory_digest,
                     )
+                    _semi_stats = _semi.stats()
+                    logger.info(
+                        "[SemanticIndex] op=%s corpus_n=%d centroid_hash8=%s "
+                        "inject_site=context_expansion prompt_chars=%d",
+                        ctx.op_id, _semi_stats.corpus_n,
+                        _semi_stats.centroid_hash8, len(_semi_prompt),
+                    )
+                else:
+                    logger.debug(
+                        "[SemanticIndex] op=%s no prompt section (disabled or empty)",
+                        ctx.op_id,
+                    )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] SemanticIndex injection skipped",
+                    exc_info=True,
+                )
+
+            # ---- TaskBoard advisory prompt injection (Gap #5 Slice 3) ----
+            #
+            # Read-only + authority-free. We do NOT lazily create a board
+            # here — only render when the model has already touched a task
+            # tool during this op (i.e. a board exists in the registry).
+            # Avoids injecting an empty "Current tasks" section on every
+            # op. Per authorization: NEVER gates Iron Gate / policy /
+            # approval (Manifesto §1 + §6). Tier -1 sanitation inside
+            # TaskBoard.render_prompt_section() handles model content
+            # safety — we don't fight the sanitizer here.
+            try:
+                from backend.core.ouroboros.governance.task_tool import (
+                    _BOARDS,
+                )
+                _tb = _BOARDS.get(ctx.op_id)
+                if _tb is not None:
+                    _tb_prompt = _tb.render_prompt_section()
+                    if _tb_prompt:
+                        _tb_existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id=(
+                                ctx.strategic_intent_id or "task-board-v1"
+                            ),
+                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                            strategic_memory_prompt=(
+                                _tb_existing + "\n\n" + _tb_prompt
+                                if _tb_existing else _tb_prompt
+                            ),
+                            strategic_memory_digest=ctx.strategic_memory_digest,
+                        )
+                        logger.info(
+                            "[TaskBoard] op=%s inject_site=context_expansion "
+                            "prompt_chars=%d",
+                            ctx.op_id, len(_tb_prompt),
+                        )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] TaskBoard injection skipped", exc_info=True,
+                )
+
+            # ---- TDD directive (Feature 1 V1 — prompt contract, NOT red-green) ----
+            #
+            # When the intent envelope carries evidence["tdd_mode"]=True,
+            # prepend a prompt directive instructing the model to emit
+            # tests + impl together (test file first in files: [...]).
+            # Honest scope: this is a prompt contract, not a red-green
+            # proof. True test-first orchestration (run tests → confirm
+            # fail → generate impl → run tests → confirm pass) is a
+            # separate multi-commit project scoped for V1.1. The V1
+            # module ships the declarative layer so ops can be marked
+            # TDD now; V1.1 flips the flag from "prompt hint" to
+            # "pipeline sub-phase trigger" without client-side changes.
+            try:
+                from backend.core.ouroboros.governance.tdd_directive import (
+                    is_tdd_op,
+                    tdd_prompt_directive,
+                )
+                if is_tdd_op(ctx):
+                    _tdd_text = tdd_prompt_directive()
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=ctx.strategic_intent_id or "tdd-v1",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=(
+                            _existing + "\n\n" + _tdd_text
+                            if _existing else _tdd_text
+                        ),
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.info(
+                        "[TDDDirective] op=%s tdd_mode=true directive_chars=%d "
+                        "scope=prompt_contract_not_red_green",
+                        ctx.op_id, len(_tdd_text),
+                    )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] TDD directive injection skipped",
+                    exc_info=True,
+                )
+
+            # ---- Goal inference — hypothesized direction from multi-signal cross-corr ----
+            #
+            # Closes the "read the room" gap: watch commits, REPL inputs,
+            # memory, completed ops, file hotspots, and declared goals;
+            # synthesize ranked hypotheses about where the operator is
+            # headed. Injected as a clearly-labeled "Inferred Direction
+            # (hypotheses — not declared goals)" section so the model
+            # weights it BELOW explicit goals. Default OFF, fail-closed.
+            #
+            # Authority invariant: hypotheses inform prompt surface only.
+            # They NEVER affect risk tier, route, guardian findings, gate
+            # verdicts, or approval. Operator accepts/rejects via /infer.
+            try:
+                from backend.core.ouroboros.governance.goal_inference import (
+                    GoalInferenceEngine,
+                    get_default_engine,
+                    inference_enabled,
+                    render_prompt_section,
+                )
+                if inference_enabled():
+                    _engine = get_default_engine(self._config.project_root)
+                    if _engine is None:
+                        _engine = GoalInferenceEngine(
+                            repo_root=self._config.project_root,
+                        )
+                    _inf_result = _engine.build()
+                    _inf_text = render_prompt_section(_inf_result)
+                    if _inf_text:
+                        _existing = getattr(
+                            ctx, "strategic_memory_prompt", "",
+                        ) or ""
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id=(
+                                ctx.strategic_intent_id or "goal-inference-v1"
+                            ),
+                            strategic_memory_fact_ids=(
+                                ctx.strategic_memory_fact_ids
+                            ),
+                            strategic_memory_prompt=(
+                                _existing + "\n\n" + _inf_text
+                                if _existing else _inf_text
+                            ),
+                            strategic_memory_digest=(
+                                ctx.strategic_memory_digest
+                            ),
+                        )
+                        logger.info(
+                            "[GoalInference] op=%s injected hypotheses=%d "
+                            "top_conf=%.2f chars=%d",
+                            ctx.op_id,
+                            min(
+                                len(_inf_result.inferred),
+                                # top_k applied inside render
+                                5,
+                            ),
+                            (_inf_result.inferred[0].confidence
+                             if _inf_result.inferred else 0.0),
+                            len(_inf_text),
+                        )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] Goal inference injection skipped",
+                    exc_info=True,
+                )
+
+            # ---- LastSessionSummary v0.1: session-to-session episodic continuity ----
+            # Read-only structured summary of past session(s), rendered as
+            # a dense untrusted block. Injected between SemanticIndex (above)
+            # and Goals (below) so the untrusted stack stays contiguous:
+            # Strategic → Bridge → Semantic → LastSession → Goals → UserPrefs.
+            # Helper extracted for integration-test coverage of the composed
+            # CONTEXT_EXPANSION prompt (see test_last_session_summary_composition).
+            ctx = _inject_last_session_summary_impl(self._config.project_root, ctx)
+
+            # ---- P2.4 + Week 2: Goal-directed context injection ----
+            # Append the *most relevant* active user goals to the strategic
+            # memory prompt so the generation model aligns its decisions with
+            # current priorities. Scoped by target_files + description so a
+            # noisy goal tracker doesn't hijack unrelated ops.
+            #
+            # Increment 3: after prompt injection, compute the full activity
+            # entry set (direct matches + descendant credits + optional
+            # sibling bumps) and append to the GoalActivityLedger. Every op
+            # that reaches CLASSIFY writes at least one row so the session-end
+            # drift aggregator sees it as "reached CLASSIFY", even when no
+            # goal scored.
+            try:
+                from backend.core.ouroboros.governance.strategic_direction import (
+                    GoalActivityLedger,
+                    GoalTracker,
+                    get_active_session_id,
+                )
+                _goal_tracker = GoalTracker(self._config.project_root)
+                _goal_prompt = _goal_tracker.format_for_prompt(
+                    target_files=list(ctx.target_files),
+                    description=ctx.description or "",
+                )
+                if _goal_prompt:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=ctx.strategic_intent_id or "goals-v1",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing + "\n\n" + _goal_prompt if _existing else _goal_prompt,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.debug(
+                        "[Orchestrator] Goal context injected (%d active / scoped)",
+                        len(_goal_tracker.active_goals),
+                    )
+
+                # Activity ledger append (Increment 3). Ledger-only — does
+                # not feed intake priority math. Zero-match ops still get a
+                # marker row so the drift denominator counts them.
+                _session_id = get_active_session_id() or ""
+                if _session_id:
                     try:
-                        import dataclasses as _dc
-                        ctx = _dc.replace(ctx, description=_new_desc)
+                        _activity_entries = _goal_tracker.compute_activity_entries(
+                            description=ctx.description or "",
+                            target_files=list(ctx.target_files),
+                        )
+                        GoalActivityLedger(self._config.project_root).append(
+                            session_id=_session_id,
+                            op_id=ctx.op_id,
+                            entries=_activity_entries,
+                        )
+                        logger.debug(
+                            "[Orchestrator] GoalActivity ledger: wrote %d entries for op=%s",
+                            len(_activity_entries) or 1,  # 1 marker row on zero-match
+                            ctx.op_id,
+                        )
                     except Exception:
                         logger.debug(
-                            "[Orchestrator] ClassifyClarify ctx merge skipped",
+                            "[Orchestrator] GoalActivity ledger append failed",
                             exc_info=True,
                         )
-        except Exception:
-            logger.debug(
-                "[Orchestrator] ClassifyClarify skipped",
-                exc_info=True,
+            except Exception:
+                logger.debug("[Orchestrator] Goal injection skipped", exc_info=True)
+
+            # ---- Task #195: User Preference Memory injection ----
+            # Append typed user-preference memories (facts about the user,
+            # feedback rules, forbidden paths, style choices) scoped by
+            # relevance to the current op. Zero model inference — pure
+            # deterministic scoring. Empty when no memory matches the op
+            # shape, so silent on fresh repos.
+            try:
+                from backend.core.ouroboros.governance.user_preference_memory import (
+                    get_default_store,
+                )
+                _user_prefs = get_default_store(self._config.project_root)
+                _pref_prompt = _user_prefs.format_for_prompt(
+                    target_files=list(ctx.target_files),
+                    description=ctx.description,
+                    risk_tier=str(getattr(ctx, "risk_tier", "") or ""),
+                )
+                if _pref_prompt:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=ctx.strategic_intent_id or "user-prefs-v1",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=(
+                            _existing + "\n\n" + _pref_prompt if _existing else _pref_prompt
+                        ),
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.debug(
+                        "[Orchestrator] User preferences injected (%d chars)",
+                        len(_pref_prompt),
+                    )
+            except Exception:
+                logger.debug("[Orchestrator] User preference injection skipped", exc_info=True)
+
+            # ---- Policy engine check (declarative YAML rules) ----
+            # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
+            # explicit deny rules in policy files can override the risk engine.
+            # Wrapped in hasattr + try/except so the pipeline is never broken
+            # by a missing or misconfigured policy_engine attribute.
+            if hasattr(self._stack, "policy_engine") and self._stack.policy_engine is not None:
+                try:
+                    _policy_engine: PolicyEngine = self._stack.policy_engine
+                    for _tf in ctx.target_files:
+                        _policy_decision = _policy_engine.classify(tool="edit", target=str(_tf))
+                        if _policy_decision is PolicyDecision.BLOCKED:
+                            logger.info(
+                                "[Orchestrator] PolicyEngine BLOCKED op=%s target=%r",
+                                ctx.op_id, _tf,
+                            )
+                            risk_tier = RiskTier.BLOCKED
+                            break
+                except Exception:
+                    logger.warning(
+                        "[Orchestrator] PolicyEngine raised during CLASSIFY for op=%s; continuing",
+                        ctx.op_id, exc_info=True,
+                    )
+
+            if risk_tier is RiskTier.BLOCKED:
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    risk_tier=risk_tier,
+                    terminal_reason_code=classification.reason_code,
+                )
+                await self._record_ledger(
+                    ctx,
+                    OperationState.BLOCKED,
+                    {
+                        "reason_code": classification.reason_code,
+                        "risk_tier": risk_tier.name,
+                    },
+                )
+                return ctx
+
+            # Announce operation start — VoiceNarrator fires here (INTENT type)
+            try:
+                await self._stack.comm.emit_intent(
+                    op_id=ctx.op_id,
+                    goal=ctx.description,
+                    target_files=list(ctx.target_files),
+                    risk_tier=risk_tier.name,
+                    blast_radius=len(ctx.target_files),
+                )
+            except Exception:
+                logger.debug("emit_intent failed for op=%s", ctx.op_id, exc_info=True)
+
+            # ---- Reasoning chain classification (optional, pre-routing) ----
+            reasoning_result = None
+            if self._reasoning_bridge and self._reasoning_bridge.is_active:
+                try:
+                    reasoning_result = await self._reasoning_bridge.classify_with_reasoning(
+                        command=ctx.description,
+                        op_id=ctx.op_id,
+                    )
+                except Exception:
+                    logger.debug("Reasoning chain bridge error", exc_info=True)
+
+            # P3.1: Emit intent chain heartbeat — full reasoning chain for the
+            # SerpentFlow display.  Deterministic: all data already computed.
+            try:
+                _chain_payload: Dict[str, Any] = {
+                    "phase": "intent_chain",
+                    "risk_tier": risk_tier.name,
+                    "complexity": (
+                        _complexity_result.complexity.value
+                        if _complexity_result is not None else ""
+                    ),
+                    "auto_approve": (
+                        _complexity_result.auto_approve_eligible
+                        if _complexity_result is not None else False
+                    ),
+                    "fast_path": (
+                        _complexity_result.fast_path_eligible
+                        if _complexity_result is not None else False
+                    ),
+                }
+                await self._stack.comm.emit_heartbeat(
+                    op_id=ctx.op_id, phase="intent_chain", progress_pct=10.0,
+                    **_chain_payload,
+                )
+            except Exception:
+                pass  # Intent chain visibility is best-effort
+
+            # Advance to ROUTE with risk_tier set (and optional reasoning result)
+            if _serpent: _serpent.update_phase("ROUTE")
+            ctx = ctx.advance(
+                OperationPhase.ROUTE,
+                risk_tier=risk_tier,
+                reasoning_chain_result=reasoning_result,
             )
+
+            # ── P0 Wiring: Start ReasoningNarrator + OperationDialogue ──────
+            if self._reasoning_narrator is not None:
+                try:
+                    self._reasoning_narrator.start_trace(ctx.op_id)
+                    self._reasoning_narrator.record_classify(
+                        ctx.op_id,
+                        risk_tier.value if hasattr(risk_tier, "value") else str(risk_tier),
+                        f"files={list(ctx.target_files)[:3]}, "
+                        f"complexity={getattr(_complexity_result, 'complexity', 'unknown')}",
+                    )
+                except Exception:
+                    pass
+
+            if self._dialogue_store is not None:
+                try:
+                    from backend.core.ouroboros.governance.entropy_calculator import extract_domain_key
+                    _dk = extract_domain_key(ctx.target_files, ctx.description)
+                    self._dialogue_store.start_dialogue(
+                        op_id=ctx.op_id,
+                        domain_key=_dk,
+                        description=ctx.description,
+                        target_files=ctx.target_files,
+                    )
+                    _dialogue = self._dialogue_store.get_active(ctx.op_id)
+                    if _dialogue:
+                        _dialogue.add_entry(
+                            "CLASSIFY",
+                            f"Risk={risk_tier}, complexity={getattr(_complexity_result, 'complexity', 'unknown')}",
+                        )
+                except Exception:
+                    pass
+
+            # ---- ClassifyClarify: one operator question at the CLASSIFY→ROUTE boundary ----
+            #
+            # Closes the "intake description is ambiguous" gap. Narrow
+            # ambiguity heuristic (short desc + no target files, or generic
+            # target list, or no goal-keyword match). On trigger, ask the
+            # operator ONE concise question with a bounded timeout. The
+            # answer enriches ctx.description + evidence only — it has NO
+            # authority over risk classification, routing law, SemanticGuardian
+            # findings, or any deterministic engine input (Manifesto §1
+            # Boundary Principle).
+            #
+            # Default OFF (JARVIS_CLASSIFY_CLARIFY_ENABLED=0). Opt-in means
+            # no session is interrupted until the operator explicitly
+            # enables the feature + the heuristic actually fires.
+            try:
+                from backend.core.ouroboros.governance.classify_clarify import (
+                    ask_operator as _clarify_ask,
+                    merge_into_context as _clarify_merge,
+                    clarify_enabled as _clarify_enabled,
+                )
+                if _clarify_enabled():
+                    # Extract goal keywords from the active GoalTracker so
+                    # the heuristic can check "no goal keyword match".
+                    _goal_keywords: tuple = ()
+                    try:
+                        from backend.core.ouroboros.governance.strategic_direction import (
+                            GoalTracker,
+                        )
+                        _kws: list = []
+                        for _g in GoalTracker(
+                            self._config.project_root,
+                        ).active_goals:
+                            _kws.extend(getattr(_g, "keywords", ()) or ())
+                        _goal_keywords = tuple(_kws)
+                    except Exception:
+                        _goal_keywords = ()
+                    _clarify_response = await _clarify_ask(
+                        op_id=ctx.op_id,
+                        description=ctx.description or "",
+                        target_files=tuple(ctx.target_files or ()),
+                        goal_keywords=_goal_keywords,
+                    )
+                    if _clarify_response.outcome == "answered":
+                        # Merge the sanitized answer into the description.
+                        # The risk classifier has ALREADY run above — we do
+                        # not re-classify. The clarification only affects
+                        # downstream prompt content (description + evidence).
+                        _new_desc, _patch = _clarify_merge(
+                            original_description=ctx.description or "",
+                            response=_clarify_response,
+                        )
+                        try:
+                            import dataclasses as _dc
+                            ctx = _dc.replace(ctx, description=_new_desc)
+                        except Exception:
+                            logger.debug(
+                                "[Orchestrator] ClassifyClarify ctx merge skipped",
+                                exc_info=True,
+                            )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] ClassifyClarify skipped",
+                    exc_info=True,
+                )
 
         # ---- Phase 2: ROUTE ----
 

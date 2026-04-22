@@ -17,8 +17,11 @@ parity-test proven and graduation-session-soak confirmed.
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.governance.phase_runners.classify_runner import (
+    CLASSIFYRunner,
+)
 from backend.core.ouroboros.governance.phase_runners.complete_runner import (
     COMPLETERunner,
 )
 
-__all__ = ["COMPLETERunner"]
+__all__ = ["CLASSIFYRunner", "COMPLETERunner"]
