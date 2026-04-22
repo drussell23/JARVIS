@@ -1,0 +1,79 @@
+{
+  "slice": 2,
+  "feature": "MemoryPressureGate",
+  "timestamp": 1776823621.14854,
+  "all_pass": true,
+  "probe_source": "psutil",
+  "probe_free_pct": 19.598388671875,
+  "total_checks": 17,
+  "checks": [
+    {
+      "name": "is_enabled() default False (Slice 1-3)",
+      "pass": true
+    },
+    {
+      "name": "master off: can_fanout unclamped",
+      "pass": true
+    },
+    {
+      "name": "master off: pressure() returns OK",
+      "pass": true
+    },
+    {
+      "name": "cascade probe returns ok result",
+      "pass": true
+    },
+    {
+      "name": "probe source is not fallback",
+      "pass": true
+    },
+    {
+      "name": "probe has sensible total_bytes",
+      "pass": true
+    },
+    {
+      "name": "pressure() returns valid level",
+      "pass": true
+    },
+    {
+      "name": "can_fanout(16) on real system produces valid decision",
+      "pass": true
+    },
+    {
+      "name": "can_fanout(16) clamps correctly for level",
+      "pass": true
+    },
+    {
+      "name": "forced CRITICAL threshold \u2192 CRITICAL level",
+      "pass": true
+    },
+    {
+      "name": "forced CRITICAL \u2192 n_allowed clamped to 1",
+      "pass": true
+    },
+    {
+      "name": "forced OK thresholds \u2192 OK + unclamped",
+      "pass": true
+    },
+    {
+      "name": "snapshot schema_version=1.0",
+      "pass": true
+    },
+    {
+      "name": "snapshot probe + level + thresholds + caps present",
+      "pass": true
+    },
+    {
+      "name": "snapshot enabled flag matches master",
+      "pass": true
+    },
+    {
+      "name": "Wave 1 #2 bridge: 7 gate flags auto-registered",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/memory_pressure_gate.py",
+      "pass": true
+    }
+  ]
+}
