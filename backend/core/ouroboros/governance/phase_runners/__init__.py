@@ -32,6 +32,9 @@ from backend.core.ouroboros.governance.phase_runners.plan_runner import (
 from backend.core.ouroboros.governance.phase_runners.route_runner import (
     ROUTERunner,
 )
+from backend.core.ouroboros.governance.phase_runners.validate_runner import (
+    VALIDATERunner,
+)
 
 __all__ = [
     "CLASSIFYRunner",
@@ -39,4 +42,5 @@ __all__ = [
     "ContextExpansionRunner",
     "PLANRunner",
     "ROUTERunner",
+    "VALIDATERunner",
 ]
