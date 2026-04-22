@@ -700,6 +700,21 @@ def main() -> None:
         interrupted = True
         print(f"\n{_YELLOW}Interrupted — shutting down gracefully...{_RESET}")
     finally:
+        # Shutdown hygiene (Python 3.9+): drain pending async generators
+        # and thread-pool executor tasks before closing the loop. Without
+        # this, background asyncio.to_thread / run_in_executor callbacks
+        # can race loop.close() and raise "RuntimeError: Event loop is
+        # closed" during otherwise-clean session exit. See
+        # memory/project_async_shutdown_race_triage.md for the full
+        # traceback + root cause analysis.
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            loop.run_until_complete(loop.shutdown_default_executor())
+        except Exception:
+            pass
         loop.close()
 
     # ------------------------------------------------------------------
