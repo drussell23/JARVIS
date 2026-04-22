@@ -257,21 +257,32 @@ def _phase_runner_slice3_fully_extracted() -> bool:
 def _phase_runner_classify_extracted() -> bool:
     """Slice 2 of Wave 2 (5) — CLASSIFY phase extraction gate.
 
-    Reads ``JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED`` (default ``false``).
+    Reads ``JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED``, **default
+    ``true`` as of 2026-04-22 graduation (3 clean soak sessions
+    bt-2026-04-22-200312 / -202123 / -203723 with 38 total
+    ``[PhaseRunnerDelegate] CLASSIFY → runner`` reachability markers
+    + Slice 2 parity 22/22 byte-identical vs inline).** Explicit
+    ``=false`` remains a runtime kill switch that reverts to the
+    inline block.
+
     When ``true``, ``_run_pipeline`` delegates the 760-line CLASSIFY
     block (emergency check + advisor + risk classification + 8 prompt
     injections + advance to ROUTE + narrator/dialogue start +
     ClassifyClarify) to
     :class:`backend.core.ouroboros.governance.phase_runners.classify_runner.CLASSIFYRunner`.
-    The ``_advisory`` local leaks downstream (Tier 6 personality voice
-    line reads ``_advisory.chronic_entropy``) and is threaded back
-    through ``PhaseResult.artifacts`` to preserve the data flow.
-    When ``false`` (default), the inline block runs unchanged. Parity
-    tests (tests/governance/phase_runner/test_classify_runner_parity.py)
+    The ``_advisory`` + ``_consciousness_bridge`` locals leak
+    downstream (Tier 6 personality voice + VERIFY L2 retry fragile-
+    file injection) and are threaded back through
+    ``PhaseResult.artifacts`` to preserve the data flow.
+
+    When ``false``, the inline block runs unchanged. Parity tests
+    (tests/governance/phase_runner/test_classify_runner_parity.py)
     pin observable output across both paths.
+
+    Graduation ledger: ``memory/project_wave2_graduation_matrix.md``.
     """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
