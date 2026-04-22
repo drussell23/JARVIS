@@ -512,6 +512,17 @@ class FlagRegistry:
                 env_name, top_name, top_d,
             )
             emitted.append((env_name, top_name, top_d))
+            # Best-effort SSE publish — lazy import keeps this module
+            # authority-free of the stream layer at import time.
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (
+                    publish_flag_typo_event,
+                )
+                publish_flag_typo_event(env_name, top_name, top_d)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[FlagRegistry] SSE typo publish failed", exc_info=True,
+                )
         return emitted
 
     # -- diagnostics / export -----------------------------------------------

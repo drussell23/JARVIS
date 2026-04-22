@@ -206,6 +206,21 @@ class IDEObservabilityRouter:
             "/observability/posture/history",
             self._handle_posture_history,
         )
+        # FlagRegistry Slice 3 — flag + verb introspection surface.
+        app.router.add_get(
+            "/observability/flags", self._handle_flags_list,
+        )
+        app.router.add_get(
+            "/observability/flags/unregistered",
+            self._handle_flags_unregistered,
+        )
+        app.router.add_get(
+            "/observability/flags/{name}",
+            self._handle_flag_detail,
+        )
+        app.router.add_get(
+            "/observability/verbs", self._handle_verbs_list,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -809,3 +824,217 @@ class IDEObservabilityRouter:
                 "limit": limit,
             },
         )
+
+    # --- FlagRegistry Slice 3 — flag + verb introspection --------------------
+
+    @staticmethod
+    def _flag_registry_enabled() -> bool:
+        """Second gate — surface inherits FlagRegistry master switch."""
+        try:
+            from backend.core.ouroboros.governance.flag_registry import is_enabled
+        except ImportError:
+            return False
+        return is_enabled()
+
+    @staticmethod
+    def _project_flag_spec(spec: Any) -> Dict[str, Any]:
+        """Bounded projection — matches FlagSpec.to_dict() — no extra
+        fields leaked beyond the documented public shape."""
+        return spec.to_dict()
+
+    @staticmethod
+    def _project_verb_spec(spec: Any) -> Dict[str, Any]:
+        return {
+            "name": spec.name,
+            "one_line": spec.one_line,
+            "category": spec.category,
+            "since": spec.since,
+        }
+
+    def _flag_check_gates(self, request: "web.Request") -> Optional[Any]:
+        """Returns an error response if any gate fails, else None."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._flag_registry_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.flag_registry_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        return None
+
+    async def _handle_flags_list(self, request: "web.Request") -> Any:
+        """GET /observability/flags — all registered flags.
+
+        Query params:
+          ?category=CAT     Category enum value filter
+          ?posture=P        Posture relevance filter (EXPLORE/CONSOLIDATE/...)
+          ?search=Q         Case-insensitive substring on name + description
+          ?limit=N          Clamp result count to N (default 500, max 1000)
+
+        Filters are combined AND-wise: category → posture → search, each
+        narrowing the previous result. Malformed category → 400.
+        """
+        err = self._flag_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.flag_registry import (
+                Category, ensure_seeded,
+            )
+            registry = ensure_seeded()
+        except Exception:  # noqa: BLE001
+            logger.debug("[IDEObservability] flag registry unavailable", exc_info=True)
+            return self._json_response(
+                request, 200,
+                {"flags": [], "count": 0, "reason_code": "flags.unavailable"},
+            )
+
+        category_arg = request.query.get("category", "").strip().lower()
+        posture_arg = request.query.get("posture", "").strip()
+        search_arg = request.query.get("search", "").strip()
+        try:
+            limit = min(1000, max(1, int(request.query.get("limit", "500"))))
+        except (TypeError, ValueError):
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+
+        specs = registry.list_all()
+        if category_arg:
+            try:
+                cat = Category(category_arg)
+            except ValueError:
+                return self._error_response(
+                    request, 400, "ide_observability.malformed_category",
+                )
+            specs = [s for s in specs if s.category is cat]
+        if posture_arg:
+            # FlagSpec has a dict field (not hashable) so filter by name
+            allowed_names = {
+                s.name for s in registry.relevant_to_posture(posture_arg)
+            }
+            specs = [s for s in specs if s.name in allowed_names]
+        if search_arg:
+            q = search_arg.lower()
+            specs = [
+                s for s in specs
+                if q in s.name.lower() or q in s.description.lower()
+            ]
+
+        specs = specs[:limit]
+        return self._json_response(
+            request, 200,
+            {
+                "flags": [self._project_flag_spec(s) for s in specs],
+                "count": len(specs),
+                "limit": limit,
+            },
+        )
+
+    async def _handle_flag_detail(self, request: "web.Request") -> Any:
+        """GET /observability/flags/{name} — full FlagSpec projection.
+
+        404 on unknown flag; 400 on malformed name. Suggested similar
+        names are included in 404 payload for client-side typo rendering.
+        """
+        err = self._flag_check_gates(request)
+        if err is not None:
+            return err
+        name = request.match_info.get("name", "")
+        # Flag names follow the JARVIS_ prefix + [A-Za-z0-9_] shape.
+        if not re.match(r"^JARVIS_[A-Za-z0-9_]{1,128}$", name):
+            return self._error_response(
+                request, 400, "ide_observability.malformed_flag_name",
+            )
+        try:
+            from backend.core.ouroboros.governance.flag_registry import (
+                ensure_seeded,
+            )
+            registry = ensure_seeded()
+        except Exception:  # noqa: BLE001
+            return self._error_response(
+                request, 500, "ide_observability.registry_unavailable",
+            )
+        spec = registry.get_spec(name)
+        if spec is None:
+            suggestions = registry.suggest_similar(name, limit=3)
+            return self._json_response(
+                request, 404,
+                {
+                    "error": True,
+                    "reason_code": "flags.unknown",
+                    "name": name,
+                    "suggestions": [
+                        {"name": n, "distance": d} for n, d in suggestions
+                    ],
+                },
+            )
+        # Include current env value if set
+        projection = self._project_flag_spec(spec)
+        env_value = os.environ.get(name)
+        if env_value is not None:
+            projection["current_env_value"] = env_value
+        return self._json_response(request, 200, projection)
+
+    async def _handle_flags_unregistered(self, request: "web.Request") -> Any:
+        """GET /observability/flags/unregistered — typo hunter.
+
+        Lists JARVIS_* env vars present in process env that are NOT
+        registered. Each entry includes Levenshtein-suggested matches.
+        """
+        err = self._flag_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.flag_registry import (
+                ensure_seeded,
+            )
+            registry = ensure_seeded()
+        except Exception:  # noqa: BLE001
+            return self._json_response(
+                request, 200,
+                {"unregistered": [], "count": 0,
+                 "reason_code": "flags.unavailable"},
+            )
+        hits = registry.unregistered_env()
+        return self._json_response(
+            request, 200,
+            {
+                "unregistered": [
+                    {
+                        "name": name,
+                        "suggestions": [
+                            {"name": n, "distance": d} for n, d in sugs
+                        ],
+                    }
+                    for name, sugs in hits
+                ],
+                "count": len(hits),
+            },
+        )
+
+    async def _handle_verbs_list(self, request: "web.Request") -> Any:
+        """GET /observability/verbs — registered REPL verbs."""
+        err = self._flag_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.help_dispatcher import (
+                get_default_verb_registry,
+            )
+            verbs = get_default_verb_registry().list_all()
+        except Exception:  # noqa: BLE001
+            verbs = []
+        return self._json_response(
+            request, 200,
+            {
+                "verbs": [self._project_verb_spec(v) for v in verbs],
+                "count": len(verbs),
+            },
+        )
+

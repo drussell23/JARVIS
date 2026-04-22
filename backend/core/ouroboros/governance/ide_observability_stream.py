@@ -124,6 +124,10 @@ EVENT_TYPE_PLAN_EXPIRED = "plan_expired"
 # the payload so clients render from one handler.
 EVENT_TYPE_POSTURE_CHANGED = "posture_changed"
 
+# FlagRegistry Slice 3 — flag introspection stream vocabulary.
+EVENT_TYPE_FLAG_TYPO_DETECTED = "flag_typo_detected"
+EVENT_TYPE_FLAG_REGISTERED = "flag_registered"
+
 # Inline Permission Slice 4 — per-tool-call prompt + grant stream vocab.
 EVENT_TYPE_INLINE_PROMPT_PENDING = "inline_prompt_pending"
 EVENT_TYPE_INLINE_PROMPT_ALLOWED = "inline_prompt_allowed"
@@ -184,6 +188,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SESSION_PINNED,
     EVENT_TYPE_SESSION_UNPINNED,
     EVENT_TYPE_POSTURE_CHANGED,
+    EVENT_TYPE_FLAG_TYPO_DETECTED,
+    EVENT_TYPE_FLAG_REGISTERED,
 })
 
 
@@ -1072,6 +1078,124 @@ def bridge_posture_to_broker(
     def _unsubscribe() -> None:
         try:
             observer._on_change = prev_hook  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _unsubscribe
+
+
+# ---------------------------------------------------------------------------
+# FlagRegistry → broker bridge (Wave 1 #2 Slice 3)
+# ---------------------------------------------------------------------------
+
+
+def publish_flag_typo_event(
+    env_name: str,
+    suggestion: str,
+    distance: int,
+) -> Optional[str]:
+    """Best-effort publisher for flag_typo_detected frames.
+
+    Returns the event_id on success, None when stream is disabled /
+    broker missing / publish raised. Never raises. Deduplication is
+    the caller's responsibility — FlagRegistry.report_typos already
+    dedups per-env-var-per-process, so this fires exactly once per
+    unique typo per session when wired through the bridge.
+    """
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_FLAG_TYPO_DETECTED, "flag_registry",
+            {
+                "env_name": env_name,
+                "closest_match": suggestion,
+                "distance": distance,
+            },
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.debug("[Stream] publish_flag_typo_event exception", exc_info=True)
+        return None
+
+
+def publish_flag_registered_event(
+    flag_name: str,
+    category: str,
+    source_file: str,
+) -> Optional[str]:
+    """Best-effort publisher for flag_registered frames.
+
+    Fires on post-boot registrations so IDE clients can refresh their
+    in-memory view without polling GET /observability/flags."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_FLAG_REGISTERED, "flag_registry",
+            {
+                "name": flag_name,
+                "category": category,
+                "source_file": source_file,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Stream] publish_flag_registered_event exception", exc_info=True)
+        return None
+
+
+def bridge_flag_registry_to_broker(
+    registry: Optional[Any] = None,
+) -> Callable[[], None]:
+    """Wire a FlagRegistry's post-boot ``register()`` calls into the SSE
+    broker.
+
+    Typo detection is surfaced via a separate path: callers invoke
+    :func:`publish_flag_typo_event` from ``FlagRegistry.report_typos``'s
+    emission loop, or via the GET
+    ``/observability/flags/unregistered`` handler on-demand.
+
+    Monkey-patches the registry's instance-level ``register`` method to
+    publish a ``flag_registered`` SSE frame for each net-new
+    registration (overrides of existing specs don't fire — they're
+    re-registrations, not new surface).
+
+    Returns an unsubscribe callable that restores the original method.
+
+    Authority invariant: read-only on registry state (the bridge never
+    mutates spec contents or read-tracking). Never raises into the
+    register() caller path — wrapper delegates to original before any
+    publish attempt, so bridge failures can't block registration.
+    """
+    if registry is None:
+        try:
+            from backend.core.ouroboros.governance.flag_registry import (
+                ensure_seeded,
+            )
+            registry = ensure_seeded()
+        except Exception:  # noqa: BLE001
+            logger.debug("[Stream] flag registry bridge: no registry",
+                         exc_info=True)
+            return lambda: None
+
+    original_register = registry.register
+
+    def _wrapped_register(spec, *, override: bool = True) -> None:
+        already = registry.get_spec(spec.name) is not None
+        original_register(spec, override=override)
+        if not already:
+            try:
+                publish_flag_registered_event(
+                    spec.name, spec.category.value, spec.source_file,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("[Stream] flag_registered publish failed",
+                             exc_info=True)
+
+    registry.register = _wrapped_register  # type: ignore[method-assign]
+
+    def _unsubscribe() -> None:
+        try:
+            registry.register = original_register  # type: ignore[method-assign]
         except Exception:  # noqa: BLE001
             pass
 

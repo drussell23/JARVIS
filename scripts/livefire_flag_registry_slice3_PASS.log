@@ -1,0 +1,149 @@
+{
+  "slice": 3,
+  "feature": "GET /observability/flags|verbs + SSE",
+  "timestamp": 1776822406.9603462,
+  "all_pass": true,
+  "total_checks": 35,
+  "checks": [
+    {
+      "name": "/channel/health responds 200",
+      "pass": true
+    },
+    {
+      "name": "GET /observability/flags \u2192 200",
+      "pass": true
+    },
+    {
+      "name": "flags payload count (52)",
+      "pass": true
+    },
+    {
+      "name": "flags payload schema_version=1.0",
+      "pass": true
+    },
+    {
+      "name": "category filter returns only safety flags",
+      "pass": true
+    },
+    {
+      "name": "malformed category \u2192 400",
+      "pass": true
+    },
+    {
+      "name": "posture=HARDEN returns HARDEN-tagged flags",
+      "pass": true
+    },
+    {
+      "name": "search=observer + limit clamp",
+      "pass": true
+    },
+    {
+      "name": "malformed limit \u2192 400",
+      "pass": true
+    },
+    {
+      "name": "flag detail \u2192 200",
+      "pass": true
+    },
+    {
+      "name": "flag detail name matches",
+      "pass": true
+    },
+    {
+      "name": "flag detail type=bool",
+      "pass": true
+    },
+    {
+      "name": "flag detail category=safety",
+      "pass": true
+    },
+    {
+      "name": "unknown flag \u2192 404",
+      "pass": true
+    },
+    {
+      "name": "404 payload has suggestions",
+      "pass": true
+    },
+    {
+      "name": "malformed flag name \u2192 400",
+      "pass": true
+    },
+    {
+      "name": "unregistered endpoint \u2192 200",
+      "pass": true
+    },
+    {
+      "name": "unregistered surfaces typo",
+      "pass": true
+    },
+    {
+      "name": "verbs endpoint \u2192 200",
+      "pass": true
+    },
+    {
+      "name": "verbs includes /posture + /help",
+      "pass": true
+    },
+    {
+      "name": "verbs count \u2265 7",
+      "pass": true
+    },
+    {
+      "name": "report_typos emits \u22651 SSE frame",
+      "pass": true
+    },
+    {
+      "name": "typo frame includes env_name",
+      "pass": true
+    },
+    {
+      "name": "typo frame includes closest_match",
+      "pass": true
+    },
+    {
+      "name": "bridge emits flag_registered SSE on new spec",
+      "pass": true
+    },
+    {
+      "name": "registered frame name matches",
+      "pass": true
+    },
+    {
+      "name": "registered frame category=experimental",
+      "pass": true
+    },
+    {
+      "name": "master=false: GET flags \u2192 403",
+      "pass": true
+    },
+    {
+      "name": "master=false: GET flag detail \u2192 403",
+      "pass": true
+    },
+    {
+      "name": "master=false: GET unregistered \u2192 403",
+      "pass": true
+    },
+    {
+      "name": "master=false: GET verbs \u2192 403",
+      "pass": true
+    },
+    {
+      "name": "re-enable: GET flags \u2192 200",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/flag_registry.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/flag_registry_seed.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/help_dispatcher.py",
+      "pass": true
+    }
+  ]
+}
