@@ -69,12 +69,8 @@
 # [Ouroboros] Modified by Ouroboros (op=op-019d9e59-) at 2026-04-18 02:11 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019d9fb7-ffff-787e-8d11-9f81a3613d3e-cau) at 2026-04-18 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019d9fb7-) at 2026-04-18 08:35 UTC
-# Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
-
-# Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
-# Python 3.12 is now the minimum supported interpreter version (3.13 also supported).
-# Requires-Python: >=3.12
-
+# [Ouroboros] Modified by Ouroboros (op=op-019db354-181b-785c-ac31-5a39019abd65-cau) at 2026-04-18 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019db354-) at 2026-04-22 04:01 UTC
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
 
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
