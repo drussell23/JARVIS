@@ -368,16 +368,18 @@ class TestUnregisteredEnv:
 
 class TestMasterSwitch:
 
-    def test_is_enabled_default_false_slice1(self):
-        assert is_enabled() is False
+    def test_is_enabled_default_true_post_graduation(self):
+        """Post-Slice-4 graduation: default flipped false → true."""
+        assert is_enabled() is True
 
     def test_is_enabled_true_via_env(self, monkeypatch):
         monkeypatch.setenv("JARVIS_FLAG_REGISTRY_ENABLED", "true")
         assert is_enabled() is True
 
     def test_typo_warn_requires_master(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_FLAG_REGISTRY_ENABLED", "false")
         monkeypatch.setenv("JARVIS_FLAG_TYPO_WARN_ENABLED", "true")
-        # Master off still silences typo warnings
+        # Master off silences typo warnings even when sub-gate is on
         assert typo_warn_enabled() is False
 
     def test_typo_warn_both_flags(self, monkeypatch):

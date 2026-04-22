@@ -83,14 +83,37 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 
 
 def is_enabled() -> bool:
-    """Master switch. Default ``false`` at Slice 1 — Slice 4 graduates.
+    """Master switch.
 
-    When ``False``: the registry data structure stays alive (descriptive
-    dict remains populated by seed registrations), but the surfaces go
-    dark — ``/help`` rejects operational verbs, GET returns 403, SSE
-    drops, typo warnings are silent.
+    Default: **``true``** (graduated 2026-04-21 via Slice 4 after
+    Slices 1-3 shipped the primitive + 52-flag seed + /help dispatcher +
+    GET /observability/flags + SSE flag_typo_detected/flag_registered
+    with 135 governance tests + 3 live-fire proofs). Explicit
+    ``"false"`` reverts to the Slice 1 deny-by-default posture so
+    operators retain a runtime kill switch — when the flag is explicitly
+    ``"false"`` every surface disables in lockstep:
+
+      * /help REPL rejects operational verbs (/help help still works
+        for discoverability so operators can find the flag name)
+      * GET /observability/flags{,/{name},/unregistered} return 403
+      * GET /observability/verbs returns 403
+      * SSE publish_flag_typo_event + publish_flag_registered_event
+        become no-ops (drop silently)
+      * FlagRegistry.report_typos() logs nothing
+
+    The registry DATA STRUCTURE remains alive when the flag is off —
+    it's descriptive, not authoritative. Seed-registered specs stay in
+    memory; typed accessors (get_bool/int/float/str/json) keep
+    functioning; internal modules that use registry as a reader keep
+    working. Only the **operator-facing surfaces** are gated.
+
+    The authority invariants (grep-pinned zero imports of
+    orchestrator/policy/iron_gate/risk_tier/change_engine/candidate_generator/gate),
+    Levenshtein threshold caps, thread-safety via threading.Lock, and
+    schema_version=1.0 discipline all remain in force regardless of
+    this flag — graduation flips opt-in friction, NOT authority surface.
     """
-    return _env_bool("JARVIS_FLAG_REGISTRY_ENABLED", False)
+    return _env_bool("JARVIS_FLAG_REGISTRY_ENABLED", True)
 
 
 def typo_warn_enabled() -> bool:

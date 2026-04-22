@@ -92,7 +92,7 @@ class TestFlagsList:
     @pytest.mark.asyncio
     async def test_403_when_flag_registry_master_off(self, monkeypatch):
         monkeypatch.setenv("JARVIS_IDE_OBSERVABILITY_ENABLED", "true")
-        # master not set → default false Slice 1-3
+        monkeypatch.setenv("JARVIS_FLAG_REGISTRY_ENABLED", "false")
         from backend.core.ouroboros.governance.ide_observability import (
             IDEObservabilityRouter,
         )

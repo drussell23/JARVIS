@@ -79,7 +79,8 @@ class TestDispatcherBasics:
         assert r.ok
         assert "/help" in r.text
 
-    def test_master_off_rejects_operational_verbs(self):
+    def test_master_off_rejects_operational_verbs(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_FLAG_REGISTRY_ENABLED", "false")
         r = _run("/help flags")
         assert r.ok is False
         assert "JARVIS_FLAG_REGISTRY_ENABLED" in r.text
@@ -373,7 +374,8 @@ class TestVerbRegistry:
 
 class TestMasterGating:
 
-    def test_dispatcher_enabled_false_when_master_off(self):
+    def test_dispatcher_enabled_false_when_master_off(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_FLAG_REGISTRY_ENABLED", "false")
         assert dispatcher_enabled() is False
 
     def test_dispatcher_enabled_true_when_master_on(self, monkeypatch):
