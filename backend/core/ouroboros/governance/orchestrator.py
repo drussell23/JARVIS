@@ -131,6 +131,48 @@ def _phase_runner_complete_extracted() -> bool:
     )
 
 
+def _phase_runner_route_extracted() -> bool:
+    """Slice 3 of Wave 2 (5) — ROUTE phase extraction gate."""
+    return (
+        os.environ.get("JARVIS_PHASE_RUNNER_ROUTE_EXTRACTED", "false")
+        .strip().lower() in _TRUTHY
+    )
+
+
+def _phase_runner_context_expansion_extracted() -> bool:
+    """Slice 3 of Wave 2 (5) — CONTEXT_EXPANSION phase extraction gate."""
+    return (
+        os.environ.get("JARVIS_PHASE_RUNNER_CONTEXT_EXPANSION_EXTRACTED", "false")
+        .strip().lower() in _TRUTHY
+    )
+
+
+def _phase_runner_plan_extracted() -> bool:
+    """Slice 3 of Wave 2 (5) — PLAN phase extraction gate."""
+    return (
+        os.environ.get("JARVIS_PHASE_RUNNER_PLAN_EXTRACTED", "false")
+        .strip().lower() in _TRUTHY
+    )
+
+
+def _phase_runner_slice3_fully_extracted() -> bool:
+    """All three Slice 3 flags set — routes ROUTE+CTX+PLAN through runners.
+
+    The three phases are currently interleaved in the inline pipeline
+    (ROUTE body → conditional CTX → PLAN body); wiring each flag
+    independently would require splitting the interleaving. For now,
+    the dispatcher demands ALL THREE flags before using runners.
+    Per-phase flags remain visible for env-var discoverability and
+    future per-phase independence once Slice 6 (dispatcher cutover)
+    decouples them entirely.
+    """
+    return (
+        _phase_runner_route_extracted()
+        and _phase_runner_context_expansion_extracted()
+        and _phase_runner_plan_extracted()
+    )
+
+
 def _phase_runner_classify_extracted() -> bool:
     """Slice 2 of Wave 2 (5) — CLASSIFY phase extraction gate.
 
@@ -2045,527 +2087,434 @@ class GovernedOrchestrator:
                     exc_info=True,
                 )
 
-        # ---- Phase 2: ROUTE ----
+        # Wave 2 (5) Slice 3 - ROUTE+CTX+PLAN PhaseRunner delegation gate.
+        # All three flags (JARVIS_PHASE_RUNNER_{ROUTE,CONTEXT_EXPANSION,PLAN}_EXTRACTED)
+        # must be set to engage the runner chain. This all-or-nothing
+        # gate simplifies wiring while the three phases remain
+        # interleaved (ROUTE body -> conditional CTX -> PLAN body) in the
+        # inline pipeline. Per-phase independence arrives with Slice 6
+        # (dispatcher cutover).
+        if _phase_runner_slice3_fully_extracted():
+            from backend.core.ouroboros.governance.phase_runners import (
+                ContextExpansionRunner,
+                PLANRunner,
+                ROUTERunner,
+            )
+            # ROUTE: runs the routing body + either advance(CTX) or advance(PLAN)
+            _route_result = await ROUTERunner(self, _serpent).run(ctx)
+            ctx = _route_result.next_ctx
+            # CTX: runs only if ROUTERunner advanced to CONTEXT_EXPANSION
+            if _route_result.next_phase is OperationPhase.CONTEXT_EXPANSION:
+                _ctx_result = await ContextExpansionRunner(self, _serpent).run(ctx)
+                ctx = _ctx_result.next_ctx
+            # PLAN: advisory artifact comes from CLASSIFY's result — carried
+            # via the _advisory local established by the CLASSIFY hook.
+            _plan_result = await PLANRunner(self, _serpent, advisory=_advisory).run(ctx)
+            if _plan_result.next_phase is None:
+                # Terminal exit from PLAN (plan_rejected, plan_expired, etc.)
+                return _plan_result.next_ctx
+            ctx = _plan_result.next_ctx
+        else:
+            # ---- Phase 2: ROUTE ----
 
-        # Telemetry host-binding enforcement for remote routes (split-brain guard)
-        _routing = getattr(ctx, "routing", None)
-        if _routing is not None and str(getattr(_routing, "name", "")).upper() in ("GCP_PRIME", "REMOTE"):
+            # Telemetry host-binding enforcement for remote routes (split-brain guard)
+            _routing = getattr(ctx, "routing", None)
+            if _routing is not None and str(getattr(_routing, "name", "")).upper() in ("GCP_PRIME", "REMOTE"):
+                try:
+                    from backend.core.ouroboros.governance.telemetry_contextualizer import (
+                        TelemetryContextualizer,
+                    )
+                    _tc = TelemetryContextualizer()
+                    _exec_host = str(getattr(_routing, "endpoint", "local"))
+                    _tel_host = str(getattr(ctx, "telemetry_host", _exec_host))
+                    await _tc.assert_host_binding(
+                        execution_host=_exec_host,
+                        telemetry_host=_tel_host,
+                    )
+                except RuntimeError as _bind_err:
+                    logger.warning(
+                        "[Orchestrator] Telemetry host-binding violation: %s [%s]",
+                        _bind_err, ctx.op_id,
+                    )
+                except Exception:
+                    logger.debug("[Orchestrator] TelemetryContextualizer not available", exc_info=True)
+
+            # ── Urgency-aware provider routing (Manifesto §5 Tier 0) ──
+            # Deterministic routing based on signal_urgency + signal_source +
+            # task_complexity. Stamps provider_route on context for
+            # CandidateGenerator dispatch.
             try:
-                from backend.core.ouroboros.governance.telemetry_contextualizer import (
-                    TelemetryContextualizer,
+                from backend.core.ouroboros.governance.urgency_router import (
+                    UrgencyRouter,
                 )
-                _tc = TelemetryContextualizer()
-                _exec_host = str(getattr(_routing, "endpoint", "local"))
-                _tel_host = str(getattr(ctx, "telemetry_host", _exec_host))
-                await _tc.assert_host_binding(
-                    execution_host=_exec_host,
-                    telemetry_host=_tel_host,
+                _urgency_router = UrgencyRouter()
+                _provider_route, _route_reason = _urgency_router.classify(ctx)
+                object.__setattr__(ctx, "provider_route", _provider_route.value)
+                object.__setattr__(ctx, "provider_route_reason", _route_reason)
+                logger.info(
+                    "[Orchestrator] \U0001f6e4\ufe0f  Route: %s (%s) [%s]",
+                    _provider_route.value, _route_reason, ctx.op_id,
                 )
-            except RuntimeError as _bind_err:
-                logger.warning(
-                    "[Orchestrator] Telemetry host-binding violation: %s [%s]",
-                    _bind_err, ctx.op_id,
+                # Emit route decision to CommProtocol for observability
+                if hasattr(self._stack, "comm") and self._stack.comm is not None:
+                    try:
+                        from backend.core.ouroboros.governance.urgency_router import (
+                            UrgencyRouter as _UR,
+                        )
+                        await self._stack.comm.emit_decision(
+                            op_id=ctx.op_id,
+                            outcome=_provider_route.value,
+                            reason_code=f"urgency_route:{_route_reason}",
+                            route=_provider_route.value,
+                            route_reason=_route_reason,
+                            budget_profile=_UR.route_budget_profile(_provider_route),
+                            details={
+                                "route": _provider_route.value,
+                                "route_description": _UR.describe_route(_provider_route),
+                                "signal_urgency": getattr(ctx, "signal_urgency", ""),
+                                "signal_source": getattr(ctx, "signal_source", ""),
+                                "task_complexity": getattr(ctx, "task_complexity", ""),
+                                "budget_profile": _UR.route_budget_profile(_provider_route),
+                            },
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                logger.debug("[Orchestrator] UrgencyRouter not available", exc_info=True)
+
+            # ── Start per-op cost governor ──
+            # Called here (post-ROUTE) so the cap is derived from the actual
+            # stamped route + task_complexity. If either field is empty the
+            # governor uses safe "standard/light" defaults. Safe to call even
+            # when governor is disabled — returns +inf cap.
+            try:
+                self._cost_governor.start(
+                    op_id=ctx.op_id,
+                    route=getattr(ctx, "provider_route", "") or "",
+                    complexity=getattr(ctx, "task_complexity", "") or "",
+                    is_read_only=bool(getattr(ctx, "is_read_only", False)),
                 )
             except Exception:
-                logger.debug("[Orchestrator] TelemetryContextualizer not available", exc_info=True)
+                logger.debug("[Orchestrator] CostGovernor.start failed", exc_info=True)
 
-        # ── Urgency-aware provider routing (Manifesto §5 Tier 0) ──
-        # Deterministic routing based on signal_urgency + signal_source +
-        # task_complexity. Stamps provider_route on context for
-        # CandidateGenerator dispatch.
-        try:
-            from backend.core.ouroboros.governance.urgency_router import (
-                UrgencyRouter,
-            )
-            _urgency_router = UrgencyRouter()
-            _provider_route, _route_reason = _urgency_router.classify(ctx)
-            object.__setattr__(ctx, "provider_route", _provider_route.value)
-            object.__setattr__(ctx, "provider_route_reason", _route_reason)
-            logger.info(
-                "[Orchestrator] \U0001f6e4\ufe0f  Route: %s (%s) [%s]",
-                _provider_route.value, _route_reason, ctx.op_id,
-            )
-            # Emit route decision to CommProtocol for observability
-            if hasattr(self._stack, "comm") and self._stack.comm is not None:
-                try:
-                    from backend.core.ouroboros.governance.urgency_router import (
-                        UrgencyRouter as _UR,
-                    )
-                    await self._stack.comm.emit_decision(
-                        op_id=ctx.op_id,
-                        outcome=_provider_route.value,
-                        reason_code=f"urgency_route:{_route_reason}",
-                        route=_provider_route.value,
-                        route_reason=_route_reason,
-                        budget_profile=_UR.route_budget_profile(_provider_route),
-                        details={
-                            "route": _provider_route.value,
-                            "route_description": _UR.describe_route(_provider_route),
-                            "signal_urgency": getattr(ctx, "signal_urgency", ""),
-                            "signal_source": getattr(ctx, "signal_source", ""),
-                            "task_complexity": getattr(ctx, "task_complexity", ""),
-                            "budget_profile": _UR.route_budget_profile(_provider_route),
-                        },
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            logger.debug("[Orchestrator] UrgencyRouter not available", exc_info=True)
-
-        # ── Start per-op cost governor ──
-        # Called here (post-ROUTE) so the cap is derived from the actual
-        # stamped route + task_complexity. If either field is empty the
-        # governor uses safe "standard/light" defaults. Safe to call even
-        # when governor is disabled — returns +inf cap.
-        try:
-            self._cost_governor.start(
-                op_id=ctx.op_id,
-                route=getattr(ctx, "provider_route", "") or "",
-                complexity=getattr(ctx, "task_complexity", "") or "",
-                is_read_only=bool(getattr(ctx, "is_read_only", False)),
-            )
-        except Exception:
-            logger.debug("[Orchestrator] CostGovernor.start failed", exc_info=True)
-
-        if self._config.context_expansion_enabled:
-            # ── PreActionNarrator: voice WHAT before CONTEXT_EXPANSION ──
-            if self._pre_action_narrator is not None:
-                try:
-                    await self._pre_action_narrator.narrate_phase(
-                        "CONTEXT_EXPANSION",
-                        {"target_file": list(ctx.target_files)[0] if ctx.target_files else "unknown"},
-                    )
-                except Exception:
-                    pass
-            if _serpent: _serpent.update_phase("CONTEXT_EXPANSION")
-            ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
-
-            # ---- Phase 2b: CONTEXT_EXPANSION ----
-            try:
-                expansion_deadline = datetime.now(tz=timezone.utc) + timedelta(
-                    seconds=self._config.context_expansion_timeout_s
-                )
-                from backend.core.ouroboros.governance.skill_registry import SkillRegistry as _SkillRegistry
-                _skill_registry = _SkillRegistry(self._config.project_root)
-                # DocFetcher: bounded external doc retrieval (P3 — Boundary Principle)
-                _doc_fetcher = None
-                try:
-                    from backend.core.ouroboros.governance.doc_fetcher import DocFetcher
-                    _doc_fetcher = DocFetcher()
-                except ImportError:
-                    pass
-
-                # WebSearchCapability: structured search with epistemic allowlist
-                _web_search = None
-                try:
-                    from backend.core.ouroboros.governance.web_search import WebSearchCapability
-                    _ws = WebSearchCapability()
-                    if _ws.is_available:
-                        _web_search = _ws
-                        logger.debug(
-                            "[Orchestrator] WebSearchCapability available (backend=%s)",
-                            _ws.backend_name,
+            if self._config.context_expansion_enabled:
+                # ── PreActionNarrator: voice WHAT before CONTEXT_EXPANSION ──
+                if self._pre_action_narrator is not None:
+                    try:
+                        await self._pre_action_narrator.narrate_phase(
+                            "CONTEXT_EXPANSION",
+                            {"target_file": list(ctx.target_files)[0] if ctx.target_files else "unknown"},
                         )
-                except ImportError:
-                    pass
+                    except Exception:
+                        pass
+                if _serpent: _serpent.update_phase("CONTEXT_EXPANSION")
+                ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
 
-                # VisualCodeComprehension: screenshot-based analysis
-                _visual = None
+                # ---- Phase 2b: CONTEXT_EXPANSION ----
                 try:
-                    from backend.core.ouroboros.governance.visual_comprehension import (
-                        VisualCodeComprehension,
+                    expansion_deadline = datetime.now(tz=timezone.utc) + timedelta(
+                        seconds=self._config.context_expansion_timeout_s
                     )
-                    _vc = VisualCodeComprehension()
-                    if _vc.is_available:
-                        _visual = _vc
-                except ImportError:
-                    pass
+                    from backend.core.ouroboros.governance.skill_registry import SkillRegistry as _SkillRegistry
+                    _skill_registry = _SkillRegistry(self._config.project_root)
+                    # DocFetcher: bounded external doc retrieval (P3 — Boundary Principle)
+                    _doc_fetcher = None
+                    try:
+                        from backend.core.ouroboros.governance.doc_fetcher import DocFetcher
+                        _doc_fetcher = DocFetcher()
+                    except ImportError:
+                        pass
 
-                # CodeExplorationTool: sandboxed hypothesis testing
-                _explorer = None
-                try:
-                    from backend.core.ouroboros.governance.code_exploration import CodeExplorationTool
-                    _explorer = CodeExplorationTool(str(self._config.project_root))
-                except ImportError:
-                    pass
+                    # WebSearchCapability: structured search with epistemic allowlist
+                    _web_search = None
+                    try:
+                        from backend.core.ouroboros.governance.web_search import WebSearchCapability
+                        _ws = WebSearchCapability()
+                        if _ws.is_available:
+                            _web_search = _ws
+                            logger.debug(
+                                "[Orchestrator] WebSearchCapability available (backend=%s)",
+                                _ws.backend_name,
+                            )
+                    except ImportError:
+                        pass
 
-                expander = ContextExpander(
+                    # VisualCodeComprehension: screenshot-based analysis
+                    _visual = None
+                    try:
+                        from backend.core.ouroboros.governance.visual_comprehension import (
+                            VisualCodeComprehension,
+                        )
+                        _vc = VisualCodeComprehension()
+                        if _vc.is_available:
+                            _visual = _vc
+                    except ImportError:
+                        pass
+
+                    # CodeExplorationTool: sandboxed hypothesis testing
+                    _explorer = None
+                    try:
+                        from backend.core.ouroboros.governance.code_exploration import CodeExplorationTool
+                        _explorer = CodeExplorationTool(str(self._config.project_root))
+                    except ImportError:
+                        pass
+
+                    expander = ContextExpander(
+                        generator=self._generator,
+                        repo_root=self._config.project_root,
+                        oracle=getattr(self._stack, "oracle", None),
+                        skill_registry=_skill_registry,
+                        doc_fetcher=_doc_fetcher,
+                        web_search=_web_search,
+                        visual_comprehension=_visual,
+                        code_explorer=_explorer,
+                        dialogue_store=self._dialogue_store,
+                    )
+                    ctx = await asyncio.wait_for(
+                        expander.expand(ctx, expansion_deadline),
+                        timeout=self._config.context_expansion_timeout_s,
+                    )
+
+                    # ExplorationFleet: parallel codebase exploration across Trinity repos
+                    if self._exploration_fleet is not None:
+                        try:
+                            _fleet_report = await asyncio.wait_for(
+                                self._exploration_fleet.deploy(
+                                    goal=ctx.description,
+                                    max_agents=8,
+                                ),
+                                timeout=min(30.0, self._config.context_expansion_timeout_s / 2),
+                            )
+                            if _fleet_report.total_findings > 0:
+                                _fleet_text = self._exploration_fleet.format_for_prompt(_fleet_report)
+                                ctx = ctx.with_expanded_files(
+                                    ctx.expanded_files + (f"[Fleet:{_fleet_report.total_findings}]",)
+                                )
+                                logger.info(
+                                    "[Orchestrator] ExplorationFleet: %d agents, %d findings in %.1fs",
+                                    _fleet_report.agents_completed,
+                                    _fleet_report.total_findings,
+                                    _fleet_report.duration_s,
+                                )
+                        except Exception as _fleet_exc:
+                            logger.debug("[Orchestrator] ExplorationFleet skipped: %s", _fleet_exc)
+
+                    # P2.1: Dependency-aware generation — inject Oracle graph summary
+                    _oracle_ref = getattr(self._stack, "oracle", None)
+                    if _oracle_ref is not None and ctx.target_files:
+                        try:
+                            _dep_summary = self._build_dependency_summary(
+                                _oracle_ref, ctx.target_files,
+                            )
+                            if _dep_summary:
+                                ctx = dataclasses.replace(ctx, dependency_summary=_dep_summary)
+                                logger.info(
+                                    "[Orchestrator] Dependency summary injected (%d chars, %d files)",
+                                    len(_dep_summary), len(ctx.target_files),
+                                )
+                        except Exception as _dep_exc:
+                            logger.debug("[Orchestrator] Dependency summary skipped: %s", _dep_exc)
+                except Exception as exc:
+                    logger.warning(
+                        "[Orchestrator] Context expansion failed for op=%s: %s; "
+                        "continuing to GENERATE",
+                        ctx.op_id, exc,
+                    )
+
+                ctx = ctx.advance(OperationPhase.PLAN)
+            else:
+                # Expansion disabled: skip directly from ROUTE to PLAN
+                ctx = ctx.advance(OperationPhase.PLAN)
+
+            # ---- Phase 2c: PLAN — model-reasoned implementation planning ----
+            # The model reasons about HOW to implement the change before writing
+            # code. Planning failures are soft — the pipeline falls through to
+            # GENERATE with an empty plan. Trivial ops skip planning entirely.
+            if _serpent:
+                _serpent.update_phase("PLAN")
+            try:
+                await self._stack.comm.emit_heartbeat(
+                    op_id=ctx.op_id, phase="plan", progress_pct=25.0,
+                )
+            except Exception:
+                pass
+
+            _plan_result: Optional[Any] = None
+            _plan_review_required_now = _plan_review_required()
+            try:
+                from backend.core.ouroboros.governance.plan_generator import (
+                    PlanGenerator, PLAN_TIMEOUT_S,
+                )
+                _plan_gen = PlanGenerator(
                     generator=self._generator,
                     repo_root=self._config.project_root,
-                    oracle=getattr(self._stack, "oracle", None),
-                    skill_registry=_skill_registry,
-                    doc_fetcher=_doc_fetcher,
-                    web_search=_web_search,
-                    visual_comprehension=_visual,
-                    code_explorer=_explorer,
-                    dialogue_store=self._dialogue_store,
                 )
-                ctx = await asyncio.wait_for(
-                    expander.expand(ctx, expansion_deadline),
-                    timeout=self._config.context_expansion_timeout_s,
+                _plan_deadline = datetime.now(tz=timezone.utc) + timedelta(
+                    seconds=PLAN_TIMEOUT_S,
+                )
+                _plan_result = await asyncio.wait_for(
+                    _plan_gen.generate_plan(ctx, _plan_deadline),
+                    timeout=PLAN_TIMEOUT_S + 5.0,
                 )
 
-                # ExplorationFleet: parallel codebase exploration across Trinity repos
-                if self._exploration_fleet is not None:
+                if not _plan_result.skipped:
+                    # Store plan in context for injection into GENERATE prompt
+                    ctx = dataclasses.replace(
+                        ctx,
+                        implementation_plan=_plan_result.plan_json,
+                        previous_hash=ctx.context_hash,
+                    )
+                    # Emit plan result for SerpentFlow rendering
                     try:
-                        _fleet_report = await asyncio.wait_for(
-                            self._exploration_fleet.deploy(
-                                goal=ctx.description,
-                                max_agents=8,
-                            ),
-                            timeout=min(30.0, self._config.context_expansion_timeout_s / 2),
+                        await self._stack.comm.emit_heartbeat(
+                            op_id=ctx.op_id, phase="plan", progress_pct=28.0,
+                            plan_complexity=_plan_result.complexity,
+                            plan_changes=len(_plan_result.ordered_changes),
                         )
-                        if _fleet_report.total_findings > 0:
-                            _fleet_text = self._exploration_fleet.format_for_prompt(_fleet_report)
-                            ctx = ctx.with_expanded_files(
-                                ctx.expanded_files + (f"[Fleet:{_fleet_report.total_findings}]",)
-                            )
-                            logger.info(
-                                "[Orchestrator] ExplorationFleet: %d agents, %d findings in %.1fs",
-                                _fleet_report.agents_completed,
-                                _fleet_report.total_findings,
-                                _fleet_report.duration_s,
-                            )
-                    except Exception as _fleet_exc:
-                        logger.debug("[Orchestrator] ExplorationFleet skipped: %s", _fleet_exc)
-
-                # P2.1: Dependency-aware generation — inject Oracle graph summary
-                _oracle_ref = getattr(self._stack, "oracle", None)
-                if _oracle_ref is not None and ctx.target_files:
-                    try:
-                        _dep_summary = self._build_dependency_summary(
-                            _oracle_ref, ctx.target_files,
-                        )
-                        if _dep_summary:
-                            ctx = dataclasses.replace(ctx, dependency_summary=_dep_summary)
-                            logger.info(
-                                "[Orchestrator] Dependency summary injected (%d chars, %d files)",
-                                len(_dep_summary), len(ctx.target_files),
-                            )
-                    except Exception as _dep_exc:
-                        logger.debug("[Orchestrator] Dependency summary skipped: %s", _dep_exc)
+                    except Exception:
+                        pass
+                    logger.info(
+                        "[Orchestrator] PLAN complete for op=%s: complexity=%s, "
+                        "%d ordered changes, %.1fs",
+                        ctx.op_id, _plan_result.complexity,
+                        len(_plan_result.ordered_changes),
+                        _plan_result.planning_duration_s,
+                    )
+                else:
+                    logger.debug(
+                        "[Orchestrator] PLAN skipped for op=%s: %s",
+                        ctx.op_id, _plan_result.skip_reason,
+                    )
+            except ImportError:
+                logger.debug("[Orchestrator] PlanGenerator not available, skipping PLAN phase")
             except Exception as exc:
                 logger.warning(
-                    "[Orchestrator] Context expansion failed for op=%s: %s; "
-                    "continuing to GENERATE",
+                    "[Orchestrator] PLAN phase failed for op=%s: %s; "
+                    "continuing to GENERATE without plan",
                     ctx.op_id, exc,
                 )
 
-            ctx = ctx.advance(OperationPhase.PLAN)
-        else:
-            # Expansion disabled: skip directly from ROUTE to PLAN
-            ctx = ctx.advance(OperationPhase.PLAN)
-
-        # ---- Phase 2c: PLAN — model-reasoned implementation planning ----
-        # The model reasons about HOW to implement the change before writing
-        # code. Planning failures are soft — the pipeline falls through to
-        # GENERATE with an empty plan. Trivial ops skip planning entirely.
-        if _serpent:
-            _serpent.update_phase("PLAN")
-        try:
-            await self._stack.comm.emit_heartbeat(
-                op_id=ctx.op_id, phase="plan", progress_pct=25.0,
-            )
-        except Exception:
-            pass
-
-        _plan_result: Optional[Any] = None
-        _plan_review_required_now = _plan_review_required()
-        try:
-            from backend.core.ouroboros.governance.plan_generator import (
-                PlanGenerator, PLAN_TIMEOUT_S,
-            )
-            _plan_gen = PlanGenerator(
-                generator=self._generator,
-                repo_root=self._config.project_root,
-            )
-            _plan_deadline = datetime.now(tz=timezone.utc) + timedelta(
-                seconds=PLAN_TIMEOUT_S,
-            )
-            _plan_result = await asyncio.wait_for(
-                _plan_gen.generate_plan(ctx, _plan_deadline),
-                timeout=PLAN_TIMEOUT_S + 5.0,
-            )
-
-            if not _plan_result.skipped:
-                # Store plan in context for injection into GENERATE prompt
-                ctx = dataclasses.replace(
-                    ctx,
-                    implementation_plan=_plan_result.plan_json,
-                    previous_hash=ctx.context_hash,
-                )
-                # Emit plan result for SerpentFlow rendering
-                try:
-                    await self._stack.comm.emit_heartbeat(
-                        op_id=ctx.op_id, phase="plan", progress_pct=28.0,
-                        plan_complexity=_plan_result.complexity,
-                        plan_changes=len(_plan_result.ordered_changes),
-                    )
-                except Exception:
-                    pass
-                logger.info(
-                    "[Orchestrator] PLAN complete for op=%s: complexity=%s, "
-                    "%d ordered changes, %.1fs",
-                    ctx.op_id, _plan_result.complexity,
-                    len(_plan_result.ordered_changes),
-                    _plan_result.planning_duration_s,
-                )
-            else:
-                logger.debug(
-                    "[Orchestrator] PLAN skipped for op=%s: %s",
-                    ctx.op_id, _plan_result.skip_reason,
-                )
-        except ImportError:
-            logger.debug("[Orchestrator] PlanGenerator not available, skipping PLAN phase")
-        except Exception as exc:
-            logger.warning(
-                "[Orchestrator] PLAN phase failed for op=%s: %s; "
-                "continuing to GENERATE without plan",
-                ctx.op_id, exc,
-            )
-
-        # Phase B PLAN-shadow (Slice 1b) — observer-only DAG dispatch.
-        # Runs AFTER the legacy PlanGenerator regardless of whether the
-        # legacy plan succeeded or skipped. Gated by
-        # JARVIS_PLAN_SUBAGENT_SHADOW (default false). The shadow never
-        # raises and never blocks the FSM; its only side-effect is
-        # setting ctx.execution_graph + emitting [PLAN-SHADOW] telemetry.
-        try:
-            ctx = await self._run_plan_shadow(ctx)
-        except Exception:
-            # Defense in depth — the hook itself is exception-safe but
-            # an awaitable propagation through asyncio.wait_for etc.
-            # could surface edge-case cancellations. Never propagate.
-            logger.debug(
-                "[Orchestrator] PLAN-shadow wrapper swallowed exception",
-                exc_info=True,
-            )
-
-        if _plan_review_required_now and (
-            _plan_result is None or getattr(_plan_result, "skipped", True)
-        ):
-            _skip_reason = getattr(_plan_result, "skip_reason", "") or "plan_not_available"
-            logger.info(
-                "[Orchestrator] Plan review required for op=%s but no plan is "
-                "available: %s",
-                ctx.op_id,
-                _skip_reason,
-            )
-            ctx = ctx.advance(
-                OperationPhase.CANCELLED,
-                terminal_reason_code="plan_required_unavailable",
-            )
-            await self._record_ledger(
-                ctx,
-                OperationState.FAILED,
-                {
-                    "reason": "plan_required_unavailable",
-                    "detail": _skip_reason,
-                },
-            )
-            return ctx
-
-        # ---- Phase 2d: Plan Approval Hard Gate (Phase 1b) ----
-        # For COMPLEX / ARCHITECTURAL ops, pause BEFORE burning generation
-        # tokens and get human sign-off on the approach. Rejection aborts
-        # the op; approval proceeds to GENERATE. Manifesto §6 (Iron Gate):
-        # "every autonomous decision is visible" + cost protection.
-        #
-        # Env-gated, fully override-able for battle tests and CI:
-        #   JARVIS_PLAN_APPROVAL_ENABLED         (default true)
-        #   JARVIS_PLAN_APPROVAL_ROUTES          (default "complex")
-        #   JARVIS_PLAN_APPROVAL_COMPLEXITIES    (default "complex,heavy_code,architectural")
-        #   JARVIS_PLAN_APPROVAL_TIMEOUT_S       (default 600.0)
-        #   JARVIS_PLAN_APPROVAL_EXPIRE_GRACE    (default false — strict)
-        _plan_gate_enabled = _plan_review_required_now or (
-            os.environ.get("JARVIS_PLAN_APPROVAL_ENABLED", "true").lower()
-            not in ("false", "0", "no", "off")
-        )
-        _plan_gate_applied = False
-        if (
-            _plan_gate_enabled
-            and _plan_result is not None
-            and not getattr(_plan_result, "skipped", True)
-        ):
-            _gate_routes = {
-                r.strip().lower()
-                for r in os.environ.get(
-                    "JARVIS_PLAN_APPROVAL_ROUTES", "complex"
-                ).split(",")
-                if r.strip()
-            }
-            _gate_complexities = {
-                c.strip().lower()
-                for c in os.environ.get(
-                    "JARVIS_PLAN_APPROVAL_COMPLEXITIES",
-                    "complex,heavy_code,architectural",
-                ).split(",")
-                if c.strip()
-            }
-            _route = (getattr(ctx, "provider_route", "") or "").lower()
-            _task_cx = (getattr(ctx, "task_complexity", "") or "").lower()
-            _plan_cx = (getattr(_plan_result, "complexity", "") or "").lower()
-            # OR-predicate: gate trips if ANY of (provider_route,
-            # task_complexity, plan_result.complexity) matches the filters.
-            # plan_result.complexity takes precedence because the model
-            # has just reasoned about the actual scope during PLAN phase.
-            # Problem #7 Slice 2: plan-mode force-review override.
-            # When JARVIS_PLAN_APPROVAL_MODE=true (or ctx opt-in)
-            # the operator has explicitly asked to halt EVERY op
-            # for review, regardless of the complexity heuristic.
-            # Late import keeps plan_approval optional — if the
-            # module is unavailable for any reason, plan mode is
-            # treated as off. Never raises.
-            _plan_mode_force = False
+            # Phase B PLAN-shadow (Slice 1b) — observer-only DAG dispatch.
+            # Runs AFTER the legacy PlanGenerator regardless of whether the
+            # legacy plan succeeded or skipped. Gated by
+            # JARVIS_PLAN_SUBAGENT_SHADOW (default false). The shadow never
+            # raises and never blocks the FSM; its only side-effect is
+            # setting ctx.execution_graph + emitting [PLAN-SHADOW] telemetry.
             try:
-                from backend.core.ouroboros.governance.plan_approval import (
-                    should_force_plan_review as _should_force_plan_review,
-                )
-                _plan_mode_force = _should_force_plan_review(ctx)
-            except Exception:  # noqa: BLE001 — optional dep
-                _plan_mode_force = False
-            _should_gate = (
-                _plan_review_required_now
-                or _plan_mode_force
-                or _route in _gate_routes
-                or _task_cx in _gate_complexities
-                or _plan_cx in _gate_complexities
-            )
-            _provider_supports_plan = (
-                self._approval_provider is not None
-                and hasattr(self._approval_provider, "request_plan")
-            )
-            if _should_gate and not _provider_supports_plan:
-                logger_msg = (
-                    "[Orchestrator] Plan review required for op=%s but no "
-                    "plan approval provider is available"
-                    if _plan_review_required_now
-                    else "[Orchestrator] Plan Gate skipped for op=%s: "
-                    "provider=%s has_request_plan=%s"
-                )
-                if _plan_review_required_now:
-                    logger.info(logger_msg, ctx.op_id)
-                    ctx = ctx.advance(
-                        OperationPhase.CANCELLED,
-                        terminal_reason_code="plan_review_unavailable",
-                    )
-                    await self._record_ledger(
-                        ctx,
-                        OperationState.FAILED,
-                        {
-                            "reason": "plan_review_unavailable",
-                            "detail": "approval_provider_missing",
-                        },
-                    )
-                    return ctx
+                ctx = await self._run_plan_shadow(ctx)
+            except Exception:
+                # Defense in depth — the hook itself is exception-safe but
+                # an awaitable propagation through asyncio.wait_for etc.
+                # could surface edge-case cancellations. Never propagate.
                 logger.debug(
-                    logger_msg,
-                    ctx.op_id,
-                    type(self._approval_provider).__name__
-                    if self._approval_provider
-                    else "None",
-                    hasattr(self._approval_provider, "request_plan"),
+                    "[Orchestrator] PLAN-shadow wrapper swallowed exception",
+                    exc_info=True,
                 )
-            elif _should_gate:
-                _plan_gate_applied = True
-                _plan_gate_timeout = float(os.environ.get(
-                    "JARVIS_PLAN_APPROVAL_TIMEOUT_S", "600.0"
-                ))
-                _expire_grace = os.environ.get(
-                    "JARVIS_PLAN_APPROVAL_EXPIRE_GRACE", "false"
-                ).lower() in ("true", "1", "yes", "on")
 
-                # Render plan as markdown for human review. Fall back to
-                # raw JSON if to_prompt_section() is unavailable.
-                try:
-                    _plan_markdown = _plan_result.to_prompt_section()
-                except Exception:
-                    _plan_markdown = _plan_result.plan_json or "(no plan)"
-
+            if _plan_review_required_now and (
+                _plan_result is None or getattr(_plan_result, "skipped", True)
+            ):
+                _skip_reason = getattr(_plan_result, "skip_reason", "") or "plan_not_available"
                 logger.info(
-                    "[Orchestrator] Plan Gate engaged for op=%s "
-                    "(route=%r task_cx=%r plan_cx=%r) — awaiting human",
-                    ctx.op_id, _route, _task_cx, _plan_cx,
+                    "[Orchestrator] Plan review required for op=%s but no plan is "
+                    "available: %s",
+                    ctx.op_id,
+                    _skip_reason,
                 )
-                try:
-                    await self._stack.comm.emit_heartbeat(
-                        op_id=ctx.op_id, phase="plan", progress_pct=30.0,
-                        plan_gate_engaged=True,
-                    )
-                except Exception:
-                    pass
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="plan_required_unavailable",
+                )
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {
+                        "reason": "plan_required_unavailable",
+                        "detail": _skip_reason,
+                    },
+                )
+                return ctx
 
-                # Problem #7 Slice 2: shadow-register this plan with
-                # the PlanApprovalController so REPL (/plan pending,
-                # /plan show) and IDE observability (/observability/
-                # plans, SSE plan_* events) surface it. The primary
-                # approval authority stays with self._approval_provider;
-                # this is a read-only mirror for operator visibility.
-                # Best-effort: any failure (module unavailable,
-                # duplicate op_id, etc.) silently no-ops — the actual
-                # approval path is unaffected.
-                _plan_mirror_registered = False
+            # ---- Phase 2d: Plan Approval Hard Gate (Phase 1b) ----
+            # For COMPLEX / ARCHITECTURAL ops, pause BEFORE burning generation
+            # tokens and get human sign-off on the approach. Rejection aborts
+            # the op; approval proceeds to GENERATE. Manifesto §6 (Iron Gate):
+            # "every autonomous decision is visible" + cost protection.
+            #
+            # Env-gated, fully override-able for battle tests and CI:
+            #   JARVIS_PLAN_APPROVAL_ENABLED         (default true)
+            #   JARVIS_PLAN_APPROVAL_ROUTES          (default "complex")
+            #   JARVIS_PLAN_APPROVAL_COMPLEXITIES    (default "complex,heavy_code,architectural")
+            #   JARVIS_PLAN_APPROVAL_TIMEOUT_S       (default 600.0)
+            #   JARVIS_PLAN_APPROVAL_EXPIRE_GRACE    (default false — strict)
+            _plan_gate_enabled = _plan_review_required_now or (
+                os.environ.get("JARVIS_PLAN_APPROVAL_ENABLED", "true").lower()
+                not in ("false", "0", "no", "off")
+            )
+            _plan_gate_applied = False
+            if (
+                _plan_gate_enabled
+                and _plan_result is not None
+                and not getattr(_plan_result, "skipped", True)
+            ):
+                _gate_routes = {
+                    r.strip().lower()
+                    for r in os.environ.get(
+                        "JARVIS_PLAN_APPROVAL_ROUTES", "complex"
+                    ).split(",")
+                    if r.strip()
+                }
+                _gate_complexities = {
+                    c.strip().lower()
+                    for c in os.environ.get(
+                        "JARVIS_PLAN_APPROVAL_COMPLEXITIES",
+                        "complex,heavy_code,architectural",
+                    ).split(",")
+                    if c.strip()
+                }
+                _route = (getattr(ctx, "provider_route", "") or "").lower()
+                _task_cx = (getattr(ctx, "task_complexity", "") or "").lower()
+                _plan_cx = (getattr(_plan_result, "complexity", "") or "").lower()
+                # OR-predicate: gate trips if ANY of (provider_route,
+                # task_complexity, plan_result.complexity) matches the filters.
+                # plan_result.complexity takes precedence because the model
+                # has just reasoned about the actual scope during PLAN phase.
+                # Problem #7 Slice 2: plan-mode force-review override.
+                # When JARVIS_PLAN_APPROVAL_MODE=true (or ctx opt-in)
+                # the operator has explicitly asked to halt EVERY op
+                # for review, regardless of the complexity heuristic.
+                # Late import keeps plan_approval optional — if the
+                # module is unavailable for any reason, plan mode is
+                # treated as off. Never raises.
+                _plan_mode_force = False
                 try:
                     from backend.core.ouroboros.governance.plan_approval import (
-                        get_default_controller as _get_pa_controller,
+                        should_force_plan_review as _should_force_plan_review,
                     )
-                    _pa_controller = _get_pa_controller()
-                    if _pa_controller.snapshot(ctx.op_id) is None:
-                        _pa_controller.request_approval(
-                            ctx.op_id,
-                            {
-                                "markdown": _plan_markdown,
-                                "description": getattr(ctx, "description", ""),
-                                "target_files": list(
-                                    getattr(ctx, "target_files", []) or [],
-                                ),
-                                "approach": getattr(
-                                    _plan_result, "approach", "",
-                                ) or "",
-                                "complexity": getattr(
-                                    _plan_result, "complexity", "",
-                                ) or "",
-                                "ordered_changes": list(
-                                    getattr(
-                                        _plan_result, "ordered_changes", [],
-                                    ) or [],
-                                ),
-                                "risk_factors": list(
-                                    getattr(
-                                        _plan_result, "risk_factors", [],
-                                    ) or [],
-                                ),
-                                "test_strategy": getattr(
-                                    _plan_result, "test_strategy", "",
-                                ) or "",
-                            },
-                            timeout_s=_plan_gate_timeout,
-                        )
-                        _plan_mirror_registered = True
-                except Exception:  # noqa: BLE001 — best-effort mirror
-                    logger.debug(
-                        "[Orchestrator] PlanApproval mirror register "
-                        "best-effort failed for op=%s", ctx.op_id,
-                        exc_info=True,
+                    _plan_mode_force = _should_force_plan_review(ctx)
+                except Exception:  # noqa: BLE001 — optional dep
+                    _plan_mode_force = False
+                _should_gate = (
+                    _plan_review_required_now
+                    or _plan_mode_force
+                    or _route in _gate_routes
+                    or _task_cx in _gate_complexities
+                    or _plan_cx in _gate_complexities
+                )
+                _provider_supports_plan = (
+                    self._approval_provider is not None
+                    and hasattr(self._approval_provider, "request_plan")
+                )
+                if _should_gate and not _provider_supports_plan:
+                    logger_msg = (
+                        "[Orchestrator] Plan review required for op=%s but no "
+                        "plan approval provider is available"
+                        if _plan_review_required_now
+                        else "[Orchestrator] Plan Gate skipped for op=%s: "
+                        "provider=%s has_request_plan=%s"
                     )
-
-                try:
-                    _plan_req_id = await self._approval_provider.request_plan(
-                        ctx, _plan_markdown,
-                    )
-                    _plan_decision: ApprovalResult = await (
-                        self._approval_provider.await_decision(
-                            _plan_req_id, _plan_gate_timeout,
-                        )
-                    )
-                except Exception as _gate_exc:
                     if _plan_review_required_now:
-                        logger.info(
-                            "[Orchestrator] Plan review required for op=%s but "
-                            "the plan gate failed: %s",
-                            ctx.op_id,
-                            _gate_exc,
-                        )
+                        logger.info(logger_msg, ctx.op_id)
                         ctx = ctx.advance(
                             OperationPhase.CANCELLED,
                             terminal_reason_code="plan_review_unavailable",
@@ -2575,439 +2524,560 @@ class GovernedOrchestrator:
                             OperationState.FAILED,
                             {
                                 "reason": "plan_review_unavailable",
-                                "detail": str(_gate_exc)[:200],
+                                "detail": "approval_provider_missing",
                             },
                         )
                         return ctx
-                    # Gate infrastructure failure — log and continue without
-                    # gating rather than blocking the pipeline forever.
-                    logger.warning(
-                        "[Orchestrator] Plan Gate infra failure for op=%s: %s; "
-                        "continuing to GENERATE without approval",
-                        ctx.op_id, _gate_exc,
+                    logger.debug(
+                        logger_msg,
+                        ctx.op_id,
+                        type(self._approval_provider).__name__
+                        if self._approval_provider
+                        else "None",
+                        hasattr(self._approval_provider, "request_plan"),
                     )
-                    _plan_decision = None  # type: ignore[assignment]
+                elif _should_gate:
+                    _plan_gate_applied = True
+                    _plan_gate_timeout = float(os.environ.get(
+                        "JARVIS_PLAN_APPROVAL_TIMEOUT_S", "600.0"
+                    ))
+                    _expire_grace = os.environ.get(
+                        "JARVIS_PLAN_APPROVAL_EXPIRE_GRACE", "false"
+                    ).lower() in ("true", "1", "yes", "on")
 
-                if _plan_decision is not None:
-                    # Problem #7 Slice 2: mirror the decision onto
-                    # the PlanApprovalController shadow so REPL /
-                    # IDE views see the terminal transition. Best-
-                    # effort; never raises.
-                    if _plan_mirror_registered:
-                        try:
-                            from backend.core.ouroboros.governance.plan_approval import (
-                                get_default_controller as _get_pa_ctrl,
-                                PlanApprovalStateError as _PAStateError,
-                            )
-                            _pa_mirror_ctrl = _get_pa_ctrl()
-                            _mirror_approver = (
-                                getattr(_plan_decision, "approver", None)
-                                or "orchestrator"
-                            )
-                            try:
-                                if _plan_decision.status is ApprovalStatus.APPROVED:
-                                    _pa_mirror_ctrl.approve(
-                                        ctx.op_id, reviewer=_mirror_approver,
-                                    )
-                                elif _plan_decision.status is ApprovalStatus.REJECTED:
-                                    _pa_mirror_ctrl.reject(
-                                        ctx.op_id,
-                                        reason=getattr(
-                                            _plan_decision, "reason", "",
-                                        ) or "",
-                                        reviewer=_mirror_approver,
-                                    )
-                                # EXPIRED path: the controller's own
-                                # timeout already auto-rejects; no
-                                # additional mirror call needed.
-                            except _PAStateError:
-                                # Already terminal — the controller's
-                                # timeout_task may have expired the
-                                # shadow first. Harmless; skip.
-                                pass
-                        except Exception:  # noqa: BLE001 — best-effort
-                            logger.debug(
-                                "[Orchestrator] PlanApproval mirror terminal "
-                                "propagation best-effort failed for op=%s",
-                                ctx.op_id, exc_info=True,
-                            )
-                    if _plan_decision.status is ApprovalStatus.REJECTED:
-                        _reject_reason = (
-                            getattr(_plan_decision, "reason", "") or ""
+                    # Render plan as markdown for human review. Fall back to
+                    # raw JSON if to_prompt_section() is unavailable.
+                    try:
+                        _plan_markdown = _plan_result.to_prompt_section()
+                    except Exception:
+                        _plan_markdown = _plan_result.plan_json or "(no plan)"
+
+                    logger.info(
+                        "[Orchestrator] Plan Gate engaged for op=%s "
+                        "(route=%r task_cx=%r plan_cx=%r) — awaiting human",
+                        ctx.op_id, _route, _task_cx, _plan_cx,
+                    )
+                    try:
+                        await self._stack.comm.emit_heartbeat(
+                            op_id=ctx.op_id, phase="plan", progress_pct=30.0,
+                            plan_gate_engaged=True,
                         )
-                        logger.info(
-                            "[Orchestrator] Plan REJECTED for op=%s: %s",
-                            ctx.op_id, _reject_reason,
+                    except Exception:
+                        pass
+
+                    # Problem #7 Slice 2: shadow-register this plan with
+                    # the PlanApprovalController so REPL (/plan pending,
+                    # /plan show) and IDE observability (/observability/
+                    # plans, SSE plan_* events) surface it. The primary
+                    # approval authority stays with self._approval_provider;
+                    # this is a read-only mirror for operator visibility.
+                    # Best-effort: any failure (module unavailable,
+                    # duplicate op_id, etc.) silently no-ops — the actual
+                    # approval path is unaffected.
+                    _plan_mirror_registered = False
+                    try:
+                        from backend.core.ouroboros.governance.plan_approval import (
+                            get_default_controller as _get_pa_controller,
                         )
-                        ctx = ctx.advance(
-                            OperationPhase.CANCELLED,
-                            terminal_reason_code="plan_rejected",
-                        )
-                        await self._record_ledger(
-                            ctx,
-                            OperationState.FAILED,
-                            {
-                                "reason": "plan_rejected",
-                                "approver": _plan_decision.approver,
-                                "rejection_reason": _reject_reason,
-                                "plan_complexity": _plan_cx,
-                            },
-                        )
-                        # Persist rejection so future similar plans learn from it.
-                        if _reject_reason:
-                            try:
-                                from backend.core.ouroboros.governance.user_preference_memory import (
-                                    get_default_store,
-                                )
-                                get_default_store().record_approval_rejection(
-                                    op_id=ctx.op_id,
-                                    description=f"[PLAN] {ctx.description}",
-                                    target_files=list(ctx.target_files),
-                                    reason=_reject_reason,
-                                    approver=(
-                                        getattr(_plan_decision, "approver", "human")
-                                        or "human"
+                        _pa_controller = _get_pa_controller()
+                        if _pa_controller.snapshot(ctx.op_id) is None:
+                            _pa_controller.request_approval(
+                                ctx.op_id,
+                                {
+                                    "markdown": _plan_markdown,
+                                    "description": getattr(ctx, "description", ""),
+                                    "target_files": list(
+                                        getattr(ctx, "target_files", []) or [],
                                     ),
-                                )
-                            except Exception:
-                                pass
-                        # Session lesson for intra-session learning.
-                        _files_short = ", ".join(
-                            p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
-                        )
-                        self._add_session_lesson(
-                            "code",
-                            f"[PLAN REJECTED] {ctx.description[:60]} "
-                            f"({_files_short}) — human rejected the approach: "
-                            f"{_reject_reason[:80] or 'no reason given'}. "
-                            f"Reconsider strategy before retry.",
-                            op_id=ctx.op_id,
-                        )
-                        return ctx
-
-                    if _plan_decision.status is ApprovalStatus.EXPIRED:
-                        if _expire_grace and not _plan_review_required_now:
-                            logger.warning(
-                                "[Orchestrator] Plan Gate expired for op=%s; "
-                                "grace mode — continuing to GENERATE",
-                                ctx.op_id,
+                                    "approach": getattr(
+                                        _plan_result, "approach", "",
+                                    ) or "",
+                                    "complexity": getattr(
+                                        _plan_result, "complexity", "",
+                                    ) or "",
+                                    "ordered_changes": list(
+                                        getattr(
+                                            _plan_result, "ordered_changes", [],
+                                        ) or [],
+                                    ),
+                                    "risk_factors": list(
+                                        getattr(
+                                            _plan_result, "risk_factors", [],
+                                        ) or [],
+                                    ),
+                                    "test_strategy": getattr(
+                                        _plan_result, "test_strategy", "",
+                                    ) or "",
+                                },
+                                timeout_s=_plan_gate_timeout,
                             )
-                        else:
+                            _plan_mirror_registered = True
+                    except Exception:  # noqa: BLE001 — best-effort mirror
+                        logger.debug(
+                            "[Orchestrator] PlanApproval mirror register "
+                            "best-effort failed for op=%s", ctx.op_id,
+                            exc_info=True,
+                        )
+
+                    try:
+                        _plan_req_id = await self._approval_provider.request_plan(
+                            ctx, _plan_markdown,
+                        )
+                        _plan_decision: ApprovalResult = await (
+                            self._approval_provider.await_decision(
+                                _plan_req_id, _plan_gate_timeout,
+                            )
+                        )
+                    except Exception as _gate_exc:
+                        if _plan_review_required_now:
                             logger.info(
-                                "[Orchestrator] Plan Gate EXPIRED for op=%s — "
-                                "aborting (strict mode)",
+                                "[Orchestrator] Plan review required for op=%s but "
+                                "the plan gate failed: %s",
                                 ctx.op_id,
+                                _gate_exc,
                             )
                             ctx = ctx.advance(
-                                OperationPhase.EXPIRED,
-                                terminal_reason_code="plan_approval_expired",
+                                OperationPhase.CANCELLED,
+                                terminal_reason_code="plan_review_unavailable",
                             )
                             await self._record_ledger(
                                 ctx,
                                 OperationState.FAILED,
-                                {"reason": "plan_approval_expired"},
+                                {
+                                    "reason": "plan_review_unavailable",
+                                    "detail": str(_gate_exc)[:200],
+                                },
+                            )
+                            return ctx
+                        # Gate infrastructure failure — log and continue without
+                        # gating rather than blocking the pipeline forever.
+                        logger.warning(
+                            "[Orchestrator] Plan Gate infra failure for op=%s: %s; "
+                            "continuing to GENERATE without approval",
+                            ctx.op_id, _gate_exc,
+                        )
+                        _plan_decision = None  # type: ignore[assignment]
+
+                    if _plan_decision is not None:
+                        # Problem #7 Slice 2: mirror the decision onto
+                        # the PlanApprovalController shadow so REPL /
+                        # IDE views see the terminal transition. Best-
+                        # effort; never raises.
+                        if _plan_mirror_registered:
+                            try:
+                                from backend.core.ouroboros.governance.plan_approval import (
+                                    get_default_controller as _get_pa_ctrl,
+                                    PlanApprovalStateError as _PAStateError,
+                                )
+                                _pa_mirror_ctrl = _get_pa_ctrl()
+                                _mirror_approver = (
+                                    getattr(_plan_decision, "approver", None)
+                                    or "orchestrator"
+                                )
+                                try:
+                                    if _plan_decision.status is ApprovalStatus.APPROVED:
+                                        _pa_mirror_ctrl.approve(
+                                            ctx.op_id, reviewer=_mirror_approver,
+                                        )
+                                    elif _plan_decision.status is ApprovalStatus.REJECTED:
+                                        _pa_mirror_ctrl.reject(
+                                            ctx.op_id,
+                                            reason=getattr(
+                                                _plan_decision, "reason", "",
+                                            ) or "",
+                                            reviewer=_mirror_approver,
+                                        )
+                                    # EXPIRED path: the controller's own
+                                    # timeout already auto-rejects; no
+                                    # additional mirror call needed.
+                                except _PAStateError:
+                                    # Already terminal — the controller's
+                                    # timeout_task may have expired the
+                                    # shadow first. Harmless; skip.
+                                    pass
+                            except Exception:  # noqa: BLE001 — best-effort
+                                logger.debug(
+                                    "[Orchestrator] PlanApproval mirror terminal "
+                                    "propagation best-effort failed for op=%s",
+                                    ctx.op_id, exc_info=True,
+                                )
+                        if _plan_decision.status is ApprovalStatus.REJECTED:
+                            _reject_reason = (
+                                getattr(_plan_decision, "reason", "") or ""
+                            )
+                            logger.info(
+                                "[Orchestrator] Plan REJECTED for op=%s: %s",
+                                ctx.op_id, _reject_reason,
+                            )
+                            ctx = ctx.advance(
+                                OperationPhase.CANCELLED,
+                                terminal_reason_code="plan_rejected",
+                            )
+                            await self._record_ledger(
+                                ctx,
+                                OperationState.FAILED,
+                                {
+                                    "reason": "plan_rejected",
+                                    "approver": _plan_decision.approver,
+                                    "rejection_reason": _reject_reason,
+                                    "plan_complexity": _plan_cx,
+                                },
+                            )
+                            # Persist rejection so future similar plans learn from it.
+                            if _reject_reason:
+                                try:
+                                    from backend.core.ouroboros.governance.user_preference_memory import (
+                                        get_default_store,
+                                    )
+                                    get_default_store().record_approval_rejection(
+                                        op_id=ctx.op_id,
+                                        description=f"[PLAN] {ctx.description}",
+                                        target_files=list(ctx.target_files),
+                                        reason=_reject_reason,
+                                        approver=(
+                                            getattr(_plan_decision, "approver", "human")
+                                            or "human"
+                                        ),
+                                    )
+                                except Exception:
+                                    pass
+                            # Session lesson for intra-session learning.
+                            _files_short = ", ".join(
+                                p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
+                            )
+                            self._add_session_lesson(
+                                "code",
+                                f"[PLAN REJECTED] {ctx.description[:60]} "
+                                f"({_files_short}) — human rejected the approach: "
+                                f"{_reject_reason[:80] or 'no reason given'}. "
+                                f"Reconsider strategy before retry.",
+                                op_id=ctx.op_id,
                             )
                             return ctx
 
-                    # APPROVED (or grace on EXPIRED) — continue to GENERATE
-                    if _plan_decision.status is ApprovalStatus.APPROVED:
-                        logger.info(
-                            "[Orchestrator] Plan APPROVED for op=%s by %s",
-                            ctx.op_id, _plan_decision.approver,
-                        )
-        ctx = ctx.advance(OperationPhase.GENERATE)
+                        if _plan_decision.status is ApprovalStatus.EXPIRED:
+                            if _expire_grace and not _plan_review_required_now:
+                                logger.warning(
+                                    "[Orchestrator] Plan Gate expired for op=%s; "
+                                    "grace mode — continuing to GENERATE",
+                                    ctx.op_id,
+                                )
+                            else:
+                                logger.info(
+                                    "[Orchestrator] Plan Gate EXPIRED for op=%s — "
+                                    "aborting (strict mode)",
+                                    ctx.op_id,
+                                )
+                                ctx = ctx.advance(
+                                    OperationPhase.EXPIRED,
+                                    terminal_reason_code="plan_approval_expired",
+                                )
+                                await self._record_ledger(
+                                    ctx,
+                                    OperationState.FAILED,
+                                    {"reason": "plan_approval_expired"},
+                                )
+                                return ctx
 
-        # ── PreActionNarrator: voice WHAT before GENERATE ──
-        if self._pre_action_narrator is not None:
-            try:
-                _provider_name = getattr(ctx, "routing_actual", None) or "unknown"
-                await self._pre_action_narrator.narrate_phase(
-                    "GENERATE",
-                    {"provider": str(_provider_name), "thinking_mode": "standard"},
-                )
-            except Exception:
-                pass
+                        # APPROVED (or grace on EXPIRED) — continue to GENERATE
+                        if _plan_decision.status is ApprovalStatus.APPROVED:
+                            logger.info(
+                                "[Orchestrator] Plan APPROVED for op=%s by %s",
+                                ctx.op_id, _plan_decision.approver,
+                            )
+            ctx = ctx.advance(OperationPhase.GENERATE)
 
-        # ── P2: Adaptive Learning — inject consolidated rules + success patterns ──
-        try:
-            from backend.core.ouroboros.governance.adaptive_learning import (
-                LearningConsolidator, SuccessPatternStore,
-            )
-            from backend.core.ouroboros.governance.entropy_calculator import (
-                extract_domain_key as _extract_dk,
-            )
-            _domain = _extract_dk(ctx.target_files, ctx.description)
-
-            _consolidator = LearningConsolidator()
-            _rules_context = _consolidator.format_rules_for_prompt(_domain)
-
-            _success_store = SuccessPatternStore()
-            _success_context = _success_store.format_for_prompt(_domain, ctx.target_files)
-
-            if _rules_context or _success_context:
-                _existing_mem = getattr(ctx, "strategic_memory_prompt", "") or ""
-                _learning_block = ""
-                if _rules_context:
-                    _learning_block += f"\n\n{_rules_context}"
-                if _success_context:
-                    _learning_block += f"\n\n{_success_context}"
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=_existing_mem + _learning_block,
-                    strategic_memory_digest=ctx.strategic_memory_digest,
-                )
-                logger.info(
-                    "[Orchestrator] Adaptive learning: injected %d rules + %d success "
-                    "patterns for domain=%s (op=%s)",
-                    len(_consolidator.get_rules_for_domain(_domain)),
-                    len(_success_store.get_similar_successes(_domain, ctx.target_files)),
-                    _domain, ctx.op_id,
-                )
-        except ImportError:
-            pass
-        except Exception:
-            logger.debug("[Orchestrator] Adaptive learning injection failed", exc_info=True)
-
-        # ── P0: Test Coverage Enforcer (pre-GENERATE) ─────────────────────
-        # If target files lack test coverage, inject instruction into the
-        # generation context so the provider generates tests alongside code.
-        try:
-            from backend.core.ouroboros.governance.intelligence_hooks import (
-                TestCoverageEnforcer,
-            )
-            _coverage_enforcer = TestCoverageEnforcer(self._config.project_root)
-            _coverage_instruction = _coverage_enforcer.check_and_inject(
-                ctx.target_files, ctx.description,
-            )
-            if _coverage_instruction:
-                _existing_human = getattr(ctx, "human_instructions", "") or ""
-                ctx = dataclasses.replace(
-                    ctx,
-                    human_instructions=_existing_human + _coverage_instruction,
-                    previous_hash=ctx.context_hash,
-                )
-                logger.info(
-                    "[Orchestrator] TestCoverageEnforcer: injected test generation "
-                    "instruction for %d uncovered files (op=%s)",
-                    _coverage_instruction.count("`"), ctx.op_id,
-                )
-        except ImportError:
-            pass
-        except Exception:
-            logger.debug("[Orchestrator] TestCoverageEnforcer failed", exc_info=True)
-
-        # ── JARVIS Tier 5: Cross-Domain Intelligence ──────────────────────
-        try:
-            from backend.core.ouroboros.governance.jarvis_intelligence import (
-                UnifiedIntelligenceLayer,
-            )
-            _intel = UnifiedIntelligenceLayer(self._config.project_root)
-            _syntheses = _intel.analyze_all_domains()
-            _intel_prompt = _intel.format_for_prompt(_syntheses)
-            if _intel_prompt:
-                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=_existing + "\n\n" + _intel_prompt,
-                    strategic_memory_digest=ctx.strategic_memory_digest,
-                )
-                logger.info(
-                    "[Orchestrator] JARVIS Tier 5: %d cross-domain syntheses injected",
-                    len(_syntheses),
-                )
-        except ImportError:
-            pass
-        except Exception:
-            logger.debug("[Orchestrator] Tier 5 injection failed", exc_info=True)
-
-        # ── JARVIS Tier 6: Personality voice line ─────────────────────────
-        _gls = getattr(self._stack, "governed_loop_service", None)
-        if _gls is not None:
-            _pe = getattr(_gls, "_personality_engine", None)
-            if _pe is not None:
+            # ── PreActionNarrator: voice WHAT before GENERATE ──
+            if self._pre_action_narrator is not None:
                 try:
-                    _chronic = getattr(_advisory, "chronic_entropy", 0.0) if _advisory else 0.0
-                    _emerg = getattr(self._stack, "_emergency_engine", None)
-                    _emerg_lvl = _emerg.current_level.value if _emerg else 0
-                    _state = _pe.compute_state(
-                        success_rate=_pe.success_rate,
-                        chronic_entropy=_chronic,
-                        emergency_level=_emerg_lvl,
+                    _provider_name = getattr(ctx, "routing_actual", None) or "unknown"
+                    await self._pre_action_narrator.narrate_phase(
+                        "GENERATE",
+                        {"provider": str(_provider_name), "thinking_mode": "standard"},
                     )
-                    if self._reasoning_narrator is not None:
-                        _voice = _pe.get_voice_line(_state)
-                        self._reasoning_narrator.record_classify(
-                            ctx.op_id, f"personality:{_state.value}", _voice,
-                        )
                 except Exception:
                     pass
 
-        # ── Advanced Repair: hierarchical localization + slow/fast thinking + doc-augmented ──
-        try:
-            from backend.core.ouroboros.governance.advanced_repair import (
-                HierarchicalFaultLocalizer, SlowFastThinkingRouter, DocAugmentedRepair,
-            )
-            _apr_blocks: list = []
-
-            # 1. Hierarchical fault localization (file → function → line)
-            _localizer = HierarchicalFaultLocalizer(self._config.project_root)
-            _error_msg = getattr(ctx, "error_pattern", "") or ctx.description
-            _locations = _localizer.localize(ctx.target_files, _error_msg)
-            _loc_prompt = _localizer.format_for_prompt(_locations)
-            if _loc_prompt:
-                _apr_blocks.append(_loc_prompt)
-
-            # 2. Slow/fast thinking router
-            _thinking = SlowFastThinkingRouter.route(
-                ctx.description, ctx.target_files,
-            )
-            _think_prompt = SlowFastThinkingRouter.format_for_prompt(_thinking)
-            if _think_prompt:
-                _apr_blocks.append(_think_prompt)
-
-            # 3. Documentation-augmented repair context
-            _doc_repair = DocAugmentedRepair(self._config.project_root)
-            _doc_context = _doc_repair.generate_docs_for_repair(ctx.target_files)
-            if _doc_context:
-                _apr_blocks.append(_doc_context)
-
-            if _apr_blocks:
-                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                _apr_combined = "\n\n".join(_apr_blocks)
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=_existing + "\n\n" + _apr_combined,
-                    strategic_memory_digest=ctx.strategic_memory_digest,
+            # ── P2: Adaptive Learning — inject consolidated rules + success patterns ──
+            try:
+                from backend.core.ouroboros.governance.adaptive_learning import (
+                    LearningConsolidator, SuccessPatternStore,
                 )
-                logger.info(
-                    "[Orchestrator] Advanced repair: %d blocks (localization=%d locs, "
-                    "thinking=%s, docs=%d chars) for op=%s",
-                    len(_apr_blocks), len(_locations), _thinking.depth,
-                    len(_doc_context), ctx.op_id,
+                from backend.core.ouroboros.governance.entropy_calculator import (
+                    extract_domain_key as _extract_dk,
                 )
-        except ImportError:
-            pass
-        except Exception:
-            logger.debug("[Orchestrator] Advanced repair injection failed", exc_info=True)
+                _domain = _extract_dk(ctx.target_files, ctx.description)
 
-        # ── Self-Evolution P0: Inject runtime prompt adaptations + negative constraints + code metrics ──
-        try:
-            from backend.core.ouroboros.governance.self_evolution import (
-                RuntimePromptAdapter, NegativeConstraintStore,
-                CodeMetricsAnalyzer, MultiVersionEvolutionTracker,
-            )
-            from backend.core.ouroboros.governance.entropy_calculator import extract_domain_key as _edk
+                _consolidator = LearningConsolidator()
+                _rules_context = _consolidator.format_rules_for_prompt(_domain)
 
-            _se_domain = _edk(ctx.target_files, ctx.description)
-            _se_blocks: List[str] = []
+                _success_store = SuccessPatternStore()
+                _success_context = _success_store.format_for_prompt(_domain, ctx.target_files)
 
-            # P0: Runtime prompt adaptation — learned instructions from outcomes
-            _prompt_adapter = RuntimePromptAdapter()
-            _adapted = _prompt_adapter.get_adapted_instructions(_se_domain)
-            if _adapted:
-                _se_blocks.append(_adapted)
+                if _rules_context or _success_context:
+                    _existing_mem = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    _learning_block = ""
+                    if _rules_context:
+                        _learning_block += f"\n\n{_rules_context}"
+                    if _success_context:
+                        _learning_block += f"\n\n{_success_context}"
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing_mem + _learning_block,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.info(
+                        "[Orchestrator] Adaptive learning: injected %d rules + %d success "
+                        "patterns for domain=%s (op=%s)",
+                        len(_consolidator.get_rules_for_domain(_domain)),
+                        len(_success_store.get_similar_successes(_domain, ctx.target_files)),
+                        _domain, ctx.op_id,
+                    )
+            except ImportError:
+                pass
+            except Exception:
+                logger.debug("[Orchestrator] Adaptive learning injection failed", exc_info=True)
 
-            # P0: Negative constraints — "never do X" rules
-            _neg_store = NegativeConstraintStore()
-            _neg_prompt = _neg_store.format_for_prompt(_se_domain)
-            if _neg_prompt:
-                _se_blocks.append(_neg_prompt)
-
-            # P1: Code metrics feedback — objective quality signals
-            for _tf in ctx.target_files[:3]:
-                _tf_path = self._config.project_root / _tf
-                if _tf_path.is_dir() or not _tf_path.suffix:
-                    continue  # Skip directories — only analyze files
-                _metrics = CodeMetricsAnalyzer.analyze(_tf_path)
-                if _metrics:
-                    _mf = CodeMetricsAnalyzer.format_for_prompt(_metrics)
-                    if _mf:
-                        _se_blocks.append(_mf)
-
-            if _se_blocks:
-                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                _se_combined = "\n\n".join(_se_blocks)
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=_existing + "\n\n" + _se_combined,
-                    strategic_memory_digest=ctx.strategic_memory_digest,
+            # ── P0: Test Coverage Enforcer (pre-GENERATE) ─────────────────────
+            # If target files lack test coverage, inject instruction into the
+            # generation context so the provider generates tests alongside code.
+            try:
+                from backend.core.ouroboros.governance.intelligence_hooks import (
+                    TestCoverageEnforcer,
                 )
-                logger.info(
-                    "[Orchestrator] Self-evolution: injected %d blocks for domain=%s",
-                    len(_se_blocks), _se_domain,
+                _coverage_enforcer = TestCoverageEnforcer(self._config.project_root)
+                _coverage_instruction = _coverage_enforcer.check_and_inject(
+                    ctx.target_files, ctx.description,
                 )
-        except ImportError:
-            pass
-        except Exception:
-            logger.debug("[Orchestrator] Self-evolution injection failed", exc_info=True)
+                if _coverage_instruction:
+                    _existing_human = getattr(ctx, "human_instructions", "") or ""
+                    ctx = dataclasses.replace(
+                        ctx,
+                        human_instructions=_existing_human + _coverage_instruction,
+                        previous_hash=ctx.context_hash,
+                    )
+                    logger.info(
+                        "[Orchestrator] TestCoverageEnforcer: injected test generation "
+                        "instruction for %d uncovered files (op=%s)",
+                        _coverage_instruction.count("`"), ctx.op_id,
+                    )
+            except ImportError:
+                pass
+            except Exception:
+                logger.debug("[Orchestrator] TestCoverageEnforcer failed", exc_info=True)
 
-        # ── Self-Evolution P2: Module-level function analysis + auto-documentation gaps ──
-        try:
-            from backend.core.ouroboros.governance.self_evolution import (
-                ModuleLevelMutator, RepositoryAutoDocumentation,
-            )
-            _se2_blocks: List[str] = []
+            # ── JARVIS Tier 5: Cross-Domain Intelligence ──────────────────────
+            try:
+                from backend.core.ouroboros.governance.jarvis_intelligence import (
+                    UnifiedIntelligenceLayer,
+                )
+                _intel = UnifiedIntelligenceLayer(self._config.project_root)
+                _syntheses = _intel.analyze_all_domains()
+                _intel_prompt = _intel.format_for_prompt(_syntheses)
+                if _intel_prompt:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing + "\n\n" + _intel_prompt,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.info(
+                        "[Orchestrator] JARVIS Tier 5: %d cross-domain syntheses injected",
+                        len(_syntheses),
+                    )
+            except ImportError:
+                pass
+            except Exception:
+                logger.debug("[Orchestrator] Tier 5 injection failed", exc_info=True)
 
-            # ModuleLevelMutator: show function-level breakdown of target files
-            # so the generator can do surgical mutations instead of full rewrites
-            for _tf in ctx.target_files[:3]:
-                _tf_path = self._config.project_root / _tf
-                if not _tf_path.is_file() or _tf_path.suffix != ".py":
-                    continue
-                _funcs = ModuleLevelMutator.list_functions(_tf_path)
-                if _funcs:
-                    _complex = [f for f in _funcs if f["complexity"] > 5]
-                    if _complex:
-                        _func_info = ", ".join(
-                            f"{f['name']}(CC={f['complexity']}, L{f['start_line']}-{f['end_line']})"
-                            for f in sorted(_complex, key=lambda x: x["complexity"], reverse=True)[:5]
+            # ── JARVIS Tier 6: Personality voice line ─────────────────────────
+            _gls = getattr(self._stack, "governed_loop_service", None)
+            if _gls is not None:
+                _pe = getattr(_gls, "_personality_engine", None)
+                if _pe is not None:
+                    try:
+                        _chronic = getattr(_advisory, "chronic_entropy", 0.0) if _advisory else 0.0
+                        _emerg = getattr(self._stack, "_emergency_engine", None)
+                        _emerg_lvl = _emerg.current_level.value if _emerg else 0
+                        _state = _pe.compute_state(
+                            success_rate=_pe.success_rate,
+                            chronic_entropy=_chronic,
+                            emergency_level=_emerg_lvl,
                         )
-                        _se2_blocks.append(
-                            f"## Function-level analysis: {_tf}\n"
-                            f"Complex functions (surgical mutation targets): {_func_info}\n"
-                            f"Prefer modifying individual functions over full-file rewrites."
-                        )
+                        if self._reasoning_narrator is not None:
+                            _voice = _pe.get_voice_line(_state)
+                            self._reasoning_narrator.record_classify(
+                                ctx.op_id, f"personality:{_state.value}", _voice,
+                            )
+                    except Exception:
+                        pass
 
-            # RepositoryAutoDocumentation: show doc gaps in target files
-            _auto_doc = RepositoryAutoDocumentation()
-            for _tf in ctx.target_files[:3]:
-                _tf_path = self._config.project_root / _tf
-                if _tf_path.is_file() and _tf_path.suffix == ".py":
-                    _auto_doc.scan_file(_tf_path)
-            _doc_prompt = _auto_doc.format_for_prompt(
-                [str(self._config.project_root / tf) for tf in ctx.target_files[:3]]
-            )
-            if _doc_prompt:
-                _se2_blocks.append(_doc_prompt)
-
-            if _se2_blocks:
-                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                _se2_combined = "\n\n".join(_se2_blocks)
-                ctx = ctx.with_strategic_memory_context(
-                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
-                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                    strategic_memory_prompt=_existing + "\n\n" + _se2_combined,
-                    strategic_memory_digest=ctx.strategic_memory_digest,
+            # ── Advanced Repair: hierarchical localization + slow/fast thinking + doc-augmented ──
+            try:
+                from backend.core.ouroboros.governance.advanced_repair import (
+                    HierarchicalFaultLocalizer, SlowFastThinkingRouter, DocAugmentedRepair,
                 )
-                logger.info(
-                    "[Orchestrator] Self-evolution P2: injected %d blocks "
-                    "(module analysis + doc gaps)",
-                    len(_se2_blocks),
-                )
-        except ImportError:
-            pass
-        except Exception:
-            logger.debug("[Orchestrator] Self-evolution P2 injection failed", exc_info=True)
+                _apr_blocks: list = []
 
-        # ── Cooperative cancellation check (pre-GENERATE) ──
-        if self._is_cancel_requested(ctx.op_id):
-            ctx = ctx.advance(OperationPhase.CANCELLED, terminal_reason_code="user_cancelled")
-            await self._record_ledger(ctx, OperationState.FAILED, {"reason": "user_cancelled"})
-            return ctx
+                # 1. Hierarchical fault localization (file → function → line)
+                _localizer = HierarchicalFaultLocalizer(self._config.project_root)
+                _error_msg = getattr(ctx, "error_pattern", "") or ctx.description
+                _locations = _localizer.localize(ctx.target_files, _error_msg)
+                _loc_prompt = _localizer.format_for_prompt(_locations)
+                if _loc_prompt:
+                    _apr_blocks.append(_loc_prompt)
+
+                # 2. Slow/fast thinking router
+                _thinking = SlowFastThinkingRouter.route(
+                    ctx.description, ctx.target_files,
+                )
+                _think_prompt = SlowFastThinkingRouter.format_for_prompt(_thinking)
+                if _think_prompt:
+                    _apr_blocks.append(_think_prompt)
+
+                # 3. Documentation-augmented repair context
+                _doc_repair = DocAugmentedRepair(self._config.project_root)
+                _doc_context = _doc_repair.generate_docs_for_repair(ctx.target_files)
+                if _doc_context:
+                    _apr_blocks.append(_doc_context)
+
+                if _apr_blocks:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    _apr_combined = "\n\n".join(_apr_blocks)
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing + "\n\n" + _apr_combined,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.info(
+                        "[Orchestrator] Advanced repair: %d blocks (localization=%d locs, "
+                        "thinking=%s, docs=%d chars) for op=%s",
+                        len(_apr_blocks), len(_locations), _thinking.depth,
+                        len(_doc_context), ctx.op_id,
+                    )
+            except ImportError:
+                pass
+            except Exception:
+                logger.debug("[Orchestrator] Advanced repair injection failed", exc_info=True)
+
+            # ── Self-Evolution P0: Inject runtime prompt adaptations + negative constraints + code metrics ──
+            try:
+                from backend.core.ouroboros.governance.self_evolution import (
+                    RuntimePromptAdapter, NegativeConstraintStore,
+                    CodeMetricsAnalyzer, MultiVersionEvolutionTracker,
+                )
+                from backend.core.ouroboros.governance.entropy_calculator import extract_domain_key as _edk
+
+                _se_domain = _edk(ctx.target_files, ctx.description)
+                _se_blocks: List[str] = []
+
+                # P0: Runtime prompt adaptation — learned instructions from outcomes
+                _prompt_adapter = RuntimePromptAdapter()
+                _adapted = _prompt_adapter.get_adapted_instructions(_se_domain)
+                if _adapted:
+                    _se_blocks.append(_adapted)
+
+                # P0: Negative constraints — "never do X" rules
+                _neg_store = NegativeConstraintStore()
+                _neg_prompt = _neg_store.format_for_prompt(_se_domain)
+                if _neg_prompt:
+                    _se_blocks.append(_neg_prompt)
+
+                # P1: Code metrics feedback — objective quality signals
+                for _tf in ctx.target_files[:3]:
+                    _tf_path = self._config.project_root / _tf
+                    if _tf_path.is_dir() or not _tf_path.suffix:
+                        continue  # Skip directories — only analyze files
+                    _metrics = CodeMetricsAnalyzer.analyze(_tf_path)
+                    if _metrics:
+                        _mf = CodeMetricsAnalyzer.format_for_prompt(_metrics)
+                        if _mf:
+                            _se_blocks.append(_mf)
+
+                if _se_blocks:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    _se_combined = "\n\n".join(_se_blocks)
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing + "\n\n" + _se_combined,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.info(
+                        "[Orchestrator] Self-evolution: injected %d blocks for domain=%s",
+                        len(_se_blocks), _se_domain,
+                    )
+            except ImportError:
+                pass
+            except Exception:
+                logger.debug("[Orchestrator] Self-evolution injection failed", exc_info=True)
+
+            # ── Self-Evolution P2: Module-level function analysis + auto-documentation gaps ──
+            try:
+                from backend.core.ouroboros.governance.self_evolution import (
+                    ModuleLevelMutator, RepositoryAutoDocumentation,
+                )
+                _se2_blocks: List[str] = []
+
+                # ModuleLevelMutator: show function-level breakdown of target files
+                # so the generator can do surgical mutations instead of full rewrites
+                for _tf in ctx.target_files[:3]:
+                    _tf_path = self._config.project_root / _tf
+                    if not _tf_path.is_file() or _tf_path.suffix != ".py":
+                        continue
+                    _funcs = ModuleLevelMutator.list_functions(_tf_path)
+                    if _funcs:
+                        _complex = [f for f in _funcs if f["complexity"] > 5]
+                        if _complex:
+                            _func_info = ", ".join(
+                                f"{f['name']}(CC={f['complexity']}, L{f['start_line']}-{f['end_line']})"
+                                for f in sorted(_complex, key=lambda x: x["complexity"], reverse=True)[:5]
+                            )
+                            _se2_blocks.append(
+                                f"## Function-level analysis: {_tf}\n"
+                                f"Complex functions (surgical mutation targets): {_func_info}\n"
+                                f"Prefer modifying individual functions over full-file rewrites."
+                            )
+
+                # RepositoryAutoDocumentation: show doc gaps in target files
+                _auto_doc = RepositoryAutoDocumentation()
+                for _tf in ctx.target_files[:3]:
+                    _tf_path = self._config.project_root / _tf
+                    if _tf_path.is_file() and _tf_path.suffix == ".py":
+                        _auto_doc.scan_file(_tf_path)
+                _doc_prompt = _auto_doc.format_for_prompt(
+                    [str(self._config.project_root / tf) for tf in ctx.target_files[:3]]
+                )
+                if _doc_prompt:
+                    _se2_blocks.append(_doc_prompt)
+
+                if _se2_blocks:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    _se2_combined = "\n\n".join(_se2_blocks)
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing + "\n\n" + _se2_combined,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.info(
+                        "[Orchestrator] Self-evolution P2: injected %d blocks "
+                        "(module analysis + doc gaps)",
+                        len(_se2_blocks),
+                    )
+            except ImportError:
+                pass
+            except Exception:
+                logger.debug("[Orchestrator] Self-evolution P2 injection failed", exc_info=True)
+
+            # ── Cooperative cancellation check (pre-GENERATE) ──
+            if self._is_cancel_requested(ctx.op_id):
+                ctx = ctx.advance(OperationPhase.CANCELLED, terminal_reason_code="user_cancelled")
+                await self._record_ledger(ctx, OperationState.FAILED, {"reason": "user_cancelled"})
+                return ctx
 
         if _serpent: _serpent.update_phase("GENERATE")
         # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
