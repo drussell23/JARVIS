@@ -104,6 +104,40 @@ def _intake_governor_mode() -> str:
         return raw
     return "shadow"
 
+
+def _allow_log_mode() -> str:
+    """Follow-up #1 — visibility for "governor allowed this op" decisions.
+
+    * ``off``      — silent (default; preserves pre-follow-up quiet behavior)
+    * ``summary``  — emit one structured INFO rollup line every N allows
+                     (N from ``JARVIS_INTAKE_GOVERNOR_ALLOW_LOG_INTERVAL``,
+                     default 100). Per-sensor counts + total included.
+    * ``debug``    — DEBUG-level per-allow line (opt-in verbose)
+
+    Operator constraint (binding from Slice 5 closure policy): default
+    INFO noise is unacceptable. Default is ``off``; ``summary`` rate-limits
+    to 1/N; ``debug`` requires explicit verbose opt-in.
+    """
+    raw = os.environ.get(
+        "JARVIS_INTAKE_GOVERNOR_ALLOW_LOG", "off",
+    ).strip().lower()
+    if raw in ("off", "summary", "debug"):
+        return raw
+    return "off"
+
+
+def _allow_log_interval() -> int:
+    """Allow-count threshold between summary rollup log lines. Default 100.
+
+    Clamped to [1, 10000]. Lower = more frequent rollups (noisier);
+    higher = longer aggregation window (less signal per line)."""
+    raw = os.environ.get("JARVIS_INTAKE_GOVERNOR_ALLOW_LOG_INTERVAL", "100")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 100
+    return max(1, min(10000, v))
+
 # P2.4: Module-level GoalTracker reference.  Set by UnifiedIntakeRouter on
 # init so _compute_priority can apply goal-alignment boost without changing
 # the function signature at every call site.
@@ -301,6 +335,11 @@ class UnifiedIntakeRouter:
         # Assign a coroutine callable to enable; None disables.
         self._on_ingest_hook: Optional[Callable[..., Any]] = None
 
+        # Slice 5 Arc A follow-up #1 — governor "allow" log visibility.
+        # Counters reset to zero on every rollup emit in summary mode.
+        self._gov_allow_total: int = 0
+        self._gov_allow_by_sensor: Dict[str, int] = {}
+
         # P2.4: Initialize GoalTracker for goal-directed prioritization.
         # Sets the module-level reference so _compute_priority can use it.
         try:
@@ -426,6 +465,9 @@ class UnifiedIntakeRouter:
                     gov_decision.reason_code,
                     gov_decision.weighted_cap, gov_decision.current_count,
                 )
+            elif gov_decision is not None and gov_decision.allowed:
+                # Follow-up #1 — visibility into "governor allowed this"
+                self._note_governor_allow(envelope, gov_decision)
 
         # 4. WAL enqueue — durable before placing on in-memory queue
         lease_id = generate_operation_id("lse")
@@ -510,6 +552,59 @@ class UnifiedIntakeRouter:
                 exc_info=True,
             )
             return None
+
+    def _note_governor_allow(
+        self, envelope: IntentEnvelope, decision: Any,
+    ) -> None:
+        """Follow-up #1 — rate-limited / opt-in visibility for governor allows.
+
+        Behavior driven by ``JARVIS_INTAKE_GOVERNOR_ALLOW_LOG``:
+          * ``off``     → no-op (default; matches pre-follow-up quiet)
+          * ``summary`` → increment per-sensor counter; every N allows
+                          emit ONE structured INFO rollup line + reset
+          * ``debug``   → emit one DEBUG line per allow (opt-in verbose)
+
+        Never raises. Counter state is per-router-instance; resets at
+        every rollup emit so the N-allow window starts fresh.
+        """
+        mode = _allow_log_mode()
+        if mode == "off":
+            return
+        try:
+            sensor = envelope.source
+            if mode == "debug":
+                logger.debug(
+                    "[Router] governor allow: sensor=%s urgency=%s "
+                    "cap=%d count=%d remaining=%d",
+                    sensor, envelope.urgency,
+                    decision.weighted_cap, decision.current_count,
+                    decision.remaining,
+                )
+                return
+            # summary: accumulate and emit one structured line per N allows
+            self._gov_allow_total += 1
+            self._gov_allow_by_sensor[sensor] = (
+                self._gov_allow_by_sensor.get(sensor, 0) + 1
+            )
+            interval = _allow_log_interval()
+            if self._gov_allow_total >= interval:
+                top5 = sorted(
+                    self._gov_allow_by_sensor.items(),
+                    key=lambda kv: -kv[1],
+                )[:5]
+                pairs = " ".join(f"{k}={v}" for k, v in top5)
+                logger.info(
+                    "[Router] governor allow rollup: total=%d window=%d "
+                    "top_sensors=[%s]",
+                    self._gov_allow_total, interval, pairs,
+                )
+                self._gov_allow_total = 0
+                self._gov_allow_by_sensor.clear()
+        except Exception:  # noqa: BLE001 — allow-log must never break intake
+            logger.debug(
+                "[Router] governor allow-log accounting failed (non-fatal)",
+                exc_info=True,
+            )
 
     def _record_governor_emission(self, envelope: IntentEnvelope) -> None:
         """Record emission in the rolling-window counter. Never raises."""
