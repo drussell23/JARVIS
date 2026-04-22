@@ -29,6 +29,9 @@ from backend.core.ouroboros.governance.phase_runners.context_expansion_runner im
 from backend.core.ouroboros.governance.phase_runners.gate_runner import (
     GATERunner,
 )
+from backend.core.ouroboros.governance.phase_runners.generate_runner import (
+    GENERATERunner,
+)
 from backend.core.ouroboros.governance.phase_runners.plan_runner import (
     PLANRunner,
 )
@@ -47,6 +50,7 @@ __all__ = [
     "COMPLETERunner",
     "ContextExpansionRunner",
     "GATERunner",
+    "GENERATERunner",
     "PLANRunner",
     "ROUTERunner",
     "Slice4bRunner",
