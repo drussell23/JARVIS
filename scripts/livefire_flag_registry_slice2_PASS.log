@@ -1,0 +1,153 @@
+{
+  "slice": 2,
+  "feature": "/help dispatcher + VerbRegistry",
+  "timestamp": 1776822025.7006562,
+  "all_pass": true,
+  "total_checks": 36,
+  "checks": [
+    {
+      "name": "dispatcher_enabled() True with master on",
+      "pass": true
+    },
+    {
+      "name": "/help help returns ok",
+      "pass": true
+    },
+    {
+      "name": "/help help contains subcommand list",
+      "pass": true
+    },
+    {
+      "name": "/help top-index ok",
+      "pass": true
+    },
+    {
+      "name": "/help lists \u22657 REPL verbs",
+      "pass": true
+    },
+    {
+      "name": "/help shows flag total",
+      "pass": true
+    },
+    {
+      "name": "/help verbs lists 7 verbs",
+      "pass": true
+    },
+    {
+      "name": "/help /posture delegates",
+      "pass": true
+    },
+    {
+      "name": "/help recover (no slash) delegates",
+      "pass": true
+    },
+    {
+      "name": "/help flags bare ok",
+      "pass": true
+    },
+    {
+      "name": "/help flags lists 52 flags",
+      "pass": true
+    },
+    {
+      "name": "/help flags --category safety",
+      "pass": true
+    },
+    {
+      "name": "/help flags --category made_up returns error",
+      "pass": true
+    },
+    {
+      "name": "/help flags --posture HARDEN surfaces flags",
+      "pass": true
+    },
+    {
+      "name": "/help flags --posture EXPLORE surfaces flags",
+      "pass": true
+    },
+    {
+      "name": "/help flags --search observer",
+      "pass": true
+    },
+    {
+      "name": "/help flags --search xyzzy no match",
+      "pass": true
+    },
+    {
+      "name": "/help flag detail on known flag ok",
+      "pass": true
+    },
+    {
+      "name": "/help flag detail shows 'currently set' when env set",
+      "pass": true
+    },
+    {
+      "name": "/help flag unknown shows Did-you-mean suggestion",
+      "pass": true
+    },
+    {
+      "name": "/help category alias works",
+      "pass": true
+    },
+    {
+      "name": "/help posture EXPLORE alias works",
+      "pass": true
+    },
+    {
+      "name": "/help unregistered ok",
+      "pass": true
+    },
+    {
+      "name": "unregistered identifies JARVIS_POSTURE_OBSERVR",
+      "pass": true
+    },
+    {
+      "name": "unregistered identifies JARVIS_POSTUR_HYSTERESIS",
+      "pass": true
+    },
+    {
+      "name": "unregistered shows closest matches",
+      "pass": true
+    },
+    {
+      "name": "/help stats ok",
+      "pass": true
+    },
+    {
+      "name": "stats contains schema_version",
+      "pass": true
+    },
+    {
+      "name": "stats contains total_flags",
+      "pass": true
+    },
+    {
+      "name": "stats contains by_category",
+      "pass": true
+    },
+    {
+      "name": "stats contains verbs_registered",
+      "pass": true
+    },
+    {
+      "name": "master off: /help flags rejected",
+      "pass": true
+    },
+    {
+      "name": "master off: /help help still works",
+      "pass": true
+    },
+    {
+      "name": "re-enable: /help flags works again",
+      "pass": true
+    },
+    {
+      "name": "posture HARDEN returns \u22655 relevant flags (consumer of Wave 1 #1)",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/help_dispatcher.py",
+      "pass": true
+    }
+  ]
+}
