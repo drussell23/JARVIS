@@ -117,16 +117,23 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 def _phase_runner_complete_extracted() -> bool:
     """Slice 1 of Wave 2 (5) — COMPLETE phase extraction gate.
 
-    Reads ``JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED`` (default ``false``).
+    Reads ``JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED``, **default
+    ``true`` as of 2026-04-22 graduation (3 clean soak sessions
+    bt-2026-04-22-183425 / -185203 / -190730 + Slice 1 parity
+    22/22 byte-identical vs inline). Explicit ``=false`` remains a
+    runtime kill switch that reverts to the inline block.**
+
     When ``true``, ``_run_pipeline`` delegates the COMPLETE block at
     line ~7073 to
     :class:`backend.core.ouroboros.governance.phase_runners.complete_runner.COMPLETERunner`.
-    When ``false`` (default), the inline block runs unchanged. Parity
-    tests (tests/governance/phase_runner/test_complete_runner_parity.py)
+    When ``false``, the inline block runs unchanged. Parity tests
+    (tests/governance/phase_runner/test_complete_runner_parity.py)
     pin byte-identical observable output across both paths.
+
+    Graduation ledger: ``memory/project_wave2_graduation_matrix.md``.
     """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
