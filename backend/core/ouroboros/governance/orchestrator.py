@@ -155,6 +155,23 @@ def _phase_runner_plan_extracted() -> bool:
     )
 
 
+def _phase_runner_gate_extracted() -> bool:
+    """Slice 4a.2 of Wave 2 (5) — GATE phase extraction gate.
+
+    Reads ``JARVIS_PHASE_RUNNER_GATE_EXTRACTED`` (default ``false``).
+    When ``true``, delegates the 600-line GATE block (can_write +
+    SecurityReviewer + SimilarityGate + frozen_tier + risk ceiling +
+    SemanticGuardian + REVIEW shadow + MutationGate + MIN_RISK_TIER
+    floor + 5a green preview + 5b NOTIFY_APPLY yellow) to GATERunner.
+    The ``risk_tier`` local mutates at up to 6 sites in GATE and is
+    threaded back via ``PhaseResult.artifacts["risk_tier"]``.
+    """
+    return (
+        os.environ.get("JARVIS_PHASE_RUNNER_GATE_EXTRACTED", "false")
+        .strip().lower() in _TRUTHY
+    )
+
+
 def _phase_runner_validate_extracted() -> bool:
     """Slice 4a.1 of Wave 2 (5) — VALIDATE phase extraction gate.
 
@@ -5493,567 +5510,476 @@ class GovernedOrchestrator:
             except Exception:
                 pass
 
-        if _serpent: _serpent.update_phase("GATE")
-        # ---- Phase 5: GATE ----
-        allowed, reason = self._stack.can_write(
-            {"files": list(ctx.target_files)}
-        )
-        logger.info(
-            "[Orchestrator] GATE can_write decision for op=%s: "
-            "allowed=%s reason=%s",
-            ctx.op_id, allowed, reason,
-        )
-        if not allowed:
-            logger.warning(
-                "[Orchestrator] GATE BLOCKED: can_write=%s for op=%s files=%s",
-                reason, ctx.op_id, list(ctx.target_files)[:3],
+        # Wave 2 (5) Slice 4a.2 - GATERunner delegation gate.
+        # Flag JARVIS_PHASE_RUNNER_GATE_EXTRACTED (default false) routes
+        # the 600-line GATE block (can_write + SecurityReviewer +
+        # SimilarityGate + frozen_tier + risk ceiling + SemanticGuardian
+        # + REVIEW shadow + MutationGate + MIN_RISK_TIER floor + 5a green
+        # preview + 5b NOTIFY_APPLY yellow) through the extracted runner.
+        # risk_tier mutates at up to 6 sites inside GATE and is threaded
+        # back via PhaseResult.artifacts["risk_tier"] so APPROVE inline
+        # code downstream sees the final (possibly escalated) value.
+        if _phase_runner_gate_extracted():
+            from backend.core.ouroboros.governance.phase_runners.gate_runner import (
+                GATERunner,
             )
-            ctx = ctx.advance(
-                OperationPhase.CANCELLED,
-                terminal_reason_code=f"gate_blocked:{reason}",
+            _gate_runner = GATERunner(self, _serpent, best_candidate, risk_tier)
+            _gate_result = await _gate_runner.run(ctx)
+            # Rebind risk_tier (GATE mutates it). best_candidate unchanged
+            # but pass through for symmetry with other slices.
+            risk_tier = _gate_result.artifacts.get("risk_tier", risk_tier)
+            best_candidate = _gate_result.artifacts.get("best_candidate", best_candidate)
+            if _gate_result.next_phase is None:
+                # Terminal exit (gate_blocked / security_review_blocked /
+                # user_rejected_safe_auto_preview / user_rejected_notify_apply)
+                return _gate_result.next_ctx
+            ctx = _gate_result.next_ctx
+        else:
+            if _serpent: _serpent.update_phase("GATE")
+            # ---- Phase 5: GATE ----
+            allowed, reason = self._stack.can_write(
+                {"files": list(ctx.target_files)}
             )
-            await self._record_ledger(
-                ctx,
-                OperationState.BLOCKED,
-                {"reason": f"gate_blocked:{reason}"},
+            logger.info(
+                "[Orchestrator] GATE can_write decision for op=%s: "
+                "allowed=%s reason=%s",
+                ctx.op_id, allowed, reason,
             )
-            return ctx
-
-        # ---- Security Review (LLM-as-a-Judge) before APPROVE gate ----
-        try:
-            from backend.core.ouroboros.governance.security_reviewer import SecurityReviewer, SecurityVerdict
-            # Only wire SecurityReviewer with a genuine PrimeClient — the
-            # former fallback passed CandidateGenerator / provider objects
-            # whose generate(context, deadline) signature crashes SecurityReviewer
-            # (TypeError: generate() got an unexpected keyword argument 'prompt').
-            # See orchestrator battle test bt-2026-04-10-184157 postmortem.
-            _sec_client = getattr(self._stack, "prime_client", None)
-            _sec_reviewer = SecurityReviewer(prime_client=_sec_client)
-            if _sec_reviewer.is_enabled and best_candidate is not None:
-                _sec_result = await _sec_reviewer.review(
-                    candidate=best_candidate,
-                    target_files=list(ctx.target_files),
-                    description=ctx.description,
+            if not allowed:
+                logger.warning(
+                    "[Orchestrator] GATE BLOCKED: can_write=%s for op=%s files=%s",
+                    reason, ctx.op_id, list(ctx.target_files)[:3],
                 )
-                if _sec_result.verdict == SecurityVerdict.BLOCK:
-                    logger.warning(
-                        "[Orchestrator] Security review BLOCKED: %s [%s]",
-                        _sec_result.summary, ctx.op_id,
-                    )
-                    ctx = ctx.advance(
-                        OperationPhase.CANCELLED,
-                        terminal_reason_code="security_review_blocked",
-                    )
-                    await self._record_ledger(
-                        ctx, OperationState.BLOCKED,
-                        {"reason": "security_review_blocked", "summary": _sec_result.summary},
-                    )
-                    return ctx
-                elif _sec_result.verdict == SecurityVerdict.WARN:
-                    logger.info(
-                        "[Orchestrator] Security review WARN: %s [%s]",
-                        _sec_result.summary, ctx.op_id,
-                    )
-                    # Emit proactive alert for security warnings (Manifesto §7)
-                    try:
-                        _warn_msg = type("_Msg", (), {
-                            "payload": {
-                                "proactive_alert": True,
-                                "alert_title": "Security Review Warning",
-                                "alert_body": _sec_result.summary or "Potential security concern detected.",
-                                "alert_severity": "warning",
-                                "alert_source": "SecurityReviewer",
-                            },
-                            "op_id": ctx.op_id,
-                            "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
-                        })()
-                        for _t in getattr(self._stack.comm, "_transports", []):
-                            try:
-                                await _t.send(_warn_msg)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-        except Exception:
-            logger.debug("[Orchestrator] SecurityReviewer not available", exc_info=True)
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code=f"gate_blocked:{reason}",
+                )
+                await self._record_ledger(
+                    ctx,
+                    OperationState.BLOCKED,
+                    {"reason": f"gate_blocked:{reason}"},
+                )
+                return ctx
 
-        # ---- Diff-Aware Similarity Gate (Sub-project C) ----
-        if best_candidate is not None:
+            # ---- Security Review (LLM-as-a-Judge) before APPROVE gate ----
             try:
-                from backend.core.ouroboros.governance.similarity_gate import check_similarity
-                _src_content = ""
-                if ctx.target_files:
-                    _src_path = self._config.project_root / ctx.target_files[0]
-                    if _src_path.exists():
-                        _src_content = _src_path.read_text(encoding="utf-8", errors="replace")
-                # Extract candidate content as a string. best_candidate is a dict with
-                # either top-level `full_content` (legacy single-file) or a `files` list
-                # (multi-file). Passing the raw dict would crash similarity_gate with
-                # AttributeError: 'dict' object has no attribute 'splitlines'.
-                _cand_content = ""
-                if isinstance(best_candidate, dict):
-                    _cand_content = best_candidate.get("full_content", "") or ""
-                    if not _cand_content and isinstance(best_candidate.get("files"), list):
-                        _target0 = ctx.target_files[0] if ctx.target_files else None
-                        for _entry in best_candidate["files"]:
-                            if not isinstance(_entry, dict):
-                                continue
-                            if _target0 is None or _entry.get("file_path") == _target0:
-                                _cand_content = _entry.get("full_content", "") or ""
-                                if _cand_content:
-                                    break
-                if _src_content and _cand_content:
-                    _sim_reason = check_similarity(_cand_content, _src_content)
-                    if _sim_reason is not None:
-                        logger.info(
-                            "[Orchestrator] GATE similarity escalation: %s [%s]",
-                            _sim_reason, ctx.op_id,
+                from backend.core.ouroboros.governance.security_reviewer import SecurityReviewer, SecurityVerdict
+                # Only wire SecurityReviewer with a genuine PrimeClient — the
+                # former fallback passed CandidateGenerator / provider objects
+                # whose generate(context, deadline) signature crashes SecurityReviewer
+                # (TypeError: generate() got an unexpected keyword argument 'prompt').
+                # See orchestrator battle test bt-2026-04-10-184157 postmortem.
+                _sec_client = getattr(self._stack, "prime_client", None)
+                _sec_reviewer = SecurityReviewer(prime_client=_sec_client)
+                if _sec_reviewer.is_enabled and best_candidate is not None:
+                    _sec_result = await _sec_reviewer.review(
+                        candidate=best_candidate,
+                        target_files=list(ctx.target_files),
+                        description=ctx.description,
+                    )
+                    if _sec_result.verdict == SecurityVerdict.BLOCK:
+                        logger.warning(
+                            "[Orchestrator] Security review BLOCKED: %s [%s]",
+                            _sec_result.summary, ctx.op_id,
                         )
-                        if risk_tier is not RiskTier.APPROVAL_REQUIRED:
-                            risk_tier = RiskTier.APPROVAL_REQUIRED
-                        # Emit gate event for VoiceNarrator
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="security_review_blocked",
+                        )
+                        await self._record_ledger(
+                            ctx, OperationState.BLOCKED,
+                            {"reason": "security_review_blocked", "summary": _sec_result.summary},
+                        )
+                        return ctx
+                    elif _sec_result.verdict == SecurityVerdict.WARN:
+                        logger.info(
+                            "[Orchestrator] Security review WARN: %s [%s]",
+                            _sec_result.summary, ctx.op_id,
+                        )
+                        # Emit proactive alert for security warnings (Manifesto §7)
                         try:
-                            await self._stack.comm.emit_decision(
-                                op_id=ctx.op_id,
-                                outcome="escalated",
-                                reason_code="similarity_escalation",
-                                target_files=list(ctx.target_files),
-                            )
+                            _warn_msg = type("_Msg", (), {
+                                "payload": {
+                                    "proactive_alert": True,
+                                    "alert_title": "Security Review Warning",
+                                    "alert_body": _sec_result.summary or "Potential security concern detected.",
+                                    "alert_severity": "warning",
+                                    "alert_source": "SecurityReviewer",
+                                },
+                                "op_id": ctx.op_id,
+                                "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                            })()
+                            for _t in getattr(self._stack.comm, "_transports", []):
+                                try:
+                                    await _t.send(_warn_msg)
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
             except Exception:
-                logger.debug("[Orchestrator] Similarity gate skipped", exc_info=True)
+                logger.debug("[Orchestrator] SecurityReviewer not available", exc_info=True)
 
-        # Autonomy tier gate: frozen at submit() to prevent TrustGraduator race.
-        # "observe" → force APPROVAL_REQUIRED regardless of risk_tier.
-        _frozen_tier = getattr(ctx, "frozen_autonomy_tier", "governed")
-        if _frozen_tier == "observe" and risk_tier is not RiskTier.APPROVAL_REQUIRED:
-            risk_tier = RiskTier.APPROVAL_REQUIRED
-            logger.info(
-                "[Orchestrator] GATE: frozen_tier=observe → APPROVAL_REQUIRED; op=%s",
-                ctx.op_id,
-            )
+            # ---- Diff-Aware Similarity Gate (Sub-project C) ----
+            if best_candidate is not None:
+                try:
+                    from backend.core.ouroboros.governance.similarity_gate import check_similarity
+                    _src_content = ""
+                    if ctx.target_files:
+                        _src_path = self._config.project_root / ctx.target_files[0]
+                        if _src_path.exists():
+                            _src_content = _src_path.read_text(encoding="utf-8", errors="replace")
+                    # Extract candidate content as a string. best_candidate is a dict with
+                    # either top-level `full_content` (legacy single-file) or a `files` list
+                    # (multi-file). Passing the raw dict would crash similarity_gate with
+                    # AttributeError: 'dict' object has no attribute 'splitlines'.
+                    _cand_content = ""
+                    if isinstance(best_candidate, dict):
+                        _cand_content = best_candidate.get("full_content", "") or ""
+                        if not _cand_content and isinstance(best_candidate.get("files"), list):
+                            _target0 = ctx.target_files[0] if ctx.target_files else None
+                            for _entry in best_candidate["files"]:
+                                if not isinstance(_entry, dict):
+                                    continue
+                                if _target0 is None or _entry.get("file_path") == _target0:
+                                    _cand_content = _entry.get("full_content", "") or ""
+                                    if _cand_content:
+                                        break
+                    if _src_content and _cand_content:
+                        _sim_reason = check_similarity(_cand_content, _src_content)
+                        if _sim_reason is not None:
+                            logger.info(
+                                "[Orchestrator] GATE similarity escalation: %s [%s]",
+                                _sim_reason, ctx.op_id,
+                            )
+                            if risk_tier is not RiskTier.APPROVAL_REQUIRED:
+                                risk_tier = RiskTier.APPROVAL_REQUIRED
+                            # Emit gate event for VoiceNarrator
+                            try:
+                                await self._stack.comm.emit_decision(
+                                    op_id=ctx.op_id,
+                                    outcome="escalated",
+                                    reason_code="similarity_escalation",
+                                    target_files=list(ctx.target_files),
+                                )
+                            except Exception:
+                                pass
+                except Exception:
+                    logger.debug("[Orchestrator] Similarity gate skipped", exc_info=True)
 
-        # ---- Risk floor override (REPL /risk command) ----
-        # JARVIS_RISK_CEILING env var sets the minimum risk tier floor.
-        # E.g. /risk notify_apply → everything is at least NOTIFY_APPLY.
-        _risk_floor_str = os.environ.get("JARVIS_RISK_CEILING", "")
-        if _risk_floor_str:
-            _floor_map = {
-                "SAFE_AUTO": RiskTier.SAFE_AUTO,
-                "NOTIFY_APPLY": RiskTier.NOTIFY_APPLY,
-                "APPROVAL_REQUIRED": RiskTier.APPROVAL_REQUIRED,
-            }
-            _floor = _floor_map.get(_risk_floor_str.upper())
-            if _floor is not None and risk_tier.value < _floor.value:
+            # Autonomy tier gate: frozen at submit() to prevent TrustGraduator race.
+            # "observe" → force APPROVAL_REQUIRED regardless of risk_tier.
+            _frozen_tier = getattr(ctx, "frozen_autonomy_tier", "governed")
+            if _frozen_tier == "observe" and risk_tier is not RiskTier.APPROVAL_REQUIRED:
+                risk_tier = RiskTier.APPROVAL_REQUIRED
                 logger.info(
-                    "[Orchestrator] GATE: risk floor %s → escalating %s to %s; op=%s",
-                    _risk_floor_str, risk_tier.name, _floor.name, ctx.op_id,
-                )
-                risk_tier = _floor
-
-        # ---- SemanticGuardian: deterministic pre-APPLY pattern check ----
-        #
-        # Closes the SAFE_AUTO blast-radius gap (Priority 3 audit):
-        # risk_engine.py classifies on size (blast radius / file count /
-        # test confidence) only — a syntactically-valid but semantically-
-        # inverted candidate (flipped boolean, removed import, collapsed
-        # body, hardcoded credential, inverted test assertion, loosened
-        # perms …) lands as SAFE_AUTO and auto-applies while the operator
-        # is asleep. The guardian runs 10 deterministic AST/regex
-        # patterns on (pre-apply on-disk content) vs (candidate content)
-        # and, if any fire, upgrades the tier:
-        #
-        #   hard detection → APPROVAL_REQUIRED (force human gate)
-        #   soft detection → NOTIFY_APPLY      (force 5s preview window)
-        #
-        # Pure-deterministic, no LLM, ~10ms per candidate. Master switch
-        # JARVIS_SEMANTIC_GUARD_ENABLED (default on).
-        _guardian_findings: list = []
-        if best_candidate is not None:
-            try:
-                from backend.core.ouroboros.governance.semantic_guardian import (
-                    SemanticGuardian,
-                    recommend_tier_floor,
-                )
-                _guardian = SemanticGuardian()
-                # Build (path, old, new) triples from the candidate. For
-                # multi-file candidates the orchestrator already has
-                # _iter_candidate_files; we replicate its unpacking here
-                # so we don't need to thread ctx through.
-                _pairs: list = []
-                _candidate_files = best_candidate.get("files") if isinstance(
-                    best_candidate.get("files"), list,
-                ) else None
-                if _candidate_files:
-                    _iter = [
-                        (entry.get("file_path", ""), entry.get("full_content", ""))
-                        for entry in _candidate_files
-                        if isinstance(entry, dict)
-                    ]
-                else:
-                    _iter = [(
-                        best_candidate.get("file_path", ""),
-                        best_candidate.get("full_content", ""),
-                    )]
-                for _path, _new in _iter:
-                    if not _path or not isinstance(_new, str):
-                        continue
-                    _old = ""
-                    try:
-                        _abs = (
-                            self._config.project_root / _path
-                            if not Path(_path).is_absolute()
-                            else Path(_path)
-                        )
-                        if _abs.is_file():
-                            _old = _abs.read_text(encoding="utf-8", errors="replace")
-                    except Exception:
-                        _old = ""
-                    _pairs.append((_path, _old, _new))
-
-                # Time the whole batch so operators can detect a pattern
-                # detector regressing into a slow path (Track A telemetry).
-                _sg_t0 = time.monotonic()
-                _guardian_findings = _guardian.inspect_batch(_pairs)
-                _sg_duration_ms = int((time.monotonic() - _sg_t0) * 1000)
-
-                # Compute structured telemetry fields BEFORE any tier
-                # upgrade so ``risk_before`` reflects the classifier's
-                # verdict pre-guardian. The single INFO contract below
-                # fires on every op (hit OR clean) so downstream grep /
-                # aggregation pipelines have a stable one-line record.
-                _hard_count = sum(
-                    1 for f in _guardian_findings if f.severity == "hard"
-                )
-                _soft_count = sum(
-                    1 for f in _guardian_findings if f.severity == "soft"
-                )
-                _risk_before_name = risk_tier.name
-
-                _floor_name = recommend_tier_floor(_guardian_findings)
-                _upgrade: Optional[RiskTier] = None
-                if _floor_name is not None:
-                    _upgrade_map = {
-                        "notify_apply": RiskTier.NOTIFY_APPLY,
-                        "approval_required": RiskTier.APPROVAL_REQUIRED,
-                    }
-                    _upgrade = _upgrade_map.get(_floor_name)
-                    if _upgrade is not None and risk_tier.value < _upgrade.value:
-                        risk_tier = _upgrade
-                    else:
-                        _upgrade = None  # floor wasn't stricter; no upgrade
-
-                # Stable structured line — always emitted. Fields are
-                # intentionally key=value so a simple split("=") parser
-                # can build rollup counters (top patterns, top files,
-                # FP rate estimate). Track A observability contract.
-                _pattern_names = (
-                    ",".join(sorted({f.pattern for f in _guardian_findings}))
-                    if _guardian_findings else "none"
-                )
-                logger.info(
-                    "[SemanticGuard] op=%s findings=%d hard=%d soft=%d "
-                    "patterns=[%s] risk_before=%s risk_after=%s "
-                    "duration_ms=%d files_scanned=%d",
+                    "[Orchestrator] GATE: frozen_tier=observe → APPROVAL_REQUIRED; op=%s",
                     ctx.op_id,
-                    len(_guardian_findings),
-                    _hard_count, _soft_count,
-                    _pattern_names,
-                    _risk_before_name, risk_tier.name,
-                    _sg_duration_ms,
-                    len(_pairs),
-                )
-            except Exception:
-                logger.debug(
-                    "[Orchestrator] SemanticGuardian skipped",
-                    exc_info=True,
                 )
 
-        # ---- REVIEW subagent (Slice 1a — SHADOW MODE observer only) ----
-        # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW. Emits verdict telemetry
-        # only; FSM proceeds to GATE unchanged. See _run_review_shadow.
-        await self._run_review_shadow(ctx, best_candidate)
+            # ---- Risk floor override (REPL /risk command) ----
+            # JARVIS_RISK_CEILING env var sets the minimum risk tier floor.
+            # E.g. /risk notify_apply → everything is at least NOTIFY_APPLY.
+            _risk_floor_str = os.environ.get("JARVIS_RISK_CEILING", "")
+            if _risk_floor_str:
+                _floor_map = {
+                    "SAFE_AUTO": RiskTier.SAFE_AUTO,
+                    "NOTIFY_APPLY": RiskTier.NOTIFY_APPLY,
+                    "APPROVAL_REQUIRED": RiskTier.APPROVAL_REQUIRED,
+                }
+                _floor = _floor_map.get(_risk_floor_str.upper())
+                if _floor is not None and risk_tier.value < _floor.value:
+                    logger.info(
+                        "[Orchestrator] GATE: risk floor %s → escalating %s to %s; op=%s",
+                        _risk_floor_str, risk_tier.name, _floor.name, ctx.op_id,
+                    )
+                    risk_tier = _floor
 
-        # ---- MutationGate: APPLY-phase execution boundary (cached) ----
-        #
-        # Closes the "tests pass != tests test" gap empirically surfaced
-        # by the Session W calibration (28.6% mutation score on green
-        # test suite). For operator-allowlisted critical paths only:
-        #
-        #   * Enumerate deterministic AST mutants (cached by content hash).
-        #   * For each mutant, run the scoped test suite; cache outcomes
-        #     by (sut_hash, tests_hash) so repeat ops on unchanged files
-        #     are near-free.
-        #   * Map score → decision:
-        #       score >= allow_threshold  (default 0.75) → no change
-        #       score in [block, allow)                  → force APPROVAL_REQUIRED
-        #       score <  block_threshold (default 0.40)  → force BLOCKED
-        #
-        # Authority split (Manifesto §1): the tester measures; this
-        # module decides; the orchestrator enforces. The gate never
-        # auto-improves tests, never short-circuits VALIDATE, never
-        # runs on non-critical paths (cost would be prohibitive).
-        #
-        # Master switch JARVIS_MUTATION_GATE_ENABLED (default 0).
-        if best_candidate is not None:
-            try:
-                from backend.core.ouroboros.governance import mutation_gate as _mg
-                if _mg.gate_enabled():
-                    _mg_allowlist = _mg.load_allowlist()
-                    # Reuse the _iter already built for SemanticGuardian.
-                    _candidate_pairs = []
-                    _candidate_files_mg = best_candidate.get("files") if isinstance(
+            # ---- SemanticGuardian: deterministic pre-APPLY pattern check ----
+            #
+            # Closes the SAFE_AUTO blast-radius gap (Priority 3 audit):
+            # risk_engine.py classifies on size (blast radius / file count /
+            # test confidence) only — a syntactically-valid but semantically-
+            # inverted candidate (flipped boolean, removed import, collapsed
+            # body, hardcoded credential, inverted test assertion, loosened
+            # perms …) lands as SAFE_AUTO and auto-applies while the operator
+            # is asleep. The guardian runs 10 deterministic AST/regex
+            # patterns on (pre-apply on-disk content) vs (candidate content)
+            # and, if any fire, upgrades the tier:
+            #
+            #   hard detection → APPROVAL_REQUIRED (force human gate)
+            #   soft detection → NOTIFY_APPLY      (force 5s preview window)
+            #
+            # Pure-deterministic, no LLM, ~10ms per candidate. Master switch
+            # JARVIS_SEMANTIC_GUARD_ENABLED (default on).
+            _guardian_findings: list = []
+            if best_candidate is not None:
+                try:
+                    from backend.core.ouroboros.governance.semantic_guardian import (
+                        SemanticGuardian,
+                        recommend_tier_floor,
+                    )
+                    _guardian = SemanticGuardian()
+                    # Build (path, old, new) triples from the candidate. For
+                    # multi-file candidates the orchestrator already has
+                    # _iter_candidate_files; we replicate its unpacking here
+                    # so we don't need to thread ctx through.
+                    _pairs: list = []
+                    _candidate_files = best_candidate.get("files") if isinstance(
                         best_candidate.get("files"), list,
                     ) else None
-                    if _candidate_files_mg:
-                        _candidate_pairs = [
-                            entry.get("file_path", "")
-                            for entry in _candidate_files_mg
+                    if _candidate_files:
+                        _iter = [
+                            (entry.get("file_path", ""), entry.get("full_content", ""))
+                            for entry in _candidate_files
                             if isinstance(entry, dict)
                         ]
                     else:
-                        _single = best_candidate.get("file_path", "")
-                        if _single:
-                            _candidate_pairs = [_single]
-                    # Filter to critical-only.
-                    _critical = [
-                        Path(p) for p in _candidate_pairs
-                        if _mg.is_path_critical(Path(p), allowlist=_mg_allowlist)
-                    ]
-                    if _critical:
-                        _verdicts = []
-                        for _sp in _critical:
-                            _abs_sp = (
-                                self._config.project_root / _sp
-                                if not _sp.is_absolute() else _sp
+                        _iter = [(
+                            best_candidate.get("file_path", ""),
+                            best_candidate.get("full_content", ""),
+                        )]
+                    for _path, _new in _iter:
+                        if not _path or not isinstance(_new, str):
+                            continue
+                        _old = ""
+                        try:
+                            _abs = (
+                                self._config.project_root / _path
+                                if not Path(_path).is_absolute()
+                                else Path(_path)
                             )
-                            # Caller supplies tests — a path-correlated
-                            # discovery helper keeps the wiring minimal
-                            # (Session W style: tests/test_<stem>*.py).
-                            _tests = self._discover_tests_for_gate(_sp)
-                            _verdicts.append(
-                                _mg.evaluate_file(_abs_sp, _tests)
-                            )
-                        if _verdicts:
-                            _merged = _mg.merge_verdicts(_verdicts)
-                            _risk_before_mg = risk_tier.name
-                            _mg_mode = _mg.gate_mode()
-                            _enforced = (_mg_mode == _mg.MODE_ENFORCE)
-                            _applied_change = ""
-                            if _enforced:
-                                if _merged.decision == "block":
-                                    risk_tier = RiskTier.BLOCKED
-                                    _applied_change = (
-                                        f"{_risk_before_mg}->BLOCKED"
-                                    )
-                                elif _merged.decision == "upgrade_to_approval":
-                                    if risk_tier.value < RiskTier.APPROVAL_REQUIRED.value:
-                                        risk_tier = RiskTier.APPROVAL_REQUIRED
-                                        _applied_change = (
-                                            f"{_risk_before_mg}->APPROVAL_REQUIRED"
-                                        )
-                            # Ledger EVERY verdict regardless of mode so
-                            # shadow-mode operators accumulate data for
-                            # the enforce-mode flip decision.
-                            try:
-                                _mg.append_ledger(
-                                    op_id=ctx.op_id, verdict=_merged,
-                                    mode=_mg_mode, enforced=_enforced,
-                                    applied_tier_change=_applied_change,
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "[MutationGate] ledger append skipped",
-                                    exc_info=True,
-                                )
-                            logger.info(
-                                "[MutationGate] op=%s mode=%s enforced=%s "
-                                "decision=%s score=%.2f grade=%s "
-                                "caught=%d/%d survivors=%d cache_hits=%d "
-                                "cache_misses=%d duration=%.1fs "
-                                "risk_before=%s risk_after=%s",
-                                ctx.op_id, _mg_mode, _enforced,
-                                _merged.decision, _merged.score,
-                                _merged.grade, _merged.caught,
-                                _merged.total_mutants, len(_merged.survivors),
-                                _merged.cache_hits, _merged.cache_misses,
-                                _merged.duration_s,
-                                _risk_before_mg, risk_tier.name,
-                            )
-            except Exception:
-                logger.debug(
-                    "[Orchestrator] MutationGate skipped",
-                    exc_info=True,
-                )
+                            if _abs.is_file():
+                                _old = _abs.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            _old = ""
+                        _pairs.append((_path, _old, _new))
 
-        # ---- MIN_RISK_TIER floor (paranoia mode + quiet hours) ----
-        #
-        # Separate from JARVIS_RISK_CEILING above — that knob is scoped
-        # to the /risk REPL command. This floor composes THREE operator
-        # signals into a single tier floor:
-        #
-        #   JARVIS_MIN_RISK_TIER=notify_apply  (explicit)
-        #   JARVIS_PARANOIA_MODE=1              (shortcut for notify_apply)
-        #   JARVIS_AUTO_APPLY_QUIET_HOURS=22-7 (time-of-day window)
-        #
-        # The strictest of the three applies. Flipping PARANOIA_MODE or
-        # QUIET_HOURS before going to sleep guarantees zero SAFE_AUTO
-        # auto-applies land overnight.
-        try:
-            from backend.core.ouroboros.governance.risk_tier_floor import (
-                apply_floor_to_name,
-                floor_reason,
-            )
-            _cur_name = risk_tier.name.lower()
-            _effective, _applied = apply_floor_to_name(_cur_name)
-            if _applied is not None:
-                _floor_tier_map = {
-                    "safe_auto": RiskTier.SAFE_AUTO,
-                    "notify_apply": RiskTier.NOTIFY_APPLY,
-                    "approval_required": RiskTier.APPROVAL_REQUIRED,
-                    "blocked": RiskTier.BLOCKED,
-                }
-                _tgt = _floor_tier_map.get(_effective)
-                if _tgt is not None and risk_tier.value < _tgt.value:
+                    # Time the whole batch so operators can detect a pattern
+                    # detector regressing into a slow path (Track A telemetry).
+                    _sg_t0 = time.monotonic()
+                    _guardian_findings = _guardian.inspect_batch(_pairs)
+                    _sg_duration_ms = int((time.monotonic() - _sg_t0) * 1000)
+
+                    # Compute structured telemetry fields BEFORE any tier
+                    # upgrade so ``risk_before`` reflects the classifier's
+                    # verdict pre-guardian. The single INFO contract below
+                    # fires on every op (hit OR clean) so downstream grep /
+                    # aggregation pipelines have a stable one-line record.
+                    _hard_count = sum(
+                        1 for f in _guardian_findings if f.severity == "hard"
+                    )
+                    _soft_count = sum(
+                        1 for f in _guardian_findings if f.severity == "soft"
+                    )
+                    _risk_before_name = risk_tier.name
+
+                    _floor_name = recommend_tier_floor(_guardian_findings)
+                    _upgrade: Optional[RiskTier] = None
+                    if _floor_name is not None:
+                        _upgrade_map = {
+                            "notify_apply": RiskTier.NOTIFY_APPLY,
+                            "approval_required": RiskTier.APPROVAL_REQUIRED,
+                        }
+                        _upgrade = _upgrade_map.get(_floor_name)
+                        if _upgrade is not None and risk_tier.value < _upgrade.value:
+                            risk_tier = _upgrade
+                        else:
+                            _upgrade = None  # floor wasn't stricter; no upgrade
+
+                    # Stable structured line — always emitted. Fields are
+                    # intentionally key=value so a simple split("=") parser
+                    # can build rollup counters (top patterns, top files,
+                    # FP rate estimate). Track A observability contract.
+                    _pattern_names = (
+                        ",".join(sorted({f.pattern for f in _guardian_findings}))
+                        if _guardian_findings else "none"
+                    )
                     logger.info(
-                        "[Orchestrator] GATE: MIN_RISK_TIER floor → %s→%s "
-                        "op=%s reason=%s",
-                        risk_tier.name, _tgt.name, ctx.op_id, floor_reason(),
-                    )
-                    risk_tier = _tgt
-        except Exception:
-            logger.debug(
-                "[Orchestrator] MIN_RISK_TIER floor skipped",
-                exc_info=True,
-            )
-
-        # ---- Phase 5a-green: SAFE_AUTO diff preview (Green — when human is watching) ----
-        # Mythos §7.4 UX: when a human is watching (TTY or explicit flag),
-        # show a brief diff preview even for Green ops so the operator can
-        # /reject if they spot something wrong. The delay is shorter than
-        # NOTIFY_APPLY because Green is inherently lower risk.
-        if risk_tier is RiskTier.SAFE_AUTO and _human_is_watching():
-            _green_delay_s = float(
-                os.environ.get("JARVIS_SAFE_AUTO_PREVIEW_DELAY_S", "2")
-            )
-            if best_candidate is not None and _green_delay_s > 0:
-                _diff_preview = (
-                    best_candidate.get("unified_diff")
-                    or best_candidate.get("full_content", "")
-                )
-                if _diff_preview:
-                    try:
-                        for _t in getattr(self._stack.comm, "_transports", []):
-                            try:
-                                _preview_msg = type("_Msg", (), {
-                                    "payload": {
-                                        "phase": "safe_auto_diff_preview",
-                                        "diff_preview": str(_diff_preview)[:4000],
-                                        "delay_s": _green_delay_s,
-                                        "target_files": list(ctx.target_files),
-                                    },
-                                    "op_id": ctx.op_id,
-                                    "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
-                                })()
-                                await _t.send(_preview_msg)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    logger.info(
-                        "[Orchestrator] SAFE_AUTO diff preview shown (human watching), "
-                        "waiting %.0fs for /reject; op=%s",
-                        _green_delay_s, ctx.op_id,
-                    )
-                    await asyncio.sleep(_green_delay_s)
-                    # Check if user cancelled during the preview window
-                    if self._is_cancel_requested(ctx.op_id):
-                        ctx = ctx.advance(
-                            OperationPhase.CANCELLED,
-                            terminal_reason_code="user_rejected_safe_auto_preview",
-                        )
-                        await self._record_ledger(
-                            ctx, OperationState.FAILED,
-                            {"reason": "user_rejected_safe_auto_preview"},
-                        )
-                        return ctx
-
-        # ---- Phase 5b: NOTIFY_APPLY (Yellow — auto-apply with prominent CLI notice + diff preview) ----
-        if risk_tier is RiskTier.NOTIFY_APPLY:
-            _reason = getattr(ctx, "risk_reason_code", "notify_apply")
-            logger.info(
-                "[Orchestrator] GATE: NOTIFY_APPLY (Yellow) — auto-applying with notice; op=%s reason=%s",
-                ctx.op_id, _reason,
-            )
-            try:
-                await self._stack.comm.emit_decision(
-                    op_id=ctx.op_id,
-                    outcome="notify_apply",
-                    reason_code=_reason,
-                    target_files=list(ctx.target_files),
-                )
-            except Exception:
-                pass
-
-            # Render diff preview in CLI before auto-apply.
-            #
-            # V1 rich preview: file tree + per-file panels + status
-            # badges + live countdown + cancel polling. Safe fallback
-            # to the legacy plain-sleep path on TTY-absent / env-off /
-            # any render failure — NOTIFY_APPLY behavior is preserved
-            # exactly in those cases. See diff_preview.py for the
-            # authority / kill-switch / dump-path contract.
-            _notify_delay_s = float(os.environ.get("JARVIS_NOTIFY_APPLY_DELAY_S", "5"))
-            if best_candidate is not None and _notify_delay_s > 0:
-                _changes: list = []
-                try:
-                    from backend.core.ouroboros.battle_test.diff_preview import (
-                        build_changes_from_candidate,
-                    )
-                    _changes = build_changes_from_candidate(
-                        best_candidate, self._config.project_root,
+                        "[SemanticGuard] op=%s findings=%d hard=%d soft=%d "
+                        "patterns=[%s] risk_before=%s risk_after=%s "
+                        "duration_ms=%d files_scanned=%d",
+                        ctx.op_id,
+                        len(_guardian_findings),
+                        _hard_count, _soft_count,
+                        _pattern_names,
+                        _risk_before_name, risk_tier.name,
+                        _sg_duration_ms,
+                        len(_pairs),
                     )
                 except Exception:
                     logger.debug(
-                        "[Orchestrator] build_changes_from_candidate failed; "
-                        "using legacy plain preview",
+                        "[Orchestrator] SemanticGuardian skipped",
                         exc_info=True,
                     )
-                    _changes = []
 
-                # Resolve the SerpentFlow instance from the stack. When
-                # absent (headless / non-battle-test harness), take the
-                # plain asyncio.sleep path — behavior identical to legacy.
-                _serpent = getattr(self._stack, "serpent_flow", None)
-                _cancel_check = lambda: self._is_cancel_requested(ctx.op_id)
-                _cancelled = False
+            # ---- REVIEW subagent (Slice 1a — SHADOW MODE observer only) ----
+            # Gated by JARVIS_REVIEW_SUBAGENT_SHADOW. Emits verdict telemetry
+            # only; FSM proceeds to GATE unchanged. See _run_review_shadow.
+            await self._run_review_shadow(ctx, best_candidate)
 
-                if _serpent is not None and hasattr(_serpent, "show_notify_apply_preview"):
-                    logger.info(
-                        "[Orchestrator] NOTIFY_APPLY rich preview — op=%s "
-                        "files=%d delay=%.1fs",
-                        ctx.op_id, len(_changes), _notify_delay_s,
+            # ---- MutationGate: APPLY-phase execution boundary (cached) ----
+            #
+            # Closes the "tests pass != tests test" gap empirically surfaced
+            # by the Session W calibration (28.6% mutation score on green
+            # test suite). For operator-allowlisted critical paths only:
+            #
+            #   * Enumerate deterministic AST mutants (cached by content hash).
+            #   * For each mutant, run the scoped test suite; cache outcomes
+            #     by (sut_hash, tests_hash) so repeat ops on unchanged files
+            #     are near-free.
+            #   * Map score → decision:
+            #       score >= allow_threshold  (default 0.75) → no change
+            #       score in [block, allow)                  → force APPROVAL_REQUIRED
+            #       score <  block_threshold (default 0.40)  → force BLOCKED
+            #
+            # Authority split (Manifesto §1): the tester measures; this
+            # module decides; the orchestrator enforces. The gate never
+            # auto-improves tests, never short-circuits VALIDATE, never
+            # runs on non-critical paths (cost would be prohibitive).
+            #
+            # Master switch JARVIS_MUTATION_GATE_ENABLED (default 0).
+            if best_candidate is not None:
+                try:
+                    from backend.core.ouroboros.governance import mutation_gate as _mg
+                    if _mg.gate_enabled():
+                        _mg_allowlist = _mg.load_allowlist()
+                        # Reuse the _iter already built for SemanticGuardian.
+                        _candidate_pairs = []
+                        _candidate_files_mg = best_candidate.get("files") if isinstance(
+                            best_candidate.get("files"), list,
+                        ) else None
+                        if _candidate_files_mg:
+                            _candidate_pairs = [
+                                entry.get("file_path", "")
+                                for entry in _candidate_files_mg
+                                if isinstance(entry, dict)
+                            ]
+                        else:
+                            _single = best_candidate.get("file_path", "")
+                            if _single:
+                                _candidate_pairs = [_single]
+                        # Filter to critical-only.
+                        _critical = [
+                            Path(p) for p in _candidate_pairs
+                            if _mg.is_path_critical(Path(p), allowlist=_mg_allowlist)
+                        ]
+                        if _critical:
+                            _verdicts = []
+                            for _sp in _critical:
+                                _abs_sp = (
+                                    self._config.project_root / _sp
+                                    if not _sp.is_absolute() else _sp
+                                )
+                                # Caller supplies tests — a path-correlated
+                                # discovery helper keeps the wiring minimal
+                                # (Session W style: tests/test_<stem>*.py).
+                                _tests = self._discover_tests_for_gate(_sp)
+                                _verdicts.append(
+                                    _mg.evaluate_file(_abs_sp, _tests)
+                                )
+                            if _verdicts:
+                                _merged = _mg.merge_verdicts(_verdicts)
+                                _risk_before_mg = risk_tier.name
+                                _mg_mode = _mg.gate_mode()
+                                _enforced = (_mg_mode == _mg.MODE_ENFORCE)
+                                _applied_change = ""
+                                if _enforced:
+                                    if _merged.decision == "block":
+                                        risk_tier = RiskTier.BLOCKED
+                                        _applied_change = (
+                                            f"{_risk_before_mg}->BLOCKED"
+                                        )
+                                    elif _merged.decision == "upgrade_to_approval":
+                                        if risk_tier.value < RiskTier.APPROVAL_REQUIRED.value:
+                                            risk_tier = RiskTier.APPROVAL_REQUIRED
+                                            _applied_change = (
+                                                f"{_risk_before_mg}->APPROVAL_REQUIRED"
+                                            )
+                                # Ledger EVERY verdict regardless of mode so
+                                # shadow-mode operators accumulate data for
+                                # the enforce-mode flip decision.
+                                try:
+                                    _mg.append_ledger(
+                                        op_id=ctx.op_id, verdict=_merged,
+                                        mode=_mg_mode, enforced=_enforced,
+                                        applied_tier_change=_applied_change,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "[MutationGate] ledger append skipped",
+                                        exc_info=True,
+                                    )
+                                logger.info(
+                                    "[MutationGate] op=%s mode=%s enforced=%s "
+                                    "decision=%s score=%.2f grade=%s "
+                                    "caught=%d/%d survivors=%d cache_hits=%d "
+                                    "cache_misses=%d duration=%.1fs "
+                                    "risk_before=%s risk_after=%s",
+                                    ctx.op_id, _mg_mode, _enforced,
+                                    _merged.decision, _merged.score,
+                                    _merged.grade, _merged.caught,
+                                    _merged.total_mutants, len(_merged.survivors),
+                                    _merged.cache_hits, _merged.cache_misses,
+                                    _merged.duration_s,
+                                    _risk_before_mg, risk_tier.name,
+                                )
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] MutationGate skipped",
+                        exc_info=True,
                     )
-                    try:
-                        _cancelled = await _serpent.show_notify_apply_preview(
-                            op_id=ctx.op_id,
-                            reason=_reason,
-                            changes=_changes,
-                            delay_s=_notify_delay_s,
-                            cancel_check=_cancel_check,
+
+            # ---- MIN_RISK_TIER floor (paranoia mode + quiet hours) ----
+            #
+            # Separate from JARVIS_RISK_CEILING above — that knob is scoped
+            # to the /risk REPL command. This floor composes THREE operator
+            # signals into a single tier floor:
+            #
+            #   JARVIS_MIN_RISK_TIER=notify_apply  (explicit)
+            #   JARVIS_PARANOIA_MODE=1              (shortcut for notify_apply)
+            #   JARVIS_AUTO_APPLY_QUIET_HOURS=22-7 (time-of-day window)
+            #
+            # The strictest of the three applies. Flipping PARANOIA_MODE or
+            # QUIET_HOURS before going to sleep guarantees zero SAFE_AUTO
+            # auto-applies land overnight.
+            try:
+                from backend.core.ouroboros.governance.risk_tier_floor import (
+                    apply_floor_to_name,
+                    floor_reason,
+                )
+                _cur_name = risk_tier.name.lower()
+                _effective, _applied = apply_floor_to_name(_cur_name)
+                if _applied is not None:
+                    _floor_tier_map = {
+                        "safe_auto": RiskTier.SAFE_AUTO,
+                        "notify_apply": RiskTier.NOTIFY_APPLY,
+                        "approval_required": RiskTier.APPROVAL_REQUIRED,
+                        "blocked": RiskTier.BLOCKED,
+                    }
+                    _tgt = _floor_tier_map.get(_effective)
+                    if _tgt is not None and risk_tier.value < _tgt.value:
+                        logger.info(
+                            "[Orchestrator] GATE: MIN_RISK_TIER floor → %s→%s "
+                            "op=%s reason=%s",
+                            risk_tier.name, _tgt.name, ctx.op_id, floor_reason(),
                         )
-                    except Exception:
-                        logger.debug(
-                            "[Orchestrator] rich NOTIFY_APPLY preview raised; "
-                            "plain-sleep fallback",
-                            exc_info=True,
-                        )
-                        await asyncio.sleep(_notify_delay_s)
-                        _cancelled = _cancel_check()
-                else:
-                    # Legacy path preserved: emit heartbeat + sleep +
-                    # post-sleep cancel check.
+                        risk_tier = _tgt
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] MIN_RISK_TIER floor skipped",
+                    exc_info=True,
+                )
+
+            # ---- Phase 5a-green: SAFE_AUTO diff preview (Green — when human is watching) ----
+            # Mythos §7.4 UX: when a human is watching (TTY or explicit flag),
+            # show a brief diff preview even for Green ops so the operator can
+            # /reject if they spot something wrong. The delay is shorter than
+            # NOTIFY_APPLY because Green is inherently lower risk.
+            if risk_tier is RiskTier.SAFE_AUTO and _human_is_watching():
+                _green_delay_s = float(
+                    os.environ.get("JARVIS_SAFE_AUTO_PREVIEW_DELAY_S", "2")
+                )
+                if best_candidate is not None and _green_delay_s > 0:
                     _diff_preview = (
                         best_candidate.get("unified_diff")
                         or best_candidate.get("full_content", "")
@@ -6064,9 +5990,9 @@ class GovernedOrchestrator:
                                 try:
                                     _preview_msg = type("_Msg", (), {
                                         "payload": {
-                                            "phase": "notify_apply_diff",
+                                            "phase": "safe_auto_diff_preview",
                                             "diff_preview": str(_diff_preview)[:4000],
-                                            "delay_s": _notify_delay_s,
+                                            "delay_s": _green_delay_s,
                                             "target_files": list(ctx.target_files),
                                         },
                                         "op_id": ctx.op_id,
@@ -6077,24 +6003,140 @@ class GovernedOrchestrator:
                                     pass
                         except Exception:
                             pass
-                    logger.info(
-                        "[Orchestrator] NOTIFY_APPLY diff preview shown, "
-                        "waiting %.0fs for /reject",
-                        _notify_delay_s,
-                    )
-                    await asyncio.sleep(_notify_delay_s)
-                    _cancelled = _cancel_check()
+                        logger.info(
+                            "[Orchestrator] SAFE_AUTO diff preview shown (human watching), "
+                            "waiting %.0fs for /reject; op=%s",
+                            _green_delay_s, ctx.op_id,
+                        )
+                        await asyncio.sleep(_green_delay_s)
+                        # Check if user cancelled during the preview window
+                        if self._is_cancel_requested(ctx.op_id):
+                            ctx = ctx.advance(
+                                OperationPhase.CANCELLED,
+                                terminal_reason_code="user_rejected_safe_auto_preview",
+                            )
+                            await self._record_ledger(
+                                ctx, OperationState.FAILED,
+                                {"reason": "user_rejected_safe_auto_preview"},
+                            )
+                            return ctx
 
-                if _cancelled:
-                    ctx = ctx.advance(
-                        OperationPhase.CANCELLED,
-                        terminal_reason_code="user_rejected_notify_apply",
+            # ---- Phase 5b: NOTIFY_APPLY (Yellow — auto-apply with prominent CLI notice + diff preview) ----
+            if risk_tier is RiskTier.NOTIFY_APPLY:
+                _reason = getattr(ctx, "risk_reason_code", "notify_apply")
+                logger.info(
+                    "[Orchestrator] GATE: NOTIFY_APPLY (Yellow) — auto-applying with notice; op=%s reason=%s",
+                    ctx.op_id, _reason,
+                )
+                try:
+                    await self._stack.comm.emit_decision(
+                        op_id=ctx.op_id,
+                        outcome="notify_apply",
+                        reason_code=_reason,
+                        target_files=list(ctx.target_files),
                     )
-                    await self._record_ledger(
-                        ctx, OperationState.FAILED,
-                        {"reason": "user_rejected_notify_apply"},
-                    )
-                    return ctx
+                except Exception:
+                    pass
+
+                # Render diff preview in CLI before auto-apply.
+                #
+                # V1 rich preview: file tree + per-file panels + status
+                # badges + live countdown + cancel polling. Safe fallback
+                # to the legacy plain-sleep path on TTY-absent / env-off /
+                # any render failure — NOTIFY_APPLY behavior is preserved
+                # exactly in those cases. See diff_preview.py for the
+                # authority / kill-switch / dump-path contract.
+                _notify_delay_s = float(os.environ.get("JARVIS_NOTIFY_APPLY_DELAY_S", "5"))
+                if best_candidate is not None and _notify_delay_s > 0:
+                    _changes: list = []
+                    try:
+                        from backend.core.ouroboros.battle_test.diff_preview import (
+                            build_changes_from_candidate,
+                        )
+                        _changes = build_changes_from_candidate(
+                            best_candidate, self._config.project_root,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "[Orchestrator] build_changes_from_candidate failed; "
+                            "using legacy plain preview",
+                            exc_info=True,
+                        )
+                        _changes = []
+
+                    # Resolve the SerpentFlow instance from the stack. When
+                    # absent (headless / non-battle-test harness), take the
+                    # plain asyncio.sleep path — behavior identical to legacy.
+                    _serpent = getattr(self._stack, "serpent_flow", None)
+                    _cancel_check = lambda: self._is_cancel_requested(ctx.op_id)
+                    _cancelled = False
+
+                    if _serpent is not None and hasattr(_serpent, "show_notify_apply_preview"):
+                        logger.info(
+                            "[Orchestrator] NOTIFY_APPLY rich preview — op=%s "
+                            "files=%d delay=%.1fs",
+                            ctx.op_id, len(_changes), _notify_delay_s,
+                        )
+                        try:
+                            _cancelled = await _serpent.show_notify_apply_preview(
+                                op_id=ctx.op_id,
+                                reason=_reason,
+                                changes=_changes,
+                                delay_s=_notify_delay_s,
+                                cancel_check=_cancel_check,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[Orchestrator] rich NOTIFY_APPLY preview raised; "
+                                "plain-sleep fallback",
+                                exc_info=True,
+                            )
+                            await asyncio.sleep(_notify_delay_s)
+                            _cancelled = _cancel_check()
+                    else:
+                        # Legacy path preserved: emit heartbeat + sleep +
+                        # post-sleep cancel check.
+                        _diff_preview = (
+                            best_candidate.get("unified_diff")
+                            or best_candidate.get("full_content", "")
+                        )
+                        if _diff_preview:
+                            try:
+                                for _t in getattr(self._stack.comm, "_transports", []):
+                                    try:
+                                        _preview_msg = type("_Msg", (), {
+                                            "payload": {
+                                                "phase": "notify_apply_diff",
+                                                "diff_preview": str(_diff_preview)[:4000],
+                                                "delay_s": _notify_delay_s,
+                                                "target_files": list(ctx.target_files),
+                                            },
+                                            "op_id": ctx.op_id,
+                                            "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                                        })()
+                                        await _t.send(_preview_msg)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        logger.info(
+                            "[Orchestrator] NOTIFY_APPLY diff preview shown, "
+                            "waiting %.0fs for /reject",
+                            _notify_delay_s,
+                        )
+                        await asyncio.sleep(_notify_delay_s)
+                        _cancelled = _cancel_check()
+
+                    if _cancelled:
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="user_rejected_notify_apply",
+                        )
+                        await self._record_ledger(
+                            ctx, OperationState.FAILED,
+                            {"reason": "user_rejected_notify_apply"},
+                        )
+                        return ctx
 
         # ---- Phase 6: APPROVE (conditional) ----
         if risk_tier is RiskTier.APPROVAL_REQUIRED:
