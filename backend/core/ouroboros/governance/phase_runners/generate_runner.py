@@ -85,7 +85,9 @@ from backend.core.ouroboros.governance.forward_progress import (
 from backend.core.ouroboros.governance.productivity_detector import (
     productivity_content_hash,
 )
-from backend.core.ouroboros.governance.ledger import OperationState
+from dataclasses import asdict as _dc_asdict
+
+from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,

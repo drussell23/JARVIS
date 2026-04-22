@@ -1370,6 +1370,20 @@ class GovernedOrchestrator:
         except Exception:
             pass
 
+        # Wave 2 (5) Slice 6a — Dispatcher short-circuit.
+        # When JARVIS_PHASE_RUNNER_DISPATCHER_ENABLED=true, the phase
+        # dispatcher runs every phase through the PhaseRunnerRegistry;
+        # the legacy inline blocks below are never reached. When off
+        # (default), fall through to the legacy path unchanged.
+        from backend.core.ouroboros.governance.phase_dispatcher import (
+            dispatcher_enabled as _dispatcher_enabled,
+        )
+        if _dispatcher_enabled():
+            from backend.core.ouroboros.governance.phase_dispatcher import (
+                dispatch_pipeline as _dispatch_pipeline,
+            )
+            return await _dispatch_pipeline(self, _serpent, ctx)
+
         # Wave 2 (5) Slice 2 - CLASSIFYRunner delegation gate.
         # Flag JARVIS_PHASE_RUNNER_CLASSIFY_EXTRACTED (default false) routes
         # the 760-line CLASSIFY block through the extracted PhaseRunner.
