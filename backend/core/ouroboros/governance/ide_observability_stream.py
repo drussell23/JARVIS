@@ -128,6 +128,11 @@ EVENT_TYPE_POSTURE_CHANGED = "posture_changed"
 EVENT_TYPE_FLAG_TYPO_DETECTED = "flag_typo_detected"
 EVENT_TYPE_FLAG_REGISTERED = "flag_registered"
 
+# SensorGovernor + MemoryPressureGate (Wave 1 #3 Slice 3) vocabulary.
+EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
+EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
+EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
+
 # Inline Permission Slice 4 — per-tool-call prompt + grant stream vocab.
 EVENT_TYPE_INLINE_PROMPT_PENDING = "inline_prompt_pending"
 EVENT_TYPE_INLINE_PROMPT_ALLOWED = "inline_prompt_allowed"
@@ -190,6 +195,9 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_POSTURE_CHANGED,
     EVENT_TYPE_FLAG_TYPO_DETECTED,
     EVENT_TYPE_FLAG_REGISTERED,
+    EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED,
+    EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE,
+    EVENT_TYPE_MEMORY_PRESSURE_CHANGED,
 })
 
 
@@ -1196,6 +1204,181 @@ def bridge_flag_registry_to_broker(
     def _unsubscribe() -> None:
         try:
             registry.register = original_register  # type: ignore[method-assign]
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _unsubscribe
+
+
+# ---------------------------------------------------------------------------
+# SensorGovernor + MemoryPressureGate bridges (Wave 1 #3 Slice 3)
+# ---------------------------------------------------------------------------
+
+
+def publish_governor_throttle_event(decision: Any) -> Optional[str]:
+    """Best-effort publisher for governor_throttle_applied frames."""
+    if not stream_enabled():
+        return None
+    try:
+        payload = {
+            "sensor_name": decision.sensor_name,
+            "urgency": decision.urgency.value,
+            "posture": decision.posture,
+            "weighted_cap": decision.weighted_cap,
+            "current_count": decision.current_count,
+            "reason_code": decision.reason_code,
+            "emergency_brake": decision.emergency_brake,
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED,
+            decision.sensor_name, payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_governor_throttle_event exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_governor_emergency_brake_event(
+    activated: bool, cost_burn: float, postmortem_rate: float,
+) -> Optional[str]:
+    """Best-effort publisher for governor_emergency_brake transitions."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE, "sensor_governor",
+            {
+                "activated": activated,
+                "cost_burn_normalized": cost_burn,
+                "postmortem_failure_rate": postmortem_rate,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Stream] brake publish exception", exc_info=True)
+        return None
+
+
+def publish_memory_pressure_event(
+    previous_level: str, current_level: str,
+    free_pct: float, source: str,
+) -> Optional[str]:
+    """Best-effort publisher for memory_pressure_changed frames."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_MEMORY_PRESSURE_CHANGED, "memory_pressure_gate",
+            {
+                "previous_level": previous_level,
+                "current_level": current_level,
+                "free_pct": free_pct,
+                "source": source,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Stream] pressure publish exception", exc_info=True)
+        return None
+
+
+def bridge_governor_to_broker(
+    governor: Optional[Any] = None,
+) -> Callable[[], None]:
+    """Wrap ``governor.request_budget`` to publish throttle + brake SSE.
+
+    Monkey-patches the instance method. Returns an unsubscribe callable."""
+    if governor is None:
+        try:
+            from backend.core.ouroboros.governance.sensor_governor import (
+                ensure_seeded,
+            )
+            governor = ensure_seeded()
+        except Exception:  # noqa: BLE001
+            return lambda: None
+
+    original_request = governor.request_budget
+    brake_state = {"active": False}
+
+    def _wrapped_request(sensor_name, urgency=None):
+        from backend.core.ouroboros.governance.sensor_governor import Urgency
+        if urgency is None:
+            urgency = Urgency.STANDARD
+        decision = original_request(sensor_name, urgency)
+        if not decision.allowed:
+            try:
+                publish_governor_throttle_event(decision)
+            except Exception:  # noqa: BLE001
+                logger.debug("[Stream] throttle publish failed", exc_info=True)
+        if decision.emergency_brake != brake_state["active"]:
+            brake_state["active"] = decision.emergency_brake
+            try:
+                cost = 0.0
+                pm = 0.0
+                try:
+                    sb = governor._signal_bundle_fn()
+                    if sb:
+                        cost = float(sb.get("cost_burn_normalized", 0.0))
+                        pm = float(sb.get("postmortem_failure_rate", 0.0))
+                except Exception:  # noqa: BLE001
+                    pass
+                publish_governor_emergency_brake_event(
+                    decision.emergency_brake, cost, pm,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("[Stream] brake publish failed", exc_info=True)
+        return decision
+
+    governor.request_budget = _wrapped_request  # type: ignore[method-assign]
+
+    def _unsubscribe() -> None:
+        try:
+            governor.request_budget = original_request  # type: ignore[method-assign]
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _unsubscribe
+
+
+def bridge_memory_pressure_to_broker(
+    gate: Optional[Any] = None,
+) -> Callable[[], None]:
+    """Wrap ``gate.pressure`` to publish level-transition SSE frames."""
+    if gate is None:
+        try:
+            from backend.core.ouroboros.governance.memory_pressure_gate import (
+                get_default_gate,
+            )
+            gate = get_default_gate()
+        except Exception:  # noqa: BLE001
+            return lambda: None
+
+    original_pressure = gate.pressure
+    level_state = {"prev": None}
+
+    def _wrapped_pressure():
+        level = original_pressure()
+        prev = level_state["prev"]
+        if prev is not None and prev is not level:
+            try:
+                probe = gate.probe()
+                publish_memory_pressure_event(
+                    prev.value if prev else "unknown",
+                    level.value,
+                    probe.free_pct if probe else 0.0,
+                    probe.source if probe else "unknown",
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("[Stream] pressure publish failed", exc_info=True)
+        level_state["prev"] = level
+        return level
+
+    gate.pressure = _wrapped_pressure  # type: ignore[method-assign]
+
+    def _unsubscribe() -> None:
+        try:
+            gate.pressure = original_pressure  # type: ignore[method-assign]
         except Exception:  # noqa: BLE001
             pass
 

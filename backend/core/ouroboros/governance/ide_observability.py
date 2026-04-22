@@ -221,6 +221,18 @@ class IDEObservabilityRouter:
         app.router.add_get(
             "/observability/verbs", self._handle_verbs_list,
         )
+        # SensorGovernor + MemoryPressureGate — Wave 1 #3 Slice 3.
+        app.router.add_get(
+            "/observability/governor", self._handle_governor_snapshot,
+        )
+        app.router.add_get(
+            "/observability/governor/history",
+            self._handle_governor_history,
+        )
+        app.router.add_get(
+            "/observability/memory-pressure",
+            self._handle_memory_pressure,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -1037,4 +1049,120 @@ class IDEObservabilityRouter:
                 "count": len(verbs),
             },
         )
+
+    # --- SensorGovernor + MemoryPressureGate Slice 3 ----------------------
+
+    @staticmethod
+    def _sensor_governor_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.sensor_governor import (
+                is_enabled,
+            )
+        except ImportError:
+            return False
+        return is_enabled()
+
+    @staticmethod
+    def _memory_gate_enabled() -> bool:
+        try:
+            from backend.core.ouroboros.governance.memory_pressure_gate import (
+                is_enabled,
+            )
+        except ImportError:
+            return False
+        return is_enabled()
+
+    def _governor_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._sensor_governor_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.governor_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        return None
+
+    def _memory_check_gates(self, request: "web.Request") -> Optional[Any]:
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._memory_gate_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.memory_gate_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        return None
+
+    async def _handle_governor_snapshot(self, request: "web.Request") -> Any:
+        """GET /observability/governor — current governor snapshot."""
+        err = self._governor_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.sensor_governor import (
+                ensure_seeded,
+            )
+            snap = ensure_seeded().snapshot()
+        except Exception:  # noqa: BLE001
+            logger.debug("[IDEObservability] governor snapshot failed", exc_info=True)
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "governor.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
+
+    async def _handle_governor_history(self, request: "web.Request") -> Any:
+        """GET /observability/governor/history?limit=N — recent decisions."""
+        err = self._governor_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            limit = max(1, min(512, int(request.query.get("limit", "20"))))
+        except (TypeError, ValueError):
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        try:
+            from backend.core.ouroboros.governance.sensor_governor import (
+                ensure_seeded,
+            )
+            decisions = ensure_seeded().recent_decisions(limit=limit)
+        except Exception:  # noqa: BLE001
+            decisions = []
+        return self._json_response(
+            request, 200,
+            {
+                "decisions": [d.to_dict() for d in decisions],
+                "count": len(decisions),
+                "limit": limit,
+            },
+        )
+
+    async def _handle_memory_pressure(self, request: "web.Request") -> Any:
+        """GET /observability/memory-pressure — current pressure snapshot."""
+        err = self._memory_check_gates(request)
+        if err is not None:
+            return err
+        try:
+            from backend.core.ouroboros.governance.memory_pressure_gate import (
+                get_default_gate,
+            )
+            snap = get_default_gate().snapshot()
+        except Exception:  # noqa: BLE001
+            logger.debug("[IDEObservability] memory pressure snapshot failed",
+                         exc_info=True)
+            return self._json_response(
+                request, 200,
+                {"snapshot": None, "reason_code": "memory.unavailable"},
+            )
+        return self._json_response(request, 200, snap)
 
