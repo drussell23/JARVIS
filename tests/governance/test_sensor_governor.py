@@ -406,8 +406,9 @@ class TestThreadSafety:
 
 class TestEnvHelpers:
 
-    def test_is_enabled_default_false(self):
-        assert is_enabled() is False
+    def test_is_enabled_default_true_post_graduation(self):
+        """Post-Slice-4 graduation: default flipped false→true."""
+        assert is_enabled() is True
 
     def test_global_cap_default_200(self):
         assert global_cap_per_hour() == 200

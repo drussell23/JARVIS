@@ -88,7 +88,8 @@ class TestREPLBasics:
         assert r.ok
         assert "/governor" in r.text
 
-    def test_master_off_rejects_operational(self):
+    def test_master_off_rejects_operational(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_SENSOR_GOVERNOR_ENABLED", "false")
         r = dispatch_governor_command("/governor status")
         assert r.ok is False
         assert "SensorGovernor disabled" in r.text
@@ -165,7 +166,8 @@ class TestReset:
 
 class TestMemorySubcommand:
 
-    def test_memory_off_rejects(self):
+    def test_memory_off_rejects(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "false")
         r = dispatch_governor_command("/governor memory")
         assert r.ok is False
         assert "MemoryPressureGate" in r.text

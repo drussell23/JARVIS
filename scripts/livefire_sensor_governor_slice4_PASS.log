@@ -1,0 +1,113 @@
+{
+  "slice": 4,
+  "feature": "SensorGovernor + MemoryPressureGate GRADUATION",
+  "timestamp": 1776824490.1279051,
+  "all_pass": true,
+  "total_checks": 26,
+  "checks": [
+    {
+      "name": "governor is_enabled() True post-graduation",
+      "pass": true
+    },
+    {
+      "name": "gate is_enabled() True post-graduation",
+      "pass": true
+    },
+    {
+      "name": "seed installed 16 sensors",
+      "pass": true
+    },
+    {
+      "name": "REPL /governor status works on defaults",
+      "pass": true
+    },
+    {
+      "name": "REPL /governor memory works on defaults",
+      "pass": true
+    },
+    {
+      "name": "GET /observability/governor 200 on defaults",
+      "pass": true
+    },
+    {
+      "name": "GET /governor has 16 sensors",
+      "pass": true
+    },
+    {
+      "name": "GET /governor/history 200",
+      "pass": true
+    },
+    {
+      "name": "GET /memory-pressure 200 on defaults",
+      "pass": true
+    },
+    {
+      "name": "GET /memory-pressure has level",
+      "pass": true
+    },
+    {
+      "name": "governor off: is_enabled() False",
+      "pass": true
+    },
+    {
+      "name": "governor off: /governor status rejected",
+      "pass": true
+    },
+    {
+      "name": "governor off: /governor help still works",
+      "pass": true
+    },
+    {
+      "name": "governor off: GET /governor 403",
+      "pass": true
+    },
+    {
+      "name": "governor off: GET /governor/history 403",
+      "pass": true
+    },
+    {
+      "name": "gate off: is_enabled() False",
+      "pass": true
+    },
+    {
+      "name": "gate off: /governor memory rejected",
+      "pass": true
+    },
+    {
+      "name": "gate off: GET /memory-pressure 403",
+      "pass": true
+    },
+    {
+      "name": "both off: governor GET 403",
+      "pass": true
+    },
+    {
+      "name": "both off: memory GET 403",
+      "pass": true
+    },
+    {
+      "name": "re-default: governor GET 200",
+      "pass": true
+    },
+    {
+      "name": "re-default: memory GET 200",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/sensor_governor.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/sensor_governor_seed.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/memory_pressure_gate.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/governor_repl.py",
+      "pass": true
+    }
+  ]
+}

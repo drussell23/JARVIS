@@ -128,8 +128,8 @@ class TestLevelThresholds:
 
 class TestPressure:
 
-    def test_disabled_always_ok(self):
-        # Master default false
+    def test_disabled_always_ok(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "false")
         gate = MemoryPressureGate(probe_fn=lambda: _fake_probe(5.0))
         assert gate.pressure() is PressureLevel.OK
 
@@ -163,7 +163,8 @@ class TestPressure:
 
 class TestCanFanout:
 
-    def test_disabled_unclamped(self):
+    def test_disabled_unclamped(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "false")
         gate = MemoryPressureGate(probe_fn=lambda: _fake_probe(5.0))
         d = gate.can_fanout(16)
         assert d.allowed is True
@@ -346,7 +347,8 @@ class TestSnapshot:
         assert snap["ok"] is False
         assert "error" in snap
 
-    def test_snapshot_disabled(self):
+    def test_snapshot_disabled(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", "false")
         gate = MemoryPressureGate(probe_fn=lambda: _fake_probe(50.0))
         snap = gate.snapshot()
         assert snap["enabled"] is False
@@ -359,8 +361,9 @@ class TestSnapshot:
 
 class TestEnvHelpers:
 
-    def test_is_enabled_default_false(self):
-        assert is_enabled() is False
+    def test_is_enabled_default_true_post_graduation(self):
+        """Post-Slice-4 graduation: default flipped false→true."""
+        assert is_enabled() is True
 
     def test_threshold_defaults(self):
         assert warn_threshold_pct() == 30.0

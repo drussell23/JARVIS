@@ -96,8 +96,29 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 
 
 def is_enabled() -> bool:
-    """Master kill switch. Default ``false`` Slice 1 — Slice 4 graduates."""
-    return _env_bool("JARVIS_SENSOR_GOVERNOR_ENABLED", False)
+    """Master switch.
+
+    Default: **``true``** (graduated 2026-04-21 via Slice 4 after
+    Slices 1-3 shipped primitive + 16-sensor seed + /governor REPL +
+    GET /observability/governor + SSE throttle/brake/memory_pressure
+    events with 130 governance tests + 3 live-fire proofs). Explicit
+    ``"false"`` reverts to the Slice 1 deny-by-default posture — every
+    surface disables in lockstep:
+
+      * request_budget() returns ``allowed=True`` with reason
+        ``"governor.disabled"`` so sensors fall through to the
+        pre-governor path (no throttling)
+      * record_emission() is a no-op
+      * /governor REPL rejects operational verbs (help still works)
+      * GET /observability/governor{,/history} return 403
+      * SSE publish_governor_* helpers return None
+
+    The rolling-window counters, posture-weight math, emergency-brake
+    thresholds, authority invariants (grep-pinned), and §5 Tier 0
+    discipline remain in force regardless of this flag — graduation
+    flips opt-in friction, NOT authority surface.
+    """
+    return _env_bool("JARVIS_SENSOR_GOVERNOR_ENABLED", True)
 
 
 def global_cap_per_hour() -> int:

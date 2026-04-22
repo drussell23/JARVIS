@@ -97,8 +97,25 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 
 
 def is_enabled() -> bool:
-    """Master kill switch. Default ``false`` Slice 1-3; Slice 4 graduates."""
-    return _env_bool("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", False)
+    """Master switch.
+
+    Default: **``true``** (graduated 2026-04-21 via Slice 4 after
+    Slices 1-2 shipped probe cascade + fanout decision math + Slice 3
+    shipped REPL/GET/SSE surfaces). Explicit ``"false"`` reverts to
+    Slice 1-3 deny-by-default posture:
+
+      * pressure() returns OK unconditionally
+      * can_fanout(N) returns FanoutDecision(allowed=True, n_allowed=N)
+        so consumers fall through to the pre-gate path
+      * GET /observability/memory-pressure returns 403
+      * /governor memory REPL rejects
+      * SSE publish_memory_pressure_event returns None
+
+    Probe cascade (psutil → /proc/meminfo → vm_stat → fallback),
+    threshold math, and authority invariants all stay in force
+    regardless of flag state.
+    """
+    return _env_bool("JARVIS_MEMORY_PRESSURE_GATE_ENABLED", True)
 
 
 def warn_threshold_pct() -> float:
