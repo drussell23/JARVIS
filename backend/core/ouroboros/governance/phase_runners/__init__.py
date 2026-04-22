@@ -35,6 +35,9 @@ from backend.core.ouroboros.governance.phase_runners.plan_runner import (
 from backend.core.ouroboros.governance.phase_runners.route_runner import (
     ROUTERunner,
 )
+from backend.core.ouroboros.governance.phase_runners.slice4b_runner import (
+    Slice4bRunner,
+)
 from backend.core.ouroboros.governance.phase_runners.validate_runner import (
     VALIDATERunner,
 )
@@ -46,5 +49,6 @@ __all__ = [
     "GATERunner",
     "PLANRunner",
     "ROUTERunner",
+    "Slice4bRunner",
     "VALIDATERunner",
 ]
