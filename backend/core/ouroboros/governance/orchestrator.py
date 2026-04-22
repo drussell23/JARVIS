@@ -139,25 +139,48 @@ def _phase_runner_complete_extracted() -> bool:
 
 
 def _phase_runner_route_extracted() -> bool:
-    """Slice 3 of Wave 2 (5) — ROUTE phase extraction gate."""
+    """Slice 3 of Wave 2 (5) — ROUTE phase extraction gate.
+
+    **Default ``true`` as of 2026-04-22 atomic #3 graduation** (3 clean
+    soak sessions bt-2026-04-22-214630 / -220234 / -222322, each with
+    zero runner-attributed frames + zero shutdown race + 40 total
+    ROUTE+CTX+PLAN delegation markers). Flipped together with
+    ``_phase_runner_context_expansion_extracted`` and
+    ``_phase_runner_plan_extracted`` since the combined gate
+    ``_phase_runner_slice3_fully_extracted`` requires all three.
+    Explicit ``=false`` on this helper alone remains a per-phase
+    kill switch — operator can sever ROUTE without affecting CTX/PLAN.
+
+    Graduation ledger: ``memory/project_wave2_graduation_matrix.md``.
+    """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_ROUTE_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_ROUTE_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
 
 def _phase_runner_context_expansion_extracted() -> bool:
-    """Slice 3 of Wave 2 (5) — CONTEXT_EXPANSION phase extraction gate."""
+    """Slice 3 of Wave 2 (5) — CONTEXT_EXPANSION phase extraction gate.
+
+    **Default ``true`` as of 2026-04-22** (atomic #3 graduation with
+    ROUTE + PLAN; see ``_phase_runner_route_extracted`` docstring for
+    soak evidence). Explicit ``=false`` kill switch remains.
+    """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_CONTEXT_EXPANSION_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_CONTEXT_EXPANSION_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
 
 def _phase_runner_plan_extracted() -> bool:
-    """Slice 3 of Wave 2 (5) — PLAN phase extraction gate."""
+    """Slice 3 of Wave 2 (5) — PLAN phase extraction gate.
+
+    **Default ``true`` as of 2026-04-22** (atomic #3 graduation with
+    ROUTE + CTX; see ``_phase_runner_route_extracted`` docstring).
+    Explicit ``=false`` kill switch remains.
+    """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_PLAN_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_PLAN_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
