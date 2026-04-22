@@ -1267,10 +1267,22 @@ class GovernedOrchestrator:
             )
             _classify_runner = CLASSIFYRunner(self, _serpent)
             _classify_result = await _classify_runner.run(ctx)
+            # Rebind CLASSIFY locals that downstream phases read:
+            #  - _advisory at ~line 2819 (Tier 6 personality voice)
+            #  - _consciousness_bridge at ~line 3030 and ~line 4513
+            #    (fragile-file memory injection, both initial + L2 retry)
             _advisory = _classify_result.artifacts.get("advisory")
+            _consciousness_bridge = _classify_result.artifacts.get(
+                "consciousness_bridge",
+            )
             if _classify_result.next_phase is None:
                 return _classify_result.next_ctx
             ctx = _classify_result.next_ctx
+            # `risk_tier` is carried as a function-scoped local across
+            # phases (reassigned at ~5498, 5515, 5538, 5628, 5731, 5737,
+            # 5809). advance(ROUTE, risk_tier=...) stamped it on ctx,
+            # so we rebind from there to keep both paths identical.
+            risk_tier = ctx.risk_tier
         else:
             # ── JARVIS Tier 2: Emergency Protocol Check ──────────────────────
             # If emergency level is ORANGE or higher, block autonomous operations

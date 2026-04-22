@@ -151,7 +151,10 @@ class CLASSIFYRunner(PhaseRunner):
                     next_phase=None,
                     status="fail",
                     reason=f"emergency_{state.level.name.lower()}",
-                    artifacts={"advisory": None},
+                    artifacts={
+                        "advisory": None,
+                        "consciousness_bridge": None,
+                    },
                 )
         except ImportError:
             pass
@@ -202,7 +205,10 @@ class CLASSIFYRunner(PhaseRunner):
                     next_phase=None,
                     status="fail",
                     reason="advisor_blocked",
-                    artifacts={"advisory": _advisory},
+                    artifacts={
+                        "advisory": _advisory,
+                        "consciousness_bridge": None,
+                    },
                 )
 
             if _advisory.decision != AdvisoryDecision.RECOMMEND:
@@ -752,7 +758,10 @@ class CLASSIFYRunner(PhaseRunner):
                 next_phase=None,
                 status="fail",
                 reason=classification.reason_code,
-                artifacts={"advisory": _advisory},
+                artifacts={
+                    "advisory": _advisory,
+                    "consciousness_bridge": _consciousness_bridge,
+                },
             )
 
         # Announce operation start — VoiceNarrator fires here (INTENT type)
@@ -914,7 +923,10 @@ class CLASSIFYRunner(PhaseRunner):
             next_phase=OperationPhase.ROUTE,
             status="ok",
             reason="classified",
-            artifacts={"advisory": _advisory},
+            artifacts={
+                "advisory": _advisory,
+                "consciousness_bridge": _consciousness_bridge,
+            },
         )
 
 
