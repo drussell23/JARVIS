@@ -54,6 +54,56 @@ _URGENCY_BOOST: Dict[str, int] = {
 # Sources that bypass backpressure
 _BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
 
+# ---------------------------------------------------------------------------
+# Slice 5 Arc A — SensorGovernor consultation maps
+# ---------------------------------------------------------------------------
+# IntentEnvelope uses snake_case source strings (e.g. "test_failure") while
+# the SensorGovernor seed registers CamelCase sensor names ("TestFailureSensor").
+# Translate at the call site rather than renaming either side — both catalogs
+# have existing test surface that would break on rename.
+_SOURCE_TO_GOVERNOR_SENSOR: Dict[str, str] = {
+    "test_failure": "TestFailureSensor",
+    "backlog": "BacklogSensor",
+    "voice_human": "VoiceCommandSensor",
+    "ai_miner": "OpportunityMinerSensor",
+    "capability_gap": "CapabilityGapSensor",
+    "runtime_health": "RuntimeHealthSensor",
+    "exploration": "ProactiveExplorationSensor",
+    "intent_discovery": "IntentDiscoverySensor",
+    "todo_scanner": "TodoScannerSensor",
+    "doc_staleness": "DocStalenessSensor",
+    "github_issue": "GitHubIssueSensor",
+    "performance_regression": "PerformanceRegressionSensor",
+    "cross_repo_drift": "CrossRepoDriftSensor",
+    "web_intelligence": "WebIntelligenceSensor",
+    "vision_sensor": "VisionSensor",
+    # Unmapped (no governor spec): architecture, roadmap, cu_execution,
+    # security_advisory — fall through to "governor.unregistered_sensor"
+    # which always allows (safe default).
+}
+
+# Envelope urgency → Governor urgency. Envelope uses 4 values; Governor has 5
+# (adds SPECULATIVE which isn't currently produced by sensors).
+_URGENCY_STR_TO_GOVERNOR: Dict[str, str] = {
+    "critical": "immediate",  # 2.0x multiplier
+    "high": "standard",       # 1.0x multiplier
+    "normal": "complex",      # 0.8x multiplier
+    "low": "background",      # 0.5x multiplier
+}
+
+
+def _intake_governor_mode() -> str:
+    """Shadow / enforce / off — default shadow for Slice 5 Arc A first drop.
+
+    * ``off``      — skip governor consultation entirely (pre-Arc-A behavior)
+    * ``shadow``   — consult + log/SSE any would-be denials, allow through
+    * ``enforce``  — honor the decision; deny returns ``governor_throttled``
+    """
+    raw = os.environ.get("JARVIS_INTAKE_GOVERNOR_MODE", "shadow").strip().lower()
+    if raw in ("off", "shadow", "enforce"):
+        return raw
+    return "shadow"
+
 # P2.4: Module-level GoalTracker reference.  Set by UnifiedIntakeRouter on
 # init so _compute_priority can apply goal-alignment boost without changing
 # the function signature at every call site.
@@ -351,6 +401,32 @@ class UnifiedIntakeRouter:
         ):
             return "backpressure"
 
+        # 4b. Slice 5 Arc A — SensorGovernor advisory consultation.
+        # Shadow mode (default for Arc A first drop): log any would-be deny +
+        # let the SSE bridge publish, but pass through. Enforce mode: honor.
+        # Off mode: skip entirely (pre-Arc-A behavior).
+        gov_mode = _intake_governor_mode()
+        if gov_mode != "off":
+            gov_decision = self._consult_governor(envelope)
+            if gov_decision is not None and not gov_decision.allowed:
+                if gov_mode == "enforce":
+                    logger.info(
+                        "[Router] governor ENFORCE deny: "
+                        "sensor=%s urgency=%s reason=%s cap=%d count=%d",
+                        envelope.source, envelope.urgency,
+                        gov_decision.reason_code,
+                        gov_decision.weighted_cap, gov_decision.current_count,
+                    )
+                    return "governor_throttled"
+                # shadow: would have denied but allow through
+                logger.info(
+                    "[Router] governor SHADOW deny (would have thrown): "
+                    "sensor=%s urgency=%s reason=%s cap=%d count=%d",
+                    envelope.source, envelope.urgency,
+                    gov_decision.reason_code,
+                    gov_decision.weighted_cap, gov_decision.current_count,
+                )
+
         # 4. WAL enqueue — durable before placing on in-memory queue
         lease_id = generate_operation_id("lse")
         envelope = envelope.with_lease(lease_id)
@@ -390,6 +466,11 @@ class UnifiedIntakeRouter:
                 logger.debug("[Router] evidence stash failed: %s", _stash_exc)
         await self._queue.put((priority, envelope.submitted_at, envelope))
 
+        # Slice 5 Arc A — record emission so rolling-window counters update.
+        # Only fires if governor mode was not "off". Never raises.
+        if _intake_governor_mode() != "off":
+            self._record_governor_emission(envelope)
+
         # Fire A-narrator hook — non-critical; failures logged only
         if self._on_ingest_hook is not None:
             try:
@@ -398,6 +479,57 @@ class UnifiedIntakeRouter:
                 logger.debug("[Router] on_ingest_hook error: %s", _hook_exc)
 
         return "enqueued"
+
+    # ------------------------------------------------------------------
+    # Slice 5 Arc A — SensorGovernor consultation helpers
+    # ------------------------------------------------------------------
+
+    def _consult_governor(self, envelope: IntentEnvelope) -> Optional[Any]:
+        """Return a BudgetDecision (or None on any failure).
+
+        Translates envelope source + urgency to governor vocabulary and
+        calls ``request_budget()``. Never raises into the ingest path —
+        governor outage must not break intake.
+        """
+        try:
+            from backend.core.ouroboros.governance.sensor_governor import (
+                Urgency as GovernorUrgency, ensure_seeded,
+            )
+            sensor_name = _SOURCE_TO_GOVERNOR_SENSOR.get(
+                envelope.source, envelope.source,
+            )
+            urgency_str = _URGENCY_STR_TO_GOVERNOR.get(
+                envelope.urgency, "standard",
+            )
+            urgency = GovernorUrgency(urgency_str)
+            governor = ensure_seeded()
+            return governor.request_budget(sensor_name, urgency)
+        except Exception:  # noqa: BLE001 — governor must never break intake
+            logger.debug(
+                "[Router] governor consultation failed (non-fatal)",
+                exc_info=True,
+            )
+            return None
+
+    def _record_governor_emission(self, envelope: IntentEnvelope) -> None:
+        """Record emission in the rolling-window counter. Never raises."""
+        try:
+            from backend.core.ouroboros.governance.sensor_governor import (
+                Urgency as GovernorUrgency, ensure_seeded,
+            )
+            sensor_name = _SOURCE_TO_GOVERNOR_SENSOR.get(
+                envelope.source, envelope.source,
+            )
+            urgency_str = _URGENCY_STR_TO_GOVERNOR.get(
+                envelope.urgency, "standard",
+            )
+            urgency = GovernorUrgency(urgency_str)
+            ensure_seeded().record_emission(sensor_name, urgency)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[Router] governor record_emission failed (non-fatal)",
+                exc_info=True,
+            )
 
     def intake_queue_depth(self) -> int:
         """Current number of items waiting in the dispatch queue."""

@@ -1180,6 +1180,54 @@ class GovernedLoopService:
                 self._health_probe_loop(), name="health_probe_loop"
             )
 
+            # Slice 5 Arc A — start PostureObserver so SensorGovernor's
+            # default_posture_fn sees live readings. Without this, posture
+            # weights collapse to 1.0 and the governor becomes posture-
+            # blind (captured as soak finding #1 on 2026-04-21).
+            # Idempotent: get_default_observer() is a singleton. Failures
+            # are logged but never raise — posture observation is advisory.
+            try:
+                from backend.core.ouroboros.governance.direction_inferrer import (
+                    is_enabled as _di_enabled,
+                )
+                if _di_enabled():
+                    from backend.core.ouroboros.governance.posture_observer import (
+                        get_default_observer,
+                    )
+                    self._posture_observer = get_default_observer(
+                        Path(os.getcwd()),
+                    )
+                    self._posture_observer.start()
+                    logger.info(
+                        "[GovernedLoop] PostureObserver started (Slice 5 Arc A)",
+                    )
+                    # Install SSE bridges for Wave 1 #3 observability —
+                    # best-effort, never-raise pattern.
+                    try:
+                        from backend.core.ouroboros.governance.ide_observability_stream import (
+                            bridge_governor_to_broker,
+                            bridge_memory_pressure_to_broker,
+                            bridge_posture_to_broker,
+                        )
+                        bridge_posture_to_broker(observer=self._posture_observer)
+                        bridge_governor_to_broker()  # uses default singleton
+                        bridge_memory_pressure_to_broker()  # uses default singleton
+                        logger.info(
+                            "[GovernedLoop] Wave 1 SSE bridges installed "
+                            "(posture + governor + memory-pressure)",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "[GovernedLoop] SSE bridge install failed "
+                            "(non-fatal)", exc_info=True,
+                        )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[GovernedLoop] PostureObserver startup failed (non-fatal)",
+                    exc_info=True,
+                )
+                self._posture_observer = None
+
             # C+ L2/L3: CommandBus + EventEmitter + optional subagent scheduler
             if self._command_bus is None:
                 self._command_bus = CommandBus(maxsize=1000)
@@ -1257,6 +1305,17 @@ class GovernedLoopService:
                 await self._health_probe_task
             except asyncio.CancelledError:
                 pass
+
+        # Slice 5 Arc A — stop PostureObserver cleanly (no orphan tasks)
+        observer = getattr(self, "_posture_observer", None)
+        if observer is not None:
+            try:
+                await observer.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] PostureObserver stop failed (non-fatal)",
+                    exc_info=True,
+                )
 
         # Stop L3 scheduler before background loops so no unit outlives GLS
         if self._subagent_scheduler is not None:
