@@ -1,0 +1,133 @@
+{
+  "slice": 3,
+  "feature": "/governor REPL + IDE GET + SSE",
+  "timestamp": 1776824182.6848059,
+  "all_pass": true,
+  "total_checks": 31,
+  "checks": [
+    {
+      "name": "REPL status: 'Sensors' in output",
+      "pass": true
+    },
+    {
+      "name": "REPL bare-alias: 'Sensors' in output",
+      "pass": true
+    },
+    {
+      "name": "REPL explain: 'Sensor budgets' in output",
+      "pass": true
+    },
+    {
+      "name": "REPL history-empty: 'recent' in output",
+      "pass": true
+    },
+    {
+      "name": "REPL help: '/governor' in output",
+      "pass": true
+    },
+    {
+      "name": "REPL memory shows fanout projection",
+      "pass": true
+    },
+    {
+      "name": "REPL reset clears counters",
+      "pass": true
+    },
+    {
+      "name": "REPL reset: count now 0 after reset",
+      "pass": true
+    },
+    {
+      "name": "/channel/health 200",
+      "pass": true
+    },
+    {
+      "name": "GET /governor 200",
+      "pass": true
+    },
+    {
+      "name": "GET /governor has 16 sensors",
+      "pass": true
+    },
+    {
+      "name": "GET /governor schema=1.0",
+      "pass": true
+    },
+    {
+      "name": "GET /governor/history 200",
+      "pass": true
+    },
+    {
+      "name": "GET /governor/history schema=1.0",
+      "pass": true
+    },
+    {
+      "name": "GET /governor/history limit respected",
+      "pass": true
+    },
+    {
+      "name": "GET /memory-pressure 200",
+      "pass": true
+    },
+    {
+      "name": "GET /memory-pressure schema=1.0",
+      "pass": true
+    },
+    {
+      "name": "GET /memory-pressure has probe",
+      "pass": true
+    },
+    {
+      "name": "GET /memory-pressure has level",
+      "pass": true
+    },
+    {
+      "name": "SSE governor_throttle_applied received",
+      "pass": true
+    },
+    {
+      "name": "throttle frame sensor=LiveFireTinySensor",
+      "pass": true
+    },
+    {
+      "name": "SSE memory_pressure_changed on transition",
+      "pass": true
+    },
+    {
+      "name": "pressure frame previous_level=ok",
+      "pass": true
+    },
+    {
+      "name": "pressure frame current_level=critical",
+      "pass": true
+    },
+    {
+      "name": "master=false governor 403",
+      "pass": true
+    },
+    {
+      "name": "master=false memory-pressure 403",
+      "pass": true
+    },
+    {
+      "name": "re-enable governor 200",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/sensor_governor.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/sensor_governor_seed.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/memory_pressure_gate.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/governor_repl.py",
+      "pass": true
+    }
+  ]
+}
