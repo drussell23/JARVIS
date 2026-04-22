@@ -1,24 +1,7 @@
 """Slice 5 Arc A integration tests — SensorGovernor wiring into intake +
 PostureObserver startup at canonical boot.
 
-Scope:
-  1. Intake router consults governor (shadow/enforce/off) and respects
-     the mode via JARVIS_INTAKE_GOVERNOR_MODE
-  2. Urgency + source translation (envelope vocab → governor vocab) is
-     correct and stable
-  3. Source names NOT in the translation map fall through cleanly to
-     "governor.unregistered_sensor" (always allowed)
-  4. ``record_emission`` fires on successful enqueue so rolling-window
-     counters update
-  5. Shadow-mode deny logs the would-be-throttle at INFO but still
-     returns "enqueued"
-  6. Enforce-mode deny returns "governor_throttled" without touching
-     WAL or dedup registry
-  7. Off-mode skips governor consultation entirely (pre-Arc-A behavior)
-  8. Governor failure path is silent — intake must not break when the
-     governor module raises
-
-Authority invariant: this test file imports nothing from
+Authority invariant: no imports from
 orchestrator/policy/iron_gate/risk_tier.
 """
 from __future__ import annotations
@@ -27,7 +10,6 @@ import asyncio
 import logging
 import os
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -36,6 +18,7 @@ from backend.core.ouroboros.governance.intake.intent_envelope import (
     IntentEnvelope, make_envelope,
 )
 from backend.core.ouroboros.governance.intake.unified_intake_router import (
+    IntakeRouterConfig,
     UnifiedIntakeRouter,
     _SOURCE_TO_GOVERNOR_SENSOR,
     _URGENCY_STR_TO_GOVERNOR,
@@ -55,8 +38,14 @@ from backend.core.ouroboros.governance.sensor_governor import (
 # ---------------------------------------------------------------------------
 
 
+_REPO_ROOT_CACHED = Path(subprocess.run(
+    ["git", "rev-parse", "--show-toplevel"],
+    capture_output=True, text=True, check=True,
+).stdout.strip())
+
+
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch, tmp_path):
+def _clean_env(monkeypatch):
     for k in list(os.environ):
         if (k.startswith("JARVIS_INTAKE_GOVERNOR")
                 or k.startswith("JARVIS_SENSOR_GOVERNOR")
@@ -64,17 +53,26 @@ def _clean_env(monkeypatch, tmp_path):
                 or k.startswith("JARVIS_DIRECTION_INFERRER")):
             monkeypatch.delenv(k, raising=False)
     reset_default_governor()
-    # Ensure router uses a clean working dir (its WAL lands under cwd)
-    monkeypatch.chdir(tmp_path)
+    from backend.core.ouroboros.governance.posture_observer import (
+        reset_default_observer, reset_default_store,
+    )
+    reset_default_observer()
+    reset_default_store()
+    # Don't chdir — breaks `git rev-parse` used by the authority pin.
+    # Router WAL writes to config.project_root (tmp_path), not cwd.
     yield
     reset_default_governor()
+    reset_default_observer()
+    reset_default_store()
 
 
 def _make_router(tmp_path: Path) -> UnifiedIntakeRouter:
-    """Build a router with sane defaults for isolation tests."""
-    return UnifiedIntakeRouter(
-        project_root=tmp_path,
-    )
+    """Router wired to a real IntakeRouterConfig under tmp_path.
+
+    ``gls=None`` is safe: the ingest path doesn't touch ``self._gls``.
+    """
+    config = IntakeRouterConfig(project_root=tmp_path)
+    return UnifiedIntakeRouter(gls=None, config=config)
 
 
 def _make_test_envelope(
@@ -83,7 +81,14 @@ def _make_test_envelope(
     description: str = "test op",
 ) -> IntentEnvelope:
     return make_envelope(
-        source=source, urgency=urgency, description=description,
+        source=source,
+        description=description,
+        target_files=("dummy/file.py",),
+        repo="jarvis",
+        confidence=0.8,
+        urgency=urgency,
+        evidence={},
+        requires_human_ack=False,
     )
 
 
@@ -158,28 +163,24 @@ class TestModeEnv:
 
 
 # ---------------------------------------------------------------------------
-# Shadow / enforce / off behavior via direct helpers (no asyncio needed)
+# Governor helpers in isolation (no ingest needed)
 # ---------------------------------------------------------------------------
 
 
 class TestGovernorHelpers:
-    """Test the per-call helpers in isolation; full async ingest covered below."""
 
     def test_consult_governor_returns_decision_for_registered_source(
         self, monkeypatch, tmp_path,
     ):
         monkeypatch.setenv("JARVIS_SENSOR_GOVERNOR_ENABLED", "true")
-        monkeypatch.setenv("JARVIS_INTAKE_GOVERNOR_MODE", "shadow")
         reset_default_governor()
         _sg_seed()
-
         router = _make_router(tmp_path)
         env = _make_test_envelope(source="backlog", urgency="normal")
         decision = router._consult_governor(env)
         assert decision is not None
         assert decision.sensor_name == "BacklogSensor"
-        # urgency "normal" → governor COMPLEX
-        assert decision.urgency is Urgency.COMPLEX
+        assert decision.urgency is Urgency.COMPLEX  # normal → complex
 
     def test_consult_governor_unmapped_source_returns_unregistered(
         self, monkeypatch, tmp_path,
@@ -188,27 +189,22 @@ class TestGovernorHelpers:
         reset_default_governor()
         _sg_seed()
         router = _make_router(tmp_path)
-        # "architecture" is a valid envelope source but NOT in the
-        # governor seed (and NOT in the translation map)
         env = _make_test_envelope(source="architecture", urgency="normal")
         decision = router._consult_governor(env)
         assert decision is not None
         assert decision.allowed is True
         assert decision.reason_code == "governor.unregistered_sensor"
 
-    def test_consult_governor_never_raises_on_registry_failure(
+    def test_consult_governor_never_raises(
         self, monkeypatch, tmp_path,
     ):
-        """Simulate governor import failure — consultation returns None."""
-        # Point the import to nowhere by breaking ensure_seeded
         import backend.core.ouroboros.governance.sensor_governor as sg
 
         def _broken():
-            raise RuntimeError("simulated governor outage")
+            raise RuntimeError("simulated outage")
         monkeypatch.setattr(sg, "ensure_seeded", _broken)
         router = _make_router(tmp_path)
         env = _make_test_envelope()
-        # Must not raise, must return None
         assert router._consult_governor(env) is None
 
     def test_record_emission_never_raises(self, monkeypatch, tmp_path):
@@ -223,14 +219,17 @@ class TestGovernorHelpers:
 
 
 # ---------------------------------------------------------------------------
-# Full ingest path — shadow vs enforce vs off
+# Full ingest path — shadow / enforce / off
 # ---------------------------------------------------------------------------
+
+
+_LOGGER = "backend.core.ouroboros.governance.intake.unified_intake_router"
 
 
 class TestIngestIntegration:
 
     @pytest.mark.asyncio
-    async def test_off_mode_skips_governor_consultation(
+    async def test_off_mode_no_governor_consultation(
         self, monkeypatch, tmp_path, caplog,
     ):
         monkeypatch.setenv("JARVIS_INTAKE_GOVERNOR_MODE", "off")
@@ -238,35 +237,31 @@ class TestIngestIntegration:
         reset_default_governor()
         _sg_seed()
         router = _make_router(tmp_path)
-        env = _make_test_envelope(source="backlog", urgency="normal")
-        with caplog.at_level(logging.INFO, logger="backend.core.ouroboros.governance.intake.unified_intake_router"):
+        env = _make_test_envelope()
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
             result = await router.ingest(env)
         assert result == "enqueued"
-        # No governor SHADOW/ENFORCE log lines
         assert not any("governor" in r.message.lower() for r in caplog.records), \
             "governor should not be consulted in off mode"
 
     @pytest.mark.asyncio
-    async def test_shadow_mode_logs_would_be_deny_but_enqueues(
+    async def test_shadow_mode_logs_deny_but_enqueues(
         self, monkeypatch, tmp_path, caplog,
     ):
         monkeypatch.setenv("JARVIS_INTAKE_GOVERNOR_MODE", "shadow")
         monkeypatch.setenv("JARVIS_SENSOR_GOVERNOR_ENABLED", "true")
-        # Register a 1-cap sensor so we can saturate it
         reset_default_governor()
         g = _sg_seed()
         g.register(SensorBudgetSpec(
             sensor_name="BacklogSensor", base_cap_per_hour=1,
         ), override=True)
-        # Pre-saturate
         g.record_emission("BacklogSensor", Urgency.COMPLEX)
 
         router = _make_router(tmp_path)
         env = _make_test_envelope(source="backlog", urgency="normal")
-        with caplog.at_level(logging.INFO, logger="backend.core.ouroboros.governance.intake.unified_intake_router"):
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
             result = await router.ingest(env)
 
-        # Shadow: would have denied but let through
         assert result == "enqueued"
         assert any("SHADOW deny" in r.message for r in caplog.records), \
             "shadow-mode deny must be logged"
@@ -286,7 +281,7 @@ class TestIngestIntegration:
 
         router = _make_router(tmp_path)
         env = _make_test_envelope(source="backlog", urgency="normal")
-        with caplog.at_level(logging.INFO, logger="backend.core.ouroboros.governance.intake.unified_intake_router"):
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
             result = await router.ingest(env)
         assert result == "governor_throttled"
         assert any("ENFORCE deny" in r.message for r in caplog.records)
@@ -298,7 +293,7 @@ class TestIngestIntegration:
         monkeypatch.setenv("JARVIS_INTAKE_GOVERNOR_MODE", "enforce")
         monkeypatch.setenv("JARVIS_SENSOR_GOVERNOR_ENABLED", "true")
         reset_default_governor()
-        _sg_seed()  # default cap high enough
+        _sg_seed()
         router = _make_router(tmp_path)
         env = _make_test_envelope(source="backlog", urgency="normal")
         result = await router.ingest(env)
@@ -315,16 +310,11 @@ class TestIngestIntegration:
         router = _make_router(tmp_path)
         env = _make_test_envelope(source="backlog", urgency="normal")
 
-        # Before: count = 0
-        d_before = gov.request_budget("BacklogSensor", Urgency.COMPLEX)
-        before_count = d_before.current_count
-
+        before = gov.request_budget("BacklogSensor", Urgency.COMPLEX).current_count
         result = await router.ingest(env)
         assert result == "enqueued"
-
-        # After: count should have grown by 1
-        d_after = gov.request_budget("BacklogSensor", Urgency.COMPLEX)
-        assert d_after.current_count == before_count + 1
+        after = gov.request_budget("BacklogSensor", Urgency.COMPLEX).current_count
+        assert after == before + 1
 
     @pytest.mark.asyncio
     async def test_off_mode_does_not_record_emission(
@@ -337,78 +327,58 @@ class TestIngestIntegration:
         router = _make_router(tmp_path)
         env = _make_test_envelope(source="backlog", urgency="normal")
 
-        d_before = gov.request_budget("BacklogSensor", Urgency.COMPLEX)
-        before_count = d_before.current_count
-
+        before = gov.request_budget("BacklogSensor", Urgency.COMPLEX).current_count
         await router.ingest(env)
-
-        d_after = gov.request_budget("BacklogSensor", Urgency.COMPLEX)
-        assert d_after.current_count == before_count, \
-            "off-mode must not touch the governor counter"
+        after = gov.request_budget("BacklogSensor", Urgency.COMPLEX).current_count
+        assert after == before
 
 
 # ---------------------------------------------------------------------------
-# PostureObserver startup wiring — GovernedLoopService integration
+# PostureObserver startup wiring
 # ---------------------------------------------------------------------------
 
 
 class TestPostureObserverStartup:
-    """Verify PostureObserver starts at the canonical boot site without
-    duplication. We test the startup *block* behavior by importing
-    get_default_observer directly and verifying idempotency."""
 
-    def test_observer_singleton_returns_same_instance(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_observer_singleton_idempotent(self, tmp_path, monkeypatch):
         monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "true")
         from backend.core.ouroboros.governance.posture_observer import (
-            get_default_observer, reset_default_observer,
+            get_default_observer,
         )
-        reset_default_observer()
         o1 = get_default_observer(tmp_path)
         o2 = get_default_observer(tmp_path)
         assert o1 is o2
 
-    def test_observer_start_idempotent(self, tmp_path, monkeypatch):
-        """Calling start() twice must not create two background tasks."""
+    @pytest.mark.asyncio
+    async def test_observer_start_idempotent(self, tmp_path, monkeypatch):
         monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "true")
         from backend.core.ouroboros.governance.posture_observer import (
-            get_default_observer, reset_default_observer,
+            get_default_observer,
         )
-        reset_default_observer()
+        obs = get_default_observer(tmp_path)
+        obs.start()
+        first_task = obs._task
+        obs.start()  # idempotent
+        assert obs._task is first_task
+        await obs.stop()
 
-        async def _inner():
-            obs = get_default_observer(tmp_path)
-            obs.start()
-            first_task = obs._task
-            obs.start()  # idempotent — must not replace the task
-            assert obs._task is first_task
-            await obs.stop()
-
-        asyncio.run(_inner())
-
-    def test_observer_disabled_start_noop(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_observer_disabled_start_noop(self, tmp_path, monkeypatch):
         monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "false")
         from backend.core.ouroboros.governance.posture_observer import (
-            get_default_observer, reset_default_observer,
+            get_default_observer,
         )
-        reset_default_observer()
+        obs = get_default_observer(tmp_path)
+        obs.start()
+        assert obs.is_running() is False
 
-        async def _inner():
-            obs = get_default_observer(tmp_path)
-            obs.start()
-            assert obs.is_running() is False
-
-        asyncio.run(_inner())
-
-    def test_governed_loop_service_has_posture_attr_safe(self):
-        """Regression: getattr(self, '_posture_observer', None) pattern in
-        GovernedLoopService.stop() must work even if start() never set it
-        (e.g. construction without start)."""
+    def test_governed_loop_stop_references_posture_observer(self):
+        """Regression: stop() uses getattr(self, '_posture_observer', None)
+        safely even if start() never set it. Verified via source inspection."""
         from backend.core.ouroboros.governance.governed_loop_service import (
             GovernedLoopService,
         )
-        # We just need to verify the attribute access pattern is safe —
-        # getattr with default is defensive. Sanity check on the
-        # attribute name itself existing as a code path.
         import inspect
         src = inspect.getsource(GovernedLoopService.stop)
         assert "_posture_observer" in src, (
@@ -417,27 +387,21 @@ class TestPostureObserverStartup:
 
 
 # ---------------------------------------------------------------------------
-# Authority invariant (re-pinned for Arc A)
+# Authority invariant (Arc A)
 # ---------------------------------------------------------------------------
 
 
 class TestArcAAuthorityInvariant:
 
-    def test_intake_router_new_code_authority_free(self):
-        """The Arc A edits in unified_intake_router.py add NO new imports
-        from orchestrator/policy/iron_gate/risk_tier."""
-        repo_root = Path(subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip())
+    def test_intake_router_arc_a_additions_authority_free(self):
         src = (
-            repo_root
+            _REPO_ROOT_CACHED
             / "backend/core/ouroboros/governance/intake/unified_intake_router.py"
         ).read_text(encoding="utf-8")
-        # The Arc A additions we introduced:
+        # Arc A additions must not pull in execution-authority modules
         forbidden = ("iron_gate", "risk_tier", "change_engine",
                      "candidate_generator")
         for f in forbidden:
             assert f".{f}" not in src, (
-                f"unified_intake_router.py must not import {f}"
+                f"unified_intake_router.py references authority module {f}"
             )

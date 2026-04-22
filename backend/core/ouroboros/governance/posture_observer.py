@@ -671,7 +671,11 @@ class PostureObserver:
 
 
 import threading as _threading  # noqa: E402  — late alias for singleton guard
-_singleton_guard = _threading.Lock()
+# RLock (reentrant) because get_default_observer() acquires this lock
+# and then calls get_default_store() which acquires it again. A plain
+# threading.Lock would deadlock on that recursive acquisition — bug
+# surfaced by Slice 5 Arc A integration tests on 2026-04-21.
+_singleton_guard = _threading.RLock()
 _singleton_observer: Optional[PostureObserver] = None
 _singleton_store: Optional[PostureStore] = None
 
