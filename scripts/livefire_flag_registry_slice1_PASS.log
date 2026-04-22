@@ -1,0 +1,129 @@
+{
+  "slice": 1,
+  "feature": "FlagRegistry + seed registrations",
+  "timestamp": 1776821640.209569,
+  "all_pass": true,
+  "seed_count": 52,
+  "categories_covered": [
+    "capacity",
+    "experimental",
+    "integration",
+    "observability",
+    "routing",
+    "safety",
+    "timing",
+    "tuning"
+  ],
+  "postures_reached": [
+    "CONSOLIDATE",
+    "EXPLORE",
+    "HARDEN",
+    "MAINTAIN"
+  ],
+  "checks": [
+    {
+      "name": "get_default_registry returns singleton",
+      "pass": true
+    },
+    {
+      "name": "ensure_seeded installs \u226540 flags (actual: 52)",
+      "pass": true
+    },
+    {
+      "name": "SEED_SPECS count matches registry count",
+      "pass": true
+    },
+    {
+      "name": "All 9 DirectionInferrer flags registered (missing: 0)",
+      "pass": true
+    },
+    {
+      "name": "all 8 categories covered (seen: 8)",
+      "pass": true
+    },
+    {
+      "name": "all 4 postures reached in relevance (['CONSOLIDATE', 'EXPLORE', 'HARDEN', 'MAINTAIN'])",
+      "pass": true
+    },
+    {
+      "name": "get_int reads real env",
+      "pass": true
+    },
+    {
+      "name": "get_int falls back to spec default",
+      "pass": true
+    },
+    {
+      "name": "get_int on malformed falls back to spec default",
+      "pass": true
+    },
+    {
+      "name": "suggest_similar finds nearby registered flag",
+      "pass": true
+    },
+    {
+      "name": "nearest suggestion is POSTURE_OBSERVER_INTERVAL_S",
+      "pass": true
+    },
+    {
+      "name": "report_typos silent when master off",
+      "pass": true
+    },
+    {
+      "name": "report_typos emits \u22652 on injected typos with master on",
+      "pass": true
+    },
+    {
+      "name": "report_typos deduplicates within session",
+      "pass": true
+    },
+    {
+      "name": "unregistered_env identifies typo",
+      "pass": true
+    },
+    {
+      "name": "unregistered_env includes suggestions",
+      "pass": true
+    },
+    {
+      "name": "JSON export has schema_version=1.0",
+      "pass": true
+    },
+    {
+      "name": "JSON total matches count (52)",
+      "pass": true
+    },
+    {
+      "name": "JSON export contains master flag",
+      "pass": true
+    },
+    {
+      "name": "JSON flag has category",
+      "pass": true
+    },
+    {
+      "name": "JSON flag has posture_relevance",
+      "pass": true
+    },
+    {
+      "name": "Slice 1 default: is_enabled() is False",
+      "pass": true
+    },
+    {
+      "name": "stats total = count",
+      "pass": true
+    },
+    {
+      "name": "stats has 8 category rollups",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/flag_registry.py",
+      "pass": true
+    },
+    {
+      "name": "authority-free: backend/core/ouroboros/governance/flag_registry_seed.py",
+      "pass": true
+    }
+  ]
+}
