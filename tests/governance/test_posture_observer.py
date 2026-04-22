@@ -622,12 +622,19 @@ class TestEnvDefaults:
 class TestStrategicDirectionIntegration:
 
     @pytest.mark.asyncio
-    async def test_format_for_prompt_without_posture_when_master_off(self, tmp_path: Path):
+    async def test_format_for_prompt_without_posture_when_master_off(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Post-Wave-1-graduation: master defaults True, so must set
+        =false explicitly to test the master-off path. Without this
+        the live-fire-populated .jarvis/posture_current.json would
+        get picked up by the default store and the section would
+        render."""
+        monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "false")
         from backend.core.ouroboros.governance.strategic_direction import (
             StrategicDirectionService,
         )
         svc = StrategicDirectionService(tmp_path)
-        # Force a minimal digest so the method returns non-empty
         svc._digest = "test digest"  # type: ignore[attr-defined]
         svc._loaded = True  # type: ignore[attr-defined]
         out = svc.format_for_prompt()
@@ -682,11 +689,22 @@ class TestStrategicDirectionIntegration:
     async def test_format_for_prompt_no_crash_when_store_empty(
         self, tmp_path: Path, monkeypatch,
     ):
+        """Store points to a tmp_path with no posture_current.json — the
+        render_posture_section must gracefully produce no section rather
+        than crash. Must reset the default store so the Arc-A-live-fire-
+        written .jarvis/posture_current.json in the real repo doesn't
+        leak in via the default singleton path."""
         from backend.core.ouroboros.governance.strategic_direction import (
             StrategicDirectionService,
         )
+        from backend.core.ouroboros.governance.posture_observer import (
+            get_default_store,
+        )
         monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ENABLED", "true")
-        # No write_current → store has nothing
+        # Force the default store onto tmp_path so the real repo's
+        # .jarvis/posture_current.json doesn't leak in.
+        reset_default_store()
+        get_default_store(tmp_path / ".jarvis")
         svc = StrategicDirectionService(tmp_path)
         svc._digest = "test digest"  # type: ignore[attr-defined]
         svc._loaded = True  # type: ignore[attr-defined]

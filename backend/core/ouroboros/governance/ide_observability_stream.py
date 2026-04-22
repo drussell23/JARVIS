@@ -133,6 +133,11 @@ EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
 EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 
+# Slice 5 Arc B — L3 fan-out decision (allow / clamp / disabled / probe_fail).
+# Fires on every gate consultation from subagent_scheduler, not just clamps,
+# so operator has full §8 trail. Scheduler call rate is bounded.
+EVENT_TYPE_MEMORY_FANOUT_DECISION = "memory_fanout_decision"
+
 # Inline Permission Slice 4 — per-tool-call prompt + grant stream vocab.
 EVENT_TYPE_INLINE_PROMPT_PENDING = "inline_prompt_pending"
 EVENT_TYPE_INLINE_PROMPT_ALLOWED = "inline_prompt_allowed"
@@ -198,6 +203,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED,
     EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE,
     EVENT_TYPE_MEMORY_PRESSURE_CHANGED,
+    EVENT_TYPE_MEMORY_FANOUT_DECISION,
 })
 
 
@@ -1383,3 +1389,42 @@ def bridge_memory_pressure_to_broker(
             pass
 
     return _unsubscribe
+
+
+def publish_memory_fanout_decision_event(
+    graph_id: str,
+    disposition: str,
+    decision: Any,
+) -> Optional[str]:
+    """Best-effort publisher for Slice 5 Arc B fanout gate decisions.
+
+    Fires on every gate consultation from subagent_scheduler (not just
+    clamps) so operators get a full §8 audit trail. Scheduler call rate
+    is bounded by graph-execution cadence.
+
+    ``disposition`` ∈ {``"allow"``, ``"clamp"``, ``"disabled"``,
+    ``"probe_fail"``}. ``decision`` is a ``FanoutDecision`` from
+    ``MemoryPressureGate.can_fanout()``.
+    """
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_MEMORY_FANOUT_DECISION, graph_id,
+            {
+                "graph_id": graph_id,
+                "disposition": disposition,
+                "n_requested": decision.n_requested,
+                "n_allowed": decision.n_allowed,
+                "level": decision.level.value,
+                "free_pct": decision.free_pct,
+                "reason_code": decision.reason_code,
+                "source": decision.source,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_memory_fanout_decision_event exception",
+            exc_info=True,
+        )
+        return None

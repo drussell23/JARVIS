@@ -483,6 +483,23 @@ class SubagentScheduler:
 
                 ready = self._compute_ready_units(graph, state)
                 selected, deferred = self._select_ready_batch(graph, ready)
+
+                # Slice 5 Arc B — MemoryPressureGate consultation before L3
+                # fan-out. Direct enforce (per operator authorization): if the
+                # gate clamps N_requested → N_allowed, move overflow into the
+                # deferred queue so it gets replayed on the next loop iteration.
+                # Zero work loss. Gate-disabled → pass-through (no clamp). Every
+                # decision is logged + SSE-published (allow / clamp / disabled /
+                # probe_fail) so operators have a §8 audit trail.
+                if selected:
+                    decision = self._consult_memory_gate(
+                        len(selected), graph_id=graph_id,
+                    )
+                    if decision is not None and decision.n_allowed < len(selected):
+                        overflow = list(selected[decision.n_allowed:])
+                        selected = list(selected[:decision.n_allowed])
+                        deferred = sorted(list(deferred) + overflow)
+
                 if not selected:
                     state = self._update_state(
                         state,
@@ -657,6 +674,80 @@ class SubagentScheduler:
             if all(dep in completed for dep in unit.dependency_ids):
                 ready.append(unit.unit_id)
         return sorted(ready)
+
+    def _consult_memory_gate(
+        self,
+        n_requested: int,
+        *,
+        graph_id: str,
+    ) -> Optional[Any]:
+        """Slice 5 Arc B — consult MemoryPressureGate + log + publish SSE.
+
+        Returns the ``FanoutDecision`` (or ``None`` on any failure —
+        scheduler must not break when the gate is unavailable).
+
+        Classifies the decision into one of four deterministic
+        dispositions for the SSE payload + log line:
+
+          * ``allow``      — OK level, no clamp
+          * ``clamp``      — requested > allowed; overflow gets deferred
+          * ``disabled``   — gate master flag off (pass-through)
+          * ``probe_fail`` — probe raised / returned unreliable data
+
+        Log every decision (INFO normally, WARNING on clamp) and fire
+        one SSE frame per decision so operators get a full §8 audit
+        trail of fan-out pressure behavior. Scheduler call rate is
+        bounded by graph-execution cadence.
+        """
+        try:
+            from backend.core.ouroboros.governance.memory_pressure_gate import (
+                get_default_gate,
+            )
+            gate = get_default_gate()
+            decision = gate.can_fanout(n_requested)
+        except Exception:  # noqa: BLE001 — gate must not break scheduler
+            logger.debug(
+                "[SubagentScheduler] memory gate consultation failed "
+                "(non-fatal)", exc_info=True,
+            )
+            return None
+
+        # Deterministic disposition classification
+        reason = decision.reason_code
+        if reason == "memory_pressure_gate.disabled":
+            disposition = "disabled"
+        elif reason.startswith("memory_pressure_gate.probe_"):
+            disposition = "probe_fail"
+        elif decision.n_allowed < decision.n_requested:
+            disposition = "clamp"
+        else:
+            disposition = "allow"
+
+        log_fn = logger.warning if disposition == "clamp" else logger.info
+        log_fn(
+            "[SubagentScheduler] fanout_gate: graph=%s disposition=%s "
+            "requested=%d allowed=%d level=%s reason=%s",
+            graph_id, disposition, decision.n_requested,
+            decision.n_allowed, decision.level.value, decision.reason_code,
+        )
+
+        # Best-effort SSE publish
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                publish_memory_fanout_decision_event,
+            )
+            publish_memory_fanout_decision_event(
+                graph_id=graph_id,
+                disposition=disposition,
+                decision=decision,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[SubagentScheduler] fanout SSE publish failed (non-fatal)",
+                exc_info=True,
+            )
+
+        return decision
 
     def _select_ready_batch(
         self,
