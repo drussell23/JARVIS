@@ -227,7 +227,15 @@ def _phase_runner_slice4b_extracted() -> bool:
 def _phase_runner_gate_extracted() -> bool:
     """Slice 4a.2 of Wave 2 (5) — GATE phase extraction gate.
 
-    Reads ``JARVIS_PHASE_RUNNER_GATE_EXTRACTED`` (default ``false``).
+    **Default ``true`` as of 2026-04-23 graduation** (3 clean soak
+    sessions bt-2026-04-23-005127 / -010733 / -012329, each 0 PM /
+    $0 / 0 runner-attributed frames / 0 shutdown race; reachability
+    observed in 2/3 sessions via ``[PhaseRunnerDelegate] GATE`` +
+    ``[SemanticGuard]`` lines — S3 terminated upstream of GATE per
+    downstream-of-VALIDATE reachability profile). Explicit ``=false``
+    remains a runtime kill switch reverting to the 600-line inline
+    GATE block.
+
     When ``true``, delegates the 600-line GATE block (can_write +
     SecurityReviewer + SimilarityGate + frozen_tier + risk ceiling +
     SemanticGuardian + REVIEW shadow + MutationGate + MIN_RISK_TIER
@@ -236,7 +244,7 @@ def _phase_runner_gate_extracted() -> bool:
     threaded back via ``PhaseResult.artifacts["risk_tier"]``.
     """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_GATE_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_GATE_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
