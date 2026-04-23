@@ -188,7 +188,29 @@ def _phase_runner_plan_extracted() -> bool:
 def _phase_runner_generate_extracted() -> bool:
     """Slice 5a/5b of Wave 2 (5) — GENERATE phase extraction gate.
 
-    Reads ``JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED`` (default ``false``).
+    **Default ``true`` as of 2026-04-23 graduation** (3 clean sessions
+    under post-Ticket-A1/B/C guards: bt-2026-04-23-062014 (14 markers)
+    + bt-2026-04-23-203517 S2′ (12 markers, session_outcome=complete)
+    + bt-2026-04-23-210943 S3 (13 markers, session_outcome=complete);
+    all three idle_timeout stop, 0 runner-attributed frames, 0 JARVIS
+    shutdown race, 0 POSTMORTEMs, 39 total [PhaseRunnerDelegate] GENERATE
+    markers). Iron Gate live lines NOT observed across the cadence
+    because Anthropic transport weather (canonical signature:
+    anthropic/_base_client.py:1637 request → httpx/_transports/default.py:101
+    map_httpcore_exceptions) prevented candidates from forming; §6
+    depth is attested by the Slice 5a+5b parity oracle (36/36 tests
+    green on HEAD 68954cc62d — 12 FSM-edge parity + 24 Iron Gate
+    suite across Exploration-first / Exploration Ledger / ASCII strict
+    / Dependency integrity / Multi-file coverage / Retry feedback).
+    reachability_source=partial_live+parity under the path (B)
+    contract documented in project_wave2_graduation_matrix.md.
+    Explicit ``=false`` remains a runtime kill switch reverting to the
+    ~1,611-line inline GENERATE block. A post-flip confirmation session
+    is required per operator directive to capture Iron Gate telemetry
+    if/when the transport weather clears — failure to observe Iron
+    Gate lines post-flip does NOT auto-rollback unless runner-attributed
+    regression or parity breaks.
+
     When ``true``, delegates the ~1,611-line GENERATE block (prelude +
     retry loop + CandidateGenerator dispatch + cost cap + forward-progress
     detector + productivity detector + Iron Gate suite + retry feedback)
@@ -198,7 +220,7 @@ def _phase_runner_generate_extracted() -> bool:
     Gate suite parity depth (same runner module + flag).
     """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
