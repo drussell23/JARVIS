@@ -212,7 +212,7 @@ class BattleTestHarness:
         """
         atexit.register(self._atexit_fallback_write)
 
-    def _atexit_fallback_write(self) -> None:
+    def _atexit_fallback_write(self, session_outcome: Optional[str] = None) -> None:
         """Best-effort synchronous summary.json writer for partial shutdown.
 
         Stamps ``stop_reason="partial_shutdown:atexit_fallback"`` (or
@@ -223,6 +223,14 @@ class BattleTestHarness:
         operations list) so partial sessions still yield v1.1a-compatible
         summaries — LastSessionSummary on the next boot can parse them
         the same way it parses clean summaries.
+
+        Ticket B (2026-04-23): when called from the signal-driven path
+        (SIGHUP / SIGTERM / SIGINT) the caller passes
+        ``session_outcome="incomplete_kill"`` which gets stamped on the
+        partial summary so audit tooling can distinguish clean vs
+        interrupted sessions without parsing free-form ``stop_reason``
+        strings. Also captures ``last_activity_ts`` best-effort from
+        the idle watchdog's monotonic clock.
 
         Never raises: any exception is logged and swallowed. Running
         during interpreter teardown means we can't trust the event loop
@@ -270,6 +278,24 @@ class BattleTestHarness:
             except Exception:  # noqa: BLE001
                 pass
 
+            # Ticket B (v1.1b): stamp session_outcome when caller provided
+            # it (signal-driven path sends "incomplete_kill"). Best-effort
+            # last-activity timestamp from the idle watchdog's monotonic
+            # clock converted to wall-clock via _started_at.
+            _last_activity_ts: Optional[float] = None
+            try:
+                _wd = self._idle_watchdog
+                if self._started_at and _wd is not None:
+                    _last_poke = getattr(_wd, "_last_poke", None)
+                    if _last_poke is not None:
+                        # Watchdog uses time.monotonic(); convert to wall
+                        # clock by anchoring at _started_at.
+                        _last_activity_ts = self._started_at + (
+                            _last_poke - getattr(_wd, "_start_monotonic", _last_poke)
+                        )
+            except Exception:  # noqa: BLE001
+                _last_activity_ts = None
+
             self._session_recorder.save_summary(
                 output_dir=session_dir,
                 stop_reason=reason,
@@ -280,6 +306,8 @@ class BattleTestHarness:
                 convergence_state="INSUFFICIENT_DATA",
                 convergence_slope=0.0,
                 convergence_r2=0.0,
+                session_outcome=session_outcome,
+                last_activity_ts=_last_activity_ts,
             )
             self._summary_written = True
             # Can't trust logger during interpreter teardown — fallback
@@ -3053,7 +3081,7 @@ class BattleTestHarness:
     # ------------------------------------------------------------------
 
     def register_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Register SIGINT/SIGTERM handlers to trigger clean shutdown.
+        """Register SIGHUP/SIGINT/SIGTERM handlers to trigger clean shutdown.
 
         Insurance pattern: each signal handler does a **synchronous**
         partial-summary write BEFORE setting the shutdown event. This
@@ -3062,6 +3090,27 @@ class BattleTestHarness:
         SIGTERM to SIGKILL, asyncio gets stuck in a C extension, or
         an exception in ``_shutdown_components`` aborts the finally
         block mid-execution).
+
+        **Ticket B (2026-04-23): SIGHUP added.** Previously only SIGINT
+        and SIGTERM were handled; when the agent-conducted soak harness
+        is launched as a background pipeline (``tail -f /dev/null |
+        python3 scripts/ouroboros_battle_test.py ...``) and the parent
+        bash is killed via Claude Code's ``TaskStop``, Python's default
+        SIGHUP action is to terminate without running ``atexit`` — the
+        signature left behind was a session dir with only ``debug.log``
+        and no ``summary.json`` (#7 GENERATE S2, ``bt-2026-04-23-070317``).
+        SIGHUP now routes through the same sync-partial-write path as
+        SIGTERM/SIGINT and stamps ``session_outcome="incomplete_kill"``
+        plus a signal-specific ``stop_reason`` so audit tooling can
+        distinguish parent-death from operator-interrupt.
+
+        **Ticket B: SIGPIPE explicitly ignored.** Harness runs under the
+        ``tail -f /dev/null | ...`` idiom (see Ticket C). If the parent
+        bash dies, the stdin pipe closes and subsequent writes to stdout
+        (log handlers during shutdown) could raise ``BrokenPipeError``
+        via SIGPIPE. Setting ``SIG_IGN`` prevents the interpreter from
+        crashing on the first pipe-broken write during the signal-driven
+        cleanup path.
 
         The sync write is idempotent: the ``_summary_written`` flag
         prevents the atexit fallback from double-writing if the async
@@ -3072,14 +3121,39 @@ class BattleTestHarness:
         Catches ``NotImplementedError`` on Windows where
         ``loop.add_signal_handler`` is not supported.
         """
+        # SIGPIPE: ignore process-wide so broken-pipe writes during
+        # shutdown don't crash before atexit runs. Safe — the harness
+        # doesn't rely on SIGPIPE for anything else. Must happen OUTSIDE
+        # loop.add_signal_handler (SIG_IGN is a plain signal.signal call).
         try:
-            loop.add_signal_handler(signal.SIGINT, self._handle_shutdown_signal)
-            loop.add_signal_handler(signal.SIGTERM, self._handle_shutdown_signal)
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        except (AttributeError, ValueError, OSError):
+            # Windows lacks SIGPIPE; ValueError/OSError can surface when
+            # called off the main thread. All non-fatal — fall through.
+            pass
+        try:
+            import functools as _functools
+            loop.add_signal_handler(
+                signal.SIGINT,
+                _functools.partial(self._handle_shutdown_signal, "sigint"),
+            )
+            loop.add_signal_handler(
+                signal.SIGTERM,
+                _functools.partial(self._handle_shutdown_signal, "sigterm"),
+            )
+            # Ticket B: SIGHUP. macOS/Linux only — Windows lacks SIGHUP
+            # and the getattr probe below keeps this import-safe.
+            _sighup = getattr(signal, "SIGHUP", None)
+            if _sighup is not None:
+                loop.add_signal_handler(
+                    _sighup,
+                    _functools.partial(self._handle_shutdown_signal, "sighup"),
+                )
         except NotImplementedError:
             logger.warning("Signal handlers not supported on this platform")
 
-    def _handle_shutdown_signal(self) -> None:
-        """Bound callback fired by asyncio on SIGINT/SIGTERM.
+    def _handle_shutdown_signal(self, signal_name: Optional[str] = None) -> None:
+        """Bound callback fired by asyncio on SIGHUP/SIGINT/SIGTERM.
 
         Performs the sync partial-summary write BEFORE setting the
         shutdown event so the async cleanup cannot be cut off without
@@ -3087,9 +3161,34 @@ class BattleTestHarness:
         the async clean path subsequently completes, it overwrites
         the partial with the full summary (same ``_summary_written``
         flag gate).
+
+        Ticket B (2026-04-23): ``signal_name`` is bound via
+        ``functools.partial`` at registration time (one of ``"sighup"``,
+        ``"sigterm"``, ``"sigint"``). Stamps a signal-specific
+        ``_stop_reason`` before the sync write so the partial summary
+        distinguishes parent-death (SIGHUP) from operator-interrupt
+        (SIGINT) from container-kill (SIGTERM), and passes
+        ``session_outcome="incomplete_kill"`` through to the writer.
+
+        When called with ``signal_name=None`` (legacy test-harness path
+        before Ticket B), behavior is preserved: no ``_stop_reason``
+        stamping, atexit fallback writes ``"partial_shutdown:atexit_fallback"``
+        and no ``session_outcome`` field. This preserves the pre-Ticket-B
+        contract that the ``register_signal_handlers`` production path
+        always supplies the signal name.
         """
+        # Stamp the signal-specific reason before the write runs so the
+        # partial summary carries an actionable classifier instead of the
+        # generic "shutdown_signal" catch-all. Keep the existing value if
+        # something earlier on the path already set a more informative
+        # one (e.g. wall_clock_cap raced ahead of the signal).
+        if signal_name is not None and self._stop_reason in ("unknown", "", None):
+            self._stop_reason = signal_name
         try:
-            self._atexit_fallback_write()
+            if signal_name is not None:
+                self._atexit_fallback_write(session_outcome="incomplete_kill")
+            else:
+                self._atexit_fallback_write()
         except Exception:  # noqa: BLE001
             logger.debug("signal-driven partial write failed", exc_info=True)
         if self._shutdown_event is not None:
@@ -3649,6 +3748,12 @@ class BattleTestHarness:
                 convergence_slope=convergence_slope,
                 convergence_r2=convergence_r2,
                 strategic_drift=strategic_drift,
+                # Ticket B (v1.1b): clean path stamps session_outcome="complete".
+                # Signal-driven partial path stamps "incomplete_kill" via
+                # _atexit_fallback_write(session_outcome=...). Together these
+                # two values form the enum audit tooling consumes.
+                session_outcome="complete",
+                last_activity_ts=time.time(),
             )
             # Flag prevents the atexit fallback from double-writing a
             # partial summary on top of the clean one.

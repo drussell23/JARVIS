@@ -437,6 +437,8 @@ class SessionRecorder:
         convergence_slope: float,
         convergence_r2: float,
         strategic_drift: Optional[Dict[str, Any]] = None,
+        session_outcome: Optional[str] = None,
+        last_activity_ts: Optional[float] = None,
     ) -> Path:
         """Write ``summary.json`` and (if any) ``review_queue.jsonl`` to *output_dir*.
 
@@ -460,6 +462,21 @@ class SessionRecorder:
             Linear-regression slope from the convergence tracker.
         convergence_r2:
             R² of the logarithmic fit.
+        session_outcome:
+            Ticket B (v1.1b, 2026-04-23): optional high-level classifier of
+            how the session ended. ``None`` is omitted from the JSON for
+            back-compat; set to ``"complete"`` on the clean ``_generate_report``
+            path, ``"incomplete_kill"`` when the signal-driven partial-write
+            path ran (SIGHUP / SIGTERM / SIGINT). Orthogonal to
+            ``stop_reason`` (which is free-form) — ``session_outcome`` is a
+            small enum distinguishing clean vs interrupted without the
+            audit tooling needing to parse ``stop_reason`` strings.
+        last_activity_ts:
+            Ticket B (v1.1b): optional POSIX timestamp of the last observed
+            FSM transition or structured log line. Helps downstream audit
+            compute the silence gap between "last interesting thing" and
+            "session ended" — the distinguishing feature of retry-storm
+            hangs vs normal idle_timeout.
 
         Returns
         -------
@@ -487,6 +504,13 @@ class SessionRecorder:
         }
         if strategic_drift is not None:
             summary["strategic_drift"] = strategic_drift
+        # v1.1b additive fields (Ticket B, 2026-04-23). Emitted only when
+        # non-None so pre-v1.1b consumers (LSS v1.1a) still parse cleanly —
+        # schema_version stays at 2 because the extension is purely additive.
+        if session_outcome is not None:
+            summary["session_outcome"] = session_outcome
+        if last_activity_ts is not None:
+            summary["last_activity_ts"] = last_activity_ts
 
         # v1.1a: emit ``ops_digest`` only when at least one real APPLY
         # was observed. Empty sessions produce no digest key at all so
