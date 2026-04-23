@@ -206,7 +206,18 @@ def _phase_runner_generate_extracted() -> bool:
 def _phase_runner_slice4b_extracted() -> bool:
     """Slice 4b of Wave 2 (5) — APPROVE + APPLY + VERIFY combined gate.
 
-    Reads ``JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED`` (default ``false``).
+    **Default ``true`` as of 2026-04-23 graduation** (harness-class 4-session
+    cadence bt-2026-04-23-033530 / -040327 / -043017 / -045653 — each 0 PM /
+    0 runner-attributed frames / 0 shutdown race; reachability observed in
+    4/4 via `[PhaseRunnerDelegate] APPROVE+APPLY+VERIFY → Slice4bRunner`
+    markers on live RuntimeHealthSensor IMMEDIATE ops walking
+    CLASSIFY → ROUTE+CTX+PLAN → VALIDATE → GATE → SLICE4B with APPLY
+    HEARTBEAT @ 80% on `requirements.txt`; reachability_source=opportunistic
+    per operator-accepted bar "real op hit the runner under flag-on, not
+    that our backlog seed won a race"). Explicit ``=false`` remains a
+    runtime kill switch reverting to the ~1150-line inline APPROVE+APPLY+VERIFY
+    block.
+
     When ``true``, delegates the ~1150-line APPROVE + APPLY (with 7.5
     INFRA) + VERIFY (with 8a scoped tests, 8b auto-commit, 8b2 hot-reload,
     8c self-critique, 8d visual VERIFY) block to :class:`Slice4bRunner`.
@@ -219,7 +230,7 @@ def _phase_runner_slice4b_extracted() -> bool:
     canary latency calculation.
     """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
