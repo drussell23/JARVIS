@@ -75,6 +75,15 @@ class HarnessConfig:
         Maximum API spend for the session.
     idle_timeout_s:
         Seconds of inactivity before the session is stopped.
+    max_wall_seconds_s:
+        Hard wall-clock ceiling on total session duration. ``None`` or
+        ``<=0`` disables the cap (legacy behavior — only ``idle_timeout_s``
+        and ``cost_cap_usd`` bound the session). When set and exceeded,
+        the session terminates with ``stop_reason="wall_clock_cap"`` via
+        the same graceful-shutdown path used by ``idle_timeout``. Added
+        per Ticket A (2026-04-23) to prevent provider retry storms from
+        defeating both idle-gap and budget watchdogs. Graduation soaks
+        MUST set this to a bounded value (e.g. 2400 = 40 min).
     branch_prefix:
         Prefix for the accumulation branch name.
     session_dir:
@@ -86,6 +95,7 @@ class HarnessConfig:
     repo_path: Path = field(default_factory=lambda: Path("."))
     cost_cap_usd: float = 0.50
     idle_timeout_s: float = 600.0
+    max_wall_seconds_s: Optional[float] = None
     branch_prefix: str = "ouroboros/battle-test"
     session_dir: Optional[Path] = None
     notebook_output_dir: Optional[Path] = None
@@ -97,13 +107,16 @@ class HarnessConfig:
         Reads:
         - ``OUROBOROS_BATTLE_COST_CAP``
         - ``OUROBOROS_BATTLE_IDLE_TIMEOUT``
+        - ``OUROBOROS_BATTLE_MAX_WALL_SECONDS`` (``0`` or unset = disabled)
         - ``OUROBOROS_BATTLE_BRANCH_PREFIX``
         - ``JARVIS_REPO_PATH``
         """
+        _wall = float(os.environ.get("OUROBOROS_BATTLE_MAX_WALL_SECONDS", "0"))
         return cls(
             repo_path=Path(os.environ.get("JARVIS_REPO_PATH", ".")),
             cost_cap_usd=float(os.environ.get("OUROBOROS_BATTLE_COST_CAP", "0.50")),
             idle_timeout_s=float(os.environ.get("OUROBOROS_BATTLE_IDLE_TIMEOUT", "600.0")),
+            max_wall_seconds_s=_wall if _wall > 0 else None,
             branch_prefix=os.environ.get("OUROBOROS_BATTLE_BRANCH_PREFIX", "ouroboros/battle-test"),
         )
 
@@ -325,6 +338,12 @@ class BattleTestHarness:
         self._shutdown_event = asyncio.Event()
         self._cost_tracker.budget_event = asyncio.Event()
         self._idle_watchdog.idle_event = asyncio.Event()
+        # Ticket A Guard 2: wall-clock ceiling. Event fires when total session
+        # wall time exceeds config.max_wall_seconds_s. Prevents provider retry
+        # storms from hijacking both --idle-timeout (reset by retry activity)
+        # and budget caps (retries may not be billable). Disabled when
+        # max_wall_seconds_s is None or <= 0.
+        self._wall_clock_event: asyncio.Event = asyncio.Event()
 
         # Publish the session id to the strategic_direction module global so
         # that the Orchestrator's CLASSIFY-phase GoalActivityLedger append can
@@ -554,6 +573,22 @@ class BattleTestHarness:
             # Start provider cost monitor — feeds real API spend into CostTracker
             self._cost_monitor_task = asyncio.ensure_future(self._monitor_provider_costs())
 
+            # Ticket A Guard 2: wall-clock watchdog. Opaque hard ceiling on
+            # total session duration — fires independently of any activity
+            # signal so retry storms cannot hijack termination. Only spawned
+            # when max_wall_seconds_s is a positive float.
+            self._wall_clock_monitor_task: Optional[asyncio.Future] = None
+            _wall_cap = self._config.max_wall_seconds_s
+            if _wall_cap is not None and _wall_cap > 0:
+                self._wall_clock_monitor_task = asyncio.ensure_future(
+                    self._monitor_wall_clock(_wall_cap)
+                )
+                logger.info(
+                    "[WallClockWatchdog] armed: max_wall_seconds=%.0fs — session will "
+                    "terminate with stop_reason=wall_clock_cap if not already stopped.",
+                    _wall_cap,
+                )
+
             # Start hot-reload restart-pending monitor — graceful respawn on
             # quarantined self-modifications. See _monitor_restart_pending.
             self._restart_monitor_task = asyncio.ensure_future(
@@ -571,9 +606,14 @@ class BattleTestHarness:
             shutdown_waiter = asyncio.ensure_future(self._shutdown_event.wait())
             budget_waiter = asyncio.ensure_future(self._cost_tracker.budget_event.wait())
             idle_waiter = asyncio.ensure_future(self._idle_watchdog.idle_event.wait())
+            # Ticket A Guard 2: wall-clock waiter joins the 4-way race. When
+            # max_wall_seconds_s is None/disabled the event is never set, so
+            # the waiter blocks forever and has no effect on the legacy
+            # 3-way race — backwards-compatible.
+            wall_clock_waiter = asyncio.ensure_future(self._wall_clock_event.wait())
 
             done, pending = await asyncio.wait(
-                [shutdown_waiter, budget_waiter, idle_waiter],
+                [shutdown_waiter, budget_waiter, idle_waiter, wall_clock_waiter],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -590,6 +630,14 @@ class BattleTestHarness:
             # overwritten with the generic "shutdown_signal").
             if self._stop_reason.startswith("restart_pending:"):
                 pass  # already set by _monitor_restart_pending
+            elif wall_clock_waiter in done:
+                self._stop_reason = "wall_clock_cap"
+                logger.warning(
+                    "Session %s stopping: wall_clock_cap — max_wall_seconds=%.0fs "
+                    "exceeded. This is a harness-class clean stop (Ticket A Guard 2).",
+                    self._session_id,
+                    self._config.max_wall_seconds_s or 0.0,
+                )
             elif shutdown_waiter in done:
                 self._stop_reason = "shutdown_signal"
             elif budget_waiter in done:
@@ -3319,6 +3367,39 @@ class BattleTestHarness:
     # Hot-reload Restart Monitor
     # ------------------------------------------------------------------
 
+    async def _monitor_wall_clock(self, cap_s: float) -> None:
+        """Ticket A Guard 2 — hard wall-clock watchdog.
+
+        Opaque ceiling on total session duration. Unlike ``_monitor_gls_activity``
+        which gates on phase-transition progress (and can be hijacked by
+        provider retry storms that reset per-op last_transition_at_utc), this
+        watchdog fires strictly on wall-clock elapsed time and is immune to
+        any activity signal. Graduation soaks MUST arm this via
+        ``--max-wall-seconds`` to guarantee deterministic termination.
+
+        Fires ``self._wall_clock_event`` once the configured cap is exceeded,
+        which joins the FIRST_COMPLETED race in ``run()`` alongside shutdown /
+        budget / idle waiters and routes to ``stop_reason="wall_clock_cap"``.
+
+        Per the harness-class footnote in the graduation matrix,
+        ``wall_clock_cap`` is treated equivalent to ``idle_timeout`` for
+        clean-bar purposes — both are orderly graceful-shutdown paths.
+        """
+        try:
+            await asyncio.sleep(cap_s)
+        except asyncio.CancelledError:
+            return
+        # If another waiter already fired and the shutdown path is in progress,
+        # this is a no-op — set() on an already-set event is idempotent, and
+        # the FIRST_COMPLETED race has already picked its winner.
+        logger.warning(
+            "[WallClockWatchdog] fired: wall time %.0fs exceeded max_wall_seconds=%.0fs — "
+            "triggering graceful shutdown with stop_reason=wall_clock_cap.",
+            time.time() - self._started_at,
+            cap_s,
+        )
+        self._wall_clock_event.set()
+
     async def _monitor_restart_pending(self) -> None:
         """Background task: poll the orchestrator's hot-reloader for a
         restart-pending flag, and trigger graceful shutdown when set.
@@ -3420,6 +3501,18 @@ class BattleTestHarness:
                 self._restart_monitor_task.cancel()
                 try:
                     await self._restart_monitor_task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
+
+        # 0e. Wall-clock watchdog (Ticket A Guard 2) — may be None when
+        # max_wall_seconds_s is disabled.
+        try:
+            if hasattr(self, "_wall_clock_monitor_task") and self._wall_clock_monitor_task:
+                self._wall_clock_monitor_task.cancel()
+                try:
+                    await self._wall_clock_monitor_task
                 except asyncio.CancelledError:
                     pass
         except Exception:

@@ -580,6 +580,18 @@ def main() -> None:
         help="Inactivity timeout in seconds (env: OUROBOROS_BATTLE_IDLE_TIMEOUT, default: 600)",
     )
     parser.add_argument(
+        "--max-wall-seconds",
+        type=float,
+        default=float(os.environ.get("OUROBOROS_BATTLE_MAX_WALL_SECONDS", "0")),
+        metavar="SEC",
+        help=(
+            "Hard wall-clock ceiling on total session duration — fires stop_reason=wall_clock_cap "
+            "when exceeded. 0 or unset = disabled (legacy behavior). Graduation soaks MUST set "
+            "this (e.g. 2400 = 40 min) to guarantee deterministic termination when provider "
+            "retry storms defeat --idle-timeout. Env: OUROBOROS_BATTLE_MAX_WALL_SECONDS."
+        ),
+    )
+    parser.add_argument(
         "--branch-prefix",
         type=str,
         default=os.environ.get("OUROBOROS_BATTLE_BRANCH_PREFIX", "ouroboros/battle-test"),
@@ -674,6 +686,7 @@ def main() -> None:
         repo_path=Path(args.repo_path),
         cost_cap_usd=args.cost_cap,
         idle_timeout_s=args.idle_timeout,
+        max_wall_seconds_s=args.max_wall_seconds or None,
         branch_prefix=args.branch_prefix,
     )
 
