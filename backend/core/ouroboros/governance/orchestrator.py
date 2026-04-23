@@ -244,7 +244,14 @@ def _phase_runner_gate_extracted() -> bool:
 def _phase_runner_validate_extracted() -> bool:
     """Slice 4a.1 of Wave 2 (5) — VALIDATE phase extraction gate.
 
-    Reads ``JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED`` (default ``false``).
+    **Default ``true`` as of 2026-04-22 graduation** (3 clean soak
+    sessions bt-2026-04-22-230147 / -232323 / -235808, each 0 PM /
+    $0 / 0 runner-attributed frames / 0 shutdown race; reachability
+    observed in 2/3 sessions via 2 ``[PhaseRunnerDelegate] VALIDATE``
+    delegation markers + 6 ``[ValidateRetryFSM]`` FSM transition lines).
+    Explicit ``=false`` remains a runtime kill switch reverting to
+    the 762-line inline VALIDATE block.
+
     When ``true``, delegates the 762-line VALIDATE block (nested retry
     FSM + L2 dispatch + source-drift + shadow harness + entropy +
     read-only short-circuit) to VALIDATERunner. Parity tests at
@@ -252,9 +259,11 @@ def _phase_runner_validate_extracted() -> bool:
     pin observable output across both paths. The ``best_candidate``
     local leaks downstream to GATE (37 refs) and is threaded via
     ``PhaseResult.artifacts``.
+
+    Graduation ledger: ``memory/project_wave2_graduation_matrix.md``.
     """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED", "true")
         .strip().lower() in _TRUTHY
     )
 
