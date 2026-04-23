@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -84,6 +85,20 @@ class HarnessConfig:
         per Ticket A (2026-04-23) to prevent provider retry storms from
         defeating both idle-gap and budget watchdogs. Graduation soaks
         MUST set this to a bounded value (e.g. 2400 = 40 min).
+    headless:
+        Ticket C (2026-04-23). Tri-state flag controlling whether the
+        harness starts the interactive ``SerpentREPL`` input task.
+        ``True`` → skip REPL (agent-conducted / CI / daemon runs).
+        ``False`` → force interactive REPL even when stdin isn't a TTY
+        (rare; escape hatch). ``None`` (default) → auto-detect via
+        ``not sys.stdin.isatty()`` which is correct for every real
+        headless launch pattern (background shell, CI runner, pipeline).
+        When headless, the REPL's ``PromptSession.prompt_async()`` loop
+        is never started, so graduation soaks no longer need the
+        opaque ``tail -f /dev/null | ...`` stdin guard to prevent a
+        ``EOFError → break`` exit in ~16 log lines. Other TUI surfaces
+        (SerpentFlow renderer, CommProtocol transports, status line)
+        remain active.
     branch_prefix:
         Prefix for the accumulation branch name.
     session_dir:
@@ -96,6 +111,7 @@ class HarnessConfig:
     cost_cap_usd: float = 0.50
     idle_timeout_s: float = 600.0
     max_wall_seconds_s: Optional[float] = None
+    headless: Optional[bool] = None
     branch_prefix: str = "ouroboros/battle-test"
     session_dir: Optional[Path] = None
     notebook_output_dir: Optional[Path] = None
@@ -108,17 +124,46 @@ class HarnessConfig:
         - ``OUROBOROS_BATTLE_COST_CAP``
         - ``OUROBOROS_BATTLE_IDLE_TIMEOUT``
         - ``OUROBOROS_BATTLE_MAX_WALL_SECONDS`` (``0`` or unset = disabled)
+        - ``OUROBOROS_BATTLE_HEADLESS`` (``1``/``true`` → True,
+          ``0``/``false`` → False, unset → None = auto-detect)
         - ``OUROBOROS_BATTLE_BRANCH_PREFIX``
         - ``JARVIS_REPO_PATH``
         """
         _wall = float(os.environ.get("OUROBOROS_BATTLE_MAX_WALL_SECONDS", "0"))
+        _headless_raw = os.environ.get("OUROBOROS_BATTLE_HEADLESS", "").strip().lower()
+        _headless: Optional[bool]
+        if _headless_raw in ("1", "true", "yes", "on"):
+            _headless = True
+        elif _headless_raw in ("0", "false", "no", "off"):
+            _headless = False
+        else:
+            _headless = None
         return cls(
             repo_path=Path(os.environ.get("JARVIS_REPO_PATH", ".")),
             cost_cap_usd=float(os.environ.get("OUROBOROS_BATTLE_COST_CAP", "0.50")),
             idle_timeout_s=float(os.environ.get("OUROBOROS_BATTLE_IDLE_TIMEOUT", "600.0")),
             max_wall_seconds_s=_wall if _wall > 0 else None,
+            headless=_headless,
             branch_prefix=os.environ.get("OUROBOROS_BATTLE_BRANCH_PREFIX", "ouroboros/battle-test"),
         )
+
+    def resolve_headless(self) -> bool:
+        """Resolve the tri-state ``headless`` field into a concrete bool.
+
+        ``True`` / ``False`` are returned unchanged. ``None`` triggers
+        auto-detect via ``not sys.stdin.isatty()`` — correct for every
+        real headless launch pattern (Claude Code Bash-tool background,
+        CI runner, daemon pipeline). Guarded against rare
+        ``OSError`` / ``ValueError`` from ``isatty()`` on closed or
+        invalid stdin (treat as headless, same pattern as
+        ``_headless_auto_approve_reason`` in serpent_flow.py).
+        """
+        if self.headless is not None:
+            return self.headless
+        try:
+            return not sys.stdin.isatty()
+        except (ValueError, OSError):
+            return True
 
 
 # ---------------------------------------------------------------------------
@@ -578,15 +623,33 @@ class BattleTestHarness:
 
                 # Boot non-blocking REPL (prompt_toolkit) — runs alongside
                 # background telemetry without blocking the event loop.
-                try:
-                    from backend.core.ouroboros.battle_test.serpent_flow import SerpentREPL
-                    self._serpent_repl = SerpentREPL(
-                        flow=self._serpent_flow,
-                        on_command=self._handle_repl_command,
+                #
+                # Ticket C (2026-04-23): skip the REPL entirely in
+                # headless mode. Starting PromptSession.prompt_async()
+                # against a non-TTY stdin hits `EOFError → break` on the
+                # first iteration and ends the session in ~16 log lines.
+                # The tail -f /dev/null stdin guard documented in the
+                # matrix runbook was the prior workaround; this native
+                # skip retires it. Other surfaces (SerpentFlow renderer,
+                # CommProtocol transports, status line) stay active.
+                if self._config.resolve_headless():
+                    logger.info(
+                        "[Harness] Headless mode: REPL input disabled "
+                        "(headless=%s, stdin.isatty=%s)",
+                        self._config.headless,
+                        getattr(sys.stdin, "isatty", lambda: None)()
+                        if hasattr(sys.stdin, "isatty") else None,
                     )
-                    await self._serpent_repl.start()
-                except Exception as _repl_exc:
-                    logger.debug("SerpentREPL not available: %s", _repl_exc)
+                else:
+                    try:
+                        from backend.core.ouroboros.battle_test.serpent_flow import SerpentREPL
+                        self._serpent_repl = SerpentREPL(
+                            flow=self._serpent_flow,
+                            on_command=self._handle_repl_command,
+                        )
+                        await self._serpent_repl.start()
+                    except Exception as _repl_exc:
+                        logger.debug("SerpentREPL not available: %s", _repl_exc)
             elif hasattr(self, "_tui_console") and self._tui_console is not None:
                 self._tui_console.show_controls_bar()
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:

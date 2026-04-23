@@ -591,6 +591,34 @@ def main() -> None:
             "retry storms defeat --idle-timeout. Env: OUROBOROS_BATTLE_MAX_WALL_SECONDS."
         ),
     )
+    # Ticket C (2026-04-23): tri-state --headless. argparse doesn't
+    # natively distinguish "flag absent" from "--no-headless" across
+    # a single option — use a mutually-exclusive group so absence maps
+    # to None (auto-detect via isatty in HarnessConfig.resolve_headless).
+    _headless_group = parser.add_mutually_exclusive_group()
+    _headless_group.add_argument(
+        "--headless",
+        dest="headless",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Skip the SerpentREPL input task — the TUI REPL is a no-op "
+            "in headless runs and starting it against non-TTY stdin "
+            "exits in ~16 log lines. When absent, auto-detects via "
+            "``not sys.stdin.isatty()``. Env: OUROBOROS_BATTLE_HEADLESS."
+        ),
+    )
+    _headless_group.add_argument(
+        "--no-headless",
+        dest="headless",
+        action="store_const",
+        const=False,
+        help=(
+            "Force the interactive REPL even when stdin isn't a TTY "
+            "(rare; escape hatch). Overrides auto-detection."
+        ),
+    )
     parser.add_argument(
         "--branch-prefix",
         type=str,
@@ -682,11 +710,23 @@ def main() -> None:
     # ------------------------------------------------------------------
     from backend.core.ouroboros.battle_test.harness import BattleTestHarness, HarnessConfig
 
+    # Ticket C: when CLI did not specify --headless/--no-headless (args.headless
+    # is None), fall back to the env var OUROBOROS_BATTLE_HEADLESS via
+    # HarnessConfig.resolve_headless() which also does isatty auto-detect.
+    # CLI wins over env when set — consistent with --cost-cap etc.
+    _env_headless = os.environ.get("OUROBOROS_BATTLE_HEADLESS", "").strip().lower()
+    if args.headless is None and _env_headless:
+        if _env_headless in ("1", "true", "yes", "on"):
+            args.headless = True
+        elif _env_headless in ("0", "false", "no", "off"):
+            args.headless = False
+
     config = HarnessConfig(
         repo_path=Path(args.repo_path),
         cost_cap_usd=args.cost_cap,
         idle_timeout_s=args.idle_timeout,
         max_wall_seconds_s=args.max_wall_seconds or None,
+        headless=args.headless,
         branch_prefix=args.branch_prefix,
     )
 
