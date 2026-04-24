@@ -193,9 +193,13 @@ def test_default_registry_covers_all_nine_extracted_phases():
 # ===========================================================================
 
 
-def test_dispatcher_enabled_default_false(monkeypatch):
+def test_dispatcher_enabled_default_true_post_graduation(monkeypatch):
+    """Post-#8 FINAL (commit 203856371e, 2026-04-23): dispatcher_enabled()
+    default flipped false → true. Unset env → True. Original pre-graduation
+    name kept for git blame continuity via the truthy/falsey variant tests
+    below (which cover explicit env values in both directions)."""
     monkeypatch.delenv("JARVIS_PHASE_RUNNER_DISPATCHER_ENABLED", raising=False)
-    assert dispatcher_enabled() is False
+    assert dispatcher_enabled() is True
 
 
 def test_dispatcher_enabled_truthy_variants(monkeypatch):
