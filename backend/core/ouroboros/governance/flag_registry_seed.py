@@ -787,6 +787,86 @@ SEED_SPECS: list = [
         example="3",
         since="v1.0",
     ),
+    # ====================================================================
+    # Wave 3 (6) — Parallel L3 fan-out (parallel_dispatch) — 5 flags
+    # Operator directive 2026-04-23: env knobs operator-visible via /help.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master kill switch for Wave 3 (6) parallel L3 fan-out. "
+            "When false (graduation default), all fan-out surfaces are "
+            "dead code: the post-GENERATE hook in phase_dispatcher does "
+            "nothing, no ExecutionGraph is built, no scheduler submit. "
+            "Flip true ALONGSIDE _SHADOW or _ENFORCE to engage."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/parallel_dispatch.py",
+        example="true",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_WAVE3_PARALLEL_DISPATCH_SHADOW",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Shadow sub-flag. With master on + shadow on (+ enforce "
+            "off), the post-GENERATE hook builds the ExecutionGraph "
+            "and emits [ParallelDispatch] telemetry but does NOT "
+            "submit to SubagentScheduler. Used for live-ops decision-"
+            "correctness observation before enforce engagement."
+        ),
+        category=Category.EXPERIMENTAL,
+        source_file="backend/core/ouroboros/governance/parallel_dispatch.py",
+        example="true",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_WAVE3_PARALLEL_DISPATCH_ENFORCE",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Enforce sub-flag. With master on + enforce on, eligible "
+            "multi-file ops submit to SubagentScheduler via "
+            "enforce_evaluate_fanout (MemoryPressureGate re-consulted "
+            "immediately before submit; narrow error handling; "
+            "bounded wait). Downstream APPLY consumption by "
+            "slice4b_runner is a separate follow-up after Wave 3 (6) "
+            "FINAL. Enforce wins when both shadow+enforce are set."
+        ),
+        category=Category.EXPERIMENTAL,
+        source_file="backend/core/ouroboros/governance/parallel_dispatch.py",
+        example="true",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_WAVE3_PARALLEL_MAX_UNITS",
+        type=FlagType.INT, default=3,
+        description=(
+            "Hard ceiling on fan-out degree, applied after posture "
+            "weighting and before MemoryPressureGate.can_fanout. "
+            "Default 3 per scope §12 (b); env-tunable for graduation "
+            "boundary tests (2 / 3 / 4). Non-positive + unparseable "
+            "values fall back to 3."
+        ),
+        category=Category.CAPACITY,
+        source_file="backend/core/ouroboros/governance/parallel_dispatch.py",
+        example="3",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_WAVE3_PARALLEL_WAIT_TIMEOUT_S",
+        type=FlagType.FLOAT, default=900.0,
+        description=(
+            "Per-graph wait budget for enforce_evaluate_fanout. "
+            "Bounded to keep scheduler.wait_for_graph from defeating "
+            "--max-wall-seconds (Ticket A1). Default 900s (15 min). "
+            "Non-positive + unparseable values fall back to default."
+        ),
+        category=Category.TIMING,
+        source_file="backend/core/ouroboros/governance/parallel_dispatch.py",
+        example="900.0",
+        since="v1.0",
+    ),
 ]
 
 

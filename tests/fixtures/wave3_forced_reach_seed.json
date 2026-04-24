@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "wave3-item6-forced-reach-multifile-seed",
+    "description": "Wave 3 (6) Slice 5a graduation forced-reachability seed. Three empty Python package __init__.py files need one-sentence module docstrings so the packages are self-documenting. This is a deterministic, low-risk, multi-file trivial edit designed to walk through CLASSIFY -> ROUTE -> CTX -> PLAN -> GENERATE (multi-file candidate shape) -> the post-GENERATE parallel_dispatch seam, exercising enforce-mode fan-out when JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED and ...ENFORCE are both true. Edit: in each of the three target files, add a single triple-quoted module docstring on line 1 - one short sentence per file describing the package's role. Do not add any code, imports, or exports. Each file's full content after the edit should be exactly one line: a triple-quoted string. This seeds the Wave 3 (6) graduation cadence without accumulating meaningful production side effects; the diff across all three files totals roughly 3 lines of docstring content. Classify as SAFE_AUTO, trivial complexity, blast_radius=3.",
+    "target_files": [
+      "backend/core/ouroboros/architect/__init__.py",
+      "backend/core/tui/__init__.py",
+      "backend/core/umf/__init__.py"
+    ],
+    "priority": 1,
+    "repo": "jarvis",
+    "status": "pending"
+  }
+]
