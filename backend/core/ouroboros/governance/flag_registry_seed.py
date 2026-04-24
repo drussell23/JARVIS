@@ -867,6 +867,38 @@ SEED_SPECS: list = [
         example="900.0",
         since="v1.0",
     ),
+    # ====================================================================
+    # F3 (Wave 3 (6) Slice 5a side-arc, 2026-04-23) — BacklogSensor
+    # default-urgency override. Graduation / harness-only knob; not for
+    # production intake tuning. See
+    # memory/project_followup_f3_backlog_default_urgency.md for full arc
+    # rationale; F1 (intake governor enforcement) + F2 (per-entry
+    # urgency_hint schema) are the proper post-graduation fixes.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_BACKLOG_SENSOR_DEFAULT_URGENCY",
+        type=FlagType.STR, default="",
+        description=(
+            "Graduation/harness-only override for BacklogSensor-emitted "
+            "envelope urgency. Default unset → priority→urgency map "
+            "preserved byte-identical (priority 4-5 = high, 3 = normal, "
+            "1-2 = low). Set to one of {critical, high, normal, low} → "
+            "overrides emitted urgency for ALL BacklogSensor tasks this "
+            "scan. Invalid values silently fall back to default. Setting "
+            "=critical lets graduation seeds escape the source=backlog → "
+            "BACKGROUND default classification via UrgencyRouter's "
+            "Priority-1 IMMEDIATE gate. Production intake routing should "
+            "rely on the enforcing SensorGovernor from F1 (non-blocking "
+            "follow-up), not this knob."
+        ),
+        category=Category.EXPERIMENTAL,
+        source_file=(
+            "backend/core/ouroboros/governance/intake/sensors/"
+            "backlog_sensor.py"
+        ),
+        example="critical",
+        since="v1.0",
+    ),
 ]
 
 

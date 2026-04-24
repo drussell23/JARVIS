@@ -65,6 +65,58 @@ _PRIORITY_URGENCY: Dict[int, str] = {
     1: "low",
 }
 
+# ---------------------------------------------------------------------------
+# F3 (Wave 3 (6) Slice 5a side-arc, 2026-04-23): default-urgency override
+# ---------------------------------------------------------------------------
+#
+# Graduation cadences for Wave 2 (5) / Wave 3 (6) that require multi-file
+# post-GENERATE work (fan-out, Iron Gate live evidence) hit a structural
+# bottleneck: BacklogSensor-emitted ops carry ``source="backlog"`` which
+# :class:`UrgencyRouter` maps to BACKGROUND whenever urgency != "critical"
+# (source-based BG classification fires regardless of priority→urgency).
+# BACKGROUND is sealed from Claude cascade (``project_bg_spec_sealed.md``),
+# so when DW has topology issues, backlog ops die upstream of the phase
+# pipeline's `pctx.generation` production and no downstream reachability
+# markers (including Wave 3 (6)'s ``[ParallelDispatch]``) can fire.
+#
+# F3 is the narrowest fix: a session-scoped env knob that overrides the
+# priority→urgency mapping for BacklogSensor emissions. Default unset →
+# behavior byte-identical to pre-F3. Set to ``"critical"`` → ops route
+# IMMEDIATE (Claude direct). Set to ``"high"`` / ``"normal"`` / ``"low"``
+# → priority mapping ignored but urgency still flows through the rest of
+# classification (source=backlog may still land BG via the source-based
+# branch; ``"critical"`` is the only escape via the Priority-1 IMMEDIATE
+# gate).
+#
+# Scope boundaries (binding per operator F3 contract, 2026-04-23):
+# - Only affects this sensor's emissions. No changes to UrgencyRouter or
+#   the intake router's dispatch semantics. Those are F1 (non-blocking
+#   follow-up — see project_followup_f1_intake_governor_enforcement.md).
+# - No schema change to backlog.json entries. Per-entry urgency_hint is
+#   F2 (non-blocking follow-up — project_followup_f2_backlog_urgency_hint_schema.md).
+# - One INFO log per override-armed scan cycle so the ledger can prove
+#   when the knob was active.
+#
+# This knob is intended for graduation / battle-test harness use ONLY.
+# Long-term production intake should rely on the enforcing SensorGovernor
+# from F1.
+_VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
+
+
+def _default_urgency_override() -> Optional[str]:
+    """Return the urgency override if set to a recognized value, else None.
+
+    Reads ``JARVIS_BACKLOG_SENSOR_DEFAULT_URGENCY`` at call time. Invalid
+    or unset values return ``None`` — the sensor then falls back to the
+    priority→urgency mapping. Never raises.
+    """
+    raw = os.environ.get("JARVIS_BACKLOG_SENSOR_DEFAULT_URGENCY", "").strip().lower()
+    if not raw:
+        return None
+    if raw in _VALID_URGENCIES:
+        return raw
+    return None
+
 
 @dataclass
 class BacklogTask:
@@ -129,6 +181,12 @@ class BacklogSensor:
             return []
 
         produced: List[IntentEnvelope] = []
+        # F3: re-read the override per scan so operator env changes take
+        # effect without a restart. When set, log ONCE per scan_once
+        # invocation that produced an envelope — keeps telemetry concise
+        # (not per-task) while still §8-auditable per graduation directive.
+        _urgency_override = _default_urgency_override()
+        _override_logged_this_scan = False
         for item in tasks_raw:
             task = BacklogTask(
                 task_id=item.get("task_id", ""),
@@ -145,13 +203,28 @@ class BacklogSensor:
             if not task.target_files:
                 continue
 
+            # F3: apply override when set; else fall back to
+            # priority-based urgency map (byte-identical to pre-F3).
+            effective_urgency = (
+                _urgency_override if _urgency_override is not None
+                else task.urgency
+            )
+            if _urgency_override is not None and not _override_logged_this_scan:
+                logger.info(
+                    "[BacklogSensor] JARVIS_BACKLOG_SENSOR_DEFAULT_URGENCY "
+                    "override active: urgency=%s (applied to all emissions "
+                    "this scan)",
+                    _urgency_override,
+                )
+                _override_logged_this_scan = True
+
             envelope = make_envelope(
                 source="backlog",
                 description=task.description,
                 target_files=tuple(task.target_files),
                 repo=task.repo,
                 confidence=0.7 + (task.priority - 1) * 0.05,
-                urgency=task.urgency,
+                urgency=effective_urgency,
                 evidence={"task_id": task.task_id, "signature": task.task_id},
                 requires_human_ack=False,
             )
