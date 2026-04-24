@@ -942,19 +942,45 @@ SEED_SPECS: list = [
         name="JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED",
         type=FlagType.BOOL, default=False,
         description=(
-            "F1 Slice 1 — master flag for the intake priority scheduler "
-            "(``IntakePriorityQueue`` primitive). Default off → byte-"
-            "identical to pre-F1 class-partitioned FIFO intake queue. "
-            "Set to true → urgency-priority heap with reserved-slot "
-            "starvation guard + per-envelope deadlines + priority-"
-            "inversion emergency pop + queue-depth telemetry + back-"
-            "pressure signals. Slice 1 ships the primitive only; "
-            "UnifiedIntakeRouter wiring lands in Slice 2."
+            "F1 master flag — intake priority scheduler primary mode. "
+            "Default off → byte-identical to pre-F1 class-partitioned "
+            "FIFO intake queue. Set to true → ``IntakePriorityQueue`` "
+            "becomes the source of truth for dispatch (urgency-priority "
+            "heap + reserved-slot starvation guard + per-envelope "
+            "deadlines + priority-inversion emergency pop + queue-depth "
+            "telemetry + back-pressure). Legacy ``asyncio.PriorityQueue`` "
+            "still receives puts (for WAL/back-compat) but is drained as "
+            "a tombstone behind the primary queue. Graduation cadence: "
+            "Slice 3 integration tests + Slice 4 live cadence + 3 clean "
+            "sessions before default flip."
         ),
         category=Category.SAFETY,
         source_file=(
             "backend/core/ouroboros/governance/intake/"
             "intake_priority_queue.py"
+        ),
+        example="true",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "F1 Slice 2 shadow flag — observational parallel "
+            "IntakePriorityQueue without behavior change. When set to "
+            "true AND the master flag is off, the router builds a "
+            "parallel priority queue alongside the legacy queue; "
+            "ingest mirrors to both; dispatch reads from legacy but "
+            "logs ``[IntakePriority shadow_delta]`` whenever the "
+            "priority queue would have popped a different envelope. "
+            "Enables live evidence gathering of ordering improvements "
+            "without risk to production dispatch. Inert when the master "
+            "flag is on (primary-mode dominates)."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file=(
+            "backend/core/ouroboros/governance/intake/"
+            "unified_intake_router.py"
         ),
         example="true",
         since="v1.0",

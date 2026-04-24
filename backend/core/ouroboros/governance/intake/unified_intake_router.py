@@ -22,10 +22,39 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
+from .intake_priority_queue import (
+    IntakePriorityQueue,
+    _intake_priority_scheduler_enabled,
+)
 from .intent_envelope import IntentEnvelope
 from .wal import WAL, WALEntry
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# F1 Slice 2 — shadow-mode flag for observational IntakePriorityQueue
+# ---------------------------------------------------------------------------
+# When ``JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW=true`` AND the master flag
+# is OFF, the router builds a parallel ``IntakePriorityQueue`` alongside the
+# legacy ``asyncio.PriorityQueue``. Ingestion mirrors to both; dispatch
+# dequeues from legacy but peeks at shadow to log a delta when the
+# priority queue would have dequeued a different envelope. Enables live
+# evidence-gathering without behavioral change.
+#
+# When the master flag (``JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED``) is ON,
+# shadow-mode is superseded — the priority queue becomes the source of
+# truth for dequeue order, and legacy queue is drained as a tombstone.
+def _intake_priority_scheduler_shadow_enabled() -> bool:
+    """Re-read ``JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW`` at call time.
+
+    Shadow is inert when the master flag is on (primary mode dominates).
+    Default off.
+    """
+    raw = os.environ.get(
+        "JARVIS_INTAKE_PRIORITY_SCHEDULER_SHADOW", "",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 # ---------------------------------------------------------------------------
 # Priority map — lower int = higher priority
@@ -371,6 +400,52 @@ class UnifiedIntakeRouter:
         self._coalesce_buffer: Dict[str, List[IntentEnvelope]] = {}
         self._coalesce_timestamps: Dict[str, float] = {}  # key -> first arrival
 
+        # ── F1 Slice 2 — parallel IntakePriorityQueue ──
+        # Built when either the master flag (primary-mode: priority queue
+        # backs dequeue) OR the shadow flag (observational: priority queue
+        # tracks what WOULD have been dequeued, legacy queue stays primary)
+        # is on. Flags re-read at __init__ time and cached — per-session
+        # lifecycle, consistent with governor mode capture pattern.
+        self._f1_master_on: bool = _intake_priority_scheduler_enabled()
+        self._f1_shadow_on: bool = _intake_priority_scheduler_shadow_enabled()
+        self._priority_queue: Optional[IntakePriorityQueue] = None
+        self._f1_shadow_delta_count: int = 0
+        self._f1_shadow_agree_count: int = 0
+        if self._f1_master_on or self._f1_shadow_on:
+            # Caller-side telemetry sink logs at INFO for visibility when
+            # operator is tracing intake decisions. Queue's own debug lines
+            # live at DEBUG via the caller's logger — we only promote a
+            # few high-signal events here.
+            def _priority_telemetry_sink(event_type: str, payload: Dict[str, Any]) -> None:
+                if event_type == "priority_inversion":
+                    logger.warning(
+                        "[IntakePriority] priority_inversion urgency=%s source=%s "
+                        "waited_s=%.2f deadline_s=%s",
+                        payload.get("urgency"),
+                        payload.get("source"),
+                        payload.get("waited_s", 0.0),
+                        payload.get("deadline_s"),
+                    )
+                elif event_type == "backpressure_applied":
+                    logger.warning(
+                        "[IntakePriority] backpressure_applied source=%s "
+                        "urgency=%s retry_after_s=%.2f queue_depth=%d",
+                        payload.get("source"),
+                        payload.get("urgency"),
+                        payload.get("retry_after_s", 0.0),
+                        payload.get("queue_depth_total", 0),
+                    )
+
+            self._priority_queue = IntakePriorityQueue(
+                telemetry_sink=_priority_telemetry_sink,
+            )
+            logger.info(
+                "[IntakePriority] wired mode=%s (master=%s shadow=%s)",
+                "primary" if self._f1_master_on else "shadow",
+                self._f1_master_on,
+                self._f1_shadow_on,
+            )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -507,6 +582,19 @@ class UnifiedIntakeRouter:
             except Exception as _stash_exc:  # pragma: no cover — defence in depth
                 logger.debug("[Router] evidence stash failed: %s", _stash_exc)
         await self._queue.put((priority, envelope.submitted_at, envelope))
+
+        # F1 Slice 2 — mirror to IntakePriorityQueue when wired.
+        # Primary mode (master on): this queue becomes the source of truth
+        # for dispatch; legacy _queue still receives puts for WAL/back-compat
+        # but dispatch reads from priority queue instead.
+        # Shadow mode (shadow on, master off): purely observational —
+        # legacy _queue remains primary; priority queue lets us log
+        # "what would have been dequeued next" for diagnostic delta.
+        # Capacity-limit refusal: when back-pressure fires, the enqueue
+        # is dropped from the priority queue but the legacy queue still
+        # accepted it, preserving flag-off byte-parity.
+        if self._priority_queue is not None:
+            self._priority_queue.enqueue(envelope)
 
         # Slice 5 Arc A — record emission so rolling-window counters update.
         # Only fires if governor mode was not "off". Never raises.
@@ -737,18 +825,89 @@ class UnifiedIntakeRouter:
         Applies a coalescing window: envelopes targeting overlapping files
         are buffered for up to ``_coalesce_window_s`` before dispatch.
         HIGH urgency signals bypass coalescing.
+
+        F1 Slice 2: when the master flag is on (``_f1_master_on``), the
+        ``IntakePriorityQueue`` is the source of truth for dequeue order.
+        The legacy ``_queue`` still receives puts (for WAL/back-compat)
+        but is drained as a tombstone after each priority-queue pop.
+        When only shadow flag is on, legacy is primary and we log a delta
+        if the priority queue would have popped a different envelope.
         """
         while self._running:
-            try:
-                priority, ts, envelope = await asyncio.wait_for(
-                    self._queue.get(), timeout=1.0
+            envelope: Optional[IntentEnvelope] = None
+            # F1 Slice 2: track whether legacy _queue.task_done() still owed
+            # after we finish processing this envelope. In primary-mode we
+            # drain the legacy queue AT dequeue time and mark done there,
+            # so downstream task_done() calls would unbalance the counter.
+            _legacy_task_done_owed: bool = False
+            if self._f1_master_on and self._priority_queue is not None:
+                # F1 primary-mode: priority queue is source of truth.
+                decision = self._priority_queue.dequeue()
+                if decision is None:
+                    # Priority queue empty — sleep briefly + flush coalesce
+                    # then loop. Symmetric to the legacy TimeoutError path.
+                    try:
+                        await asyncio.sleep(0.1)
+                    except asyncio.CancelledError:
+                        break
+                    await self._flush_expired_coalesce_buffers()
+                    continue
+                envelope = decision.envelope
+                # Drain the matching entry from the legacy queue so
+                # qsize() stays honest. Best-effort: if the head doesn't
+                # match, skip (legacy queue is tombstone in primary-mode).
+                # The drain consumes task_done() balance here — downstream
+                # stays balanced because _legacy_task_done_owed stays False.
+                try:
+                    _ = self._queue.get_nowait()
+                    self._queue.task_done()
+                except asyncio.QueueEmpty:
+                    pass
+                logger.debug(
+                    "[IntakePriority] primary dequeue urgency=%s source=%s "
+                    "waited_s=%.2f mode=%s depth=%d",
+                    decision.urgency, decision.source, decision.waited_s,
+                    decision.dequeue_mode, len(self._priority_queue),
                 )
-            except asyncio.TimeoutError:
-                # Flush any expired coalescing buffers
-                await self._flush_expired_coalesce_buffers()
+            else:
+                # Legacy path (byte-identical to pre-F1).
+                try:
+                    priority, ts, envelope = await asyncio.wait_for(
+                        self._queue.get(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    # Flush any expired coalescing buffers
+                    await self._flush_expired_coalesce_buffers()
+                    continue
+                except asyncio.CancelledError:
+                    break
+                _legacy_task_done_owed = True
+
+                # F1 shadow-mode delta: consume one from the priority queue
+                # (kept in sync via mirror-ingest) and compare. Only logs
+                # when the priority queue would have popped something else.
+                if self._f1_shadow_on and self._priority_queue is not None:
+                    shadow_decision = self._priority_queue.dequeue()
+                    if shadow_decision is not None:
+                        if shadow_decision.envelope is envelope:
+                            self._f1_shadow_agree_count += 1
+                        else:
+                            self._f1_shadow_delta_count += 1
+                            logger.info(
+                                "[IntakePriority shadow_delta] "
+                                "legacy_popped=%s:%s shadow_would_pop=%s:%s "
+                                "(mode=%s waited_s=%.2f)",
+                                envelope.source, envelope.urgency,
+                                shadow_decision.source, shadow_decision.urgency,
+                                shadow_decision.dequeue_mode,
+                                shadow_decision.waited_s,
+                            )
+
+            # Defensive: both branches must set envelope. The `None` path
+            # returns via `continue` above, so mypy/pyright can't infer;
+            # an explicit guard here makes the invariant readable.
+            if envelope is None:
                 continue
-            except asyncio.CancelledError:
-                break
 
             # HIGH urgency: bypass coalescing, dispatch immediately
             if envelope.urgency == "high" or self._coalesce_window_s <= 0:
@@ -761,7 +920,8 @@ class UnifiedIntakeRouter:
                         "Router: dispatch error for lease_id=%s", envelope.lease_id
                     )
                 finally:
-                    self._queue.task_done()
+                    if _legacy_task_done_owed:
+                        self._queue.task_done()
                 continue
 
             # Buffer for coalescing
@@ -770,7 +930,8 @@ class UnifiedIntakeRouter:
                 self._coalesce_buffer[_key] = []
                 self._coalesce_timestamps[_key] = time.monotonic()
             self._coalesce_buffer[_key].append(envelope)
-            self._queue.task_done()
+            if _legacy_task_done_owed:
+                self._queue.task_done()
 
             # Flush if window expired
             await self._flush_expired_coalesce_buffers()
