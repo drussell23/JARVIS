@@ -96,20 +96,24 @@ _TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
 _PRIMARY_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_PRIMARY_BUDGET_FRACTION", "0.65"))
 _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "30"))
 
-# Tier 3 Reflex (Manifesto §5): aggressive hard cap on primary provider.
-# If the primary (e.g., DoubleWord 397B) stalls on stream rendering or token
-# generation for longer than this cap, the deterministic router severs the
-# thread and cascades to the high-reliability frontier model (Claude).
+# Tier 3 Reflex (Manifesto §5): aggressive hard cap on DoubleWord 397B
+# across ALL cost-optimized call paths. If DW stalls on stream rendering
+# or token generation for longer than this cap, the deterministic router
+# severs the thread and cascades to the high-reliability frontier model
+# (Claude). Single source of truth for the hard cap; both the Tier-0-first
+# path (_compute_tier0_budget) and the Primary-first path
+# (_compute_primary_budget) reference it via the aliases below.
 #
-# Problem this fixes — F1 Slice 4 S3 (bt-2026-04-24-204029):
-# The primary held semaphore for up to 153.76s (DW SSE stream stall), which
-# exceeded the then-current fraction-based cap of ~143s (0.65 * 220s
-# remaining). The seed's GENERATE phase could not produce a candidate; both
-# primary AND fallback exhausted because fallback inherited only 77s of
-# remaining budget after primary ate the bulk. Zero $ billed (all timeouts).
-# Multi-file candidate shape was verified present (PLAN-SHADOW dag_units=3
-# parallel_pairs=3) but the parallel_dispatch seam never evaluated because
-# GENERATE returned no candidate.
+# Problem this fixes — F1 Slice 4 S3 (bt-2026-04-24-204029) + S4
+# (bt-2026-04-24-213248):
+#   S3: primary held semaphore for up to 153.76s (DW SSE stream stall),
+#       exceeding the then-current fraction-based cap of ~143s.
+#   S4: patch landed but didn't fire — DW was promoted to BOTH Tier 0 AND
+#       primary (J-Prime unhealthy), which routes via the Tier 0 fast path
+#       (_compute_tier0_budget, max_wait=_TIER0_MAX_WAIT_S=90s), NOT via
+#       _call_primary where the S3 patch lived. The _PRIMARY_MAX_TIMEOUT_S
+#       cap was inert for this configuration because _call_primary was
+#       never invoked. Same 153s DW semaphore hold pattern repeated.
 #
 # Manifesto §5 Tier 3 quote (verbatim):
 #   "If a cost-optimized inference node (e.g., DW 397B) exhausts its
@@ -117,21 +121,37 @@ _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S
 #    deterministic router autonomously severs the thread and triggers
 #    an instant cascade to a high-reliability frontier model."
 #
-# This cap is a HARD TIME BOX, not a fraction. Fraction-based logic in
-# _compute_primary_budget stays in effect only as an inner floor — the
-# outer min() enforces this absolute ceiling.
+# This cap is a HARD TIME BOX applied at TWO sites:
+#   1. _compute_primary_budget — for the "call primary first" path
+#      (FSM PRIMARY_READY / PRIMARY_DEGRADED with J-Prime as primary).
+#   2. _compute_tier0_budget — for the "Tier 0 fast-path first" (the
+#      Manifesto §5 default cascade; DW-as-Tier-0 always tries here).
 #
-# Default 30s is calibrated from S3 evidence: DW first_token_ms=1898 was
-# observed, but stream stall extended hold to 85-153s. A 30s cap forces
-# a sever at any stall beyond the expected first-token-plus-generation
-# window, which for docstring-expansion workloads should comfortably
-# finish in <20s on a healthy DW endpoint.
+# Fraction + route-specific max_wait logic stays inside each function as
+# inner floors; this cap is the strict outer ceiling that enforces the
+# reflex regardless of route.
+#
+# Default 30s is calibrated from S3+S4 evidence: DW first_token_ms=1898
+# was observed on a healthy call, but stream stall extended hold to
+# 85-153s. A 30s cap forces a sever at any stall beyond the expected
+# first-token-plus-generation window, which for docstring-expansion
+# workloads should comfortably finish in <20s on a healthy DW endpoint.
 #
 # Env-tunable so operators can relax for legitimately slow workloads
 # (e.g., extremely long CoT traces on architectural ops). The Claude
 # fallback still sees its own `_FALLBACK_MAX_TIMEOUT_S` budget after
-# the primary is severed.
-_PRIMARY_MAX_TIMEOUT_S = float(os.environ.get("OUROBOROS_PRIMARY_MAX_TIMEOUT_S", "30"))
+# the DW path is severed.
+_TIER3_REFLEX_HARD_CAP_S = float(
+    os.environ.get("OUROBOROS_TIER3_REFLEX_HARD_CAP_S", "30")
+)
+# Legacy alias retained for downstream imports + existing test surface.
+# Do not change to a different default without updating the test pins.
+# Reads OUROBOROS_PRIMARY_MAX_TIMEOUT_S as a per-primary override — when
+# set, wins over the shared Tier 3 cap for the _call_primary path only
+# (the _compute_tier0_budget path continues to use _TIER3_REFLEX_HARD_CAP_S).
+_PRIMARY_MAX_TIMEOUT_S = float(
+    os.environ.get("OUROBOROS_PRIMARY_MAX_TIMEOUT_S", str(_TIER3_REFLEX_HARD_CAP_S))
+)
 
 # Minimum time worth attempting a fallback API call.  Below this threshold
 # the call will almost certainly timeout before the model finishes; skip it
@@ -2763,10 +2783,18 @@ class CandidateGenerator:
 
         # Reserve Tier 1 budget first (defensive — Tier 1 must always get a chance)
         tier1_reserve = min(min_reserve, total_s * (1.0 - effective_fraction))
+        # Tier 3 Reflex (Manifesto §5): absolute hard cap on DW calls.
+        # Strictest of four constraints wins (fraction, route max_wait,
+        # tier1 reserve, Tier 3 cap). Added 2026-04-24 after F1 Slice 4 S4
+        # (bt-2026-04-24-213248) proved the previous patch (inside
+        # _call_primary) was inert for the DW-is-Tier0-AND-Primary
+        # configuration — this code path is where DW actually gets its
+        # 90s max_wait in that configuration.
         budget = min(
             total_s * effective_fraction,
             max_wait,
             total_s - tier1_reserve,
+            _TIER3_REFLEX_HARD_CAP_S,
         )
         return max(budget, 0.0)
 
