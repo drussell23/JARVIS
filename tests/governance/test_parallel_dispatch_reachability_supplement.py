@@ -48,6 +48,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from unittest.mock import MagicMock
 
@@ -422,3 +423,291 @@ async def test_dispatch_pipeline_flags_off_skips_post_generate_hook(
     assert scheduler.submitted_graphs == []
     assert scheduler.wait_calls == []
     assert "parallel_dispatch_fanout_result" not in pctx.extras
+
+
+# ===========================================================================
+# F2 Slice 3 — end-to-end reachability: sensor → envelope → intake ctx
+# stamp → UrgencyRouter decision → post-GENERATE parallel_dispatch seam.
+#
+# Scope (operator-authorized 2026-04-23): prove the F2 path wires end-to-end
+# WITHOUT widening Wave 3 graduation work. This test chains:
+#
+#   1. BacklogSensor.scan_once() reading the real
+#      tests/fixtures/wave3_forced_reach_seed.json (which now carries
+#      F2 Slice 3's urgency_hint=critical + routing_hint=standard fields).
+#   2. Envelope construction via make_envelope with routing_override stamped.
+#   3. Intake-router ctx stamping pattern: OperationContext.create(
+#         provider_route=envelope.routing_override,
+#         provider_route_reason="envelope_routing_override:<value>")
+#      mimics the real unified_intake_router.py line ~881 block.
+#   4. UrgencyRouter.classify(ctx) returns STANDARD (F2 priority-0.5 clause).
+#   5. Ctx advanced CLASSIFY→ROUTE→GENERATE (the valid transitions).
+#   6. GENERATE stub emits 3-file multi-file GenerationResult keyed to
+#      the seed's exact target_files (end-to-end target matching).
+#   7. dispatch_pipeline runs once; post-GENERATE hook fires
+#      enforce_evaluate_fanout; [ParallelDispatch] eligibility + submit
+#      logs emit; scheduler submits + returns COMPLETED; FanoutResult
+#      landed in pctx.extras.
+#
+# Default-off variant: same chain, F2 flag off → envelope carries NO
+# routing_override, ctx.provider_route stays empty, UrgencyRouter returns
+# source-default (BACKGROUND), BG route is parallel_dispatch-ineligible.
+# Proves F2 is the enabling causal link, not Wave 3 (6) parallel wiring
+# alone.
+# ===========================================================================
+
+
+# Path to the real fixture (not a test tmp_path copy — this is the exact
+# file the live battle-test harness seeds into .jarvis/backlog.json).
+_SEED_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "wave3_forced_reach_seed.json"
+)
+
+
+def _copy_seed_to_tmp(tmp_path: Path) -> Path:
+    """Copy the real forced-reach seed fixture into a tmp_path so
+    BacklogSensor can read it as if it were .jarvis/backlog.json.
+    Avoids mutating the real ./.jarvis/backlog.json or needing the
+    battle-test harness.
+    """
+    import json as _json
+    data = _json.loads(_SEED_FIXTURE_PATH.read_text(encoding="utf-8"))
+    out = tmp_path / ".jarvis" / "backlog.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(_json.dumps(data), encoding="utf-8")
+    return out
+
+
+class _CapturingRouter:
+    """Stand-in for UnifiedIntakeRouter — just captures envelopes so
+    the test can inspect the routing_override flowing through. Returns
+    ``"enqueued"`` so BacklogSensor marks the task seen."""
+
+    def __init__(self) -> None:
+        self.envelopes: list = []
+
+    async def ingest(self, envelope):  # noqa: ANN001
+        self.envelopes.append(envelope)
+        return "enqueued"
+
+
+def test_f2_slice3_fixture_declares_both_hints():
+    """Pin the fixture shape — regression guard so a future edit can't
+    silently drop the F2 hints and break the end-to-end proof."""
+    import json as _json
+    data = _json.loads(_SEED_FIXTURE_PATH.read_text(encoding="utf-8"))
+    assert isinstance(data, list) and len(data) == 1
+    entry = data[0]
+    assert entry["task_id"] == "wave3-item6-forced-reach-multifile-seed"
+    assert entry["urgency_hint"] == "critical"
+    assert entry["routing_hint"] == "standard"
+    assert entry["target_files"] == list(_SEED_TARGETS)
+
+
+@pytest.mark.asyncio
+async def test_f2_e2e_seed_to_dispatch_pipeline_standard_route_markers(
+    tmp_path, monkeypatch, caplog,
+):
+    """F2 END-TO-END: forced-reach seed + F2 flag on →
+    envelope.routing_override=standard → ctx.provider_route=standard →
+    UrgencyRouter returns STANDARD → dispatch_pipeline hook fires →
+    [ParallelDispatch] markers + FanoutResult(COMPLETED) + 3 work units.
+
+    This is the one test proving the F2 arc's causal chain end-to-end.
+    """
+    # ---- Env: F2 + Wave 3 parallel dispatch all on ----
+    monkeypatch.setenv("JARVIS_BACKLOG_URGENCY_HINT_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_WAVE3_PARALLEL_DISPATCH_ENFORCE", "true")
+    monkeypatch.setenv("JARVIS_PHASE_RUNNER_DISPATCHER_ENABLED", "true")
+    import backend.core.ouroboros.governance.parallel_dispatch as pd_mod
+    monkeypatch.setattr(pd_mod, "get_default_gate", _ok_gate)
+    monkeypatch.setattr(pd_mod, "_default_posture_fn", _maintain_posture())
+
+    caplog.set_level(logging.INFO, logger="Ouroboros.ParallelDispatch")
+    caplog.set_level(
+        logging.INFO,
+        logger="backend.core.ouroboros.governance.intake.sensors.backlog_sensor",
+    )
+
+    # ---- Step 1-2: BacklogSensor scans fixture → produces envelope ----
+    from backend.core.ouroboros.governance.intake.sensors.backlog_sensor import (
+        BacklogSensor,
+    )
+    backlog_path = _copy_seed_to_tmp(tmp_path)
+    capturing_router = _CapturingRouter()
+    sensor = BacklogSensor(
+        backlog_path=backlog_path,
+        repo_root=tmp_path,
+        router=capturing_router,
+        poll_interval_s=0.01,
+    )
+    produced = await sensor.scan_once()
+    assert len(produced) == 1, f"expected 1 envelope from seed, got {len(produced)}"
+    envelope = produced[0]
+
+    # Phase A assertions: F2 Slice 1 + Slice 2 stamps landed on envelope.
+    assert envelope.source == "backlog"
+    assert envelope.urgency == "critical", (
+        f"F2 Slice 1 urgency_hint should stamp envelope.urgency; "
+        f"got {envelope.urgency!r}"
+    )
+    assert envelope.routing_override == "standard", (
+        f"F2 Slice 2 routing_hint should stamp envelope.routing_override; "
+        f"got {envelope.routing_override!r}"
+    )
+    assert tuple(envelope.target_files) == _SEED_TARGETS
+
+    # ---- Step 3: intake-router pattern — build ctx with pre-stamp ----
+    from backend.core.ouroboros.governance.op_context import (
+        OperationContext as _OC, OperationPhase as _OP,
+    )
+    pre_route = envelope.routing_override
+    pre_route_reason = f"envelope_routing_override:{pre_route}"
+    ctx_classify = _OC.create(
+        target_files=envelope.target_files,
+        description=envelope.description,
+        op_id=envelope.causal_id,
+        signal_urgency=envelope.urgency,
+        signal_source=envelope.source,
+        provider_route=pre_route,
+        provider_route_reason=pre_route_reason,
+    )
+    assert ctx_classify.provider_route == "standard"
+    assert ctx_classify.provider_route_reason == "envelope_routing_override:standard"
+
+    # ---- Step 4: UrgencyRouter.classify honors the F2 pre-stamp ----
+    from backend.core.ouroboros.governance.urgency_router import (
+        ProviderRoute as _PR, UrgencyRouter as _UR,
+    )
+    route, reason = _UR().classify(ctx_classify)
+    assert route is _PR.STANDARD, (
+        f"F2 priority-0.5 clause must return STANDARD for the seed; "
+        f"got {route} ({reason})"
+    )
+    assert reason == "envelope_routing_override:standard"
+
+    # ---- Step 5: advance ctx to GENERATE (valid CLASSIFY→ROUTE→GENERATE) ----
+    ts = datetime(2026, 4, 23, 22, 0, 0, tzinfo=timezone.utc)
+    ctx_route = ctx_classify.advance(new_phase=_OP.ROUTE, _timestamp=ts)
+    ctx_generate = ctx_route.advance(new_phase=_OP.GENERATE, _timestamp=ts)
+
+    # ---- Step 6-7: dispatch_pipeline GENERATE stub → parallel_dispatch seam ----
+    scheduler = _FakeScheduler(
+        terminal_phase=GraphExecutionPhase.COMPLETED,
+        unit_tallies=(3, 0, 0),
+    )
+    orchestrator = _StubOrchestrator(_subagent_scheduler=scheduler)
+    registry = PhaseRunnerRegistry()
+    registry.register(OperationPhase.GENERATE, _stub_generate_factory)
+    pctx = PhaseContext()
+
+    await dispatch_pipeline(
+        orchestrator, None, ctx_generate,
+        registry=registry, initial_context=pctx,
+    )
+
+    # Phase D assertions: post-GENERATE seam fired with 3-file fan-out.
+    pd_messages = [
+        r.message for r in caplog.records
+        if "[ParallelDispatch]" in r.message or "enforce_submit_start" in r.message
+    ]
+    eligibility_lines = [m for m in pd_messages if "[ParallelDispatch] op=" in m]
+    submit_lines = [m for m in pd_messages if "enforce_submit_start" in m]
+    assert len(eligibility_lines) == 1
+    assert len(submit_lines) == 1
+    assert "concurrency_limit=3" in submit_lines[0]
+    assert "n_units=3" in submit_lines[0]
+
+    assert len(scheduler.submitted_graphs) == 1
+    graph = scheduler.submitted_graphs[0]
+    assert len(graph.units) == 3
+    unit_targets = sorted(
+        file_path for u in graph.units for file_path in u.target_files
+    )
+    assert unit_targets == sorted(_SEED_TARGETS)
+
+    fanout_result = pctx.extras.get("parallel_dispatch_fanout_result")
+    assert fanout_result is not None
+    assert isinstance(fanout_result, FanoutResult)
+    assert fanout_result.outcome == FanoutOutcome.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_f2_e2e_flag_off_routes_background_and_seam_skipped(
+    tmp_path, monkeypatch, caplog,
+):
+    """F2 END-TO-END NEGATIVE CONTROL: same fixture, F2 flag off →
+    envelope carries NO routing_override → ctx.provider_route stays
+    empty → UrgencyRouter returns BACKGROUND (source-default trap) →
+    BG route would fail parallel_dispatch eligibility upstream.
+
+    Proves F2 is the enabling causal link. Without F2 flag on, the
+    seed is structurally unreachable for STANDARD/COMPLEX routing even
+    though it declares routing_hint=standard in the fixture (fixture
+    fields parsed but not consumed — byte-identical to pre-F2).
+    """
+    monkeypatch.delenv("JARVIS_BACKLOG_URGENCY_HINT_ENABLED", raising=False)
+    import backend.core.ouroboros.governance.parallel_dispatch as pd_mod
+    monkeypatch.setattr(pd_mod, "get_default_gate", _ok_gate)
+    monkeypatch.setattr(pd_mod, "_default_posture_fn", _maintain_posture())
+
+    caplog.set_level(logging.INFO, logger="Ouroboros.ParallelDispatch")
+
+    # Sensor emits envelope — fixture still carries F2 hints, but flag off.
+    from backend.core.ouroboros.governance.intake.sensors.backlog_sensor import (
+        BacklogSensor,
+    )
+    backlog_path = _copy_seed_to_tmp(tmp_path)
+    capturing_router = _CapturingRouter()
+    sensor = BacklogSensor(
+        backlog_path=backlog_path,
+        repo_root=tmp_path,
+        router=capturing_router,
+        poll_interval_s=0.01,
+    )
+    produced = await sensor.scan_once()
+    assert len(produced) == 1
+    envelope = produced[0]
+
+    # Flag off → F2 Slice 1 + Slice 2 both inert: envelope uses priority-map
+    # default (priority=1 → "low") for urgency AND empty routing_override.
+    assert envelope.urgency == "low", (
+        f"flag off: urgency should fall back to priority-map (priority 1 = low); "
+        f"got {envelope.urgency!r}"
+    )
+    assert envelope.routing_override == "", (
+        f"flag off: routing_override should NOT be stamped; "
+        f"got {envelope.routing_override!r}"
+    )
+
+    # Intake-router pattern: empty routing_override → empty pre-stamp.
+    from backend.core.ouroboros.governance.op_context import (
+        OperationContext as _OC,
+    )
+    pre_route = envelope.routing_override
+    pre_route_reason = (
+        f"envelope_routing_override:{pre_route}" if pre_route else ""
+    )
+    ctx = _OC.create(
+        target_files=envelope.target_files,
+        description=envelope.description,
+        op_id=envelope.causal_id,
+        signal_urgency=envelope.urgency,
+        signal_source=envelope.source,
+        provider_route=pre_route,
+        provider_route_reason=pre_route_reason,
+    )
+    assert ctx.provider_route == ""
+    assert ctx.provider_route_reason == ""
+
+    # UrgencyRouter falls back to source-default mapping.
+    from backend.core.ouroboros.governance.urgency_router import (
+        ProviderRoute as _PR, UrgencyRouter as _UR,
+    )
+    route, reason = _UR().classify(ctx)
+    assert route is _PR.BACKGROUND, (
+        f"flag off + source=backlog → BACKGROUND (the trap F2 unblocks); "
+        f"got {route} ({reason})"
+    )
+    assert "background_source:backlog" in reason
