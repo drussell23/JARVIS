@@ -926,6 +926,94 @@ SEED_SPECS: list = [
         example="true",
         since="v1.0",
     ),
+    # ====================================================================
+    # F1 Slice 1 — intake priority scheduler (master flag + tuning knobs)
+    # ====================================================================
+    # Addresses live_reachability=blocked_by_intake_starvation gap surfaced
+    # by Wave 3 (6) Slice 5b graduation S1 (bt-2026-04-24-062608): F2
+    # envelope stamping fires correctly but class-partitioned FIFO intake
+    # queue lets BG burst emissions starve critical envelopes. F1 makes
+    # urgency a dequeue-priority signal, not just an envelope label.
+    #
+    # Slice 1 is the primitive (IntakePriorityQueue) + default-off flag +
+    # unit tests. Slice 2 wires UnifiedIntakeRouter. Default stays off
+    # through the Slice 3 graduation cadence.
+    FlagSpec(
+        name="JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "F1 Slice 1 — master flag for the intake priority scheduler "
+            "(``IntakePriorityQueue`` primitive). Default off → byte-"
+            "identical to pre-F1 class-partitioned FIFO intake queue. "
+            "Set to true → urgency-priority heap with reserved-slot "
+            "starvation guard + per-envelope deadlines + priority-"
+            "inversion emergency pop + queue-depth telemetry + back-"
+            "pressure signals. Slice 1 ships the primitive only; "
+            "UnifiedIntakeRouter wiring lands in Slice 2."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/intake/"
+            "intake_priority_queue.py"
+        ),
+        example="true",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_INTAKE_RESERVED_N",
+        type=FlagType.INT, default=5,
+        description=(
+            "F1 reserved-slot window size. Of every N sequential dequeues "
+            "from the intake priority queue, at least ``JARVIS_INTAKE_"
+            "RESERVED_M`` must be urgency >= normal IF any such envelope "
+            "is in queue. Prevents pathological 'infinite low-urgency "
+            "burst after a normal entry starves it'. Only consumed when "
+            "JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED=true."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/intake/"
+            "intake_priority_queue.py"
+        ),
+        example="5",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_INTAKE_RESERVED_M",
+        type=FlagType.INT, default=1,
+        description=(
+            "F1 reserved-slot minimum: how many of the last "
+            "``JARVIS_INTAKE_RESERVED_N`` dequeues must be urgency >= "
+            "normal. Set to 0 to disable reserved-slot starvation guard "
+            "(priority-only ordering). Only consumed when "
+            "JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED=true."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/intake/"
+            "intake_priority_queue.py"
+        ),
+        example="1",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_INTAKE_BACKPRESSURE_THRESHOLD",
+        type=FlagType.INT, default=200,
+        description=(
+            "F1 queue-depth cap above which non-critical ingestion is "
+            "refused with ``retry_after_s`` (sensors see the signal and "
+            "back off). Critical envelopes are always admitted to "
+            "prevent the exact starvation mode F1 exists to fix. Only "
+            "consumed when JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED=true."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/intake/"
+            "intake_priority_queue.py"
+        ),
+        example="200",
+        since="v1.0",
+    ),
 ]
 
 
