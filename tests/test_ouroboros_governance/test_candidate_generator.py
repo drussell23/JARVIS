@@ -1316,8 +1316,12 @@ class TestFallbackSemStarvation:
         refreshed = (
             received_deadline[0] - datetime.now(tz=timezone.utc)
         ).total_seconds()
-        assert refreshed > 60.0, (
-            f"Plan fallback should refresh depleted deadline: {refreshed:.1f}s"
+        # PLAN fallback now caps at _PLAN_FALLBACK_MAX_TIMEOUT_S (60s default,
+        # tighter than GENERATE's 120s — F1 Slice 4 S5 fix 2026-04-24).
+        # Refresh still applies; just clamps at 60s instead of 120s.
+        assert 55.0 < refreshed <= 60.5, (
+            f"Plan fallback should refresh depleted deadline to PLAN cap (≤60s): "
+            f"{refreshed:.1f}s"
         )
 
 

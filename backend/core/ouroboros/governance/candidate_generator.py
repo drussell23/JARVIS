@@ -171,6 +171,23 @@ _FALLBACK_MIN_GUARANTEED_S = float(
     os.environ.get("OUROBOROS_FALLBACK_MIN_GUARANTEED_S", "90"),
 )
 
+# Tier 3 reflex cap for PLAN phase (item B from F1 Slice 4 S5 triage,
+# bt-2026-04-24-220418). PLAN is soft-fail — callers (PlanGenerator) catch
+# exceptions and fall through to GENERATE without plan, so an aggressive cap
+# is even more appropriate here than at GENERATE. Two surfaces:
+#   (a) primary path reuses the same `_TIER3_REFLEX_HARD_CAP_S` as the
+#       GENERATE Tier-0 budget (default 30s) — see plan() below.
+#   (b) fallback (Claude) path uses this PLAN-specific override (default 60s,
+#       half the GENERATE fallback cap) because PLAN's structured plan.1 JSON
+#       is short — Claude doesn't need the full 120s reserve.
+# S5 surfaced the gap: CandidateGenerator.plan() at line ~2244 was passing
+# raw `remaining` (≈parent deadline) to wait_for, so DW could stall up to
+# 90s before failing and Claude could stall up to 120s, total 210s — eating
+# the entire BG worker pool ceiling (360s) before GENERATE got to run.
+_PLAN_FALLBACK_MAX_TIMEOUT_S = float(
+    os.environ.get("OUROBOROS_PLAN_FALLBACK_MAX_TIMEOUT_S", "60"),
+)
+
 # ---------------------------------------------------------------------------
 # Nervous System Reflex — BACKGROUND cascade for read-only ops
 # ---------------------------------------------------------------------------
@@ -2241,9 +2258,21 @@ class CandidateGenerator:
             try:
                 async with self._primary_sem:
                     remaining = self._remaining_seconds(deadline)
+                    primary_budget = min(remaining, _TIER3_REFLEX_HARD_CAP_S)
+                    if (
+                        remaining > _TIER3_REFLEX_HARD_CAP_S + 1.0
+                        and primary_budget >= _TIER3_REFLEX_HARD_CAP_S - 0.01
+                    ):
+                        logger.info(
+                            "[CandidateGenerator] Plan Tier3_cap_active: "
+                            "primary_budget=%.1fs (hard cap _TIER3_REFLEX_HARD_CAP_S=%.1fs), "
+                            "remaining=%.1fs — PLAN primary will sever at cap "
+                            "for Manifesto §5 cascade",
+                            primary_budget, _TIER3_REFLEX_HARD_CAP_S, remaining,
+                        )
                     return await asyncio.wait_for(
                         self._primary.plan(prompt, deadline),
-                        timeout=remaining,
+                        timeout=primary_budget,
                     )
             except (Exception, asyncio.CancelledError) as exc:
                 logger.warning(
@@ -2262,7 +2291,7 @@ class CandidateGenerator:
             _sem_wait_s = time.monotonic() - _sem_t0
             _parent_remaining = self._remaining_seconds(deadline)
             _budget_target = max(_parent_remaining, _FALLBACK_MIN_GUARANTEED_S)
-            remaining = min(_budget_target, self._FALLBACK_MAX_TIMEOUT_S)
+            remaining = min(_budget_target, _PLAN_FALLBACK_MAX_TIMEOUT_S)
             if remaining > _parent_remaining + 1.0:
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=remaining,
