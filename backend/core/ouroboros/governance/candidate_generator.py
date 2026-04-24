@@ -94,7 +94,44 @@ _TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
     "heavy_code": 1.231,       # alias for complex
 }
 _PRIMARY_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_PRIMARY_BUDGET_FRACTION", "0.65"))
-_FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "20"))
+_FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "30"))
+
+# Tier 3 Reflex (Manifesto §5): aggressive hard cap on primary provider.
+# If the primary (e.g., DoubleWord 397B) stalls on stream rendering or token
+# generation for longer than this cap, the deterministic router severs the
+# thread and cascades to the high-reliability frontier model (Claude).
+#
+# Problem this fixes — F1 Slice 4 S3 (bt-2026-04-24-204029):
+# The primary held semaphore for up to 153.76s (DW SSE stream stall), which
+# exceeded the then-current fraction-based cap of ~143s (0.65 * 220s
+# remaining). The seed's GENERATE phase could not produce a candidate; both
+# primary AND fallback exhausted because fallback inherited only 77s of
+# remaining budget after primary ate the bulk. Zero $ billed (all timeouts).
+# Multi-file candidate shape was verified present (PLAN-SHADOW dag_units=3
+# parallel_pairs=3) but the parallel_dispatch seam never evaluated because
+# GENERATE returned no candidate.
+#
+# Manifesto §5 Tier 3 quote (verbatim):
+#   "If a cost-optimized inference node (e.g., DW 397B) exhausts its
+#    temporal budget without returning a valid execution plan, the
+#    deterministic router autonomously severs the thread and triggers
+#    an instant cascade to a high-reliability frontier model."
+#
+# This cap is a HARD TIME BOX, not a fraction. Fraction-based logic in
+# _compute_primary_budget stays in effect only as an inner floor — the
+# outer min() enforces this absolute ceiling.
+#
+# Default 30s is calibrated from S3 evidence: DW first_token_ms=1898 was
+# observed, but stream stall extended hold to 85-153s. A 30s cap forces
+# a sever at any stall beyond the expected first-token-plus-generation
+# window, which for docstring-expansion workloads should comfortably
+# finish in <20s on a healthy DW endpoint.
+#
+# Env-tunable so operators can relax for legitimately slow workloads
+# (e.g., extremely long CoT traces on architectural ops). The Claude
+# fallback still sees its own `_FALLBACK_MAX_TIMEOUT_S` budget after
+# the primary is severed.
+_PRIMARY_MAX_TIMEOUT_S = float(os.environ.get("OUROBOROS_PRIMARY_MAX_TIMEOUT_S", "30"))
 
 # Minimum time worth attempting a fallback API call.  Below this threshold
 # the call will almost certainly timeout before the model finishes; skip it
@@ -2308,11 +2345,33 @@ class CandidateGenerator:
             _primary_sem_wait_s = time.monotonic() - _primary_sem_t0
             remaining = self._remaining_seconds(deadline)
             primary_budget = self._compute_primary_budget(remaining)
-            logger.debug(
-                "[CandidateGenerator] Primary budget: %.1fs of %.1fs remaining "
-                "(fallback reserve: %.1fs)",
-                primary_budget, remaining, remaining - primary_budget,
+            # Tier 3 Reflex observability (Manifesto §5): log at INFO when
+            # the hard cap is the binding constraint (not the fraction or
+            # the fallback-reserve). Operators can grep for
+            # "Tier3_cap_active" to see sessions where the aggressive
+            # circuit breaker is forcing fast fallback cascades.
+            _tier3_cap_active = (
+                primary_budget >= _PRIMARY_MAX_TIMEOUT_S - 0.01
+                and remaining > _PRIMARY_MAX_TIMEOUT_S + _FALLBACK_MIN_RESERVE_S
             )
+            if _tier3_cap_active:
+                logger.info(
+                    "[CandidateGenerator] Tier3_cap_active: primary_budget=%.1fs "
+                    "(hard cap _PRIMARY_MAX_TIMEOUT_S=%.1fs), remaining=%.1fs "
+                    "fallback_reserve=%.1fs route=%s phase=%s op=%s — "
+                    "primary will sever at budget expiry for Manifesto §5 cascade",
+                    primary_budget, _PRIMARY_MAX_TIMEOUT_S, remaining,
+                    remaining - primary_budget,
+                    getattr(context, "provider_route", "?"),
+                    _primary_phase_hint,
+                    getattr(context, "op_id", "?")[:16],
+                )
+            else:
+                logger.debug(
+                    "[CandidateGenerator] Primary budget: %.1fs of %.1fs remaining "
+                    "(fallback reserve: %.1fs)",
+                    primary_budget, remaining, remaining - primary_budget,
+                )
             try:
                 _pri_result = await asyncio.wait_for(
                     self._primary.generate(context, deadline),
@@ -2760,11 +2819,18 @@ class CandidateGenerator:
 
     @staticmethod
     def _compute_primary_budget(total_s: float) -> float:
-        """Deterministic Tier 1 primary budget with fallback reserve.
+        """Deterministic Tier 1 primary budget with fallback reserve + Tier 3 cap.
 
-        Invariants:
+        Invariants (enforced via ``min()`` — strictest wins):
           - primary_budget <= total_s * _PRIMARY_BUDGET_FRACTION
           - total_s - primary_budget >= _FALLBACK_MIN_RESERVE_S (when possible)
+          - **primary_budget <= _PRIMARY_MAX_TIMEOUT_S** (Tier 3 hard cap,
+            Manifesto §5 — prevents a stalled primary from consuming the
+            whole session budget and starving the Claude fallback)
+
+        Tier 3 cap added 2026-04-24 after F1 Slice 4 S3 (bt-2026-04-24-204029)
+        exposed a 153s DW primary hold that exhausted the session before
+        Claude fallback could produce a candidate.
         """
         if total_s <= 0:
             return 0.0
@@ -2772,5 +2838,6 @@ class CandidateGenerator:
         budget = min(
             total_s * _PRIMARY_BUDGET_FRACTION,
             total_s - fb_reserve,
+            _PRIMARY_MAX_TIMEOUT_S,
         )
         return max(budget, 0.0)
