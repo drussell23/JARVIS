@@ -567,6 +567,38 @@ async def dispatch_pipeline(
         # Merge runner artifacts into PhaseContext for downstream phases.
         pctx.merge_artifacts(dict(result.artifacts))
 
+        # Wave 3 (6) Slice 3 — shadow-mode fan-out evaluation.
+        # Post-GENERATE seam: when this iter ran a GENERATE runner AND
+        # GENERATE produced a `generation` artifact that landed on
+        # pctx.generation, invoke the shadow-only fan-out evaluator.
+        # Guards are in evaluate_shadow_fanout — it short-circuits
+        # (no logs, no work) unless JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED
+        # AND JARVIS_WAVE3_PARALLEL_DISPATCH_SHADOW are both `true`.
+        # When armed, it emits [ParallelDispatch] telemetry and
+        # optionally builds the ExecutionGraph — but does NOT submit to
+        # any scheduler and does NOT mutate pctx or ctx. Slice 3 is
+        # shadow-only (scope §9); enforce wiring is Slice 4.
+        if (
+            dispatch_phase == OperationPhase.GENERATE
+            and pctx.generation is not None
+        ):
+            try:
+                from backend.core.ouroboros.governance.parallel_dispatch import (
+                    evaluate_shadow_fanout as _evaluate_shadow_fanout,
+                )
+                _evaluate_shadow_fanout(
+                    op_id=ctx.op_id,
+                    generation=pctx.generation,
+                )
+            except Exception as _shadow_exc:  # noqa: BLE001 — never fail
+                # Shadow must NEVER escalate into a production crash.
+                # Catch everything, log at DEBUG (so it doesn't clutter
+                # INFO streams), and continue the pipeline unchanged.
+                logger.debug(
+                    "[PhaseDispatcher] shadow_fanout_hook raised (suppressed): %r",
+                    _shadow_exc,
+                )
+
         # Terminal exit from runner → return immediately.
         if result.next_phase is None:
             logger.debug(

@@ -39,7 +39,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from backend.core.ouroboros.governance.autonomy.subagent_types import (
     ExecutionGraph,
@@ -835,6 +835,269 @@ def build_execution_graph(
 
 
 # ---------------------------------------------------------------------------
+# Slice 3 — shadow-mode evaluation helpers
+# ---------------------------------------------------------------------------
+
+
+def extract_candidate_files(
+    generation: Any,
+) -> Optional[Tuple[CandidateFile, ...]]:
+    """Defensive extraction of candidate files from a GENERATE artifact.
+
+    Shadow-mode consumer — intentionally lenient. Returns ``None`` on any
+    unrecognized shape so the shadow hook emits a no-op telemetry line
+    rather than crashing the pipeline.
+
+    Accepts :class:`GenerationResult`-like shapes (anything with a
+    ``.candidates`` iterable of dicts). Each candidate is inspected for:
+
+    * ``files: [{file_path, full_content, rationale?}, ...]`` — multi-file
+      shape (Slice 5 multi-file gen contract).
+    * ``{file_path, full_content, ...}`` — single-file legacy shape.
+
+    When a candidate carries a multi-file ``files`` list, returns that
+    list as :class:`CandidateFile` tuples. When all candidates are
+    single-file, returns a tuple with the unique files across candidates
+    (which in practice is just one CandidateFile since each candidate
+    describes the same change).
+
+    Parameters
+    ----------
+    generation:
+        The ``generation`` artifact emitted by GENERATE — typically a
+        :class:`~backend.core.ouroboros.governance.op_context.GenerationResult`
+        but any object with a ``.candidates`` attribute will work.
+
+    Returns
+    -------
+    Optional[Tuple[CandidateFile, ...]]
+        Extracted file list, or ``None`` if the shape doesn't match.
+        Never raises.
+    """
+    try:
+        candidates = getattr(generation, "candidates", None)
+        if candidates is None:
+            return None
+        candidates_tuple = tuple(candidates)
+        if not candidates_tuple:
+            return tuple()  # non-None but empty → caller skips fan-out
+
+        # Multi-file shape: inspect the first candidate for a ``files`` list.
+        first = candidates_tuple[0]
+        if isinstance(first, dict):
+            files_list = first.get("files")
+            if isinstance(files_list, list) and files_list:
+                extracted: list = []
+                seen_paths: set = set()
+                for entry in files_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    path = entry.get("file_path")
+                    content = entry.get("full_content")
+                    if not isinstance(path, str) or not path:
+                        continue
+                    if content is None:
+                        continue
+                    if path in seen_paths:
+                        continue  # dedupe defensively
+                    seen_paths.add(path)
+                    extracted.append(
+                        CandidateFile(
+                            file_path=path,
+                            full_content=str(content),
+                            rationale=str(entry.get("rationale") or ""),
+                        )
+                    )
+                return tuple(extracted)
+
+            # Single-file legacy shape: collect unique file_paths across
+            # all candidates (typically just one in practice).
+            path = first.get("file_path")
+            content = first.get("full_content")
+            if isinstance(path, str) and path and content is not None:
+                return (
+                    CandidateFile(
+                        file_path=path,
+                        full_content=str(content),
+                        rationale=str(first.get("rationale") or ""),
+                    ),
+                )
+        return None
+    except Exception:  # noqa: BLE001 — shadow path must never crash caller
+        return None
+
+
+@dataclass(frozen=True)
+class ShadowEvaluation:
+    """Record of a single shadow-mode evaluation.
+
+    Returned from :func:`evaluate_shadow_fanout` so callers can inspect
+    the outcome in tests without log scraping. Nothing about this record
+    is consumed by the production pipeline — Slice 3 is shadow-only.
+
+    Attributes
+    ----------
+    ran:
+        ``True`` if the shadow evaluation was armed (master + shadow both
+        on). ``False`` when either flag was off — eligibility + graph
+        construction were skipped and no ``[ParallelDispatch]`` telemetry
+        emitted.
+    skip_reason:
+        Non-empty when ``ran=False`` — human-readable note for why the
+        shadow hook short-circuited (master off / shadow off / unrecognized
+        generation shape / empty candidates).
+    eligibility:
+        The :class:`FanoutEligibility` computed when ``ran=True``.
+    graph:
+        The :class:`ExecutionGraph` built when ``eligibility.allowed``.
+        ``None`` when eligibility denied fan-out (or when graph build
+        itself raised — build errors are caught + logged in shadow).
+    graph_id:
+        Convenience accessor for telemetry: ``graph.graph_id`` when
+        present, empty string otherwise.
+    plan_digest:
+        Convenience accessor: ``graph.plan_digest`` when present, empty
+        string otherwise.
+    """
+
+    ran: bool
+    skip_reason: str = ""
+    eligibility: Optional[FanoutEligibility] = None
+    graph: Optional[ExecutionGraph] = None
+    graph_id: str = ""
+    plan_digest: str = ""
+
+
+def evaluate_shadow_fanout(
+    *,
+    op_id: str,
+    generation: Any,
+    repo: str = "jarvis",
+    gate: Optional[MemoryPressureGate] = None,
+    posture_fn: Optional[
+        Callable[[], Tuple[Optional[Posture], Optional[float]]]
+    ] = None,
+) -> ShadowEvaluation:
+    """Slice 3 — shadow-mode fan-out evaluation for the post-GENERATE seam.
+
+    Evaluates fan-out eligibility + (when allowed) builds the execution
+    graph — but does NOT submit to any scheduler. All side effects are
+    confined to structured log emission under the ``[ParallelDispatch]``
+    tag, preserving the Slice 3 contract ("no silent shadow").
+
+    Guards (first-short-circuit wins):
+
+    1. Master flag (:func:`parallel_dispatch_enabled`) must be on.
+    2. Shadow sub-flag (:func:`parallel_dispatch_shadow_enabled`) must
+       be on. Enforce flag is intentionally irrelevant here — shadow and
+       enforce are mutually exclusive modes; Slice 3 is shadow-only.
+    3. ``generation`` artifact must yield an extractable candidate list
+       via :func:`extract_candidate_files`.
+
+    On each armed evaluation the module logger emits one or more
+    ``[ParallelDispatch]`` lines:
+
+    * The eligibility decision line (same format as
+      :func:`is_fanout_eligible`).
+    * When a graph is built, an additional
+      ``[ParallelDispatch shadow_graph_built]`` line with ``graph_id``,
+      ``plan_digest``, ``concurrency_limit``, and ``n_units``.
+
+    Parameters
+    ----------
+    op_id:
+        Parent op id for telemetry tagging + unit id derivation.
+    generation:
+        GENERATE artifact (``GenerationResult``-like). Defensive
+        extraction; unknown shapes yield a ``ran=False`` result with a
+        ``skip_reason``.
+    repo:
+        Repository tag for :class:`WorkUnitSpec`. Default ``"jarvis"``.
+    gate, posture_fn:
+        Dependency-injection hooks forwarded to
+        :func:`is_fanout_eligible`; default to the module-level real gate
+        + PostureStore reader.
+
+    Returns
+    -------
+    ShadowEvaluation
+        Always returned; never raises. Shadow never breaks the pipeline.
+    """
+    if not parallel_dispatch_enabled():
+        result = ShadowEvaluation(ran=False, skip_reason="master_off")
+        logger.debug(
+            "[ParallelDispatch shadow_skipped] op=%s reason=master_off",
+            op_id[:16],
+        )
+        return result
+
+    if not parallel_dispatch_shadow_enabled():
+        result = ShadowEvaluation(ran=False, skip_reason="shadow_off")
+        logger.debug(
+            "[ParallelDispatch shadow_skipped] op=%s reason=shadow_off",
+            op_id[:16],
+        )
+        return result
+
+    files = extract_candidate_files(generation)
+    if files is None:
+        result = ShadowEvaluation(ran=False, skip_reason="unrecognized_shape")
+        logger.info(
+            "[ParallelDispatch shadow_skipped] op=%s reason=unrecognized_shape",
+            op_id[:16],
+        )
+        return result
+
+    n_files = len(files)
+    # Run eligibility regardless of n_files so the operator gets the
+    # explicit reason (SINGLE_FILE_OP / EMPTY_CANDIDATE_LIST) in logs.
+    eligibility = is_fanout_eligible(
+        op_id=op_id,
+        n_candidate_files=n_files,
+        gate=gate,
+        posture_fn=posture_fn,
+        emit_log=True,
+    )
+
+    if not eligibility.allowed:
+        return ShadowEvaluation(ran=True, eligibility=eligibility)
+
+    # Try to build the graph — any validator error is caught + logged so
+    # shadow never escalates into a production crash.
+    try:
+        graph = build_execution_graph(
+            op_id=op_id,
+            repo=repo,
+            candidate_files=files,
+            eligibility=eligibility,
+        )
+    except Exception as exc:  # noqa: BLE001 — shadow never crashes pipeline
+        logger.warning(
+            "[ParallelDispatch shadow_graph_build_failed] op=%s error=%s",
+            op_id[:16],
+            f"{type(exc).__name__}: {exc}",
+        )
+        return ShadowEvaluation(ran=True, eligibility=eligibility)
+
+    logger.info(
+        "[ParallelDispatch shadow_graph_built] op=%s graph_id=%s "
+        "plan_digest=%s concurrency_limit=%d n_units=%d",
+        op_id[:16],
+        graph.graph_id,
+        graph.plan_digest[:12],
+        graph.concurrency_limit,
+        len(graph.units),
+    )
+    return ShadowEvaluation(
+        ran=True,
+        eligibility=eligibility,
+        graph=graph,
+        graph_id=graph.graph_id,
+        plan_digest=graph.plan_digest,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Module public surface — explicit for grep clarity
 # ---------------------------------------------------------------------------
 
@@ -848,7 +1111,10 @@ __all__ = [
     "PLANNER_ID",
     "POSTURE_CONFIDENCE_FLOOR",
     "ReasonCode",
+    "ShadowEvaluation",
     "build_execution_graph",
+    "evaluate_shadow_fanout",
+    "extract_candidate_files",
     "is_fanout_eligible",
     "parallel_dispatch_enabled",
     "parallel_dispatch_enforce_enabled",
