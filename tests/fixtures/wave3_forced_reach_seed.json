@@ -1,11 +1,11 @@
 [
   {
     "task_id": "wave3-item6-forced-reach-multifile-seed",
-    "description": "Wave 3 (6) Slice 5a graduation forced-reachability seed. Three empty Python package __init__.py files need one-sentence module docstrings so the packages are self-documenting. This is a deterministic, low-risk, multi-file trivial edit designed to walk through CLASSIFY -> ROUTE -> CTX -> PLAN -> GENERATE (multi-file candidate shape) -> the post-GENERATE parallel_dispatch seam, exercising enforce-mode fan-out when JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED and ...ENFORCE are both true. Edit: in each of the three target files, add a single triple-quoted module docstring on line 1 - one short sentence per file describing the package's role. Do not add any code, imports, or exports. Each file's full content after the edit should be exactly one line: a triple-quoted string. This seeds the Wave 3 (6) graduation cadence without accumulating meaningful production side effects; the diff across all three files totals roughly 3 lines of docstring content. Classify as SAFE_AUTO, trivial complexity, blast_radius=3. F2 Slice 3 (2026-04-23): urgency_hint and routing_hint added so that when JARVIS_BACKLOG_URGENCY_HINT_ENABLED=true this seed declares urgency=critical + routing=standard at the schema level, escaping the source=backlog -> BACKGROUND classification trap and enabling the multi-file STANDARD/COMPLEX eligibility path at the post-GENERATE parallel_dispatch seam. Backward-compatible: pre-F2 BacklogSensor ignores both fields.",
+    "description": "Wave 3 (6) Slice 5b / F1 graduation forced-reachability seed — REFRAMED 2026-04-24 after F1 Slice 4 S1 (bt-2026-04-24-075052) revealed OperationAdvisor auto-blocking the prior targets (3 × empty package __init__.py files) due to blast_radius=50 + coverage=0% composite. The prior block was Manifesto §6 Iron Gate working as designed — a 0-coverage high-blast-radius edit correctly got refused. This reframed seed targets three isolated utility modules with existing test coverage and low blast radius (8 total importers), satisfying the Advisor without weakening the Iron Gate. Task: each target module has an existing brief module docstring; expand each docstring into a fuller 4-6 sentence description covering (1) module purpose, (2) key exported symbols, (3) usage context. Safe docstring-only multi-file edit; zero behavioral change; 3-file shape preserved so the post-GENERATE parallel_dispatch seam receives a multi-file candidate. Classify as SAFE_AUTO, trivial complexity, blast_radius=8.",
     "target_files": [
-      "backend/core/ouroboros/architect/__init__.py",
-      "backend/core/tui/__init__.py",
-      "backend/core/umf/__init__.py"
+      "backend/core/ouroboros/roadmap/hypothesis_envelope_factory.py",
+      "backend/core/ouroboros/exploration_envelope_factory.py",
+      "backend/core/ouroboros/cancellation_token.py"
     ],
     "priority": 1,
     "repo": "jarvis",

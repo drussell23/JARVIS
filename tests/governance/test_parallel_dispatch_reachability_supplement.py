@@ -90,10 +90,16 @@ from backend.core.ouroboros.governance.posture import Posture
 # exactly so this supplement is the test-harness analogue of the live seed.
 # ---------------------------------------------------------------------------
 
+# Reframed 2026-04-24 after F1 Slice 4 S1 (bt-2026-04-24-075052) exposed
+# the OperationAdvisor auto-blocking the prior targets (3 × empty package
+# __init__.py) via blast_radius=50 + coverage=0% composite. The block was
+# Manifesto §6 Iron Gate working as designed. Reframed targets are three
+# isolated utility modules with existing test coverage and low blast radius
+# (~8 total importers), satisfying the Advisor without weakening Iron Gate.
 _SEED_TARGETS: Tuple[str, ...] = (
-    "backend/core/ouroboros/architect/__init__.py",
-    "backend/core/tui/__init__.py",
-    "backend/core/umf/__init__.py",
+    "backend/core/ouroboros/roadmap/hypothesis_envelope_factory.py",
+    "backend/core/ouroboros/exploration_envelope_factory.py",
+    "backend/core/ouroboros/cancellation_token.py",
 )
 
 
