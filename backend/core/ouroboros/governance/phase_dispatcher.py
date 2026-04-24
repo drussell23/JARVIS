@@ -109,9 +109,42 @@ _TERMINAL_PHASES = frozenset({
 
 
 def dispatcher_enabled() -> bool:
-    """Flag read: ``JARVIS_PHASE_RUNNER_DISPATCHER_ENABLED`` default false."""
+    """Flag read: ``JARVIS_PHASE_RUNNER_DISPATCHER_ENABLED``.
+
+    **Default ``true`` as of 2026-04-23 graduation** (Wave 2 (5) #8
+    FINAL). 3-session cadence under post-Ticket-A1/B/C guards:
+    bt-2026-04-23-224649 (12 markers) + bt-2026-04-23-231351 (12 markers)
+    + bt-2026-04-23-235215 (11 markers) — all three idle_timeout /
+    session_outcome=complete / 0 runner-attributed frames (zero
+    `phase_dispatcher.py`, `phase_runners/`, `generate_runner`,
+    `slice4b_runner` frames in any traceback) / 0 JARVIS shutdown
+    race / 0 POSTMORTEMs. **35 total `[PhaseRunnerDelegate] DISPATCHER
+    → pipeline` markers** across the cadence, with **zero per-phase
+    legacy delegation markers** in any session — proof-positive that
+    the dispatcher short-circuit at orchestrator.py:1477 engaged on
+    every dispatched op (the legacy inline `if _phase_runner_<PHASE>_extracted()`
+    blocks were never reached).
+
+    reachability_source: `dispatcher_markers+parity`. §6 Iron Gate
+    live evidence NOT required for #8 per operator binding — the
+    dispatcher is routing infrastructure, not a generator/gate;
+    §6 depth for downstream phases was already graduated under
+    #5–#7. Correctness oracle: Slice 6a parity (228/228 structural)
+    + Slice 6b parity (248/248 via _run_both_paths harness across
+    20 per-phase terminal matrix tests). Iron Gate silence under
+    continued upstream exhaustion is non-rollback per binding
+    unless runner-attributed regression or parity breaks are
+    detected.
+
+    legacy_if_blocks=0 across the cadence — no legacy per-phase
+    block was reached on any dispatched op.
+
+    Explicit ``=false`` remains a runtime kill switch reverting
+    to the legacy else-chain in orchestrator.py. Wave 2 (5) CLOSED
+    at this flip's post-flip-FINAL stamp.
+    """
     return (
-        os.environ.get("JARVIS_PHASE_RUNNER_DISPATCHER_ENABLED", "false")
+        os.environ.get("JARVIS_PHASE_RUNNER_DISPATCHER_ENABLED", "true")
         .strip().lower() in _TRUTHY
     )
 
