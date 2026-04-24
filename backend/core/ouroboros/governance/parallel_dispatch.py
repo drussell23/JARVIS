@@ -34,12 +34,17 @@ Those integrations arrive in Slices 2-4 per the scope doc's §9.
 from __future__ import annotations
 
 import enum
+import hashlib
 import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Mapping, Optional, Sequence, Tuple
 
+from backend.core.ouroboros.governance.autonomy.subagent_types import (
+    ExecutionGraph,
+    WorkUnitSpec,
+)
 from backend.core.ouroboros.governance.memory_pressure_gate import (
     FanoutDecision as MemoryFanoutDecision,
     MemoryPressureGate,
@@ -535,14 +540,315 @@ def is_fanout_eligible(
 
 
 # ---------------------------------------------------------------------------
+# Slice 2 — candidate-file container + build_execution_graph
+# ---------------------------------------------------------------------------
+
+
+# Constant name for consumers + tests. Bumped when the candidate → graph
+# conversion contract changes in a non-backward-compatible way.
+GRAPH_SCHEMA_VERSION: str = "wave3_item6_slice2.v1"
+
+# Planner id stamped on every graph this primitive emits. Lets downstream
+# telemetry / audit distinguish parallel-dispatch-generated graphs from
+# other producers (e.g. the legacy autonomy graph planner).
+PLANNER_ID: str = "parallel_dispatch.v1"
+
+# Default per-unit execution budget in seconds. Mirrors
+# ``WorkUnitSpec.timeout_s`` default so Slice 2 does not silently widen
+# the scheduler's existing per-unit time budget.
+DEFAULT_UNIT_TIMEOUT_S: float = 180.0
+
+# Default per-unit retry budget. Mirrors ``WorkUnitSpec.max_attempts``
+# default — scheduler handles retries at the unit level; parallel
+# dispatch does not add its own retry layer.
+DEFAULT_UNIT_MAX_ATTEMPTS: int = 1
+
+
+@dataclass(frozen=True)
+class CandidateFile:
+    """Slim candidate-file container consumed by :func:`build_execution_graph`.
+
+    Mirrors the shape that the multi-file GENERATE path already emits
+    (``{file_path, full_content, rationale}``, per CLAUDE.md's "Multi-file
+    coordinated generation" spec) WITHOUT importing from
+    :mod:`~backend.core.ouroboros.governance.candidate_generator` — that
+    module is on the §4 invariant #3 authority-import ban list.
+
+    Slice 3+ translates ``candidate_generator.Candidate.files[i]`` into
+    this type at the post-GENERATE seam; Slice 2 only consumes.
+
+    Attributes
+    ----------
+    file_path:
+        Repository-relative POSIX path the unit will own. Must be
+        non-empty, unique across the candidate list.
+    full_content:
+        Desired post-APPLY content. Carried through to the unit so the
+        scheduler's per-unit APPLY can write it.
+    rationale:
+        Human-readable one-line description of why this file changes.
+        Threaded into ``WorkUnitSpec.goal`` so §8 observability surfaces
+        the per-unit intent.
+    """
+
+    file_path: str
+    full_content: str
+    rationale: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.file_path or not self.file_path.strip():
+            raise ValueError("CandidateFile.file_path must be non-empty")
+        if self.full_content is None:
+            raise ValueError(
+                f"CandidateFile[{self.file_path!r}].full_content may not be None"
+            )
+
+
+def _unit_id_for(op_id: str, file_path: str) -> str:
+    """Compute a deterministic ``unit_id`` from ``(op_id, file_path)``.
+
+    Stable across runs so the same graph inputs yield the same graph
+    (supports :attr:`ExecutionGraph.plan_digest` stability). 12-hex-char
+    prefix matches the op-id-style-prefix convention already used by
+    other autonomy types.
+    """
+    digest = hashlib.sha256(
+        f"{op_id}\x1f{file_path}".encode("utf-8")
+    ).hexdigest()
+    return f"unit-{digest[:12]}"
+
+
+def _graph_id_for(op_id: str, eligibility: "FanoutEligibility") -> str:
+    """Compute a deterministic ``graph_id`` tied to the op + eligibility."""
+    digest = hashlib.sha256(
+        (
+            f"{op_id}\x1f"
+            f"{eligibility.n_requested}\x1f"
+            f"{eligibility.n_allowed}\x1f"
+            f"{eligibility.reason_code.value}"
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"graph-{digest[:12]}"
+
+
+def build_execution_graph(
+    *,
+    op_id: str,
+    repo: str,
+    candidate_files: Sequence[CandidateFile],
+    eligibility: "FanoutEligibility",
+    dependency_edges: Optional[Mapping[str, Sequence[str]]] = None,
+    per_unit_timeout_s: float = DEFAULT_UNIT_TIMEOUT_S,
+    per_unit_max_attempts: int = DEFAULT_UNIT_MAX_ATTEMPTS,
+    planner_id: str = PLANNER_ID,
+    schema_version: str = GRAPH_SCHEMA_VERSION,
+) -> ExecutionGraph:
+    """Convert a multi-file candidate list into an :class:`ExecutionGraph`.
+
+    Post-GENERATE seam primitive (per scope §12 (a)). Pure deterministic
+    function: identical inputs yield identical ``graph_id`` + ``plan_digest``
+    + ``unit_id`` values. Slice 3+ consumes this graph via the existing
+    :class:`~backend.core.ouroboros.governance.autonomy.subagent_scheduler.SubagentScheduler`
+    without recomputing eligibility — eligibility is already baked into
+    ``concurrency_limit`` via ``eligibility.n_allowed``.
+
+    Parameters
+    ----------
+    op_id:
+        Parent operation id. Used for graph/unit-id derivation + op-level
+        lineage in scheduler telemetry. Must be non-empty.
+    repo:
+        Repository tag the units target (typically ``"jarvis"`` for the
+        primary repo, matching :class:`WorkUnitSpec.repo`). Must be
+        non-empty.
+    candidate_files:
+        The multi-file GENERATE output to fan out over. Must contain at
+        least two entries with unique ``file_path`` values; callers are
+        responsible for having already passed :func:`is_fanout_eligible`
+        with ``allowed=True``.
+    eligibility:
+        The ``FanoutEligibility`` record that authorized this fan-out.
+        ``eligibility.allowed`` MUST be ``True`` and
+        ``eligibility.n_allowed >= 2`` — otherwise the primitive raises
+        :class:`ValueError`. ``eligibility.n_allowed`` becomes the graph's
+        ``concurrency_limit``.
+    dependency_edges:
+        Optional mapping ``file_path -> [file_path, ...]`` expressing
+        per-unit upstream dependencies. Each key + value must match a
+        ``file_path`` present in ``candidate_files``; unknown paths
+        raise ``ValueError`` before the graph is constructed. Cycles and
+        duplicates are caught by the :class:`ExecutionGraph` validator
+        (``_validate_unit_dag``) and surface as ``ValueError`` from its
+        ``__post_init__``. When ``None``, every unit is independent
+        (fully parallel-safe DAG).
+    per_unit_timeout_s:
+        Wall-clock budget for each unit's execution. Default matches the
+        scheduler's existing :attr:`WorkUnitSpec.timeout_s`.
+    per_unit_max_attempts:
+        Per-unit retry budget. Default 1 (scheduler handles retries;
+        parallel dispatch does not add its own retry layer).
+    planner_id:
+        Stamped onto the graph for telemetry lineage. Default
+        ``"parallel_dispatch.v1"``.
+    schema_version:
+        Contract version for the candidate → graph conversion. Default
+        ``"wave3_item6_slice2.v1"``. Bumped when the conversion contract
+        changes incompatibly.
+
+    Returns
+    -------
+    ExecutionGraph
+        Validated DAG (unique unit_ids, known edges, acyclic) ready for
+        :meth:`SubagentScheduler.submit`. ``concurrency_limit`` equals
+        ``eligibility.n_allowed``. ``plan_digest`` + ``causal_trace_id``
+        derived deterministically from inputs.
+
+    Raises
+    ------
+    ValueError
+        On empty candidate list, single-file op, duplicate file_paths,
+        ineligible ``eligibility``, unknown dependency edges, cycles, or
+        any ``WorkUnitSpec``/``ExecutionGraph`` constructor failure
+        (cascaded from :class:`autonomy.subagent_types` validators).
+    """
+    # --- Input validation (our own contract; subagent_types validates again) ---
+
+    if not op_id or not op_id.strip():
+        raise ValueError("build_execution_graph: op_id must be non-empty")
+    if not repo or not repo.strip():
+        raise ValueError("build_execution_graph: repo must be non-empty")
+
+    # Defensive None check — type annotation says non-Optional but callers
+    # in Python land may still pass None accidentally; surface a clear
+    # contract error before the first attribute access.
+    if eligibility is None:  # type: ignore[unreachable]
+        raise ValueError("build_execution_graph: eligibility must not be None")
+    if not eligibility.allowed:
+        raise ValueError(
+            "build_execution_graph: eligibility.allowed=False "
+            f"(reason={eligibility.reason_code.value}) — "
+            "callers must not build a graph when fan-out is denied"
+        )
+    if eligibility.n_allowed < 2:
+        raise ValueError(
+            "build_execution_graph: eligibility.n_allowed must be >= 2; "
+            f"got {eligibility.n_allowed} (reason={eligibility.reason_code.value})"
+        )
+
+    if not candidate_files:
+        raise ValueError("build_execution_graph: candidate_files must be non-empty")
+
+    files_tuple: Tuple[CandidateFile, ...] = tuple(candidate_files)
+    if len(files_tuple) < 2:
+        raise ValueError(
+            "build_execution_graph: fan-out requires >=2 candidate files; "
+            f"got {len(files_tuple)}"
+        )
+
+    seen_paths: set = set()
+    for cf in files_tuple:
+        if cf.file_path in seen_paths:
+            raise ValueError(
+                f"build_execution_graph: duplicate file_path {cf.file_path!r} "
+                "in candidate_files"
+            )
+        seen_paths.add(cf.file_path)
+
+    if per_unit_timeout_s <= 0.0:
+        raise ValueError(
+            f"build_execution_graph: per_unit_timeout_s must be > 0; "
+            f"got {per_unit_timeout_s}"
+        )
+    if per_unit_max_attempts < 1:
+        raise ValueError(
+            "build_execution_graph: per_unit_max_attempts must be >= 1; "
+            f"got {per_unit_max_attempts}"
+        )
+
+    # --- Resolve dependency_edges against concrete file_paths ---
+
+    path_to_unit_id = {
+        cf.file_path: _unit_id_for(op_id, cf.file_path) for cf in files_tuple
+    }
+
+    if dependency_edges:
+        unknown = [
+            path
+            for path in dependency_edges.keys()
+            if path not in path_to_unit_id
+        ]
+        if unknown:
+            raise ValueError(
+                "build_execution_graph: dependency_edges references unknown "
+                f"file_paths: {sorted(unknown)}"
+            )
+        for dependent_path, deps in dependency_edges.items():
+            for dep_path in deps:
+                if dep_path not in path_to_unit_id:
+                    raise ValueError(
+                        f"build_execution_graph: dependency_edges[{dependent_path!r}] "
+                        f"references unknown file_path {dep_path!r}"
+                    )
+                if dep_path == dependent_path:
+                    # _validate_unit_dag handles self-loops via cycle detection,
+                    # but we surface a clearer message here.
+                    raise ValueError(
+                        f"build_execution_graph: dependency_edges[{dependent_path!r}] "
+                        "contains self-dependency"
+                    )
+
+    # --- Build WorkUnitSpec list in deterministic order ---
+
+    units: list = []
+    for cf in files_tuple:
+        dep_paths = (
+            tuple(dependency_edges.get(cf.file_path, ()))
+            if dependency_edges
+            else ()
+        )
+        dependency_ids = tuple(path_to_unit_id[p] for p in dep_paths)
+        goal = cf.rationale or f"apply candidate to {cf.file_path}"
+        units.append(
+            WorkUnitSpec(
+                unit_id=path_to_unit_id[cf.file_path],
+                repo=repo,
+                goal=goal,
+                target_files=(cf.file_path,),
+                dependency_ids=dependency_ids,
+                owned_paths=(cf.file_path,),
+                max_attempts=per_unit_max_attempts,
+                timeout_s=per_unit_timeout_s,
+            )
+        )
+
+    # --- Construct ExecutionGraph (cycles + duplicates caught here) ---
+
+    graph = ExecutionGraph(
+        graph_id=_graph_id_for(op_id, eligibility),
+        op_id=op_id,
+        planner_id=planner_id,
+        schema_version=schema_version,
+        units=tuple(units),
+        concurrency_limit=eligibility.n_allowed,
+    )
+    return graph
+
+
+# ---------------------------------------------------------------------------
 # Module public surface — explicit for grep clarity
 # ---------------------------------------------------------------------------
 
 
 __all__ = [
+    "CandidateFile",
+    "DEFAULT_UNIT_MAX_ATTEMPTS",
+    "DEFAULT_UNIT_TIMEOUT_S",
     "FanoutEligibility",
+    "GRAPH_SCHEMA_VERSION",
+    "PLANNER_ID",
     "POSTURE_CONFIDENCE_FLOOR",
     "ReasonCode",
+    "build_execution_graph",
     "is_fanout_eligible",
     "parallel_dispatch_enabled",
     "parallel_dispatch_enforce_enabled",
