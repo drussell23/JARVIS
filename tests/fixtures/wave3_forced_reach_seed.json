@@ -1,11 +1,11 @@
 [
   {
     "task_id": "wave3-item6-forced-reach-multifile-seed",
-    "description": "Wave 3 (6) Slice 5b / F1 graduation forced-reachability seed — REFRAMED 2026-04-24 after F1 Slice 4 S1 (bt-2026-04-24-075052) revealed OperationAdvisor auto-blocking the prior targets (3 × empty package __init__.py files) due to blast_radius=50 + coverage=0% composite. The prior block was Manifesto §6 Iron Gate working as designed — a 0-coverage high-blast-radius edit correctly got refused. This reframed seed targets three isolated utility modules with existing test coverage and low blast radius (8 total importers), satisfying the Advisor without weakening the Iron Gate. Task: each target module has an existing brief module docstring; expand each docstring into a fuller 4-6 sentence description covering (1) module purpose, (2) key exported symbols, (3) usage context. Safe docstring-only multi-file edit; zero behavioral change; 3-file shape preserved so the post-GENERATE parallel_dispatch seam receives a multi-file candidate. Classify as SAFE_AUTO, trivial complexity, blast_radius=8.",
+    "description": "Wave 3 (6) Slice 5b / F1 graduation forced-reachability seed — REFRAMED TWICE. First reframe 2026-04-24 after F1 Slice 4 S1 (bt-2026-04-24-075052) revealed OperationAdvisor auto-blocking the original targets (3 × empty package __init__.py files) due to blast_radius=50 + coverage=0% composite. Second reframe 2026-04-24 after F1 Slice 4 S2 (bt-2026-04-24-091016) revealed risk_engine unconditional BLOCK on touches_security_surface from naive substring match 'token' in cancellation_token.py (filename false positive against the regex any(kw in path for kw in ['auth','secret','cred','token','encrypt'])). Third-slot target swapped to context_memory_loader.py after preflight confirmed clean profile flags + no BLOCK from risk_engine + 7-total blast radius + 100% test coverage. Task: each target module has an existing brief module docstring; expand each docstring into a fuller 4-6 sentence description covering (1) module purpose, (2) key exported symbols, (3) usage context. Safe docstring-only multi-file edit; zero behavioral change; 3-file shape preserved so the post-GENERATE parallel_dispatch seam receives a multi-file candidate. Classify as SAFE_AUTO, trivial complexity, blast_radius=7.",
     "target_files": [
       "backend/core/ouroboros/roadmap/hypothesis_envelope_factory.py",
       "backend/core/ouroboros/exploration_envelope_factory.py",
-      "backend/core/ouroboros/cancellation_token.py"
+      "backend/core/ouroboros/governance/context_memory_loader.py"
     ],
     "priority": 1,
     "repo": "jarvis",
