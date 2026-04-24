@@ -150,6 +150,27 @@ def _respect_pre_stamped_route() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+# F2 Slice 2 — priority-0.5 clause gate.
+# Distinct from the priority-0 harness flag above: this one consumes
+# ONLY provider_route stamped by the UnifiedIntakeRouter from an
+# envelope's ``routing_override`` (disambiguated by the reason prefix
+# ``envelope_routing_override:``). Keeps F2 orthogonal to the harness
+# knob so neither flag can accidentally consume the other's pre-stamp.
+_ENVELOPE_ROUTING_OVERRIDE_REASON_PREFIX = "envelope_routing_override"
+
+
+def _envelope_routing_override_enabled() -> bool:
+    """Re-read ``JARVIS_BACKLOG_URGENCY_HINT_ENABLED`` at call-time.
+
+    Shares the master flag with F2 Slice 1's per-entry urgency_hint
+    (single operator knob for the full F2 arc). Default OFF.
+    """
+    raw = os.environ.get(
+        "JARVIS_BACKLOG_URGENCY_HINT_ENABLED", "",
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # UrgencyRouter — the deterministic classifier
 # ---------------------------------------------------------------------------
@@ -204,6 +225,30 @@ class UrgencyRouter:
             forced = (getattr(ctx, "provider_route", "") or "").strip().lower()
             if forced and forced in _VALID_ROUTE_VALUES:
                 return ProviderRoute(forced), f"forced_pre_stamped:{forced}"
+
+        # ── Priority 0.5: F2 envelope_routing_override ──
+        # When JARVIS_BACKLOG_URGENCY_HINT_ENABLED is on AND the ctx was
+        # pre-stamped by UnifiedIntakeRouter from an envelope carrying a
+        # valid ``routing_override`` (disambiguated by the reason prefix
+        # ``envelope_routing_override:``), honor it immediately. This is
+        # how F2 lets individual backlog.json entries declare their own
+        # routing — unblocking the source=backlog → BACKGROUND trap for
+        # graduation seeds without coupling to the harness priority-0
+        # knob above.
+        #
+        # Validation is defensive: empty / bogus / case-variant values
+        # silently fall through to the normal priority 1-5 matrix. The
+        # intake router emits only lowercase enum values, but we still
+        # normalize to be robust against manual ctx construction in tests.
+        if _envelope_routing_override_enabled():
+            _reason_raw = (getattr(ctx, "provider_route_reason", "") or "")
+            if _reason_raw.startswith(_ENVELOPE_ROUTING_OVERRIDE_REASON_PREFIX):
+                _route_raw = (getattr(ctx, "provider_route", "") or "").strip().lower()
+                if _route_raw and _route_raw in _VALID_ROUTE_VALUES:
+                    return (
+                        ProviderRoute(_route_raw),
+                        f"{_ENVELOPE_ROUTING_OVERRIDE_REASON_PREFIX}:{_route_raw}",
+                    )
 
         urgency = getattr(ctx, "signal_urgency", "") or "normal"
         source = getattr(ctx, "signal_source", "") or ""

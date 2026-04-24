@@ -10,7 +10,9 @@ Schema per entry:
         "priority": int 1-5,
         "repo": str,
         "status": "pending" | "in_progress" | "completed",
-        "urgency_hint": "critical" | "high" | "normal" | "low"  (F2 Slice 1, optional)
+        "urgency_hint": "critical" | "high" | "normal" | "low"    (F2 Slice 1, optional)
+        "routing_hint": "immediate" | "standard" | "complex" |
+                        "background" | "speculative"              (F2 Slice 2, optional)
     }
 
 Priority → urgency mapping:
@@ -20,9 +22,15 @@ F2 Slice 1 — optional per-entry ``urgency_hint`` lets individual backlog
 entries override the priority-map default (and the F3 session-wide env
 override) when ``JARVIS_BACKLOG_URGENCY_HINT_ENABLED=true``. Absent /
 invalid values fall back to priority-map. Precedence, most-specific wins:
-per-entry hint > F3 env override > priority-map default. See
+per-entry hint > F3 env override > priority-map default.
+
+F2 Slice 2 — optional per-entry ``routing_hint`` stamps an envelope-level
+``routing_override`` that UrgencyRouter honors under the same master flag
+``JARVIS_BACKLOG_URGENCY_HINT_ENABLED``. Disambiguated from
+UrgencyRouter's existing harness pre-stamp path via the
+``provider_route_reason`` prefix ``"envelope_routing_override"``. See
 ``memory/project_followup_f2_backlog_urgency_hint_schema.md`` for the
-full arc; ``routing_hint`` is Slice 2 and is NOT read here.
+full arc.
 """
 from __future__ import annotations
 
@@ -159,6 +167,31 @@ def _validate_urgency_hint(raw: Any) -> Optional[str]:
     return None
 
 
+# F2 Slice 2 — allowed routing_hint values (ProviderRoute enum values).
+# Duplicated here (vs importing) to keep intake → urgency_router import-
+# acyclic: sensors run upstream of routing and must not depend on
+# routing internals.
+_VALID_ROUTING_HINTS = frozenset({
+    "immediate", "standard", "complex", "background", "speculative",
+})
+
+
+def _validate_routing_hint(raw: Any) -> Optional[str]:
+    """Normalize + validate a raw routing_hint value.
+
+    Accepts any string matching (case-insensitive) one of
+    ``_VALID_ROUTING_HINTS``. Non-string, empty, or unknown values
+    return ``None`` so the caller can skip envelope stamping. Never
+    raises.
+    """
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().lower()
+    if cleaned in _VALID_ROUTING_HINTS:
+        return cleaned
+    return None
+
+
 @dataclass
 class BacklogTask:
     task_id: str
@@ -170,6 +203,9 @@ class BacklogTask:
     # F2 Slice 1 — optional per-entry hint. None = not set / invalid;
     # caller falls back to priority-map default.
     urgency_hint: Optional[str] = None
+    # F2 Slice 2 — optional per-entry routing hint. None = not set /
+    # invalid; caller skips envelope routing_override stamping.
+    routing_hint: Optional[str] = None
 
     @property
     def urgency(self) -> str:
@@ -237,6 +273,10 @@ class BacklogSensor:
         _hint_flag_on = _urgency_hint_enabled()
         _hint_applied_this_scan = False
         _hint_invalid_this_scan = False
+        # F2 Slice 2 — routing_hint telemetry counters. Same master flag
+        # gates consumption (single operator knob for the full F2 arc).
+        _routing_applied_this_scan = False
+        _routing_invalid_this_scan = False
         for item in tasks_raw:
             # F2 Slice 1: validate + normalize the per-entry hint at
             # construction time. Invalid values get surfaced as one
@@ -245,6 +285,11 @@ class BacklogSensor:
             _validated_hint = _validate_urgency_hint(_raw_hint)
             if _raw_hint is not None and _validated_hint is None:
                 _hint_invalid_this_scan = True
+            # F2 Slice 2: same pattern for routing_hint.
+            _raw_routing = item.get("routing_hint")
+            _validated_routing = _validate_routing_hint(_raw_routing)
+            if _raw_routing is not None and _validated_routing is None:
+                _routing_invalid_this_scan = True
             task = BacklogTask(
                 task_id=item.get("task_id", ""),
                 description=item.get("description", ""),
@@ -253,6 +298,7 @@ class BacklogSensor:
                 repo=item.get("repo", "jarvis"),
                 status=item.get("status", "pending"),
                 urgency_hint=_validated_hint,
+                routing_hint=_validated_routing,
             )
             if task.status != "pending":
                 continue
@@ -282,6 +328,15 @@ class BacklogSensor:
                 )
                 _override_logged_this_scan = True
 
+            # F2 Slice 2: stamp envelope.routing_override when master
+            # flag on + entry has valid routing_hint. Flag-off or hint
+            # absent/invalid → empty string (pre-F2 byte-identical,
+            # envelope carries no override, UrgencyRouter falls through
+            # to source-type mapping).
+            _effective_routing_override = ""
+            if _hint_flag_on and task.routing_hint is not None:
+                _effective_routing_override = task.routing_hint
+                _routing_applied_this_scan = True
             envelope = make_envelope(
                 source="backlog",
                 description=task.description,
@@ -291,6 +346,7 @@ class BacklogSensor:
                 urgency=effective_urgency,
                 evidence={"task_id": task.task_id, "signature": task.task_id},
                 requires_human_ack=False,
+                routing_override=_effective_routing_override,
             )
             try:
                 result = await self._router.ingest(envelope)
@@ -317,6 +373,21 @@ class BacklogSensor:
                 "invalid urgency_hint (accepted values: %s); affected "
                 "entries fell back to priority-map / F3 override",
                 sorted(_VALID_URGENCIES),
+            )
+        # F2 Slice 2 — mirror telemetry for routing_hint.
+        if _routing_applied_this_scan:
+            logger.info(
+                "[BacklogSensor] JARVIS_BACKLOG_URGENCY_HINT_ENABLED active: "
+                "per-entry routing_hint consumed for one or more emissions "
+                "this scan (envelope.routing_override stamped; "
+                "UrgencyRouter honors via envelope_routing_override path)"
+            )
+        if _routing_invalid_this_scan:
+            logger.warning(
+                "[BacklogSensor] one or more backlog.json entries had an "
+                "invalid routing_hint (accepted values: %s); affected "
+                "entries emit without routing_override (pre-F2 fallback)",
+                sorted(_VALID_ROUTING_HINTS),
             )
 
         return produced

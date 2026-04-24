@@ -944,6 +944,15 @@ class OperationContext:
         signal_source: str = "",
         is_read_only: bool = False,
         attachments: Tuple[Attachment, ...] = (),
+        # F2 Slice 2 — optional pre-stamped provider route + reason.
+        # Default "" = unset (normal ROUTE-phase decides). When the
+        # UnifiedIntakeRouter observes a ``routing_override`` on the
+        # inbound envelope, it stamps these fields on ctx at creation
+        # time so UrgencyRouter can honor the hint. Values intentionally
+        # unvalidated here — UrgencyRouter re-validates against its
+        # ProviderRoute enum before consuming.
+        provider_route: str = "",
+        provider_route_reason: str = "",
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
 
@@ -1020,8 +1029,8 @@ class OperationContext:
             "signal_urgency": signal_urgency,
             "signal_source": signal_source,
             "task_complexity": "",
-            "provider_route": "",
-            "provider_route_reason": "",
+            "provider_route": provider_route,
+            "provider_route_reason": provider_route_reason,
             "is_read_only": is_read_only,
             "attachments": attachments,
         }
@@ -1069,6 +1078,8 @@ class OperationContext:
             frozen_autonomy_tier="governed",
             signal_urgency=signal_urgency,
             signal_source=signal_source,
+            provider_route=provider_route,
+            provider_route_reason=provider_route_reason,
             is_read_only=is_read_only,
             attachments=attachments,
         )

@@ -47,6 +47,17 @@ _VALID_SOURCES = frozenset({
 })
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 
+# F2 Slice 2 — allowed values for the optional ``routing_override``
+# envelope field. Empty string is the "no override" sentinel (default).
+# Non-empty values MUST be one of the five ProviderRoute enum values.
+# We duplicate the enum values here rather than importing ProviderRoute
+# to avoid an intake → governance.urgency_router import cycle (intent
+# envelopes are upstream of routing; nothing in intake should depend
+# on routing internals).
+_VALID_ROUTING_OVERRIDES = frozenset({
+    "", "immediate", "standard", "complex", "background", "speculative",
+})
+
 
 class EnvelopeValidationError(ValueError):
     """Raised when an IntentEnvelope fails schema validation."""
@@ -69,6 +80,12 @@ class IntentEnvelope:
     evidence: Dict[str, Any]
     requires_human_ack: bool
     submitted_at: float  # time.monotonic()
+    # F2 Slice 2 — optional per-envelope routing override. Default "" =
+    # not set (pre-F2 byte-identical). When non-empty, MUST be one of
+    # ProviderRoute enum values. Additive: SCHEMA_VERSION unchanged
+    # because old envelopes + WAL-persisted dicts still parse cleanly
+    # via ``from_dict``'s ``.get(..., "")`` fallback.
+    routing_override: str = ""
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -104,6 +121,15 @@ class IntentEnvelope:
                     "target_files must be non-empty "
                     "(exempt: vision_sensor source, or evidence.user_attachments present)"
                 )
+        # F2 Slice 2: validate routing_override. Empty = no override;
+        # non-empty must be a known ProviderRoute value. Invalid values
+        # fail fast here rather than silently dropping downstream.
+        if self.routing_override not in _VALID_ROUTING_OVERRIDES:
+            raise EnvelopeValidationError(
+                f"routing_override must be one of "
+                f"{sorted(_VALID_ROUTING_OVERRIDES)}, "
+                f"got {self.routing_override!r}"
+            )
 
     def with_lease(self, lease_id: str) -> "IntentEnvelope":
         """Return a new envelope with the given lease_id set."""
@@ -123,6 +149,7 @@ class IntentEnvelope:
             evidence=self.evidence,
             requires_human_ack=self.requires_human_ack,
             submitted_at=self.submitted_at,
+            routing_override=self.routing_override,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -142,6 +169,7 @@ class IntentEnvelope:
             "evidence": dict(self.evidence),
             "requires_human_ack": self.requires_human_ack,
             "submitted_at": self.submitted_at,
+            "routing_override": self.routing_override,
         }
 
     @classmethod
@@ -163,6 +191,9 @@ class IntentEnvelope:
                 evidence=dict(d.get("evidence", {})),
                 requires_human_ack=bool(d["requires_human_ack"]),
                 submitted_at=float(d["submitted_at"]),
+                # F2 Slice 2 — additive. Pre-F2 persisted envelopes
+                # omit this field entirely; default "" = no override.
+                routing_override=d.get("routing_override", ""),
             )
         except KeyError as exc:
             raise EnvelopeValidationError(f"missing required field: {exc}") from exc
@@ -186,8 +217,15 @@ def make_envelope(
     requires_human_ack: bool,
     causal_id: str = "",
     signal_id: str = "",
+    routing_override: str = "",
 ) -> IntentEnvelope:
-    """Create a new IntentEnvelope with auto-generated IDs."""
+    """Create a new IntentEnvelope with auto-generated IDs.
+
+    ``routing_override`` (F2 Slice 2): optional per-envelope provider-
+    route hint. Default "" = no override (pre-F2 byte-identical). When
+    non-empty, must be one of the 5 ProviderRoute values; the envelope
+    constructor validates via ``_VALID_ROUTING_OVERRIDES``.
+    """
     sid = signal_id or generate_operation_id("sig")
     cid = causal_id or generate_operation_id("cau")
     ikey = generate_operation_id("ikey")
@@ -208,4 +246,5 @@ def make_envelope(
         evidence=dict(evidence),
         requires_human_ack=requires_human_ack,
         submitted_at=time.monotonic(),
+        routing_override=routing_override,
     )

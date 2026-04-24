@@ -878,6 +878,20 @@ class UnifiedIntakeRouter:
         _is_read_only_at_intake = bool(infer_read_only_intent(
             envelope.description or ""
         ))
+        # F2 Slice 2: when the envelope carries a non-empty
+        # routing_override (set by a sensor that emitted a valid
+        # routing_hint under the F2 master flag), stamp ctx.provider_route
+        # at creation so UrgencyRouter can honor it via the
+        # envelope_routing_override path. When unset, behavior is
+        # byte-identical to pre-F2 (ROUTE phase computes the route
+        # normally via UrgencyRouter.classify source-type mapping).
+        _env_routing = getattr(envelope, "routing_override", "") or ""
+        _pre_route = _env_routing if _env_routing else ""
+        _pre_route_reason = (
+            f"envelope_routing_override:{_env_routing}"
+            if _env_routing
+            else ""
+        )
         ctx = OperationContext.create(
             target_files=envelope.target_files,
             description=envelope.description,
@@ -885,6 +899,8 @@ class UnifiedIntakeRouter:
             signal_urgency=envelope.urgency,
             signal_source=envelope.source,
             is_read_only=_is_read_only_at_intake,
+            provider_route=_pre_route,
+            provider_route_reason=_pre_route_reason,
         )
 
         # Manifesto §1 — the Tri-Partite Microkernel must bridge Senses→Mind.
