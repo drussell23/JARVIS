@@ -33,16 +33,20 @@ Those integrations arrive in Slices 2-4 per the scope doc's §9.
 """
 from __future__ import annotations
 
+import asyncio
 import enum
 import hashlib
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from backend.core.ouroboros.governance.autonomy.subagent_types import (
     ExecutionGraph,
+    GraphExecutionPhase,
+    GraphExecutionState,
     WorkUnitSpec,
 )
 from backend.core.ouroboros.governance.memory_pressure_gate import (
@@ -1098,6 +1102,456 @@ def evaluate_shadow_fanout(
 
 
 # ---------------------------------------------------------------------------
+# Slice 4 — enforce-mode submit
+# ---------------------------------------------------------------------------
+
+
+# Default per-graph wait timeout, seconds. Bounded so that a stuck
+# graph does not pin a caller past :data:`~Ticket A1`'s
+# ``--max-wall-seconds`` session cap — callers should verify their
+# outer budget is larger than this value. Env-tunable via
+# ``JARVIS_WAVE3_PARALLEL_WAIT_TIMEOUT_S`` for test isolation.
+_DEFAULT_WAIT_TIMEOUT_S: float = 900.0  # 15 min default
+
+
+def parallel_dispatch_wait_timeout_s(default: float = _DEFAULT_WAIT_TIMEOUT_S) -> float:
+    """Env-overridable per-graph wait-for-completion budget.
+
+    Ticket A1 discipline: a fan-out's wait must not defeat
+    ``--max-wall-seconds``. When the env is unset, returns the
+    in-code default (900s). When set but unparseable or non-positive,
+    returns the default. Never raises.
+    """
+    raw = os.environ.get("JARVIS_WAVE3_PARALLEL_WAIT_TIMEOUT_S", "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    if v <= 0.0:
+        return default
+    return v
+
+
+class FanoutOutcome(str, enum.Enum):
+    """Terminal classifier for an enforce-mode fan-out evaluation.
+
+    Stable, grep-friendly strings for telemetry + dashboards.
+    """
+    SKIPPED = "skipped"            # guards denied engagement (master/enforce off / ineligible)
+    SUBMIT_DENIED = "submit_denied"  # scheduler returned False (capacity/not running)
+    SUBMIT_FAILED = "submit_failed"  # scheduler raised a known-safe exception
+    COMPLETED = "completed"          # graph reached COMPLETED phase
+    FAILED = "failed"                # graph reached FAILED phase
+    CANCELLED = "cancelled"          # graph reached CANCELLED / wait aborted
+    TIMEOUT = "timeout"              # wait_for_graph timeout
+
+
+@dataclass(frozen=True)
+class FanoutResult:
+    """Immutable result of :func:`enforce_evaluate_fanout`.
+
+    Callers use this to decide whether downstream phases (VALIDATE,
+    GATE, APPLY, VERIFY, COMPLETE) should proceed normally (outcome =
+    SKIPPED or FAILED/CANCELLED → fall through to sequential) or to
+    consume fan-out per-unit results (outcome = COMPLETED → slice4b
+    runner may opt-in to per-unit APPLY). Slice 4 does NOT auto-skip
+    downstream phases; that wiring lives in later slices / operator-
+    authorized follow-ups.
+
+    Attributes
+    ----------
+    outcome:
+        :class:`FanoutOutcome` — primary classifier.
+    skip_reason:
+        Non-empty when ``outcome == SKIPPED``.
+    eligibility:
+        Eligibility decision from :func:`is_fanout_eligible` (or
+        re-checked post-submit). Non-None when the guard matrix
+        engaged past master+enforce gates.
+    graph:
+        Built graph when eligibility allowed. Non-None from
+        eligibility allowed through the final outcome.
+    state:
+        Terminal :class:`GraphExecutionState` when scheduler completed
+        (or wait exited normally). ``None`` on SKIPPED / SUBMIT_DENIED /
+        SUBMIT_FAILED / TIMEOUT.
+    wait_duration_s:
+        Wall-clock seconds spent in :meth:`scheduler.wait_for_graph`.
+        ``0.0`` when wait was not entered.
+    error:
+        Human-readable error message for SUBMIT_FAILED / FAILED /
+        CANCELLED / TIMEOUT; empty for success/skipped.
+    n_units_requested:
+        Units in the built graph (eligibility.n_allowed at build time).
+    n_units_completed / n_units_failed / n_units_cancelled:
+        Per-unit tallies from terminal GraphExecutionState. All zero
+        when no graph was submitted.
+    """
+
+    outcome: FanoutOutcome
+    skip_reason: str = ""
+    eligibility: Optional[FanoutEligibility] = None
+    graph: Optional[ExecutionGraph] = None
+    state: Optional[GraphExecutionState] = None
+    wait_duration_s: float = 0.0
+    error: str = ""
+    n_units_requested: int = 0
+    n_units_completed: int = 0
+    n_units_failed: int = 0
+    n_units_cancelled: int = 0
+
+    @property
+    def graph_id(self) -> str:
+        return self.graph.graph_id if self.graph is not None else ""
+
+    @property
+    def plan_digest(self) -> str:
+        return self.graph.plan_digest if self.graph is not None else ""
+
+
+def _tally_unit_results(state: GraphExecutionState) -> Tuple[int, int, int]:
+    """Return (completed, failed, cancelled) unit tallies from a terminal state."""
+    return (
+        len(state.completed_units),
+        len(state.failed_units),
+        len(state.cancelled_units),
+    )
+
+
+async def enforce_evaluate_fanout(
+    *,
+    op_id: str,
+    generation: Any,
+    scheduler: Any,
+    repo: str = "jarvis",
+    gate: Optional[MemoryPressureGate] = None,
+    posture_fn: Optional[
+        Callable[[], Tuple[Optional[Posture], Optional[float]]]
+    ] = None,
+    wait_timeout_s: Optional[float] = None,
+) -> FanoutResult:
+    """Slice 4 — enforce-mode fan-out evaluation + scheduler submit.
+
+    Distinct from :func:`evaluate_shadow_fanout` in that this path
+    actually submits the built graph to the injected scheduler and
+    awaits terminal state. **Narrow error handling**: only known-safe
+    categories are caught (``asyncio.CancelledError`` for cooperative
+    cancellation per Ticket A1 discipline, ``asyncio.TimeoutError`` for
+    wait-timeout, and specific scheduler-contract returns like
+    ``submit(...) -> False``). Unexpected exceptions propagate —
+    per-operator directive, enforce must fail loud on the hot path.
+
+    Gates (first-short-circuit):
+
+    1. Master flag (:func:`parallel_dispatch_enabled`) must be on.
+    2. Enforce sub-flag (:func:`parallel_dispatch_enforce_enabled`)
+       must be on. Shadow flag is independent — enforce wins when
+       both are set.
+    3. Generation artifact must yield a candidate file list.
+    4. :func:`is_fanout_eligible` must return ``allowed=True``.
+    5. :func:`build_execution_graph` must succeed.
+    6. **Sovereignty re-check**: immediately before ``scheduler.submit``,
+       :meth:`MemoryPressureGate.can_fanout` is consulted again with
+       ``graph.concurrency_limit``. If the gate clamps below the
+       built graph's concurrency (e.g. memory pressure rose since
+       eligibility was computed), outcome = ``SUBMIT_DENIED`` without
+       submitting. This is the operator-mandated §2 sovereignty
+       check — gate must remain authoritative right at submit time.
+
+    Parameters
+    ----------
+    op_id:
+        Parent op id for telemetry and unit-id derivation.
+    generation:
+        GENERATE artifact (``GenerationResult``-like). Extracted
+        defensively via :func:`extract_candidate_files`.
+    scheduler:
+        Object exposing the :class:`SubagentScheduler` async contract —
+        ``submit(graph) -> bool`` + ``wait_for_graph(graph_id,
+        timeout_s) -> GraphExecutionState``. Dependency-injected; tests
+        pass in a mock. Runtime callers wire in
+        :class:`~backend.core.ouroboros.governance.autonomy.subagent_scheduler.SubagentScheduler`.
+    repo:
+        Repository tag for :class:`WorkUnitSpec`. Default ``"jarvis"``.
+    gate:
+        Memory pressure gate override. Default: module-level singleton.
+    posture_fn:
+        Posture reader override. Default: PostureStore via
+        :mod:`~backend.core.ouroboros.governance.posture_observer`.
+    wait_timeout_s:
+        Per-graph wait budget. Default via
+        :func:`parallel_dispatch_wait_timeout_s` (env-overridable).
+
+    Returns
+    -------
+    FanoutResult
+        Immutable outcome record. Callers inspect
+        :attr:`FanoutResult.outcome` + :attr:`FanoutResult.state` to
+        decide next steps.
+
+    Raises
+    ------
+    Exception
+        Unexpected exceptions from :meth:`scheduler.submit` or
+        :meth:`scheduler.wait_for_graph` propagate unchanged. Only
+        ``asyncio.CancelledError``, ``asyncio.TimeoutError``, and
+        scheduler-contract ``False`` returns are caught + classified.
+    """
+    wait_budget = (
+        float(wait_timeout_s)
+        if wait_timeout_s is not None
+        else parallel_dispatch_wait_timeout_s()
+    )
+
+    # Guard 1: master flag.
+    if not parallel_dispatch_enabled():
+        logger.debug(
+            "[ParallelDispatch enforce_skipped] op=%s reason=master_off",
+            op_id[:16],
+        )
+        return FanoutResult(outcome=FanoutOutcome.SKIPPED, skip_reason="master_off")
+
+    # Guard 2: enforce sub-flag.
+    if not parallel_dispatch_enforce_enabled():
+        logger.debug(
+            "[ParallelDispatch enforce_skipped] op=%s reason=enforce_off",
+            op_id[:16],
+        )
+        return FanoutResult(outcome=FanoutOutcome.SKIPPED, skip_reason="enforce_off")
+
+    # Guard 3: candidate extraction.
+    files = extract_candidate_files(generation)
+    if files is None:
+        logger.info(
+            "[ParallelDispatch enforce_skipped] op=%s reason=unrecognized_shape",
+            op_id[:16],
+        )
+        return FanoutResult(
+            outcome=FanoutOutcome.SKIPPED,
+            skip_reason="unrecognized_shape",
+        )
+
+    n_files = len(files)
+
+    # Guard 4: eligibility (single-file / empty / memory-critical / posture).
+    eligibility = is_fanout_eligible(
+        op_id=op_id,
+        n_candidate_files=n_files,
+        gate=gate,
+        posture_fn=posture_fn,
+        emit_log=True,
+    )
+    if not eligibility.allowed:
+        return FanoutResult(
+            outcome=FanoutOutcome.SKIPPED,
+            skip_reason=f"ineligible:{eligibility.reason_code.value}",
+            eligibility=eligibility,
+        )
+
+    # Guard 5: graph build.
+    # A ValueError here is a STRUCTURAL bug (duplicate paths from an
+    # earlier slice's shape validation, etc.) — propagate per
+    # fail-loud discipline. Do NOT swallow.
+    graph = build_execution_graph(
+        op_id=op_id,
+        repo=repo,
+        candidate_files=files,
+        eligibility=eligibility,
+    )
+
+    # Guard 6: §2 sovereignty re-check right before submit.
+    _gate = gate if gate is not None else get_default_gate()
+    sovereignty = _gate.can_fanout(graph.concurrency_limit)
+    if (
+        sovereignty.level == PressureLevel.CRITICAL
+        or sovereignty.n_allowed < graph.concurrency_limit
+    ):
+        logger.warning(
+            "[ParallelDispatch enforce_submit_denied] op=%s graph_id=%s "
+            "sovereignty_level=%s sovereignty_n_allowed=%d "
+            "graph_concurrency_limit=%d reason=sovereignty_clamp",
+            op_id[:16],
+            graph.graph_id,
+            sovereignty.level.value,
+            sovereignty.n_allowed,
+            graph.concurrency_limit,
+        )
+        return FanoutResult(
+            outcome=FanoutOutcome.SUBMIT_DENIED,
+            skip_reason="sovereignty_clamp",
+            eligibility=eligibility,
+            graph=graph,
+            n_units_requested=graph.concurrency_limit,
+            error=(
+                f"memory gate clamped to n_allowed={sovereignty.n_allowed} "
+                f"at submit time (graph needed {graph.concurrency_limit}); "
+                f"level={sovereignty.level.value}"
+            ),
+        )
+
+    # Submit. Narrow exception catches only: scheduler.submit() returning
+    # False is the known-safe "not running / over capacity" signal.
+    # asyncio.CancelledError is cooperative cancellation per Ticket A1.
+    # All other exceptions propagate.
+    logger.info(
+        "[ParallelDispatch enforce_submit_start] op=%s graph_id=%s "
+        "plan_digest=%s concurrency_limit=%d n_units=%d",
+        op_id[:16],
+        graph.graph_id,
+        graph.plan_digest[:12],
+        graph.concurrency_limit,
+        len(graph.units),
+    )
+    try:
+        accepted = await scheduler.submit(graph)
+    except asyncio.CancelledError:
+        logger.warning(
+            "[ParallelDispatch enforce_cancelled] op=%s graph_id=%s phase=submit",
+            op_id[:16],
+            graph.graph_id,
+        )
+        raise
+    if not accepted:
+        logger.warning(
+            "[ParallelDispatch enforce_submit_denied] op=%s graph_id=%s "
+            "reason=scheduler_refused",
+            op_id[:16],
+            graph.graph_id,
+        )
+        return FanoutResult(
+            outcome=FanoutOutcome.SUBMIT_DENIED,
+            skip_reason="scheduler_refused",
+            eligibility=eligibility,
+            graph=graph,
+            n_units_requested=graph.concurrency_limit,
+            error="scheduler.submit returned False (not running or at capacity)",
+        )
+
+    # Wait for terminal. asyncio.TimeoutError from wait_for is the known
+    # budget-exhaustion signal; asyncio.CancelledError is cooperative.
+    # Both classify the result without re-raising. Scheduler-side
+    # exceptions propagate unchanged.
+    wait_start = time.monotonic()
+    try:
+        state = await scheduler.wait_for_graph(graph.graph_id, timeout_s=wait_budget)
+    except asyncio.CancelledError:
+        elapsed = time.monotonic() - wait_start
+        logger.warning(
+            "[ParallelDispatch enforce_cancelled] op=%s graph_id=%s "
+            "phase=wait elapsed_s=%.1f",
+            op_id[:16],
+            graph.graph_id,
+            elapsed,
+        )
+        raise
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - wait_start
+        logger.warning(
+            "[ParallelDispatch enforce_timeout] op=%s graph_id=%s "
+            "wait_budget_s=%.1f elapsed_s=%.1f",
+            op_id[:16],
+            graph.graph_id,
+            wait_budget,
+            elapsed,
+        )
+        return FanoutResult(
+            outcome=FanoutOutcome.TIMEOUT,
+            eligibility=eligibility,
+            graph=graph,
+            wait_duration_s=elapsed,
+            n_units_requested=graph.concurrency_limit,
+            error=(
+                f"wait_for_graph timeout after {elapsed:.1f}s "
+                f"(budget={wait_budget:.1f}s)"
+            ),
+        )
+
+    wait_elapsed = time.monotonic() - wait_start
+    n_completed, n_failed, n_cancelled = _tally_unit_results(state)
+
+    # Classify terminal phase.
+    if state.phase == GraphExecutionPhase.COMPLETED:
+        logger.info(
+            "[ParallelDispatch enforce_completed] op=%s graph_id=%s "
+            "wait_s=%.1f n_completed=%d n_failed=%d n_cancelled=%d",
+            op_id[:16],
+            graph.graph_id,
+            wait_elapsed,
+            n_completed,
+            n_failed,
+            n_cancelled,
+        )
+        return FanoutResult(
+            outcome=FanoutOutcome.COMPLETED,
+            eligibility=eligibility,
+            graph=graph,
+            state=state,
+            wait_duration_s=wait_elapsed,
+            n_units_requested=graph.concurrency_limit,
+            n_units_completed=n_completed,
+            n_units_failed=n_failed,
+            n_units_cancelled=n_cancelled,
+        )
+    if state.phase == GraphExecutionPhase.FAILED:
+        logger.warning(
+            "[ParallelDispatch enforce_failed] op=%s graph_id=%s "
+            "wait_s=%.1f n_completed=%d n_failed=%d n_cancelled=%d "
+            "last_error=%r",
+            op_id[:16],
+            graph.graph_id,
+            wait_elapsed,
+            n_completed,
+            n_failed,
+            n_cancelled,
+            state.last_error,
+        )
+        return FanoutResult(
+            outcome=FanoutOutcome.FAILED,
+            eligibility=eligibility,
+            graph=graph,
+            state=state,
+            wait_duration_s=wait_elapsed,
+            n_units_requested=graph.concurrency_limit,
+            n_units_completed=n_completed,
+            n_units_failed=n_failed,
+            n_units_cancelled=n_cancelled,
+            error=state.last_error or "graph phase=FAILED",
+        )
+    if state.phase == GraphExecutionPhase.CANCELLED:
+        logger.warning(
+            "[ParallelDispatch enforce_cancelled] op=%s graph_id=%s "
+            "wait_s=%.1f n_completed=%d n_failed=%d n_cancelled=%d",
+            op_id[:16],
+            graph.graph_id,
+            wait_elapsed,
+            n_completed,
+            n_failed,
+            n_cancelled,
+        )
+        return FanoutResult(
+            outcome=FanoutOutcome.CANCELLED,
+            eligibility=eligibility,
+            graph=graph,
+            state=state,
+            wait_duration_s=wait_elapsed,
+            n_units_requested=graph.concurrency_limit,
+            n_units_completed=n_completed,
+            n_units_failed=n_failed,
+            n_units_cancelled=n_cancelled,
+            error="graph phase=CANCELLED",
+        )
+
+    # Non-terminal phase returned — unexpected contract violation.
+    # Fail loud per operator directive.
+    raise RuntimeError(
+        f"scheduler returned non-terminal GraphExecutionPhase={state.phase.value} "
+        f"for graph_id={graph.graph_id}; expected COMPLETED/FAILED/CANCELLED"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Module public surface — explicit for grep clarity
 # ---------------------------------------------------------------------------
 
@@ -1107,12 +1561,15 @@ __all__ = [
     "DEFAULT_UNIT_MAX_ATTEMPTS",
     "DEFAULT_UNIT_TIMEOUT_S",
     "FanoutEligibility",
+    "FanoutOutcome",
+    "FanoutResult",
     "GRAPH_SCHEMA_VERSION",
     "PLANNER_ID",
     "POSTURE_CONFIDENCE_FLOOR",
     "ReasonCode",
     "ShadowEvaluation",
     "build_execution_graph",
+    "enforce_evaluate_fanout",
     "evaluate_shadow_fanout",
     "extract_candidate_files",
     "is_fanout_eligible",
@@ -1120,5 +1577,6 @@ __all__ = [
     "parallel_dispatch_enforce_enabled",
     "parallel_dispatch_max_units",
     "parallel_dispatch_shadow_enabled",
+    "parallel_dispatch_wait_timeout_s",
     "posture_weight_for",
 ]

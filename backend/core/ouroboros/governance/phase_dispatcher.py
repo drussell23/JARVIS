@@ -567,37 +567,90 @@ async def dispatch_pipeline(
         # Merge runner artifacts into PhaseContext for downstream phases.
         pctx.merge_artifacts(dict(result.artifacts))
 
-        # Wave 3 (6) Slice 3 — shadow-mode fan-out evaluation.
+        # Wave 3 (6) Slices 3 + 4 — post-GENERATE fan-out hook.
         # Post-GENERATE seam: when this iter ran a GENERATE runner AND
         # GENERATE produced a `generation` artifact that landed on
-        # pctx.generation, invoke the shadow-only fan-out evaluator.
-        # Guards are in evaluate_shadow_fanout — it short-circuits
-        # (no logs, no work) unless JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED
-        # AND JARVIS_WAVE3_PARALLEL_DISPATCH_SHADOW are both `true`.
-        # When armed, it emits [ParallelDispatch] telemetry and
-        # optionally builds the ExecutionGraph — but does NOT submit to
-        # any scheduler and does NOT mutate pctx or ctx. Slice 3 is
-        # shadow-only (scope §9); enforce wiring is Slice 4.
+        # pctx.generation, invoke the fan-out evaluator(s).
+        #
+        # Three flag states matter here:
+        #   master off                          → no hook runs (default)
+        #   master + enforce (Slice 4)          → enforce path: submits
+        #                                         + awaits scheduler
+        #   master + shadow (Slice 3, not enforce) → shadow-only path:
+        #                                         builds graph + logs,
+        #                                         never submits
+        #
+        # When BOTH enforce and shadow are set, enforce wins (enforce
+        # already exercises the shadow's observability surface at
+        # higher fidelity). The shadow-only branch is strictly for
+        # operators who want decision-correctness telemetry without
+        # scheduler side effects.
         if (
             dispatch_phase == OperationPhase.GENERATE
             and pctx.generation is not None
         ):
-            try:
+            from backend.core.ouroboros.governance.parallel_dispatch import (
+                parallel_dispatch_enabled as _master_on,
+                parallel_dispatch_enforce_enabled as _enforce_on,
+                parallel_dispatch_shadow_enabled as _shadow_on,
+            )
+            if _master_on() and _enforce_on():
+                # Enforce path — fail loud on unexpected errors
+                # (operator directive: narrow catches only on hot
+                # path). asyncio.CancelledError cooperates with
+                # Ticket A1 wall-clock; TimeoutError is classified
+                # internally. Structural bugs (ValueError from graph
+                # validators, RuntimeError from non-terminal phase)
+                # propagate and abort the pipeline.
                 from backend.core.ouroboros.governance.parallel_dispatch import (
-                    evaluate_shadow_fanout as _evaluate_shadow_fanout,
+                    enforce_evaluate_fanout as _enforce_evaluate_fanout,
                 )
-                _evaluate_shadow_fanout(
-                    op_id=ctx.op_id,
-                    generation=pctx.generation,
-                )
-            except Exception as _shadow_exc:  # noqa: BLE001 — never fail
-                # Shadow must NEVER escalate into a production crash.
-                # Catch everything, log at DEBUG (so it doesn't clutter
-                # INFO streams), and continue the pipeline unchanged.
-                logger.debug(
-                    "[PhaseDispatcher] shadow_fanout_hook raised (suppressed): %r",
-                    _shadow_exc,
-                )
+                _scheduler = getattr(orchestrator, "_subagent_scheduler", None)
+                if _scheduler is None:
+                    # Narrow known-safe: scheduler not wired → treat
+                    # as skip (operator enables enforce before the
+                    # scheduler is available, e.g. unit harness).
+                    logger.warning(
+                        "[PhaseDispatcher] enforce_fanout skipped: "
+                        "orchestrator has no _subagent_scheduler reference"
+                    )
+                else:
+                    _fanout_result = await _enforce_evaluate_fanout(
+                        op_id=ctx.op_id,
+                        generation=pctx.generation,
+                        scheduler=_scheduler,
+                    )
+                    # Slice 4 ships the submit + await primitive with
+                    # loud-fail error handling. Consumption of
+                    # per-unit results by downstream phases (VALIDATE /
+                    # slice4b) is a later-slice concern — for now the
+                    # result is stashed in extras so operators + tests
+                    # can inspect it, and the sequential phase walk
+                    # continues unchanged. This preserves behavioral
+                    # parity with the serial path while the enforce
+                    # surface matures.
+                    pctx.extras["parallel_dispatch_fanout_result"] = (
+                        _fanout_result
+                    )
+            elif _master_on() and _shadow_on():
+                # Shadow-only path — per Slice 3, broad exception
+                # catch is acceptable because shadow has no
+                # production side effects. Enforce path (above) does
+                # NOT use this pattern; shadow remains the defensive
+                # path.
+                try:
+                    from backend.core.ouroboros.governance.parallel_dispatch import (
+                        evaluate_shadow_fanout as _evaluate_shadow_fanout,
+                    )
+                    _evaluate_shadow_fanout(
+                        op_id=ctx.op_id,
+                        generation=pctx.generation,
+                    )
+                except Exception as _shadow_exc:  # noqa: BLE001 — shadow never fails
+                    logger.debug(
+                        "[PhaseDispatcher] shadow_fanout_hook raised (suppressed): %r",
+                        _shadow_exc,
+                    )
 
         # Terminal exit from runner → return immediately.
         if result.next_phase is None:
