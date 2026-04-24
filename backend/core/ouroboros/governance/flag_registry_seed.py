@@ -899,6 +899,33 @@ SEED_SPECS: list = [
         example="critical",
         since="v1.0",
     ),
+    # F2 Slice 1 — per-entry urgency_hint master flag.
+    # Default-off gate for consumption of optional ``urgency_hint``
+    # field on backlog.json entries. When on, per-entry hint wins over
+    # both the F3 session-wide env override and the priority-map
+    # default (most-specific wins). Absent / invalid hints fall back
+    # to pre-F2 behavior. See memory/project_followup_f2_backlog_urgency_hint_schema.md.
+    FlagSpec(
+        name="JARVIS_BACKLOG_URGENCY_HINT_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "F2 Slice 1 — consume per-entry ``urgency_hint`` field on "
+            "backlog.json entries. Default off → hint parsed but "
+            "ignored (byte-identical to pre-F2). Set to true → hint "
+            "stamps envelope urgency, winning over F3 env override AND "
+            "priority-map default (most-specific wins). Invalid hint "
+            "values fall back to priority-map with one WARNING per "
+            "scan. Slice 1 is sensor-side stamping only; UrgencyRouter "
+            "consumption lands in Slice 2."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/intake/sensors/"
+            "backlog_sensor.py"
+        ),
+        example="true",
+        since="v1.0",
+    ),
 ]
 
 

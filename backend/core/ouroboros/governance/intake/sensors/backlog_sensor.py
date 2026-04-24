@@ -9,11 +9,20 @@ Schema per entry:
         "target_files": [str, ...],
         "priority": int 1-5,
         "repo": str,
-        "status": "pending" | "in_progress" | "completed"
+        "status": "pending" | "in_progress" | "completed",
+        "urgency_hint": "critical" | "high" | "normal" | "low"  (F2 Slice 1, optional)
     }
 
 Priority → urgency mapping:
     5 → "high", 4 → "high", 3 → "normal", 1-2 → "low"
+
+F2 Slice 1 — optional per-entry ``urgency_hint`` lets individual backlog
+entries override the priority-map default (and the F3 session-wide env
+override) when ``JARVIS_BACKLOG_URGENCY_HINT_ENABLED=true``. Absent /
+invalid values fall back to priority-map. Precedence, most-specific wins:
+per-entry hint > F3 env override > priority-map default. See
+``memory/project_followup_f2_backlog_urgency_hint_schema.md`` for the
+full arc; ``routing_hint`` is Slice 2 and is NOT read here.
 """
 from __future__ import annotations
 
@@ -118,6 +127,38 @@ def _default_urgency_override() -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# F2 Slice 1 — per-entry urgency_hint consumption
+# ---------------------------------------------------------------------------
+#
+# Default-off flag gating per-entry ``urgency_hint`` reads on backlog.json
+# entries. When on + entry carries a valid hint, that hint wins over both
+# the F3 session-wide env override AND the priority-map default. When off
+# OR hint absent/invalid, the sensor behaves byte-identically to pre-F2.
+# Slice 1 stamps the envelope with the hint value only; ``routing_hint``
+# consumption lives in Slice 2 (see F2 scope doc).
+def _urgency_hint_enabled() -> bool:
+    """Re-read ``JARVIS_BACKLOG_URGENCY_HINT_ENABLED`` at call-time."""
+    return os.environ.get(
+        "JARVIS_BACKLOG_URGENCY_HINT_ENABLED", "false",
+    ).strip().lower() in ("true", "1", "yes")
+
+
+def _validate_urgency_hint(raw: Any) -> Optional[str]:
+    """Normalize + validate a raw urgency_hint value.
+
+    Accepts any string matching (case-insensitive) one of ``_VALID_URGENCIES``.
+    Non-string, empty, or unknown values return ``None`` so the caller can
+    fall back to the priority-map default. Never raises.
+    """
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().lower()
+    if cleaned in _VALID_URGENCIES:
+        return cleaned
+    return None
+
+
 @dataclass
 class BacklogTask:
     task_id: str
@@ -126,6 +167,9 @@ class BacklogTask:
     priority: int
     repo: str
     status: str = "pending"
+    # F2 Slice 1 — optional per-entry hint. None = not set / invalid;
+    # caller falls back to priority-map default.
+    urgency_hint: Optional[str] = None
 
     @property
     def urgency(self) -> str:
@@ -187,7 +231,20 @@ class BacklogSensor:
         # (not per-task) while still §8-auditable per graduation directive.
         _urgency_override = _default_urgency_override()
         _override_logged_this_scan = False
+        # F2 Slice 1: re-read the master flag per scan (same runtime-
+        # responsiveness contract as F3). Default-off: hints are parsed
+        # into BacklogTask but not consumed for envelope urgency.
+        _hint_flag_on = _urgency_hint_enabled()
+        _hint_applied_this_scan = False
+        _hint_invalid_this_scan = False
         for item in tasks_raw:
+            # F2 Slice 1: validate + normalize the per-entry hint at
+            # construction time. Invalid values get surfaced as one
+            # WARNING per scan (below) for §8 auditability.
+            _raw_hint = item.get("urgency_hint")
+            _validated_hint = _validate_urgency_hint(_raw_hint)
+            if _raw_hint is not None and _validated_hint is None:
+                _hint_invalid_this_scan = True
             task = BacklogTask(
                 task_id=item.get("task_id", ""),
                 description=item.get("description", ""),
@@ -195,6 +252,7 @@ class BacklogSensor:
                 priority=int(item.get("priority", 3)),
                 repo=item.get("repo", "jarvis"),
                 status=item.get("status", "pending"),
+                urgency_hint=_validated_hint,
             )
             if task.status != "pending":
                 continue
@@ -203,12 +261,18 @@ class BacklogSensor:
             if not task.target_files:
                 continue
 
-            # F3: apply override when set; else fall back to
-            # priority-based urgency map (byte-identical to pre-F3).
-            effective_urgency = (
-                _urgency_override if _urgency_override is not None
-                else task.urgency
-            )
+            # Precedence (most-specific wins):
+            #   F2 per-entry hint > F3 session env override > priority-map
+            # When master flag is off, per-entry hint is parsed but NOT
+            # consumed — falls through to F3/priority, byte-identical to
+            # pre-F2 behavior for default-off sessions.
+            if _hint_flag_on and task.urgency_hint is not None:
+                effective_urgency = task.urgency_hint
+                _hint_applied_this_scan = True
+            elif _urgency_override is not None:
+                effective_urgency = _urgency_override
+            else:
+                effective_urgency = task.urgency
             if _urgency_override is not None and not _override_logged_this_scan:
                 logger.info(
                     "[BacklogSensor] JARVIS_BACKLOG_SENSOR_DEFAULT_URGENCY "
@@ -236,6 +300,24 @@ class BacklogSensor:
                     logger.info("BacklogSensor: enqueued task_id=%s", task.task_id)
             except Exception:
                 logger.exception("BacklogSensor: ingest failed for task_id=%s", task.task_id)
+
+        # F2 Slice 1 telemetry — one INFO per scan when at least one
+        # per-entry hint was consumed; one WARNING per scan when any
+        # raw hint failed validation (so operators can diagnose silent
+        # fallbacks without scanning every entry by hand). Ledger-parseable.
+        if _hint_applied_this_scan:
+            logger.info(
+                "[BacklogSensor] JARVIS_BACKLOG_URGENCY_HINT_ENABLED active: "
+                "per-entry urgency_hint consumed for one or more emissions "
+                "this scan (precedence: per-entry > F3 env > priority-map)"
+            )
+        if _hint_invalid_this_scan:
+            logger.warning(
+                "[BacklogSensor] one or more backlog.json entries had an "
+                "invalid urgency_hint (accepted values: %s); affected "
+                "entries fell back to priority-map / F3 override",
+                sorted(_VALID_URGENCIES),
+            )
 
         return produced
 
