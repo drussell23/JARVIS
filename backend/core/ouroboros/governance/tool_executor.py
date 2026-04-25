@@ -2325,26 +2325,115 @@ class GoverningToolPolicy:
                         detail=f"type_check path {f!r} escapes repo root",
                     )
 
-        # Rule 14: ask_human — requires NOTIFY_APPLY or APPROVAL_REQUIRED risk tier
-        # (Manifesto §5: deploy intelligence where it creates true leverage;
-        # Green ops shouldn't bother the human with questions)
+        # Rule 14: ask_human — risk-tier gated.
+        #
+        # Default behavior (pre-W2(4)): requires NOTIFY_APPLY or
+        # APPROVAL_REQUIRED risk tier (Manifesto §5: deploy intelligence
+        # where it creates true leverage; Green ops shouldn't bother the
+        # human with questions).
+        #
+        # W2(4) Slice 2 widening: when JARVIS_CURIOSITY_ENABLED=true AND
+        # a CuriosityBudget is bound to the ambient ContextVar AND
+        # current posture is in the allowlist (default EXPLORE+CONSOLIDATE)
+        # AND the per-session quota + cost cap aren't exhausted,
+        # ask_human is ALSO allowed at SAFE_AUTO. Master-flag-off
+        # (default) → byte-for-byte pre-W2(4) behavior. The widening is
+        # purely "when does ask_human fire", not "what can it do" — the
+        # tool is already authority-free.
+        #
+        # The budget try_charge() decision happens inside this gate so
+        # the same call site that allows the tool also accounts for it
+        # in the per-session ledger. Question text is the model's tool
+        # call argument (call.arguments["question"]); cost estimate is
+        # an upper bound (per-question cap default $0.05 — operators
+        # can tighten).
         elif name == "ask_human":
             try:
                 from backend.core.ouroboros.governance.risk_engine import RiskTier
                 _tier = ctx.risk_tier
-                if _tier is None or _tier == RiskTier.SAFE_AUTO:
-                    return PolicyResult(
-                        decision=PolicyDecision.DENY,
-                        reason_code="tool.denied.ask_human_low_risk",
-                        detail="ask_human requires NOTIFY_APPLY+ risk tier; "
-                               "SAFE_AUTO ops should not interrupt the human",
-                    )
                 if _tier == RiskTier.BLOCKED:
                     return PolicyResult(
                         decision=PolicyDecision.DENY,
                         reason_code="tool.denied.ask_human_blocked_op",
                         detail="BLOCKED operations cannot interact with human",
                     )
+                if _tier is None or _tier == RiskTier.SAFE_AUTO:
+                    # W2(4) Slice 2 — try the curiosity widening before
+                    # the legacy reject. If the curiosity budget is bound
+                    # AND allows this question, return ALLOW; otherwise
+                    # fall through to the legacy NOTIFY_APPLY+ rejection
+                    # so operators see the original reason code.
+                    try:
+                        from backend.core.ouroboros.governance.curiosity_engine import (  # noqa: E501
+                            current_curiosity_budget as _curr_curiosity_budget,
+                            cost_cap_usd as _curiosity_cost_cap,
+                        )
+                        _budget = _curr_curiosity_budget()
+                        if _budget is not None:
+                            _question_text = str(
+                                call.arguments.get("question", "") or ""
+                            ).strip()
+                            # Conservative cost estimate: assume each
+                            # question burns up to the per-question cap.
+                            # Slice 2 doesn't have access to per-call cost
+                            # accounting; the cap-as-upper-bound is the
+                            # operator-binding guarantee.
+                            _est_cost = _curiosity_cost_cap()
+                            _result = _budget.try_charge(
+                                question_text=_question_text,
+                                est_cost_usd=_est_cost,
+                            )
+                            if _result.allowed:
+                                # Allowed via curiosity widening — note
+                                # that we fall through to the bottom of
+                                # the policy gate rather than `return ALLOW`
+                                # immediately, because subsequent rules
+                                # (validation, etc.) may still gate the
+                                # tool. The policy gate's default-allow
+                                # at the end picks this up.
+                                pass
+                            else:
+                                # Curiosity denied (master off / posture /
+                                # quota / cost). Fall through to the
+                                # legacy SAFE_AUTO rejection below — the
+                                # original reason code is more useful for
+                                # operators than the curiosity-deny detail.
+                                return PolicyResult(
+                                    decision=PolicyDecision.DENY,
+                                    reason_code=(
+                                        "tool.denied.ask_human_low_risk"
+                                    ),
+                                    detail=(
+                                        "ask_human requires NOTIFY_APPLY+ "
+                                        "risk tier; SAFE_AUTO ops should "
+                                        "not interrupt the human "
+                                        f"(curiosity widening considered: "
+                                        f"{_result.deny_reason.value if _result.deny_reason else 'unknown'})"
+                                    ),
+                                )
+                        else:
+                            # No curiosity budget bound — legacy reject.
+                            return PolicyResult(
+                                decision=PolicyDecision.DENY,
+                                reason_code="tool.denied.ask_human_low_risk",
+                                detail=(
+                                    "ask_human requires NOTIFY_APPLY+ risk "
+                                    "tier; SAFE_AUTO ops should not "
+                                    "interrupt the human"
+                                ),
+                            )
+                    except ImportError:
+                        # curiosity_engine not importable — fall back to
+                        # legacy reject (defensive — module always present
+                        # post-Slice-1, but be tolerant).
+                        return PolicyResult(
+                            decision=PolicyDecision.DENY,
+                            reason_code="tool.denied.ask_human_low_risk",
+                            detail=(
+                                "ask_human requires NOTIFY_APPLY+ risk tier; "
+                                "SAFE_AUTO ops should not interrupt the human"
+                            ),
+                        )
             except ImportError:
                 pass
 

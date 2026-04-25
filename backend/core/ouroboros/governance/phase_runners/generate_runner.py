@@ -136,6 +136,63 @@ class GENERATERunner(PhaseRunner):
             _PreloadedExplorationRecord,
         )
 
+        # W2(4) Slice 2 — bind the per-op CuriosityBudget to the ambient
+        # ContextVar so tool_executor Rule 14 can consult it during the
+        # Venom tool loop. Master flag default-off → curiosity_enabled()
+        # returns False → CuriosityBudget.try_charge() always denies →
+        # tool_executor's curiosity widening short-circuits to the
+        # legacy SAFE_AUTO reject. Byte-for-byte pre-W2(4) when master
+        # is off. Best-effort: any exception here must not block GENERATE.
+        try:
+            from backend.core.ouroboros.governance.curiosity_engine import (
+                CuriosityBudget as _CuriosityBudget,
+                curiosity_budget_var as _curiosity_budget_var,
+                curiosity_enabled as _curiosity_enabled,
+            )
+            if _curiosity_enabled():
+                # Resolve current posture via Wave 1 #1 DirectionInferrer
+                # observer. If unavailable (test orchestrator without a
+                # PostureStore), default to "UNKNOWN" so the posture
+                # allowlist gate denies cleanly.
+                _posture_str = "UNKNOWN"
+                try:
+                    from backend.core.ouroboros.governance.posture_observer import (  # noqa: E501
+                        get_default_store as _get_default_posture_store,
+                    )
+                    _store = _get_default_posture_store()
+                    _reading = (
+                        _store.current_reading() if _store is not None else None
+                    )
+                    if _reading is not None:
+                        _posture_str = str(
+                            getattr(_reading, "posture", _reading)
+                        )
+                        # Some posture types are Enum.NAME — strip the prefix
+                        if "." in _posture_str:
+                            _posture_str = _posture_str.split(".", 1)[1]
+                except Exception:  # noqa: BLE001
+                    pass
+                # Resolve session_dir for the JSONL ledger (best-effort).
+                _session_dir = None
+                try:
+                    _gls = getattr(orch._stack, "governed_loop_service", None)
+                    if _gls is not None:
+                        _sd = getattr(_gls, "_session_dir", None)
+                        if _sd is not None:
+                            from pathlib import Path as _Path
+                            _session_dir = (
+                                _sd if isinstance(_sd, _Path) else _Path(_sd)
+                            )
+                except Exception:  # noqa: BLE001
+                    pass
+                _curiosity_budget_var.set(_CuriosityBudget(
+                    op_id=ctx.op_id,
+                    posture_at_arm=_posture_str,
+                    session_dir=_session_dir,
+                ))
+        except Exception:  # noqa: BLE001 — best-effort, never blocks GENERATE
+            pass
+
         # ---- VERBATIM transcription of orchestrator.py 3138-4748 ----
         if _serpent: _serpent.update_phase("GENERATE")
         # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
