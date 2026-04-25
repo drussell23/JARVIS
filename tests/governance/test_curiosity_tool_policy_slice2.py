@@ -29,9 +29,7 @@ G. **Source-grep pins** for the wiring (curiosity_engine import + Rule 14
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -43,29 +41,32 @@ from backend.core.ouroboros.governance.curiosity_engine import (
 
 # Stub-light helpers — Rule 14 only needs a few attrs on the policy ctx.
 
-def _mk_policy_ctx(*, repo_root: Path, risk_tier=None):
-    """Build a minimal PolicyContext-shaped object for Rule 14 evaluation."""
+def _mk_policy_ctx(*, repo_root: Path, risk_tier=None, op_id: str = "op-w24-s2"):
+    """Build a PolicyContext for Rule 14 evaluation."""
     from backend.core.ouroboros.governance.tool_executor import PolicyContext
-    return PolicyContext(repo_root=repo_root, risk_tier=risk_tier)
+    return PolicyContext(
+        repo="jarvis",
+        repo_root=repo_root,
+        op_id=op_id,
+        call_id=f"{op_id}:r0:ask_human",
+        round_index=0,
+        risk_tier=risk_tier,
+        is_read_only=False,
+    )
 
 
 def _mk_ask_human_call(question: str = "What should I do?"):
-    """Build a minimal ToolCall for ask_human."""
+    """Build a ToolCall for ask_human."""
     from backend.core.ouroboros.governance.tool_executor import ToolCall
     return ToolCall(name="ask_human", arguments={"question": question})
 
 
 def _evaluate_rule_14(call, ctx):
-    """Run the policy gate (which contains Rule 14) and return the PolicyResult.
-
-    The gate is a module-level helper exposed by tool_executor. We reuse
-    the production path so any future refactor that breaks Rule 14
-    surface fails this test.
-    """
+    """Run the production policy gate (which contains Rule 14)."""
     from backend.core.ouroboros.governance.tool_executor import (
-        ToolPolicyGate,
+        GoverningToolPolicy,
     )
-    gate = ToolPolicyGate()
+    gate = GoverningToolPolicy(repo_roots={"jarvis": ctx.repo_root})
     return gate.evaluate(call, ctx)
 
 
