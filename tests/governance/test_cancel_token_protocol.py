@@ -37,15 +37,21 @@ from backend.core.ouroboros.governance.cancel_token import (
 # ---------------------------------------------------------------------------
 
 
-def test_master_flag_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """JARVIS_MID_OP_CANCEL_ENABLED defaults to false."""
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+def test_master_flag_explicit_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """JARVIS_MID_OP_CANCEL_ENABLED=false reverts to pre-W3(7) (hot-revert path).
+
+    Note: post-Slice-7 the *default* is True. This test pins the
+    explicit-false behavior — the byte-for-byte pre-W3(7) hot-revert path.
+    The default-True invariant lives in
+    ``test_w3_7_graduation_pins_slice7.py``.
+    """
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     assert mid_op_cancel_enabled() is False
 
 
 def test_repl_immediate_off_when_master_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sub-flag is force-False when master is off, regardless of its own value."""
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     monkeypatch.setenv("JARVIS_MID_OP_CANCEL_REPL_IMMEDIATE", "true")
     assert repl_immediate_enabled() is False
 
@@ -59,7 +65,7 @@ def test_repl_immediate_on_when_master_on(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_record_persist_off_when_master_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """Persist sub-flag is force-False when master is off."""
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     monkeypatch.setenv("JARVIS_CANCEL_RECORD_PERSIST_ENABLED", "true")
     assert record_persist_enabled() is False
 
@@ -265,7 +271,7 @@ def test_emit_class_d_returns_none_when_master_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Master flag off → emit is silent no-op (byte-for-byte pre-W3(7))."""
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     token = CancelToken("op-test-001")
     emitter = CancelOriginEmitter()
     record = emitter.emit_class_d(

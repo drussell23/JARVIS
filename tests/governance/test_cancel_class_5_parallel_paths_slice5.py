@@ -279,7 +279,7 @@ async def test_master_off_plan_exploit_passes_through_to_wait_for(
 ) -> None:
     """With token=None (master off), the helper falls through to plain
     asyncio.wait_for — no Slice 5 behavior change."""
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
 
     cancel_token_var.set(None)
 

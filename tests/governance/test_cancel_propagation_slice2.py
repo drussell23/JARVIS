@@ -387,7 +387,7 @@ async def test_master_off_emit_no_op_does_not_set_token(
 ) -> None:
     """End-to-end: master flag off → REPL Class D emit returns None,
     token never gets set, race_or_wait_for falls through."""
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
 
     token = CancelToken("op-master-off-001")
     emitter = CancelOriginEmitter()

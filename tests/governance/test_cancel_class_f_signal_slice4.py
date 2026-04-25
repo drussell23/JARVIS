@@ -41,7 +41,7 @@ from backend.core.ouroboros.governance.cancel_token import (
 def test_signal_flag_default_off_when_master_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     monkeypatch.setenv("JARVIS_MID_OP_CANCEL_SIGNAL_ENABLED", "true")
     assert signal_enabled() is False
 
@@ -72,7 +72,7 @@ def test_signal_flag_on_when_both_set(
 def test_emit_class_f_returns_none_when_master_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     monkeypatch.setenv("JARVIS_MID_OP_CANCEL_SIGNAL_ENABLED", "true")
     token = CancelToken("op-test-001")
     emitter = CancelOriginEmitter()
@@ -246,7 +246,7 @@ def test_emit_signal_cancel_fans_out_to_all_active_ops(
 def test_emit_signal_cancel_returns_zero_when_master_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     monkeypatch.setenv("JARVIS_MID_OP_CANCEL_SIGNAL_ENABLED", "true")
     reg = CancelTokenRegistry()
     reg.get_or_create("op-master-off")
