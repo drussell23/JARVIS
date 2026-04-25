@@ -98,7 +98,7 @@ def test_master_off_with_budget_bound_still_rejects(
 ) -> None:
     """Even with a CuriosityBudget bound (e.g., test pollution), master
     off forces the budget to deny → legacy reject."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     from backend.core.ouroboros.governance.risk_engine import RiskTier
 
     bud = CuriosityBudget(op_id="op-test-001", posture_at_arm="EXPLORE")
