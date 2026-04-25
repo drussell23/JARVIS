@@ -3254,6 +3254,33 @@ class BattleTestHarness:
                 self._atexit_fallback_write()
         except Exception:  # noqa: BLE001
             logger.debug("signal-driven partial write failed", exc_info=True)
+        # W3(7) Slice 4 — Class F cancel emission for in-flight ops.
+        # ADDITIVE to the existing partial-summary write above (operator
+        # resolution-4: no harness dependency for correctness; the
+        # partial-summary path keeps working regardless of this hook).
+        # Master flag off OR signal sub-flag off (both default false) →
+        # emit_signal_cancel returns 0 — silent no-op, byte-for-byte
+        # pre-W3(7). Never raises into the signal handler — interrupt-safe.
+        if signal_name is not None:
+            try:
+                from backend.core.ouroboros.governance.cancel_token import (
+                    emit_signal_cancel as _emit_signal_cancel,
+                )
+                _gls = getattr(self, "_governed_loop_service", None)
+                _registry = getattr(_gls, "_cancel_token_registry", None) if _gls else None
+                if _registry is not None:
+                    _emit_signal_cancel(
+                        signal_name=signal_name,
+                        registry=_registry,
+                        session_dir=getattr(self, "_session_dir", None),
+                        phase_at_trigger="unknown",
+                        reason=f"signal {signal_name} received during session",
+                    )
+            except Exception:  # noqa: BLE001 — interrupt-safe
+                logger.debug(
+                    "signal-driven Class F emission skipped",
+                    exc_info=True,
+                )
         if self._shutdown_event is not None:
             self._shutdown_event.set()
 
