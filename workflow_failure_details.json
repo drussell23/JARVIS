@@ -1,0 +1,72 @@
+{
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24925013463",
+  "branch": "fix/fallback-outer-retry-on-transient-budget-remaining",
+  "commit_sha": "c78d1e5",
+  "run_number": 38039,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pr-automation-validation-run38039-20260425-065106",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #38039)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 23,
+              "content": "2026-04-25T06:48:16.8170016Z   subjectPatternError: The PR title must start with a capital letter.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 35,
+              "content": "2026-04-25T06:48:17.3786238Z ##[error]The PR title must start with a capital letter.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 44,
+              "content": "2026-04-25T06:48:17.4240800Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 27,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            },
+            {
+              "line_number": 39,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
+      ],
+      "severity": "high",
+      "category": "timeout",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-04-25T06:51:06.730394"
+}
