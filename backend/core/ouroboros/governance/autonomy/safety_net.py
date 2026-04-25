@@ -72,6 +72,27 @@ class SafetyNetConfig:
             os.environ.get("JARVIS_SAFETY_NET_SEVERE_THRESHOLD", "5")
         )
     )
+    # Anthropic resilience pack 2026-04-25 — auto-recovery from L3 demotion.
+    # Without this, a transient Anthropic API instability that triggered
+    # REDUCED_AUTONOMY / READ_ONLY_PLANNING demotion stays sticky FOREVER
+    # (until session restart). The failure counter resets on success, but
+    # no REQUEST_MODE_SWITCH back to FULL_AUTONOMY ever fires.
+    #
+    # Observed live in F1 Slice 4 S4b (`bt-2026-04-25-085942`): L3 demoted
+    # to READ_ONLY_PLANNING at 02:15:57; the seed couldn't reach
+    # post-GENERATE seam for the rest of the 30+ minute session even if
+    # Anthropic recovered.
+    #
+    # The fix: track consecutive successes WHILE in degraded state; after
+    # `probe_recovery_success_threshold` (default 3) emit
+    # REQUEST_MODE_SWITCH back to FULL_AUTONOMY. Default 3 matches the
+    # escalation threshold (symmetric: 3 fails to demote, 3 successes to
+    # promote). Master-off via threshold=0 → byte-for-byte pre-fix.
+    probe_recovery_success_threshold: int = field(
+        default_factory=lambda: int(
+            os.environ.get("JARVIS_SAFETY_NET_RECOVERY_THRESHOLD", "3")
+        )
+    )
     rollback_pattern_threshold: int = 2
     rollback_pattern_window_s: float = 3600.0
     human_presence_defer_s: float = 300.0
@@ -101,6 +122,11 @@ class ProductionSafetyNet:
         self._consecutive_failures: int = 0
         self._escalated_reduced: bool = False
         self._escalated_readonly: bool = False
+        # Anthropic resilience pack — track consecutive successes WHILE
+        # in degraded state for auto-promotion back to FULL_AUTONOMY.
+        # Reset whenever we enter or leave degraded mode (so the count
+        # only accumulates within a single recovery window).
+        self._consecutive_successes_while_degraded: int = 0
         self._rollback_history: List[Dict[str, Any]] = []
         self._incident_triggered: bool = False
         self._health_tracker: ComponentHealthTracker = ComponentHealthTracker()
@@ -140,9 +166,59 @@ class ProductionSafetyNet:
         component_name = payload.get("component", "system")
 
         if payload.get("success"):
+            # Anthropic resilience pack 2026-04-25 — auto-recovery from
+            # L3 demotion. Track consecutive successes WHILE in degraded
+            # state. After `probe_recovery_success_threshold` (default 3)
+            # emit REQUEST_MODE_SWITCH back to FULL_AUTONOMY. Without this,
+            # L3 demotion is sticky until session restart even after the
+            # external API recovers.
+            _recovery_threshold = self._config.probe_recovery_success_threshold
+            _was_degraded = self._escalated_reduced or self._escalated_readonly
+            if _recovery_threshold > 0 and _was_degraded:
+                self._consecutive_successes_while_degraded += 1
+                if self._consecutive_successes_while_degraded >= _recovery_threshold:
+                    # Promote back to FULL_AUTONOMY. The L1 governor's
+                    # mode switcher honors this via the same CommandBus
+                    # path the demotion used (REQUEST_MODE_SWITCH).
+                    cmd = CommandEnvelope(
+                        source_layer="L3",
+                        target_layer="L1",
+                        command_type=CommandType.REQUEST_MODE_SWITCH,
+                        payload={
+                            "target_mode": "FULL_AUTONOMY",
+                            "reason": (
+                                f"{self._consecutive_successes_while_degraded} "
+                                "consecutive probe successes — "
+                                "auto-recovery from degraded mode"
+                            ),
+                            "evidence_count": self._consecutive_successes_while_degraded,
+                            "probe_recovery_streak": self._consecutive_successes_while_degraded,
+                        },
+                        ttl_s=300.0,
+                    )
+                    self._bus.try_put(cmd)
+                    # Reset state so subsequent demotions work fresh.
+                    self._escalated_reduced = False
+                    self._escalated_readonly = False
+                    self._consecutive_successes_while_degraded = 0
+                    logger.info(
+                        "[SafetyNet] Auto-recovery: L3 promoted to FULL_AUTONOMY "
+                        "after %d consecutive probe successes "
+                        "(component=%s)",
+                        _recovery_threshold, component_name,
+                    )
+            elif _recovery_threshold <= 0:
+                # Recovery DISABLED — preserve byte-for-byte pre-fix
+                # semantics: clear escalated flags on every success so
+                # subsequent failure bursts can re-emit a demotion command.
+                self._escalated_reduced = False
+                self._escalated_readonly = False
+                self._consecutive_successes_while_degraded = 0
+            else:
+                # Not degraded + recovery enabled — keep counter at 0
+                # (only accumulates in the recovery window).
+                self._consecutive_successes_while_degraded = 0
             self._consecutive_failures = 0
-            self._escalated_reduced = False
-            self._escalated_readonly = False
             # Update health tracker: success -> ACTIVE with score from payload or 1.0
             score = payload.get("health_score", 1.0)
             self._health_tracker.update(
@@ -154,6 +230,9 @@ class ProductionSafetyNet:
             return
 
         self._consecutive_failures += 1
+        # Reset recovery streak on any failure — the recovery window
+        # only counts CONSECUTIVE successes.
+        self._consecutive_successes_while_degraded = 0
 
         # Update health tracker: failure -> ERROR, decrement score by 0.1
         current = self._health_tracker.get_status(component_name)
