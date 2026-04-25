@@ -1603,6 +1603,149 @@ async def enforce_evaluate_fanout(
 
 
 # ---------------------------------------------------------------------------
+# Slice 5a — FlagRegistry seed (Wave 1 #2 integration)
+# ---------------------------------------------------------------------------
+
+
+def _own_flag_specs() -> list:
+    """Wave 3 (6) env flag descriptors for the FlagRegistry.
+
+    Per the Slice 5b prerequisites doc (project_wave3_item6_graduation_matrix.md):
+    "FlagRegistry seed entries for all 5 Wave 3 env knobs present and
+    `/help flag JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED` renders correctly
+    (landed in Slice 5a docs commit)."
+
+    Posture relevance:
+    - HARDEN posture should suppress fan-out (favor stabilization over
+      parallel risk) — flagged CRITICAL there so operators see it in
+      `/help flags --posture HARDEN`.
+    - EXPLORE / CONSOLIDATE benefit from fan-out throughput when
+      multi-file ops appear — flagged RELEVANT.
+    """
+    from backend.core.ouroboros.governance.flag_registry import (
+        Category, FlagSpec, FlagType, Relevance,
+    )
+    return [
+        FlagSpec(
+            name="JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED",
+            type=FlagType.BOOL, default=False,
+            description=(
+                "Master kill switch for Wave 3 (6) parallel L3 fan-out. "
+                "When false, post-GENERATE seam in phase_dispatcher reverts "
+                "to serial per-phase walks (graduated #8 dispatcher). "
+                "Single env-flip hot-revert: =false force-disables every "
+                "sub-flag (mirrors W2(4) / W3(7) master-off composition). "
+                "Default false until Slice 5b operator-authorized flip."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/parallel_dispatch.py"
+            ),
+            example="true", since="v1.0",
+            posture_relevance={
+                "EXPLORE":     Relevance.RELEVANT,
+                "CONSOLIDATE": Relevance.RELEVANT,
+                "HARDEN":      Relevance.CRITICAL,
+                "MAINTAIN":    Relevance.RELEVANT,
+            },
+        ),
+        FlagSpec(
+            name="JARVIS_WAVE3_PARALLEL_DISPATCH_SHADOW",
+            type=FlagType.BOOL, default=False,
+            description=(
+                "Shadow sub-flag — log eligibility + graph build without "
+                "actually submitting to the scheduler. Telemetry only; no "
+                "behavioral effect on the live op. Master-off forces this "
+                "off too (composition)."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=(
+                "backend/core/ouroboros/governance/parallel_dispatch.py"
+            ),
+            example="true", since="v1.0",
+        ),
+        FlagSpec(
+            name="JARVIS_WAVE3_PARALLEL_DISPATCH_ENFORCE",
+            type=FlagType.BOOL, default=False,
+            description=(
+                "Enforce sub-flag — actually submit the execution graph "
+                "to subagent_scheduler when eligibility allows. Covers "
+                "shadow's telemetry surface at higher fidelity. "
+                "Master-off forces this off too."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/parallel_dispatch.py"
+            ),
+            example="true", since="v1.0",
+            posture_relevance={
+                "HARDEN": Relevance.CRITICAL,
+            },
+        ),
+        FlagSpec(
+            name="JARVIS_WAVE3_PARALLEL_MAX_UNITS",
+            type=FlagType.INT, default=3,
+            description=(
+                "Hard ceiling on fan-out degree. Eligibility decision "
+                "clamps the candidate-file count to this value. Posture "
+                "+ memory-pressure may clamp further (e.g. HARDEN × OK "
+                "memory weights down via posture_weight_for()). Bounded "
+                "to keep parallel L3 worktree disk + memory pressure "
+                "predictable."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/parallel_dispatch.py"
+            ),
+            example="3", since="v1.0",
+            posture_relevance={
+                "HARDEN": Relevance.RELEVANT,
+            },
+        ),
+        FlagSpec(
+            name="JARVIS_WAVE3_PARALLEL_WAIT_TIMEOUT_S",
+            type=FlagType.FLOAT, default=900.0,
+            description=(
+                "Maximum wall-clock seconds enforce_evaluate_fanout will "
+                "block on subagent_scheduler.wait_for_graph before "
+                "returning FanoutOutcome.TIMEOUT. Default 900s (15m) "
+                "matches per-unit timeout × max_units × headroom. "
+                "Below 60s the wait will starve realistic fan-outs."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/parallel_dispatch.py"
+            ),
+            example="900.0", since="v1.0",
+        ),
+    ]
+
+
+def ensure_flag_registry_seeded() -> None:
+    """Register the 5 Wave 3 (6) env flags into the Wave 1 #2 FlagRegistry.
+
+    Idempotent — `register(spec, override=True)` is safe to call multiple
+    times. Best-effort: if FlagRegistry isn't available (tests or stripped
+    deployments), silently skip — `parallel_dispatch.py` itself doesn't
+    depend on the registry, only on the env vars directly.
+
+    Called from :func:`backend.core.ouroboros.governance.governed_loop_service.GovernedLoopService.start`
+    when the GLS boots. Tests can also call it directly to verify the
+    flags are registered correctly.
+    """
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            ensure_seeded as _fr_seed,
+        )
+        fr = _fr_seed()
+        for spec in _own_flag_specs():
+            fr.register(spec, override=True)
+    except ImportError:
+        # FlagRegistry module unavailable — non-fatal, env reads still work.
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Module public surface — explicit for grep clarity
 # ---------------------------------------------------------------------------
 
@@ -1620,6 +1763,7 @@ __all__ = [
     "ReasonCode",
     "ShadowEvaluation",
     "build_execution_graph",
+    "ensure_flag_registry_seeded",
     "enforce_evaluate_fanout",
     "evaluate_shadow_fanout",
     "extract_candidate_files",

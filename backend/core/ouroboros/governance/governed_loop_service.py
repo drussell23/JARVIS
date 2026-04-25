@@ -1240,6 +1240,25 @@ class GovernedLoopService:
                 )
                 self._posture_observer = None
 
+            # Wave 3 (6) Slice 5a — register parallel-dispatch env flags into
+            # the FlagRegistry so `/help flags --search parallel_dispatch`
+            # surfaces all 5 knobs. Best-effort, never-raise (the env reads
+            # work without the registry).
+            try:
+                from backend.core.ouroboros.governance.parallel_dispatch import (
+                    ensure_flag_registry_seeded as _w3_seed,
+                )
+                _w3_seed()
+                logger.info(
+                    "[GovernedLoop] Wave 3 (6) FlagRegistry seed installed "
+                    "(parallel-dispatch knobs discoverable via /help flags)",
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] Wave 3 (6) FlagRegistry seed failed "
+                    "(non-fatal)", exc_info=True,
+                )
+
             # C+ L2/L3: CommandBus + EventEmitter + optional subagent scheduler
             if self._command_bus is None:
                 self._command_bus = CommandBus(maxsize=1000)
