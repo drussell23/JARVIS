@@ -1433,9 +1433,60 @@ async def enforce_evaluate_fanout(
     # budget-exhaustion signal; asyncio.CancelledError is cooperative.
     # Both classify the result without re-raising. Scheduler-side
     # exceptions propagate unchanged.
+    #
+    # W3(7) Slice 5 — race against ambient cancel token. When a Class
+    # D/E/F cancel fires while we're waiting on the scheduler, the race
+    # surfaces as OperationCancelledError; we cancel the scheduler graph
+    # and return a FanoutResult tagged with the cancel record so
+    # downstream POSTMORTEM can read it. Master-flag-off →
+    # current_cancel_token() returns None → race_or_wait_for falls
+    # through to plain wait_for → byte-for-byte pre-W3(7).
+    from backend.core.ouroboros.governance.cancel_token import (
+        OperationCancelledError as _OpCancelledError,
+        current_cancel_token as _curr_cancel_token,
+        race_or_wait_for as _race_or_wait_for,
+    )
+
     wait_start = time.monotonic()
     try:
-        state = await scheduler.wait_for_graph(graph.graph_id, timeout_s=wait_budget)
+        state = await _race_or_wait_for(
+            scheduler.wait_for_graph(graph.graph_id, timeout_s=wait_budget),
+            timeout=wait_budget + 5.0,  # outer guard slightly above scheduler's own timeout
+            cancel_token=_curr_cancel_token(),
+        )
+    except _OpCancelledError as _cancel_exc:
+        elapsed = time.monotonic() - wait_start
+        cancel_record = _cancel_exc.record
+        logger.warning(
+            "[ParallelDispatch enforce_cancelled] op=%s graph_id=%s "
+            "phase=wait elapsed_s=%.1f cancel_origin=%s cancel_id=%s "
+            "(W3(7) Slice 5 — Class D/E/F cancel mid-fanout)",
+            op_id[:16],
+            graph.graph_id,
+            elapsed,
+            cancel_record.origin,
+            cancel_record.cancel_id,
+        )
+        # Best-effort scheduler graph cancel so worktrees can be reaped.
+        try:
+            _cancel_method = getattr(scheduler, "cancel_graph", None)
+            if _cancel_method is not None:
+                _r = _cancel_method(graph.graph_id)
+                if asyncio.iscoroutine(_r):
+                    await _r
+        except Exception:  # noqa: BLE001 — best-effort, never block POSTMORTEM
+            pass
+        return FanoutResult(
+            outcome=FanoutOutcome.CANCELLED,
+            eligibility=eligibility,
+            graph=graph,
+            wait_duration_s=elapsed,
+            n_units_requested=graph.concurrency_limit,
+            error=(
+                f"cancelled mid-fanout: origin={cancel_record.origin} "
+                f"cancel_id={cancel_record.cancel_id}"
+            ),
+        )
     except asyncio.CancelledError:
         elapsed = time.monotonic() - wait_start
         logger.warning(
