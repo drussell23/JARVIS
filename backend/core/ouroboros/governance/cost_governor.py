@@ -79,6 +79,38 @@ logger = logging.getLogger(__name__)
 # Env-var helpers
 # -----------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Default-singleton accessor (rooted-problem fix 2026-04-25)
+# ---------------------------------------------------------------------------
+# Process-wide reference to the active CostGovernor instance. Set by
+# the orchestrator at boot via :func:`set_default_cost_governor` after
+# it constructs `self._cost_governor`. Lookups via :func:`get_default_cost_governor`
+# return None when no governor is active (test isolation, partial boot).
+#
+# This indirection avoids forcing PLAN-EXPLOIT (or any other "pure"
+# helper module) to take a CostGovernor parameter through every call
+# site. The pure-module discipline is preserved — PLAN-EXPLOIT still
+# never imports orchestrator; it imports this accessor and tolerates
+# None.
+_default_cost_governor: Optional["CostGovernor"] = None
+
+
+def set_default_cost_governor(governor: "CostGovernor") -> None:
+    """Register the process-wide CostGovernor for default-singleton lookup.
+
+    Idempotent — calling twice with the same instance is a no-op; calling
+    with a different instance replaces the reference. Tests should call
+    with ``governor=None`` between cases for isolation.
+    """
+    global _default_cost_governor
+    _default_cost_governor = governor
+
+
+def get_default_cost_governor() -> Optional["CostGovernor"]:
+    """Return the process-wide CostGovernor, or None if not registered."""
+    return _default_cost_governor
+
+
 def _env_float(name: str, default: float) -> float:
     """Read a float env var with a safe default. Negative values fall back."""
     raw = os.environ.get(name)
@@ -177,6 +209,23 @@ class CostGovernorConfig:
     readonly_factor: float = field(
         default_factory=lambda: _env_float("JARVIS_OP_COST_READONLY_FACTOR", 5.0)
     )
+    # Parallel-stream multiplier for fan-out paths (rooted-problem fix
+    # 2026-04-25). PLAN-EXPLOIT spawns N concurrent Claude streams for
+    # a single op; the cap must scale with stream count or the governor
+    # will cancel mid-flight (observed F1 Slice 4 S2: 3-stream fan-out
+    # spent $0.49 against $0.45 single-stream cap → enforce_cancelled
+    # 53.3s into wait, fan-out units exhausted).
+    #
+    # Default 1.10× safety margin per stream — the parallel cost isn't
+    # exactly N× single-stream because each stream may have variable
+    # output size, but the multiplier needs SOME headroom over linear
+    # scaling. PLAN-EXPLOIT passes n_streams; the governor uses
+    # max(1.0, n_streams) × parallel_stream_factor as the multiplier.
+    parallel_stream_factor: float = field(
+        default_factory=lambda: _env_float(
+            "JARVIS_OP_COST_PARALLEL_STREAM_FACTOR", 1.1,
+        )
+    )
     # Default multiplier if route/complexity key is unknown (unknown token
     # taxonomy shouldn't starve the op — default to standard/light).
     default_route_factor: float = 1.5
@@ -215,6 +264,13 @@ class _OpCostEntry:
     route_factor: float = 1.0
     complexity_factor: float = 1.0
     retry_headroom: float = 1.0
+    # Parallel-stream multiplier (rooted-problem fix 2026-04-25).
+    # Defaults to 1.0 (single-stream / serial). PLAN-EXPLOIT calls
+    # `bump_for_parallel_streams(op_id, n_streams)` BEFORE its `gather()`
+    # so the cap is sized for N concurrent provider calls — preventing
+    # the F1 Slice 4 S2 post-fix bottleneck where a 3-stream fan-out
+    # ($0.49 total) tripped a single-stream-sized cap ($0.45).
+    parallel_factor: float = 1.0
     # Per-phase cost instrumentation — drill-down arc Slice 2.
     # phase_totals: {phase_name: cumulative_usd} rolling per-phase.
     # phase_by_provider: {phase_name: {provider: cumulative_usd}}.
@@ -319,7 +375,11 @@ class CostGovernor:
     # --------------------------------------------------------------
 
     def _derive_cap(
-        self, route: str, complexity: str, is_read_only: bool = False,
+        self,
+        route: str,
+        complexity: str,
+        is_read_only: bool = False,
+        parallel_factor: float = 1.0,
     ) -> Tuple[float, float, float]:
         """Compute ``(cap_usd, route_factor, complexity_factor)`` dynamically.
 
@@ -329,7 +389,15 @@ class CostGovernor:
         When ``is_read_only=True`` the cap is multiplied by
         ``cfg.readonly_factor`` (default 5.0) BEFORE the min/max clamp
         to account for subagent fan-out + Claude synthesis payload sizes.
-        Still bounded by max_cap_usd so runaway costs remain capped.
+
+        ``parallel_factor`` (default 1.0) scales the cap for fan-out
+        paths. PLAN-EXPLOIT passes ``max(1.0, n_streams) × cfg.parallel_stream_factor``
+        via :meth:`bump_for_parallel_streams` so a 3-stream concurrent
+        gather doesn't trip a single-stream-sized cap.
+
+        Still bounded by max_cap_usd so runaway costs remain capped
+        (the operator's financial circuit-breaker mandate per Manifesto
+        §6 — Iron Gate at the wallet layer).
         """
         cfg = self._config
         route_key = (route or "").strip().lower() or "standard"
@@ -348,6 +416,12 @@ class CostGovernor:
         )
         if is_read_only:
             raw_cap *= cfg.readonly_factor
+        # Parallel-stream multiplier (rooted-problem fix 2026-04-25).
+        # Defaults to 1.0 for serial / single-stream ops — byte-for-byte
+        # identical to pre-fix behavior. PLAN-EXPLOIT sets it via
+        # `bump_for_parallel_streams` to scale for fan-out.
+        if parallel_factor > 1.0:
+            raw_cap *= parallel_factor
 
         # Clamp into [min_cap_usd, max_cap_usd]; protects against env typos.
         cap = max(cfg.min_cap_usd, min(cfg.max_cap_usd, raw_cap))
@@ -418,6 +492,114 @@ class CostGovernor:
             self._config.retry_headroom,
         )
         return cap
+
+    def bump_for_parallel_streams(
+        self,
+        op_id: str,
+        n_streams: int,
+    ) -> Optional[float]:
+        """Recompute the cap for an op about to launch ``n_streams`` parallel
+        provider calls. Idempotent.
+
+        Called by PLAN-EXPLOIT before its ``asyncio.gather()`` of N
+        concurrent fan-out streams. Without this bump, the cap derived
+        at :meth:`start` (sized for ONE stream) would trip mid-flight
+        when the gather's cumulative spend crosses the cap, cancelling
+        the in-progress fan-out and exhausting the units (observed
+        F1 Slice 4 S2 post-fix: 3-stream gather = $0.49 vs $0.45 cap).
+
+        Multiplier semantics:
+          * ``n_streams <= 1`` → no-op (returns None, cap unchanged)
+          * ``n_streams >= 2`` → cap *= max(1.0, n_streams) × cfg.parallel_stream_factor
+
+        The bump is idempotent within an op's lifecycle: subsequent
+        calls with the same ``n_streams`` produce the same cap. Calls
+        with a HIGHER ``n_streams`` raise the cap further (rare —
+        most fan-outs decide n_streams once and stick with it).
+        Calls with a LOWER ``n_streams`` are NO-OP (caps never shrink
+        — the orchestrator must not retroactively starve an op that
+        already committed to a higher concurrency budget).
+
+        Returns the new cap_usd on success, None when:
+          * Governor disabled (master flag off)
+          * No entry for op_id (op not yet started — shouldn't happen
+            in production but defensive)
+          * n_streams <= 1 (no-op case)
+
+        Authority: this method ONLY raises the cap; it never lowers
+        below the existing cap_usd. The financial circuit-breaker
+        invariant (cumulative_usd < cap_usd) remains the sole
+        authoritative gate.
+        """
+        if not self._config.enabled:
+            return None
+        if n_streams <= 1:
+            return None
+
+        entry = self._entries.get(op_id)
+        if entry is None:
+            logger.debug(
+                "[CostGovernor] bump_for_parallel_streams: op=%s not yet "
+                "started — skipping bump (will use single-stream cap on charge)",
+                op_id[:12],
+            )
+            return None
+
+        # Compute the new parallel_factor. max(1.0, ...) guards against
+        # n_streams=0 misuse upstream (shouldn't happen per the n_streams<=1
+        # short-circuit above, but defensive).
+        new_parallel_factor = max(1.0, float(n_streams)) * self._config.parallel_stream_factor
+
+        # Idempotent: same factor → no change.
+        if abs(entry.parallel_factor - new_parallel_factor) < 1e-6:
+            return entry.cap_usd
+
+        # Caps NEVER shrink — only grow.
+        if new_parallel_factor < entry.parallel_factor:
+            return entry.cap_usd
+
+        # Recompute cap with the new factor. Preserves all other factors
+        # frozen at start() (route, complexity, headroom, readonly).
+        old_cap = entry.cap_usd
+        new_cap, _, _ = self._derive_cap(
+            route=entry.route,
+            complexity=entry.complexity,
+            is_read_only=False,  # readonly already absorbed into raw_cap at start()
+            parallel_factor=new_parallel_factor,
+        )
+        # If readonly was applied at start, _derive_cap above WITHOUT
+        # is_read_only=True would shrink the cap. Detect this by
+        # comparing baseline derivation to the saved entry's existing
+        # cap with parallel_factor=1.0; only apply the bump as a
+        # *delta* on top of the existing cap.
+        baseline_no_parallel, _, _ = self._derive_cap(
+            route=entry.route,
+            complexity=entry.complexity,
+            is_read_only=False,
+            parallel_factor=1.0,
+        )
+        # Multiplicative bump in linear space, then re-clamp to max_cap.
+        if baseline_no_parallel > 0:
+            ratio = new_parallel_factor / 1.0
+            new_cap = min(self._config.max_cap_usd, old_cap * ratio)
+        # Cap can never shrink below current
+        new_cap = max(new_cap, old_cap)
+
+        entry.cap_usd = new_cap
+        entry.parallel_factor = new_parallel_factor
+        # Reset exceeded flag if the new cap accommodates current spend
+        # (e.g. governor saw 1-stream cap exceed before PLAN-EXPLOIT
+        # called this — the bump retroactively rescues the op).
+        if entry.exceeded and entry.cumulative_usd < new_cap:
+            entry.exceeded = False
+        logger.info(
+            "[CostGovernor] op=%s cap bumped for parallel fan-out: "
+            "$%.4f → $%.4f (n_streams=%d, parallel_factor=%.2fx — "
+            "rooted-problem fix; per-stream cost stays charged against the "
+            "single per-op ledger but cap scales with concurrency)",
+            op_id[:12], old_cap, new_cap, n_streams, new_parallel_factor,
+        )
+        return new_cap
 
     def charge(
         self,
