@@ -118,6 +118,21 @@ def record_persist_enabled() -> bool:
     return _env_bool("JARVIS_CANCEL_RECORD_PERSIST_ENABLED", True)
 
 
+def watchdog_enabled() -> bool:
+    """Class E watchdog sub-flag — `JARVIS_MID_OP_CANCEL_WATCHDOG_ENABLED`.
+
+    Default false (even when master is on) per operator resolution-2 — the
+    first rollout is operator-only (Class D); watchdog-initiated cancels
+    are a separate trust step. Always returns False when master is off.
+
+    Slice 3 (W3(7)) gates Class E (cost / wall / productivity / idle
+    watchdog cancels) on this flag.
+    """
+    if not mid_op_cancel_enabled():
+        return False
+    return _env_bool("JARVIS_MID_OP_CANCEL_WATCHDOG_ENABLED", False)
+
+
 def bounded_deadline_s() -> float:
     """`JARVIS_CANCEL_BOUNDED_DEADLINE_S` — settle budget (default 30s).
 
@@ -391,6 +406,105 @@ class CancelOriginEmitter:
 
         return record
 
+    # Class E watchdogs (W3(7) Slice 3) — cost / wall / productivity / idle.
+    # Each watchdog identifies itself via the ``watchdog`` keyword; the
+    # origin string follows the canonical ``E:<watchdog>`` shape.
+    _ALLOWED_WATCHDOGS: frozenset = frozenset({
+        "cost",          # cost_governor cap exceeded
+        "wall",          # WallClockWatchdog wall-clock cap
+        "productivity",  # productivity / forward-progress trip
+        "idle",          # idle-timeout (lowest precedence per operator resolution-3)
+    })
+
+    def emit_class_e(
+        self,
+        *,
+        watchdog: str,
+        op_id: str,
+        token: CancelToken,
+        phase_at_trigger: str,
+        reason: str = "",
+        initiator_task: str = "",
+    ) -> Optional[CancelRecord]:
+        """Class E — watchdog-initiated immediate cancel.
+
+        Slice 3 (W3(7)). Same mechanics as :meth:`emit_class_d` but:
+
+        * Gated by :func:`watchdog_enabled` (sub-flag default false even
+          when master is on — operator resolution-2).
+        * ``watchdog`` MUST be in :attr:`_ALLOWED_WATCHDOGS` — surfaces
+          typos loudly rather than silently emitting an unparseable origin.
+        * Origin string is ``E:<watchdog>`` for machine-grep stability.
+
+        Precedence (operator resolution-3) — operator/safety > idle/productivity:
+        the actual *trigger* logic in each watchdog module owns the timing
+        decision; if multiple watchdogs fire near-simultaneously, asyncio
+        scheduling determines which wins ``token.set()``. The supersede
+        log includes both origins so postmortem can audit. Watchdog
+        modules SHOULD self-throttle (e.g., idle-timeout backs off when a
+        Class D / safety-class E is in flight) per the resolution.
+
+        Returns the committed CancelRecord, or None if:
+        * master flag is off (no-op),
+        * watchdog sub-flag is off (no-op),
+        * the watchdog name is unknown (raises ValueError — typo guard),
+        * the token was already cancelled by another origin (idempotent loss).
+        """
+        if watchdog not in self._ALLOWED_WATCHDOGS:
+            raise ValueError(
+                f"unknown watchdog={watchdog!r}; "
+                f"allowed={sorted(self._ALLOWED_WATCHDOGS)}"
+            )
+        if not mid_op_cancel_enabled():
+            return None
+        if not watchdog_enabled():
+            return None
+
+        origin = f"E:{watchdog}"
+        record = CancelRecord(
+            schema_version="cancel.1",
+            cancel_id=_new_cancel_id(),
+            op_id=op_id,
+            origin=origin,
+            phase_at_trigger=phase_at_trigger,
+            trigger_monotonic=time.monotonic(),
+            trigger_wall_iso=_now_iso(),
+            bounded_deadline_s=bounded_deadline_s(),
+            reason=reason or f"watchdog-initiated cancel ({watchdog})",
+        )
+
+        committed = token.set(record)
+        if not committed:
+            existing = token.get_record()
+            logger.info(
+                "[CancelOrigin] superseded — op=%s requested_origin=%s "
+                "winner_origin=%s winner_cancel_id=%s",
+                op_id[:16],
+                origin,
+                existing.origin if existing else "unknown",
+                existing.cancel_id if existing else "unknown",
+            )
+            return None
+
+        logger.info(
+            "[CancelOrigin] op=%s origin=%s phase=%s cancel_id=%s "
+            "at_monotonic=%.3f reason=%r initiator_task=%s "
+            "bounded_deadline_s=%.1f",
+            op_id[:16],
+            origin,
+            phase_at_trigger,
+            record.cancel_id,
+            record.trigger_monotonic,
+            record.reason,
+            initiator_task or watchdog,
+            record.bounded_deadline_s,
+        )
+
+        if record_persist_enabled() and self._session_dir is not None:
+            self._persist(record)
+
+        return record
+
     def _persist(self, record: CancelRecord) -> None:
         """Append the record to ``cancel_records.jsonl``. Best-effort."""
         try:
@@ -565,6 +679,48 @@ async def race_or_wait_for(
                 t.cancel()
 
 
+def emit_watchdog_cancel(
+    *,
+    watchdog: str,
+    op_id: str,
+    registry: "CancelTokenRegistry",
+    session_dir: Optional[Path] = None,
+    phase_at_trigger: str = "unknown",
+    reason: str = "",
+    initiator_task: str = "",
+) -> Optional[CancelRecord]:
+    """Convenience helper for watchdog modules — look up token + emit Class E.
+
+    Slice 3 (W3(7)). Watchdogs (cost_governor, WallClockWatchdog,
+    productivity-trip detector, idle-timeout) call this from their
+    termination path instead of importing/instantiating
+    :class:`CancelOriginEmitter` themselves.
+
+    Returns None when:
+    * master flag off (no-op, byte-for-byte pre-W3(7)),
+    * Class E sub-flag off (no-op — operator hasn't enabled watchdog cancels),
+    * the token was already cancelled by another origin (race lost,
+      logged as supersede).
+
+    The watchdog module's existing termination logic (raising
+    OpCostCapExceeded, writing stop_reason=wall_clock_cap, etc.) is NOT
+    replaced by this hook — it's *added alongside* so the cancel record
+    + dispatcher's POSTMORTEM routing engages cleanly.
+    """
+    if not watchdog_enabled():
+        return None
+    token = registry.get_or_create(op_id)
+    emitter = CancelOriginEmitter(session_dir=session_dir)
+    return emitter.emit_class_e(
+        watchdog=watchdog,
+        op_id=op_id,
+        token=token,
+        phase_at_trigger=phase_at_trigger,
+        reason=reason,
+        initiator_task=initiator_task,
+    )
+
+
 def subprocess_grace_s() -> float:
     """`JARVIS_CANCEL_SUBPROCESS_GRACE_S` — terminate→kill grace (default 5s).
 
@@ -592,4 +748,6 @@ __all__ = [
     "repl_immediate_enabled",
     "record_persist_enabled",
     "bounded_deadline_s",
+    "watchdog_enabled",
+    "emit_watchdog_cancel",
 ]
