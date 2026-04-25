@@ -3200,8 +3200,23 @@ class SerpentREPL:
                         self._print_help()
                         continue
                     if line.startswith("cancel "):
-                        _cancel_target = line.split(None, 1)[1].strip()
-                        await self._handle_cancel(_cancel_target)
+                        _cancel_args = line.split(None, 1)[1].strip()
+                        # W3(7) Slice 1 — `cancel <op-id> --immediate` extension.
+                        # Existing `cancel <op-id>` keeps phase-boundary
+                        # semantics (CLAUDE.md current behavior). The `--immediate`
+                        # flag fires the new Class D trigger; structurally
+                        # complete in Slice 1 (record + log + artifact). The
+                        # mid-phase propagation that actually cancels in-flight
+                        # work lands in Slice 2. Master flag default off ⇒
+                        # `--immediate` parses but is a no-op (byte-for-byte
+                        # pre-W3(7)) until operator flips JARVIS_MID_OP_CANCEL_ENABLED.
+                        _immediate = False
+                        for _flag in ("--immediate", "-i"):
+                            if _cancel_args.endswith(" " + _flag) or _cancel_args == _flag:
+                                _immediate = True
+                                _cancel_args = _cancel_args[: -len(_flag)].strip()
+                                break
+                        await self._handle_cancel(_cancel_args, immediate=_immediate)
                         continue
 
                     # Runtime configuration commands
@@ -3457,8 +3472,21 @@ class SerpentREPL:
         f.console.print(panel)
         f.console.print()
 
-    async def _handle_cancel(self, op_id: str) -> None:
-        """Request cancellation of an in-flight operation."""
+    async def _handle_cancel(self, op_id: str, immediate: bool = False) -> None:
+        """Request cancellation of an in-flight operation.
+
+        Backward-compat: ``immediate=False`` (the existing ``cancel <op-id>``
+        UX) keeps phase-boundary semantics — adds the op_id to GovernedLoop's
+        cooperative cancel set; orchestrator catches at the next transition.
+
+        New (W3(7) Slice 1): ``immediate=True`` (``cancel <op-id> --immediate``)
+        also emits a Class D `[CancelOrigin]` log + cancel_records.jsonl entry
+        via :class:`CancelOriginEmitter`, gated by
+        ``JARVIS_MID_OP_CANCEL_ENABLED`` + ``JARVIS_MID_OP_CANCEL_REPL_IMMEDIATE``.
+        Master-off → no-op (record never created, byte-for-byte pre-W3(7)).
+        Slice 2 will propagate the cancel mid-phase; Slice 1 is observability
+        only — the op continues until the existing phase-boundary check fires.
+        """
         if self._gls is None:
             self._flow.console.print(
                 f"  [{_C['death']}]Cancel not available (no GLS reference)[/{_C['death']}]",
@@ -3468,8 +3496,19 @@ class SerpentREPL:
         if hasattr(self._gls, "request_cancel"):
             found = self._gls.request_cancel(op_id)
             if found:
+                # W3(7) Slice 1 — Class D emission (gated; default no-op)
+                if immediate:
+                    self._emit_class_d_cancel(op_id)
+                msg = (
+                    f"Cancel requested for {op_id}"
+                    + (
+                        " — Class D recorded; will take effect at next phase boundary (Slice 1 observability only)"
+                        if immediate
+                        else " — will take effect at next phase boundary"
+                    )
+                )
                 self._flow.console.print(
-                    f"  [{_C['evolved']}]Cancel requested for {op_id} — will take effect at next phase boundary[/{_C['evolved']}]",
+                    f"  [{_C['evolved']}]{msg}[/{_C['evolved']}]",
                     highlight=False,
                 )
             else:
@@ -3482,6 +3521,60 @@ class SerpentREPL:
                 f"  [{_C['death']}]GLS does not support cancel (upgrade needed)[/{_C['death']}]",
                 highlight=False,
             )
+
+    def _emit_class_d_cancel(self, op_id_prefix: str) -> None:
+        """W3(7) Slice 1 — Class D Cancel record emission via REPL.
+
+        Gated by ``JARVIS_MID_OP_CANCEL_ENABLED`` (master, default false)
+        and ``JARVIS_MID_OP_CANCEL_REPL_IMMEDIATE`` (sub-flag, default true
+        when master on). Master off → silent no-op.
+
+        Looks up the CancelToken via the GLS-attached registry (Slice 2 will
+        wire the registry; Slice 1 falls back to a per-call temporary token
+        when the registry isn't available, so the artifact + log surface is
+        still exercised). Phase tag is "unknown" until Slice 2 threads it
+        through the orchestrator.
+        """
+        try:
+            from backend.core.ouroboros.governance.cancel_token import (
+                CancelOriginEmitter,
+                CancelToken,
+                mid_op_cancel_enabled,
+            )
+        except Exception:
+            return
+        if not mid_op_cancel_enabled():
+            return
+
+        # Slice 2 attaches a CancelTokenRegistry on GLS; Slice 1 falls back
+        # to a fresh token so the trigger surface is exercisable today.
+        registry = getattr(self._gls, "_cancel_token_registry", None)
+        token: Optional[CancelToken] = None
+        resolved_op_id = op_id_prefix
+        if registry is not None:
+            token = registry.find_by_prefix(op_id_prefix)
+            if token is not None:
+                resolved_op_id = token.op_id
+        if token is None:
+            token = CancelToken(resolved_op_id)
+
+        # Resolve session dir for the durable artifact (best-effort).
+        session_dir = None
+        for attr in ("_session_dir", "session_dir"):
+            sd = getattr(self._gls, attr, None)
+            if sd is not None:
+                from pathlib import Path as _Path
+                session_dir = _Path(sd) if not isinstance(sd, _Path) else sd
+                break
+
+        emitter = CancelOriginEmitter(session_dir=session_dir)
+        emitter.emit_class_d(
+            op_id=resolved_op_id,
+            token=token,
+            phase_at_trigger="unknown",  # Slice 2 will thread the live phase
+            reason="operator-initiated immediate cancel (REPL)",
+            initiator_task="repl_operator",
+        )
 
     # ── /attach — human-initiated multi-modal ingest (CC-parity) ────
 
