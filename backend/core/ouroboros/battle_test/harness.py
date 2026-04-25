@@ -218,6 +218,17 @@ class BattleTestHarness:
         self._summary_written: bool = False
         self._install_atexit_fallback()
 
+        # Harness Epic Slice 1 — bounded shutdown watchdog.
+        # Daemon thread, idle until ``arm()``-ed by signal handler / wall
+        # cap. On arm, sleeps the deadline; if not disarmed, calls
+        # ``os._exit(75)``. Closes the 14-incident Py_FinalizeEx zombie
+        # class + S5/S6 SIGTERM-partial-summary regression + S6
+        # WallClockWatchdog asyncio-task starvation.
+        from backend.core.ouroboros.battle_test.shutdown_watchdog import (
+            BoundedShutdownWatchdog as _BoundedShutdownWatchdog,
+        )
+        self._shutdown_watchdog = _BoundedShutdownWatchdog()
+
         # Component references (populated during boot)
         self._oracle: Any = None
         self._governance_stack: Any = None
@@ -758,6 +769,17 @@ class BattleTestHarness:
         finally:
             await self._shutdown_components()
             await self._generate_report()
+            # Harness Epic Slice 1 — disarm the bounded-shutdown watchdog
+            # since clean shutdown completed within deadline. Without
+            # this disarm, a race between graceful shutdown completion
+            # and the watchdog's deadline could cause spurious os._exit.
+            # Idempotent — no-op if not armed.
+            try:
+                _wdg = getattr(self, "_shutdown_watchdog", None)
+                if _wdg is not None:
+                    _wdg.disarm()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------
     # Boot methods (all overridable for test mocking)
@@ -3240,6 +3262,22 @@ class BattleTestHarness:
         contract that the ``register_signal_handlers`` production path
         always supplies the signal name.
         """
+        # Harness Epic Slice 1 — arm the bounded-shutdown watchdog FIRST
+        # (before any of the existing async / partial-summary work). If
+        # the rest of this handler (or the downstream asyncio shutdown
+        # path) wedges, the watchdog's daemon thread will fire
+        # os._exit(75) after the deadline. Master flag default true;
+        # ``=false`` reverts to pre-Slice-1 (asyncio-only shutdown).
+        try:
+            from backend.core.ouroboros.battle_test.shutdown_watchdog import (
+                default_deadline_s as _bsw_deadline_s,
+            )
+            _wdg = getattr(self, "_shutdown_watchdog", None)
+            if _wdg is not None and signal_name is not None:
+                _wdg.arm(reason=signal_name, deadline_s=_bsw_deadline_s())
+        except Exception:  # noqa: BLE001 — never let watchdog arm crash signal handler
+            pass
+
         # Stamp the signal-specific reason before the write runs so the
         # partial summary carries an actionable classifier instead of the
         # generic "shutdown_signal" catch-all. Keep the existing value if
@@ -3587,6 +3625,20 @@ class BattleTestHarness:
             time.time() - self._started_at,
             cap_s,
         )
+        # Harness Epic Slice 1 — arm the bounded-shutdown watchdog in
+        # PARALLEL to the asyncio event. If the asyncio loop is wedged
+        # (the S6 hypothesis — wall watchdog never fired at 2400s),
+        # this thread-side arm guarantees os._exit fires after the
+        # deadline. Best-effort, never raises.
+        try:
+            from backend.core.ouroboros.battle_test.shutdown_watchdog import (
+                default_deadline_s as _bsw_deadline_s,
+            )
+            _wdg = getattr(self, "_shutdown_watchdog", None)
+            if _wdg is not None:
+                _wdg.arm(reason="wall_clock_cap", deadline_s=_bsw_deadline_s())
+        except Exception:  # noqa: BLE001
+            pass
         self._wall_clock_event.set()
 
     async def _monitor_restart_pending(self) -> None:
