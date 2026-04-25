@@ -1,12 +1,12 @@
 {
-  "workflow_name": "Database Connection Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24921664323",
-  "branch": "seed-arc-plan-exploit-ledger-merge",
-  "commit_sha": "d223401",
-  "run_number": 3350,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24921896961",
+  "branch": "fix/ci/database-connection-validation-run3350-20260425-034931",
+  "commit_sha": "a80e292",
+  "run_number": 37266,
   "failed_count": 1,
-  "fix_branch": "fix/ci/database-connection-validation-run3350-20260425-034931",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: Database Connection Validation (Run #3350)",
+  "fix_branch": "fix/ci/pr-automation-validation-run37266-20260425-035645",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #37266)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,32 +14,26 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 63,
-              "content": "2026-04-25T03:37:03.8424340Z ##[error]Process completed with exit code 1.",
+              "line_number": 30,
+              "content": "2026-04-25T03:50:17.5916204Z   subjectPatternError: The PR title must start with a capital letter.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 42,
+              "content": "2026-04-25T03:50:18.2715474Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: Database Connection Validation (Run #3350)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
           ],
-          "count": 1
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 97,
-              "content": "2026-04-25T03:37:04.0004423Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            }
-          ],
-          "count": 1
+          "count": 2
         },
         {
           "pattern": "WARN|Warning|warning",
           "matches": [
             {
-              "line_number": 97,
-              "content": "2026-04-25T03:37:04.0004423Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "line_number": 58,
+              "content": "2026-04-25T03:50:18.3266188Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -50,34 +44,23 @@
           "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 3,
-              "content": "2026-04-25T03:37:00.7978343Z Using cached async_timeout-5.0.1-py3-none-any.whl (6.2 kB)",
-              "severity": "medium",
-              "emoji": "\u23f1\ufe0f"
-            },
-            {
-              "line_number": 17,
-              "content": "2026-04-25T03:37:00.9236558Z Installing collected packages: urllib3, typing-extensions, pyyaml, pycparser, pyasn1, psycopg2-binary, propcache, idna, greenlet, frozenlist, dnspython, charset_normalizer, certifi, attrs, async-timeout, aiohappyeyeballs, aiofiles, sqlalchemy, Requests, pyasn1-modules, multidict, cffi, aiosignal, yarl, cryptography, google-auth, aiohttp, cloud-sql-python-connector",
-              "severity": "medium",
-              "emoji": "\u23f1\ufe0f"
-            },
-            {
-              "line_number": 19,
-              "content": "2026-04-25T03:37:03.3345152Z Successfully installed Requests-2.33.1 aiofiles-25.1.0 aiohappyeyeballs-2.6.1 aiohttp-3.13.5 aiosignal-1.4.0 async-timeout-5.0.1 attrs-26.1.0 certifi-2026.4.22 cffi-2.0.0 charset_normalizer-3.4.7 cloud-sql-python-connector-1.20.2 cryptography-47.0.0 dnspython-2.8.0 frozenlist-1.8.0 google-auth-2.49.2 greenlet-3.4.0 idna-3.13 multidict-6.7.1 propcache-0.4.1 psycopg2-binary-2.9.12 pyasn1-0.6.3 pyasn1-modules-0.4.2 pycparser-3.0 pyyaml-6.0.3 sqlalchemy-2.0.49 typing-extensions-4.15.0 urllib3-2.6.3 yarl-1.23.0",
+              "line_number": 34,
+              "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
               "emoji": "\u23f1\ufe0f"
             }
           ],
-          "count": 3
+          "count": 1
         }
       ],
       "suggested_fixes": [
-        "Consider increasing timeout values or optimizing slow operations"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
       "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-04-25T03:49:31.706401"
+  "timestamp": "2026-04-25T03:56:45.730047"
 }
