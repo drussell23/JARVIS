@@ -263,6 +263,113 @@ def _cleanup_stale_router_lock() -> None:
         pass  # Different user — leave it alone
 
 
+def _single_flight_preflight() -> None:
+    """Harness Epic Slice 2 — single-flight launcher enforcement.
+
+    Rejects concurrent battle-test runs at the process level. Two checks:
+
+    1. **pgrep canonical**: ``pgrep -f "python3? scripts/ouroboros_battle_test\\.py"``
+       must return at most 1 PID (this process). The pattern is anchored
+       enough to avoid matching zsh wrapper eval text (operator runbook
+       pattern from harness epic item 4 — also addressed in Slice 3).
+
+    2. **Lock-with-live-PID-and-non-stale-TTL**: if ``.jarvis/intake_router.lock``
+       exists AND its PID is alive AND its ``ts`` is newer than the
+       stale TTL (``JARVIS_INTAKE_LOCK_STALE_TTL_S``, default 7200s),
+       another battle-test is genuinely running. Note: the zombie reaper
+       and ``_cleanup_stale_router_lock`` already removed dead-PID and
+       wedged-TTL locks before this preflight runs — so anything still
+       present here is a true conflict.
+
+    On conflict: print actionable info + ``sys.exit(75)``. Exit code 75
+    (``EX_TEMPFAIL`` from BSD sysexits.h) signals "try again later" to
+    wrappers — distinct from generic error code 1.
+
+    Disable via ``JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED=false`` (operator
+    escape hatch — useful for diagnostics or recovery).
+    """
+    from pathlib import Path as _Path
+    import json as _json
+    import subprocess as _subprocess
+
+    self_pid = os.getpid()
+    violators: list = []
+
+    # (1) pgrep canonical probe
+    try:
+        result = _subprocess.run(
+            ["pgrep", "-f", r"python3? scripts/ouroboros_battle_test\.py"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+        if result.returncode == 0:
+            pgrep_pids = [
+                int(line.strip())
+                for line in result.stdout.splitlines()
+                if line.strip().isdigit()
+            ]
+            others = [pid for pid in pgrep_pids if pid != self_pid]
+            for pid in others:
+                violators.append(("pgrep", pid))
+    except (FileNotFoundError, _subprocess.TimeoutExpired, OSError):
+        # pgrep unavailable / timed out — fall through; rely on lock check
+        pass
+
+    # (2) Lock-with-live-PID-and-non-stale-TTL check
+    project_root = _Path.cwd()
+    lock_path = project_root / ".jarvis" / "intake_router.lock"
+    if lock_path.exists():
+        try:
+            data = _json.loads(lock_path.read_text())
+            holder_pid = int(data.get("pid", 0))
+            holder_ts = float(data.get("ts", 0.0))
+            if holder_pid and holder_pid != self_pid:
+                # Is the holder alive?
+                try:
+                    os.kill(holder_pid, 0)
+                    alive = True
+                except (ProcessLookupError, PermissionError):
+                    alive = False
+                # Is the lock fresh? (TTL check)
+                _stale_ttl_raw = os.environ.get(
+                    "JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200",
+                )
+                try:
+                    _stale_ttl = float(_stale_ttl_raw)
+                except (TypeError, ValueError):
+                    _stale_ttl = 7200.0
+                age_s = time.time() - holder_ts if holder_ts > 0 else 0.0
+                fresh = age_s <= _stale_ttl
+                if alive and fresh:
+                    violators.append(("lock", holder_pid))
+                elif alive and not fresh:
+                    print(
+                        f"  {_DIM}[single-flight] adopting wedged lock "
+                        f"(PID={holder_pid} alive, age={age_s:.0f}s > "
+                        f"TTL={_stale_ttl:.0f}s — Py_FinalizeEx-class "
+                        f"zombie pattern){_RESET}"
+                    )
+        except (ValueError, OSError, KeyError):
+            pass  # corrupt lock — IntakeRouter._cleanup_stale_lock will handle
+
+    if violators:
+        print()
+        print(
+            f"  {_RED}[single-flight] REJECTED — concurrent battle-test detected{_RESET}"
+        )
+        for source, pid in violators:
+            print(f"  {_DIM}  • {source}: PID {pid}{_RESET}")
+        print(
+            f"  {_DIM}  exit code 75 (EX_TEMPFAIL) — try again after the other run completes{_RESET}"
+        )
+        print(
+            f"  {_DIM}  override: JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED=false{_RESET}"
+        )
+        print()
+        sys.exit(75)
+
+
 def _print_preflight() -> None:
     """Print a preflight checklist showing what's enabled."""
     print(f"\n{_BOLD}{_CYAN}  Preflight Checklist{_RESET}")
@@ -673,6 +780,18 @@ def main() -> None:
     if os.environ.get("JARVIS_BATTLE_REAP_ZOMBIES", "true").lower() not in ("false", "0", "no", "off"):
         _reap_zombies()
         _cleanup_stale_router_lock()
+
+    # ------------------------------------------------------------------
+    # Harness Epic Slice 2 — single-flight preflight.
+    # Reject concurrent battle-test runs at the process level. The
+    # zombie reap above kills DEAD lingering processes; this check
+    # rejects ALIVE concurrent processes (operator launched twice by
+    # accident, etc.). Exit 75 (EX_TEMPFAIL) signals "try again later"
+    # to wrappers — distinct from generic error code 1.
+    # Master flag: JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED (default true).
+    # ------------------------------------------------------------------
+    if os.environ.get("JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED", "true").lower() not in ("false", "0", "no", "off"):
+        _single_flight_preflight()
 
     # ------------------------------------------------------------------
     # Preflight checklist

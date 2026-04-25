@@ -1360,7 +1360,23 @@ class UnifiedIntakeRouter:
 
             os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)
-            _meta = _json.dumps({"pid": os.getpid(), "ts": time.time()})
+            # Harness Epic Slice 2 — additive schema upgrade. New fields:
+            #   * monotonic_ts — for stale-TTL detection independent of
+            #     wall-clock skew
+            #   * wall_iso — human-readable timestamp for log audits
+            #   * session_id — links lock to the session dir on disk
+            # Old readers continue to work (they read pid + ts only).
+            from datetime import datetime, timezone
+            _session_id = os.environ.get("OUROBOROS_SESSION_ID", "")
+            _meta = _json.dumps({
+                "pid": os.getpid(),
+                "ts": time.time(),
+                "monotonic_ts": time.monotonic(),
+                "wall_iso": datetime.now(tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "session_id": _session_id,
+            })
             os.write(fd, _meta.encode())
             os.fsync(fd)
 
@@ -1378,26 +1394,54 @@ class UnifiedIntakeRouter:
 
     @staticmethod
     def _cleanup_stale_lock(lock_path: Path) -> bool:
-        """Check if the process holding the lock is dead. Remove if so.
+        """Check if the process holding the lock is dead OR the lock is too old.
 
         Returns True if a stale lock was removed.
+
+        Two staleness predicates (Harness Epic Slice 2):
+          1. **Dead-PID stale** (pre-Slice-2): PID in lock metadata is
+             not running → remove lock.
+          2. **Wedged-but-alive stale** (NEW Slice 2): PID is running BUT
+             lock's wall ``ts`` is older than ``JARVIS_INTAKE_LOCK_STALE_TTL_S``
+             (default 7200s = 2h) → treat as wedged zombie, remove lock.
+             Closes the 14-incident class where Py_FinalizeEx-deadlocked
+             zombies held the lock for hours while still being "alive".
         """
         try:
             import json as _json
             data = _json.loads(lock_path.read_text())
             pid = data.get("pid", 0)
+            ts = float(data.get("ts", 0.0)) if data.get("ts") else 0.0
             if pid and pid != os.getpid():
+                # (1) Dead-PID staleness check
                 try:
                     os.kill(pid, 0)  # signal 0 = existence check
                 except ProcessLookupError:
-                    # PID is dead — stale lock from a crashed session
                     lock_path.unlink(missing_ok=True)
                     logger.warning(
                         "[IntakeRouter] Removed stale lock (dead PID %d)", pid,
                     )
                     return True
                 except PermissionError:
-                    pass  # PID alive, different user
+                    pass  # PID alive, different user — fall through to TTL check
+                # (2) Wedged-but-alive TTL check (Slice 2)
+                _stale_ttl_raw = os.environ.get(
+                    "JARVIS_INTAKE_LOCK_STALE_TTL_S", "7200",
+                )
+                try:
+                    _stale_ttl = float(_stale_ttl_raw)
+                except (TypeError, ValueError):
+                    _stale_ttl = 7200.0
+                _age_s = time.time() - ts if ts > 0 else 0.0
+                if ts > 0 and _age_s > _stale_ttl:
+                    lock_path.unlink(missing_ok=True)
+                    logger.warning(
+                        "[IntakeRouter] Removed wedged-but-alive stale lock "
+                        "(PID=%d alive, age=%.0fs > TTL=%.0fs — treating as "
+                        "Py_FinalizeEx-class zombie)",
+                        pid, _age_s, _stale_ttl,
+                    )
+                    return True
         except (ValueError, OSError, KeyError):
             # Corrupt or empty lock file — remove it
             lock_path.unlink(missing_ok=True)
