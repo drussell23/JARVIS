@@ -209,6 +209,89 @@ _BG_READONLY_DW_STALL_BUDGET_S = float(
     os.environ.get("JARVIS_BG_DW_STALL_BUDGET_S", "60"),
 )
 
+
+def _attribute_cancel(
+    exc: BaseException,
+    *,
+    label: str,
+    op_id: str,
+    elapsed_s: float,
+    remaining_s: float,
+) -> str:
+    """Best-effort cancel-source attribution for telemetry.
+
+    Pure-observation helper added 2026-04-24 (post-S6 / bt-2026-04-24-225137)
+    to disambiguate three cancel classes seen in F1 Slice 4 graduation:
+
+    - **A** — `_FALLBACK_MAX_TIMEOUT_S=120s` per-call cap (`TimeoutError`).
+    - **B** — ToolLoop per-round budget (`TimeoutError` at the per-round mark).
+    - **C** — external cooperative cancel (`CancelledError` with non-zero
+      remaining budget) — sibling-task cancel / retry-harness deadline /
+      mid-flight TopologyBlock reroute.
+
+    Walks `asyncio.current_task()` to capture this task's `cancelling()`
+    counter (>0 means we were cancelled by an outer task; ==0 means we
+    timed out from our own `wait_for`). Walks `asyncio.all_tasks()` to
+    surface a likely-canceller name (best-effort; no guarantee).
+
+    Returns a single-line structured string suitable for logging.
+    Never raises — attribution failure is logged as `attribution_error=...`.
+    """
+    err_class = type(exc).__name__
+
+    def _safe_cancelling(task: Any) -> int:
+        # Task.cancelling() is Python 3.11+. We target 3.9+, so always go
+        # through getattr/lambda to keep typecheckers + 3.9 runtime happy.
+        fn = getattr(task, "cancelling", None)
+        if fn is None:
+            return 0
+        try:
+            return int(fn())
+        except Exception:
+            return 0
+
+    try:
+        current = asyncio.current_task()
+        own_cancelling = _safe_cancelling(current)
+        # Best-effort canceller search: any other live task with cancelling()>0
+        # is a candidate. Walks at most 64 tasks to bound cost.
+        canceller = "unknown"
+        try:
+            for t in list(asyncio.all_tasks())[:64]:
+                if t is current:
+                    continue
+                if _safe_cancelling(t) > 0:
+                    canceller = t.get_name()
+                    break
+        except RuntimeError:
+            canceller = "no_running_loop"
+        # Heuristic class assignment:
+        #   - TimeoutError + own_cancelling==0 + remaining≈0 → Class A/B (own deadline)
+        #   - CancelledError + own_cancelling>0              → Class C (external)
+        #   - CancelledError + own_cancelling==0             → ambiguous (loop teardown?)
+        if isinstance(exc, asyncio.TimeoutError):
+            klass = "A_or_B_timeout"
+        elif isinstance(exc, asyncio.CancelledError) and own_cancelling > 0:
+            klass = "C_external_cancel"
+        elif isinstance(exc, asyncio.CancelledError):
+            klass = "C_ambiguous"
+        else:
+            klass = "non_cancel"
+        return (
+            f"label={label} op={op_id[:16]} class={klass} "
+            f"err={err_class} elapsed={elapsed_s:.2f}s "
+            f"remaining={remaining_s:.2f}s "
+            f"own_cancelling={own_cancelling} "
+            f"canceller_task={canceller}"
+        )
+    except Exception as e:
+        return (
+            f"label={label} op={op_id[:16]} class=attribution_failed "
+            f"err={err_class} elapsed={elapsed_s:.2f}s "
+            f"remaining={remaining_s:.2f}s "
+            f"attribution_error={type(e).__name__}"
+        )
+
 # ---------------------------------------------------------------------------
 # Route-scoped Claude fallback disable (isolation harnesses)
 # ---------------------------------------------------------------------------
@@ -2435,7 +2518,7 @@ class CandidateGenerator:
                     getattr(context, "op_id", "?")[:16],
                 )
                 return _pri_result
-            except (Exception, asyncio.CancelledError):
+            except (Exception, asyncio.CancelledError) as _exc:
                 logger.info(
                     "[CandidateGenerator] Primary sem release: "
                     "hold=%.1fs sem_wait=%.1fs route=%s phase=%s op=%s outcome=fail",
@@ -2443,6 +2526,16 @@ class CandidateGenerator:
                     getattr(context, "provider_route", "?"),
                     _primary_phase_hint,
                     getattr(context, "op_id", "?")[:16],
+                )
+                logger.info(
+                    "[CancelAttribution] %s",
+                    _attribute_cancel(
+                        _exc,
+                        label="_call_primary",
+                        op_id=getattr(context, "op_id", "?"),
+                        elapsed_s=time.monotonic() - _primary_sem_t0,
+                        remaining_s=self._remaining_seconds(deadline),
+                    ),
                 )
                 raise
 
@@ -2678,6 +2771,16 @@ class CandidateGenerator:
             # the exhaustion event counter.
             if hasattr(exc, "exhaustion_report"):
                 raise
+            logger.info(
+                "[CancelAttribution] %s",
+                _attribute_cancel(
+                    exc,
+                    label="_call_fallback",
+                    op_id=getattr(context, "op_id", "?"),
+                    elapsed_s=time.monotonic() - _sem_t0,
+                    remaining_s=self._remaining_seconds(deadline),
+                ),
+            )
             mode = FailbackStateMachine.classify_exception(exc)
             self.fsm.record_fallback_failure(mode=mode)
             # Distinct cause tag when the tool-loop pre-round viability
