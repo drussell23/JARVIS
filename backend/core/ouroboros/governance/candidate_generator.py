@@ -2505,9 +2505,18 @@ class CandidateGenerator:
                     primary_budget, remaining, remaining - primary_budget,
                 )
             try:
-                _pri_result = await asyncio.wait_for(
+                # W3(7) Slice 2 — race against ambient cancel token (if any).
+                # `current_cancel_token()` reads the ContextVar set by
+                # `dispatch_pipeline`; None outside dispatcher (unit tests,
+                # pre-W3(7) callers) → falls through to plain wait_for.
+                from backend.core.ouroboros.governance.cancel_token import (
+                    current_cancel_token as _curr_cancel_token,
+                    race_or_wait_for as _race_or_wait_for,
+                )
+                _pri_result = await _race_or_wait_for(
                     self._primary.generate(context, deadline),
                     timeout=primary_budget,
+                    cancel_token=_curr_cancel_token(),
                 )
                 logger.info(
                     "[CandidateGenerator] Primary sem release: "
@@ -2751,9 +2760,15 @@ class CandidateGenerator:
                         remaining, _max_cap, _sem_wait_s,
                     )
 
-                _fb_result = await asyncio.wait_for(
+                # W3(7) Slice 2 — race against ambient cancel token (if any).
+                from backend.core.ouroboros.governance.cancel_token import (
+                    current_cancel_token as _curr_cancel_token,
+                    race_or_wait_for as _race_or_wait_for,
+                )
+                _fb_result = await _race_or_wait_for(
                     self._fallback.generate(context, deadline),
                     timeout=remaining,
+                    cancel_token=_curr_cancel_token(),
                 )
                 logger.info(
                     "[CandidateGenerator] Fallback sem release: "

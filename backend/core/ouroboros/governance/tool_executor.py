@@ -3152,6 +3152,35 @@ class AsyncProcessToolBackend:
             paths_arg = [paths_arg]
         cmd = ["python3", "-m", "pytest", "--tb=short", "-q"] + list(paths_arg)
         proc = None
+        # W3(7) Slice 2 — race pytest subprocess against the ambient cancel
+        # token. On Class D/E/F cancel mid-pytest: SIGTERM → grace → SIGKILL.
+        # Master-flag-off → current_cancel_token() returns None →
+        # race_or_wait_for falls through to plain wait_for → unchanged.
+        from backend.core.ouroboros.governance.cancel_token import (
+            OperationCancelledError as _OpCancelledError,
+            current_cancel_token as _curr_cancel_token,
+            race_or_wait_for as _race_or_wait_for,
+            subprocess_grace_s as _subprocess_grace_s,
+        )
+
+        async def _term_then_force(_proc):
+            if _proc is None or _proc.returncode is not None:
+                return
+            try:
+                _proc.terminate()
+            except ProcessLookupError:
+                return
+            try:
+                await asyncio.wait_for(_proc.wait(), timeout=_subprocess_grace_s())
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                _proc.kill()
+                await _proc.wait()
+            except ProcessLookupError:
+                pass
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -3159,7 +3188,11 @@ class AsyncProcessToolBackend:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(policy_ctx.repo_root),
             )
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_b, stderr_b = await _race_or_wait_for(
+                proc.communicate(),
+                timeout=timeout,
+                cancel_token=_curr_cancel_token(),
+            )
             exit_code = proc.returncode if proc.returncode is not None else -1
             run_result = _parse_pytest_output(
                 stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace"), exit_code)
@@ -3169,12 +3202,13 @@ class AsyncProcessToolBackend:
                 else ToolExecStatus.EXEC_ERROR)
             return ToolResult(tool_call=call, output=output, status=exec_status)
         except asyncio.TimeoutError:
-            if proc is not None:
-                proc.kill()
-                await proc.wait()
+            await _term_then_force(proc)
             run_result = TestRunResult(status=TestRunStatus.TIMEOUT)
             return ToolResult(tool_call=call, output=json.dumps(_dc.asdict(run_result))[:cap],
                 error="TIMEOUT", status=ToolExecStatus.TIMEOUT)
+        except _OpCancelledError:
+            await _term_then_force(proc)
+            raise
         except asyncio.CancelledError:
             if proc is not None:
                 proc.kill()

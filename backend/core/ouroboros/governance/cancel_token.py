@@ -25,6 +25,7 @@ Cancel classes (full taxonomy per scope doc §3):
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -37,6 +38,40 @@ from typing import Any, Awaitable, Optional, Set
 
 
 logger = logging.getLogger("Ouroboros.CancelToken")
+
+
+# ---------------------------------------------------------------------------
+# ContextVar for ambient token propagation (W3(7) Slice 2)
+# ---------------------------------------------------------------------------
+#
+# Slice 2 needs the per-op token reachable from the candidate_generator and
+# tool_executor without threading a parameter through ~9 PhaseRunners,
+# 6+ candidate_generator entry points, and 4 ToolExecutor methods. A
+# ContextVar carries the token *through* asyncio's task copying machinery:
+# `asyncio.create_task(coro)` copies the parent's contextvars to the child,
+# so the token survives nested gather() / wait_for() boundaries naturally.
+#
+# Master-flag-off contract: when JARVIS_MID_OP_CANCEL_ENABLED=false, the
+# token (if any) is never `set()` from a Class D/E/F trigger, so the
+# helper functions below short-circuit on `is_cancelled is False` and
+# fall through to plain `asyncio.wait_for(...)`. Byte-for-byte pre-W3(7).
+#
+# The Var is sentinel-aware: `Sentinel.UNSET` (the default) means "no
+# token in scope" — different from `None` which a caller could legitimately
+# set (defensive — if a caller wants to clear the token mid-operation,
+# `cancel_token_var.set(None)` works and helpers see no-token).
+cancel_token_var: contextvars.ContextVar[Optional["CancelToken"]] = (
+    contextvars.ContextVar("ouroboros.cancel_token", default=None)
+)
+
+
+def current_cancel_token() -> Optional["CancelToken"]:
+    """Read the ambient :class:`CancelToken` for this asyncio task chain.
+
+    Returns ``None`` when no token has been bound (default — Slice 1
+    callers, unit tests, pre-W3(7) call paths).
+    """
+    return cancel_token_var.get()
 
 
 # ---------------------------------------------------------------------------
@@ -429,11 +464,130 @@ class CancelTokenRegistry:
         return set(self._tokens.keys())
 
 
+class OperationCancelledError(Exception):
+    """Raised by Slice 2 helpers when the in-scope CancelToken fires.
+
+    Carries the :class:`CancelRecord` so callers can route to POSTMORTEM
+    with full attribution. NOT an :class:`asyncio.CancelledError` — keeping
+    these distinct avoids tangling with asyncio's own cancellation
+    machinery (which has subtle Python-version semantics; see PEP 479
+    and Python 3.11's CancelledError-is-BaseException promotion).
+    """
+
+    def __init__(self, record: "CancelRecord") -> None:
+        self.record = record
+        super().__init__(
+            f"op cancelled: op={record.op_id[:16]} origin={record.origin} "
+            f"cancel_id={record.cancel_id}"
+        )
+
+
+async def race_or_wait_for(
+    coro: Awaitable[Any],
+    *,
+    timeout: float,
+    cancel_token: Optional["CancelToken"] = None,
+) -> Any:
+    """Race ``coro`` against (a) its timeout and (b) the cancel token.
+
+    Drop-in replacement for ``asyncio.wait_for(coro, timeout=N)`` that
+    additionally surfaces a Class D/E/F cancel as
+    :class:`OperationCancelledError`.
+
+    Resolution order:
+        * If ``cancel_token`` is None or already cancelled: re-raise
+          accordingly (already-cancelled → ``OperationCancelledError``
+          immediately; None → behaves identically to ``asyncio.wait_for``).
+        * If ``coro`` finishes first: return its result.
+        * If ``timeout`` elapses first: raise ``asyncio.TimeoutError``.
+        * If the cancel fires first: raise ``OperationCancelledError``.
+    """
+    if cancel_token is None:
+        return await asyncio.wait_for(coro, timeout=timeout)
+
+    if cancel_token.is_cancelled:
+        # Pre-cancelled: don't even start the coro. Caller's `coro` was
+        # already constructed and would otherwise leak as an unawaited
+        # warning, so we close it explicitly.
+        if hasattr(coro, "close"):
+            try:
+                coro.close()  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                pass
+        record = cancel_token.get_record()
+        assert record is not None  # is_cancelled invariant
+        raise OperationCancelledError(record)
+
+    coro_task = asyncio.ensure_future(coro)
+    cancel_task = asyncio.ensure_future(cancel_token.wait())
+    try:
+        done, pending = await asyncio.wait(
+            {coro_task, cancel_task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            # Timeout fired
+            for p in pending:
+                p.cancel()
+            for p in pending:
+                try:
+                    await p
+                except (asyncio.CancelledError, Exception):
+                    pass
+            raise asyncio.TimeoutError()
+
+        if cancel_task in done and coro_task not in done:
+            # Cancel won
+            for p in pending:
+                p.cancel()
+            for p in pending:
+                try:
+                    await p
+                except (asyncio.CancelledError, Exception):
+                    pass
+            record = cancel_task.result()
+            raise OperationCancelledError(record)
+
+        # Coro won (possibly with cancel arriving simultaneously — coro
+        # result wins per the operator's "first-emitted wins" semantics).
+        for p in pending:
+            p.cancel()
+        for p in pending:
+            try:
+                await p
+            except (asyncio.CancelledError, Exception):
+                pass
+        return coro_task.result()
+    finally:
+        for t in (coro_task, cancel_task):
+            if not t.done():
+                t.cancel()
+
+
+def subprocess_grace_s() -> float:
+    """`JARVIS_CANCEL_SUBPROCESS_GRACE_S` — terminate→kill grace (default 5s).
+
+    Used by Slice 2 ToolExecutor subprocess wrappers between
+    ``proc.terminate()`` and ``proc.kill()`` when a cancel fires mid-call.
+    """
+    raw = os.environ.get("JARVIS_CANCEL_SUBPROCESS_GRACE_S", "5.0")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 5.0
+
+
 __all__ = [
     "CancelRecord",
     "CancelToken",
     "CancelTokenRegistry",
     "CancelOriginEmitter",
+    "OperationCancelledError",
+    "cancel_token_var",
+    "current_cancel_token",
+    "race_or_wait_for",
+    "subprocess_grace_s",
     "mid_op_cancel_enabled",
     "repl_immediate_enabled",
     "record_persist_enabled",

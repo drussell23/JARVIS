@@ -967,6 +967,18 @@ class GovernedLoopService:
         self._completed_ops: Dict[str, OperationResult] = {}
         # Cooperative cancellation: op_ids requested for cancel via REPL /cancel
         self._cancel_requested: Set[str] = set()
+        # W3(7) Slice 2 — per-op CancelToken registry. Slice 1 added the
+        # primitive + Class D REPL emitter; Slice 2 attaches the registry
+        # so the dispatcher / candidate_generator / tool_loop can look up
+        # the in-flight token for an op. Master-flag-off: tokens are still
+        # created (cheap) but never have ``set()`` called on them →
+        # ``race()`` always returns the wrapped coro result → byte-for-byte
+        # pre-W3(7) behavior. The REPL handler in serpent_flow.py looks
+        # up this attribute (``_cancel_token_registry``) by name.
+        from backend.core.ouroboros.governance.cancel_token import (
+            CancelTokenRegistry as _CancelTokenRegistry,
+        )
+        self._cancel_token_registry = _CancelTokenRegistry()
 
     @property
     def state(self) -> ServiceState:
