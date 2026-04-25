@@ -88,13 +88,32 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def mid_op_cancel_enabled() -> bool:
-    """Master flag — `JARVIS_MID_OP_CANCEL_ENABLED` (default false).
+    """Master flag — `JARVIS_MID_OP_CANCEL_ENABLED` (default **true** post-Slice-7).
 
-    When false: no `[CancelOrigin]` emissions, no record artifacts, no
-    behavior change vs pre-W3(7). Existing REPL /cancel keeps phase-
-    boundary semantics (see GovernedLoopService.request_cancel).
+    Pre-graduation (Slices 1–6) default was ``False``. Slice 7 flipped the
+    default to ``True`` after the full propagation surface (D/E/F + SSE +
+    IDE GET) landed and was unit-test green. The flip is safe because the
+    *actuating* sub-flags stay default off:
+
+    * ``JARVIS_MID_OP_CANCEL_WATCHDOG_ENABLED`` — Class E (cost / wall /
+      productivity / idle) — default ``False``.
+    * ``JARVIS_MID_OP_CANCEL_SIGNAL_ENABLED`` — Class F signals — default ``False``.
+    * ``JARVIS_CANCEL_SSE_ENABLED`` — additive SSE event — default ``False``.
+
+    Class D REPL ``cancel <op-id> --immediate`` defaults active when master
+    is on (sub-flag default ``True``) but only fires on explicit operator
+    action — no auto-cancellation surface.
+
+    The ContextVar token plumbing runs on every dispatched op once master
+    is on, but is observably-no-op when no Class D/E/F trigger ever calls
+    ``token.set(...)`` — ``race_or_wait_for`` falls through to plain
+    ``asyncio.wait_for``. This is the standard graduation pattern from
+    Wave 1 / Wave 2 / W3(6) Slice 5b.
+
+    Hot-revert: ``JARVIS_MID_OP_CANCEL_ENABLED=false`` restores byte-for-byte
+    pre-W3(7) behavior. No code revert needed. Pinned by graduation tests.
     """
-    return _env_bool("JARVIS_MID_OP_CANCEL_ENABLED", False)
+    return _env_bool("JARVIS_MID_OP_CANCEL_ENABLED", True)
 
 
 def repl_immediate_enabled() -> bool:

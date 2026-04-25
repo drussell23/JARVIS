@@ -43,7 +43,7 @@ from backend.core.ouroboros.governance.cancel_token import (
 def test_watchdog_flag_default_off_when_master_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     monkeypatch.setenv("JARVIS_MID_OP_CANCEL_WATCHDOG_ENABLED", "true")
     # Master off forces sub-flag off regardless
     assert watchdog_enabled() is False
@@ -75,7 +75,7 @@ def test_watchdog_flag_on_when_both_set(
 def test_emit_class_e_returns_none_when_master_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     monkeypatch.setenv("JARVIS_MID_OP_CANCEL_WATCHDOG_ENABLED", "true")
     token = CancelToken("op-test-001")
     emitter = CancelOriginEmitter()
@@ -226,7 +226,7 @@ def test_emit_class_e_supersede_log_when_token_already_cancelled(
 def test_emit_watchdog_cancel_master_off_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
     monkeypatch.setenv("JARVIS_MID_OP_CANCEL_WATCHDOG_ENABLED", "true")
     reg = CancelTokenRegistry()
     result = emit_watchdog_cancel(
@@ -354,7 +354,7 @@ def test_cost_governor_cap_exceeded_no_op_when_master_off(
     """Master flag off → cap exceeded doesn't emit a cancel record (byte-for-byte
     pre-W3(7) — cost_governor still flips entry.exceeded=True for the
     orchestrator's existing cap-check at line ~3402)."""
-    monkeypatch.delenv("JARVIS_MID_OP_CANCEL_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MID_OP_CANCEL_ENABLED", "false")
 
     from backend.core.ouroboros.governance.cost_governor import (
         CostGovernor,
