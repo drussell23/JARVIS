@@ -1,9 +1,13 @@
-"""Wave 2 (4) Slice 1 — Curiosity engine primitive + per-op budget tracker.
+"""Wave 2 (4) Curiosity engine primitive + per-op budget tracker.
 
-Per ``project_w2_4_curiosity_scope.md`` Slice 1 (operator-authorized
-2026-04-25). Ships the in-memory primitive + ContextVar transport + JSONL
-ledger + 4 env knobs. Does NOT widen tool policy (Slice 2), publish SSE
-events (Slice 3), or flip the master flag (Slice 4).
+Slice 1 (2026-04-25) — primitive + ContextVar + JSONL ledger + 4 env knobs.
+Slice 2 (2026-04-25) — Rule 14 widening + GENERATE phase budget binding.
+Slice 3 (2026-04-25) — SSE bridge + IDE GET routes (this slice).
+
+Slice 3 adds the ``JARVIS_CURIOSITY_SSE_ENABLED`` sub-flag (default
+``false``) and the :func:`bridge_curiosity_to_sse` helper (mirrors
+W3(7) ``bridge_cancel_origin_to_sse``). Master-off → SSE force-off.
+Master flip + graduation pins are deferred to Slice 4.
 
 Authority posture (per scope doc):
 
@@ -120,6 +124,21 @@ def posture_allowlist() -> frozenset:
         for part in raw.split(",")
         if part.strip()
     )
+
+
+def sse_enabled() -> bool:
+    """`JARVIS_CURIOSITY_SSE_ENABLED` — default ``false`` (operator opt-in).
+
+    Slice 3 sub-flag. Mirrors W3(7) ``cancel_token.sse_enabled()``: even
+    when curiosity master is on + persistence on, the SSE publish stays
+    off until the operator explicitly opts in. Composition: master-off
+    forces SSE-off (no event ever leaks past the gate). The IDE stream's
+    own master flag (`JARVIS_IDE_STREAM_ENABLED`) is consulted at publish
+    time too — both gates must be on for an event to land on the broker.
+    """
+    if not curiosity_enabled():
+        return False
+    return _env_bool("JARVIS_CURIOSITY_SSE_ENABLED", False)
 
 
 def ledger_persist_enabled() -> bool:
@@ -370,6 +389,11 @@ class CuriosityBudget:
         # Persist to ledger (best-effort).
         if ledger_persist_enabled() and self.session_dir is not None:
             self._persist(record)
+        # Slice 3 — bridge to SSE (best-effort, gated by master + sub-flag
+        # + IDE stream master). Both allowed and denied records are
+        # surfaced so operators can see the full curiosity audit trail
+        # in the live stream — same shape as cancel_origin_emitted.
+        bridge_curiosity_to_sse(record)
         return ChargeResult(
             allowed=allowed,
             question_id=question_id if allowed else None,
@@ -423,6 +447,57 @@ def current_curiosity_budget() -> Optional[CuriosityBudget]:
     return curiosity_budget_var.get()
 
 
+# ---------------------------------------------------------------------------
+# Slice 3 — SSE bridge
+# ---------------------------------------------------------------------------
+
+
+def bridge_curiosity_to_sse(record: "CuriosityRecord") -> None:
+    """Publish a ``curiosity_question_emitted`` SSE event for ``record``.
+
+    Slice 3 (W2(4)). Best-effort, never raises. Gated by:
+
+    1. :func:`sse_enabled` — curiosity master + curiosity SSE sub-flag.
+    2. :func:`ide_observability_stream.stream_enabled` — IDE stream master.
+
+    Both must be on for the event to land on the broker. The payload is
+    a summary form (question_id, op_id, posture, result, question text
+    truncated to 80 chars). Full record stays in
+    ``curiosity_ledger.jsonl`` and at the
+    ``/observability/curiosity/<question_id>`` GET endpoint.
+
+    Mirrors ``cancel_token.bridge_cancel_origin_to_sse`` byte-for-byte
+    in error handling: never raises, swallows ImportError /
+    AttributeError / broker-publish exceptions silently.
+    """
+    if not sse_enabled():
+        return
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            EVENT_TYPE_CURIOSITY_QUESTION_EMITTED as _EV_TYPE,
+            get_default_broker as _get_default_broker,
+            stream_enabled as _stream_enabled,
+        )
+        if not _stream_enabled():
+            return
+        _broker = _get_default_broker()
+        if _broker is None:
+            return
+        _broker.publish(
+            event_type=_EV_TYPE,
+            op_id=record.op_id,
+            payload={
+                "question_id": record.question_id,
+                "posture": record.posture_at_charge,
+                "result": record.result,
+                # Truncate model-supplied text — full text in ledger.
+                "question_text": record.question_text[:80],
+            },
+        )
+    except Exception:  # noqa: BLE001 — SSE publish is best-effort
+        pass
+
+
 __all__ = [
     "CuriosityBudget",
     "CuriosityRecord",
@@ -435,4 +510,6 @@ __all__ = [
     "cost_cap_usd",
     "posture_allowlist",
     "ledger_persist_enabled",
+    "sse_enabled",
+    "bridge_curiosity_to_sse",
 ]
