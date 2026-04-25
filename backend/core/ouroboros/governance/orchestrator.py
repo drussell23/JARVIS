@@ -698,6 +698,17 @@ class GovernedOrchestrator:
         # pattern below, which is required for *rebindable* fields.
         self._oracle_update_lock: asyncio.Lock = self._state.oracle_update_lock
         self._cost_governor: CostGovernor = self._state.cost_governor
+        # Register the cost_governor as the process-wide default so
+        # pure helper modules (PLAN-EXPLOIT, etc.) can look it up
+        # without taking it as a parameter through every call site.
+        # Best-effort — never fails orchestrator construction.
+        try:
+            from backend.core.ouroboros.governance.cost_governor import (
+                set_default_cost_governor as _set_default_cg,
+            )
+            _set_default_cg(self._cost_governor)
+        except Exception:  # noqa: BLE001
+            pass
         self._forward_progress: ForwardProgressDetector = self._state.forward_progress
         self._productivity_detector: ProductivityDetector = (
             self._state.productivity_detector
