@@ -41,10 +41,12 @@ bump the major.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -173,9 +175,14 @@ class IDEObservabilityRouter:
     boundary (GET vs POST, external webhooks vs local IDE).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_dir: Optional[Path] = None) -> None:
         # sliding-window rate tracker: { client_key -> [ts_epoch_s, ...] }
         self._rate_tracker: Dict[str, List[float]] = {}
+        # W3(7) Slice 6 — optional session_dir for /observability/cancels.
+        # When None (default — IDE-only deployments without a battle-test
+        # harness), the cancel routes return 503 cleanly. GLS sets this at
+        # construction time when the router is mounted on the harness app.
+        self._session_dir: Optional[Path] = session_dir
 
     def register_routes(self, app: "web.Application") -> None:
         app.router.add_get("/observability/health", self._handle_health)
@@ -232,6 +239,14 @@ class IDEObservabilityRouter:
         app.router.add_get(
             "/observability/memory-pressure",
             self._handle_memory_pressure,
+        )
+        # W3(7) Slice 6 — Class D/E/F cancel record surface.
+        app.router.add_get(
+            "/observability/cancels", self._handle_cancel_list,
+        )
+        app.router.add_get(
+            "/observability/cancels/{cancel_id}",
+            self._handle_cancel_detail,
         )
 
     # --- request-path helpers ---------------------------------------------
@@ -1165,4 +1180,124 @@ class IDEObservabilityRouter:
                 {"snapshot": None, "reason_code": "memory.unavailable"},
             )
         return self._json_response(request, 200, snap)
+
+    # --- W3(7) Slice 6 — cancel record surface ---------------------------
+
+    def _read_cancel_records(self) -> Tuple[List[Dict[str, Any]], int]:
+        """Read all records from cancel_records.jsonl in session_dir.
+
+        Returns ``(records, parse_error_count)``. Never raises.
+        """
+        if self._session_dir is None:
+            return [], 0
+        artifact = self._session_dir / "cancel_records.jsonl"
+        if not artifact.exists():
+            return [], 0
+        records: List[Dict[str, Any]] = []
+        parse_errors = 0
+        try:
+            text = artifact.read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            return [], 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                if isinstance(rec, dict):
+                    records.append(rec)
+            except (ValueError, TypeError):
+                parse_errors += 1
+        return records, parse_errors
+
+    async def _handle_cancel_list(self, request: "web.Request") -> Any:
+        """GET /observability/cancels — list of CancelRecord projections.
+
+        Query params (optional):
+          * ``origin``  — filter by origin substring (e.g. ``D:`` for all
+                          operator cancels, ``E:cost`` for cost-watchdog).
+          * ``op_id``   — filter to a specific op (exact match).
+          * ``limit``   — 1..1000 (default 100).
+
+        Shape::
+
+            {"schema_version": "1.0", "records": [...], "count": N,
+             "parse_errors": K}
+
+        503 when no session_dir is bound (IDE-only mount, no harness).
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        if self._session_dir is None:
+            return self._error_response(
+                request, 503, "ide_observability.cancels_unavailable",
+            )
+        try:
+            limit = int(request.query.get("limit", "100"))
+        except ValueError:
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        if limit < 1 or limit > 1000:
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        records, parse_errors = self._read_cancel_records()
+        # Filters
+        origin_filter = request.query.get("origin", "").strip()
+        op_id_filter = request.query.get("op_id", "").strip()
+        filtered = []
+        for r in records:
+            if origin_filter and not str(r.get("origin", "")).startswith(origin_filter):
+                continue
+            if op_id_filter and r.get("op_id") != op_id_filter:
+                continue
+            filtered.append(r)
+        # Newest-last is the natural JSONL order; UI usually wants
+        # newest-first, so reverse for the response.
+        filtered.reverse()
+        truncated = filtered[:limit]
+        return self._json_response(
+            request, 200,
+            {
+                "schema_version": "1.0",
+                "records": truncated,
+                "count": len(truncated),
+                "parse_errors": parse_errors,
+            },
+        )
+
+    async def _handle_cancel_detail(self, request: "web.Request") -> Any:
+        """GET /observability/cancels/{cancel_id} — full CancelRecord by id."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        if self._session_dir is None:
+            return self._error_response(
+                request, 503, "ide_observability.cancels_unavailable",
+            )
+        cancel_id = request.match_info.get("cancel_id", "").strip()
+        if not cancel_id or not re.match(r"^[A-Za-z0-9_\-:.]{1,128}$", cancel_id):
+            return self._error_response(
+                request, 400, "ide_observability.malformed_cancel_id",
+            )
+        records, _ = self._read_cancel_records()
+        for r in records:
+            if r.get("cancel_id") == cancel_id:
+                return self._json_response(request, 200, r)
+        return self._error_response(
+            request, 404, "ide_observability.cancel_not_found",
+        )
 

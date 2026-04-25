@@ -133,6 +133,22 @@ def watchdog_enabled() -> bool:
     return _env_bool("JARVIS_MID_OP_CANCEL_WATCHDOG_ENABLED", False)
 
 
+def sse_enabled() -> bool:
+    """SSE event sub-flag — `JARVIS_CANCEL_SSE_ENABLED` (default false).
+
+    Slice 6 (W3(7)) — gates the additive `cancel_origin_emitted` SSE
+    event publish to `IDEStreamRouter`. Independent of master flag —
+    operators may want SSE observability without enabling the underlying
+    cancel mechanism (or vice versa). Returns False whenever the parent
+    IDE-stream master flag is off, regardless of this sub-flag.
+
+    The cancel-records.jsonl artifact (Slice 1) and `[CancelOrigin]`
+    log lines are NOT gated by this flag — those land regardless of
+    the SSE consumer being enabled.
+    """
+    return _env_bool("JARVIS_CANCEL_SSE_ENABLED", False)
+
+
 def signal_enabled() -> bool:
     """Class F signal sub-flag — `JARVIS_MID_OP_CANCEL_SIGNAL_ENABLED`.
 
@@ -423,6 +439,9 @@ class CancelOriginEmitter:
         if record_persist_enabled() and self._session_dir is not None:
             self._persist(record)
 
+        # W3(7) Slice 6 — best-effort SSE publish (gated; never raises).
+        bridge_cancel_origin_to_sse(record)
+
         return record
 
     # Class E watchdogs (W3(7) Slice 3) — cost / wall / productivity / idle.
@@ -521,6 +540,9 @@ class CancelOriginEmitter:
 
         if record_persist_enabled() and self._session_dir is not None:
             self._persist(record)
+
+        # W3(7) Slice 6 — best-effort SSE publish (gated; never raises).
+        bridge_cancel_origin_to_sse(record)
 
         return record
 
@@ -622,6 +644,9 @@ class CancelOriginEmitter:
 
         if record_persist_enabled() and self._session_dir is not None:
             self._persist(record)
+
+        # W3(7) Slice 6 — best-effort SSE publish (gated; never raises).
+        bridge_cancel_origin_to_sse(record)
 
         return record
 
@@ -841,6 +866,45 @@ def emit_watchdog_cancel(
     )
 
 
+def bridge_cancel_origin_to_sse(record: "CancelRecord") -> None:
+    """Publish a ``cancel_origin_emitted`` SSE event for ``record``.
+
+    Slice 6 (W3(7)). Best-effort, never raises. Gated by
+    :func:`sse_enabled` AND the IDE stream's own master flag (looked up
+    via :func:`ide_observability_stream.stream_enabled`). The SSE payload
+    is the summary form per scope doc §6.3 — full record lives at the
+    `/observability/cancels/<cancel_id>` GET endpoint.
+
+    Called from :class:`CancelOriginEmitter` after a successful commit,
+    or directly from external code that wants to surface a cancel record
+    on SSE without going through an emitter (e.g. test harnesses).
+    """
+    if not sse_enabled():
+        return
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            EVENT_TYPE_CANCEL_ORIGIN_EMITTED as _EV_TYPE,
+            get_default_broker as _get_default_broker,
+            stream_enabled as _stream_enabled,
+        )
+        if not _stream_enabled():
+            return
+        _broker = _get_default_broker()
+        if _broker is None:
+            return
+        _broker.publish(
+            event_type=_EV_TYPE,
+            op_id=record.op_id,
+            payload={
+                "cancel_id": record.cancel_id,
+                "origin": record.origin,
+                "phase": record.phase_at_trigger,
+            },
+        )
+    except Exception:  # noqa: BLE001 — SSE publish is best-effort
+        pass
+
+
 def emit_signal_cancel(
     *,
     signal_name: str,
@@ -925,4 +989,6 @@ __all__ = [
     "emit_watchdog_cancel",
     "signal_enabled",
     "emit_signal_cancel",
+    "sse_enabled",
+    "bridge_cancel_origin_to_sse",
 ]
