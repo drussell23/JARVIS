@@ -203,17 +203,17 @@ def test_sse_event_vocabulary_count_is_11_post_slice_6():
     from backend.core.ouroboros.governance.ide_observability_stream import (
         _VALID_EVENT_TYPES,
     )
-    assert len(_VALID_EVENT_TYPES) == 40, (
-        # Slice 6 added the 11th cancel event on top of the existing
-        # vocabulary, bringing the total set size to 40 (the broader
-        # observability arc grew over time — task / session / posture /
-        # flag / governor / memory / plan / cancel events). The
-        # additive-only contract means this number grows; if it shrinks
-        # below 40, an event type was REMOVED (contract break — fix the
-        # source, don't update this pin).
+    assert len(_VALID_EVENT_TYPES) == 41, (
+        # Post-Slice-6 the count was 40 (10 task/stream + 4 plan + 1 posture
+        # + 2 flag + 3 governor + 1 memory-fanout + 7 inline + 5 context
+        # + 6 session + 1 cancel = 40). W2(4) Slice 3 (2026-04-25) added
+        # the 41st event (curiosity_question_emitted). Additive-only
+        # contract — this number grows over time; if it shrinks below
+        # 41, an event type was REMOVED (contract break — fix the source,
+        # don't update this pin).
         f"SSE event vocabulary size changed unexpectedly to "
-        f"{len(_VALID_EVENT_TYPES)}; this slice did not add/remove events. "
-        "Audit recent commits for vocab churn."
+        f"{len(_VALID_EVENT_TYPES)}; expected 41 (40 pre-W2(4) + 1 from "
+        "Slice 3). Audit recent commits for vocab churn."
     )
 
 

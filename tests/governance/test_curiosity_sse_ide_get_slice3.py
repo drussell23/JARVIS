@@ -74,9 +74,11 @@ def test_curiosity_question_emitted_in_event_vocabulary() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_sse_flag_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Master off (default) → sse_enabled() returns False regardless of sub-flag."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+def test_sse_flag_off_when_master_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit master-off + SSE-default → sse_enabled() returns False.
+    Post-Slice-4 graduation, master defaults true; this pins the explicit-
+    off escape hatch composition."""
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     monkeypatch.delenv("JARVIS_CURIOSITY_SSE_ENABLED", raising=False)
     assert sse_enabled() is False
 
@@ -109,7 +111,7 @@ def test_sse_flag_master_on_sub_on(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_bridge_no_op_when_master_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """Master off → bridge no-ops, no exception."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     monkeypatch.setenv("JARVIS_CURIOSITY_SSE_ENABLED", "true")
     bridge_curiosity_to_sse(_make_record())  # must not raise
 
@@ -254,7 +256,7 @@ def test_try_charge_master_off_publishes_no_sse(
     tmp_path,
 ) -> None:
     """Master off → try_charge denies + no SSE publish (master-off invariant)."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     monkeypatch.setenv("JARVIS_CURIOSITY_SSE_ENABLED", "true")
     monkeypatch.setenv("JARVIS_IDE_STREAM_ENABLED", "true")
 

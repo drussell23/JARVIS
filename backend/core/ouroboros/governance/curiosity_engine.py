@@ -2,27 +2,26 @@
 
 Slice 1 (2026-04-25) — primitive + ContextVar + JSONL ledger + 4 env knobs.
 Slice 2 (2026-04-25) — Rule 14 widening + GENERATE phase budget binding.
-Slice 3 (2026-04-25) — SSE bridge + IDE GET routes (this slice).
+Slice 3 (2026-04-25) — SSE bridge + IDE GET routes.
+Slice 4 (2026-04-25) — GRADUATION: ``JARVIS_CURIOSITY_ENABLED`` default
+flipped ``false → true``. SSE sub-flag stays default ``false`` (operator
+opt-in). Per-session caps unchanged: 3 questions / $0.05 each / posture
+must be EXPLORE or CONSOLIDATE.
 
-Slice 3 adds the ``JARVIS_CURIOSITY_SSE_ENABLED`` sub-flag (default
-``false``) and the :func:`bridge_curiosity_to_sse` helper (mirrors
-W3(7) ``bridge_cancel_origin_to_sse``). Master-off → SSE force-off.
-Master flip + graduation pins are deferred to Slice 4.
+Authority posture (preserved across all 4 slices):
 
-Authority posture (per scope doc):
-
-* §1 additive only — ``ask_human`` is already authority-free; this
+* §1 additive only — ``ask_human`` was already authority-free; this
   primitive only tracks budget for *when* it can fire.
-* §5 Tier −1 — question-text sanitization happens at the policy gate
-  (Slice 2). This primitive accepts already-sanitized text or stores
-  whatever the caller passes (Slice 1 has no sanitizer).
+* §5 Tier −1 — question-text sanitization at the policy gate (Slice 2).
 * §6 Iron Gate unchanged.
 * §7 Approval surface untouched.
-* §8 Observability — JSONL ledger writes here; SSE publish in Slice 3.
+* §8 Observability — JSONL ledger + SSE bridge + IDE GET routes.
 
-Hot-revert: ``JARVIS_CURIOSITY_ENABLED=false`` (default) → all sub-flags
-force-disabled via master-off composition → byte-for-byte pre-W2(4).
-Mirrors W3(7) cancel master-off semantics.
+Hot-revert (graduation): set ``JARVIS_CURIOSITY_ENABLED=false`` — that
+single env knob force-disables every sub-flag and restores byte-for-byte
+pre-W2(4) behavior (Rule 14 falls through to the legacy
+``tool.denied.ask_human_low_risk`` reject at SAFE_AUTO). Pinned by
+``tests/governance/test_w2_4_graduation_pins_slice4.py`` on every commit.
 """
 from __future__ import annotations
 
@@ -56,14 +55,19 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def curiosity_enabled() -> bool:
-    """Master flag — `JARVIS_CURIOSITY_ENABLED` (default ``false``).
+    """Master flag — `JARVIS_CURIOSITY_ENABLED`.
 
-    Slice 1 default is False per operator binding. Slice 4 graduation
-    decides whether to flip. Master-off is THE single hot-revert env knob
-    — when False, every sub-flag below force-disables (composition pattern,
-    same as W3(7) cancel master-off).
+    **Default**: ``true`` (graduated 2026-04-25 via Slice 4 after Slices
+    1-3 shipped the primitive + Rule 14 widening + SSE/IDE surfaces with
+    158/158 combined regression green and the structural live-fire smoke
+    pinning the GENERATE → ContextVar → Rule 14 → ledger → SSE chain).
+
+    Master-off is THE single hot-revert env knob — when ``false``, every
+    sub-flag below force-disables (composition pattern, same as W3(7)
+    cancel master-off). Setting ``JARVIS_CURIOSITY_ENABLED=false``
+    restores byte-for-byte pre-W2(4) behavior.
     """
-    return _env_bool("JARVIS_CURIOSITY_ENABLED", False)
+    return _env_bool("JARVIS_CURIOSITY_ENABLED", True)
 
 
 def questions_per_session() -> int:

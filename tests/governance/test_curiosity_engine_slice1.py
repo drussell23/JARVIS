@@ -40,9 +40,11 @@ from backend.core.ouroboros.governance.curiosity_engine import (
 # ---------------------------------------------------------------------------
 
 
-def test_master_default_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    """JARVIS_CURIOSITY_ENABLED defaults to false (Slice 1)."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+def test_master_explicit_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit JARVIS_CURIOSITY_ENABLED=false is the hot-revert path
+    post-Slice-4 graduation. Default-true is pinned by the Slice 4
+    graduation suite; this test pins the explicit-off escape hatch."""
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     assert curiosity_enabled() is False
 
 
@@ -62,7 +64,7 @@ def test_master_off_force_disables_questions_quota(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Master off → questions_per_session forced to 0 regardless of env."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     monkeypatch.setenv("JARVIS_CURIOSITY_QUESTIONS_PER_SESSION", "100")
     assert questions_per_session() == 0
 
@@ -78,7 +80,7 @@ def test_master_off_force_disables_cost_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Master off → cost cap forced to 0.0 → rejects everything."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     monkeypatch.setenv("JARVIS_CURIOSITY_COST_CAP_USD", "1.00")
     assert cost_cap_usd() == 0.0
 
@@ -97,7 +99,7 @@ def test_posture_allowlist_default_explore_consolidate(
 def test_master_off_force_disables_posture_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     monkeypatch.setenv("JARVIS_CURIOSITY_POSTURE_ALLOWLIST", "EXPLORE,HARDEN")
     assert posture_allowlist() == frozenset()
 
@@ -105,7 +107,7 @@ def test_master_off_force_disables_posture_allowlist(
 def test_ledger_persist_off_when_master_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     monkeypatch.setenv("JARVIS_CURIOSITY_LEDGER_PERSIST_ENABLED", "true")
     assert ledger_persist_enabled() is False
 
@@ -120,7 +122,7 @@ def test_master_off_denies_everything(
 ) -> None:
     """Master off → every charge returns Denied(MASTER_OFF), counter
     never increments."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     bud = CuriosityBudget(op_id="op-test-001", posture_at_arm="EXPLORE")
     result = bud.try_charge("Should I refactor X?", est_cost_usd=0.01)
     assert result.allowed is False
@@ -202,7 +204,7 @@ def test_remaining_quota_zero_when_master_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """questions_remaining returns 0 when master is off."""
-    monkeypatch.delenv("JARVIS_CURIOSITY_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_CURIOSITY_ENABLED", "false")
     bud = CuriosityBudget(op_id="op-test-001", posture_at_arm="EXPLORE")
     assert bud.questions_remaining == 0
 
