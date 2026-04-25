@@ -189,6 +189,45 @@ _PLAN_FALLBACK_MAX_TIMEOUT_S = float(
 )
 
 # ---------------------------------------------------------------------------
+# Outer-retry budget (rooted-problem fix 2026-04-25)
+# ---------------------------------------------------------------------------
+#
+# F1 Slice 4 cadence S1b (`bt-2026-04-25-054256`) surfaced the rooted
+# problem behind W3(6) Slice 5b's `live_reachability=blocked_by_provider_exhaustion`:
+#
+#   * `_call_fallback` invokes the provider ONCE.
+#   * The provider's internal `_call_with_backoff` does ~3 attempts with
+#     exponential 2s/4s backoff, recycling the httpx pool between attempts.
+#   * When TCP connect or stream-read fails (anyio cancel scope fires
+#     before the API even responds), all 3 internal attempts can exhaust
+#     in ~70-80s.
+#   * `_call_fallback` then catches the propagated CancelledError and
+#     fires `EXHAUSTION cause=fallback_failed` — even when 100+s of
+#     parent budget remains.
+#
+# The budget JARVIS authorized at ROUTE goes unused. Network conditions
+# may have recovered by the time those retries would have fired.
+#
+# Operator binding 2026-04-25 (Option B closure of S1b):
+#   "Will not mask provider latency by modifying the seed (Option C) or
+#    artificially inflating the timeout boundaries (Option D). The
+#    internal architecture is mathematically sound."
+#
+# This fix adds NO new budget — it just CONSUMES the budget already
+# authorized. Outer retry loop re-invokes the provider (head-of-queue
+# preserved by holding `_fallback_sem`) on transient failures while
+# remaining budget exceeds `_MIN_VIABLE_FALLBACK_S` and the failure
+# mode is in `_FALLBACK_TRANSIENT_MODES`. Cooperative cancel via
+# `OperationCancelledError` (W3(7) cancel-token) is honored immediately
+# — never retried.
+_FALLBACK_OUTER_RETRY_MAX = int(
+    os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_MAX", "3")
+)
+_FALLBACK_OUTER_RETRY_BACKOFF_S = float(
+    os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "1.0")
+)
+
+# ---------------------------------------------------------------------------
 # Nervous System Reflex — BACKGROUND cascade for read-only ops
 # ---------------------------------------------------------------------------
 #
@@ -497,6 +536,35 @@ _TRANSIENT_TRANSPORT_NAMES: frozenset = frozenset({
     "StreamClosed",            # httpx — read after close
     "ResponseNotRead",         # httpx — async stream race
 })
+
+
+# FailureMode set safe to retry from `_call_fallback`'s outer loop. Any
+# mode in this set indicates a transient infrastructure condition where
+# re-invoking the provider may succeed on a fresh TCP connection / fresh
+# pool generation. Permanent failure modes (CONTENT_FAILURE,
+# CONTEXT_OVERFLOW) MUST NOT be retried — they would just re-fail.
+# Defined as a frozenset (not the FailureMode enum directly) to avoid
+# import ordering with the FailureMode definition below; populated lazily
+# by `_is_outer_retry_eligible_mode()`.
+_FALLBACK_OUTER_RETRY_TRANSIENT_MODE_NAMES: frozenset = frozenset({
+    "TIMEOUT",
+    "CONNECTION_ERROR",
+    "TRANSIENT_TRANSPORT",
+    "SERVER_ERROR",
+    "RATE_LIMITED",
+})
+
+
+def _is_outer_retry_eligible_mode(mode: "FailureMode") -> bool:
+    """Return True iff ``mode`` indicates a transient failure worth
+    retrying within the remaining fallback budget.
+
+    Used by `_call_fallback`'s outer retry loop (rooted-problem fix
+    2026-04-25). Defined as a free function so unit tests can pin the
+    classification → retry decision without instantiating the full
+    `CandidateGenerator`.
+    """
+    return mode.name in _FALLBACK_OUTER_RETRY_TRANSIENT_MODE_NAMES
 
 
 def _walk_exception_chain(exc: BaseException, max_depth: int = 8) -> tuple:
@@ -2783,25 +2851,126 @@ class CandidateGenerator:
                     )
 
                 # W3(7) Slice 2 — race against ambient cancel token (if any).
+                # Outer-retry loop (rooted-problem fix 2026-04-25): re-invoke
+                # the provider on transient failures while remaining budget
+                # exceeds `_MIN_VIABLE_FALLBACK_S`. Holds `_fallback_sem`
+                # across attempts so head-of-queue position is preserved
+                # (paying the wait fee twice would penalize the op for
+                # provider flakiness — semantically incorrect).
                 from backend.core.ouroboros.governance.cancel_token import (
+                    OperationCancelledError as _OperationCancelledError,
                     current_cancel_token as _curr_cancel_token,
                     race_or_wait_for as _race_or_wait_for,
                 )
-                _fb_result = await _race_or_wait_for(
-                    self._fallback.generate(context, deadline),
-                    timeout=remaining,
-                    cancel_token=_curr_cancel_token(),
-                )
-                logger.info(
-                    "[CandidateGenerator] Fallback sem release: "
-                    "hold=%.1fs sem_wait=%.1fs route=%s phase=%s op=%s outcome=ok",
-                    time.monotonic() - _sem_t0, _sem_wait_s,
-                    getattr(context, "provider_route", "?"),
-                    _phase_hint,
-                    getattr(context, "op_id", "?")[:16],
-                )
-                return _fb_result
+                _outer_attempt = 0
+                _outer_max = _FALLBACK_OUTER_RETRY_MAX
+                _last_inner_exc: Optional[BaseException] = None
+                while True:
+                    _outer_attempt += 1
+                    _attempt_t0 = time.monotonic()
+                    _attempt_remaining = self._remaining_seconds(deadline)
+                    if _attempt_remaining < _MIN_VIABLE_FALLBACK_S:
+                        # Budget exhausted — break to outer except handler
+                        # which fires `fallback_budget_starved` if no prior
+                        # exception, else fallback_failed with last exc.
+                        if _last_inner_exc is not None:
+                            raise _last_inner_exc
+                        self._raise_exhausted(
+                            "fallback_budget_starved",
+                            context=context,
+                            deadline=deadline,
+                            sem_wait_s=round(_sem_wait_s, 2),
+                            pre_sem_remaining_s=round(_pre_sem_remaining, 2),
+                            parent_remaining_s=round(_attempt_remaining, 2),
+                            fallback_budget_s=round(_attempt_remaining, 2),
+                            min_viable_fallback_s=_MIN_VIABLE_FALLBACK_S,
+                        )
+                    try:
+                        _fb_result = await _race_or_wait_for(
+                            self._fallback.generate(context, deadline),
+                            timeout=_attempt_remaining,
+                            cancel_token=_curr_cancel_token(),
+                        )
+                        if _outer_attempt > 1:
+                            logger.info(
+                                "[CandidateGenerator] Fallback outer-retry "
+                                "succeeded on attempt %d/%d after %.1fs "
+                                "(rooted-problem fix consumed %.1fs of "
+                                "previously-unused budget)",
+                                _outer_attempt, _outer_max,
+                                time.monotonic() - _sem_t0,
+                                time.monotonic() - _sem_t0 - (
+                                    _attempt_t0 - _sem_t0
+                                ),
+                            )
+                        logger.info(
+                            "[CandidateGenerator] Fallback sem release: "
+                            "hold=%.1fs sem_wait=%.1fs route=%s phase=%s op=%s outcome=ok",
+                            time.monotonic() - _sem_t0, _sem_wait_s,
+                            getattr(context, "provider_route", "?"),
+                            _phase_hint,
+                            getattr(context, "op_id", "?")[:16],
+                        )
+                        return _fb_result
+                    except _OperationCancelledError:
+                        # W3(7) cooperative cancel — operator/watchdog/signal.
+                        # NEVER retry; honor the cancel immediately.
+                        raise
+                    except (Exception, asyncio.CancelledError) as inner_exc:
+                        # Pre-instrumented (e.g. fallback_budget_starved
+                        # from a different code path) → propagate as-is.
+                        if hasattr(inner_exc, "exhaustion_report"):
+                            raise
+                        _last_inner_exc = inner_exc
+                        _inner_mode = (
+                            FailbackStateMachine.classify_exception(inner_exc)
+                        )
+                        # Permanent failures — never retry.
+                        if not _is_outer_retry_eligible_mode(_inner_mode):
+                            raise
+                        # Hit the outer-retry cap.
+                        if _outer_attempt >= _outer_max:
+                            raise
+                        # Budget check before backoff.
+                        _attempt_elapsed = time.monotonic() - _attempt_t0
+                        _budget_after = self._remaining_seconds(deadline)
+                        if _budget_after < _MIN_VIABLE_FALLBACK_S:
+                            raise
+                        logger.info(
+                            "[CandidateGenerator] Fallback outer-retry: "
+                            "attempt %d/%d failed (%s/%s) after %.1fs; "
+                            "%.1fs budget remains, retrying op=%s "
+                            "(rooted-problem fix — consuming budget JARVIS "
+                            "already authorized, not inflating)",
+                            _outer_attempt, _outer_max,
+                            type(inner_exc).__name__,
+                            _inner_mode.name,
+                            _attempt_elapsed, _budget_after,
+                            getattr(context, "op_id", "?")[:16],
+                        )
+                        # Brief backoff between outer attempts. Capped at
+                        # remaining-budget/4 so a 12s budget doesn't sleep
+                        # 1s of it (which would risk underflow into the
+                        # min_viable floor on the next attempt).
+                        _backoff = min(
+                            _FALLBACK_OUTER_RETRY_BACKOFF_S,
+                            max(0.1, _budget_after / 4.0),
+                        )
+                        await asyncio.sleep(_backoff)
+                        continue
+                # Unreachable — loop either returns or raises.
         except (Exception, asyncio.CancelledError) as exc:
+            # Cooperative cancel via W3(7) cancel-token — propagate
+            # immediately (NEVER treat as exhaustion). The inner loop
+            # raises OperationCancelledError; this outer handler must
+            # not swallow it into the fallback_failed taxonomy or the
+            # operator's cancel signal would be silently downgraded
+            # into "another transport failure".
+            from backend.core.ouroboros.governance.cancel_token import (
+                OperationCancelledError as _OperationCancelledError_outer,
+            )
+            if isinstance(exc, _OperationCancelledError_outer):
+                raise
             # If the exception is already instrumented (e.g. the inner
             # ``fallback_budget_starved`` raise), re-raise as-is so we
             # preserve the more-specific cause and don't double-count
