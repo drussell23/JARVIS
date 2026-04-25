@@ -756,6 +756,23 @@ class GovernedOrchestrator:
     # copy — so the existing call sites keep working unchanged.
 
     @property
+    def _subagent_scheduler(self) -> Any:
+        """Alias to ``_config.execution_graph_scheduler``.
+
+        Added 2026-04-24 (S7 finding) to close the W3(6) Slice 4 wiring gap:
+        ``phase_dispatcher.py`` reads ``orchestrator._subagent_scheduler``
+        when deciding whether to run the post-GENERATE enforce-mode
+        ``dispatch_fanout`` path; orchestrator stores the same handle as
+        ``_config.execution_graph_scheduler`` (passed in via
+        ``OrchestratorConfig`` from ``governed_loop_service``). Pre-fix
+        ``getattr`` returned ``None`` and the enforce path always logged
+        ``enforce_fanout skipped: orchestrator has no _subagent_scheduler
+        reference``. The alias keeps the dispatcher's call shape stable
+        while making the field reachable.
+        """
+        return self._config.execution_graph_scheduler
+
+    @property
     def _session_lessons(self) -> list:
         return self._state.session_lessons
 
