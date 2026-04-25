@@ -227,6 +227,27 @@ _FALLBACK_OUTER_RETRY_BACKOFF_S = float(
     os.environ.get("JARVIS_FALLBACK_OUTER_RETRY_BACKOFF_S", "1.0")
 )
 
+# Anthropic resilience pack 2026-04-25 — failure-rate-aware outer-retry.
+# When the FailbackStateMachine has logged transient failures recently
+# (a window of consecutive_failures > 0 within the past few cycles), bump
+# the outer-retry cap from `_FALLBACK_OUTER_RETRY_MAX` to
+# `_FALLBACK_OUTER_RETRY_MAX_DEGRADED` for that op only. Healthy ops
+# never pay the extra retry cost.
+#
+# Observed live in F1 Slice 4 S4b: 6 Claude transient failures + 8 pool
+# recycles in 30min. The seed's 1 outer-retry attempt wasn't enough to
+# survive the full anthropic_transport instability window. Bumping to 5
+# attempts during instability gives ~3× more headroom to catch a
+# recovery window.
+#
+# Default = 5 (vs base 3). Set via JARVIS_FALLBACK_OUTER_RETRY_MAX_DEGRADED.
+# Master-off via DEGRADED == base (no extra retries even when degraded).
+_FALLBACK_OUTER_RETRY_MAX_DEGRADED = int(
+    os.environ.get(
+        "JARVIS_FALLBACK_OUTER_RETRY_MAX_DEGRADED", "5",
+    )
+)
+
 # ---------------------------------------------------------------------------
 # Nervous System Reflex — BACKGROUND cascade for read-only ops
 # ---------------------------------------------------------------------------
@@ -2863,7 +2884,28 @@ class CandidateGenerator:
                     race_or_wait_for as _race_or_wait_for,
                 )
                 _outer_attempt = 0
-                _outer_max = _FALLBACK_OUTER_RETRY_MAX
+                # Anthropic resilience pack 2026-04-25 — failure-rate-aware
+                # outer-retry max. When the FSM shows recent transient
+                # failures (consecutive_failures > 0), bump the outer-retry
+                # cap to give the op more headroom to catch a recovery
+                # window during external instability. Healthy ops keep
+                # the base cap (no extra cost).
+                _fsm_consec_fails = getattr(
+                    self.fsm, "_consecutive_failures", 0,
+                )
+                if _fsm_consec_fails > 0 and _FALLBACK_OUTER_RETRY_MAX_DEGRADED > _FALLBACK_OUTER_RETRY_MAX:
+                    _outer_max = _FALLBACK_OUTER_RETRY_MAX_DEGRADED
+                    logger.info(
+                        "[CandidateGenerator] Fallback outer-retry: degraded mode "
+                        "detected (FSM consecutive_failures=%d) — bumping outer-retry "
+                        "cap from %d to %d for op=%s (rooted-problem fix — failure-"
+                        "rate-aware retry headroom)",
+                        _fsm_consec_fails,
+                        _FALLBACK_OUTER_RETRY_MAX, _outer_max,
+                        getattr(context, "op_id", "?")[:16],
+                    )
+                else:
+                    _outer_max = _FALLBACK_OUTER_RETRY_MAX
                 _last_inner_exc: Optional[BaseException] = None
                 while True:
                     _outer_attempt += 1
