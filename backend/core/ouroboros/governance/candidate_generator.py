@@ -2689,6 +2689,28 @@ class CandidateGenerator:
         else:
             _max_cap = self._FALLBACK_MAX_TIMEOUT_S
 
+        # Seed Arc Path 3 follow-up — PLAN-EXPLOIT per-stream override.
+        # When ``plan_exploit_active_var`` is True (set by
+        # ``try_parallel_generate`` before its gather), the per-stream
+        # cap uses ``plan_exploit_per_stream_timeout_s()`` instead of
+        # the default _FALLBACK_MAX_TIMEOUT_S. The 120s default was sized
+        # for serial calls with retry rounds; applying it per-stream in
+        # parallel mode artificially constrains streams doing legitimate
+        # full-file generation when the parent has 220s+ remaining.
+        # Outside PLAN-EXPLOIT context (the common case), behavior is
+        # unchanged. The override clamps with max() against the existing
+        # _max_cap so it never SHRINKS an already-larger cap (e.g. the
+        # COMPLEX-route cap or the BG/SPEC subagent extension above).
+        try:
+            from backend.core.ouroboros.governance.plan_exploit import (
+                plan_exploit_active_var as _plan_exploit_active,
+                plan_exploit_per_stream_timeout_s as _plan_exploit_timeout,
+            )
+            if _plan_exploit_active.get(False):
+                _max_cap = max(_max_cap, _plan_exploit_timeout())
+        except Exception:  # noqa: BLE001 — override is best-effort
+            pass
+
         # Promoted to INFO with phase label so traces distinguish first
         # GENERATE from GENERATE_RETRY contention on the shared fallback
         # semaphore — Session bt-2026-04-15-041413 (2026-04-14) saw a
