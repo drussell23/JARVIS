@@ -164,6 +164,14 @@ EVENT_TYPE_SESSION_UNBOOKMARKED = "session_unbookmarked"
 EVENT_TYPE_SESSION_PINNED = "session_pinned"
 EVENT_TYPE_SESSION_UNPINNED = "session_unpinned"
 
+# W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
+# scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
+# {"cancel_id": str, "op_id": str, "origin": str, "phase": str}}``.
+# Full record (with reason, monotonic timestamp, bounded_deadline_s,
+# tasks_cancelled list once Slice 5+ populates it) lives at the
+# ``/observability/cancels/<cancel_id>`` GET endpoint.
+EVENT_TYPE_CANCEL_ORIGIN_EMITTED = "cancel_origin_emitted"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -204,6 +212,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE,
     EVENT_TYPE_MEMORY_PRESSURE_CHANGED,
     EVENT_TYPE_MEMORY_FANOUT_DECISION,
+    EVENT_TYPE_CANCEL_ORIGIN_EMITTED,  # W3(7) Slice 6
 })
 
 
