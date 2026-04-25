@@ -75,7 +75,16 @@ def current_cancel_token() -> Optional["CancelToken"]:
 
 
 # ---------------------------------------------------------------------------
-# Flags (defaults align with scope doc §8 — all default OFF when master is off)
+# Flags (defaults align with scope doc §8 + Slice 7 graduation policy line):
+#   - Master `JARVIS_MID_OP_CANCEL_ENABLED` default `True` post-Slice-7
+#     (was `False` during Slices 1–6 build).
+#   - All actuating sub-flags (WATCHDOG / SIGNAL / SSE) stay default `False` —
+#     operator opt-in required for Class E / F / SSE.
+#   - REPL_IMMEDIATE / RECORD_PERSIST default `True` when master is on
+#     (Slice 1 design — Class D is the operator-cancel surface, no
+#     auto-cancellation, only fires on explicit `cancel <op-id> --immediate`).
+#   - Hot-revert: `JARVIS_MID_OP_CANCEL_ENABLED=false` force-disables every
+#     sub-flag → byte-for-byte pre-W3(7).
 # ---------------------------------------------------------------------------
 
 
