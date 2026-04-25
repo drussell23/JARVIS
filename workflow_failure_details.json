@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24922797590",
-  "branch": "fix/ci/database-connection-validation-run3357-20260425-044105",
-  "commit_sha": "3d3a5b1",
-  "run_number": 37610,
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24923079434",
+  "branch": "fix/ci/pr-automation-validation-run37610-20260425-045724",
+  "commit_sha": "8c3fd26",
+  "run_number": 37687,
   "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run37610-20260425-045724",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #37610)",
+  "fix_branch": "fix/ci/pr-automation-validation-run37687-20260425-050814",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #37687)",
   "analyses": [
     {
       "error_patterns": [
@@ -15,13 +15,13 @@
           "matches": [
             {
               "line_number": 30,
-              "content": "2026-04-25T04:44:33.3846827Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2026-04-25T04:59:10.3262022Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 42,
-              "content": "2026-04-25T04:44:33.9448994Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: Database Connection Validation (Run #3357)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2026-04-25T04:59:10.9913047Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #37610)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -33,7 +33,7 @@
           "matches": [
             {
               "line_number": 58,
-              "content": "2026-04-25T04:44:34.0073093Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "content": "2026-04-25T04:59:11.0394463Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -62,5 +62,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-04-25T04:57:24.497782"
+  "timestamp": "2026-04-25T05:08:14.808585"
 }
