@@ -133,6 +133,25 @@ def watchdog_enabled() -> bool:
     return _env_bool("JARVIS_MID_OP_CANCEL_WATCHDOG_ENABLED", False)
 
 
+def signal_enabled() -> bool:
+    """Class F signal sub-flag — `JARVIS_MID_OP_CANCEL_SIGNAL_ENABLED`.
+
+    Default false (even when master is on) per operator resolution-2 — Class F
+    (system signal cancels: SIGTERM / SIGINT / SIGHUP) is a separate trust
+    step beyond Class D operator and Class E watchdog. Always returns False
+    when master is off.
+
+    Slice 4 (W3(7)) gates the signal-handler-emitted Class F records on this
+    flag. The existing harness signal-handler partial-summary write path is
+    unchanged regardless of this flag — Class F is *additive* observability
+    on top of the existing handler (operator resolution-4: no harness
+    dependency for correctness).
+    """
+    if not mid_op_cancel_enabled():
+        return False
+    return _env_bool("JARVIS_MID_OP_CANCEL_SIGNAL_ENABLED", False)
+
+
 def bounded_deadline_s() -> float:
     """`JARVIS_CANCEL_BOUNDED_DEADLINE_S` — settle budget (default 30s).
 
@@ -505,6 +524,107 @@ class CancelOriginEmitter:
 
         return record
 
+    # Class F signals (W3(7) Slice 4) — SIGTERM / SIGINT / SIGHUP.
+    # Names mirror the lowercase form already used by harness ticket B
+    # (`signal_name` arg of `_handle_shutdown_signal`).
+    _ALLOWED_SIGNALS: frozenset = frozenset({
+        "sigterm",  # container kill / external orchestrator stop
+        "sigint",   # operator Ctrl-C / interactive interrupt
+        "sighup",   # parent-process death (per S5/S6 incidents — terminal pipeline)
+    })
+
+    def emit_class_f(
+        self,
+        *,
+        signal_name: str,
+        op_id: str,
+        token: CancelToken,
+        phase_at_trigger: str,
+        reason: str = "",
+        initiator_task: str = "",
+    ) -> Optional[CancelRecord]:
+        """Class F — system-signal-initiated immediate cancel.
+
+        Slice 4 (W3(7)). Same mechanics as :meth:`emit_class_d` /
+        :meth:`emit_class_e` but:
+
+        * Gated by :func:`signal_enabled` (sub-flag default false even
+          when master is on — operator resolution-2).
+        * ``signal_name`` MUST be in :attr:`_ALLOWED_SIGNALS` — surfaces
+          typos loudly. Use the same lowercase form as harness ticket B
+          (``"sigterm"``, ``"sigint"``, ``"sighup"``).
+        * Origin string is ``F:<signal_name>`` for machine-grep stability.
+
+        Coordination with harness ticket B (operator resolution-4 — Class F
+        works correctly even if harness epic items still have bugs):
+        the existing harness ``_handle_shutdown_signal`` path that writes
+        the partial ``summary.json`` is unchanged. Class F is *additive*
+        observability on top — emitted ONCE per in-flight op when the
+        signal handler chooses to. The `cancel_records.jsonl` artifact
+        and `[CancelOrigin]` log line live alongside the existing
+        partial-summary write; they do not replace or block it.
+
+        Returns the committed CancelRecord, or None if:
+        * master flag is off (no-op),
+        * signal sub-flag is off (no-op),
+        * the signal name is unknown (raises ValueError — typo guard),
+        * the token was already cancelled by another origin (idempotent loss).
+        """
+        if signal_name not in self._ALLOWED_SIGNALS:
+            raise ValueError(
+                f"unknown signal_name={signal_name!r}; "
+                f"allowed={sorted(self._ALLOWED_SIGNALS)}"
+            )
+        if not mid_op_cancel_enabled():
+            return None
+        if not signal_enabled():
+            return None
+
+        origin = f"F:{signal_name}"
+        record = CancelRecord(
+            schema_version="cancel.1",
+            cancel_id=_new_cancel_id(),
+            op_id=op_id,
+            origin=origin,
+            phase_at_trigger=phase_at_trigger,
+            trigger_monotonic=time.monotonic(),
+            trigger_wall_iso=_now_iso(),
+            bounded_deadline_s=bounded_deadline_s(),
+            reason=reason or f"system signal received ({signal_name})",
+        )
+
+        committed = token.set(record)
+        if not committed:
+            existing = token.get_record()
+            logger.info(
+                "[CancelOrigin] superseded — op=%s requested_origin=%s "
+                "winner_origin=%s winner_cancel_id=%s",
+                op_id[:16],
+                origin,
+                existing.origin if existing else "unknown",
+                existing.cancel_id if existing else "unknown",
+            )
+            return None
+
+        logger.info(
+            "[CancelOrigin] op=%s origin=%s phase=%s cancel_id=%s "
+            "at_monotonic=%.3f reason=%r initiator_task=%s "
+            "bounded_deadline_s=%.1f",
+            op_id[:16],
+            origin,
+            phase_at_trigger,
+            record.cancel_id,
+            record.trigger_monotonic,
+            record.reason,
+            initiator_task or signal_name,
+            record.bounded_deadline_s,
+        )
+
+        if record_persist_enabled() and self._session_dir is not None:
+            self._persist(record)
+
+        return record
+
     def _persist(self, record: CancelRecord) -> None:
         """Append the record to ``cancel_records.jsonl``. Best-effort."""
         try:
@@ -721,6 +841,59 @@ def emit_watchdog_cancel(
     )
 
 
+def emit_signal_cancel(
+    *,
+    signal_name: str,
+    registry: "CancelTokenRegistry",
+    session_dir: Optional[Path] = None,
+    phase_at_trigger: str = "unknown",
+    reason: str = "",
+) -> int:
+    """Convenience — emit Class F:<signal> for **every active op** in the registry.
+
+    Slice 4 (W3(7)). The harness signal handler calls this from within
+    ``_handle_shutdown_signal`` so that one signal arrival fans out into
+    one cancel record per in-flight op (typical case: 1-3 active ops at
+    signal time).
+
+    Returns the number of records emitted (0 when master/sub-flag off, or
+    when no active ops exist). Never raises — the harness signal handler
+    must remain interrupt-safe.
+
+    The existing harness partial-summary write path is NOT touched by this
+    helper (per operator resolution-4 — Class F is additive observability,
+    not a replacement). Callers invoke both: the partial-summary write
+    AND ``emit_signal_cancel`` from the same handler.
+    """
+    if not signal_enabled():
+        return 0
+    try:
+        active = registry.active_op_ids()
+    except Exception:  # noqa: BLE001 — registry must not crash signal handler
+        return 0
+
+    emitter = CancelOriginEmitter(session_dir=session_dir)
+    emitted = 0
+    for op_id in list(active):
+        try:
+            token = registry.get(op_id)
+            if token is None:
+                continue
+            rec = emitter.emit_class_f(
+                signal_name=signal_name,
+                op_id=op_id,
+                token=token,
+                phase_at_trigger=phase_at_trigger,
+                reason=reason,
+                initiator_task=f"harness:{signal_name}",
+            )
+            if rec is not None:
+                emitted += 1
+        except Exception:  # noqa: BLE001 — per-op emit must not block others
+            continue
+    return emitted
+
+
 def subprocess_grace_s() -> float:
     """`JARVIS_CANCEL_SUBPROCESS_GRACE_S` — terminate→kill grace (default 5s).
 
@@ -750,4 +923,6 @@ __all__ = [
     "bounded_deadline_s",
     "watchdog_enabled",
     "emit_watchdog_cancel",
+    "signal_enabled",
+    "emit_signal_cancel",
 ]
