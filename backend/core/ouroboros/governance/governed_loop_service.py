@@ -3300,6 +3300,22 @@ class GovernedLoopService:
             validation_runner=validation_runner,
         )
 
+        # W3(7) Slice 3 — attach Class E cancel surface to CostGovernor.
+        # CostGovernor needs the registry to emit a Class E:cost record on
+        # cap-exceeded. Master + watchdog sub-flag both off (default) →
+        # the emit path inside cost_governor returns None (byte-for-byte
+        # pre-W3(7)). Attach is best-effort; if cost_governor lacks the
+        # method (older test fixture), silently skip.
+        try:
+            _cost_gov = getattr(self._orchestrator, "_cost_governor", None)
+            if _cost_gov is not None and hasattr(_cost_gov, "attach_cancel_surface"):
+                _cost_gov.attach_cancel_surface(
+                    registry=self._cancel_token_registry,
+                    session_dir=getattr(self, "_session_dir", None),
+                )
+        except Exception as _attach_exc:  # noqa: BLE001 — best-effort
+            logger.debug("[GLS] Class E cancel surface attach skipped: %s", _attach_exc)
+
         # ---- Wire ReasoningChainBridge (P1) ----
         try:
             from backend.core.ouroboros.governance.reasoning_chain_bridge import ReasoningChainBridge

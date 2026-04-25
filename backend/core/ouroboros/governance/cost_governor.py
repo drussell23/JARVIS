@@ -257,6 +257,62 @@ class CostGovernor:
     def __init__(self, config: Optional[CostGovernorConfig] = None) -> None:
         self._config = config or CostGovernorConfig()
         self._entries: Dict[str, _OpCostEntry] = {}
+        # W3(7) Slice 3 — Class E cancel hook surfaces. The registry +
+        # session_dir are attached lazily by GovernedLoopService when
+        # available; both default None so unit tests / standalone callers
+        # don't need to provide them. When None, ``_emit_class_e_cancel``
+        # is a silent no-op (matches the master-off invariant).
+        self._cancel_token_registry = None  # type: ignore[assignment]
+        self._cancel_session_dir = None  # type: ignore[assignment]
+
+    def attach_cancel_surface(
+        self,
+        *,
+        registry: Any,
+        session_dir: Optional[Any] = None,
+    ) -> None:
+        """Wire the Class E cancel surface (registry + optional session dir).
+
+        Called by GovernedLoopService after construction. Slice 3 (W3(7)).
+        Idempotent — re-attaching just overwrites the previous handles.
+        """
+        self._cancel_token_registry = registry
+        self._cancel_session_dir = session_dir
+
+    def _emit_class_e_cancel(
+        self,
+        op_id: str,
+        *,
+        cumulative_usd: float,
+        cap_usd: float,
+    ) -> None:
+        """Emit a Class E:cost cancel record on cap exceeded.
+
+        Best-effort. No registry attached → silent no-op. Master flag off
+        OR Class E sub-flag off → ``emit_watchdog_cancel`` returns None.
+        Never raises into the charge() path (cost accounting must not be
+        blocked by cancel-side failures).
+        """
+        if self._cancel_token_registry is None:
+            return
+        try:
+            from backend.core.ouroboros.governance.cancel_token import (
+                emit_watchdog_cancel as _emit_watchdog_cancel,
+            )
+            _emit_watchdog_cancel(
+                watchdog="cost",
+                op_id=op_id,
+                registry=self._cancel_token_registry,
+                session_dir=self._cancel_session_dir,
+                phase_at_trigger="unknown",  # cost charge can fire from any phase
+                reason=(
+                    f"per-op cost cap exceeded: "
+                    f"cumulative=${cumulative_usd:.4f} >= cap=${cap_usd:.4f}"
+                ),
+                initiator_task="cost_governor",
+            )
+        except Exception:  # noqa: BLE001 — emit is best-effort, never blocks
+            pass
 
     # --------------------------------------------------------------
     # Cap derivation
@@ -439,6 +495,14 @@ class CostGovernor:
                 entry.call_count,
                 {k: round(v, 4) for k, v in entry.provider_totals.items()},
             )
+            # W3(7) Slice 3 — Class E watchdog cancel hook (best-effort).
+            # When master + watchdog sub-flag are both on, emit a Class E
+            # cancel record so the dispatcher's pre-iteration cancel-check
+            # routes the op to POSTMORTEM cleanly. Master-off OR
+            # sub-flag-off → no-op (byte-for-byte pre-W3(7) — existing
+            # `entry.exceeded=True` flag remains the authoritative signal
+            # the orchestrator already consults at line ~3402).
+            self._emit_class_e_cancel(op_id, cumulative_usd=entry.cumulative_usd, cap_usd=entry.cap_usd)
         else:
             logger.debug(
                 "[CostGovernor] op=%s charge +$%.4f (%s) cumulative=$%.4f / $%.4f",
