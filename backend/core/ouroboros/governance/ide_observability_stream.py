@@ -172,6 +172,14 @@ EVENT_TYPE_SESSION_UNPINNED = "session_unpinned"
 # ``/observability/cancels/<cancel_id>`` GET endpoint.
 EVENT_TYPE_CANCEL_ORIGIN_EMITTED = "cancel_origin_emitted"
 
+# W2(4) Slice 3 — curiosity question SSE event (additive). Payload schema
+# per scope doc §6: ``{"event": "curiosity_question_emitted", "data":
+# {"question_id": str, "op_id": str, "posture": str, "result": str,
+# "question_text": str (<=80 chars)}}``. Full record (with cost burn,
+# monotonic timestamp, full question text) lives at the
+# ``/observability/curiosity/<question_id>`` GET endpoint.
+EVENT_TYPE_CURIOSITY_QUESTION_EMITTED = "curiosity_question_emitted"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -213,6 +221,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_MEMORY_PRESSURE_CHANGED,
     EVENT_TYPE_MEMORY_FANOUT_DECISION,
     EVENT_TYPE_CANCEL_ORIGIN_EMITTED,  # W3(7) Slice 6
+    EVENT_TYPE_CURIOSITY_QUESTION_EMITTED,  # W2(4) Slice 3
 })
 
 
