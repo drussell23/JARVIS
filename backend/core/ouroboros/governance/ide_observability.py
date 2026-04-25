@@ -248,6 +248,14 @@ class IDEObservabilityRouter:
             "/observability/cancels/{cancel_id}",
             self._handle_cancel_detail,
         )
+        # W2(4) Slice 3 — curiosity question record surface.
+        app.router.add_get(
+            "/observability/curiosity", self._handle_curiosity_list,
+        )
+        app.router.add_get(
+            "/observability/curiosity/{question_id}",
+            self._handle_curiosity_detail,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -1299,5 +1307,130 @@ class IDEObservabilityRouter:
                 return self._json_response(request, 200, r)
         return self._error_response(
             request, 404, "ide_observability.cancel_not_found",
+        )
+
+    # --- W2(4) Slice 3 — curiosity record surface ------------------------
+
+    def _read_curiosity_records(self) -> Tuple[List[Dict[str, Any]], int]:
+        """Read all records from curiosity_ledger.jsonl in session_dir.
+
+        Returns ``(records, parse_error_count)``. Never raises. Mirrors
+        :meth:`_read_cancel_records` byte-for-byte (same JSONL contract).
+        """
+        if self._session_dir is None:
+            return [], 0
+        artifact = self._session_dir / "curiosity_ledger.jsonl"
+        if not artifact.exists():
+            return [], 0
+        records: List[Dict[str, Any]] = []
+        parse_errors = 0
+        try:
+            text = artifact.read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            return [], 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                if isinstance(rec, dict):
+                    records.append(rec)
+            except (ValueError, TypeError):
+                parse_errors += 1
+        return records, parse_errors
+
+    async def _handle_curiosity_list(self, request: "web.Request") -> Any:
+        """GET /observability/curiosity — list of CuriosityRecord projections.
+
+        Query params (optional):
+          * ``op_id``   — filter to a specific op (exact match).
+          * ``result``  — filter by result substring (e.g. ``allowed`` for
+                          successful charges, ``denied:`` for any deny).
+          * ``limit``   — 1..1000 (default 100).
+
+        Shape::
+
+            {"schema_version": "1.0", "records": [...], "count": N,
+             "parse_errors": K}
+
+        503 when no session_dir is bound (IDE-only mount, no harness).
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        if self._session_dir is None:
+            return self._error_response(
+                request, 503, "ide_observability.curiosity_unavailable",
+            )
+        try:
+            limit = int(request.query.get("limit", "100"))
+        except ValueError:
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        if limit < 1 or limit > 1000:
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        records, parse_errors = self._read_curiosity_records()
+        # Filters
+        op_id_filter = request.query.get("op_id", "").strip()
+        result_filter = request.query.get("result", "").strip()
+        filtered = []
+        for r in records:
+            if op_id_filter and r.get("op_id") != op_id_filter:
+                continue
+            if result_filter and not str(r.get("result", "")).startswith(
+                result_filter
+            ):
+                continue
+            filtered.append(r)
+        # Newest-last is the natural JSONL order; UI usually wants
+        # newest-first, so reverse for the response.
+        filtered.reverse()
+        truncated = filtered[:limit]
+        return self._json_response(
+            request, 200,
+            {
+                "schema_version": "1.0",
+                "records": truncated,
+                "count": len(truncated),
+                "parse_errors": parse_errors,
+            },
+        )
+
+    async def _handle_curiosity_detail(self, request: "web.Request") -> Any:
+        """GET /observability/curiosity/{question_id} — full CuriosityRecord."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        if self._session_dir is None:
+            return self._error_response(
+                request, 503, "ide_observability.curiosity_unavailable",
+            )
+        question_id = request.match_info.get("question_id", "").strip()
+        if not question_id or not re.match(
+            r"^[A-Za-z0-9_\-:.]{1,128}$", question_id,
+        ):
+            return self._error_response(
+                request, 400, "ide_observability.malformed_question_id",
+            )
+        records, _ = self._read_curiosity_records()
+        for r in records:
+            if r.get("question_id") == question_id:
+                return self._json_response(request, 200, r)
+        return self._error_response(
+            request, 404, "ide_observability.curiosity_not_found",
         )
 
