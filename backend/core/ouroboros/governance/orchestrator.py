@@ -773,6 +773,22 @@ class GovernedOrchestrator:
         return self._config.execution_graph_scheduler
 
     @property
+    def _cancel_token_registry(self) -> Any:
+        """Forward to GovernedLoopService's :class:`CancelTokenRegistry`.
+
+        W3(7) Slice 2 — gives the dispatcher a single attribute lookup to
+        find the per-session registry. The registry lives on GLS (created
+        in __init__); the orchestrator surfaces it via ``self._stack``.
+        Returns ``None`` for unit-test orchestrators constructed without
+        a stack — runners must handle ``pctx.cancel_token is None``
+        cleanly (no race wrap, behavior identical to pre-W3(7)).
+        """
+        _gls = getattr(self._stack, "governed_loop_service", None)
+        if _gls is None:
+            return None
+        return getattr(_gls, "_cancel_token_registry", None)
+
+    @property
     def _session_lessons(self) -> list:
         return self._state.session_lessons
 

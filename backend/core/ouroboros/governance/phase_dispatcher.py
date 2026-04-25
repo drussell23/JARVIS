@@ -214,6 +214,15 @@ class PhaseContext:
     episodic_memory: Any = None
     generate_retries_remaining: Optional[int] = None
     t_apply: float = 0.0
+    # W3(7) Slice 2 — cancel propagation surface. ``cancel_token`` is the
+    # per-op CancelToken (or None for ops dispatched without a registry,
+    # e.g. unit tests / pre-W3(7) callers). Dispatcher checks
+    # ``cancel_token.is_cancelled`` before each iteration; runners that
+    # call into long-running awaits (provider.generate, ToolLoop subprocess)
+    # forward the token to surface mid-phase cancel. Master-flag-off →
+    # token never gets ``set()`` → race() always returns the wrapped coro
+    # result → byte-for-byte pre-W3(7) behavior.
+    cancel_token: Any = None
     extras: Dict[str, Any] = field(default_factory=dict)
 
     def merge_artifacts(self, artifacts: Dict[str, Any]) -> None:
@@ -498,6 +507,27 @@ async def dispatch_pipeline(
     reg = registry if registry is not None else build_default_registry()
     pctx = initial_context if initial_context is not None else PhaseContext()
     ctx = start_ctx
+    # W3(7) Slice 2 — attach the per-op CancelToken if the orchestrator
+    # exposes a registry. ``getattr`` with a default None keeps unit-test
+    # callers working (they construct an orchestrator without a stack /
+    # GLS and the registry property returns None). Runners read
+    # ``pctx.cancel_token`` and skip race-wrapping cleanly when it's None.
+    if pctx.cancel_token is None:
+        _registry = getattr(orchestrator, "_cancel_token_registry", None)
+        if _registry is not None and hasattr(ctx, "op_id"):
+            try:
+                pctx.cancel_token = _registry.get_or_create(ctx.op_id)
+            except Exception:  # noqa: BLE001 — registry attach is best-effort
+                pctx.cancel_token = None
+
+    # Bind the ambient ContextVar so candidate_generator + tool_executor
+    # can reach the token without parameter threading. Reset on exit so
+    # adjacent ops don't inherit a stale value (asyncio task isolation
+    # mostly handles this, but the explicit reset is defensive).
+    from backend.core.ouroboros.governance.cancel_token import (
+        cancel_token_var as _cancel_token_var,
+    )
+    _cancel_token_reset = _cancel_token_var.set(pctx.cancel_token)
     # dispatch_phase = "which runner factory to invoke next."
     # This is NOT always equal to ctx.phase because some runners (e.g.
     # GENERATE) don't advance ctx internally — the inline FSM depended
@@ -511,6 +541,38 @@ async def dispatch_pipeline(
     dispatch_phase = ctx.phase
 
     for _iter in range(max_iterations):
+        # W3(7) Slice 2 — pre-iteration cancel check. If the per-op
+        # CancelToken has been set (REPL Class D, future Class E/F), the
+        # dispatcher routes directly to POSTMORTEM with status=cancelled
+        # before invoking the next runner. This is the deterministic
+        # mid-phase cancel surface: the *currently running* runner finishes
+        # via its own race() wrappers (provider.generate / subprocess kill);
+        # the *next* iteration short-circuits here.
+        #
+        # Master-flag-off: pctx.cancel_token is None or never set → branch
+        # is structurally unreachable → byte-for-byte pre-W3(7) behavior.
+        _cancel_token = getattr(pctx, "cancel_token", None)
+        if (
+            _cancel_token is not None
+            and getattr(_cancel_token, "is_cancelled", False)
+            and dispatch_phase != OperationPhase.POSTMORTEM
+        ):
+            _record = _cancel_token.get_record()
+            pctx.extras["cancel_record"] = _record  # single-writer (Slice 1 trigger)
+            _origin = _record.origin if _record is not None else "unknown"
+            logger.info(
+                "[PhaseDispatcher] cancel detected — routing to POSTMORTEM "
+                "op=%s prev_phase=%s origin=%s",
+                ctx.op_id[:16] if hasattr(ctx, "op_id") else "?",
+                dispatch_phase.name,
+                _origin,
+            )
+            dispatch_phase = OperationPhase.POSTMORTEM
+            # Loop continues at top; POSTMORTEM may be terminal-unregistered
+            # (short-circuit below) or registered (runs cleanly). Either
+            # path emits a clean terminal.
+            continue
+
         # Terminal-phase handling: COMPLETE IS registered (COMPLETERunner
         # does the terminal work — canary, oracle update, serpent stop)
         # so we check the registry first. Only UNregistered terminals
