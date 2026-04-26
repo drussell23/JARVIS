@@ -90,10 +90,14 @@ def test_chat_intent_has_four_values():
     }
 
 
-def test_is_enabled_default_false_pre_graduation():
-    """Slice 1 ships default-OFF. Renamed to
-    ``test_is_enabled_default_true_post_graduation`` at Slice 4 flip."""
-    assert is_enabled() is False
+def test_is_enabled_default_true_post_graduation(monkeypatch):
+    """Slice 4 graduation flipped default OFF→ON.
+
+    Renamed from ``test_is_enabled_default_false_pre_graduation`` per
+    its embedded discipline. Hot-revert: explicit
+    ``JARVIS_CONVERSATIONAL_MODE_ENABLED=false``."""
+    monkeypatch.delenv("JARVIS_CONVERSATIONAL_MODE_ENABLED", raising=False)
+    assert is_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])
@@ -104,6 +108,10 @@ def test_is_enabled_truthy_variants(monkeypatch, val):
 
 @pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
 def test_is_enabled_falsy_variants(monkeypatch, val):
+    """Post-graduation: any non-truthy explicit value disables.
+    Hot-revert: ``JARVIS_CONVERSATIONAL_MODE_ENABLED=false``. ``""``
+    (empty string) still disables — only an *unset* env var hits the
+    new ``"1"`` default."""
     monkeypatch.setenv("JARVIS_CONVERSATIONAL_MODE_ENABLED", val)
     assert is_enabled() is False
 

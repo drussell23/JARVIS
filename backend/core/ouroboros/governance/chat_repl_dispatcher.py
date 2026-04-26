@@ -87,14 +87,14 @@ DEFAULT_SESSION_ID: str = "repl"
 
 def is_enabled() -> bool:
     """Master flag — ``JARVIS_CONVERSATIONAL_MODE_ENABLED`` (default
-    false until Slice 4 graduation).
+    **true** post Slice 4 graduation).
 
-    SerpentFlow is the gating caller — when off, the REPL doesn't even
-    construct the dispatcher. This module's behaviour does not change
-    based on the flag; the helper is exported for SerpentFlow's
-    convenience + symmetry with the P3 renderer pattern."""
+    The :func:`build_chat_repl_dispatcher` factory consults this flag
+    and returns either a wired dispatcher (with the safe-default
+    :class:`LoggingChatActionExecutor`) or ``None`` so SerpentFlow can
+    skip surfacing ``/chat`` entirely when reverted."""
     return os.environ.get(
-        "JARVIS_CONVERSATIONAL_MODE_ENABLED", "",
+        "JARVIS_CONVERSATIONAL_MODE_ENABLED", "1",
     ).strip().lower() in _TRUTHY
 
 
@@ -524,6 +524,132 @@ class ChatReplDispatcher:
         return None
 
 
+# ---------------------------------------------------------------------------
+# LoggingChatActionExecutor — Slice 4 graduation safe-default
+# ---------------------------------------------------------------------------
+
+
+class LoggingChatActionExecutor:
+    """Safe-default executor: logs each invocation + returns a synthetic
+    pseudo-id token so the dispatcher's audit trail is complete, but
+    DOES NOT call into the live FSM (no backlog write, no subagent
+    spawn, no Claude query).
+
+    This is the executor wired by :func:`build_chat_repl_dispatcher`
+    when graduation flips the master flag default-true. Concrete
+    executors that hit real backlog ingestion / subagent_scheduler /
+    Claude provider are tracked as **follow-up slices** — wiring those
+    crosses authority boundaries that need their own pin suites.
+
+    Operator value at graduation:
+      * Natural-language understood + classified + visible in
+        ``/chat history``.
+      * Decisions audited to ConversationBridge (already wired).
+      * Verdict reasons inspectable via ``/chat why <turn-id>``.
+      * Hot-revert proven (master-off → factory returns ``None``).
+
+    The contract preserves the ChatActionExecutor Protocol: every
+    method returns a short status string starting with ``logged-`` so
+    operators (and tests) can detect this is the safe-default rather
+    than a wired side-effecting executor.
+    """
+
+    LABEL_PREFIX: str = "logged-"
+
+    def __init__(self) -> None:
+        self.calls: List[str] = []  # for tests + operator audit
+
+    def dispatch_backlog(self, message: str, turn: ChatTurn) -> str:
+        token = f"{self.LABEL_PREFIX}backlog-{turn.turn_id}"
+        self.calls.append(token)
+        logger.info(
+            "[LoggingExecutor] backlog op_id=%s msg=%r",
+            turn.turn_id, message[:120],
+        )
+        return token
+
+    def spawn_subagent(self, message: str, turn: ChatTurn) -> str:
+        token = f"{self.LABEL_PREFIX}subagent-{turn.turn_id}"
+        self.calls.append(token)
+        logger.info(
+            "[LoggingExecutor] subagent op_id=%s msg=%r",
+            turn.turn_id, message[:120],
+        )
+        return token
+
+    def query_claude(
+        self,
+        message: str,
+        turn: ChatTurn,
+        recent_turns: List[ChatTurn],
+    ) -> str:
+        token = (
+            f"{self.LABEL_PREFIX}claude-{turn.turn_id}"
+            f"(ctx={len(recent_turns)})"
+        )
+        self.calls.append(token)
+        logger.info(
+            "[LoggingExecutor] claude op_id=%s ctx_turns=%d msg=%r",
+            turn.turn_id, len(recent_turns), message[:120],
+        )
+        return token
+
+    def attach_context(
+        self,
+        message: str,
+        turn: ChatTurn,
+        target_turn: ChatTurn,
+    ) -> str:
+        token = (
+            f"{self.LABEL_PREFIX}attach-{turn.turn_id}"
+            f"->{target_turn.turn_id}"
+        )
+        self.calls.append(token)
+        logger.info(
+            "[LoggingExecutor] attach op_id=%s target=%s msg=%r",
+            turn.turn_id, target_turn.turn_id, message[:120],
+        )
+        return token
+
+
+# ---------------------------------------------------------------------------
+# Slice 4 graduation factory
+# ---------------------------------------------------------------------------
+
+
+def build_chat_repl_dispatcher(
+    *,
+    orchestrator: Optional[ConversationOrchestrator] = None,
+    executor: Optional[ChatActionExecutor] = None,
+    default_session_id: str = DEFAULT_SESSION_ID,
+) -> Optional[ChatReplDispatcher]:
+    """Slice 4 graduation factory.
+
+    Returns a wired :class:`ChatReplDispatcher` when
+    ``JARVIS_CONVERSATIONAL_MODE_ENABLED`` is truthy (default **true**
+    post-graduation). Returns ``None`` when reverted so SerpentFlow
+    callers can skip surfacing ``/chat`` entirely.
+
+    The default executor is the safe-default
+    :class:`LoggingChatActionExecutor` — it logs each invocation +
+    returns a synthetic id but does NOT touch the live FSM. Concrete
+    executors against backlog / subagent / Claude are deferred to
+    follow-up slices (cross-authority wiring needs its own pin
+    suites).
+
+    Hot-revert: ``JARVIS_CONVERSATIONAL_MODE_ENABLED=false`` and the
+    next factory call returns ``None`` — orchestrator + bridge state
+    remain inspectable for prior-decision recall (mirrors the P3
+    factory pattern)."""
+    if not is_enabled():
+        return None
+    return ChatReplDispatcher(
+        orchestrator=orchestrator,
+        executor=executor or LoggingChatActionExecutor(),
+        default_session_id=default_session_id,
+    )
+
+
 __all__ = [
     "ChatActionExecutor",
     "ChatReplDispatcher",
@@ -532,7 +658,9 @@ __all__ = [
     "DEFAULT_SESSION_ID",
     "HISTORY_DEFAULT_N",
     "HISTORY_MAX_N",
+    "LoggingChatActionExecutor",
     "MAX_RENDERED_BYTES",
+    "build_chat_repl_dispatcher",
     "is_enabled",
     "render_decision",
     "render_help",
