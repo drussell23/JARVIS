@@ -445,6 +445,73 @@ class _PreloadedExplorationRecord:
         self.status = "success"
 
 
+def _inject_postmortem_recall_impl(
+    ctx: OperationContext,
+) -> OperationContext:
+    """Inject prior-op POSTMORTEM lessons into ``ctx.strategic_memory_prompt``.
+
+    Extracted from ``_run_pipeline`` for testability (mirrors the
+    ``_inject_last_session_summary_impl`` pattern). Zero behavioral change
+    vs. the inline block: looks up POSTMORTEMs from prior sessions whose
+    op_signature is similar to the current op's signature (file paths +
+    descriptive intent) and injects up to ``top_k`` lessons into the prompt
+    as the "## Lessons from prior similar ops" section.
+
+    Authority invariant per PRD §12.2: read-only, best-effort, never blocks
+    the FSM. Master flag default-off (``JARVIS_POSTMORTEM_RECALL_ENABLED``).
+    When off this is byte-for-byte pre-P0 behavior. ``PostmortemRecallService``
+    itself returns ``[]`` cleanly on any failure path; this wrapper additionally
+    swallows any exception and emits a DEBUG breadcrumb.
+
+    Closes the rooted "system has perfect memory and zero recall" gap from
+    PRD §4.2 Shallow #2 — P0 of PRD Phase 1.
+    """
+    try:
+        from backend.core.ouroboros.governance.postmortem_recall import (
+            get_default_service as _get_pm_recall,
+            render_recall_section as _render_pm_recall,
+        )
+        _pm_svc = _get_pm_recall()
+        if _pm_svc is not None:
+            _pm_target_files = ", ".join(
+                sorted((ctx.target_files or ()))[:5]
+            )
+            _pm_op_signature = (
+                f"description={(ctx.description or '')[:200]} | "
+                f"files={_pm_target_files}"
+            )
+            _pm_matches = _pm_svc.recall_for_op(_pm_op_signature)
+            _pm_section = _render_pm_recall(_pm_matches)
+            if _pm_section:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=ctx.strategic_intent_id or "pm-recall-p0",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=(
+                        _existing + "\n\n" + _pm_section
+                        if _existing else _pm_section
+                    ),
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.info(
+                    "[PostmortemRecall] op=%s enabled=true matched=%d "
+                    "inject_site=context_expansion (P0 — PRD Phase 1)",
+                    ctx.op_id, len(_pm_matches),
+                )
+            else:
+                logger.debug(
+                    "[PostmortemRecall] op=%s no matches "
+                    "inject_site=context_expansion",
+                    ctx.op_id,
+                )
+    except Exception:
+        logger.debug(
+            "[Orchestrator] PostmortemRecall injection skipped",
+            exc_info=True,
+        )
+    return ctx
+
+
 def _plan_review_required() -> bool:
     """Return True when the session requires pre-execution plan review."""
     return (
@@ -1819,62 +1886,11 @@ class GovernedOrchestrator:
                 )
 
             # ---- P0 PostmortemRecall (PRD Phase 1): prior-op lessons ----
-            # Closes the rooted "system has perfect memory and zero recall"
-            # gap from PRD §4.2 Shallow #2. Looks up POSTMORTEMs from prior
-            # sessions whose op_signature is similar to the current op's
-            # signature (file paths + descriptive intent) and injects up to
-            # top_k lessons into the prompt as "## Lessons from prior similar
-            # ops" section.
-            #
-            # Authority invariant per PRD §12.2: read-only, best-effort, never
-            # blocks the FSM. Master flag default-off
-            # (`JARVIS_POSTMORTEM_RECALL_ENABLED=true` to enable). When off
-            # this is byte-for-byte pre-P0 behavior. PostmortemRecallService
-            # itself returns [] cleanly on any failure path.
-            try:
-                from backend.core.ouroboros.governance.postmortem_recall import (
-                    get_default_service as _get_pm_recall,
-                    render_recall_section as _render_pm_recall,
-                )
-                _pm_svc = _get_pm_recall()
-                if _pm_svc is not None:
-                    # Build the op signature: target_files + description.
-                    _pm_target_files = ", ".join(
-                        sorted((ctx.target_files or ()))[:5]
-                    )
-                    _pm_op_signature = (
-                        f"description={(ctx.description or '')[:200]} | "
-                        f"files={_pm_target_files}"
-                    )
-                    _pm_matches = _pm_svc.recall_for_op(_pm_op_signature)
-                    _pm_section = _render_pm_recall(_pm_matches)
-                    if _pm_section:
-                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
-                        ctx = ctx.with_strategic_memory_context(
-                            strategic_intent_id=ctx.strategic_intent_id or "pm-recall-p0",
-                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
-                            strategic_memory_prompt=(
-                                _existing + "\n\n" + _pm_section
-                                if _existing else _pm_section
-                            ),
-                            strategic_memory_digest=ctx.strategic_memory_digest,
-                        )
-                        logger.info(
-                            "[PostmortemRecall] op=%s enabled=true matched=%d "
-                            "inject_site=context_expansion (P0 — PRD Phase 1)",
-                            ctx.op_id, len(_pm_matches),
-                        )
-                    else:
-                        logger.debug(
-                            "[PostmortemRecall] op=%s no matches "
-                            "inject_site=context_expansion",
-                            ctx.op_id,
-                        )
-            except Exception:
-                logger.debug(
-                    "[Orchestrator] PostmortemRecall injection skipped",
-                    exc_info=True,
-                )
+            # Helper extraction mirrors LSS pattern (testability per PRD §11
+            # Layer 3 reachability supplement, W3(6) precedent). Body lives at
+            # module scope as `_inject_postmortem_recall_impl`. ConversationBridge
+            # → PostmortemRecall → SemanticIndex ordering preserved.
+            ctx = _inject_postmortem_recall_impl(ctx)
 
             # ---- SemanticIndex v0.1: recency-weighted focus + closures ----
             # Soft semantic prior drawn from the recency-weighted centroid

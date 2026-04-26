@@ -590,14 +590,20 @@ def test_pin_orchestrator_invokes_recall_at_context_expansion() -> None:
 
 
 def test_pin_orchestrator_recall_after_conversation_bridge() -> None:
-    """Sequence pin: PostmortemRecall block appears AFTER ConversationBridge
-    block (matches the ordering established in CONTEXT_EXPANSION)."""
+    """Sequence pin: PostmortemRecall call site AFTER ConversationBridge.
+
+    Updated post-extraction (mirrors LSS pattern). The PostmortemRecall body
+    now lives in module-level helper ``_inject_postmortem_recall_impl``;
+    sequencing is enforced at the call site in ``_run_pipeline`` rather than
+    log-string position. The ConversationBridge inline block remains in
+    ``_run_pipeline`` (no extraction yet) — its log-string is the anchor.
+    """
     src = _read("backend/core/ouroboros/governance/orchestrator.py")
     bridge_idx = src.find("ConversationBridge injection skipped")
-    recall_idx = src.find("PostmortemRecall injection skipped")
+    recall_call_idx = src.find("ctx = _inject_postmortem_recall_impl(ctx)")
     assert bridge_idx > 0, "ConversationBridge marker missing"
-    assert recall_idx > 0, "PostmortemRecall marker missing"
-    assert bridge_idx < recall_idx, (
-        "PostmortemRecall must inject AFTER ConversationBridge "
-        "(per CONTEXT_EXPANSION ordering)"
+    assert recall_call_idx > 0, "PostmortemRecall call site missing"
+    assert bridge_idx < recall_call_idx, (
+        "PostmortemRecall call site must follow ConversationBridge inline "
+        "block (per CONTEXT_EXPANSION ordering)"
     )

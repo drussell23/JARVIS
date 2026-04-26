@@ -230,15 +230,41 @@ def test_pin_orchestrator_wiring_at_context_expansion() -> None:
 
 
 def test_pin_orchestrator_recall_after_conversation_bridge() -> None:
-    """Sequence pin: PostmortemRecall block AFTER ConversationBridge block."""
+    """Sequence pin: PostmortemRecall call site AFTER ConversationBridge block.
+
+    Updated post-extraction (mirrors LSS pattern). The PostmortemRecall body
+    now lives in module-level helper ``_inject_postmortem_recall_impl``;
+    sequencing is enforced at the call site in ``_run_pipeline`` rather than
+    log-string position. The ConversationBridge inline block remains in
+    ``_run_pipeline`` (no extraction yet) — its log-string is the anchor.
+    """
     src = _read("backend/core/ouroboros/governance/orchestrator.py")
     bridge_idx = src.find("ConversationBridge injection skipped")
-    recall_idx = src.find("PostmortemRecall injection skipped")
+    recall_call_idx = src.find("ctx = _inject_postmortem_recall_impl(ctx)")
     assert bridge_idx > 0, "ConversationBridge marker missing"
-    assert recall_idx > 0, "PostmortemRecall marker missing"
-    assert bridge_idx < recall_idx, (
-        "PostmortemRecall must inject AFTER ConversationBridge "
-        "(per CONTEXT_EXPANSION ordering)"
+    assert recall_call_idx > 0, "PostmortemRecall call site missing"
+    assert bridge_idx < recall_call_idx, (
+        "PostmortemRecall call site must follow ConversationBridge inline "
+        "block (per CONTEXT_EXPANSION ordering)"
+    )
+
+
+def test_pin_postmortem_recall_helper_extracted() -> None:
+    """Helper extraction pin (mirrors LSS): the body lives at module scope.
+
+    Mirror of ``test_last_session_summary_v1_1a`` AST regression. Extracting
+    the body makes CONTEXT_EXPANSION reachable from a deterministic in-process
+    smoke (W3(6) reachability supplement precedent — used when live cadence
+    can't reliably exercise the wiring within the wall cap).
+    """
+    src = _read("backend/core/ouroboros/governance/orchestrator.py")
+    # Helper defined at module scope
+    assert "def _inject_postmortem_recall_impl(" in src, (
+        "Helper signature missing — wire moved or unextracted"
+    )
+    # Helper invoked exactly once from the pipeline (idempotent integration)
+    assert src.count("_inject_postmortem_recall_impl(ctx)") >= 1, (
+        "Helper not invoked from the pipeline"
     )
 
 
