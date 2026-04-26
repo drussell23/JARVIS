@@ -630,6 +630,56 @@ class PLANRunner(PhaseRunner):
         except Exception:
             logger.debug("[Orchestrator] Tier 5 injection failed", exc_info=True)
 
+        # ── Phase 5 P5: AdversarialReviewer pre-GENERATE injection ──
+        # Hook deferred from P5 Slice 5 graduation; wires the
+        # adversarial-review pipeline into the orchestrator's post-
+        # PLAN/pre-GENERATE site. Hook is best-effort + the underlying
+        # service has 6 skip paths (master_off / safe_auto / empty_plan
+        # / no_provider / provider_error / budget_exhausted), so this
+        # NEVER raises and NEVER blocks. PLAN authority is preserved by
+        # construction — the hook returns text only, never gates.
+        try:
+            from backend.core.ouroboros.governance.adversarial_reviewer_hook import (
+                review_plan_for_generate_injection,
+            )
+            _adv_plan_text = getattr(ctx, "implementation_plan", "") or ""
+            _adv_risk_name = (
+                ctx.risk_tier.name if ctx.risk_tier is not None else None
+            )
+            _adv_injection = review_plan_for_generate_injection(
+                op_id=ctx.op_id,
+                plan_text=_adv_plan_text,
+                target_files=ctx.target_files or (),
+                risk_tier_name=_adv_risk_name,
+            )
+            if _adv_injection.injection_text:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=_existing + "\n\n" + _adv_injection.injection_text,
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.info(
+                    "[Orchestrator] AdversarialReviewer: %d findings injected for "
+                    "op=%s (bridge_fed=%s)",
+                    len(_adv_injection.review.findings),
+                    ctx.op_id,
+                    _adv_injection.bridge_fed,
+                )
+            elif _adv_injection.review.was_skipped:
+                logger.debug(
+                    "[Orchestrator] AdversarialReviewer skipped for op=%s: %s",
+                    ctx.op_id, _adv_injection.review.skip_reason,
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug(
+                "[Orchestrator] AdversarialReviewer hook injection failed",
+                exc_info=True,
+            )
+
         # ── JARVIS Tier 6: Personality voice line ── (reads _advisory from CLASSIFY)
         _gls = getattr(orch._stack, "governed_loop_service", None)
         if _gls is not None:
