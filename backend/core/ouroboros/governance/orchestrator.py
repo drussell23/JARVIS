@@ -472,7 +472,17 @@ def _inject_postmortem_recall_impl(
             render_recall_section as _render_pm_recall,
         )
         _pm_svc = _get_pm_recall()
-        if _pm_svc is not None:
+        if _pm_svc is None:
+            # Master flag off: emit observability breadcrumb so live-cadence
+            # graduation can distinguish "helper ran with master off" from
+            # "helper never ran". Mirrors LSS / ConversationBridge / SemanticIndex
+            # disabled-state breadcrumbs (uniform CONTEXT_EXPANSION audit).
+            logger.debug(
+                "[PostmortemRecall] op=%s enabled=false "
+                "inject_site=context_expansion",
+                ctx.op_id,
+            )
+        else:
             _pm_target_files = ", ".join(
                 sorted((ctx.target_files or ()))[:5]
             )
@@ -500,7 +510,7 @@ def _inject_postmortem_recall_impl(
                 )
             else:
                 logger.debug(
-                    "[PostmortemRecall] op=%s no matches "
+                    "[PostmortemRecall] op=%s enabled=true matched=0 "
                     "inject_site=context_expansion",
                     ctx.op_id,
                 )
