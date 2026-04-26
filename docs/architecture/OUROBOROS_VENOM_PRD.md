@@ -135,6 +135,85 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
 
 Update discipline: each closing slice updates this section in the same PR. Status is the source of truth for "what's next" — when in doubt, the lowest-numbered `[ ]` row in the lowest-numbered active phase is the next slice.
 
+### Forward-Looking Priority Roadmap (chronological, impact-weighted)
+
+This section is the **canonical "what's next" ordering** for everything still on the board after Phase 3's full graduation (2026-04-26). Each item is scored by:
+- **Impact**: how much the operator-visible system improves once the item lands.
+- **Dependency depth**: how many downstream items it unblocks (a high-leverage prerequisite outranks a high-impact terminal).
+- **Cost-of-delay**: how stale / load-bearing the item becomes if deferred (Order-2 governance designed against a moving Order-1 target ages badly).
+- **Risk surface**: novel cognitive layers (P5/P6/Pass C) ship safer when the measurement substrate (P4) is in place to detect regressions.
+
+The list below resolves the four-way ordering for: **P4** (Convergence metrics), **P5** (Adversarial reviewer), **P6** (Self-narrative), **Reverse Russian Doll Pass B** (Order-2 governance), **Reverse Russian Doll Pass C** (Adaptive Anti-Venom). Anything not in this list is either complete or out of scope.
+
+---
+
+#### Priority 1 — Phase 4 P4: Convergence metrics suite ⭐ **NEXT**
+
+**Why first**: foundational — everything below this line needs measurable convergence to claim it worked.
+
+- **Impact (high)**: replaces `convergence_state: "INSUFFICIENT_DATA"` (the most-cited "unprovable" gap in the RSI claim) with 7 concrete metrics + Wang's composite score. Operator gets `/metrics 7d`, IDE GET `/observability/metrics`, SSE `metrics_updated` event. Every `summary.json` gets a `metrics: {…}` block.
+- **Dependency leverage (highest)**: unblocks P5 (need metrics to validate that AdversarialReviewer findings actually move the score) and P6 (self-narrative needs metric history to narrate). Also un-strands the existing `composite_score.py` + `convergence_tracker.py` primitives (305 + 354 LOC already on disk, currently unsurfaced).
+- **Cost of delay (high)**: every Phase 5/6 PR shipped without P4 gets a "did this actually help?" question we can't answer. Ad-hoc metrics added later won't be cross-comparable to the framework spec.
+- **Risk (low)**: pure observability layer. No authority crossings. Hot-revert single env knob. Mirrors Phase 4 P3 cognitive_metrics graduation pattern (proven 2026-04-26).
+- **Scope**: 5 slices (~1,230 LOC + ~145 tests + graduation pins + live-fire). See §9 P4.
+- **Status**: 📋 plan briefed; Slice 1 (`metrics_engine.py` primitive) starting.
+
+#### Priority 2 — Phase 5 P5: AdversarialReviewer subagent
+
+**Why second**: highest-impact NEW cognitive layer the system can grow once measurable.
+
+- **Impact (high)**: closes the "Iron Gate enforces hygiene; SemanticGuardian matches patterns; *neither thinks adversarially*" gap. AdversarialReviewer activates post-PLAN/pre-GENERATE, prompted as "find at least 3 failure modes," structured findings injected into GENERATE prompt as `Reviewer raised:`. Catches the class of bug that passes static analysis + tests but fails on a thoughtful read.
+- **Dependency leverage (medium)**: P4 metrics let us prove AdversarialReviewer findings → composite score moves up. Without P4 baseline this is unprovable folklore.
+- **Cost of delay (medium)**: the system is currently shipping plans that escape adversarial review entirely; deferring keeps a known cognitive gap open.
+- **Risk (medium-high)**: novel side-stream Claude call (cost-budgeted at $0.05/op default). Reviewer hallucinations are a real failure mode (must reference specific files; ungrounded findings filtered). Telemetry-heavy.
+- **Scope**: ~1,000 LOC + 40 tests per PRD §9; will need 4-5 sub-slices: (1) `adversarial_reviewer.py` primitive (Tier -1 sanitized findings JSON), (2) Claude side-stream caller + cost budget enforcement, (3) GENERATE-prompt injection wiring, (4) telemetry + REPL surface, (5) graduation.
+- **Status**: ❌ not started (PRD §9 P5 spec landed; no code yet).
+
+#### Priority 3 — Reverse Russian Doll Pass B: Order-2 governance (Order-1 freeze)
+
+**Why third (not last)**: must land *before* Pass C and *after* Phase 5 to avoid designing the meta-layer against a moving target — but should NOT wait for Phase 6.
+
+- **Impact (high)**: introduces the **Order-2** vocabulary into the live system: `MetaPhaseRunner` + Order-2 manifest + `ORDER_2_GOVERNANCE` risk class + AST validator + shadow replay + locked-true amendment protocol. Distinguishes "the FSM ran a phase" (Order-1) from "the rules-of-the-FSM changed" (Order-2). This is the architectural prerequisite for Pass C (adaptive Anti-Venom).
+- **Dependency leverage (high)**: Pass C is **strictly blocked** on Pass B Slice 1 (`MetaPhaseRunner` primitive). Without Pass B, Anti-Venom adaptation has nowhere to live.
+- **Cost of delay (medium-high)**: current chronic blocker is W2(5) Slice 5b graduation, which is itself held on operator decision. Status from `memory/project_reverse_russian_doll_pass_b.md`: "DRAFT (held on W2(5) Slice 5b)." When W2(5) Slice 5b unblocks, Pass B becomes immediately actionable.
+- **Risk (high)**: this is the highest-stakes architectural change since Iron Gate. Touches the FSM control flow. Pass B's **monotonic-tightening invariant** + **operator-approval-required for all Order-2 amendments** keep it safe, but the design surface is large (6 slices, all defaults false).
+- **Scope**: 6 slices per `memory/project_reverse_russian_doll_pass_b.md` draft.
+- **Status**: 📋 DESIGN COMPLETE; **execution held on W2(5) Slice 5b graduation** (current blocker).
+- **Recommended ordering knob**: if W2(5) Slice 5b unblocks **before** Phase 5 completes, Pass B Slice 1 (lowest-risk slice — primitive only) can run in parallel with the tail Phase 5 slices. Else hold strictly serial.
+
+#### Priority 4 — Reverse Russian Doll Pass C: Adaptive Anti-Venom
+
+**Why fourth**: this is **the** novel architectural contribution per `memory/project_reverse_russian_doll_pass_a.md` ("Anti-Venom adaptive thesis is genuinely novel"). It must wait for Pass B's primitives.
+
+- **Impact (highest long-term, lowest short-term)**: the system **adapts its own gates** within bounds — `AdaptationLedger` + 5 surfaces (SemanticGuardian patterns, IronGate floors, per-Order budgets, risk-tier ladder, ExplorationLedger weights) + `MetaAdaptationGovernor`. This is the closest existing item to genuine RSI: not just *measuring* convergence (P4) but *responding to it by tightening rules*. Per `memory/project_reverse_russian_doll_pass_c.md`: "monotonic-tightening invariant; operator-approval required; zero-LLM in cage." The "zero-LLM in cage" constraint is what makes it provably safe.
+- **Dependency leverage (none — terminal)**: nothing downstream depends on Pass C in the current PRD. It's the **endgame** of the cognitive-substrate work.
+- **Cost of delay (low)**: every other item in this list ships value before Pass C. Pass C is the multiplicative finisher, not a prerequisite for anything else.
+- **Risk (highest)**: the system actively rewrites its own governance gates. The full safety stack (monotonic-tightening invariant + operator-approval per amendment + zero-LLM-in-cage + AdaptationLedger immutable audit) is what makes this defensible — but every safety pin must hold under live operation.
+- **Scope**: 6 slices per `memory/project_reverse_russian_doll_pass_c.md` draft.
+- **Status**: 📋 DESIGN COMPLETE; **strictly blocked on Pass B Slice 1** (needs `MetaPhaseRunner` primitive + Order-2 manifest infrastructure).
+
+#### Priority 5 — Phase 6 P6: Behavior summarizer + self-narrative
+
+**Why last (not lowest impact — longest horizon)**: PRD §9 P6 explicitly tags this as **"target: 3–6 months, long-horizon"**. The reason is depth, not lack of value: self-narrative requires sustained metric history (P4) + adversarial-finding history (P5) + Order-2 amendment history (Pass B/C) to have anything substantial to narrate.
+
+- **Impact (medium-high but slow-burning)**: system gets a model of its own behavior over time. Operator + audit get a "who is this AI becoming?" view that's grounded in actual data, not anthropomorphism.
+- **Dependency leverage (low)**: nothing else depends on P6.
+- **Cost of delay (low)**: per the PRD's own 3-6 month horizon, this is intentionally back-loaded.
+- **Risk (medium)**: surface is small but the failure mode (self-narrative drifting from actual behavior, becoming hallucinated) requires careful pinning. Easier once P4 metrics provide ground truth.
+- **Status**: ❌ not started; do not start until P4 + P5 are graduated.
+
+---
+
+#### Cross-priority sequencing rules (binding)
+
+1. **Never ship Pass C before Pass B Slice 1.** Pass C has zero abstraction layer to live on without `MetaPhaseRunner`.
+2. **Never ship Pass B before W2(5) Slice 5b graduates.** Operator binding from `feedback_wave_1_closure_and_slice5_policy.md`: "no Wave 2 work until Slice 5 merged or reprioritized."
+3. **P4 first, always.** Every novel cognitive layer (P5, Pass B, Pass C, P6) needs the metric substrate to claim it worked.
+4. **P5 before Pass B/C** when possible — same authority class (cognitive enhancement) and adversarial findings + metrics are natural inputs to `MetaAdaptationGovernor`'s "should we tighten?" decision.
+5. **P6 after the adaptive substrate exists.** Narrating a system that doesn't adapt is less interesting than narrating one that does.
+
+The "lowest-numbered `[ ]` row" heuristic (above) still applies *within* a phase. This priority list is the **between-phase** ordering when multiple phases are simultaneously eligible.
+
 ---
 
 ## 2. Vision Statement
