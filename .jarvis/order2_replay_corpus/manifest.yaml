@@ -1,0 +1,33 @@
+# RR Pass B Slice 4 — shadow-replay corpus manifest
+#
+# Curated set of completed Order-1 ops used by Slice 5
+# MetaPhaseRunner to verify that O+V's proposed PhaseRunner
+# subclasses produce byte-identical decisions on golden corpus
+# data (per Pass B §6).
+#
+# Slice 4 SHIPS THIS FILE WITH ONE SYNTHETIC SEED ENTRY.
+# The seed proves the file format works; the full ~20-op corpus
+# (5 happy-path single-file, 5 multi-file, 5 retry/L2, 3 ORANGE-tier,
+# 2 with semantic-firewall hits per Pass B §6.2) is operational
+# work to populate as Slice 5+ goes live.
+#
+# Amendment policy (Pass B Slice 6, when implemented):
+#   * Adding/removing/replacing corpus ops is itself an Order-2
+#     manifest amendment (Pass B §6.5). Bypass would defeat the
+#     cage: a candidate runner could pass against a smaller,
+#     more permissive corpus.
+#   * AutoCommitter trailer: Order-2-Authorized-By: <operator>
+#   * No SAFE_AUTO eligibility ever
+#
+# Initial seed entry per Pass B §6.
+
+schema_version: 1
+
+entries:
+  # SEED — synthetic example proving the file format. Slice 5+
+  # will replace this with real session ctx snapshots curated from
+  # the battle-test breakthrough log.
+  - op_id: seed-synthetic-noop
+    path: ops/seed-synthetic-noop
+    phases: [classify]
+    tags: [seed, synthetic, file-format-proof]

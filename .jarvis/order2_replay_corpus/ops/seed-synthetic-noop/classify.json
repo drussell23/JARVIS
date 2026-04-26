@@ -1,0 +1,19 @@
+{
+  "_comment": "RR Pass B Slice 4 seed snapshot. Synthetic — proves the file format. Slice 5+ replaces with real session ctx data.",
+  "pre_phase_ctx": {
+    "op_id": "seed-synthetic-noop",
+    "phase": "CLASSIFY",
+    "target_files": ["backend/example.py"],
+    "description": "synthetic seed for shadow-replay file format proof"
+  },
+  "expected_next_phase": "ROUTE",
+  "expected_status": "ok",
+  "expected_reason": null,
+  "expected_next_ctx": {
+    "op_id": "seed-synthetic-noop",
+    "phase": "ROUTE",
+    "risk_tier": "SAFE_AUTO",
+    "target_files": ["backend/example.py"],
+    "candidate_files": []
+  }
+}
