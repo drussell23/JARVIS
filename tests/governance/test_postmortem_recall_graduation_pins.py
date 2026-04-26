@@ -34,20 +34,23 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def test_master_flag_default_false_pre_graduation(
+def test_master_flag_default_true_post_graduation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """JARVIS_POSTMORTEM_RECALL_ENABLED defaults False until P0 graduation
-    cadence completes (3 clean live sessions per PRD §11 Layer 4).
+    """JARVIS_POSTMORTEM_RECALL_ENABLED defaults True post-graduation
+    (2026-04-26, reachability supplement per PRD §11 Layer 3 / W3(6)
+    precedent — see graduation flip PR).
 
-    If this test fails AND P0 has been graduated: rename to
-    test_master_flag_default_true_post_graduation, update assertion,
-    update the env-reader source-grep pin in (F)."""
+    Hot-revert: set ``JARVIS_POSTMORTEM_RECALL_ENABLED=false`` in the
+    environment to restore pre-graduation behavior. If this test fails
+    AND the flip is being intentionally rolled back: rename to
+    test_master_flag_default_false_pre_graduation, flip the assertion,
+    and update the env-reader source-grep pin in (F)."""
     monkeypatch.delenv("JARVIS_POSTMORTEM_RECALL_ENABLED", raising=False)
     from backend.core.ouroboros.governance.postmortem_recall import is_enabled
-    assert is_enabled() is False, (
-        "Pre-graduation default is False. If P0 has been graduated, update "
-        "this pin to assert True."
+    assert is_enabled() is True, (
+        "Post-graduation default is True. If P0 has been rolled back, update "
+        "this pin to assert False."
     )
 
 
@@ -184,15 +187,16 @@ def test_jsonl_schema_version_frozen_at_postmortem_recall_1() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_pin_master_env_reader_default_false_literal() -> None:
-    """The is_enabled() reader literal-defaults to False (pre-graduation).
+def test_pin_master_env_reader_default_true_literal() -> None:
+    """The is_enabled() reader literal-defaults to True (post-graduation).
 
-    Slice flip will change this to True in a single commit."""
+    Graduated 2026-04-26. Hot-revert: change to ``False`` in the source +
+    rename this pin back to test_pin_master_env_reader_default_false_literal."""
     src = _read("backend/core/ouroboros/governance/postmortem_recall.py")
-    assert '_env_bool("JARVIS_POSTMORTEM_RECALL_ENABLED", False)' in src, (
+    assert '_env_bool("JARVIS_POSTMORTEM_RECALL_ENABLED", True)' in src, (
         "Master flag default literal moved or changed. If P0 has been "
-        "graduated, update both the source and this pin (rename to "
-        "test_pin_master_env_reader_default_true_literal)."
+        "rolled back, update both the source and this pin (rename to "
+        "test_pin_master_env_reader_default_false_literal)."
     )
 
 

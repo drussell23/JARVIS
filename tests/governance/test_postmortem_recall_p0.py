@@ -22,14 +22,25 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def test_master_flag_default_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    """JARVIS_POSTMORTEM_RECALL_ENABLED defaults false (PRD §17 default-off)."""
+def test_master_flag_default_true_post_graduation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JARVIS_POSTMORTEM_RECALL_ENABLED defaults true post-graduation
+    (2026-04-26). Hot-revert: set the env to "false"."""
     monkeypatch.delenv("JARVIS_POSTMORTEM_RECALL_ENABLED", raising=False)
+    from backend.core.ouroboros.governance.postmortem_recall import is_enabled
+    assert is_enabled() is True
+
+
+def test_master_flag_explicit_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hot-revert path: explicit false disables post-graduation."""
+    monkeypatch.setenv("JARVIS_POSTMORTEM_RECALL_ENABLED", "false")
     from backend.core.ouroboros.governance.postmortem_recall import is_enabled
     assert is_enabled() is False
 
 
 def test_master_flag_explicit_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Idempotent: explicit true matches the new default."""
     monkeypatch.setenv("JARVIS_POSTMORTEM_RECALL_ENABLED", "true")
     from backend.core.ouroboros.governance.postmortem_recall import is_enabled
     assert is_enabled() is True
@@ -529,10 +540,13 @@ def test_pin_module_exists() -> None:
     assert "def render_recall_section" in src
 
 
-def test_pin_master_flag_default_off() -> None:
-    """Default-off discipline per PRD §17."""
+def test_pin_master_flag_default_on_post_graduation() -> None:
+    """Post-graduation default per the 2026-04-26 flip.
+
+    Hot-revert: change literal to ``False`` in source + flip this pin's
+    assertion back to test_pin_master_flag_default_off."""
     src = _read("backend/core/ouroboros/governance/postmortem_recall.py")
-    assert '_env_bool("JARVIS_POSTMORTEM_RECALL_ENABLED", False)' in src
+    assert '_env_bool("JARVIS_POSTMORTEM_RECALL_ENABLED", True)' in src
 
 
 def test_pin_no_authority_imports() -> None:
