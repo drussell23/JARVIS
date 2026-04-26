@@ -192,6 +192,49 @@ def _validate_routing_hint(raw: Any) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# P1 Slice 3 — auto_proposed second source (SelfGoalFormationEngine ledger)
+# ---------------------------------------------------------------------------
+#
+# When ``JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED=true``, BacklogSensor reads
+# the ``self_goal_formation_proposals.jsonl`` audit ledger as a second
+# input source. Each proposal becomes one IntentEnvelope with:
+#   * source = "auto_proposed"  (distinct from manual "backlog" entries)
+#   * evidence = {auto_proposed: True, signature_hash, cluster_member_count, rationale, ...}
+#   * requires_human_ack = True  (operator-review-required tier per PRD §9 P1)
+#
+# Default-off until Slice 5 graduation.
+
+# Cap on proposals emitted per scan — bounds the second source's
+# emission rate so a runaway engine cannot flood the intake queue.
+_MAX_PROPOSALS_PER_SCAN: int = 5
+
+# Cap on the number of ledger entries we scan per call (most-recent N).
+# Mirrors the postmortem-recall MAX_SCAN pattern; keeps the read bounded
+# even if the ledger grows beyond expectation.
+_MAX_LEDGER_ENTRIES_TO_SCAN: int = 200
+
+# Posture-to-urgency mapping for proposals. EXPLORE proposals come from
+# active development cycles → "normal". CONSOLIDATE proposals indicate
+# the operator wants to close threads → "high" so they surface ahead of
+# routine BG work.
+_POSTURE_URGENCY_MAP: Dict[str, str] = {
+    "EXPLORE": "normal",
+    "CONSOLIDATE": "high",
+}
+
+
+def _auto_proposed_enabled() -> bool:
+    """Master flag for the P1 Slice 3 auto_proposed second source.
+
+    Default ``false`` until Slice 5 graduation. When off, BacklogSensor
+    behaves byte-for-byte like pre-Slice-3 (manual backlog.json only)."""
+    raw = os.environ.get(
+        "JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 @dataclass
 class BacklogTask:
     task_id: str
@@ -233,6 +276,7 @@ class BacklogSensor:
         repo_root: Path,
         router: Any,
         poll_interval_s: float = 60.0,
+        proposals_ledger_path: Optional[Path] = None,
     ) -> None:
         self._backlog_path = backlog_path
         self._repo_root = repo_root
@@ -241,6 +285,15 @@ class BacklogSensor:
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
         self._seen_task_ids: set[str] = set()
+        # P1 Slice 3 — second-source: SelfGoalFormationEngine proposals
+        # JSONL ledger. Default path mirrors the engine's persistence
+        # default (.jarvis/self_goal_formation_proposals.jsonl).
+        self._proposals_ledger_path: Path = (
+            Path(proposals_ledger_path).resolve()
+            if proposals_ledger_path is not None
+            else (Path(repo_root) / ".jarvis"
+                  / "self_goal_formation_proposals.jsonl").resolve()
+        )
         # --- Gap #4 FS-event state (captured once so a runtime env flip
         # does not retroactively demote the poll loop; matches every
         # earlier sensor migration) ----------------------------------
@@ -249,7 +302,25 @@ class BacklogSensor:
         self._fs_events_ignored: int = 0
 
     async def scan_once(self) -> List[IntentEnvelope]:
-        """Run one scan. Returns list of envelopes produced and ingested."""
+        """Run one scan. Returns list of envelopes produced and ingested
+        across BOTH the manual ``backlog.json`` source and (P1 Slice 3,
+        when enabled via ``JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED``) the
+        ``SelfGoalFormationEngine`` proposals JSONL ledger.
+
+        The two scans are independent — a missing ``backlog.json`` does
+        not block the proposals scan, and vice versa — so operators can
+        rely on the auto-proposed pipeline even before they create their
+        first manual backlog entry."""
+        produced: List[IntentEnvelope] = []
+        produced.extend(await self._scan_backlog_json())
+        if _auto_proposed_enabled():
+            produced.extend(await self._scan_proposals_ledger())
+        return produced
+
+    async def _scan_backlog_json(self) -> List[IntentEnvelope]:
+        """Original ``scan_once`` body — reads ``backlog.json`` (manual
+        operator entries). Extracted in P1 Slice 3 so the proposals
+        ledger can run as a peer second source."""
         if not self._backlog_path.exists():
             return []
 
@@ -390,6 +461,130 @@ class BacklogSensor:
                 sorted(_VALID_ROUTING_HINTS),
             )
 
+        return produced
+
+    async def _scan_proposals_ledger(self) -> List[IntentEnvelope]:
+        """P1 Slice 3 — read the SelfGoalFormationEngine JSONL ledger as
+        a second input source.
+
+        Per-scan bounds (defense-in-depth on top of engine-side caps):
+          * Reads at most ``_MAX_LEDGER_ENTRIES_TO_SCAN`` most-recent rows.
+          * Emits at most ``_MAX_PROPOSALS_PER_SCAN`` envelopes.
+          * Skips any signature_hash already in ``_seen_task_ids`` so the
+            same proposal cannot fan out across multiple scans.
+
+        Best-effort: malformed lines / missing fields / missing files
+        return ``[]`` — never raises.
+        """
+        if not self._proposals_ledger_path.exists():
+            return []
+
+        try:
+            raw = self._proposals_ledger_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.debug(
+                "[BacklogSensor] auto_proposed: ledger read failed: %s", exc,
+            )
+            return []
+
+        lines = raw.splitlines()
+        # Most-recent N (ledger is append-only newest-last).
+        recent = lines[-_MAX_LEDGER_ENTRIES_TO_SCAN:]
+
+        produced: List[IntentEnvelope] = []
+        emitted_log_count = 0
+
+        for line in recent:
+            if len(produced) >= _MAX_PROPOSALS_PER_SCAN:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                draft = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                # Malformed line — skip silently (defensive: never abort
+                # on a bad row).
+                continue
+            if not isinstance(draft, dict):
+                continue
+
+            sig_hash = str(draft.get("signature_hash", "")).strip()
+            description = str(draft.get("description", "")).strip()
+            target_files_raw = draft.get("target_files", []) or []
+            if not (sig_hash and description and target_files_raw):
+                continue
+            # Dedup against the prefixed task_id form actually stored
+            # in _seen_task_ids on successful enqueue (below).
+            dedup_key = f"auto-proposed:{sig_hash}"
+            if dedup_key in self._seen_task_ids:
+                continue
+
+            target_files = tuple(
+                str(f) for f in target_files_raw if str(f).strip()
+            )
+            if not target_files:
+                continue
+
+            posture = str(draft.get("posture_at_proposal", "")).strip().upper()
+            urgency = _POSTURE_URGENCY_MAP.get(posture, "normal")
+
+            evidence: Dict[str, Any] = {
+                # Use signature_hash as both task_id (for sensor dedup) +
+                # signature (for downstream dedup keys).
+                "task_id": f"auto-proposed:{sig_hash}",
+                "signature": sig_hash,
+                "auto_proposed": True,
+                "signature_hash": sig_hash,
+                "cluster_member_count": int(
+                    draft.get("cluster_member_count", 0) or 0
+                ),
+                "rationale": str(draft.get("rationale", ""))[:500],
+                "posture_at_proposal": posture,
+                "schema_version": str(
+                    draft.get("schema_version", "self_goal_formation.1")
+                ),
+            }
+
+            envelope = make_envelope(
+                source="auto_proposed",
+                description=description,
+                target_files=target_files,
+                repo="jarvis",
+                confidence=0.6,
+                urgency=urgency,
+                evidence=evidence,
+                # Operator-review-required tier per PRD §9 P1: every
+                # auto-proposed entry must hit a human surface before
+                # the FSM auto-applies it.
+                requires_human_ack=True,
+            )
+
+            try:
+                result = await self._router.ingest(envelope)
+                if result == "enqueued":
+                    self._seen_task_ids.add(f"auto-proposed:{sig_hash}")
+                    produced.append(envelope)
+                    if emitted_log_count == 0:
+                        logger.info(
+                            "[BacklogSensor] auto_proposed: enqueued "
+                            "signature=%s description=%r posture=%s urgency=%s",
+                            sig_hash, description[:80], posture, urgency,
+                        )
+                    emitted_log_count += 1
+            except Exception:
+                logger.exception(
+                    "BacklogSensor: auto_proposed ingest failed for "
+                    "signature=%s",
+                    sig_hash,
+                )
+
+        if emitted_log_count > 1:
+            logger.info(
+                "[BacklogSensor] auto_proposed: %d total proposals enqueued "
+                "this scan",
+                emitted_log_count,
+            )
         return produced
 
     async def start(self) -> None:
