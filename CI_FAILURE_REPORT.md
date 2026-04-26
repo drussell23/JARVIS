@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: Environment Variable Validation
-- **Run Number**: #3979
-- **Branch**: `feat/p0-live-fire-graduation-prep-prd-status`
-- **Commit**: `9900fb0efc18a1f8958434f8ec8011176670591d`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #40563
+- **Branch**: `fix/ci/environment-variable-validation-run3979-20260426-003940`
+- **Commit**: `fbe07070effe7851b4e201d225fb74759c711d8d`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-26T00:37:29Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24944397868)
+- **Timestamp**: 2026-04-26T00:40:09Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24944441587)
 
 ## Failure Overview
 
@@ -17,49 +17,48 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate Environment Variables | permission_error | high | 14s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
-### 1. Validate Environment Variables
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-26T00:37:43Z
-**Completed**: 2026-04-26T00:37:57Z
-**Duration**: 14 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24944397868/job/73043188697)
+**Started**: 2026-04-26T00:40:12Z
+**Completed**: 2026-04-26T00:40:15Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24944441587/job/73043309863)
 
 #### Failed Steps
 
-- **Step 5**: Run Comprehensive Env Var Validation
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 51: `2026-04-26T00:37:55.0700017Z ##[error]Process completed with exit code 1.`
-
-- Pattern: `FAIL|Failed|failed`
   - Occurrences: 2
   - Sample matches:
-    - Line 24: `2026-04-26T00:37:55.0650424Z ❌ VALIDATION FAILED`
-    - Line 96: `2026-04-26T00:37:55.4105360Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 30: `2026-04-26T00:40:14.1310720Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-04-26T00:40:14.6414993Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Envi`
 
 - Pattern: `WARN|Warning|warning`
-  - Occurrences: 5
+  - Occurrences: 1
   - Sample matches:
-    - Line 29: `2026-04-26T00:37:55.0652370Z ⚠️  WARNINGS`
-    - Line 74: `2026-04-26T00:37:55.0882437Z   if-no-files-found: warn`
-    - Line 86: `2026-04-26T00:37:55.2844482Z ##[warning]No files were found with the provided path: /tmp/env_summary`
+    - Line 58: `2026-04-26T00:40:14.6856799Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -79,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-04-26T00:39:40.034731*
+📊 *Report generated on 2026-04-26T00:42:04.650206*
 🤖 *JARVIS CI/CD Auto-PR Manager*
