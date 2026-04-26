@@ -180,6 +180,14 @@ EVENT_TYPE_CANCEL_ORIGIN_EMITTED = "cancel_origin_emitted"
 # ``/observability/curiosity/<question_id>`` GET endpoint.
 EVENT_TYPE_CURIOSITY_QUESTION_EMITTED = "curiosity_question_emitted"
 
+# Phase 4 P4 Slice 4 — convergence metrics suite (PRD §9 P4). Payload:
+# ``{"session_id": str, "schema_version": int, "trend": str,
+# "composite_score_session_mean": float | None}``. Operators get a
+# live ping when a new MetricsSnapshot lands; the full record (all 7
+# metrics + sparkline-ready per-op composite list) lives at
+# ``/observability/metrics`` GET.
+EVENT_TYPE_METRICS_UPDATED = "metrics_updated"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -222,6 +230,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_MEMORY_FANOUT_DECISION,
     EVENT_TYPE_CANCEL_ORIGIN_EMITTED,  # W3(7) Slice 6
     EVENT_TYPE_CURIOSITY_QUESTION_EMITTED,  # W2(4) Slice 3
+    EVENT_TYPE_METRICS_UPDATED,  # Phase 4 P4 Slice 4
 })
 
 
