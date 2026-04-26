@@ -155,6 +155,22 @@ def min_cluster_size_override() -> int:
         return DEFAULT_MIN_CLUSTER_SIZE
 
 
+def hypothesis_pairing_enabled() -> bool:
+    """P1.5 Slice 2 — when on, the engine extends the model prompt to
+    also produce a paired Hypothesis (claim + expected_outcome) and
+    persists it to the HypothesisLedger.
+
+    GRADUATED 2026-04-26 (P1.5 Slice 2). Default: ``true`` post-graduation.
+    Hot-revert: ``export JARVIS_HYPOTHESIS_PAIRING_ENABLED=false`` →
+    engine emits ProposalDraft only (pre-Slice-2 behavior).
+
+    The hypothesis primitive itself (P1.5 Slice 1) is always available;
+    this flag controls only whether the engine writes to it."""
+    return os.environ.get(
+        "JARVIS_HYPOTHESIS_PAIRING_ENABLED", "true",
+    ).strip().lower() in _TRUTHY
+
+
 # Postures that are PERMITTED to propose self-formed goals. Per PRD §9
 # P1: "Posture must be EXPLORE or CONSOLIDATE". HARDEN / MAINTAIN veto.
 _PERMITTED_POSTURES: Tuple[Posture, ...] = (Posture.EXPLORE, Posture.CONSOLIDATE)
@@ -219,6 +235,10 @@ class ProposalDraft:
     cost_usd_spent: float
     timestamp_unix: float
     auto_proposed: bool = True
+    # P1.5 Slice 2 — paired Hypothesis id when JARVIS_HYPOTHESIS_PAIRING_ENABLED
+    # is on AND the model emitted a parseable hypothesis. None otherwise
+    # (back-compat with pre-Slice-2 ledger rows).
+    hypothesis_id: Optional[str] = None
 
     def to_ledger_dict(self) -> dict:
         d = asdict(self)
@@ -386,7 +406,9 @@ class SelfGoalFormationEngine:
         with self._lock:
             self._cost_spent_usd += call_cost_usd
 
-        description, rationale = self._parse_proposal(response_text)
+        description, rationale, claim, expected_outcome = (
+            self._parse_proposal(response_text)
+        )
         if not description:
             logger.debug(
                 "[SelfGoalFormation] short_circuit reason=model_returned_empty "
@@ -395,6 +417,24 @@ class SelfGoalFormationEngine:
             )
             return None
 
+        # P1.5 Slice 2 — when pairing enabled AND the model emitted a
+        # parseable hypothesis, persist it to HypothesisLedger BEFORE
+        # the ProposalDraft so the proposal can carry a stable
+        # hypothesis_id forward.
+        emitted_hypothesis_id: Optional[str] = None
+        if (
+            hypothesis_pairing_enabled()
+            and claim
+            and expected_outcome
+        ):
+            emitted_hypothesis_id = self._persist_hypothesis(
+                op_id=f"engine:{chosen.signature.signature_hash()}",
+                claim=claim,
+                expected_outcome=expected_outcome,
+                proposed_signature_hash=chosen.signature.signature_hash(),
+            )
+
+        proposal_ts = time.time()
         draft = ProposalDraft(
             schema_version=PROPOSAL_SCHEMA_VERSION,
             signature_hash=chosen.signature.signature_hash(),
@@ -405,8 +445,9 @@ class SelfGoalFormationEngine:
             rationale=rationale,
             posture_at_proposal=posture.value,
             cost_usd_spent=call_cost_usd,
-            timestamp_unix=time.time(),
+            timestamp_unix=proposal_ts,
             auto_proposed=True,
+            hypothesis_id=emitted_hypothesis_id,
         )
 
         # Persist to ledger (best-effort, never blocks). Doing this
@@ -443,7 +484,11 @@ class SelfGoalFormationEngine:
         """Render the LLM prompt for one proposal candidate.
 
         Pure-string shape — no model invocation here. Pinned by source-grep
-        so the prompt structure stays reviewable + reproducible."""
+        so the prompt structure stays reviewable + reproducible.
+
+        P1.5 Slice 2: when pairing is enabled, the prompt asks the model
+        for two extra fields (``claim`` + ``expected_outcome``) so a
+        Hypothesis can be persisted alongside the proposal."""
         files = ", ".join(candidate.target_files_union[:8])
         if len(candidate.target_files_union) > 8:
             files += f" (+{len(candidate.target_files_union) - 8} more)"
@@ -453,6 +498,27 @@ class SelfGoalFormationEngine:
             if candidate.dominant_next_safe_action
             else ""
         )
+        if hypothesis_pairing_enabled():
+            json_schema = (
+                '  {"description": "<one-line backlog entry>", '
+                '"rationale": "<2-3 sentences citing the recurrence count + '
+                'root cause + suggested investigation>", '
+                '"claim": "<I think X causes Y>", '
+                '"expected_outcome": "<if I do Z, I expect W>"}\n\n'
+            )
+            extra_constraints = (
+                "  - claim MUST state the suspected causal relationship "
+                "in one sentence.\n"
+                "  - expected_outcome MUST be a falsifiable predicate the "
+                "post-op validator can check.\n"
+            )
+        else:
+            json_schema = (
+                '  {"description": "<one-line backlog entry>", '
+                '"rationale": "<2-3 sentences citing the recurrence count + '
+                'root cause + suggested investigation>"}\n\n'
+            )
+            extra_constraints = ""
         return (
             "You are the SelfGoalFormationEngine of an autonomous "
             "self-development engine. A POSTMORTEM cluster has surfaced "
@@ -466,25 +532,32 @@ class SelfGoalFormationEngine:
             f"  Representative root_cause: {candidate.representative_root_cause[:200]}\n"
             f"  Target files: {files}"
             f"{action_line}\n\n"
-            "Respond as STRICT JSON with two fields:\n"
-            '  {"description": "<one-line backlog entry>", '
-            '"rationale": "<2-3 sentences citing the recurrence count + '
-            'root cause + suggested investigation>"}\n\n'
+            "Respond as STRICT JSON:\n"
+            f"{json_schema}"
             "Constraints:\n"
             "  - description MUST be ≤ 120 characters.\n"
             "  - rationale MUST cite the specific recurrence count.\n"
+            f"{extra_constraints}"
             "  - DO NOT propose a destructive action — investigation only.\n"
             "  - DO NOT include backticks or markdown fences in the JSON.\n"
         )
 
-    def _parse_proposal(self, response_text: str) -> Tuple[str, str]:
-        """Parse the model's JSON response into (description, rationale).
+    def _parse_proposal(
+        self, response_text: str,
+    ) -> Tuple[str, str, str, str]:
+        """Parse the model's JSON response.
+
+        Returns ``(description, rationale, claim, expected_outcome)``.
+        Pre-Slice-2 callers expected only ``(description, rationale)``;
+        the extra two fields are empty strings when the model didn't
+        emit them (back-compat) so the caller can decide whether to
+        persist a Hypothesis.
 
         Tolerates surrounding whitespace + accidental markdown fences.
-        Returns ("", "") on any parse failure — engine treats that as a
-        short-circuit + records zero proposal."""
+        Returns ``("", "", "", "")`` on any parse failure."""
+        empty = ("", "", "", "")
         if not response_text:
-            return ("", "")
+            return empty
         text = response_text.strip()
         # Tolerate accidental ```json ... ``` fences.
         if text.startswith("```"):
@@ -495,19 +568,66 @@ class SelfGoalFormationEngine:
         first_brace = text.find("{")
         last_brace = text.rfind("}")
         if first_brace == -1 or last_brace == -1 or last_brace <= first_brace:
-            return ("", "")
+            return empty
         candidate_json = text[first_brace : last_brace + 1]
         try:
             data = json.loads(candidate_json)
         except (json.JSONDecodeError, ValueError):
-            return ("", "")
+            return empty
         if not isinstance(data, dict):
-            return ("", "")
+            return empty
         description = str(data.get("description", "")).strip()[:200]
         rationale = str(data.get("rationale", "")).strip()[:1000]
+        claim = str(data.get("claim", "")).strip()[:500]
+        expected_outcome = str(data.get("expected_outcome", "")).strip()[:300]
         if not description:
-            return ("", "")
-        return (description, rationale)
+            return empty
+        return (description, rationale, claim, expected_outcome)
+
+    def _persist_hypothesis(
+        self,
+        *,
+        op_id: str,
+        claim: str,
+        expected_outcome: str,
+        proposed_signature_hash: str,
+    ) -> Optional[str]:
+        """Persist a paired Hypothesis to the HypothesisLedger. Best-effort.
+
+        Returns the hypothesis_id on success, None on any failure. The
+        engine swallows ledger write failures + still emits the proposal
+        (the hypothesis is observability + future validation, not the
+        load-bearing path)."""
+        try:
+            from backend.core.ouroboros.governance.hypothesis_ledger import (
+                Hypothesis,
+                HypothesisLedger,
+                make_hypothesis_id,
+            )
+            ts = time.time()
+            hid = make_hypothesis_id(op_id, claim, ts)
+            ledger = HypothesisLedger(project_root=self._root)
+            h = Hypothesis(
+                hypothesis_id=hid,
+                op_id=op_id,
+                claim=claim,
+                expected_outcome=expected_outcome,
+                proposed_signature_hash=proposed_signature_hash,
+                created_unix=ts,
+            )
+            if ledger.append(h):
+                logger.info(
+                    "[SelfGoalFormation] paired hypothesis emitted "
+                    "id=%s op_id=%s",
+                    hid, op_id,
+                )
+                return hid
+        except Exception:  # noqa: BLE001 — engine never raises
+            logger.debug(
+                "[SelfGoalFormation] hypothesis persist failed",
+                exc_info=True,
+            )
+        return None
 
     def _persist(self, draft: ProposalDraft) -> bool:
         """Append draft to the JSONL ledger. Best-effort, never raises.
