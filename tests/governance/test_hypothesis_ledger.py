@@ -564,14 +564,21 @@ def test_hypothesis_ledger_only_writes_jsonl():
 
 
 def test_hypothesis_repl_is_read_only_on_ledger():
-    """REPL never writes — only reads. Slice 2 wires the engine to write."""
+    """REPL never mutates the ledger — only reads. Slice 2 wires the
+    engine to call append() / record_outcome() directly."""
     src = (
         Path(__file__).resolve().parent.parent.parent
         / "backend/core/ouroboros/governance/hypothesis_repl.py"
     ).read_text(encoding="utf-8")
-    # No append() / record_outcome() calls in REPL.
-    assert ".append(" not in src or "rows.append" in src  # only Python list.append OK
-    assert ".record_outcome(" not in src
+    # Pin: REPL never calls the ledger's mutation methods.
+    forbidden_ledger_calls = [
+        "ledger.append(",
+        "ledger.record_outcome(",
+        "resolved_ledger.append(",
+        "resolved_ledger.record_outcome(",
+    ]
+    for c in forbidden_ledger_calls:
+        assert c not in src, f"REPL must not call {c}"
 
 
 def test_default_ledger_filename_pinned():
