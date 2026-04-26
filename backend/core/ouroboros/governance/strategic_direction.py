@@ -39,12 +39,6 @@ _GIT_HISTORY_ENABLED = os.environ.get(
 _GIT_HISTORY_MAX_COMMITS = int(
     os.environ.get("JARVIS_STRATEGIC_GIT_MAX_COMMITS", "50")
 )
-# Regex for Conventional Commits: `type(scope): subject`. Scope is optional.
-_CONVENTIONAL_COMMIT_RE = re.compile(
-    r"^(?P<type>[a-zA-Z]+)(?:\((?P<scope>[^)]+)\))?:\s*(?P<subject>.+)$"
-)
-
-
 class StrategicDirectionService:
     """Reads the developer's strategic vision and injects it into operations.
 
@@ -240,85 +234,26 @@ class StrategicDirectionService:
     ) -> List[str]:
         """Infer active development themes from recent git history.
 
-        Runs ``git log`` for the last ``max_commits`` commits and parses
-        Conventional Commit subjects to build:
-          • a histogram of the most touched scopes (the "(governance)"
-            / "(sensors)" tags — reveal where the momentum is)
-          • a histogram of commit types (``feat`` / ``fix`` / ``refactor``
-            — reveal whether we're building or hardening)
-          • the three most recent subject lines (reveal freshest work)
+        P0.5 Slice 1 (2026-04-26): the parsing + formatting logic moved
+        to ``backend.core.ouroboros.governance.git_momentum`` so the
+        DirectionInferrer can consume the same signal as a structured
+        ``MomentumSnapshot``. This wrapper preserves the legacy
+        ``List[str]`` return shape so callers + their tests are
+        byte-for-byte unchanged.
 
-        Returns a list of short theme strings. Empty list on any failure
-        (no git, shallow clone, subprocess timeout). Zero model inference.
-
-        Manifesto §4 rationale: the synthetic soul remembers what it has
-        been working on — this turns raw git history into explicit context
-        the organism can reason over during GENERATE.
+        Manifesto §4 rationale (unchanged): the synthetic soul remembers
+        what it has been working on — this turns raw git history into
+        explicit context the organism can reason over during GENERATE.
         """
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["git", "log", f"-{int(max_commits)}", "--pretty=format:%s"],
-                cwd=str(project_root),
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            return []
-        if result.returncode != 0:
-            return []
-
-        lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
-        if not lines:
-            return []
-
-        scope_counts: Dict[str, int] = {}
-        type_counts: Dict[str, int] = {}
-        subjects: List[str] = []
-        for line in lines:
-            m = _CONVENTIONAL_COMMIT_RE.match(line)
-            if not m:
-                # Non-conventional commit (e.g., "Merge branch ..."): still
-                # record the first ~60 chars as a raw subject so we never
-                # drop information completely.
-                subjects.append(line[:60])
-                continue
-            t = (m.group("type") or "").lower()
-            s = (m.group("scope") or "").lower()
-            sub = (m.group("subject") or "").strip()
-            if t:
-                type_counts[t] = type_counts.get(t, 0) + 1
-            if s:
-                scope_counts[s] = scope_counts.get(s, 0) + 1
-            if sub:
-                subjects.append(sub[:60])
-
-        themes: List[str] = []
-
-        if scope_counts:
-            top_scopes = sorted(
-                scope_counts.items(), key=lambda kv: (-kv[1], kv[0])
-            )[:5]
-            themes.append(
-                "Active scopes: "
-                + ", ".join(f"{name} ({count})" for name, count in top_scopes)
-            )
-
-        if type_counts:
-            top_types = sorted(
-                type_counts.items(), key=lambda kv: (-kv[1], kv[0])
-            )[:4]
-            themes.append(
-                "Commit mix: "
-                + ", ".join(f"{name}={count}" for name, count in top_types)
-            )
-
-        if subjects:
-            themes.append("Latest work: " + " | ".join(subjects[:3]))
-
-        return themes
+        from backend.core.ouroboros.governance.git_momentum import (
+            compute_recent_momentum,
+            format_themes,
+        )
+        snapshot = compute_recent_momentum(
+            project_root=project_root,
+            max_commits=int(max_commits),
+        )
+        return format_themes(snapshot)
 
     @staticmethod
     def _format_git_themes(themes: List[str]) -> str:
