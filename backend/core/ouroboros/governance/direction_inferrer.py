@@ -98,18 +98,25 @@ def is_enabled() -> bool:
 
 
 def arc_context_enabled() -> bool:
-    """P0.5 Slice 2 — when on, ``DirectionInferrer.infer(arc_context=...)``
-    applies bounded score nudges (≤ ``MAX_NUDGE_PER_POSTURE`` per posture)
-    derived from recent git momentum + last-session summary.
+    """P0.5 — when on, ``DirectionInferrer.infer(arc_context=...)`` applies
+    bounded score nudges (≤ ``MAX_NUDGE_PER_POSTURE`` per posture) derived
+    from recent git momentum + last-session summary.
 
-    Default: ``false``. Slice 3 graduation flips this default-off → on
-    after the same evidence pattern P0 used. When off, ``arc_context``
-    kwargs are still observed (carried through to ``PostureReading`` +
-    surfaced in the posture log line) but contribute zero to scoring —
-    this is the "observation-only" mode that lets live-cadence sessions
-    measure the would-be effect before flipping the default.
+    GRADUATED 2026-04-26 (Slice 3). Default: **``true``** post-graduation.
+    Layered evidence on the graduation PR:
+      * Slice 1 — git_momentum extraction (22 tests, byte-identical refactor)
+      * Slice 2 — arc_context consumer (20 tests, bounded ≤0.10 / posture)
+      * Slice 3 — REPL surfacing + graduation pin suite + in-process
+        live-fire + posture-observer orchestrator-level smoke
+      * 60+ deterministic regression tests across the P0.5 stack
+
+    Hot-revert: ``export JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED=false``
+    restores byte-for-byte pre-graduation observation-only behavior. The
+    bounded-nudge math itself stays bounded by construction regardless of
+    the flag state; the flag controls only whether the bounded nudge is
+    summed into the score vector.
     """
-    return _env_bool("JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED", False)
+    return _env_bool("JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED", True)
 
 
 def confidence_floor() -> float:
