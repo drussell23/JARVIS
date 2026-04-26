@@ -79,13 +79,23 @@ DEFAULT_LEDGER_FILENAME: str = "cognitive_metrics.jsonl"
 
 
 def is_enabled() -> bool:
-    """Master flag — ``JARVIS_COGNITIVE_METRICS_ENABLED`` (default ``false``).
+    """Master flag — ``JARVIS_COGNITIVE_METRICS_ENABLED`` (default ``true``).
 
-    Slice 1 ships default-off. Slice 2 graduation flips it after the
-    orchestrator integration lands + the comprehensive pin suite +
-    in-process live-fire smoke + reachability supplement complete."""
+    GRADUATED 2026-04-26 (Slice 2). Default: **``true``** post-graduation.
+    Layered evidence on the graduation PR:
+      * Slice 1 — wrapper + REPL + ledger (43 tests, authority-pinned)
+      * Slice 2 — orchestrator integration (boot-time singleton wiring +
+        CONTEXT_EXPANSION pre-score call site) + comprehensive pin suite
+        + in-process live-fire smoke + reachability supplement
+      * Underlying RSI modules — 131/131 tests green per Phase 0 audit
+
+    Hot-revert: ``export JARVIS_COGNITIVE_METRICS_ENABLED=false`` →
+    helper short-circuits, no ledger writes, behavior byte-for-byte
+    identical to pre-graduation. Both wrapped methods continue to
+    return their underlying module's neutral fallback even when the
+    flag is on but the oracle fails — fail-safe by construction."""
     return os.environ.get(
-        "JARVIS_COGNITIVE_METRICS_ENABLED", "",
+        "JARVIS_COGNITIVE_METRICS_ENABLED", "true",
     ).strip().lower() in _TRUTHY
 
 
