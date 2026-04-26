@@ -38,6 +38,19 @@
 20. [Roadmap Summary (one-page chronological)](#20-roadmap-summary-one-page-chronological)
 21. [Why this Roadmap, in this Order](#21-why-this-roadmap-in-this-order)
 22. [The Larger Frame — Trinity AI Ecosystem](#22-the-larger-frame--trinity-ai-ecosystem)
+23. [The Reverse Russian Doll — Orders of Self-Reference (Architectural Framing)](#23-the-reverse-russian-doll--orders-of-self-reference-architectural-framing)
+    - [23.1 The vocabulary contribution](#231-the-vocabulary-contribution)
+    - [23.2 Orthogonality — the Order axis runs perpendicular](#232-orthogonality--the-order-axis-runs-perpendicular)
+    - [23.3 Order 0 — The Exoskeleton Baseline](#233-order-0--the-exoskeleton-baseline)
+    - [23.4 Order 1 — The Body (current shipping state)](#234-order-1--the-body-current-shipping-state)
+    - [23.5 Order 2 — The Cognitive Substrate (horizon)](#235-order-2--the-cognitive-substrate-horizon)
+    - [23.6 Anti-Venom — the Adaptive Immune System Thesis](#236-anti-venom--the-adaptive-immune-system-thesis)
+    - [23.7 Trinity-Wide Order-2 Manifest Architecture](#237-trinity-wide-order-2-manifest-architecture)
+    - [23.8 Composition with the Phase 1–6 Roadmap](#238-composition-with-the-phase-16-roadmap)
+    - [23.9 Composition with Wang RSI Convergence (§5)](#239-composition-with-wang-rsi-convergence-5)
+    - [23.10 Pass A → Pass B → Pass C — the Three-Pass Sequence](#2310-pass-a--pass-b--pass-c--the-three-pass-sequence)
+    - [23.11 Operator Decisions Ratified 2026-04-26](#2311-operator-decisions-ratified-2026-04-26)
+    - [23.12 Implementation Discipline + Cross-References](#2312-implementation-discipline--cross-references)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -988,6 +1001,282 @@ This PRD's 7-month timeline is the precondition for Trinity work.
 
 ---
 
+## 23. The Reverse Russian Doll — Orders of Self-Reference (Architectural Framing)
+
+> *"In a standard Russian doll, the layers compress inward, getting smaller and simpler. We are doing the exact opposite. We have established the solid core, and we are building the mechanisms for the core to autonomously carve an exponentially larger, smarter shell around itself."*
+>
+> — Derek J. Russell, operator binding (2026-04-26)
+
+This section introduces an **architectural lens** for understanding the system's self-improvement that is *orthogonal* to the Phase 1–6 roadmap (§9) and complementary to the Wang convergence framework (§5). Where Phases describe **behavioral milestones** ("the system reads its own output," "the system forms its own goals"), and Wang describes the **mathematical guarantee** that score-monotonic optimization converges, the Reverse Russian Doll axis describes **what O+V acts upon** — the layer of self-reference at which a given improvement operates.
+
+The framework was articulated by the operator in the 2026-04-26 architectural review and reconciled against the four canonical docs (`OUROBOROS.md`, this PRD, `RSI_CONVERGENCE_FRAMEWORK.md`, `JARVIS_LEVEL_OUROBOROS.md`) in a Pass A document — `memory/project_reverse_russian_doll_pass_a.md`. The Pass A finding was that **the Order axis was not present in any canonical doc**, even though every Order-1 subsystem it describes was already shipping. This section closes that vocabulary gap.
+
+### 23.1 The vocabulary contribution
+
+Pre-existing taxonomies in this PRD and adjacent docs:
+
+| Taxonomy | What it captures | Where it lives |
+|---|---|---|
+| **Phases 1–6** (this PRD §9) | Behavioral milestones — Self-Reading → Self-Direction → Operator Symbiosis → Cognitive Metrics → Adversarial Depth → Self-Modeling | §9 of this PRD |
+| **Tiers 1–7** (`JARVIS_LEVEL_OUROBOROS.md`) | Behavioral enhancements — Judgment → Emergency → Prediction → Resilience → Reasoning → Personality → Autonomous Judgment | All Pre-Implementation per source doc |
+| **Wang RSI loop** (§5) | Single score-monotonic optimization with O(log n) expected convergence | §5 of this PRD |
+| **11-phase FSM** (`OUROBOROS.md`) | Operational stages of one operation — CLASSIFY → COMPLETE | `orchestrator.py` |
+
+None of these capture **what O+V is acting upon**: is the patch modifying application code (the body), or modifying the cognitive substrate that produces patches? The Reverse Russian Doll axis fills that gap.
+
+### 23.2 Orthogonality — the Order axis runs perpendicular
+
+Phase, Tier, Wang, and FSM-stage all describe **dynamics within a fixed substrate**. Order describes **which substrate is in play**. They compose freely:
+
+| | Order 0 | Order 1 | Order 2 |
+|---|---|---|---|
+| **Phase 1 (Self-Reading)** | n/a | shipping (POSTMORTEM ledger reads, SemanticIndex centroids) | future: cognitive substrate reads its own commit history of governance changes |
+| **Phase 2 (Self-Direction)** | n/a | partial (DirectionInferrer on env signals) | future: O+V proposes new PhaseRunner subclasses to address postmortem patterns |
+| **Phase 6 (Self-Modeling)** | n/a | future scope: Body's behavior summary | future scope: cognitive substrate produces a summary of its own evolution |
+| **Wang composite score** (Imp #1) | n/a | already mapped to Order-1 ops | future: separate score for Order-2 ops with different weights — see §23.6 |
+
+The Order axis tells the reader *"this work is about the Body"* (Phase 1 today) vs. *"this work is about the cognitive cage"* (Phase 1 in the Order-2 horizon). Without this distinction, "Self-Reading" is ambiguous — the loop reads what?
+
+### 23.3 Order 0 — The Exoskeleton Baseline
+
+**Industry default. Ouroboros rejects it by design.**
+
+Order 0 is the operating mode of mainstream developer-AI tools: the AI is a compiled exoskeleton — the human types, the AI suggests; the human stops, the AI freezes. The system has no continuous existence between turns, no sensory layer, no autonomous initiation, no memory across sessions in any architecturally load-bearing way.
+
+This is documented as the contrast in `TRINITY_ECOSYSTEM_TECHNICAL_DOCUMENT.md:534`:
+
+> *"Claude Code / OpenClaw / ClawdBot — Developer CLI agent — Session-scoped, no continuous operation, no sensory layer, single model, cannot self-modify."*
+
+The reason Order 0 is included in this taxonomy is to make the rejection explicit. **Every Order-1 capability listed below is a deliberate departure from the Order-0 default.** Where the industry treats AI as a frozen-when-idle exoskeleton, Ouroboros treats it as a continuously-running autonomic nervous system that initiates, perceives, and acts on its own.
+
+### 23.4 Order 1 — The Body (current shipping state)
+
+**O+V as autonomic nervous system. This is what currently runs.**
+
+Order 1 is the layer at which the cognitive engine acts on **the body** — the JARVIS application code, sensors, tooling, tests, runbooks, documentation, and configuration. The cognitive engine itself is the actor; the body is the object. Every battle-test breakthrough logged in `OUROBOROS.md` is an Order-1 success.
+
+#### 23.4.1 Order-1 substrate, by subsystem
+
+| Capability | Subsystem | Location |
+|---|---|---|
+| Continuous environmental scan | 16 autonomous sensors | `backend/core/ouroboros/intake/sensors/` |
+| Priority queue + WAL persistence | UnifiedIntakeRouter | `backend/core/ouroboros/intake/` |
+| 11-phase governed loop | Orchestrator FSM | `backend/core/ouroboros/governance/orchestrator.py` |
+| 3-tier provider cascade | DW 397B → Claude → J-Prime | `candidate_generator.py`, `providers.py`, `doubleword_provider.py` |
+| Multi-turn agentic tool loop | Venom (16 built-in + MCP) | `tool_executor.py` |
+| Multi-file coordinated APPLY | `files: [...]` schema + ChangeEngine batch rollback | `orchestrator.py::_apply_multi_file_candidate` |
+| Posture-aware self-regulation | DirectionInferrer + StrategicPosture (4 values) | `direction_inferrer.py`, `posture*.py` |
+| Global op-emission cap | SensorGovernor | `sensor_governor.py` |
+| Memory-pressure throttle | MemoryPressureGate | `memory_pressure_gate.py` |
+| Post-VERIFY structured commit | AutoCommitter with O+V signature | `auto_committer.py` |
+| Cross-session memory | UserPreferenceMemory + SemanticIndex + LastSessionSummary | `user_preference_memory.py`, `semantic_index.py`, `last_session_summary.py` |
+| L3 worktree isolation | Per-unit COW worktrees + `reap_orphans` | `subagent_scheduler.py`, `worktree_manager.py` |
+| Mid-op cooperative cancel | W3(7) cancel-token (REPL + watchdog + signal) | per W3(7) graduation 2026-04-25 |
+| Parallel L3 fan-out | parallel_dispatch + cost-cap parallel-stream | per W3(6) architectural completion 2026-04-25 |
+
+#### 23.4.2 What "Order 1 ships" means concretely
+
+End-to-end autonomous APPLY-to-disk under full complex-route enforcement is **proven and graduated**. Battle-test landmarks documented in `docs/architecture/OUROBOROS.md` battle-test breakthrough log:
+
+- **2026-04-15 Session O** — first sustained single-file APPLY (`test_test_failure_sensor_dedup.py`, ChangeEngine + L2 CONVERGED + POSTMORTEM root_cause=none)
+- **2026-04-15 Sessions U–W** — first end-to-end multi-file APPLY (4 test modules, AutoCommitter commit `0890a7b6f0`, 20/20 post-hoc pytest pass)
+- **Wave 1 graduations 2026-04-21** — DirectionInferrer + FlagRegistry + SensorGovernor: the system reads its own posture and self-throttles
+- **W2(4) graduation 2026-04-25** — Curiosity engine widening `ask_human` on EXPLORE/CONSOLIDATE Green ops
+- **W3(7) graduation 2026-04-25** — mid-op cancellation infrastructure
+
+The Order-1 thesis is no longer conjecture; it is the operating regime.
+
+#### 23.4.3 What Order 1 still has to grow into
+
+The Phase 1–6 roadmap (§9) is largely Order-1 work. Phase 1 (Self-Reading) wires existing structured outputs (POSTMORTEM, SemanticIndex, ConversationBridge) back into Order-1 decisions. Phase 2 (Self-Direction) lets Order-1 ops form their own backlog entries. Phase 5 (Adversarial Depth) adds an internal opponent for Order-1 plans. None of those Phases require Order-2 capabilities to land.
+
+**This is important**: Phases 1–6 do not require self-modification of the cognitive substrate. They require deeper self-reference *within* the Order-1 layer. Order 2 is a separate horizon (§23.5), not a Phase 1–6 prerequisite.
+
+### 23.5 Order 2 — The Cognitive Substrate (horizon)
+
+**O+V turns inward and proposes modifications to its own cognitive architecture.**
+
+Order 2 is the layer at which the cognitive engine acts on **itself** — the orchestrator FSM, the immune system gates (Iron Gate sequence, `semantic_firewall.py`, `semantic_guardian.py`, `scoped_tool_backend.py`), the change engine, the risk-tier ladder, the PhaseRunner classes that implement each phase.
+
+#### 23.5.1 Why Order 2 is not Phase B subagent invocation
+
+A common misreading after the Phase B subagent graduation (2026-04-20, `memory/project_phase_b_subagent_roadmap.md`) is that Phase B subagents constitute "partial Order 2." They do not. **Phase B subagents are cognitive *delegation*, not cognitive *self-modification*.** O+V invokes EXPLORE/REVIEW/PLAN/GENERAL; it does not generate them, modify their scope contracts, or design new subagent kinds. The subagent shells (`agentic_*_subagent.py`) and their contracts (`subagent_contracts.py`) are hand-written governance code — they would themselves be Order-2 modification targets if O+V proposed to change them.
+
+The Phase C Slice 1b GENERAL LLM driver (2026-04-20) is the closest existing thing to a *cognitive interior on a subagent shell*, but the shell itself is still hand-written. Real Order 2 would be O+V proposing new subagent kinds with their own scope/budget/allowlist contracts. This is explicitly out of Pass B scope (§23.10) and reserved for future architectural work.
+
+#### 23.5.2 The Order-2 rung map
+
+Five gaps separate "Order 1 graduated" from "Order 2 real," in structural-prerequisite order:
+
+| Rung | Gap | Status | Reference |
+|---|---|---|---|
+| **2.1** | Pipeline FSM not yet pluggable | In motion — W2(5) PhaseRunner extraction shipped per `phase_runner.py`/`phase_runners/`; Slice 5b (final dispatcher cutover + Iron Gate depth) gated on operator authorization | `memory/project_wave2_phaserunner_slice5a.md` |
+| **2.2** | No amendment protocol for governance code (orchestrator, gates, firewall) | **Hard ceiling, not in any roadmap doc** | Pass B closes this |
+| **2.3** | Anti-Venom is static, not adaptive | **Framework's load-bearing novel claim, not in any roadmap doc** | Pass C scope (§23.6) |
+| **2.4** | Cognitive primitives are fixed, not composable (subagent kinds hand-written) | Future scope; no Pass yet | n/a |
+| **2.5** | Cross-Trinity scope deferred | Operator decision 2026-04-26: Trinity-wide eventually; Body-only execution focus for now | §15 of this PRD; §23.7 |
+
+Pass B (`memory/project_reverse_russian_doll_pass_b.md`) closes Rungs 2.1 + 2.2 *jointly*. Pass C will close Rung 2.3. Rungs 2.4 + 2.5 are reserved for future work.
+
+#### 23.5.3 Why Order 2 must be additively gated, not replaced
+
+The Anti-Venom thesis (§23.6) is that as the cognitive engine reaches inward, the cage must scale proportionally. **No existing Iron Gate / SemanticGuardian / SemanticFirewall path may be loosened or replaced by Order-2 capability.** Order-2 changes traverse all existing Order-1 gates *plus* additional structural cages defined in Pass B:
+
+1. The Order-2 manifest classifier (does this patch touch governance code?)
+2. The `ORDER_2_GOVERNANCE` risk class (strictly above `BLOCKED` — no auto-apply at any nominal tier)
+3. The AST-shape validator (for new `PhaseRunner` subclasses against the W2(5) Slice 1 frozen ABC)
+4. The shadow-pipeline regression-replay (against a curated 20-op golden corpus from the battle-test breakthrough log)
+5. The manifest-amendment protocol (operator-only mutation path for the manifest itself; locked-true invariant)
+
+Composition rule: **Order-2 cages are additive to Order-1 gates, never substitutive.**
+
+### 23.6 Anti-Venom — the Adaptive Immune System Thesis
+
+**As the outward shell expands, the inward cage must scale proportionally.**
+
+This is the framework's load-bearing novel claim. None of the four canonical docs articulate adaptive gate calibration; the existing immune system is uniformly *static*:
+
+| Anti-Venom layer | Subsystem | Adaptive today? |
+|---|---|---|
+| AST validation | `change_engine` AST parser + multi-file coverage gate (Iron Gate 5) | **Static** — patterns fixed at code-time |
+| Exploration-first | Iron Gate 1 (`JARVIS_EXPLORATION_GATE`) + ExplorationLedger 5-category diversity scoring | **Static** — category floors are env-tuned, not learned |
+| ASCII strictness | Iron Gate 2 (`JARVIS_ASCII_GATE`) | **Static** — codepoint set fixed |
+| Pre-APPLY pattern detection | SemanticGuardian (10 AST/regex patterns, ~10ms, zero LLM) | **Static** — patterns hand-written |
+| Mutation cage | `ScopedToolBackend._mutations_count` structural COUNT gate | **Static cap** — budget set per-invocation |
+| Injection cage | SemanticFirewall (11 detectors, 5 credential shapes, recursion ban) | **Static** — detector set hand-written |
+| Risk-tier floor | 4-tier ladder + 3 composing knobs | **Static** — strictest-wins composition; thresholds operator-set |
+| Isolation | L3 worktree with hard-fail (no silent shared-tree fallback) | **Static** — isolation policy is binary |
+| Atomic rollback | Multi-file batch snapshots | **Static** — semantics fixed |
+
+**The Anti-Venom thesis**: every entry above must, eventually, learn. Concretely:
+
+- SemanticGuardian patterns mined from the POSTMORTEM corpus (failure → new detector)
+- Iron Gate exploration-floors auto-tightening when a category-bypass is detected in graduated ops
+- Mutation budgets calibrated **per Order**: Order-1 ops get the current budget; Order-2 ops (touching governance code) get a much smaller one (e.g. 1)
+- Risk-tier ladder learning new tiers as new attack surfaces emerge from Order-1 outward expansion
+- ExplorationLedger weighting adjusting when categories show diminishing-marginal-value across ops
+
+Pass C (forward pointer §23.10) designs how each of these grows adaptive. Pass C's existence depends on Pass B — you cannot grow an adaptive immune system if amending the immune system itself isn't a defined protocol.
+
+### 23.7 Trinity-Wide Order-2 Manifest Architecture
+
+Per §22 the larger frame is Body + Mind + Soul. Per the operator decision recorded 2026-04-26:
+
+> Order 2 = **Trinity-wide eventually**; **JARVIS-Body cognitive code only for now** (phased buildout via O+V & Anti-Venom).
+
+The Pass B design surface honors both halves of this decision via the `(repo, path-glob)` manifest schema documented in `memory/project_reverse_russian_doll_pass_b.md` §3:
+
+```python
+@dataclass(frozen=True)
+class Order2ManifestEntry:
+    repo: str           # RepoRegistry key: "jarvis" | "jarvis-prime" | "jarvis-reactor"
+    path_glob: str      # POSIX glob relative to repo root
+    rationale: str      # Why this path is governance code (audit-readable)
+    added: str          # ISO date the entry landed
+    added_by: str       # "operator" | "<commit-sha>"
+```
+
+The schema is **Trinity-ready from day one**. Initial deployment registers only `repo: jarvis` entries (Body-only execution focus). Adding J-Prime or Reactor Core later is one entry per file — no schema change, no logic change, no orchestrator refactor. The `RepoRegistry` (`backend/core/ouroboros/governance/multi_repo/registry.py`) already resolves `jarvis-prime` and `jarvis-reactor` to filesystem paths via `JARVIS_PRIME_REPO_PATH` and `JARVIS_REACTOR_REPO_PATH`.
+
+**This means**: the framework supports Trinity-wide self-modification authority even though the *initial enforcement* is Body-only. When the deferred cross-Trinity integration document referenced in §15 lands, activating Mind/Soul Order-2 enforcement is a manifest amendment, not an architecture change.
+
+### 23.8 Composition with the Phase 1–6 Roadmap
+
+The Order axis is orthogonal to the Phase axis. They compose without conflict:
+
+| Phase × Order | Order 1 (Body) | Order 2 (Cognitive substrate) |
+|---|---|---|
+| **Phase 1 — Self-Reading** | PostmortemRecallService, SelfRAG over commit history (this PRD §9.P0–P1.5) | future: cognitive substrate reads its own evolution log; postmortems of Order-2 ops feed back into Order-2 caging |
+| **Phase 2 — Self-Direction** | SelfGoalFormation forming Order-1 backlog entries (§9.P0) | future: O+V proposes new PhaseRunner subclasses to address recurring postmortem patterns |
+| **Phase 3 — Operator Symbiosis** | ConversationOrchestrator (§9.P2), inline approval UX | conversational approval surface for Order-2 manifest amendments (extends `/order2 amend`) |
+| **Phase 4 — Cognitive Metrics** | composite score per Order-1 op (Wang Imp #1) | separate composite score for Order-2 ops with different weights (Pass B §12 open question) |
+| **Phase 5 — Adversarial Depth** | AdversarialReviewer subagent on Order-1 plans (§9.P5) | future: AdversarialReviewer evaluates proposed PhaseRunner subclasses against the shadow-replay corpus |
+| **Phase 6 — Self-Modeling** | weekly behavior summary of Order-1 ops (§9) | future: weekly summary of Order-2 evolution (governance code change history, manifest amendments, gate calibration trajectory) |
+
+**No Phase requires Order 2 to land.** Phases 1–6 are Order-1 work. Order 2 is a separate horizon that opens after Pass B graduates, and each Phase has a natural Order-2 extension.
+
+### 23.9 Composition with Wang RSI Convergence (§5)
+
+Wang's framework (§5) proves that score-monotonic optimization converges in expected O(log n) steps under the Markov assumption. The Order axis adds a constraint: **Wang's score must be score-of-Order-1 ops, not score-of-all-ops.**
+
+Reasoning: Order-2 ops are by definition rare, structurally caged, and cannot auto-apply. Folding Order-2 ops into the same composite-score window as Order-1 ops would produce noise that overwhelms the Order-1 signal. The Pass C design (§23.10) will likely introduce:
+
+- **Composite Score (Order-1)**: existing 5-component formula (test_delta + coverage_delta + complexity_delta + lint_delta + blast_radius), Wang-grounded
+- **Composite Score (Order-2)**: separate metric with different weights — blast_radius dominates (e.g. 0.6+), test_delta de-weighted (Order-2 patches often add new structural cages without changing existing tests)
+
+The Wang convergence claim then lives at Order-1 only. Order-2 ops are not convergence-monotonic; they're authority-gated discrete events. This is consistent with §5.6 ("The convergence threshold") — the threshold metrics there are Order-1 metrics by construction.
+
+### 23.10 Pass A → Pass B → Pass C — the Three-Pass Sequence
+
+The framework's operationalization proceeds in three Passes, each producing a memory-file deliverable:
+
+#### Pass A — Reconciliation (complete, 2026-04-26)
+
+`memory/project_reverse_russian_doll_pass_a.md`
+
+- Verified the Order axis is genuinely new vocabulary (zero hits across the four canonical docs for "Order 0/1/2" or "Reverse Russian Doll").
+- Mapped Order 1 to existing subsystems with file:line citations (the table in §23.4.1 derives from this).
+- Mapped Anti-Venom layers to existing gates and confirmed all are static (the table in §23.6 derives from this).
+- Identified the five Rungs (Gaps 2.1–2.5) separating "Order 1 ships" from "Order 2 real."
+- Surfaced three operator decisions; all three ratified 2026-04-26 (§23.11).
+
+#### Pass B — Joint Design for Rungs 2.1 + 2.2 (drafted 2026-04-26; execution gated on W2(5) Slice 5b)
+
+`memory/project_reverse_russian_doll_pass_b.md`
+
+Six-slice plan, mirroring the W2(5) PhaseRunner extraction discipline (per-slice flag, parity tests, authority invariants, full-revert matrix, defaults all `false` until graduation):
+
+| Slice | Deliverable | Env flag |
+|---|---|---|
+| 1 | `Order2Manifest` schema + loader + `.jarvis/order2_manifest.yaml` initial Body-only entries | `JARVIS_ORDER2_MANIFEST_LOADED` (default false) |
+| 2 | `ORDER_2_GOVERNANCE` risk class + `risk_tier_floor.py` integration + GATE classifier hook | `JARVIS_ORDER2_RISK_CLASS_ENABLED` (default false) |
+| 3 | AST-shape validator for new PhaseRunner subclasses (6-rule check against W2(5) Slice 1 frozen ABC) | `JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED` (default false) |
+| 4 | Shadow-pipeline replay corpus (20 ops curated from battle-test breakthrough log) + structural-equality diff harness | `JARVIS_SHADOW_PIPELINE_ENABLED` (default false) |
+| 5 | `MetaPhaseRunner` primitive composing Slices 1–4 | `JARVIS_META_PHASE_RUNNER_ENABLED` (default false) |
+| 6 | Manifest-amendment protocol: `/order2 {pending,show,amend,reject,history}` REPL + `order2_review` queue + AutoCommitter trailer | `JARVIS_ORDER2_MANIFEST_AMENDMENT_REQUIRES_OPERATOR` (**locked true**, never flipped) |
+
+Pass B is **design only — no code, no flag flips** until W2(5) Slice 5b authorizes execution.
+
+#### Pass C — Adaptive Anti-Venom (deferred; depends on Pass B existing)
+
+Per §23.6, Pass C designs how each static gate grows adaptive. Pass C's existence depends on Pass B because you cannot grow an adaptive immune system if amending the immune system itself isn't a defined protocol. Pass C scope draft will follow Pass B Slice 1 graduation.
+
+### 23.11 Operator Decisions Ratified 2026-04-26
+
+The Pass A reconciliation surfaced three open operator decisions. All three were ratified in the architectural review:
+
+1. **Order-2 scope**: **Trinity-wide eventually; JARVIS-Body cognitive code only for now.** Phased buildout via O+V & Anti-Venom. The `(repo, path-glob)` manifest schema (§23.7) honors both halves.
+2. **Pass B sequencing**: **Draft now; flip-gate execution on W2(5) Slice 5b authorization.** Pass B drafted 2026-04-26; per-slice graduation cadence determined post-W2(5) Slice 5b.
+3. **Vocabulary landing**: **Add the Reverse Russian Doll Order axis to this PRD as a new section orthogonal to Phase 1–6.** This §23 is the deliverable for that decision.
+
+### 23.12 Implementation Discipline + Cross-References
+
+**Authority invariants** (Pass B §3.4 + §8):
+
+- The Order-2 manifest is **read** by the Order-2 risk classifier (GATE phase) and the `MetaPhaseRunner` AST validator (§23.5.3). It is **written** only by the §23.10 manifest-amendment protocol — never by APPLY, never by AutoCommitter, never by O+V autonomous proposal.
+- AST-grep CI invariant: any future import of `Order2Manifest` outside `risk_tier_floor.py`, `meta_phase_runner.py`, and the manifest amendment path is a CI failure.
+- `JARVIS_ORDER2_MANIFEST_AMENDMENT_REQUIRES_OPERATOR=true` is **not a graduation candidate** — it ships locked-true. Flipping it false is itself an Order-2 governance change. The flag exists only so the property is greppable and asserted in tests.
+- No Order-1 gate (Iron Gate, SemanticGuardian, SemanticFirewall, exploration ledger, mutation cage, risk-tier floor) may be loosened by an Order-2 capability. Order-2 cages are **additive** to Order-1 gates, never substitutive.
+
+**Hot-revert path**: every Pass B slice ships behind a per-slice env flag defaulting `false` (or locked-true for §23.10 Slice 6). Reverting Pass B is `unset` of all five non-locked flags + revert of `.jarvis/order2_manifest.yaml`. Mirrors the W2(5) and W3(7) revert discipline (`docs/operations/wave3-parallel-dispatch-graduation.md`).
+
+**Cross-references** (canonical):
+
+| Document | Relationship to §23 |
+|---|---|
+| `memory/project_reverse_russian_doll_pass_a.md` | Pass A — reconciliation source for §23.4.1, §23.6, §23.10 |
+| `memory/project_reverse_russian_doll_pass_b.md` | Pass B — design source for §23.5.3, §23.7, §23.10, §23.12 |
+| §5 (this PRD) — RSI Convergence Framework | Wang's framework; complementary mathematical lens (§23.9) |
+| §9 (this PRD) — Roadmap | Phase 1–6 work; orthogonal to Order axis (§23.8) |
+| §22 (this PRD) — The Larger Frame | Trinity Body/Mind/Soul scope; §23.7 honors §22's Body-first sequencing |
+| `CLAUDE.md` Battle Test Milestones | Order-1 graduation evidence (§23.4.2) |
+| `docs/architecture/OUROBOROS.md` battle-test breakthrough log | Source corpus for Pass B Slice 4 shadow-replay (§23.10) |
+| `docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md` | Wang's mathematical foundation; complemented by Order axis |
+
+**Status**: §23 lands as doctrine. It does not gate or block any in-flight work — Pass B execution is gated separately on W2(5) Slice 5b authorization (§23.10), and Phases 1–6 (§9) do not depend on Order 2 (§23.8).
+
+---
+
 ## Appendix A — Glossary
 
 ### Core terms
@@ -1022,6 +1311,20 @@ This PRD's 7-month timeline is the precondition for Trinity work.
 - **Composite Score**: Wang Improvement 1 — unified quality metric per op
 - **Convergence State**: classifier `IMPROVING/PLATEAU/OSCILLATING/DEGRADING` from rolling score window
 
+### Reverse Russian Doll vocabulary (§23)
+
+- **Reverse Russian Doll**: architectural lens for self-improvement; the core ("cognitive engine") carves an exponentially larger shell around itself rather than compressing inward (operator framing 2026-04-26)
+- **Order**: layer of self-reference at which an O+V improvement operates; orthogonal to Phase (§9) and Tier (`JARVIS_LEVEL_OUROBOROS.md`)
+- **Order 0**: industry default — AI as exoskeleton, frozen between turns; Ouroboros rejects this baseline by design
+- **Order 1**: O+V acting on the body (JARVIS application code, sensors, tooling, tests, docs, config); current shipping state
+- **Order 2**: O+V acting on its own cognitive substrate (orchestrator FSM, immune system gates, change engine, risk-tier ladder, PhaseRunner classes); horizon, additively gated, no auto-apply ever
+- **Anti-Venom**: thesis that the immune system (Iron Gate, SemanticGuardian, SemanticFirewall, mutation cage, risk-tier floor) must scale proportionally as O+V's outward reach grows; today static, Pass C scope to grow adaptive
+- **Order-2 manifest**: `(repo, path-glob)` registry of governance-code paths; Trinity-extensible from day one; written only via the operator-only manifest-amendment protocol
+- **`ORDER_2_GOVERNANCE`**: risk class strictly above `BLOCKED`; no auto-apply at any nominal tier; cannot be cleared by REPL `approve <op-id>`; only by `/order2 amend <op-id>`
+- **MetaPhaseRunner**: Pass B Slice 5 primitive composing the Order-2 manifest classifier + AST-shape validator + shadow-pipeline replay; the cage through which O+V proposes new `PhaseRunner` subclasses
+- **Shadow-pipeline replay**: structural-equality diff against a curated 20-op golden corpus from the battle-test breakthrough log; pre-APPLY regression cage for Order-2 PhaseRunner candidates
+- **Pass A / Pass B / Pass C**: the three-pass operationalization sequence — A = reconciliation (complete), B = joint design for Rungs 2.1+2.2 (drafted, gated on W2(5) Slice 5b), C = adaptive Anti-Venom (deferred, depends on Pass B)
+
 ---
 
 ## Appendix B — Reference Documents Map
@@ -1038,6 +1341,13 @@ This PRD's 7-month timeline is the precondition for Trinity work.
 | `docs/architecture/SUBAGENT_PHASE1_ARCHITECTURE.md` | Phase 1 subagent design | Background for Phase 5 (Adversarial Reviewer) |
 | `docs/architecture/CLAUDE_MYTHOS_OV_INTEGRATION.md` | OV integration with Claude/CC mythology | Background for §22 Trinity context |
 | `docs/architecture/OV_RESEARCH_PAPER_2026-04-16.md` | Research paper format of O+V | Background; some overlap with this PRD |
+
+### Reverse Russian Doll architecture (§23)
+
+| Document | Purpose | Relationship to this PRD |
+|---|---|---|
+| `memory/project_reverse_russian_doll_pass_a.md` | Pass A reconciliation — verifies Order axis is genuinely new vocabulary; maps Order 1 to existing subsystems with file:line citations; identifies 5 Rungs (Gaps 2.1–2.5) | Source for §23.1, §23.4.1, §23.6, §23.10 |
+| `memory/project_reverse_russian_doll_pass_b.md` | Pass B joint design for Rungs 2.1+2.2 — Order-2 manifest schema, `ORDER_2_GOVERNANCE` risk class, AST-shape validator, shadow-pipeline replay, `MetaPhaseRunner`, manifest-amendment protocol | Source for §23.5.3, §23.7, §23.10, §23.12; execution gated on W2(5) Slice 5b |
 
 ### Operations runbooks
 
