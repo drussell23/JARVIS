@@ -93,13 +93,21 @@ MAX_FILE_REFERENCE_CHARS: int = 256
 
 def is_enabled() -> bool:
     """Master flag — ``JARVIS_ADVERSARIAL_REVIEWER_ENABLED`` (default
-    false until Slice 5 graduation).
+    **true** post Slice 5 graduation).
 
-    Slice 2's ``AdversarialReviewerService`` consults this; when off,
-    the service short-circuits and returns an :class:`AdversarialReview`
-    with ``skip_reason="master_off"``."""
+    Slices 1–4 shipped default-off. Slice 5 flipped the default after
+    layered evidence: cross-slice authority pins + factory-reachability
+    supplement + in-process live-fire smoke (service skip-paths +
+    happy path + REPL all subcommands + IDE GET endpoints + SSE
+    publish).
+
+    Hot-revert: ``JARVIS_ADVERSARIAL_REVIEWER_ENABLED=false`` →
+    Slice 2 service returns ``skip_reason="master_off"``; Slice 4
+    REPL renders ``DISABLED`` status; Slice 4 IDE endpoints return
+    403; Slice 4 SSE publish drops silently; Slice 3 hook returns
+    empty injection (no Reviewer raised: section to inject)."""
     return os.environ.get(
-        "JARVIS_ADVERSARIAL_REVIEWER_ENABLED", "",
+        "JARVIS_ADVERSARIAL_REVIEWER_ENABLED", "1",
     ).strip().lower() in _TRUTHY
 
 

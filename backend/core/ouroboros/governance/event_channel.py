@@ -264,6 +264,57 @@ class EventChannelServer:
                     metrics_exc,
                 )
 
+            # P5 Slice 5 — adversarial reviewer observability surface.
+            # Mounts /observability/adversarial{,/history,/stats,
+            # /{op_id}}. Loopback + CORS invariants mirror the
+            # existing IDE router; authority invariant
+            # (no orchestrator / gate / policy imports + read-only
+            # over the JSONL ledger) is grep-pinned in
+            # tests/governance/test_adversarial_observability.py +
+            # the Slice 5 graduation suite.
+            adversarial_router_mounted = False
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (
+                    IDEObservabilityRouter as _IDEObsRouterAdv,
+                    assert_loopback_only as _assert_loopback_adversarial,
+                )
+                from backend.core.ouroboros.governance.adversarial_observability import (  # noqa: E501
+                    register_adversarial_routes,
+                )
+                from backend.core.ouroboros.governance.adversarial_reviewer import (  # noqa: E501
+                    is_enabled as _adversarial_enabled,
+                )
+                if _adversarial_enabled():
+                    _assert_loopback_adversarial(self._host)
+                    # Dedicated IDEObservabilityRouter helper instance
+                    # whose _check_rate_limit + _cors_headers we reuse
+                    # as callables. Per-instance rate state is
+                    # independent from the main IDE router but uses
+                    # the same env-driven cap + CORS allowlist so the
+                    # operator-visible surface stays uniform (mirrors
+                    # the P4 metrics wiring pattern).
+                    _adv_helper = _IDEObsRouterAdv()
+                    register_adversarial_routes(
+                        app,
+                        rate_limit_check=lambda req: (
+                            _adv_helper._check_rate_limit(
+                                _adv_helper._client_key(req),
+                            )
+                        ),
+                        cors_headers=_adv_helper._cors_headers,
+                    )
+                    adversarial_router_mounted = True
+            except ValueError as adversarial_loopback_exc:
+                logger.warning(
+                    "[EventChannel] adversarial observability refused: %s",
+                    adversarial_loopback_exc,
+                )
+            except Exception as adversarial_exc:
+                logger.warning(
+                    "[EventChannel] adversarial observability wiring failed: %s",
+                    adversarial_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is
