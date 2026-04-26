@@ -29,7 +29,10 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
-from backend.core.ouroboros.governance.approval_provider import CLIApprovalProvider
+from backend.core.ouroboros.governance.approval_provider import CLIApprovalProvider  # noqa: F401  (kept for back-compat reference; factory selects)
+from backend.core.ouroboros.governance.inline_approval_provider import (
+    build_approval_provider,
+)
 from backend.core.ouroboros.governance.candidate_generator import (
     CandidateGenerator,
     FailbackState,
@@ -3100,8 +3103,11 @@ class GovernedLoopService:
         # GAP 6: instantiate user signal bus (always present; silent until request_stop() called)
         self._user_signal_bus = UserSignalBus()
 
-        # Build approval provider
-        self._approval_provider = CLIApprovalProvider(
+        # Build approval provider via Slice 4 factory: returns
+        # InlineApprovalProvider when JARVIS_APPROVAL_UX_INLINE_ENABLED
+        # is truthy (default true post-graduation), else legacy
+        # CLIApprovalProvider. Single source of truth for selection.
+        self._approval_provider = build_approval_provider(
             project_root=self._config.project_root,
         )
 
