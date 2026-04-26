@@ -85,11 +85,12 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
   - [x] Helper extraction + orchestrator-level reachability supplement (W3(6) precedent — `tests/governance/test_postmortem_recall_orchestrator_smoke.py`, 9/9 PASS). Total layered evidence: **67 deterministic tests + 16 in-process smoke**. Live-cadence soak attempts (3/3) hit known BG-starvation pattern (memory `project_wave3_item6_graduation_matrix.md`) — supplement substitutes per Layer 3 precedent.
   - [x] Observability follow-on (PR #21451): helper emits CONTEXT_EXPANSION DEBUG breadcrumbs uniformly on master-off + matched=0 paths (mirrors LSS pattern; closes audit gap discovered during post-#21355 live verification).
   - [x] **Master flag `JARVIS_POSTMORTEM_RECALL_ENABLED` flipped `false`→`true`** (2026-04-26, this PR). Hot-revert: `export JARVIS_POSTMORTEM_RECALL_ENABLED=false`. **Phase 1 P0 COMPLETE — first cognitive feedback loop now live by default.**
-- P0.5 — POSTMORTEM root-cause taxonomy expansion: [ ] not started
-- P1 — Cross-session pattern detector: [ ] not started
-- P1.5 — Self-RAG over own commit history: [ ] not started
+- P0.5 — Cross-session direction memory (DirectionInferrer + LSS + 100-commit git momentum, ~200 LOC): [ ] not started
 
-**Phase 2 — Self-Direction**: [ ] not started
+**Phase 2 — Self-Direction** (per PRD §9):
+- P1 — Curiosity Engine v2 (model writes backlog entries; consumes POSTMORTEM clusters + SemanticIndex drift): [ ] not started
+- P1.5 — Hypothesis ledger (every self-formed goal paired with a falsifiable hypothesis): [ ] not started
+
 **Phase 3 — Operator Symbiosis**: [ ] not started (CC-parity items P2/P3 in §3.2 deferred here)
 **Phase 4 — Cognitive Metrics**: [ ] not started (oracle_prescorer + vindication_reflector wiring lives here)
 **Phase 5 — Adversarial Depth**: [ ] not started
@@ -1195,3 +1196,4 @@ When §5.4 MVP RSI conditions all met → claim Wang-grounded RSI.
 | 2026-04-25 | 2.1 | Added §1 "Roadmap Execution Status (live)" subsection — per-slice [x]/[~]/[ ] tracking. Records: Phase 0 audit complete; Phase 1 P0 build (PR #20968) + live-fire smoke + graduation pins landed; P0 master-flag flip pending 3-clean-session cadence. Update discipline noted: each closing slice updates this section in same PR. | Claude Opus 4.7 (P0 follow-on PR) |
 | 2026-04-26 | 2.2 | P0 reachability supplement: 3/3 live-cadence soak attempts hit the known BG-starvation pattern (W3(6) memory). Pivoted to W3(6) Layer 3 reachability supplement precedent — extracted CONTEXT_EXPANSION wiring to `_inject_postmortem_recall_impl` (mirrors LSS), added orchestrator-level smoke (9 tests covering integration / concat contract / authority invariants / AST regression). Layered evidence now totals 67 deterministic tests + 16 in-process smoke. Master-flag flip gates on operator review of layered evidence (no further live cadence required). | Claude Opus 4.7 (option-2 deliverable) |
 | 2026-04-26 | 2.3 | **Phase 1 P0 GRADUATED.** `JARVIS_POSTMORTEM_RECALL_ENABLED` default flipped `false`→`true`. Pre-graduation pin renamed to `test_master_flag_default_true_post_graduation` per its embedded instructions. Source-grep pin updated to assert `_env_bool(..., True)` literal. PRD §1 status row marked `[x]`. Hot-revert: single env knob (`JARVIS_POSTMORTEM_RECALL_ENABLED=false`). First cognitive feedback loop closed end-to-end. | Claude Opus 4.7 (graduation flip PR) |
+| 2026-04-26 | 2.4 | Doc-only fix to §1 Roadmap Execution Status: corrected three mislabeled rows to match PRD §9 truth. P0.5 was "POSTMORTEM root-cause taxonomy expansion" → now "Cross-session direction memory (DirectionInferrer + LSS + 100-commit git momentum)". P1 was "Cross-session pattern detector" → now "Curiosity Engine v2 (model writes backlog entries)". P1.5 was "Self-RAG over own commit history" → now "Hypothesis ledger". P1/P1.5 also relocated from a fictional "Phase 1" sub-list into the "Phase 2 — Self-Direction" group where §9 places them. Zero behavior change. | Claude Opus 4.7 (post-graduation cleanup) |
