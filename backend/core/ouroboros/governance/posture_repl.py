@@ -361,10 +361,83 @@ def _explain(store: Any, override_state: Optional[Any]) -> PostureDispatchResult
             body_lines.append(f"    {p.value:13s} = {score:+.4f}")
         body = "\n".join(body_lines)
 
+    arc_section = _render_arc_context_section(reading)
+    if arc_section:
+        body = body.rstrip() + "\n\n" + arc_section
+
     banner = _render_override_banner(override_state)
     if banner:
         body = body.rstrip() + "\n" + banner
     return PostureDispatchResult(ok=True, text=body)
+
+
+def _render_arc_context_section(reading: Any) -> str:
+    """P0.5 Slice 3 — render the arc-context block on `/posture explain`.
+
+    Empty string when the reading carries no arc context (back-compat with
+    pre-Slice-2 readings that may persist across upgrades). Always plain-
+    text, never raises — observability surface for the operator to verify
+    cross-session direction memory in production.
+    """
+    arc = getattr(reading, "arc_context", None)
+    if arc is None:
+        return ""
+
+    try:
+        from backend.core.ouroboros.governance.direction_inferrer import (
+            arc_context_enabled,
+        )
+        applied = arc_context_enabled()
+    except Exception:
+        applied = False
+
+    lines = ["  Arc Context (P0.5 — Cross-Session Direction Memory):"]
+    lines.append(
+        f"    Status: {'APPLIED to scores' if applied else 'OBSERVED ONLY (flag off)'}"
+    )
+
+    momentum = getattr(arc, "momentum", None)
+    if momentum is not None and not momentum.is_empty():
+        top_scopes = momentum.top_scopes(3)
+        top_types = momentum.top_types(4)
+        lines.append(f"    Momentum: {momentum.commit_count} commits parsed")
+        if top_scopes:
+            scope_str = ", ".join(f"{s}({c})" for s, c in top_scopes)
+            lines.append(f"      top scopes: {scope_str}")
+        if top_types:
+            type_str = ", ".join(f"{t}={c}" for t, c in top_types)
+            lines.append(f"      top types:  {type_str}")
+    else:
+        lines.append("    Momentum: (no git history available)")
+
+    verify_ratio = getattr(arc, "lss_verify_ratio", None)
+    apply_count = getattr(arc, "lss_apply_count", None)
+    apply_mode = getattr(arc, "lss_apply_mode", None)
+    if verify_ratio is not None or apply_count is not None:
+        bits = []
+        if apply_mode is not None and apply_count is not None:
+            bits.append(f"apply={apply_mode}/{apply_count}")
+        if verify_ratio is not None:
+            bits.append(f"verify_ratio={verify_ratio:.2f}")
+        lines.append(f"    LastSession: {'  '.join(bits) if bits else '(no signal)'}")
+    else:
+        lines.append("    LastSession: (no summary available)")
+
+    try:
+        nudges = arc.suggest_nudge()
+    except Exception:
+        nudges = {}
+    if nudges:
+        lines.append("    Per-posture score nudge (bounded ≤ 0.10):")
+        for posture, nudge in sorted(
+            nudges.items(), key=lambda kv: -kv[1]
+        ):
+            marker = "applied" if applied and nudge > 0 else "      "
+            lines.append(
+                f"      {posture.value:<12s}  +{nudge:.4f}  {marker}"
+            )
+
+    return "\n".join(lines)
 
 
 def _history(store: Any, limit: int) -> PostureDispatchResult:

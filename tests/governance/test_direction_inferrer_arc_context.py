@@ -214,17 +214,33 @@ def test_nudge_every_posture_bounded():
 # ---------------------------------------------------------------------------
 
 
-def test_arc_context_enabled_default_false():
-    """Slice 2 ships default-off. Slice 3 graduation flips this."""
+def test_arc_context_enabled_default_true_post_graduation(monkeypatch):
+    """Post-graduation default per Slice 3 (2026-04-26). Hot-revert: set
+    ``JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED=false``.
+
+    If this test fails AND the flip is being intentionally rolled back:
+    rename to test_arc_context_enabled_default_false (and flip the
+    assertion) per the same discipline P0 used."""
+    monkeypatch.delenv(
+        "JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED", raising=False,
+    )
+    assert arc_context_enabled() is True
+
+
+def test_arc_context_enabled_explicit_false_hot_revert(monkeypatch):
+    """Hot-revert path: explicit ``false`` disables the bounded-nudge
+    application post-graduation. Pinned so the runtime kill switch can
+    never silently break."""
+    monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED", "false")
     assert arc_context_enabled() is False
 
 
 def test_inferrer_with_flag_off_does_not_apply_nudge(monkeypatch):
-    """Observation-only mode: scores are byte-for-byte identical to a
-    call without arc_context."""
-    monkeypatch.delenv(
-        "JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED", raising=False,
-    )
+    """Hot-revert observation-only mode: scores are byte-for-byte
+    identical to a call without arc_context. This is the same invariant
+    Slice 2 pinned for the default-off case — it now pins the explicit
+    false case for the post-graduation hot-revert path."""
+    monkeypatch.setenv("JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED", "false")
     di = DirectionInferrer()
     bundle = _strong_explore_bundle()
     ctx = ArcContextSignal(
