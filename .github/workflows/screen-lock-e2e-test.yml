@@ -175,7 +175,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
+          pip install --upgrade pip setuptools wheel
           pip install pytest pytest-asyncio pytest-mock pytest-timeout aiohttp
 
           # Install project dependencies
@@ -931,7 +931,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
+          pip install --upgrade pip setuptools wheel
           pip install pytest pytest-asyncio aiohttp
 
           if [ -f "backend/requirements.txt" ]; then
