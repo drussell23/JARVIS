@@ -575,3 +575,29 @@ def test_pin_jsonl_schema_version() -> None:
     """Schema version pinned for ledger compatibility."""
     src = _read("backend/core/ouroboros/governance/postmortem_recall.py")
     assert '"postmortem_recall.1"' in src
+
+
+def test_pin_orchestrator_invokes_recall_at_context_expansion() -> None:
+    """Wiring invariant: orchestrator must invoke get_default_service +
+    render_recall_section at the CONTEXT_EXPANSION injection site."""
+    src = _read("backend/core/ouroboros/governance/orchestrator.py")
+    assert "from backend.core.ouroboros.governance.postmortem_recall" in src
+    assert "get_default_service as _get_pm_recall" in src
+    assert "render_recall_section as _render_pm_recall" in src
+    assert "PRD Phase 1" in src
+    # Best-effort discipline: wrapped in try/except (never blocks FSM)
+    assert "[Orchestrator] PostmortemRecall injection skipped" in src
+
+
+def test_pin_orchestrator_recall_after_conversation_bridge() -> None:
+    """Sequence pin: PostmortemRecall block appears AFTER ConversationBridge
+    block (matches the ordering established in CONTEXT_EXPANSION)."""
+    src = _read("backend/core/ouroboros/governance/orchestrator.py")
+    bridge_idx = src.find("ConversationBridge injection skipped")
+    recall_idx = src.find("PostmortemRecall injection skipped")
+    assert bridge_idx > 0, "ConversationBridge marker missing"
+    assert recall_idx > 0, "PostmortemRecall marker missing"
+    assert bridge_idx < recall_idx, (
+        "PostmortemRecall must inject AFTER ConversationBridge "
+        "(per CONTEXT_EXPANSION ordering)"
+    )
