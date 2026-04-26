@@ -59,8 +59,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.governance.arc_context import (
+    build_arc_context,
+)
 from backend.core.ouroboros.governance.direction_inferrer import (
     DirectionInferrer,
+    arc_context_enabled as _arc_context_enabled,
     is_enabled as _inferrer_enabled,
 )
 from backend.core.ouroboros.governance.posture import (
@@ -531,6 +535,24 @@ class PostureObserver:
                 pass
             self._task = None
 
+    # ---- arc-context input (P0.5 Slice 2) ---------------------------------
+
+    def _read_lss_one_liner(self) -> str:
+        """Best-effort read of the most-recent LastSessionSummary one-liner.
+
+        Returns ``""`` when LSS is unavailable, the helper raises, or no
+        prior session exists. Never raises — the arc-context branch is
+        observability + small bounded nudge only."""
+        try:
+            from backend.core.ouroboros.governance.last_session_summary import (
+                get_default_summary,
+            )
+            lss = get_default_summary(self._root)
+            line = lss.format_for_prompt() or ""
+            return str(line)
+        except Exception:
+            return ""
+
     # ---- main loop --------------------------------------------------------
 
     async def _run_forever(self) -> None:
@@ -557,7 +579,23 @@ class PostureObserver:
         bundle = await self._collect_with_timeout()
         if bundle is None:
             return None
-        reading = self._inferrer.infer(bundle)
+        # P0.5 Slice 2 — build arc-context (best-effort, never raises) and
+        # pass to inferrer. Helper is observability-only by default; score
+        # adjustment fires only when JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED=true.
+        arc_ctx = None
+        try:
+            lss_one_liner = self._read_lss_one_liner()
+            arc_ctx = build_arc_context(self._root, lss_one_liner=lss_one_liner)
+        except Exception:
+            logger.debug("[PostureObserver] arc_context build skipped", exc_info=True)
+        reading = self._inferrer.infer(bundle, arc_context=arc_ctx)
+        # Single observability line for the arc-context state per cycle.
+        if arc_ctx is not None:
+            logger.info(
+                "[PostureObserver] arc_context=%s applied=%s",
+                json.dumps(arc_ctx.to_log_dict(), sort_keys=True),
+                _arc_context_enabled(),
+            )
 
         # Append to history regardless of hysteresis (we want the raw
         # signal trail; hysteresis only masks `current`).

@@ -39,7 +39,7 @@ import enum
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 SCHEMA_VERSION = "1.0"
@@ -172,6 +172,13 @@ class PostureReading:
     two identical bundles produce readings with identical hashes, which
     lets tests assert pure-function behavior without equality-comparing
     every field of the reading itself (``inferred_at`` differs per call).
+
+    ``arc_context`` (P0.5 Slice 2): optional ``ArcContextSignal`` carried
+    through from the inferrer call. ``None`` when the caller didn't
+    provide one (back-compat with all pre-Slice-2 callers). When present,
+    the field is observability-only by default — score adjustment was
+    applied iff ``JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED`` was on
+    at infer time.
     """
 
     posture: Posture
@@ -181,9 +188,10 @@ class PostureReading:
     signal_bundle_hash: str
     all_scores: Tuple[Tuple[Posture, float], ...]
     schema_version: str = SCHEMA_VERSION
+    arc_context: Optional[Any] = None  # ArcContextSignal — typed as Any to avoid circular import
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "posture": self.posture.value,
             "confidence": self.confidence,
             "evidence": [
@@ -202,6 +210,12 @@ class PostureReading:
             "all_scores": [(p.value, s) for p, s in self.all_scores],
             "schema_version": self.schema_version,
         }
+        if self.arc_context is not None:
+            try:
+                d["arc_context"] = self.arc_context.to_log_dict()
+            except Exception:
+                d["arc_context"] = None
+        return d
 
 
 def baseline_bundle() -> SignalBundle:

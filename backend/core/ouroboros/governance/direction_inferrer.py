@@ -37,6 +37,7 @@ import os
 import time
 from typing import Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.governance.arc_context import ArcContextSignal
 from backend.core.ouroboros.governance.posture import (
     Posture,
     PostureReading,
@@ -94,6 +95,21 @@ def is_enabled() -> bool:
     flag — graduation flips opt-in friction, NOT authority surface.
     """
     return _env_bool("JARVIS_DIRECTION_INFERRER_ENABLED", True)
+
+
+def arc_context_enabled() -> bool:
+    """P0.5 Slice 2 — when on, ``DirectionInferrer.infer(arc_context=...)``
+    applies bounded score nudges (≤ ``MAX_NUDGE_PER_POSTURE`` per posture)
+    derived from recent git momentum + last-session summary.
+
+    Default: ``false``. Slice 3 graduation flips this default-off → on
+    after the same evidence pattern P0 used. When off, ``arc_context``
+    kwargs are still observed (carried through to ``PostureReading`` +
+    surfaced in the posture log line) but contribute zero to scoring —
+    this is the "observation-only" mode that lets live-cadence sessions
+    measure the would-be effect before flipping the default.
+    """
+    return _env_bool("JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED", False)
 
 
 def confidence_floor() -> float:
@@ -390,12 +406,25 @@ class DirectionInferrer:
 
     # ---- public API -------------------------------------------------------
 
-    def infer(self, bundle: SignalBundle) -> PostureReading:
+    def infer(
+        self,
+        bundle: SignalBundle,
+        arc_context: Optional[ArcContextSignal] = None,
+    ) -> PostureReading:
         """Deterministic pure inference. Always returns a PostureReading
         (never None, never raises on well-formed input).
 
         Raises ``ValueError`` on schema_version mismatch — v1 reader
         reading v2+ bundle must reject, not coerce.
+
+        ``arc_context`` (P0.5 Slice 2): optional ``ArcContextSignal`` from
+        ``arc_context.build_arc_context``. When provided, it is always
+        carried through to the returned ``PostureReading`` for
+        observability — but the score adjustment is **only applied when**
+        ``JARVIS_DIRECTION_INFERRER_ARC_CONTEXT_ENABLED`` is on (default
+        off). Each per-posture nudge is bounded to
+        ``arc_context.MAX_NUDGE_PER_POSTURE`` (0.10) so existing weights
+        still dominate.
         """
         from backend.core.ouroboros.governance.posture import SCHEMA_VERSION as _SV
 
@@ -408,6 +437,17 @@ class DirectionInferrer:
         normalized = self._normalize(bundle)
         weights = self._resolve_weights()
         scores = self._score(normalized, weights)
+
+        # P0.5 Slice 2 — apply bounded arc-context nudge when flag is on.
+        # When the flag is off OR arc_context is None, scores are
+        # byte-for-byte unchanged (back-compat with all existing pins).
+        arc_nudge_applied: Dict[Posture, float] = {p: 0.0 for p in Posture}
+        if arc_context is not None and arc_context_enabled():
+            arc_nudge_applied = arc_context.suggest_nudge()
+            for posture, nudge in arc_nudge_applied.items():
+                if nudge:
+                    scores[posture] = scores[posture] + nudge
+
         winner, top, second = self._pick_winner(scores)
         confidence = self._confidence(top, second)
 
@@ -431,6 +471,7 @@ class DirectionInferrer:
             inferred_at=time.time(),
             signal_bundle_hash=bundle.hash(),
             all_scores=all_scores,
+            arc_context=arc_context,
         )
 
 
