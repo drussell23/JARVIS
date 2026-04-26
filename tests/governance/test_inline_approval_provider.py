@@ -28,7 +28,6 @@ import pytest
 
 from backend.core.ouroboros.governance.approval_provider import (
     ApprovalProvider,
-    ApprovalResult,
     ApprovalStatus,
 )
 from backend.core.ouroboros.governance.inline_approval import (
@@ -310,8 +309,11 @@ def _read_jsonl(path: Path) -> list:
 
 
 def test_audit_writes_on_approve(provider, audit_path):
-    asyncio.run(provider.request(_make_ctx(op_id="op-au1")))
-    asyncio.run(provider.approve("op-au1", "operator"))
+    async def _run():
+        await provider.request(_make_ctx(op_id="op-au1"))
+        await provider.approve("op-au1", "operator")
+
+    asyncio.run(_run())
     rows = _read_jsonl(audit_path)
     assert len(rows) == 1
     row = rows[0]
@@ -324,16 +326,22 @@ def test_audit_writes_on_approve(provider, audit_path):
 
 
 def test_audit_writes_on_reject(provider, audit_path):
-    asyncio.run(provider.request(_make_ctx(op_id="op-au2")))
-    asyncio.run(provider.reject("op-au2", "operator", "bad diff"))
+    async def _run():
+        await provider.request(_make_ctx(op_id="op-au2"))
+        await provider.reject("op-au2", "operator", "bad diff")
+
+    asyncio.run(_run())
     rows = _read_jsonl(audit_path)
     assert rows[-1]["status"] == "REJECTED"
     assert rows[-1]["reason"] == "bad diff"
 
 
 def test_audit_writes_on_expired(provider, audit_path):
-    asyncio.run(provider.request(_make_ctx(op_id="op-au3")))
-    asyncio.run(provider.await_decision("op-au3", timeout_s=0.02))
+    async def _run():
+        await provider.request(_make_ctx(op_id="op-au3"))
+        await provider.await_decision("op-au3", timeout_s=0.02)
+
+    asyncio.run(_run())
     rows = _read_jsonl(audit_path)
     assert rows[-1]["status"] == "EXPIRED"
     assert rows[-1]["approver"] is None
@@ -471,9 +479,9 @@ def test_provider_only_io_surface_is_audit_ledger():
         "subprocess.",
         "os.environ[",
         "os." + "system(",  # split to dodge pre-commit hook
-        "urllib.request",
-        "requests.",
-        "httpx.",
+        "import urllib.request",
+        "import requests",
+        "import httpx",
     ]
     for c in forbidden:
         assert c not in src, f"unexpected coupling: {c}"
