@@ -522,6 +522,51 @@ def _inject_postmortem_recall_impl(
     return ctx
 
 
+def _reflect_cognitive_metrics_post_apply_impl(
+    ctx: OperationContext,
+    applied_files: Sequence[Any],
+) -> None:
+    """Phase 4 P3 follow-on — vindication call site at APPLY-success.
+
+    Best-effort observability: when ``JARVIS_COGNITIVE_METRICS_ENABLED``
+    is on AND the singleton is wired (set by orchestrator.__init__) AND
+    a pre-apply snapshot was captured at CONTEXT_EXPANSION (via
+    ``score_pre_apply``), calls ``CognitiveMetricsService.auto_reflect_post_apply``
+    which computes before/after deltas and persists a vindication
+    ``CognitiveMetricRecord`` to the JSONL ledger.
+
+    Authority invariant per PRD §12.2: read-only, never blocks the FSM.
+    Any exception (oracle down, ledger write failed) emits a DEBUG
+    breadcrumb and returns silently. Vindication score is NOT consumed
+    by Iron Gate / risk_tier / approve gating in this slice — advisory
+    signal only, recorded for future Phase 4 work to consume.
+    """
+    try:
+        from backend.core.ouroboros.governance.cognitive_metrics import (
+            get_default_service as _get_cm_svc,
+            is_enabled as _cm_enabled,
+        )
+        if not _cm_enabled():
+            return
+        svc = _get_cm_svc()
+        if svc is None:
+            return
+        # applied_files is a Sequence[Path] from the orchestrator call
+        # site; normalize to List[str] for the service API.
+        target_strs = [str(p) for p in (applied_files or ())]
+        if not target_strs:
+            return
+        svc.auto_reflect_post_apply(
+            op_id=ctx.op_id,
+            target_files=target_strs,
+        )
+    except Exception:
+        logger.debug(
+            "[Orchestrator] CognitiveMetrics post-apply reflection skipped",
+            exc_info=True,
+        )
+
+
 def _score_cognitive_metrics_pre_apply_impl(
     ctx: OperationContext,
 ) -> None:
@@ -7725,6 +7770,16 @@ class GovernedOrchestrator:
         await self._persist_performance_record(ctx)
         applied_files = [Path(p).resolve() for p in ctx.target_files]
         await self._oracle_incremental_update(applied_files)
+
+        # ---- Phase 4 P3 follow-on: Cognitive Metrics post-APPLY ----
+        # Vindication call site — reads the pre-apply OracleSnapshot
+        # captured at CONTEXT_EXPANSION (next to score_pre_apply) and
+        # records a vindication CognitiveMetricRecord. Adjacent to
+        # _oracle_incremental_update so the live oracle has the most
+        # recent state when computing after-values. Best-effort: helper
+        # body at module scope as
+        # `_reflect_cognitive_metrics_post_apply_impl`.
+        _reflect_cognitive_metrics_post_apply_impl(ctx, applied_files)
 
         # ── P0 Wiring: Complete ReasoningNarrator + OperationDialogue ────
         if self._reasoning_narrator is not None:

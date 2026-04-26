@@ -104,6 +104,84 @@ def is_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Oracle snapshot — used by the post-APPLY vindication call site to
+# capture before-values at CONTEXT_EXPANSION (next to the pre-score call)
+# and read them back at APPLY-success time.
+# ---------------------------------------------------------------------------
+
+
+# Hard cap on the in-process snapshot cache so a long-running session
+# can't accumulate unbounded snapshots from ops that never reach APPLY.
+# Pinned by tests so behaviour stays reviewable.
+_SNAPSHOT_CACHE_MAX: int = 256
+
+
+@dataclass(frozen=True)
+class OracleSnapshot:
+    """Pre-APPLY oracle state for a target_files set.
+
+    Captured at CONTEXT_EXPANSION (alongside ``score_pre_apply``) and
+    consumed by ``reflect_post_apply`` to compute before/after deltas.
+
+    Attributes
+    ----------
+    coupling_total:
+        Sum of ``len(get_dependencies) + len(get_dependents)`` across
+        all target_files. Float so the reflector's division math is
+        consistent.
+    blast_max:
+        Max ``compute_blast_radius(file).total_affected`` across target
+        files. Float for consistency.
+    complexity_estimate:
+        Conservative complexity proxy (number of target files for v1 —
+        future slices can wire a real cyclomatic complexity probe).
+        Captured before-values lets the reflector compute entropy_delta
+        even when the post-state probe is unavailable.
+    """
+
+    coupling_total: float
+    blast_max: float
+    complexity_estimate: float
+
+
+def snapshot_oracle_state(
+    oracle: Any, target_files: List[str],
+) -> Optional[OracleSnapshot]:
+    """Best-effort oracle state snapshot for a target_files set.
+
+    Returns ``None`` on any oracle failure — caller treats absence as
+    "no before-snapshot available" and falls back to the reflector's
+    neutral path. Never raises.
+    """
+    if not target_files or oracle is None:
+        return None
+    try:
+        coupling_total = 0.0
+        blast_max = 0.0
+        for f in target_files:
+            try:
+                deps = oracle.get_dependencies(f)
+                dependents = oracle.get_dependents(f)
+                coupling_total += float(len(deps) + len(dependents))
+            except Exception:
+                # Per-file failure: skip; partial snapshot is better
+                # than none for the average-case math.
+                continue
+            try:
+                br = oracle.compute_blast_radius(f)
+                blast_max = max(blast_max, float(br.total_affected))
+            except Exception:
+                continue
+        return OracleSnapshot(
+            coupling_total=coupling_total,
+            blast_max=blast_max,
+            complexity_estimate=float(len(target_files)),
+        )
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class CognitiveMetricRecord:
     """One ledger row — a snapshot of either a pre-score or a vindication
@@ -165,6 +243,13 @@ class CognitiveMetricsService:
         self._prescorer = OraclePreScorer(oracle)
         self._reflector = VindicationReflector(oracle)
         self._lock = threading.Lock()
+        # Per-process cache: op_id → OracleSnapshot captured at
+        # CONTEXT_EXPANSION (next to score_pre_apply). Read by
+        # reflect_post_apply at APPLY-success to compute before/after
+        # deltas. Bounded by _SNAPSHOT_CACHE_MAX (FIFO eviction) so a
+        # long-running session can't accumulate snapshots from ops
+        # that never reached APPLY.
+        self._pre_apply_snapshots: Dict[str, OracleSnapshot] = {}
 
     @property
     def ledger_path(self) -> Path:
@@ -181,7 +266,9 @@ class CognitiveMetricsService:
     ) -> PreScoreResult:
         """Compute pre-score for a candidate. Always returns a
         ``PreScoreResult`` (neutral on any failure). When master flag
-        is on, also persists a ``CognitiveMetricRecord`` to the ledger."""
+        is on, also persists a ``CognitiveMetricRecord`` to the ledger
+        AND captures an ``OracleSnapshot`` keyed on ``op_id`` for the
+        post-APPLY vindication call site to read back."""
         result = self._prescorer.score(
             target_files=target_files,
             max_complexity=max_complexity,
@@ -193,12 +280,83 @@ class CognitiveMetricsService:
                 target_files=tuple(target_files),
                 result=result,
             ))
+            # Capture the before-snapshot for the post-APPLY call site.
+            # Best-effort: snapshot_oracle_state returns None on oracle
+            # failure; the post-APPLY helper falls back to neutral.
+            snap = snapshot_oracle_state(self._oracle, target_files)
+            if snap is not None:
+                self._cache_snapshot(op_id, snap)
             logger.info(
                 "[CognitiveMetrics] op=%s pre_score=%.3f gate=%s "
                 "files=%d (Phase 4 P3)",
                 op_id, result.pre_score, result.gate, len(target_files),
             )
         return result
+
+    def get_pre_apply_snapshot(self, op_id: str) -> Optional[OracleSnapshot]:
+        """Return the cached pre-APPLY snapshot for an op_id, or None
+        if no snapshot was captured (e.g. flag was off at CONTEXT_EXPANSION
+        time, or the op never went through score_pre_apply)."""
+        with self._lock:
+            return self._pre_apply_snapshots.get(op_id)
+
+    def pop_pre_apply_snapshot(self, op_id: str) -> Optional[OracleSnapshot]:
+        """Same as ``get_pre_apply_snapshot`` but ALSO evicts the entry
+        from the cache. Use this from the post-APPLY call site so the
+        cache stays bounded over a long session."""
+        with self._lock:
+            return self._pre_apply_snapshots.pop(op_id, None)
+
+    def _cache_snapshot(self, op_id: str, snap: OracleSnapshot) -> None:
+        """FIFO-bounded snapshot cache (oldest evicted at the cap)."""
+        with self._lock:
+            if len(self._pre_apply_snapshots) >= _SNAPSHOT_CACHE_MAX:
+                # Evict the oldest entry (insertion order) — Python dicts
+                # preserve insertion order so popitem(last=False) on
+                # OrderedDict semantics is the natural FIFO.
+                try:
+                    oldest = next(iter(self._pre_apply_snapshots))
+                    self._pre_apply_snapshots.pop(oldest, None)
+                except StopIteration:
+                    pass
+            self._pre_apply_snapshots[op_id] = snap
+
+    def auto_reflect_post_apply(
+        self,
+        op_id: str,
+        target_files: List[str],
+    ) -> Optional[VindicationResult]:
+        """High-level post-APPLY entry point used by the orchestrator
+        helper. Resolves before/after snapshots automatically:
+
+        * BEFORE — pulled from the snapshot cache via
+          ``pop_pre_apply_snapshot(op_id)``. Returns ``None`` (caller
+          short-circuits) when no snapshot was captured (master flag
+          was off at CONTEXT_EXPANSION OR the op skipped pre-score).
+        * AFTER — fresh ``snapshot_oracle_state(target_files)``. Returns
+          ``None`` (caller short-circuits) when the live oracle is
+          unavailable.
+
+        Returns the underlying ``VindicationResult`` (which itself
+        carries the neutral fallback contract). Caller treats ``None``
+        return as "couldn't reflect this op" — never blocks the FSM.
+        """
+        if not target_files:
+            return None
+        before = self.pop_pre_apply_snapshot(op_id)
+        if before is None:
+            return None
+        after = snapshot_oracle_state(self._oracle, target_files)
+        if after is None:
+            return None
+        return self.reflect_post_apply(
+            op_id=op_id,
+            target_files=target_files,
+            coupling_after=after.coupling_total,
+            blast_radius_after=after.blast_max,
+            complexity_after=after.complexity_estimate,
+            complexity_before=before.complexity_estimate,
+        )
 
     def reflect_post_apply(
         self,
@@ -454,8 +612,10 @@ __all__ = [
     "DEFAULT_LEDGER_FILENAME",
     "CognitiveMetricRecord",
     "CognitiveMetricsService",
+    "OracleSnapshot",
     "get_default_service",
     "is_enabled",
     "reset_default_service",
     "set_default_service",
+    "snapshot_oracle_state",
 ]
