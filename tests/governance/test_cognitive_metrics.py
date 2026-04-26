@@ -83,8 +83,20 @@ def _enable(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_master_flag_default_false():
-    """Slice 1 ships default-off — Slice 2 graduation flips it."""
+def test_master_flag_default_true_post_graduation(monkeypatch):
+    """JARVIS_COGNITIVE_METRICS_ENABLED defaults True post-graduation
+    (P3 Slice 2, 2026-04-26). Hot-revert: set env to "false".
+
+    If this test fails AND P3 has been intentionally rolled back: rename
+    to test_master_flag_default_false (and flip the assertion + the
+    source-grep pin) per the same discipline P0/P0.5/P1/P1.5 used."""
+    monkeypatch.delenv("JARVIS_COGNITIVE_METRICS_ENABLED", raising=False)
+    assert is_enabled() is True
+
+
+def test_master_flag_explicit_false_hot_revert(monkeypatch):
+    """Hot-revert path post-graduation."""
+    monkeypatch.setenv("JARVIS_COGNITIVE_METRICS_ENABLED", "false")
     assert is_enabled() is False
 
 
@@ -158,7 +170,7 @@ def test_score_pre_apply_persists_when_flag_on(monkeypatch, service):
 
 def test_score_pre_apply_no_persist_when_flag_off(monkeypatch, service):
     """Hot-revert: flag off → no ledger touch (byte-for-byte pre-Slice-1)."""
-    monkeypatch.delenv("JARVIS_COGNITIVE_METRICS_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_COGNITIVE_METRICS_ENABLED", "false")
     service.score_pre_apply(
         op_id="op-1", target_files=["a.py"], max_complexity=5,
     )
@@ -212,7 +224,7 @@ def test_reflect_persists_when_flag_on(monkeypatch, service):
 
 
 def test_reflect_no_persist_when_flag_off(monkeypatch, service):
-    monkeypatch.delenv("JARVIS_COGNITIVE_METRICS_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_COGNITIVE_METRICS_ENABLED", "false")
     service.reflect_post_apply(
         op_id="op-1", target_files=["a.py"],
         coupling_after=0, blast_radius_after=0,
@@ -317,7 +329,11 @@ def test_stats_populated(monkeypatch, service):
 # ---------------------------------------------------------------------------
 
 
-def test_get_default_service_none_when_master_off(stub_oracle, tmp_path):
+def test_get_default_service_none_when_master_off(
+    monkeypatch, stub_oracle, tmp_path,
+):
+    """Hot-revert path post-graduation: explicit false → accessor None."""
+    monkeypatch.setenv("JARVIS_COGNITIVE_METRICS_ENABLED", "false")
     assert get_default_service(oracle=stub_oracle, project_root=tmp_path) is None
 
 
@@ -369,7 +385,10 @@ def test_repl_help(tmp_path):
     assert "stats" in r.text and "show" in r.text
 
 
-def test_repl_stats_no_service_when_master_off(tmp_path):
+def test_repl_stats_no_service_when_master_off(monkeypatch, tmp_path):
+    """Hot-revert path post-graduation: explicit false → REPL says
+    not initialised."""
+    monkeypatch.setenv("JARVIS_COGNITIVE_METRICS_ENABLED", "false")
     r = REPL("/cognitive stats", project_root=tmp_path)
     assert r.ok is False
     assert "not initialised" in r.text

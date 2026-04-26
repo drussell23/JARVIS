@@ -522,6 +522,53 @@ def _inject_postmortem_recall_impl(
     return ctx
 
 
+def _score_cognitive_metrics_pre_apply_impl(
+    ctx: OperationContext,
+) -> None:
+    """Phase 4 P3 — pre-APPLY oracle pre-score for the current op.
+
+    Best-effort observability: when ``JARVIS_COGNITIVE_METRICS_ENABLED``
+    is on AND the singleton is wired (set by orchestrator.__init__) AND
+    the candidate ``ctx.target_files`` is non-empty, calls the wrapped
+    ``OraclePreScorer`` and persists a ``CognitiveMetricRecord`` to the
+    JSONL ledger. The pre-score is NOT consumed by Iron Gate / risk-tier
+    / approve gating in this slice — it's an advisory signal only.
+    Future slices can weight downstream decisions on it.
+
+    Authority invariant per PRD §12.2: read-only, never blocks the FSM.
+    Any exception (oracle down, ledger write failed, complexity probe
+    raised) emits a DEBUG breadcrumb and returns silently.
+    """
+    try:
+        from backend.core.ouroboros.governance.cognitive_metrics import (
+            get_default_service as _get_cm_svc,
+            is_enabled as _cm_enabled,
+        )
+        if not _cm_enabled():
+            return
+        svc = _get_cm_svc()
+        if svc is None:
+            return
+        target_files = list(ctx.target_files or ())
+        if not target_files:
+            return
+        # The OraclePreScorer accepts max_complexity + has_tests as
+        # optional probes; we pass the conservative defaults so the
+        # signal is computable on every well-formed ctx. Future slices
+        # can wire real complexity probes.
+        svc.score_pre_apply(
+            op_id=ctx.op_id,
+            target_files=target_files,
+            max_complexity=0,
+            has_tests=True,
+        )
+    except Exception:
+        logger.debug(
+            "[Orchestrator] CognitiveMetrics pre-score skipped",
+            exc_info=True,
+        )
+
+
 def _plan_review_required() -> bool:
     """Return True when the session requires pre-execution plan review."""
     return (
@@ -786,6 +833,30 @@ class GovernedOrchestrator:
             _set_default_cg(self._cost_governor)
         except Exception:  # noqa: BLE001
             pass
+
+        # Phase 4 P3 (2026-04-26) — un-strand the OraclePreScorer +
+        # VindicationReflector via the CognitiveMetricsService wrapper.
+        # Wires the singleton with the live Oracle off the stack so that
+        # both the orchestrator helpers and the /cognitive REPL surface
+        # share one service per process. Best-effort: any failure means
+        # cognitive metrics are observed-only-via-repl rather than
+        # auto-scored — never breaks orchestrator construction.
+        try:
+            from backend.core.ouroboros.governance.cognitive_metrics import (
+                CognitiveMetricsService as _CMSvc,
+                is_enabled as _cm_enabled,
+                set_default_service as _set_default_cm,
+            )
+            if _cm_enabled():
+                _oracle_for_cm = getattr(self._stack, "oracle", None)
+                if _oracle_for_cm is not None:
+                    _set_default_cm(_CMSvc(
+                        oracle=_oracle_for_cm,
+                        project_root=self._config.project_root,
+                    ))
+        except Exception:  # noqa: BLE001
+            pass
+
         self._forward_progress: ForwardProgressDetector = self._state.forward_progress
         self._productivity_detector: ProductivityDetector = (
             self._state.productivity_detector
@@ -1901,6 +1972,16 @@ class GovernedOrchestrator:
             # module scope as `_inject_postmortem_recall_impl`. ConversationBridge
             # → PostmortemRecall → SemanticIndex ordering preserved.
             ctx = _inject_postmortem_recall_impl(ctx)
+
+            # ---- Phase 4 P3 Cognitive Metrics: Oracle pre-score ----
+            # Best-effort observability — calls OraclePreScorer via the
+            # CognitiveMetricsService singleton wired at orchestrator boot.
+            # Persists a CognitiveMetricRecord to the JSONL ledger when
+            # JARVIS_COGNITIVE_METRICS_ENABLED is on. Advisory only —
+            # the existing Iron Gate / risk_tier_floor stack remains
+            # authoritative. Helper body at module scope as
+            # `_score_cognitive_metrics_pre_apply_impl`.
+            _score_cognitive_metrics_pre_apply_impl(ctx)
 
             # ---- SemanticIndex v0.1: recency-weighted focus + closures ----
             # Soft semantic prior drawn from the recency-weighted centroid
