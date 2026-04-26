@@ -1,0 +1,71 @@
+{
+  "workflow_name": "Validate Configuration",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24963863116",
+  "branch": "main",
+  "commit_sha": "f6dbba9",
+  "run_number": 2984,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/validate-configuration-run2984-20260426-190025",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Validate Configuration (Run #2984)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 87,
+              "content": "2026-04-26T18:33:18.4234751Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 60,
+              "content": "2026-04-26T18:33:18.4171196Z \u274c VALIDATION FAILED",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2026-04-26T18:33:18.5621258Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 65,
+              "content": "2026-04-26T18:33:18.4173266Z \u26a0\ufe0f  WARNINGS",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 97,
+              "content": "2026-04-26T18:33:18.5621258Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-04-26T19:00:25.514751"
+}
