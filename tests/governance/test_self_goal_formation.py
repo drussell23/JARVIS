@@ -118,18 +118,32 @@ def _fresh_engine(tmp_path: Path) -> SelfGoalFormationEngine:
 # ---------------------------------------------------------------------------
 
 
-def test_master_flag_default_false():
-    """Slice 2 ships default-off — Slice 5 graduation flips it."""
+def test_master_flag_default_true_post_graduation(monkeypatch):
+    """JARVIS_SELF_GOAL_FORMATION_ENABLED defaults True post-graduation
+    (P1 Slice 5, 2026-04-26). Hot-revert: set env to "false".
+
+    If this test fails AND P1 has been intentionally rolled back: rename
+    to test_master_flag_default_false (and flip the assertion + the
+    source-grep pin) per the same discipline P0/P0.5 used."""
+    monkeypatch.delenv("JARVIS_SELF_GOAL_FORMATION_ENABLED", raising=False)
+    assert is_enabled() is True
+
+
+def test_master_flag_explicit_false_hot_revert(monkeypatch):
+    """Hot-revert path: explicit false disables engine post-graduation."""
+    monkeypatch.setenv("JARVIS_SELF_GOAL_FORMATION_ENABLED", "false")
     assert is_enabled() is False
 
 
 def test_master_flag_explicit_true(monkeypatch):
+    """Idempotent: explicit true matches the new default."""
     monkeypatch.setenv("JARVIS_SELF_GOAL_FORMATION_ENABLED", "true")
     assert is_enabled() is True
 
 
 def test_master_flag_off_engine_returns_none(tmp_path, monkeypatch):
-    monkeypatch.delenv("JARVIS_SELF_GOAL_FORMATION_ENABLED", raising=False)
+    """Hot-revert pin: explicit false → engine.evaluate short-circuits."""
+    monkeypatch.setenv("JARVIS_SELF_GOAL_FORMATION_ENABLED", "false")
     eng = _fresh_engine(tmp_path)
     out = eng.evaluate(
         postmortems=_three_records(),
@@ -573,7 +587,9 @@ def test_reset_session_state_clears_counters(monkeypatch, tmp_path):
 
 
 def test_get_default_engine_returns_none_when_master_off(monkeypatch):
-    monkeypatch.delenv("JARVIS_SELF_GOAL_FORMATION_ENABLED", raising=False)
+    """Post-graduation, master is on by default. Hot-revert path: explicit
+    false returns None from accessor."""
+    monkeypatch.setenv("JARVIS_SELF_GOAL_FORMATION_ENABLED", "false")
     assert get_default_engine() is None
 
 

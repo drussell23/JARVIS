@@ -225,12 +225,16 @@ _POSTURE_URGENCY_MAP: Dict[str, str] = {
 
 
 def _auto_proposed_enabled() -> bool:
-    """Master flag for the P1 Slice 3 auto_proposed second source.
+    """Master flag for the P1 auto_proposed second source.
 
-    Default ``false`` until Slice 5 graduation. When off, BacklogSensor
-    behaves byte-for-byte like pre-Slice-3 (manual backlog.json only)."""
+    GRADUATED 2026-04-26 (P1 Slice 5). Default: **``true``** post-graduation.
+    Hot-revert: ``export JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED=false`` →
+    BacklogSensor behaves byte-for-byte like pre-Slice-3 (manual
+    backlog.json only). Per-scan emission cap (≤5) + per-process dedup
+    + ``requires_human_ack=True`` on every envelope remain in force
+    regardless of flag state."""
     raw = os.environ.get(
-        "JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", "",
+        "JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", "true",
     ).strip().lower()
     return raw in ("1", "true", "yes", "on")
 
