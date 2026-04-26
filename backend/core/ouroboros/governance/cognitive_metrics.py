@@ -321,6 +321,43 @@ class CognitiveMetricsService:
                     pass
             self._pre_apply_snapshots[op_id] = snap
 
+    def auto_reflect_post_apply(
+        self,
+        op_id: str,
+        target_files: List[str],
+    ) -> Optional[VindicationResult]:
+        """High-level post-APPLY entry point used by the orchestrator
+        helper. Resolves before/after snapshots automatically:
+
+        * BEFORE — pulled from the snapshot cache via
+          ``pop_pre_apply_snapshot(op_id)``. Returns ``None`` (caller
+          short-circuits) when no snapshot was captured (master flag
+          was off at CONTEXT_EXPANSION OR the op skipped pre-score).
+        * AFTER — fresh ``snapshot_oracle_state(target_files)``. Returns
+          ``None`` (caller short-circuits) when the live oracle is
+          unavailable.
+
+        Returns the underlying ``VindicationResult`` (which itself
+        carries the neutral fallback contract). Caller treats ``None``
+        return as "couldn't reflect this op" — never blocks the FSM.
+        """
+        if not target_files:
+            return None
+        before = self.pop_pre_apply_snapshot(op_id)
+        if before is None:
+            return None
+        after = snapshot_oracle_state(self._oracle, target_files)
+        if after is None:
+            return None
+        return self.reflect_post_apply(
+            op_id=op_id,
+            target_files=target_files,
+            coupling_after=after.coupling_total,
+            blast_radius_after=after.blast_max,
+            complexity_after=after.complexity_estimate,
+            complexity_before=before.complexity_estimate,
+        )
+
     def reflect_post_apply(
         self,
         op_id: str,
@@ -575,8 +612,10 @@ __all__ = [
     "DEFAULT_LEDGER_FILENAME",
     "CognitiveMetricRecord",
     "CognitiveMetricsService",
+    "OracleSnapshot",
     "get_default_service",
     "is_enabled",
     "reset_default_service",
     "set_default_service",
+    "snapshot_oracle_state",
 ]
