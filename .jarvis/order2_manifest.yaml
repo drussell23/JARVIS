@@ -1,0 +1,82 @@
+# Reverse Russian Doll Pass B Slice 1 — Order-2 governance manifest
+#
+# Single source of truth for which paths in this repo are
+# Order-2 governance code (the cognitive substrate that, when
+# mutated, requires the operator amendment protocol per Pass B
+# Slice 6 — not yet implemented).
+#
+# Slice 1 SHIPS THIS FILE BUT DOES NOT ENFORCE IT.
+# Slices 2-6 wire downstream consumers (risk_tier_floor at GATE,
+# AST validator, MetaPhaseRunner, REPL amendment surface). Until
+# those slices land + graduate, this file is purely observational.
+#
+# Amendment policy (Pass B Slice 6, when implemented):
+#   * Operator-only via /order2 amend <op-id>
+#   * AutoCommitter trailer: Order-2-Authorized-By: <operator>
+#   * No SAFE_AUTO eligibility ever
+#   * Editing this file directly without the protocol is itself
+#     an Order-2 amendment that bypasses its own protocol —
+#     pinned by the §7 locked-true invariant in Slice 6.
+#
+# Initial Body-only entries per
+# memory/project_reverse_russian_doll_pass_b.md §3.2.
+
+schema_version: 1
+
+entries:
+  # --- Pipeline FSM ---
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/orchestrator.py
+    rationale: 11-phase governed loop; mutating this changes O+V's cognition
+    added: "2026-04-26"
+    added_by: operator
+
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/phase_runner.py
+    rationale: PhaseRunner ABC + PhaseResult contract — frozen interface
+    added: "2026-04-26"
+    added_by: operator
+
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/phase_runners/*.py
+    rationale: Concrete phase implementations — the cognition itself
+    added: "2026-04-26"
+    added_by: operator
+
+  # --- Immune system ---
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/semantic_firewall.py
+    rationale: GENERAL cage (11 detectors, credential shapes, recursion ban)
+    added: "2026-04-26"
+    added_by: operator
+
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/semantic_guardian.py
+    rationale: Pre-APPLY pattern detector (10 patterns, raises friction)
+    added: "2026-04-26"
+    added_by: operator
+
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/scoped_tool_backend.py
+    rationale: Mutation cage (structural COUNT gate, hard-kill wrapper)
+    added: "2026-04-26"
+    added_by: operator
+
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/risk_tier_floor.py
+    rationale: 4-tier risk ladder + composing knobs — escalation authority
+    added: "2026-04-26"
+    added_by: operator
+
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/change_engine.py
+    rationale: APPLY phase write surface; AST/placeholder validation
+    added: "2026-04-26"
+    added_by: operator
+
+  # --- Self-reference ---
+  - repo: jarvis
+    path_glob: .jarvis/order2_manifest.yaml
+    rationale: This file. Amendment requires the §7 protocol.
+    added: "2026-04-26"
+    added_by: operator
