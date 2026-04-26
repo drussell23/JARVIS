@@ -93,13 +93,17 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 
 
 def is_enabled() -> bool:
-    """Master flag — `JARVIS_POSTMORTEM_RECALL_ENABLED` (default ``false``).
+    """Master flag — `JARVIS_POSTMORTEM_RECALL_ENABLED` (default ``true``).
 
-    Default-off until graduation cadence (3 clean live sessions per PRD §11
-    Layer 4). Master-off → service is a no-op; never queries postmortems,
-    never logs.
+    GRADUATED 2026-04-26 via reachability supplement (PRD §11 Layer 3, W3(6)
+    precedent). Layered evidence on the graduation PR:
+    67 deterministic tests + 16 in-process smoke + Session #1 live boot
+    proof (`bt-2026-04-26-141231` — F1+F2+F3 chain working, seed routed
+    STANDARD, full GENERATE traversal). Hot-revert: set
+    `JARVIS_POSTMORTEM_RECALL_ENABLED=false` to disable; behavior is
+    byte-for-byte pre-graduation.
     """
-    return _env_bool("JARVIS_POSTMORTEM_RECALL_ENABLED", False)
+    return _env_bool("JARVIS_POSTMORTEM_RECALL_ENABLED", True)
 
 
 def top_k() -> int:

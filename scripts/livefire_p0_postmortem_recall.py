@@ -117,10 +117,10 @@ def main() -> int:
         top_k,
     )
 
-    # --- (1) Master flag default OFF (graduation discipline)
+    # --- (1) Master flag default ON (graduated 2026-04-26)
     j.check(
-        "1. Master flag defaults False (PRD §17 default-off)",
-        is_enabled() is False,
+        "1. Master flag defaults True (post-graduation 2026-04-26)",
+        is_enabled() is True,
         f"got {is_enabled()}",
     )
 
