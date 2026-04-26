@@ -188,6 +188,15 @@ EVENT_TYPE_CURIOSITY_QUESTION_EMITTED = "curiosity_question_emitted"
 # ``/observability/metrics`` GET.
 EVENT_TYPE_METRICS_UPDATED = "metrics_updated"
 
+# Phase 5 P5 Slice 4 — adversarial reviewer (PRD §9 P5). Payload:
+# ``{"op_id": str, "schema_version": int, "filtered_findings_count":
+# int, "high": int, "med": int, "low": int, "skip_reason": str,
+# "cost_usd": float}``. Operators get a live ping when a new
+# AdversarialReview lands; the full record (findings list with
+# descriptions + mitigation_hint + file_reference) lives at
+# ``/observability/adversarial/{op_id}`` GET.
+EVENT_TYPE_ADVERSARIAL_FINDINGS_EMITTED = "adversarial_findings_emitted"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -231,6 +240,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CANCEL_ORIGIN_EMITTED,  # W3(7) Slice 6
     EVENT_TYPE_CURIOSITY_QUESTION_EMITTED,  # W2(4) Slice 3
     EVENT_TYPE_METRICS_UPDATED,  # Phase 4 P4 Slice 4
+    EVENT_TYPE_ADVERSARIAL_FINDINGS_EMITTED,  # Phase 5 P5 Slice 4
 })
 
 
