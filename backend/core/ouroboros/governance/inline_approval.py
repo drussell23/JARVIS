@@ -63,16 +63,19 @@ _IMMEDIATE_PRIORITY_RISK_TIERS = frozenset({"IMMEDIATE", "BLOCKED"})
 
 
 def is_enabled() -> bool:
-    """Master flag — ``JARVIS_APPROVAL_UX_INLINE_ENABLED`` (default false).
+    """Master flag — ``JARVIS_APPROVAL_UX_INLINE_ENABLED`` (default **true**
+    post Slice 4 graduation).
 
-    Slice 1 ships default-off. Slice 4 graduation flips it after the
-    full provider integration + SerpentFlow rendering + comprehensive
-    pin suite + in-process live-fire smoke complete.
+    Slices 1–3 shipped default-off (primitive + provider + renderer all
+    dormant). Slice 4 flipped the default after layered evidence:
+    cross-slice authority pins + in-process live-fire smoke +
+    factory-reachability supplement + dual-tier hot-revert matrix.
 
-    When off, inline-approval is invisible — existing
-    ``CLIApprovalProvider`` + Orange PR paths remain authoritative."""
+    When off, the build_approval_provider() factory returns the legacy
+    ``CLIApprovalProvider`` — the queue + audit ledger remain
+    inspectable but no inline prompt surface is wired."""
     return os.environ.get(
-        "JARVIS_APPROVAL_UX_INLINE_ENABLED", "",
+        "JARVIS_APPROVAL_UX_INLINE_ENABLED", "1",
     ).strip().lower() in _TRUTHY
 
 

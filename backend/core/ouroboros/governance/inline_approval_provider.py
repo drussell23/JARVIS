@@ -42,6 +42,7 @@ from typing import Dict, List, Optional
 from backend.core.ouroboros.governance.approval_provider import (
     ApprovalResult,
     ApprovalStatus,
+    CLIApprovalProvider,
 )
 from backend.core.ouroboros.governance.inline_approval import (
     InlineApprovalChoice,
@@ -49,6 +50,7 @@ from backend.core.ouroboros.governance.inline_approval import (
     InlineApprovalRequest,
     decision_timeout_s,
     get_default_queue,
+    is_enabled as inline_approval_is_enabled,
 )
 from backend.core.ouroboros.governance.op_context import OperationContext
 
@@ -426,9 +428,36 @@ class InlineApprovalProvider:
         return getattr(tier, "name", str(tier))
 
 
+def build_approval_provider(
+    project_root: Optional[Path] = None,
+):
+    """Slice 4 graduation factory.
+
+    Returns ``InlineApprovalProvider`` when
+    ``JARVIS_APPROVAL_UX_INLINE_ENABLED`` is truthy (default **true**
+    post-graduation), else falls back to the legacy
+    :class:`CLIApprovalProvider`.
+
+    Single source of truth for which approval surface the loop binds.
+    Hot-revert: ``JARVIS_APPROVAL_UX_INLINE_ENABLED=false`` returns the
+    CLI provider on the next factory call — no orchestrator restart
+    needed for the construction site itself, though the existing
+    process holds whichever was built at boot.
+
+    The factory is the only place the env knob gates behaviour for
+    construction selection — every downstream caller (renderer, queue,
+    audit ledger) stays flag-agnostic so they remain inspectable even
+    when the inline path is disabled (operators may want to read prior
+    decisions). This mirrors the P0 / P0.5 graduation pattern."""
+    if inline_approval_is_enabled():
+        return InlineApprovalProvider()
+    return CLIApprovalProvider(project_root=project_root)
+
+
 __all__ = [
     "AUDIT_LEDGER_SCHEMA_VERSION",
     "InlineApprovalProvider",
     "MAX_RETAINED_REQUESTS",
     "audit_ledger_path",
+    "build_approval_provider",
 ]
