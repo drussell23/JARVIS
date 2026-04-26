@@ -170,9 +170,11 @@ def test_event_type_metrics_updated_in_valid_set():
 # ===========================================================================
 
 
-def test_is_enabled_default_false_pre_graduation():
-    """Slice 4 ships default-OFF. Renamed at Slice 5 graduation."""
-    assert is_enabled() is False
+def test_is_enabled_default_true_post_graduation(monkeypatch):
+    """Slice 5 graduation flipped default OFF→ON. Renamed per
+    embedded discipline."""
+    monkeypatch.delenv("JARVIS_METRICS_SUITE_ENABLED", raising=False)
+    assert is_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on"])
@@ -186,9 +188,13 @@ def test_is_enabled_truthy(monkeypatch, val):
 # ===========================================================================
 
 
-def test_observer_master_off_short_circuits(fresh):
+def test_observer_master_off_short_circuits(fresh, monkeypatch):
     """Pin: master-off means no compute, no append, no merge, no SSE.
-    The result is fully formed (notes=master_off) so callers can log it."""
+    The result is fully formed (notes=master_off) so callers can log it.
+
+    Post Slice 5 the default is true, so this test sets the explicit
+    revert value to verify the off-path."""
+    monkeypatch.setenv("JARVIS_METRICS_SUITE_ENABLED", "false")
     obs = MetricsSessionObserver(engine=fresh["engine"], ledger=fresh["ledger"])
     res = obs.record_session_end(session_id="s")
     assert res.snapshot is None
@@ -433,9 +439,12 @@ def _seed(ledger, sids: List[str], composites: List[float]) -> None:
         ))
 
 
-def test_endpoint_disabled_returns_403(fresh):
+def test_endpoint_disabled_returns_403(fresh, monkeypatch):
     """Master off → 403. Pin: no leak about the surface (port scanners
-    see 403 not 200 with enabled=false)."""
+    see 403 not 200 with enabled=false). Post Slice 5 default is
+    true, so this test explicitly reverts to verify the disabled
+    behaviour."""
+    monkeypatch.setenv("JARVIS_METRICS_SUITE_ENABLED", "false")
     aiohttp = pytest.importorskip("aiohttp")
     web = pytest.importorskip("aiohttp.web")
     app = web.Application()

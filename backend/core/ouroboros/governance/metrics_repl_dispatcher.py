@@ -99,15 +99,16 @@ COMPOSITE_HISTORY_MAX_ROWS: int = 8_192
 
 
 def is_enabled() -> bool:
-    """Master flag — ``JARVIS_METRICS_SUITE_ENABLED`` (default false
-    until Slice 5 graduation).
+    """Master flag — ``JARVIS_METRICS_SUITE_ENABLED`` (default
+    **true** post Slice 5 graduation).
 
-    SerpentFlow is the gating caller — when off, the REPL doesn't
-    even construct the dispatcher. This module's behaviour does not
-    change based on the flag; the helper is exported for SerpentFlow's
-    convenience + symmetry with the P3 / P2 patterns."""
+    SerpentFlow consults this to decide whether to surface the
+    ``/metrics`` REPL command. Hot-revert via
+    ``JARVIS_METRICS_SUITE_ENABLED=false`` makes SerpentFlow skip the
+    surface entirely while leaving the dispatcher constructible (so
+    operators can still import + query past snapshots)."""
     return os.environ.get(
-        "JARVIS_METRICS_SUITE_ENABLED", "",
+        "JARVIS_METRICS_SUITE_ENABLED", "1",
     ).strip().lower() in _TRUTHY
 
 

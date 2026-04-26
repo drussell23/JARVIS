@@ -217,6 +217,53 @@ class EventChannelServer:
                     "[EventChannel] IDE stream wiring failed: %s", stream_exc,
                 )
 
+            # P4 Slice 5 — convergence-metrics observability surface.
+            # Mounts /observability/metrics{,/window,/composite,
+            # /sessions/{id}}. Loopback + CORS invariants mirror the
+            # existing IDE router; authority invariant
+            # (no orchestrator / gate / policy imports) is grep-pinned
+            # in tests/governance/test_metrics_observability.py +
+            # the Slice 5 graduation suite.
+            metrics_router_mounted = False
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (
+                    IDEObservabilityRouter as _IDEObsRouter,
+                    assert_loopback_only as _assert_loopback_metrics,
+                )
+                from backend.core.ouroboros.governance.metrics_observability import (  # noqa: E501
+                    is_enabled as _metrics_enabled,
+                    register_metrics_routes,
+                )
+                if _metrics_enabled():
+                    _assert_loopback_metrics(self._host)
+                    # Construct a dedicated IDEObservabilityRouter
+                    # instance whose _check_rate_limit + _cors_headers
+                    # we reuse as callables. Per-instance rate state
+                    # is independent from the main IDE router but uses
+                    # the same env-driven cap + CORS allowlist so the
+                    # operator-visible surface stays uniform.
+                    _metrics_helper = _IDEObsRouter()
+                    register_metrics_routes(
+                        app,
+                        rate_limit_check=lambda req: (
+                            _metrics_helper._check_rate_limit(
+                                _metrics_helper._client_key(req),
+                            )
+                        ),
+                        cors_headers=_metrics_helper._cors_headers,
+                    )
+                    metrics_router_mounted = True
+            except ValueError as metrics_loopback_exc:
+                logger.warning(
+                    "[EventChannel] metrics observability refused: %s",
+                    metrics_loopback_exc,
+                )
+            except Exception as metrics_exc:
+                logger.warning(
+                    "[EventChannel] metrics observability wiring failed: %s",
+                    metrics_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is

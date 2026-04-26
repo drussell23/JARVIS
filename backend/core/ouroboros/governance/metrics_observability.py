@@ -120,17 +120,18 @@ _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-:.]{1,128}$")
 
 
 def is_enabled() -> bool:
-    """Master flag — ``JARVIS_METRICS_SUITE_ENABLED`` (default false
-    until Slice 5 graduation).
+    """Master flag — ``JARVIS_METRICS_SUITE_ENABLED`` (default
+    **true** post Slice 5 graduation).
 
-    Slice 4 surfaces all gate on this. When off:
+    All Slice 4 surfaces gate on this. When off:
       * ``MetricsSessionObserver.record_session_end`` returns early
-        without computing or persisting anything.
+        with ``notes=("master_off",)`` (no compute, no append, no
+        merge, no SSE).
       * IDE GET endpoints return 403 ``ide_observability.disabled``
         so port scanners see no signal about the surface.
       * SSE publish is a no-op (drop silently)."""
     return os.environ.get(
-        "JARVIS_METRICS_SUITE_ENABLED", "",
+        "JARVIS_METRICS_SUITE_ENABLED", "1",
     ).strip().lower() in _TRUTHY
 
 

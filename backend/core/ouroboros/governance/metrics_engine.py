@@ -98,14 +98,20 @@ METRICS_SNAPSHOT_SCHEMA_VERSION: int = 1
 
 
 def is_enabled() -> bool:
-    """Master flag — ``JARVIS_METRICS_SUITE_ENABLED`` (default false
-    until Slice 5 graduation).
+    """Master flag — ``JARVIS_METRICS_SUITE_ENABLED`` (default
+    **true** post Slice 5 graduation).
 
-    When off, the engine remains importable + callable for tests +
-    Slice 2-4 builds; gating happens at the Slice 4 caller
-    (``OpsDigestObserver`` ``summary.json`` write site)."""
+    Slices 1–4 shipped default-off. Slice 5 flipped the default after
+    layered evidence: cross-slice authority pins + factory-reachability
+    supplement + 15 in-process live-fire smoke checks (observer
+    end-to-end, all 4 GET endpoints reachable, SSE event delivered).
+
+    Hot-revert: explicit ``JARVIS_METRICS_SUITE_ENABLED=false`` →
+    factory returns no-op; `register_metrics_routes` mounted
+    handlers all 403; observer's `record_session_end` short-circuits
+    with `notes=("master_off",)`."""
     return os.environ.get(
-        "JARVIS_METRICS_SUITE_ENABLED", "",
+        "JARVIS_METRICS_SUITE_ENABLED", "1",
     ).strip().lower() in _TRUTHY
 
 
