@@ -62,14 +62,18 @@ LOW_CONFIDENCE_FLOOR: float = 0.40
 
 def is_enabled() -> bool:
     """Master flag — ``JARVIS_CONVERSATIONAL_MODE_ENABLED`` (default
-    false until Slice 4 graduation).
+    **true** post Slice 4 graduation).
 
-    When off, classifier remains importable + callable for tests +
-    future telemetry, but no SerpentFlow chat surface should consult
-    it (gating happens at the caller per the renderer pattern from
-    P3 — see ``inline_approval_renderer``)."""
+    Slices 1–3 shipped default-off (classifier + orchestrator +
+    dispatcher all dormant). Slice 4 flipped the default after layered
+    evidence: cross-slice authority pins + in-process live-fire smoke
+    + factory-reachability supplement.
+
+    When off, the SerpentFlow caller (and the
+    :func:`build_chat_repl_dispatcher` factory) returns a no-op
+    dispatcher — the chat surface is invisible to operators."""
     return os.environ.get(
-        "JARVIS_CONVERSATIONAL_MODE_ENABLED", "",
+        "JARVIS_CONVERSATIONAL_MODE_ENABLED", "1",
     ).strip().lower() in _TRUTHY
 
 
