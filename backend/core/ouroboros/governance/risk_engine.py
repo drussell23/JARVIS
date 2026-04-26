@@ -40,7 +40,8 @@ POLICY_VERSION: str = "v0.2.0"
 class RiskTier(Enum):
     """Classification tier for an autonomous operation.
 
-    Four graduated severity levels (Green → Yellow → Orange → Red):
+    Five graduated severity levels (Green → Yellow → Orange → Red →
+    Order-2):
 
     - **SAFE_AUTO** (Green): Auto-apply silently. Read-only exploration,
       test additions, doc fixes, trivial dependency bumps.
@@ -51,12 +52,24 @@ class RiskTier(Enum):
       cost threshold crossings.
     - **BLOCKED** (Red): Unconditionally forbidden. Supervisor, security
       surface, hard invariant violations.
+    - **ORDER_2_GOVERNANCE** (RR Pass B Slice 2): the candidate touches
+      a governance-code path enumerated in
+      ``.jarvis/order2_manifest.yaml``. Strictly above ``BLOCKED`` —
+      ``BLOCKED`` says "this op will not run autonomously, but a human
+      can override at the REPL." ``ORDER_2_GOVERNANCE`` says "this op
+      cannot run **even with operator REPL approval** — it requires the
+      Pass B Slice 6 amendment protocol." Auto-apply forbidden at every
+      nominal tier (including ``SAFE_AUTO``); REPL ``approve`` does not
+      clear; op routes to a dedicated ``order2_review`` queue with
+      operator-driven SLO. See `memory/project_reverse_russian_doll_pass_b.md`
+      §4 for design.
     """
 
     SAFE_AUTO = auto()
     NOTIFY_APPLY = auto()
     APPROVAL_REQUIRED = auto()
     BLOCKED = auto()
+    ORDER_2_GOVERNANCE = auto()
 
 
 class ChangeType(Enum):
