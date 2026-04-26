@@ -67,6 +67,34 @@ A-level reliable execution from A-level vision — measurable by:
 
 This PRD lays out a phased roadmap to close the gap. **The gap is internal to JARVIS, not external.** External provider quality is sufficient; what's missing is the orchestration layer that converts that intelligence into self-directing, self-improving behavior.
 
+### Roadmap Execution Status (live)
+
+Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open PR; `[ ]` = not started. Master-flag flips after a graduation cadence are tracked separately (see §17 Implementation Discipline).
+
+**Phase 0 — RSI implementation status audit** (gate for Phase 1)
+- [x] 6/6 Wang RSI modules verified to exist (composite_score, convergence_tracker, oracle_prescorer, transition_tracker, vindication_reflector, adaptive graduation threshold)
+- [x] 4/6 wired into the live FSM; 2 stranded (oracle_prescorer, vindication_reflector — tracked for Phase 4)
+- [x] 131/131 RSI module tests green
+- [x] Audit memo committed (`memory/project_phase_0_rsi_audit_2026_04_25.md`)
+
+**Phase 1 — Self-Reading**
+- P0 — POSTMORTEM → next-op recall (`PostmortemRecallService`, PRD §9.P0)
+  - [x] Module + orchestrator wiring + 41 unit tests landed (PR #20968 merged → main `ef32006663`)
+  - [x] Live-fire smoke (`scripts/livefire_p0_postmortem_recall.py`, 16/16 PASS)
+  - [x] Graduation pin tests (`tests/governance/test_postmortem_recall_graduation_pins.py`, 16/16 PASS)
+  - [ ] Master flag `JARVIS_POSTMORTEM_RECALL_ENABLED` flip false→true (gate: 3 clean live sessions per §11 Layer 4)
+- P0.5 — POSTMORTEM root-cause taxonomy expansion: [ ] not started
+- P1 — Cross-session pattern detector: [ ] not started
+- P1.5 — Self-RAG over own commit history: [ ] not started
+
+**Phase 2 — Self-Direction**: [ ] not started
+**Phase 3 — Operator Symbiosis**: [ ] not started (CC-parity items P2/P3 in §3.2 deferred here)
+**Phase 4 — Cognitive Metrics**: [ ] not started (oracle_prescorer + vindication_reflector wiring lives here)
+**Phase 5 — Adversarial Depth**: [ ] not started
+**Phase 6 — Self-Modeling**: [ ] not started
+
+Update discipline: each closing slice updates this section in the same PR. Status is the source of truth for "what's next" — when in doubt, the lowest-numbered `[ ]` row in the lowest-numbered active phase is the next slice.
+
 ---
 
 ## 2. Vision Statement
@@ -1162,3 +1190,4 @@ When §5.4 MVP RSI conditions all met → claim Wang-grounded RSI.
 |---|---|---|---|
 | 2026-04-25 | 1.0 | Initial draft | Claude Opus 4.7 (synthesis from 7-day operator collaboration) |
 | 2026-04-25 | 2.0 | Added: TOC, §4 Cognitive Scaffolding deep dive, §5 RSI Convergence Framework, §8 Manifesto alignment, §10 Per-phase telemetry, §11 Per-phase testing, §18 Stakeholder map, §19 Migration & versioning. Expanded: §22 Trinity context, App A glossary, App B reference docs map, App C phase gate criteria. | Claude Opus 4.7 (per operator request: "more depth, RSI section, more references") |
+| 2026-04-25 | 2.1 | Added §1 "Roadmap Execution Status (live)" subsection — per-slice [x]/[~]/[ ] tracking. Records: Phase 0 audit complete; Phase 1 P0 build (PR #20968) + live-fire smoke + graduation pins landed; P0 master-flag flip pending 3-clean-session cadence. Update discipline noted: each closing slice updates this section in same PR. | Claude Opus 4.7 (P0 follow-on PR) |
