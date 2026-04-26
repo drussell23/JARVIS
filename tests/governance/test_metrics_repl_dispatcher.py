@@ -196,9 +196,11 @@ def test_result_is_frozen():
 # ===========================================================================
 
 
-def test_is_enabled_default_false_pre_graduation():
-    """Slice 3 ships default-OFF. Renamed at Slice 5 graduation."""
-    assert is_enabled() is False
+def test_is_enabled_default_true_post_graduation(monkeypatch):
+    """Slice 5 graduation flipped default OFF→ON. Renamed per
+    embedded discipline."""
+    monkeypatch.delenv("JARVIS_METRICS_SUITE_ENABLED", raising=False)
+    assert is_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on"])
