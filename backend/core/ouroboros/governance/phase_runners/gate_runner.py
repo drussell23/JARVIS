@@ -19,8 +19,12 @@ Extracts orchestrator.py GATE body (~600 lines, post-Slice-4a.1 lines
 7. REVIEW subagent shadow (observer-only)
 8. MutationGate (enforce mode upgrades to APPROVAL_REQUIRED or BLOCKED)
 9. MIN_RISK_TIER floor (paranoia + quiet hours composed)
-10. Phase 5a-green: SAFE_AUTO diff preview + cancel-check window
-11. Phase 5b: NOTIFY_APPLY diff preview + cancel-check window
+10. RR Pass B Slice 2b: ORDER_2_GOVERNANCE floor (governance-code
+    paths from .jarvis/order2_manifest.yaml escalate to the
+    Order-2 tier, strictly above BLOCKED). Default-off behind the
+    dual flag (Slice 1 manifest + Slice 2 risk-class).
+11. Phase 5a-green: SAFE_AUTO diff preview + cancel-check window
+12. Phase 5b: NOTIFY_APPLY diff preview + cancel-check window
 
 ## Four terminal exit paths
 
@@ -37,10 +41,11 @@ artifact passed back for APPROVE to read.
 
 ## Cross-phase artifact — ``risk_tier``
 
-GATE mutates ``risk_tier`` at up to 6 sites: SimilarityGate (→APPROVAL),
+GATE mutates ``risk_tier`` at up to 7 sites: SimilarityGate (→APPROVAL),
 frozen_tier==observe (→APPROVAL), JARVIS_RISK_CEILING (env floor),
 SemanticGuardian (soft/hard upgrade), MutationGate (block/approval upgrade),
-MIN_RISK_TIER (paranoia/quiet hours floor). Runner returns the final
+MIN_RISK_TIER (paranoia/quiet hours floor), ORDER_2_GOVERNANCE floor
+(RR Pass B governance-code paths). Runner returns the final
 ``risk_tier`` via ``PhaseResult.artifacts["risk_tier"]`` so the
 orchestrator hook rebinds the local before APPROVE-inline reads it.
 
@@ -476,6 +481,34 @@ class GATERunner(PhaseRunner):
         except Exception:
             logger.debug(
                 "[Orchestrator] MIN_RISK_TIER floor skipped",
+                exc_info=True,
+            )
+
+        # ---- RR Pass B Slice 2b: ORDER_2_GOVERNANCE floor ----
+        # Runs AFTER the MIN_RISK_TIER floor so paranoia/quiet-hours
+        # can't accidentally lower an Order-2 op below itself.
+        # Default-off behind dual flag (Slice 1 manifest + Slice 2
+        # risk-class). When either flag is off, this block is a
+        # no-op. See memory/project_reverse_russian_doll_pass_b.md
+        # §4.2 + tests/governance/test_order2_classifier.py.
+        try:
+            from backend.core.ouroboros.governance.meta.order2_classifier import (
+                apply_order2_floor,
+            )
+            _order2_tier = apply_order2_floor(
+                risk_tier, list(ctx.target_files), repo="jarvis",
+            )
+            if _order2_tier is not risk_tier:
+                logger.info(
+                    "[Orchestrator] GATE: ORDER_2 floor → %s→%s "
+                    "op=%s files=%d",
+                    risk_tier.name, _order2_tier.name, ctx.op_id,
+                    len(ctx.target_files),
+                )
+                risk_tier = _order2_tier
+        except Exception:
+            logger.debug(
+                "[Orchestrator] ORDER_2 floor skipped",
                 exc_info=True,
             )
 
