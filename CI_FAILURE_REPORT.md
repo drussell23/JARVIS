@@ -3,13 +3,13 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #41546
-- **Branch**: `fix/ci/validate-configuration-run2953-20260426-151108`
-- **Commit**: `d3ef9b4504702639bedafbca48879a32df790130`
+- **Run Number**: #41589
+- **Branch**: `fix/ci/pr-automation-validation-run41546-20260426-152437`
+- **Commit**: `165dc6fbd2031e1d843aafc4d262331e698bc58a`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-26T15:12:03Z
+- **Timestamp**: 2026-04-26T15:25:16Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24959879026)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24960150993)
 
 ## Failure Overview
 
@@ -17,7 +17,7 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 163s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
@@ -26,10 +26,10 @@ Total Failed Jobs: **1**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-26T15:12:06Z
-**Completed**: 2026-04-26T15:14:49Z
-**Duration**: 163 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24959879026/job/73084571742)
+**Started**: 2026-04-26T15:26:19Z
+**Completed**: 2026-04-26T15:26:23Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24960150993/job/73085305227)
 
 #### Failed Steps
 
@@ -40,27 +40,20 @@ Total Failed Jobs: **1**
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 3
+  - Occurrences: 2
   - Sample matches:
-    - Line 13: `2026-04-26T15:13:47.2322311Z Failed to resolve action download info. Error: The HTTP request timed o`
-    - Line 34: `2026-04-26T15:14:12.5312063Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 46: `2026-04-26T15:14:13.0097759Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Vali`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 13: `2026-04-26T15:13:47.2322311Z Failed to resolve action download info. Error: The HTTP request timed o`
+    - Line 30: `2026-04-26T15:26:21.5989876Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-04-26T15:26:22.1188659Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 62: `2026-04-26T15:14:13.0418438Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-04-26T15:26:22.1631251Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
-  - Occurrences: 2
+  - Occurrences: 1
   - Sample matches:
-    - Line 13: `2026-04-26T15:13:47.2322311Z Failed to resolve action download info. Error: The HTTP request timed o`
-    - Line 38: `- fix: Resolve database connection timeout`
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
@@ -85,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-04-26T15:24:37.949409*
+📊 *Report generated on 2026-04-26T15:28:00.297774*
 🤖 *JARVIS CI/CD Auto-PR Manager*
