@@ -81,8 +81,9 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
 - P0 — POSTMORTEM → next-op recall (`PostmortemRecallService`, PRD §9.P0)
   - [x] Module + orchestrator wiring + 41 unit tests landed (PR #20968 merged → main `ef32006663`)
   - [x] Live-fire smoke (`scripts/livefire_p0_postmortem_recall.py`, 16/16 PASS)
-  - [x] Graduation pin tests (`tests/governance/test_postmortem_recall_graduation_pins.py`, 16/16 PASS)
-  - [ ] Master flag `JARVIS_POSTMORTEM_RECALL_ENABLED` flip false→true (gate: 3 clean live sessions per §11 Layer 4)
+  - [x] Graduation pin tests (`tests/governance/test_postmortem_recall_graduation_pins.py`, 17/17 PASS)
+  - [x] Helper extraction + orchestrator-level reachability supplement (W3(6) precedent — `tests/governance/test_postmortem_recall_orchestrator_smoke.py`, 9/9 PASS). Total layered evidence: **67 deterministic tests + 16 in-process smoke**. Live-cadence soak attempts (3/3) hit known BG-starvation pattern (memory `project_wave3_item6_graduation_matrix.md`) — supplement substitutes per Layer 3 precedent.
+  - [ ] Master flag `JARVIS_POSTMORTEM_RECALL_ENABLED` flip false→true (gate: operator review of layered evidence + authorization)
 - P0.5 — POSTMORTEM root-cause taxonomy expansion: [ ] not started
 - P1 — Cross-session pattern detector: [ ] not started
 - P1.5 — Self-RAG over own commit history: [ ] not started
@@ -1191,3 +1192,4 @@ When §5.4 MVP RSI conditions all met → claim Wang-grounded RSI.
 | 2026-04-25 | 1.0 | Initial draft | Claude Opus 4.7 (synthesis from 7-day operator collaboration) |
 | 2026-04-25 | 2.0 | Added: TOC, §4 Cognitive Scaffolding deep dive, §5 RSI Convergence Framework, §8 Manifesto alignment, §10 Per-phase telemetry, §11 Per-phase testing, §18 Stakeholder map, §19 Migration & versioning. Expanded: §22 Trinity context, App A glossary, App B reference docs map, App C phase gate criteria. | Claude Opus 4.7 (per operator request: "more depth, RSI section, more references") |
 | 2026-04-25 | 2.1 | Added §1 "Roadmap Execution Status (live)" subsection — per-slice [x]/[~]/[ ] tracking. Records: Phase 0 audit complete; Phase 1 P0 build (PR #20968) + live-fire smoke + graduation pins landed; P0 master-flag flip pending 3-clean-session cadence. Update discipline noted: each closing slice updates this section in same PR. | Claude Opus 4.7 (P0 follow-on PR) |
+| 2026-04-26 | 2.2 | P0 reachability supplement: 3/3 live-cadence soak attempts hit the known BG-starvation pattern (W3(6) memory). Pivoted to W3(6) Layer 3 reachability supplement precedent — extracted CONTEXT_EXPANSION wiring to `_inject_postmortem_recall_impl` (mirrors LSS), added orchestrator-level smoke (9 tests covering integration / concat contract / authority invariants / AST regression). Layered evidence now totals 67 deterministic tests + 16 in-process smoke. Master-flag flip gates on operator review of layered evidence (no further live cadence required). | Claude Opus 4.7 (option-2 deliverable) |
