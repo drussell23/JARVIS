@@ -127,8 +127,16 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 
 
-def test_master_flag_default_false():
-    """Slice 3 ships default-off — Slice 5 graduation flips it."""
+def test_master_flag_default_true_post_graduation(monkeypatch):
+    """JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED defaults True post-graduation
+    (P1 Slice 5, 2026-04-26). Hot-revert: set env to "false"."""
+    monkeypatch.delenv("JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", raising=False)
+    assert _auto_proposed_enabled() is True
+
+
+def test_master_flag_explicit_false_hot_revert(monkeypatch):
+    """Hot-revert path post-graduation."""
+    monkeypatch.setenv("JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", "false")
     assert _auto_proposed_enabled() is False
 
 
@@ -138,10 +146,9 @@ def test_master_flag_explicit_true(monkeypatch):
 
 
 def test_flag_off_proposals_present_no_envelopes(tmp_path, monkeypatch):
-    """Pre-graduation: ledger present + populated → zero envelopes from
-    the proposals branch (sensor behaves byte-for-byte like pre-Slice-3
-    when only manual backlog entries exist)."""
-    monkeypatch.delenv("JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", raising=False)
+    """Hot-revert: explicit false → proposals branch silenced, sensor
+    behaves byte-for-byte like pre-Slice-3."""
+    monkeypatch.setenv("JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", "false")
     s = _make_sensor(tmp_path, proposals=[_proposal()])
     envs = _run(s.scan_once())
     assert envs == []
@@ -388,7 +395,9 @@ def test_both_sources_emit_in_one_scan(monkeypatch, tmp_path):
 
 
 def test_flag_off_only_backlog_json_emits(monkeypatch, tmp_path):
-    monkeypatch.delenv("JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", raising=False)
+    """Hot-revert path: explicit false silences proposals branch entirely.
+    Only the manual backlog.json entry surfaces."""
+    monkeypatch.setenv("JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED", "false")
     backlog_entries = [{
         "task_id": "manual-1",
         "description": "Manually authored backlog entry",

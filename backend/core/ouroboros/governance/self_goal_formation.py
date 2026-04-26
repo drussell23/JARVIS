@@ -81,13 +81,30 @@ PROPOSAL_SCHEMA_VERSION: str = "self_goal_formation.1"
 
 
 def is_enabled() -> bool:
-    """Master flag — ``JARVIS_SELF_GOAL_FORMATION_ENABLED`` (default false).
+    """Master flag — ``JARVIS_SELF_GOAL_FORMATION_ENABLED`` (default ``true``).
 
-    Default-off until graduation cadence completes (Slice 5). When off,
-    ``SelfGoalFormationEngine.evaluate`` returns None immediately —
-    byte-for-byte pre-engine behavior."""
+    GRADUATED 2026-04-26 (Slice 5). Default: **``true``** post-graduation.
+    Layered evidence on the graduation PR:
+      * Slice 1 — postmortem_clusterer (28 tests, deterministic + dedup
+        + signature_hash stability)
+      * Slice 2 — engine (40 tests, every gate of the 9-gate decision
+        tree pinned positive + negative)
+      * Slice 3 — BacklogSensor consumer (26 tests, default-off second
+        source + bounded ≤5/scan + dedup)
+      * Slice 4 — REPL operator-review surface (35 tests, idempotent
+        approve/reject + audit trail)
+      * Slice 5 — graduation pin suite + in-process live-fire smoke +
+        end-to-end reachability supplement
+      * 130+ deterministic regression tests across the P1 stack
+
+    Hot-revert: ``export JARVIS_SELF_GOAL_FORMATION_ENABLED=false`` makes
+    ``evaluate`` return None immediately — byte-for-byte pre-graduation
+    behavior. Bounded-by-construction safety stack (per-session cap=1,
+    cost cap=$0.10, posture veto, blocklist dedup, operator-review tier)
+    remains in force regardless of flag state — the flag controls only
+    whether the engine attempts to evaluate at all."""
     return os.environ.get(
-        "JARVIS_SELF_GOAL_FORMATION_ENABLED", ""
+        "JARVIS_SELF_GOAL_FORMATION_ENABLED", "true",
     ).strip().lower() in _TRUTHY
 
 
