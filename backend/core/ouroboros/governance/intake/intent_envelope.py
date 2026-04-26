@@ -40,6 +40,13 @@ _VALID_SOURCES = frozenset({
     "cross_repo_drift",
     "security_advisory",
     "web_intelligence",
+    # P1 Slice 3 (2026-04-26) — SelfGoalFormationEngine proposals reach
+    # the intake via BacklogSensor's second-source ledger reader. The
+    # distinct source ("auto_proposed") lets routers, sensors, and the
+    # /backlog auto-proposed REPL surface filter on it without grepping
+    # evidence dicts. Auto-proposed envelopes always carry
+    # requires_human_ack=True per PRD §9 P1 operator-review tier.
+    "auto_proposed",
     # Added 2026-04-18 for VisionSensor (Task 8 of VisionSensor + Visual
     # VERIFY arc). Mirrors ``SignalSource.VISION_SENSOR.value``. See
     # docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md.
