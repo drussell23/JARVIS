@@ -387,3 +387,6 @@ terraform/terraform.tfvars
 .jarvis/vision_frames/
 .jarvis/vision_cost_ledger.json
 .jarvis/vision_sensor_fp_ledger.json
+
+# Local wiki working tree (deploy-wiki.sh clones https://github.com/drussell23/JARVIS-AI.wiki.git here)
+JARVIS-AI.wiki/
