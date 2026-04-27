@@ -56,7 +56,7 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
-from typing import Any, Dict, NoReturn, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, NoReturn, Optional, Protocol, runtime_checkable
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -1377,6 +1377,41 @@ class CandidateGenerator:
         # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
         _provider_route = getattr(context, "provider_route", "") or "standard"
 
+        # ── Phase 10 P10.3 — AsyncTopologySentinel-driven dispatch ───
+        # When ``JARVIS_TOPOLOGY_SENTINEL_ENABLED=true``, the sentinel
+        # walks the route's ranked ``dw_models`` list (yaml v2) and
+        # picks the first model whose breaker is not OPEN. Each
+        # attempt stamps ``ctx._dw_model_override`` so the provider's
+        # ``_resolve_effective_model`` consumes it. On per-model
+        # failure, ``sentinel.report_failure(...)`` is called and the
+        # walk continues to the next model. After exhausting all DW
+        # models, the route applies its ``fallback_tolerance`` from
+        # yaml v2 (``cascade_to_claude`` or ``queue``).
+        #
+        # When the master flag is OFF (default), this branch is a
+        # no-op and the static yaml ``dw_allowed: false`` block below
+        # remains authoritative — byte-identical pre/post-Slice-3
+        # behavior. The static block is the deletion target for
+        # Phase 10 P10.5 (THE PURGE), operator-authorized after 3
+        # forced-clean once-proofs of this dynamic path.
+        try:
+            from backend.core.ouroboros.governance.topology_sentinel import (
+                is_sentinel_enabled as _sentinel_enabled,
+            )
+            _sentinel_active = _sentinel_enabled()
+        except Exception:
+            _sentinel_active = False
+        if _sentinel_active:
+            _result = await self._dispatch_via_sentinel(
+                context, deadline, _provider_route,
+            )
+            if _result is not None:
+                return _result
+            # _dispatch_via_sentinel returns None to signal "fall
+            # through to legacy path" (e.g. the route has empty
+            # dw_models — IMMEDIATE by design — so the existing
+            # _generate_immediate handler still runs below).
+
         # Brain Selection Topology — hard segmentation (Manifesto §5).
         # When ``doubleword_topology`` marks a route as DW-forbidden,
         # the ``block_mode`` field decides what to do next:
@@ -1849,6 +1884,219 @@ class CandidateGenerator:
     # ------------------------------------------------------------------
     # Route-specific generation strategies (Manifesto §5)
     # ------------------------------------------------------------------
+
+    async def _dispatch_via_sentinel(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+        provider_route: str,
+    ) -> Optional[GenerationResult]:
+        """Phase 10 P10.3 — sentinel-driven DW dispatch.
+
+        Walks the route's ranked ``dw_models`` list (yaml v2). For each
+        model whose breaker is not OPEN, stamps ``ctx._dw_model_override``
+        and attempts DW. On per-model failure reports to the sentinel
+        (with appropriate ``FailureSource`` weight) and continues to
+        the next model. After exhausting all DW models, applies the
+        route's ``fallback_tolerance``:
+
+          * ``"cascade_to_claude"`` — invokes ``_call_fallback`` (Claude).
+          * ``"queue"`` — raises the sentinel-already-known
+            ``RuntimeError("dw_severed_queued:...")`` shape that the
+            orchestrator's existing accept-failure branch handles.
+
+        Returns:
+          * ``GenerationResult`` on DW success or Claude cascade.
+          * ``None`` to signal "fall through to legacy path" — used
+            when the route has empty ``dw_models`` (e.g. IMMEDIATE,
+            which is Claude-direct by Manifesto §5 design and is
+            handled by the existing ``_generate_immediate`` dispatcher
+            below).
+        """
+        from backend.core.ouroboros.governance.provider_topology import (
+            get_topology as _get_topology,
+        )
+        from backend.core.ouroboros.governance.topology_sentinel import (
+            FailureSource,
+            get_default_sentinel,
+        )
+
+        topology = _get_topology()
+        if not topology.enabled:
+            return None
+        ranked_models = topology.dw_models_for_route(provider_route)
+        fallback_tolerance = topology.fallback_tolerance_for_route(
+            provider_route,
+        )
+
+        # Empty dw_models → fall through to legacy dispatch. IMMEDIATE
+        # has empty models by design (Claude-direct); other routes
+        # would fall here only if yaml is misconfigured.
+        if not ranked_models:
+            logger.debug(
+                "[CandidateGenerator] Sentinel dispatch: route=%s "
+                "has no dw_models — falling through to legacy",
+                provider_route,
+            )
+            return None
+
+        sentinel = get_default_sentinel()
+        # Register every model in the ranked list (idempotent). The
+        # sentinel needs to know about each model_id before it can
+        # answer get_state.
+        for model_id in ranked_models:
+            sentinel.register_endpoint(model_id)
+
+        op_id_short = (
+            getattr(context, "op_id", "?")[:16]
+            if hasattr(context, "op_id") else "?"
+        )
+
+        # Walk the ranked list. For each model not OPEN, attempt DW.
+        attempts: List[str] = []
+        last_failure: Optional[str] = None
+        for model_id in ranked_models:
+            state = sentinel.get_state(model_id)
+            if state == "OPEN":
+                logger.info(
+                    "[CandidateGenerator] Sentinel dispatch: route=%s "
+                    "model=%s state=OPEN — skipping (op=%s)",
+                    provider_route, model_id, op_id_short,
+                )
+                attempts.append(f"{model_id}:skipped_open")
+                continue
+            attempts.append(f"{model_id}:attempted")
+            # Stamp the per-attempt override on context. Each attempt
+            # mutates the same context attribute; on success / cascade
+            # we leave it set (downstream telemetry sees which model
+            # actually fired); on failure we move on and the next
+            # iteration overwrites.
+            try:
+                setattr(context, "_dw_model_override", model_id)
+            except (AttributeError, TypeError):
+                # Slotted dataclass refusing setattr — retreat to the
+                # legacy single-model dispatch.
+                logger.debug(
+                    "[CandidateGenerator] Sentinel dispatch: ctx "
+                    "rejected _dw_model_override; falling through",
+                )
+                return None
+            logger.info(
+                "[CandidateGenerator] Sentinel dispatch: route=%s "
+                "attempting model=%s (state=%s, op=%s)",
+                provider_route, model_id, state, op_id_short,
+            )
+            try:
+                if provider_route == "background":
+                    result = await self._generate_background(
+                        context, deadline,
+                    )
+                elif provider_route == "speculative":
+                    result = await self._generate_speculative(
+                        context, deadline,
+                    )
+                else:
+                    # standard / complex / unknown — use the primary-
+                    # first cascade. This walks the existing tier-0
+                    # → tier-1 logic which honors ctx._dw_model_override.
+                    result = await self._try_primary_then_fallback(
+                        context, deadline,
+                    )
+                # Success — let the sentinel know. Phase 10 P10.4
+                # also wires report_failure at existing failure sites
+                # so a stream-stall mid-generation also lands in the
+                # sentinel; this report_success closes the
+                # corresponding successful-stream signal.
+                try:
+                    sentinel.report_success(model_id)
+                except Exception:
+                    logger.debug(
+                        "[CandidateGenerator] sentinel.report_success raised",
+                        exc_info=True,
+                    )
+                return result
+            except Exception as exc:
+                # Classify the failure for the sentinel. Stream-stall
+                # exceptions get LIVE_STREAM_STALL (weight 3.0 — single
+                # occurrence trips); transport/HTTP get LIVE_TRANSPORT;
+                # everything else falls through to LIVE_TRANSPORT as a
+                # catch-all (better to over-trip than under-trip on
+                # uncategorized errors).
+                err_str = str(exc)
+                err_lower = err_str.lower()
+                if (
+                    "stream" in err_lower
+                    and ("stall" in err_lower or "timeout" in err_lower)
+                ) or "streamtimeouterror" in err_lower:
+                    failure_source = FailureSource.LIVE_STREAM_STALL
+                elif "429" in err_str:
+                    failure_source = FailureSource.LIVE_HTTP_429
+                elif "5" in err_str[:5] and (
+                    "500" in err_str or "502" in err_str
+                    or "503" in err_str or "504" in err_str
+                ):
+                    failure_source = FailureSource.LIVE_HTTP_5XX
+                elif "parse" in err_lower or "json" in err_lower:
+                    failure_source = FailureSource.LIVE_PARSE_ERROR
+                else:
+                    failure_source = FailureSource.LIVE_TRANSPORT
+                try:
+                    sentinel.report_failure(
+                        model_id, failure_source,
+                        f"{type(exc).__name__}:{err_str[:120]}",
+                    )
+                except Exception:
+                    logger.debug(
+                        "[CandidateGenerator] sentinel.report_failure raised",
+                        exc_info=True,
+                    )
+                last_failure = (
+                    f"{model_id}:{failure_source.value}:"
+                    f"{type(exc).__name__}"
+                )
+                logger.warning(
+                    "[CandidateGenerator] Sentinel dispatch: model=%s "
+                    "FAILED (source=%s, exc=%s) — trying next (op=%s)",
+                    model_id, failure_source.value,
+                    type(exc).__name__, op_id_short,
+                )
+                attempts[-1] = f"{model_id}:failed:{failure_source.value}"
+                continue
+        # All DW models exhausted (either OPEN or failed). Clear the
+        # per-attempt override so any downstream telemetry doesn't
+        # falsely attribute the cascade to the last attempted model.
+        try:
+            setattr(context, "_dw_model_override", None)
+        except (AttributeError, TypeError):
+            pass
+        logger.warning(
+            "[CandidateGenerator] Sentinel dispatch: route=%s exhausted "
+            "all %d DW models [%s] — applying fallback_tolerance=%s "
+            "(op=%s, last_failure=%s)",
+            provider_route, len(ranked_models),
+            ", ".join(attempts),
+            fallback_tolerance, op_id_short, last_failure or "none",
+        )
+        if fallback_tolerance == "queue":
+            # Same exception shape the orchestrator's existing
+            # accept-failure branch already handles for BG/SPEC.
+            if provider_route == "speculative":
+                raise RuntimeError(
+                    f"speculative_deferred:dw_severed_queued:"
+                    f"{(last_failure or 'all_models_open')[:120]}"
+                )
+            raise RuntimeError(
+                f"background_dw_blocked_by_topology:"
+                f"dw_severed_queued:"
+                f"{(last_failure or 'all_models_open')[:120]}"
+            )
+        # cascade_to_claude — Claude is the explicit cost contract.
+        if self._fallback is None:
+            raise RuntimeError(
+                f"sentinel_dispatch_no_fallback:"
+                f"{(last_failure or 'all_models_open')[:120]}"
+            )
+        return await self._call_fallback(context, deadline)
 
     async def _generate_immediate(
         self,

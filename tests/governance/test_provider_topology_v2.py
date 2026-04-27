@@ -525,44 +525,63 @@ def test_monitor_config_ramp_schedule_csv_strips_whitespace() -> None:
 # ===========================================================================
 
 
-def test_production_yaml_still_parses_as_v1(
+def test_production_yaml_parses_as_v2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The actual ``brain_selection_policy.yaml`` shipped today MUST
-    still parse to v1. If this test fails after Slice 2, it means a
-    schema_version key got accidentally added to production yaml
-    before Phase 10 P10.5 (the purge) is authorized."""
+    """Slice 3 bumped schema_version to ``topology.2`` and populated
+    every route with the audit-recommended ranked dw_models lists.
+    The v1 ``dw_allowed: false`` blocks REMAIN authoritative until
+    Phase 10 P10.5 purge — they are still pinned by
+    ``test_phase_10_static_blocks_still_present`` below."""
     pt._CACHED_TOPOLOGY = None
     topo = pt.get_topology()
     assert topo.enabled is True
-    assert topo.schema_version == pt.SCHEMA_VERSION_V1
+    assert topo.schema_version == pt.SCHEMA_VERSION_V2
 
 
-def test_production_yaml_routes_have_empty_dw_models() -> None:
-    """Production yaml is v1; ``dw_models`` should be empty tuple for
-    every route. The ``effective_dw_models`` accessor handles the
-    backward-compat single-element derivation."""
+def test_production_yaml_routes_have_audit_recommended_dw_models() -> None:
+    """Slice 3 populated each route's v2 ``dw_models`` ranked list per
+    PRD §3.7.3 audit recommendations. Pin the exact rank order so an
+    accidental yaml refactor can't silently swap models."""
     pt._CACHED_TOPOLOGY = None
     topo = pt.get_topology()
-    for route_name, entry in topo.routes.items():
-        assert entry.dw_models == (), (
-            f"production route {route_name!r} has unexpected dw_models — "
-            "Slice 2 should not modify production yaml v1 keys"
-        )
+    # IMMEDIATE intentionally has NO dw_models (Manifesto §5 — Claude direct by design).
+    assert topo.dw_models_for_route("immediate") == ()
+    # STANDARD + COMPLEX share the same ranked list.
+    expected_prefrontal = (
+        "moonshotai/Kimi-K2.6",
+        "zai-org/GLM-5.1-FP8",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        "Qwen/Qwen3.5-397B-A17B",
+    )
+    assert topo.dw_models_for_route("standard") == expected_prefrontal
+    assert topo.dw_models_for_route("complex") == expected_prefrontal
+    # BACKGROUND is cost-sensitive — cheap-first ordering.
+    assert topo.dw_models_for_route("background") == (
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        "moonshotai/Kimi-K2.6",
+    )
+    # SPECULATIVE is fire-and-forget — ultra-cheap only.
+    assert topo.dw_models_for_route("speculative") == (
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-4B",
+    )
 
 
 def test_production_yaml_v1_block_mode_methods_unchanged() -> None:
     """Regression pin: existing v1 callers' answers MUST be byte-
-    identical after Slice 2. If any of these change, Slice 2 broke
-    backward compat."""
+    identical after Slice 3 even though the yaml is now v2 — the v1
+    keys (``dw_allowed: false``, ``block_mode:``) remain in the yaml
+    until P10.5 purge, and the v1 reader paths must still honor them
+    so callers that haven't migrated to v2 accessors keep working."""
     pt._CACHED_TOPOLOGY = None
     topo = pt.get_topology()
-    # All 5 routes are sealed in production today.
+    # All 5 routes are still sealed by v1 keys (until P10.5 purge).
     for route in (
         "immediate", "complex", "standard", "background", "speculative",
     ):
         assert topo.dw_allowed_for_route(route) is False
-    # Block-mode wiring per yaml today:
+    # Block-mode wiring unchanged:
     assert topo.block_mode_for_route("immediate") == "cascade_to_claude"
     assert topo.block_mode_for_route("complex") == "cascade_to_claude"
     assert topo.block_mode_for_route("standard") == "cascade_to_claude"
@@ -570,23 +589,37 @@ def test_production_yaml_v1_block_mode_methods_unchanged() -> None:
     assert topo.block_mode_for_route("speculative") == "skip_and_queue"
 
 
-def test_production_yaml_v2_methods_derive_correctly() -> None:
-    """The new v2 accessors must give sensible answers when reading the
-    production v1 yaml. Slice 3 will consume these accessors directly."""
+def test_production_yaml_v2_fallback_tolerance() -> None:
+    """v2 ``fallback_tolerance`` per route (now explicit in yaml, not
+    derived from block_mode):
+
+      * IMMEDIATE / COMPLEX / STANDARD → cascade_to_claude
+      * BACKGROUND / SPECULATIVE → queue (project_bg_spec_sealed.md
+        contract preserved structurally)
+    """
     pt._CACHED_TOPOLOGY = None
     topo = pt.get_topology()
-    # All disallowed routes have empty dw_models lists (v1 yaml had no
-    # explicit dw_model on disallowed routes).
-    for route in (
-        "immediate", "complex", "standard", "background", "speculative",
-    ):
-        assert topo.dw_models_for_route(route) == ()
-    # Fallback tolerance derives from block_mode:
     assert topo.fallback_tolerance_for_route("immediate") == "cascade_to_claude"
     assert topo.fallback_tolerance_for_route("complex") == "cascade_to_claude"
     assert topo.fallback_tolerance_for_route("standard") == "cascade_to_claude"
     assert topo.fallback_tolerance_for_route("background") == "queue"
     assert topo.fallback_tolerance_for_route("speculative") == "queue"
+
+
+def test_production_yaml_monitor_block_populated() -> None:
+    """Slice 3 added a ``monitor:`` block to production yaml with
+    sentinel tunables. Pin the keys + sane numeric ranges."""
+    pt._CACHED_TOPOLOGY = None
+    topo = pt.get_topology()
+    cfg = topo.monitor_config()
+    assert cfg is not None
+    assert cfg.probe_interval_healthy_s == 30.0
+    assert cfg.probe_backoff_base_s == 10.0
+    assert cfg.probe_backoff_cap_s == 300.0
+    assert cfg.severed_threshold_weighted == 3.0
+    assert cfg.heavy_probe_ratio == 0.2
+    assert cfg.ramp_schedule_csv is not None
+    assert "0:1.0" in cfg.ramp_schedule_csv  # entry tier preserved
 
 
 def test_production_yaml_callers_unchanged_after_slice2() -> None:
