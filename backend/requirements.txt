@@ -103,7 +103,7 @@ pygame>=2.5.0  # For audio feedback
 playwright>=1.40.0  # For page navigation, content extraction, form automation
 
 # Computer Vision dependencies
-opencv-python>=4.8.0  # For image processing
+opencv-python>=4.13.0.92  # For image processing
 pytesseract>=0.3.10  # For OCR text extraction
 Pillow>=10.0.0  # For image manipulation
 pyobjc-core==10.1  # Core PyObjC for macOS - specific version for miniforge compatibility
