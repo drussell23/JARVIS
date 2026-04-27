@@ -435,6 +435,7 @@ _TIGHTEN_KINDS: Tuple[str, ...] = (
     "lower_budget",     # Mutation budget — only lower
     "add_tier",         # Risk-tier ladder — only insert
     "rebalance_weight",  # Category weights — surface validator MUST verify mass-conservation
+    "sunset_candidate",  # Phase 7.9 — advisory signal that an adapted pattern hasn't matched in N days; structurally conservative (operator must still file Pass B amendment to actually remove)
 )
 
 
