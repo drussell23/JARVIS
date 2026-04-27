@@ -126,10 +126,12 @@ def test_validation_status_five_values():
     }
 
 
-def test_validation_failure_reason_nine_values():
+def test_validation_failure_reason_ten_values():
     """Pin: 7 rules + 2 supporting failure shapes (RUN_NOT_ASYNC +
     RUN_BAD_SIGNATURE split rule 3 into actionable detail).
-    Phase 7.7 (2026-04-26) added INTROSPECTION_ESCAPE as the 9th value."""
+    Phase 7.7 (2026-04-26) added INTROSPECTION_ESCAPE as the 9th value.
+    Rule 8 (post-P7.7 followup, 2026-04-26) added MODULE_LEVEL_SIDE_EFFECT
+    as the 10th value."""
     assert {r.name for r in ValidationFailureReason} == {
         "NO_PHASE_RUNNER_SUBCLASS",
         "MISSING_PHASE_ATTR",
@@ -140,6 +142,7 @@ def test_validation_failure_reason_nine_values():
         "NO_TOP_LEVEL_TRY",
         "BANNED_IMPORT",
         "INTROSPECTION_ESCAPE",  # P7.7 sandbox hardening
+        "MODULE_LEVEL_SIDE_EFFECT",  # Rule 8 — post-P7.7 followup
     }
 
 
