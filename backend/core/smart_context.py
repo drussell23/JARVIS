@@ -99,6 +99,20 @@ except ImportError:
     EMBEDDINGS_AVAILABLE = False
     SentenceTransformer = None
 
+# Phase 11 P11.1 — surgical AST chunking lifted to a shared module so
+# both ``SmartContextSelector`` (this file) AND the upcoming
+# ``read_file(target_symbol=...)`` slicing backend (P11.2) consume one
+# canonical implementation. Re-exports preserve every existing
+# `from backend.core.smart_context import ASTChunker` import path.
+from backend.core.ouroboros.governance.ast_slicer import (  # noqa: F401
+    ASTChunker,
+    ChunkPriority,
+    ChunkType,
+    CodeChunk,
+    RelevanceReason,
+    TokenCounterProtocol,
+)
+
 logger = logging.getLogger("SmartContext")
 
 
@@ -143,71 +157,10 @@ class SmartContextConfig:
 # DATA STRUCTURES
 # =============================================================================
 
-class ChunkType(Enum):
-    """Type of code chunk."""
-    FUNCTION = "function"
-    METHOD = "method"
-    CLASS = "class"
-    CLASS_SKELETON = "class_skeleton"  # Class with method signatures only
-    MODULE_HEADER = "module_header"     # Imports and module-level constants
-    VARIABLE = "variable"
-    DECORATOR = "decorator"
-
-
-class RelevanceReason(Enum):
-    """Why a chunk was selected."""
-    DIRECT_MATCH = "direct_match"           # Directly matches query
-    DEPENDENCY = "dependency"                # Called by or calls relevant code
-    STRUCTURAL = "structural"                # Same class/module as relevant code
-    SEMANTIC = "semantic"                    # Semantically similar to query
-    BLAST_RADIUS = "blast_radius"           # In the impact zone of changes
-
-
-@dataclass
-class CodeChunk:
-    """A surgically extracted piece of code."""
-
-    # Identity
-    chunk_id: str                           # Unique identifier
-    chunk_type: ChunkType
-    name: str                               # Function/class/variable name
-    qualified_name: str                     # Full path: module.Class.method
-
-    # Location
-    file_path: Path
-    start_line: int
-    end_line: int
-
-    # Content
-    source_code: str
-    signature: Optional[str] = None         # For functions: def foo(a, b) -> int
-    docstring: Optional[str] = None
-    decorators: List[str] = field(default_factory=list)
-
-    # Metadata
-    token_count: int = 0
-    complexity: int = 0                     # Cyclomatic complexity
-
-    # Relevance
-    relevance_score: float = 0.0
-    relevance_reasons: List[RelevanceReason] = field(default_factory=list)
-
-    # Dependencies
-    calls: Set[str] = field(default_factory=set)       # Functions this calls
-    called_by: Set[str] = field(default_factory=set)   # Functions that call this
-    imports: Set[str] = field(default_factory=set)     # Imports needed
-
-    def __hash__(self) -> int:
-        return hash(self.chunk_id)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, CodeChunk):
-            return self.chunk_id == other.chunk_id
-        return False
-
-    def __lt__(self, other: "CodeChunk") -> bool:
-        """For priority queue (higher relevance = higher priority)."""
-        return self.relevance_score > other.relevance_score
+# ChunkType / RelevanceReason / CodeChunk moved to
+# backend.core.ouroboros.governance.ast_slicer (Phase 11 P11.1) and
+# re-exported above. ContextPackage stays here — it's a relevance-
+# scoring concept, not a chunking primitive.
 
 
 @dataclass
@@ -247,11 +200,8 @@ class ContextPackage:
 """
 
 
-class ChunkPriority(NamedTuple):
-    """For priority queue ordering."""
-    negative_score: float  # Negative because heapq is min-heap
-    chunk_id: str
-    chunk: CodeChunk
+# ChunkPriority moved to ast_slicer.py (Phase 11 P11.1) and re-exported
+# above.
 
 
 # =============================================================================
@@ -337,303 +287,10 @@ class TokenCounter:
         }
 
 
-# =============================================================================
-# AST CHUNKER - The Surgical Extraction Engine
-# =============================================================================
+# ASTChunker moved to backend.core.ouroboros.governance.ast_slicer
+# (Phase 11 P11.1). Re-exported at top of this module for backward
+# compatibility.
 
-class ASTChunker:
-    """
-    Extracts code chunks from Python files using AST.
-
-    This is the core of surgical context - it doesn't just read files,
-    it UNDERSTANDS structure and extracts exactly what's needed.
-    """
-
-    def __init__(self, token_counter: TokenCounter):
-        self._token_counter = token_counter
-        self._chunk_cache: Dict[str, List[CodeChunk]] = {}
-
-    async def extract_chunks(
-        self,
-        file_path: Path,
-        target_names: Optional[Set[str]] = None,
-        include_all: bool = False,
-    ) -> List[CodeChunk]:
-        """
-        Extract code chunks from a Python file.
-
-        Args:
-            file_path: Path to Python file
-            target_names: If provided, only extract these specific entities
-            include_all: If True, extract all entities (for dependency resolution)
-
-        Returns:
-            List of CodeChunk objects
-        """
-        # Check cache
-        cache_key = f"{file_path}:{hash(frozenset(target_names or []))}:{include_all}"
-        if cache_key in self._chunk_cache:
-            return self._chunk_cache[cache_key]
-
-        try:
-            source = await self._read_file(file_path)
-            tree = ast.parse(source, filename=str(file_path))
-        except SyntaxError as e:
-            logger.warning(f"[ASTChunker] Syntax error in {file_path}: {e}")
-            return []
-        except Exception as e:
-            logger.warning(f"[ASTChunker] Failed to parse {file_path}: {e}")
-            return []
-
-        chunks = []
-        source_lines = source.splitlines(keepends=True)
-
-        # Extract module-level docstring and imports
-        module_header = self._extract_module_header(tree, source_lines, file_path)
-        if module_header and (include_all or target_names is None):
-            chunks.append(module_header)
-
-        # Walk the AST
-        for node in ast.walk(tree):
-            chunk = None
-
-            if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
-                # Skip if we have targets and this isn't one
-                if target_names and node.name not in target_names:
-                    continue
-                chunk = self._extract_function(node, source_lines, file_path)
-
-            elif isinstance(node, ast.ClassDef):
-                if target_names and node.name not in target_names:
-                    # Check if any method is targeted
-                    method_names = {n.name for n in node.body
-                                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-                    if not (target_names & method_names):
-                        continue
-
-                # Extract class with its methods
-                class_chunks = self._extract_class(node, source_lines, file_path, target_names)
-                chunks.extend(class_chunks)
-                continue  # Methods handled in _extract_class
-
-            if chunk:
-                chunks.append(chunk)
-
-        # Compute token counts
-        for chunk in chunks:
-            chunk.token_count = self._token_counter.count(chunk.source_code)
-
-        # Cache results
-        self._chunk_cache[cache_key] = chunks
-
-        return chunks
-
-    async def _read_file(self, file_path: Path) -> str:
-        """Read file asynchronously."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, file_path.read_text)
-
-    def _extract_module_header(
-        self,
-        tree: ast.Module,
-        source_lines: List[str],
-        file_path: Path,
-    ) -> Optional[CodeChunk]:
-        """Extract module docstring and imports."""
-        imports = []
-        docstring = ast.get_docstring(tree)
-        last_import_line = 0
-
-        for node in tree.body:
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                imports.append(ast.unparse(node))
-                last_import_line = max(last_import_line, node.end_lineno or node.lineno)
-            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
-                # Module docstring
-                if node.lineno == 1 or (node.lineno <= 3 and not imports):
-                    continue  # Already captured
-
-        if not imports and not docstring:
-            return None
-
-        # Build source
-        end_line = last_import_line or (3 if docstring else 0)
-        source = "".join(source_lines[:end_line])
-
-        return CodeChunk(
-            chunk_id=f"{file_path}::__module__",
-            chunk_type=ChunkType.MODULE_HEADER,
-            name="__module__",
-            qualified_name=str(file_path.stem),
-            file_path=file_path,
-            start_line=1,
-            end_line=end_line,
-            source_code=source.strip(),
-            docstring=docstring,
-            imports=set(imports),
-        )
-
-    def _extract_function(
-        self,
-        node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
-        source_lines: List[str],
-        file_path: Path,
-        parent_class: Optional[str] = None,
-    ) -> CodeChunk:
-        """Extract a function/method as a chunk."""
-        # Get source lines (1-indexed to 0-indexed)
-        start = node.lineno - 1
-        end = node.end_lineno or node.lineno
-
-        # Include decorators
-        decorator_lines = []
-        if node.decorator_list and SmartContextConfig.INCLUDE_DECORATORS:
-            first_decorator = node.decorator_list[0]
-            start = first_decorator.lineno - 1
-            for dec in node.decorator_list:
-                decorator_lines.append(f"@{ast.unparse(dec)}")
-
-        source = "".join(source_lines[start:end])
-
-        # Build signature
-        args = []
-        for arg in node.args.args:
-            arg_str = arg.arg
-            if arg.annotation:
-                arg_str += f": {ast.unparse(arg.annotation)}"
-            args.append(arg_str)
-
-        returns = ""
-        if node.returns:
-            returns = f" -> {ast.unparse(node.returns)}"
-
-        async_prefix = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
-        signature = f"{async_prefix}def {node.name}({', '.join(args)}){returns}"
-
-        # Extract calls made by this function
-        calls = self._extract_calls(node)
-
-        # Determine type
-        chunk_type = ChunkType.METHOD if parent_class else ChunkType.FUNCTION
-
-        qualified = f"{parent_class}.{node.name}" if parent_class else node.name
-
-        return CodeChunk(
-            chunk_id=f"{file_path}::{qualified}",
-            chunk_type=chunk_type,
-            name=node.name,
-            qualified_name=qualified,
-            file_path=file_path,
-            start_line=node.lineno,
-            end_line=end,
-            source_code=source.strip(),
-            signature=signature,
-            docstring=ast.get_docstring(node),
-            decorators=decorator_lines,
-            calls=calls,
-            complexity=self._calculate_complexity(node),
-        )
-
-    def _extract_class(
-        self,
-        node: ast.ClassDef,
-        source_lines: List[str],
-        file_path: Path,
-        target_names: Optional[Set[str]] = None,
-    ) -> List[CodeChunk]:
-        """Extract a class and its methods as chunks."""
-        chunks = []
-
-        # Get class bounds
-        start = node.lineno - 1
-        if node.decorator_list and SmartContextConfig.INCLUDE_DECORATORS:
-            start = node.decorator_list[0].lineno - 1
-
-        # Extract base classes
-        bases = [ast.unparse(base) for base in node.bases]
-
-        # Class skeleton (without method bodies)
-        skeleton_lines = []
-        decorator_lines = [f"@{ast.unparse(d)}" for d in node.decorator_list]
-
-        base_str = f"({', '.join(bases)})" if bases else ""
-        skeleton_lines.append(f"class {node.name}{base_str}:")
-
-        if ast.get_docstring(node):
-            skeleton_lines.append(f'    """{ast.get_docstring(node)}"""')
-
-        # Add method signatures
-        for item in node.body:
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Check if this method is targeted
-                should_extract_full = (
-                    target_names is None or
-                    item.name in target_names or
-                    node.name in target_names
-                )
-
-                if should_extract_full:
-                    # Extract full method
-                    method_chunk = self._extract_function(
-                        item, source_lines, file_path, parent_class=node.name
-                    )
-                    chunks.append(method_chunk)
-                else:
-                    # Just add signature to skeleton
-                    async_prefix = "async " if isinstance(item, ast.AsyncFunctionDef) else ""
-                    args = ", ".join(a.arg for a in item.args.args)
-                    skeleton_lines.append(f"    {async_prefix}def {item.name}({args}): ...")
-
-        # Create class skeleton chunk
-        skeleton_source = "\n".join(decorator_lines + skeleton_lines)
-
-        class_chunk = CodeChunk(
-            chunk_id=f"{file_path}::{node.name}",
-            chunk_type=ChunkType.CLASS_SKELETON if chunks else ChunkType.CLASS,
-            name=node.name,
-            qualified_name=node.name,
-            file_path=file_path,
-            start_line=node.lineno,
-            end_line=node.end_lineno or node.lineno,
-            source_code=skeleton_source,
-            docstring=ast.get_docstring(node),
-            decorators=[f"@{ast.unparse(d)}" for d in node.decorator_list],
-        )
-        class_chunk.base_classes = bases  # type: ignore
-
-        chunks.insert(0, class_chunk)
-
-        return chunks
-
-    def _extract_calls(self, node: ast.AST) -> Set[str]:
-        """Extract function/method calls made in a code block."""
-        calls = set()
-
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call):
-                if isinstance(child.func, ast.Name):
-                    calls.add(child.func.id)
-                elif isinstance(child.func, ast.Attribute):
-                    # method call: obj.method()
-                    calls.add(child.func.attr)
-
-        return calls
-
-    def _calculate_complexity(self, node: ast.AST) -> int:
-        """Calculate cyclomatic complexity."""
-        complexity = 1
-
-        for child in ast.walk(node):
-            if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor)):
-                complexity += 1
-            elif isinstance(child, ast.ExceptHandler):
-                complexity += 1
-            elif isinstance(child, (ast.And, ast.Or)):
-                complexity += 1
-            elif isinstance(child, ast.comprehension):
-                complexity += 1
-
-        return complexity
 
 
 # =============================================================================
