@@ -55,7 +55,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.RiskFloor")
 
@@ -90,6 +90,53 @@ _ORDER = {
 }
 
 
+def get_active_tier_order() -> Dict[str, int]:
+    """Return the active risk-tier order dict.
+
+    Phase 7.4 caller wiring (Caller Wiring PR #3 — 2026-04-26):
+    composes the canonical ``_ORDER`` baseline with operator-approved
+    adapted tiers loaded via ``compute_extended_ladder()``.
+
+    Master-off byte-identical: when
+    ``JARVIS_RISK_TIER_FLOOR_LOAD_ADAPTED_TIERS=false`` (default),
+    no adapted YAML is loaded → returns ``dict(_ORDER)`` unchanged.
+
+    Master-on: each operator-approved adapted tier (per Pass C
+    Slice 4b miner — see ``adaptation/risk_tier_extender.py``) is
+    inserted into the ladder at its ``insert_after`` slot. Adapted
+    tier names from the YAML are normalized to lowercase to match
+    the canonical ``_ORDER`` convention. Cage rule (load-bearing
+    per Pass C §8.3): the ladder ONLY GROWS — no canonical tier
+    is removed or reordered.
+
+    Defense-in-depth: if the loader raises for any reason, falls
+    back to the canonical ``_ORDER`` baseline. NEVER raises into
+    the caller.
+
+    Returns a NEW dict on every call so callers may mutate it
+    without affecting future callers.
+    """
+    base_lower = sorted(_ORDER.keys(), key=lambda k: _ORDER[k])
+    # Phase 7.4 helper expects uppercase per Slice 4b miner's
+    # `_synthesize_tier_name` output charset `[A-Z0-9_]+`. Lift the
+    # base ladder to uppercase for the helper, then lowercase the
+    # extended result to match _ORDER's canonical case.
+    base_upper = tuple(n.upper() for n in base_lower)
+    try:
+        from backend.core.ouroboros.governance.adaptation.adapted_risk_tier_loader import (  # noqa: E501
+            compute_extended_ladder,
+        )
+        extended_upper = compute_extended_ladder(base_upper)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[RiskFloor] compute_extended_ladder raised %s — "
+            "falling back to canonical _ORDER", exc,
+        )
+        return dict(_ORDER)
+    # Build new ordered dict: lowercase, rank by position.
+    return {name.lower(): rank for rank, name in enumerate(extended_upper)}
+
+
 def _norm_tier(s: str) -> str:
     return (s or "").strip().lower()
 
@@ -108,7 +155,7 @@ def _env_floor() -> Optional[str]:
     raw = _norm_tier(os.environ.get(_ENV_MIN_TIER, ""))
     if not raw:
         return None
-    if raw not in _ORDER:
+    if raw not in get_active_tier_order():
         logger.debug(
             "[RiskFloor] unrecognised %s=%r — ignoring",
             _ENV_MIN_TIER, raw,
@@ -240,13 +287,14 @@ def _vision_floor_from_env() -> str:
     raw = _norm_tier(os.environ.get(_ENV_VISION_FLOOR, ""))
     if not raw:
         return _VISION_SENSOR_HARD_FLOOR
-    if raw not in _ORDER:
+    _order = get_active_tier_order()
+    if raw not in _order:
         logger.debug(
             "[RiskFloor] unrecognised %s=%r — using default %s",
             _ENV_VISION_FLOOR, raw, _VISION_SENSOR_HARD_FLOOR,
         )
         return _VISION_SENSOR_HARD_FLOOR
-    if _ORDER[raw] < _ORDER[_VISION_SENSOR_HARD_FLOOR]:
+    if _order[raw] < _order[_VISION_SENSOR_HARD_FLOOR]:
         raise ValueError(
             f"{_ENV_VISION_FLOOR}={raw!r} cannot be lower than "
             f"{_VISION_SENSOR_HARD_FLOOR!r}. Vision-originated ops are "
@@ -295,7 +343,8 @@ def recommended_floor(
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.
-    return max(candidates, key=lambda t: _ORDER.get(t, 0))
+    _order = get_active_tier_order()
+    return max(candidates, key=lambda t: _order.get(t, 0))
 
 
 def apply_floor_to_name(
@@ -318,12 +367,13 @@ def apply_floor_to_name(
     floor (Invariant I2). See :func:`recommended_floor`.
     """
     raw_in = _norm_tier(tier_name)
-    if raw_in not in _ORDER:
+    _order = get_active_tier_order()
+    if raw_in not in _order:
         return (tier_name, None)
     floor = recommended_floor(now, signal_source=signal_source)
     if floor is None:
         return (tier_name, None)
-    if _ORDER[floor] <= _ORDER[raw_in]:
+    if _order[floor] <= _order[raw_in]:
         return (tier_name, None)
     return (floor, floor)
 
