@@ -6,7 +6,7 @@ asyncpg>=0.29.0  # Async driver for production
 psycopg2-binary>=2.9.0  # Sync driver for health checks and admin tasks
 
 # Cloud SQL Python Connector (recommended for secure connections)
-cloud-sql-python-connector[asyncpg]>=1.7.0
+cloud-sql-python-connector[asyncpg]>=1.20.2
 
 # Google Cloud Storage (for ChromaDB)
 google-cloud-storage>=2.14.0
