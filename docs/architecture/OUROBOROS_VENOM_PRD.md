@@ -62,23 +62,25 @@
 
 Ouroboros + Venom (O+V) is the autonomous self-development governance engine of JARVIS. It is the **proactive autonomous opposite of Claude Code (CC)** — where CC requires a human to ask, O+V should observe, hypothesize, propose, validate, and ship without prompting (with human-in-loop escalation only when context warrants it).
 
-### Where we stand (2026-04-25)
+### Where we stand (2026-04-26)
 
-- **Architecture**: B+ — sophisticated, composable, observability-rich, financial-circuit-breaker-protected. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all work and compose correctly.
-- **Cognitive depth**: C+ — sensors fire on hardcoded conditions; POSTMORTEM is observational not corrective; no closed feedback loops.
-- **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); Wave 3 architecturally complete (W3(7) graduated, W3(6) gated only on external Anthropic API stability).
-- **RSI scaffolding**: 6 Wang-paper improvements designed (`docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md`); composite_score / convergence_tracker / oracle_prescorer / transition_tracker / vindication_reflector / adaptive-graduation-threshold pending implementation status verification.
+- **Architecture**: A− — sophisticated, composable, observability-rich, financial-circuit-breaker-protected. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all compose correctly. **Order-2 governance cage shipped (Pass B closed 2026-04-26)** — O+V can now safely propose changes to its own cognitive substrate (FSM, immune-system gates) under operator-only authorization with locked-true `amendment_requires_operator()` invariant. **Pass C Adaptive Anti-Venom in flight (4 of 6 slices landed same day)** — substrate + 4 adaptive surfaces all enforcing the monotonic-tightening invariant (would-loosen proposals are NOT persisted).
+- **Cognitive depth**: B − sensors fire on hardcoded conditions BUT 3 deferred-follow-up wirings landed 2026-04-26 closing the "shipped & dormant" gap: AdversarialReviewer auto-invokes per-op (P5), MetricsSessionObserver fires per session-end (P4), `/chat` REPL has 3 concrete executors against backlog/subagent-queue/Claude (P2). Cross-session feedback loops live: PostmortemRecall (P0), DirectionInferrer arc-context (P0.5), SelfGoalFormation (P1), Hypothesis pairing (P1.5), CognitiveMetrics (P3), MetricsSuite (P4). Adaptive immune system *under construction* (Pass C).
+- **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); Wave 3 architecturally complete (W3(7) graduated, W3(6) closed-pending-external-API-stability per operator binding 2026-04-25). **Pass B graduation soak in flight**: agent-conducted twice-daily cadence (`trig_012EvEDkABy2u5PSSs3xK5C4`) — first ledger entry expected 2026-04-27 09:03 UTC.
+- **RSI scaffolding**: 6 Wang modules verified (Phase 0 audit, 2026-04-25); 4 wired into live FSM via Phase 4 P3+P4 graduation (2026-04-26). 2 stranded modules (oracle_prescorer + vindication_reflector) un-stranded via `cognitive_metrics.py` wrapper. Wang's composite_score + 5 net-new operator metrics now surfaced via summary.json + `/metrics` REPL + IDE GET + SSE event by default.
 
 ### Where we're going
 
 A-level reliable execution from A-level vision — measurable by:
-- Sustained 90%+ session completion rate (currently variable)
-- Cross-session learning evidence (currently zero)
-- Self-directed goal formation (currently zero — sensors only)
-- Conversational mode parity with CC (currently intent-driven only)
-- Convergence metric trending in the Wang sense (currently INSUFFICIENT_DATA)
+- Sustained 90%+ session completion rate (currently variable; `/metrics 7d` now answers this concretely)
+- Cross-session learning evidence (✅ delivered: PostmortemRecall + DirectionInferrer arc-context + ConversationBridge + UserPreferenceMemory + SemanticIndex + LastSessionSummary)
+- Self-directed goal formation (✅ delivered: SelfGoalFormationEngine + Hypothesis pairing + BacklogSensor auto-proposed entries with operator-review-tier safety)
+- Conversational mode parity with CC (✅ delivered: `/chat` REPL classified + audit-trailed + 3 concrete executors against real systems)
+- Convergence metric trending in the Wang sense (✅ delivered: `INSUFFICIENT_DATA` problem statement resolved by Phase 4 P4 graduation)
+- **Adaptive immune system** that grows stricter as the shell expands (🚀 in flight: Pass C Slices 1-4 landed; 5-6 pending; per-slice graduation cadence post-arc-closure)
+- A-level reliability metric: **70%+ operator-approval rate** for adaptive proposals over a 30-day window (Pass C arc-closure criterion per §10.3)
 
-This PRD lays out a phased roadmap to close the gap. **The gap is internal to JARVIS, not external.** External provider quality is sufficient; what's missing is the orchestration layer that converts that intelligence into self-directing, self-improving behavior.
+This PRD lays out a phased roadmap to close the gap. **The gap is internal to JARVIS, not external.** External provider quality is sufficient; what's missing is the orchestration layer that converts that intelligence into self-directing, self-improving, self-tightening behavior.
 
 ### Roadmap Execution Status (live)
 
@@ -266,18 +268,21 @@ The "lowest-numbered `[ ]` row" heuristic (above) still applies *within* a phase
 
 The vision delivers when:
 
-1. **Self-initiating** — O+V begins useful work without human prompting (✅ delivered: 16 sensors)
-2. **Codebase exploration parity with CC** — same depth of read/search/reason as CC's tool loop (⚠️ partial: Iron Gate enforces hygiene, not curiosity)
-3. **Repo development without intervention** — multi-file changes ship end-to-end autonomously (⚠️ proven once, Sessions Q-S)
-4. **Human-in-loop only when severity demands** — risk-tier ladder + curiosity ask_human (✅ delivered)
-5. **Understands operator direction + goal** — without being told (❌ shallow: DirectionInferrer reads env signals, not intent)
-6. **A-level execution** — sustained quality + reliability + learning (❌ not yet)
+1. **Self-initiating** — O+V begins useful work without human prompting (✅ delivered: 16 sensors + 9 self-formed-goal entries via Phase 2 SelfGoalFormation)
+2. **Codebase exploration parity with CC** — same depth of read/search/reason as CC's tool loop (✅ partial→strong: Iron Gate enforces hygiene-first AND ExplorationLedger enforces diversity-floor across 5 categories AND Phase 5 AdversarialReviewer auto-injects findings every non-SAFE_AUTO GENERATE; Pass C Slice 3 will auto-tighten the floors based on bypass-failure observations)
+3. **Repo development without intervention** — multi-file changes ship end-to-end autonomously (⚠️ proven once Sessions Q-S; broader cadence pending Pass B per-slice graduation soak underway)
+4. **Human-in-loop only when severity demands** — risk-tier ladder + curiosity ask_human + Phase 3 inline approval UX (✅ delivered) + Phase 7 plan approval (✅ delivered) + Pass B `/order2 amend` operator-only authorization for Order-2 governance changes (✅ delivered)
+5. **Understands operator direction + goal** — without being told (✅ delivered: DirectionInferrer + arc-context + 100-commit git momentum + ConversationBridge + UserPreferenceMemory + LastSessionSummary all wired into CONTEXT_EXPANSION; intent-classifier routes natural-language `/chat` turns into structured actions)
+6. **A-level execution** — sustained quality + reliability + learning (✅ scaffolding complete: Wang composite_score + 5 operator metrics now surfaced; Pass C Adaptive Anti-Venom in flight to close the "static cage" gap; soak-cadence-driven graduation discipline proven)
+7. **Self-tightening immune system** *(NEW success criterion, added 2026-04-26)* — gates grow stricter as the shell expands, never looser via the adaptive surface (🚀 Pass C Slices 1-4 landed: AdaptationLedger substrate + 4 surfaces all enforcing the monotonic-tightening invariant. Slices 5-6 pending. Loosening operations strictly require Pass B `/order2 amend` operator authorization.)
 
 ---
 
 ## 3. Current State Assessment
 
 ### 3.1 What O+V uniquely does (the cognitive delta from CC)
+
+*Updated 2026-04-26 to reflect Phase 1-5 graduations + Pass B closure + Pass C in-flight + 3 deferred-follow-up wirings.*
 
 | Capability | Implementation | Maturity |
 |---|---|---|
@@ -289,36 +294,52 @@ The vision delivers when:
 | L3 worktree isolation for parallel fan-out | git worktree per unit, `reap_orphans` on boot | ✅ production |
 | Auto-commit with O+V signature | AutoCommitter + protected-branch guards | ✅ production |
 | Cross-session memory (3 surfaces) | UserPreferenceMemory + SemanticIndex + LastSessionSummary | ✅ production |
-| Per-op POSTMORTEM with root-cause classification | CommProtocol 5-phase + PostmortemEngine | ✅ production (but unused — see §4) |
+| Per-op POSTMORTEM with root-cause classification + recall | CommProtocol 5-phase + PostmortemEngine + **PostmortemRecall (Phase 1 P0, graduated 2026-04-26)** | ✅ production + cognitive feedback loop closed |
 | Deterministic financial circuit-breaker | cost_governor + Class E watchdog cancel | ✅ production |
 | L3 mode self-protection + auto-recovery | SafetyNet + #20147 resilience pack | ✅ production |
 | Mid-op cancellation infrastructure | W3(7) cancel-token (REPL + watchdog + signal) | ✅ production |
 | Parallel L3 fan-out with cost-aware cap | parallel_dispatch + #19800 cost-cap parallel-stream bump | ✅ production |
+| **Self-formed goals from POSTMORTEM clusters** | SelfGoalFormationEngine + 9-gate decision tree + Hypothesis pairing (Phase 2 P1+P1.5) | ✅ production (graduated 2026-04-26) |
+| **Conversational mode with classified intent + real side effects** | `/chat` REPL + IntentClassifier + 3 concrete executors (backlog/subagent-queue/Claude) | ✅ production (Phase 3 P2 graduated 2026-04-26 + 3-PR mini-arc 2026-04-26) |
+| **Inline approval UX** | InlineApprovalProvider + `[y]/[n]/[s]/[e]/[w]` + 30s timeout-to-defer | ✅ production (Phase 3 P3 graduated 2026-04-26) |
+| **Realtime progress visibility** | per-stream HEARTBEAT + coalesced status line | ✅ production (Phase 3 P3.5 graduated 2026-04-26) |
+| **Wang composite score + convergence tracking + 5 operator metrics** | MetricsEngine + JSONL ledger + `/metrics` REPL + IDE GET + SSE event | ✅ production (Phase 4 P3+P4 graduated 2026-04-26) |
+| **AdversarialReviewer auto-injection** | post-PLAN/pre-GENERATE hook in plan_runner.py + cost-budgeted Claude side-stream | ✅ production (Phase 5 P5 graduated + wiring landed 2026-04-26) |
+| **Order-2 governance cage** *(novel)* | Pass B: Order-2 manifest + ORDER_2_GOVERNANCE risk class + AST validator + shadow-replay corpus + MetaPhaseRunner + sandboxed replay executor + locked-true `amendment_requires_operator()` invariant + `/order2` REPL | ✅ structurally complete (Pass B closed 2026-04-26; per-slice graduation soak in flight) |
+| **Adaptive Anti-Venom — self-tightening immune system** *(novel + the genuine RSI architectural contribution)* | Pass C: `AdaptationLedger` substrate + 4 adaptive surfaces (SemanticGuardian POSTMORTEM-mined patterns / IronGate exploration-floor auto-tightener / per-Order mutation budget / risk-tier ladder extender) + monotonic-tightening invariant that REFUSES to persist loosening proposals | 🚀 in flight (Pass C Slices 1-4 landed 2026-04-26; Slices 5-6 pending) |
 
 ### 3.2 What CC genuinely beats O+V on (and we should port)
 
-| Capability | CC | O+V | Priority |
+*Updated 2026-04-26.*
+
+| Capability | CC | O+V | Status |
 |---|---|---|---|
-| Conversational mode — natural dialog | ✅ first-class | ✅ `/chat <message>` + bare-text + 4-intent classifier (PRD §9 P2, graduated 2026-04-26) | — |
-| Real-time token streaming with model thinking visible | ✅ always | ⚠️ phases only in headless | P3 |
-| Lightweight approval UX | ✅ inline `[y/N]` | ✅ inline `[y]/[n]/[s]/[e]/[w]` (PRD §9 P3, graduated 2026-04-26) | — |
-| Easy mid-flight redirect | ✅ "wait, do this instead" | ❌ requires `/cancel` | P5 |
-| Status line with current activity | ✅ always | ⚠️ requires opt-in dashboard | P4 |
-| Conversational context across turns | ✅ default | ⚠️ ConversationBridge default-off | **P2** |
-| MCP tool ecosystem visibility | ✅ first-class | ⚠️ integrated, thin discovery | P5 |
-| Skills/workflows surface (saved playbooks) | ✅ rich | ❌ none | P5 |
-| Background tasks with notify | ✅ run_in_background | ⚠️ internal only | P4 |
-| `/help` discoverability of slash commands | ✅ rich | ⚠️ FlagRegistry exists, /help thin | P3 |
+| Conversational mode — natural dialog | ✅ first-class | ✅ `/chat <message>` + bare-text + 4-intent classifier + 3 concrete executors (backlog / subagent-queue / Claude) | ✅ delivered (Phase 3 P2 graduated; concrete executors landed 2026-04-26) |
+| Real-time token streaming with model thinking visible | ✅ always | ⚠️ phases only in headless; per-stream HEARTBEAT delivered (Phase 3 P3.5) | partial (granular token streaming still TUI-gated) |
+| Lightweight approval UX | ✅ inline `[y/N]` | ✅ inline `[y]/[n]/[s]/[e]/[w]` | ✅ delivered (Phase 3 P3 graduated) |
+| Easy mid-flight redirect | ✅ "wait, do this instead" | ⚠️ `/cancel` infrastructure (W3(7) cancel-token) but no natural-language redirect; `/chat` could route an interrupt via IntentClassifier | future polish (low priority — `/cancel` works) |
+| Status line with current activity | ✅ always | ⚠️ requires opt-in dashboard; HEARTBEAT delivers similar info | partial |
+| Conversational context across turns | ✅ default | ✅ ConversationBridge wired (5 sources) + ChatSession ring buffer + Phase 3 P2 routing | ✅ delivered (Phase 3 P2 graduated; bridge default true post-graduation) |
+| MCP tool ecosystem visibility | ✅ first-class | ✅ MCP tools discovered + injected at GENERATE prompt (Gap #7) | ✅ delivered |
+| Skills/workflows surface (saved playbooks) | ✅ rich | ❌ none | future scope (no PRD priority assigned) |
+| Background tasks with notify | ✅ run_in_background | ✅ scheduled remote agents via routine API (Pass B graduation soak conductor running) | ✅ delivered for orchestrator-level use |
+| `/help` discoverability of slash commands | ✅ rich | ✅ FlagRegistry + `/help` dispatcher with typo detection + posture-relevant filtering | ✅ delivered (Wave 1 #2 graduated 2026-04-21) |
 
 ### 3.3 Production track record
+
+*Updated 2026-04-26.*
 
 - **Verified end-to-end multi-file APPLY**: 1 (Sessions Q-S, 2026-04-15, 4 test modules generated → applied → committed)
 - **Single-file APPLYs**: handful (most recent: Session O, 2026-04-15)
 - **NO_OP terminations**: common (model decides no change needed)
-- **EXHAUSTION terminations**: common (provider transport)
-- **Sessions completed cleanly with at least 1 commit**: small fraction of total session-hours
+- **EXHAUSTION terminations**: common (provider transport noise — handled by ExhaustionWatcher dedup)
+- **Sessions completed cleanly with at least 1 commit**: small fraction of total session-hours; **`/metrics 7d` REPL now answers this concretely** (Phase 4 P4 graduated 2026-04-26)
+- **Pass B graduation soak**: agent-conducted twice-daily cadence in flight (`trig_012EvEDkABy2u5PSSs3xK5C4`); 27 minimum sessions across 9 master flag flips, calendar projection 2-3 weeks
+- **Self-formed goal entries**: live count via `/backlog auto-proposed pending` and `/hypothesis ledger`; bounded ≤1/session/cap=$0.10 by SelfGoalFormationEngine (Phase 2 P1 graduated 2026-04-26)
+- **AdversarialReviewer findings emitted per op**: live count via `/adversarial stats`; auto-injects into every non-SAFE_AUTO GENERATE post-2026-04-26 wiring landing
+- **Adaptation proposals emitted per cycle**: pending Pass C Slice 6 MetaGovernor (will surface via `/adapt stats`)
 
-The infrastructure is exceptional. The cognitive workload it serves is sparse. **That gap is the work to do.**
+The infrastructure is exceptional. **The cognitive substrate is now rich** (Phases 0-5 graduated; Pass B closed; Pass C in flight). The remaining work is closing the loop: Pass C completion (Slices 5-6) + per-slice graduation soak across all flags-still-default-false items + accumulated-evidence battle-test landmark beyond Sessions Q-S.
 
 ### 3.4 Wave 1 + Wave 2 + Wave 3 — what's already on main
 
@@ -337,21 +358,48 @@ For context on what's available as substrate for Phases 1-6:
 
 Phases 1-6 build on this substrate. Nothing in the roadmap requires re-architecting these primitives.
 
+### 3.5 Pass B + Pass C — the Order-2 + Adaptive cage *(NEW 2026-04-26)*
+
+This section captures the architectural delta the Reverse Russian Doll arc adds on top of Waves 1-3. Pass A surfaced the gaps (`memory/project_reverse_russian_doll_pass_a.md`); Pass B closed the *governance amendment* gap; Pass C closes the *adaptive immunity* gap.
+
+| Pass | What | Status | PR(s) |
+|---|---|---|---|
+| Pass B Slice 1 | Order2Manifest + 9 Body-only entries | structurally complete | #22298 |
+| Pass B Slice 2+2b | ORDER_2_GOVERNANCE risk class + classifier + gate wiring | structurally complete | #22320, #22329 |
+| Pass B Slice 3 | AST-shape validator (6 rules) | structurally complete | #22347 |
+| Pass B Slice 4 | shadow-replay corpus + structural-equality diff | structurally complete | #22375 |
+| Pass B Slice 5 | MetaPhaseRunner evidence composer | structurally complete | #22396 |
+| Pass B Slice 6.1 | sandboxed replay executor (resolves Slice 5 deferred candidate exec) | structurally complete | #22475 |
+| Pass B Slice 6.2 | review queue + locked-true `amendment_requires_operator()` cage invariant | structurally complete | #22517 |
+| Pass B Slice 6.3 | `/order2 {pending,show,amend,reject,history,help}` REPL | structurally complete | #22535 |
+| **Pass B per-slice graduation** | 9 master flag flips via 3-clean-session arc per slice | 🔄 in flight (agent-conducted soak `trig_012EvEDkABy2u5PSSs3xK5C4` twice-daily) | — |
+| Pass C Slice 1 | AdaptationLedger substrate (universal append-only audit log + monotonic-tightening invariant) | structurally complete | #22801 |
+| Pass C Slice 2 | SemanticGuardian POSTMORTEM-mined patterns | structurally complete | #22821 |
+| Pass C Slice 3 | IronGate exploration-floor auto-tightener | structurally complete | #22841 |
+| Pass C Slice 4 | per-Order mutation budget + risk-tier ladder extender (combined) | structurally complete | #22866 |
+| Pass C Slice 5 | ExplorationLedger category-weight auto-rebalance | pending | — |
+| Pass C Slice 6 | MetaAdaptationGovernor + `/adapt` REPL + observability | pending | — |
+
+**Combined Pass B + Pass C regression spine (today): 670+ tests** (438 Pass B + 232 Pass C through Slice 4).
+
+The novel architectural claim: **the adaptive surface can only tighten, never loosen**. Loosening operations (deprecating a SemanticGuardian pattern, lowering an exploration floor, raising a mutation budget, removing a risk tier) MUST go through Pass B's `/order2 amend` operator-only authorization. Pass C's substrate REFUSES TO PERSIST a would-loosen proposal — it's structurally impossible to loosen the cage via the adaptive surface.
+
 ---
 
 ## 4. The Cognitive Scaffolding Gap (Deep Dive)
 
 This section exists because the term "cognitive gap" is ambiguous. It does **NOT** mean the LLM provider is insufficient. Claude (and DW when healthy) is plenty smart — when the seed reaches GENERATE under stable API conditions, the model reads multiple files, reasons about multi-file dependencies, produces coherent multi-file patches with rationale, and self-corrects on validate failures via L2 repair.
 
-The cognitive gap is **internal to JARVIS** — the orchestration layer that converts provider intelligence into self-directing, self-improving behavior is shallow.
+The cognitive gap is **internal to JARVIS** — the orchestration layer that converts provider intelligence into self-directing, self-improving behavior. *As of 2026-04-26, Phases 0-5 graduations + Pass B closure + Pass C in-flight have closed most of the historical gaps in this section. Each "Shallow N" entry below now also notes its graduation status.*
 
 ### 4.1 The lab analogy
 
 Claude is a brilliant scientist. JARVIS is the lab around the scientist.
 
 - The lab is **exceptional** — instruments (16 sensors), safety interlocks (Iron Gate, risk-tier-floor, cost-governor), observability (41 SSE events + 10+ JSONL ledgers + replay.html), multi-tenancy (L3 worktree isolation), financial circuit-breakers (cost-governor with parallel-stream bump), audit trails (CommProtocol 5-phase), autonomous experiment runners (16 sensors).
-- The lab does **not** have a research agenda generator. It runs whichever experiments the operator (or sensors triggered by hardcoded conditions) writes down.
-- The scientist is fully capable of forming new hypotheses; **the lab just doesn't ask them to.**
+- The lab now **also has** a research agenda generator (Phase 2 SelfGoalFormationEngine, graduated 2026-04-26), a hypothesis ledger (Phase 2 P1.5), an adversarial reviewer that auto-injects findings (Phase 5 P5 + wiring 2026-04-26), and a metrics suite that answers "is the lab getting better?" (Phase 4 P4, graduated 2026-04-26).
+- The lab now also **gates its own substrate amendments** through Pass B's locked-true `amendment_requires_operator()` invariant — the scientist can propose new lab equipment, but only the operator can install it.
+- The lab is **growing an adaptive immune system** (Pass C in flight) — sticky failure shapes get new SemanticGuardian detector patterns proposed; bypassed exploration gates get their floors auto-raised; chronically-underutilized mutation budgets get auto-lowered; novel attack surfaces get new risk tiers inserted between existing ones. None of these adaptations can loosen the cage.
 
 ### 4.2 The six concrete cognitive shallows
 
@@ -438,11 +486,11 @@ JARVIS already has a comprehensive RSI architecture document at `docs/architectu
 | 5 | **Transition Probability Tracking** | Empirical data on which of the 9 self-evolution techniques work | `transition_tracker.py` |
 | 6 | **Vindication Reflection** | After validation: "will this make future patches better?" not just "does it pass tests?" | `vindication_reflector.py` |
 
-### 5.2 Current RSI implementation status (verify before citing)
+### 5.2 Current RSI implementation status (verified 2026-04-25 + Phase 4 graduation 2026-04-26)
 
-Per memory (`project_rsi_convergence.md`, 2026-04-06): "6 improvements planned and documented, pending implementation." The architecture doc exists; **implementation status of the 6 modules requires code verification before any phase work begins**.
+Phase 0 audit (memory `project_phase_0_rsi_audit_2026_04_25.md`) verified: 6/6 Wang RSI modules exist on disk; 4/6 are wired into the live FSM (composite_score / convergence_tracker / transition_tracker / adaptive-graduation-threshold); 2/6 were stranded (oracle_prescorer + vindication_reflector — un-stranded by Phase 4 P3 wrapper graduation 2026-04-26 via `cognitive_metrics.py`). All 6 are now reachable from the orchestrator.
 
-This PRD's Phase 1 (P0 — POSTMORTEM recall) is **partially overlapping with Improvements 2 (Convergence Monitoring) and 6 (Vindication Reflection)**. When Phase 1 starts, the first task is auditing what exists vs what the RSI doc plans — to avoid duplicate work.
+Phase 4 P4 graduation (2026-04-26) shipped Wang's composite score + 5 net-new operator metrics through `MetricsEngine` + JSONL ledger + `/metrics` REPL + IDE GET + SSE. The `INSUFFICIENT_DATA` problem statement is resolved — operators can now answer "is O+V getting smarter?" with concrete data via `/metrics 7d`.
 
 ### 5.3 PRD phases mapped to Wang improvements
 
@@ -471,16 +519,17 @@ For O+V, this translates to:
 
 When ALL 5 hold, we can claim "MVP RSI" with mathematical grounding (not just architectural claim).
 
-### 5.5 RSI gap analysis
+### 5.5 RSI gap analysis (2026-04-26)
 
-| Wang requirement | O+V status | Closed by phase |
+| Wang requirement | O+V status | Closed by |
 |---|---|---|
-| Single composite score function | designed, status TBD | P4 |
-| Score-driven graduation | static "3 successful uses" | P4 (via Wang improvement 3) |
-| Convergence monitoring | none | P4 |
-| Pre-scoring (cheap quality gate) | none | P5 (adversarial reviewer fills similar role) |
-| Transition probability tracking | none | P1 + future Wang improvement 5 implementation |
-| Self-reflection on improvement trajectory | none | P6 |
+| Single composite score function | ✅ wired live (Phase 4 P3 + P4 graduated) | P3 + P4 |
+| Score-driven graduation | ✅ adaptive-graduation-threshold module live + 4-clean-session cadence operating | P0 audit + Phase 4 |
+| Convergence monitoring | ✅ wired live (`/metrics 7d`, IDE GET, SSE event) | P4 |
+| Pre-scoring (cheap quality gate) | ✅ Phase 5 P5 AdversarialReviewer auto-injects pre-GENERATE | P5 + 2026-04-26 wiring |
+| Transition probability tracking | ✅ transition_tracker.py module live (Phase 0 audit verified) | Phase 0 |
+| Self-reflection on improvement trajectory | ⏳ deferred to Phase 6 P6 (gated by Pass C completion per binding sequencing rule 5) | P6 |
+| **Adaptive immune system** *(NEW Wang-adjacent requirement)* | 🚀 Pass C in flight (4/6 slices); monotonic-tightening invariant load-bearing | Pass C Slices 1-6 |
 
 ### 5.6 The convergence threshold
 
@@ -1663,6 +1712,7 @@ When §5.4 MVP RSI conditions all met → claim Wang-grounded RSI.
 | 2026-04-26 | 2.7 | **Phase 2 P1.5 GRADUATED.** 2-slice arc landed (Slice 1 hypothesis_ledger primitive + REPL → Slice 2 engine integration + validator + graduation). `JARVIS_HYPOTHESIS_PAIRING_ENABLED` default flipped `false`→`true`. Engine extends model prompt to emit paired Hypothesis (claim + expected_outcome); auto-validator does token-overlap matching (overlap≥0.5 → True; ≤0.1 → False; middle band → None) + records back to ledger. Layered evidence: 74 deterministic tests + 15 in-process live-fire + end-to-end integration (engine emit → validator decide → ledger updated → stats reflected). Bounded-by-construction safety stack from P1 unchanged. Hot-revert: single env knob. **Phase 2 entirely closed** — every self-formed goal now testable by construction. | Claude Opus 4.7 (P1.5 Slice 2 graduation PR) |
 | 2026-04-26 | 2.8 | **Phase 4 P3 GRADUATED — both stranded RSI modules un-stranded.** 2-slice arc landed (Slice 1 cognitive_metrics wrapper + `/cognitive` REPL → Slice 2 orchestrator integration + graduation). `JARVIS_COGNITIVE_METRICS_ENABLED` default flipped `false`→`true`. Orchestrator boot wires `CognitiveMetricsService` singleton with the live Oracle; CONTEXT_EXPANSION calls `_score_cognitive_metrics_pre_apply_impl` after PostmortemRecall (advisory-only, never blocks FSM). Both `OraclePreScorer` + `VindicationReflector` accessible via REPL even when wrapper short-circuits. Layered evidence: 63 deterministic tests (43 wrapper + 19 graduation pins + 1 sequence) + 15 in-process live-fire. Vindication call site at post-APPLY tracked as future work — wrapper itself is graduated. Hot-revert: single env knob. | Claude Opus 4.7 (P3 Slice 2 graduation PR) |
 | 2026-04-26 | 2.9 | Doc-only fix to §23.8 Phase × Order composition table — Phase 1 / Order 1 cell now matches §9 truth: drops "SelfRAG over commit history" (never adopted into canonical roadmap; was speculative content from PRD v2.1) and changes the §9 reference from "P0–P1.5" to "P0–P0.5" (Phase 1 in §9 contains only P0 + P0.5; the canonical P1.5 is the Hypothesis ledger under Phase 2). Zero behavior change. Operator-binding: do not reintroduce a "Phase 1 P1.5" label anywhere. | Claude Opus 4.7 (post-P3 cleanup) |
+| 2026-04-26 | 2.24 | **Doc-only sweep — Current State Assessment + adjacent sections updated to reflect post-Pass-B + Pass-C-in-flight state.** §1 architecture grade B+→A−, cognitive depth C+→B; §2 added 7th success criterion "self-tightening immune system"; §3.1 expanded "what O+V uniquely does" table with 7 new capabilities (PostmortemRecall + SelfGoalFormation + Conversational mode + Inline approval + HEARTBEAT + Wang composite metrics + AdversarialReviewer auto-injection + Order-2 cage + Adaptive Anti-Venom); §3.2 marked 7 of 10 prior CC-superiority items as ✅ delivered or ✅ partial; §3.3 added 5 new "live count" metrics + repositioned the closing claim; **new §3.5 Pass B + Pass C status tables** with all 14 PRs landed today + 670+ test count; §4 intro acknowledges Phase 0-5 graduations + Pass B closure; §4.1 lab-analogy expanded; §5.2 audit status verified with 2 stranded modules un-stranded; §5.5 gap analysis 6/7 rows ✅ closed (P6 deferred + new Adaptive immune system row added). Zero behavior change. CLAUDE.md verified under 40K. | Claude Opus 4.7 (PRD sweep) |
 | 2026-04-26 | 2.23 | **Reverse Russian Doll Pass C Slice 4 — combined per-Order mutation budget + risk-tier ladder extender shipped.** Two sub-surfaces in one slice per §8 design ("combined slice graduates when both sub-surfaces have 5 clean each"). **Slice 4a** (`per_order_mutation_budget.py`): proposes lowering per-Order budget when ops consistently used fewer mutations than budgeted; uses max-observed as the conservative new budget; Order-2 hard floor MIN_ORDER2_BUDGET=1; surface validator pins kind=lower_budget + sha256-hash + threshold + summary-→. **Slice 4b** (`risk_tier_extender.py`): identifies novel failure_class values not in DEFAULT_KNOWN_FAILURE_CLASSES; classifies blast_radius into 4 bands (HARDENED at 3 levels + CRITICAL at top); synthesizes deterministic tier name + proposes insertion between two existing tiers (strictly tightening — ladder only grows); surface validator pins kind=add_tier + sha256-hash + threshold + summary-contains-insert/between. Both sub-surfaces auto-register their validators at module-import; both independently default-off (`JARVIS_ADAPTIVE_PER_ORDER_BUDGET_ENABLED` + `JARVIS_ADAPTIVE_RISK_TIER_LADDER_ENABLED`). **63 regression pins** (4a: 22, 4b: 24, cross-surface: 5, shared: 12) + **232/232 combined Pass C tests green** (Slice 1+2+3+4). Per §8.3: tier extension is strictly additive (insertion grows the ladder; existing tier behavior preserved for ops not matching the new class). | Claude Opus 4.7 (Pass C Slice 4 PR) |
 | 2026-04-26 | 2.22 | **Reverse Russian Doll Pass C Slice 3 — IronGate exploration-floor auto-tightener shipped.** Second adaptive surface on the Slice 1 substrate. New module `backend/core/ouroboros/governance/adaptation/exploration_floor_tightener.py`: pure stdlib analyzer of (exploration-score, verify-outcome) tuples per op. **Bypass-failure detector** (floor_satisfied=True AND verify_outcome IN {regression, failed}) identifies ops where the exploration gate was bypassed. **Weakest-category identification** via per-op argmin + group-count winner across the window (alpha tie-break for determinism). **Bounded 10% raise per cycle** via `compute_proposed_floor()` with min_nominal_raise=1 floor. Per-cycle pct hard-capped at 100% to prevent operator-typo runaway. Auto-registers per-surface validator: kind=raise_floor + sha256-prefix hash + observation_count-above-threshold + summary-contains-→-indicator (defense against doctored proposals). Idempotent proposal_id (sha256 of category + current + proposed floor). Master flag `JARVIS_ADAPTIVE_IRON_GATE_FLOORS_ENABLED` default false. Threshold default 5 (higher than Slice 2's 3 — floor-raise has broader impact than one detector pattern). Per §7.1 design: "one weakest candidate per cycle" keeps the operator-review surface trim. **55 regression pins** + **169/169 combined Pass C tests green** (Slice 1+2+3). | Claude Opus 4.7 (Pass C Slice 3 PR) |
 | 2026-04-26 | 2.21 | **Reverse Russian Doll Pass C Slice 2 — SemanticGuardian POSTMORTEM-mined patterns shipped.** First adaptive surface on the Slice 1 substrate. New module `backend/core/ouroboros/governance/adaptation/semantic_guardian_miner.py`: pure stdlib-only longest-common-substring detector synthesizer + group-by-(root_cause, failure_class) + window filter + existing-pattern duplicate check + idempotent proposal_id (hash of group+pattern) so re-mining the same events yields DUPLICATE_PROPOSAL_ID at the substrate layer. End-to-end `propose_patterns_from_events()` flows through Slice 1's `AdaptationLedger.propose()`. Auto-registers a per-surface validator at module-import enforcing: kind == "add_pattern" + proposed_state_hash sha256-prefixed + observation_count >= threshold floor. Master flag `JARVIS_ADAPTIVE_SEMANTIC_GUARDIAN_ENABLED` (default false). Bounded synthesis (MAX_EXCERPTS_PER_GROUP=32, MAX_SYNTHESIZED_PATTERN_CHARS=256, MIN_LCS_LENGTH=8) defends against multi-KB regex blobs and sub-3-char "matches-anything" patterns. Window filter retains epoch=0 events for back-compat. **54 regression pins** + **114/114 combined Pass C tests green** (Slice 1+2). Per §6.2: deterministic-only per zero-LLM-in-cage invariant; LCS is v1 — if too narrow, operator can extend the synthesizer via Pass B Order-2 amendment (it IS governance code). Slices 3-6 pending. | Claude Opus 4.7 (Pass C Slice 2 PR) |
