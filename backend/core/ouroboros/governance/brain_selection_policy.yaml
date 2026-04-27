@@ -340,29 +340,90 @@ gates:
 # callers (semantic_triage, ouroboros_plan) until DoubleWord repairs
 # their SSE generation endpoint.
 doubleword_topology:
-  schema_version: "topology.1"
+  # Bumped to topology.2 (PRD §3.7 + §9 Phase 10 P10.2, 2026-04-27).
+  # v2 adds per-route `dw_models:` ranked lists + `fallback_tolerance:`
+  # so the AsyncTopologySentinel can walk multiple DW model candidates
+  # before any Claude cascade. v1 keys (`dw_allowed`, `block_mode`)
+  # remain authoritative when JARVIS_TOPOLOGY_SENTINEL_ENABLED is off
+  # (current default). Slice 3 wires `candidate_generator` to consult
+  # the sentinel under that flag; Slice 5 (THE PURGE) deletes the v1
+  # keys after 3 forced-clean once-proofs prove the dynamic path
+  # produces correct routing decisions.
+  schema_version: "topology.2"
   enabled: true
   routes:
     immediate:
       dw_allowed: false
       block_mode: "cascade_to_claude"
       reason: "Prefrontal cortex — Claude only. 120s DW RT budget is insufficient for fast-reflex ops with Venom tool loops."
+      # v2 — IMMEDIATE intentionally has NO dw_models. Manifesto §5
+      # ("survival and execution speed permanently supersede cost
+      # optimization") makes this a Claude-direct route by design,
+      # NOT a degradation seal. Preserved across the purge.
+      dw_models: []
+      fallback_tolerance: "cascade_to_claude"
     complex:
       dw_allowed: false
       block_mode: "cascade_to_claude"
       reason: "Prefrontal cortex — Claude only. Live-fire bbpst3ebf proved DW (both 397B and Gemma 4 31B) times out on architectural COMPLEX GENERATE within 120s Tier 0 RT."
+      # v2 — ranked DW model list per PRD §3.7.3. The sentinel walks
+      # this list trying each healthy model before cascading to Claude.
+      # All three primary picks are different model families than the
+      # 397B that originally stream-stalled — different runtimes,
+      # different streaming pipelines.
+      dw_models:
+        - "moonshotai/Kimi-K2.6"           # Primary — "long-horizon coding, agents, swarm" — exact match for autonomous multi-file
+        - "zai-org/GLM-5.1-FP8"            # Secondary — leads SWE-Bench Pro, "agentic engineering, repo gen, terminal"
+        - "Qwen/Qwen3.6-35B-A3B-FP8"       # Budget tertiary — newer family than 397B
+        - "Qwen/Qwen3.5-397B-A17B"         # Legacy primary — demoted to last DW attempt
+      fallback_tolerance: "cascade_to_claude"
     standard:
       dw_allowed: false
       block_mode: "cascade_to_claude"
       reason: "Qwen 397B verified stream-stalling without candidate generation in bt-2026-04-14-203740. DW Tier 0 sealed to prevent latency debt."
+      # v2 — same ranked list as COMPLEX (per PRD §3.7.3).
+      dw_models:
+        - "moonshotai/Kimi-K2.6"
+        - "zai-org/GLM-5.1-FP8"
+        - "Qwen/Qwen3.6-35B-A3B-FP8"
+        - "Qwen/Qwen3.5-397B-A17B"
+      fallback_tolerance: "cascade_to_claude"
     background:
       dw_allowed: false
       block_mode: "skip_and_queue"
       reason: "Gemma 4 31B stream-stalls on DW endpoint even at <2K tokens. Background generation paused to preserve Claude compute runway."
+      # v2 — BG is cost-sensitive; cheap-first ranking. Kimi-K2.6 is
+      # second because long-horizon BG ops (e.g. doc staleness drafts)
+      # benefit from its agentic surface when 35B is unhealthy.
+      # `fallback_tolerance: "queue"` preserves the project_bg_spec_
+      # sealed.md contract — BG ops NEVER cascade to Claude on full
+      # DW failure; they queue and the sensor re-detects.
+      dw_models:
+        - "Qwen/Qwen3.6-35B-A3B-FP8"
+        - "moonshotai/Kimi-K2.6"
+      fallback_tolerance: "queue"
     speculative:
       dw_allowed: false
       block_mode: "skip_and_queue"
       reason: "Gemma 4 31B stream-stalls on DW endpoint even at <2K tokens. Background generation paused to preserve Claude compute runway."
+      # v2 — SPECULATIVE is fire-and-forget pre-computation; ultra-cheap
+      # picks only. Qwen3.5-4B at $0.04/$0.06 per M is the cheapest
+      # usable model in the catalog. Same `queue` fallback contract.
+      dw_models:
+        - "Qwen/Qwen3.5-9B"
+        - "Qwen/Qwen3.5-4B"
+      fallback_tolerance: "queue"
+  monitor:
+    # AsyncTopologySentinel tunables — yaml-driven so operators can
+    # adjust without code changes. When this block is absent, the
+    # sentinel falls back to its env-knob defaults (whose names match
+    # these keys, prefixed with `JARVIS_TOPOLOGY_`).
+    probe_interval_healthy_s: 30.0       # Background probe cadence when CLOSED
+    probe_backoff_base_s: 10.0           # Exponential backoff base (with full jitter)
+    probe_backoff_cap_s: 300.0           # Cap on probe interval when consecutively SEVERED
+    severed_threshold_weighted: 3.0      # Single LIVE_STREAM_STALL (weight 3.0) trips alone
+    heavy_probe_ratio: 0.2               # 1-in-5 probes are heavy (500-token VRAM stress)
+    ramp_schedule_csv: "0:1.0,10:2.0,30:4.0,60:8.0,120:16.0"  # Slow-start BG drainage
   callers:
     semantic_triage:
       dw_model: "google/gemma-4-31B-it"

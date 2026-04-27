@@ -228,20 +228,31 @@ class DoublewordProvider:
         self._mcp_client: Optional[Any] = None  # Injected by GLS for MCP tool forwarding (Gap #7)
 
     def _resolve_effective_model(self, ctx: Any) -> str:
-        """Resolve the DW model for this call from the Brain Selection Topology.
+        """Resolve the DW model for this call.
 
-        The topology (``brain_selection_policy.yaml`` →
-        ``doubleword_topology``) maps each :class:`ProviderRoute` to a
-        specific DW model. When enabled, STANDARD routes to 397B while
-        BACKGROUND / SPECULATIVE route to Gemma 4 31B. IMMEDIATE and
-        COMPLEX are hard-blocked by ``candidate_generator`` before this
-        method is ever called, so any hit here means the route allows
-        DW by design.
+        Resolution order (first match wins):
+
+          1. ``ctx._dw_model_override`` — per-attempt override stamped by
+             the AsyncTopologySentinel-driven dispatch in
+             ``candidate_generator`` (Phase 10 P10.3). When the sentinel
+             is walking a route's ranked ``dw_models`` list, each
+             attempt stamps the chosen model_id on the context so this
+             method picks it up without a global mutation.
+          2. ``topology.model_for_route(route)`` — v1 single-model
+             per-route mapping. Honored when no per-attempt override
+             is set (legacy path; default behavior when sentinel is
+             disabled).
+          3. ``self._model`` — instance default (env-configured).
 
         Falls back to ``self._model`` when the topology is disabled,
         the route is unmapped, or the ctx lacks a ``provider_route``
         attribute — identical to the pre-topology behavior.
         """
+        # (1) Per-attempt override from sentinel-driven dispatch.
+        attempt_override = getattr(ctx, "_dw_model_override", None)
+        if isinstance(attempt_override, str) and attempt_override:
+            return attempt_override
+        # (2) v1 route → model mapping.
         route = getattr(ctx, "provider_route", "") or ""
         if not route:
             return self._model

@@ -92,8 +92,20 @@ def should_circuit_break(
     """Return ``(circuit_break, reason)`` for the given route +
     read-only state.
 
-    Logic (matches ``candidate_generator.py:1404-1465`` exactly,
-    minus the actual generation):
+    **Phase 10 P10.3 update (2026-04-27)**: when
+    ``JARVIS_TOPOLOGY_SENTINEL_ENABLED=true``, the breaker also
+    consults the AsyncTopologySentinel — if **every** model in the
+    route's ranked ``dw_models`` list has its breaker OPEN AND the
+    route's ``fallback_tolerance`` is ``"queue"``, fire the breaker
+    even if the static yaml ``block_mode`` would have allowed a
+    cascade. This closes the dynamic-evidence loop: when the
+    sentinel has live empirical evidence that all DW models are
+    SEVERED, BG/SPEC ops queue (preserving unit economics) instead
+    of cascading.
+
+    When the sentinel master flag is OFF (default), behavior is
+    byte-identical to pre-Slice-3 — same logic as the old
+    ``candidate_generator.py:1404-1465`` path:
 
       1. If topology disabled → ``(False, "topology_disabled")``.
       2. If route not in topology map → ``(False, "route_unmapped")``.
@@ -128,6 +140,47 @@ def should_circuit_break(
 
     if not topology.enabled:
         return (False, "topology_disabled")
+
+    # Phase 10 P10.3 — sentinel-driven verdict (when master flag on).
+    # Consulted AHEAD of the legacy yaml-only path because the
+    # sentinel carries live empirical state; the yaml is operator
+    # intent. When both agree the verdict is the same; when they
+    # disagree, live evidence wins.
+    try:
+        from backend.core.ouroboros.governance.topology_sentinel import (
+            is_sentinel_enabled,
+            get_default_sentinel,
+        )
+        if is_sentinel_enabled():
+            sentinel = get_default_sentinel()
+            ranked = topology.dw_models_for_route(route_norm)
+            tolerance = topology.fallback_tolerance_for_route(route_norm)
+            if ranked:
+                # Every model OPEN → fire breaker iff fallback is queue.
+                all_open = all(
+                    sentinel.get_state(m) == "OPEN" for m in ranked
+                )
+                if all_open and tolerance == "queue":
+                    return (
+                        True,
+                        f"sentinel_all_severed:{','.join(ranked[:3])}"[
+                            :120
+                        ],
+                    )
+                if all_open and tolerance == "cascade_to_claude":
+                    # Sentinel says SEVERED everywhere but cascade is
+                    # the contract — let the caller's late-detection
+                    # path cascade. Don't fire here.
+                    return (False, "sentinel_severed_cascade_to_claude")
+                # At least one model not OPEN — let the dispatch try.
+                return (False, "sentinel_dw_available")
+    except Exception as exc:  # noqa: BLE001
+        # Sentinel-side failure must not block the legacy verdict.
+        logger.debug(
+            "[CircuitBreaker] sentinel consultation raised "
+            "(%s) — falling back to legacy yaml verdict",
+            type(exc).__name__,
+        )
 
     try:
         dw_allowed = topology.dw_allowed_for_route(route_norm)
