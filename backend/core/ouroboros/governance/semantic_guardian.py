@@ -895,6 +895,56 @@ _PATTERNS: dict = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Phase 7.1 — adapted-pattern boot-time merge
+# ---------------------------------------------------------------------------
+#
+# Per OUROBOROS_VENOM_PRD.md §3.6 + §9 Phase 7.1, this is the activation
+# wiring that converts Pass C Slice 2 (SemanticGuardian POSTMORTEM-mined
+# patterns) from substrate-only to functional. When the
+# JARVIS_SEMANTIC_GUARDIAN_LOAD_ADAPTED_PATTERNS env flag is on AND the
+# YAML at .jarvis/adapted_guardian_patterns.yaml exists, the loader
+# bridges Pass C's operator-approved adaptation proposals into the live
+# detector registry.
+#
+# Cage discipline (load-bearing):
+#   * Adapted patterns are ADDITIVE only — name collisions with hand-
+#     written patterns cause the adapted entry to be SKIPPED (Pass C §6.3).
+#   * Default off — when the env flag is unset OR the YAML is missing,
+#     SemanticGuardian behaves identically to pre-Phase-7.1.
+#   * Fail-open — every error path in the loader returns an empty dict
+#     and SemanticGuardian behaves identically. The boot-time merge can
+#     never crash the orchestrator.
+try:
+    from backend.core.ouroboros.governance.adaptation.adapted_guardian_loader import (  # noqa: E501
+        is_loader_enabled as _adapted_loader_enabled,
+        load_adapted_patterns as _load_adapted_patterns,
+    )
+    if _adapted_loader_enabled():
+        _adapted = _load_adapted_patterns(
+            hand_written_names=tuple(_PATTERNS.keys()),
+        )
+        for _name, _detector in _adapted.items():
+            # Adapted patterns are additive; the loader already filtered
+            # name collisions with hand-written entries. Defensive
+            # double-check: never overwrite an existing _PATTERNS key.
+            if _name not in _PATTERNS:
+                _PATTERNS[_name] = _detector
+        if _adapted:
+            _ALL_PATTERNS = tuple(_ALL_PATTERNS) + tuple(  # type: ignore[assignment]
+                n for n in _adapted.keys() if n in _PATTERNS
+            )
+            logger.info(
+                "[SemanticGuardian] merged %d adapted patterns from "
+                "Pass C YAML (Phase 7.1 wiring)", len(_adapted),
+            )
+except Exception:  # noqa: BLE001 — fail-open boot-time hook
+    logger.debug(
+        "[SemanticGuardian] adapted-pattern loader skipped (Phase 7.1)",
+        exc_info=True,
+    )
+
+
 def all_pattern_names() -> Tuple[str, ...]:
     return _ALL_PATTERNS
 
