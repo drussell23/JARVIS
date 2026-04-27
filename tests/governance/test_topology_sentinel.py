@@ -51,9 +51,9 @@ def test_top_level_imports_stdlib_only() -> None:
     importing the sentinel doesn't boot the orchestrator."""
     module = _module_ast()
     allowed = {
-        "asyncio", "enum", "json", "logging", "os", "random",
-        "tempfile", "threading", "time", "dataclasses", "pathlib",
-        "typing", "__future__",
+        "asyncio", "contextvars", "enum", "json", "logging", "os",
+        "random", "tempfile", "threading", "time", "dataclasses",
+        "pathlib", "typing", "__future__",
     }
     for node in module.body:
         if isinstance(node, ast.Import):

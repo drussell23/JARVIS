@@ -232,12 +232,19 @@ class DoublewordProvider:
 
         Resolution order (first match wins):
 
-          1. ``ctx._dw_model_override`` — per-attempt override stamped by
-             the AsyncTopologySentinel-driven dispatch in
-             ``candidate_generator`` (Phase 10 P10.3). When the sentinel
-             is walking a route's ranked ``dw_models`` list, each
-             attempt stamps the chosen model_id on the context so this
-             method picks it up without a global mutation.
+          1. ``topology_sentinel.DW_MODEL_OVERRIDE_VAR`` — per-attempt
+             override set by the AsyncTopologySentinel-driven dispatch
+             in ``candidate_generator`` (Phase 10 P10.3+P10.3.6).
+             When the sentinel is walking a route's ranked
+             ``dw_models`` list, each attempt sets this ContextVar
+             via ``set_dw_model_override(model_id)``; this method
+             reads it via ``get_dw_model_override()``. ContextVar is
+             async-safe per asyncio task, so concurrent ops can each
+             have their own value without leaking. Replaces the
+             Slice 3 ``setattr(ctx, "_dw_model_override", ...)``
+             pattern, which raised ``FrozenInstanceError`` on the
+             frozen ``OperationContext`` dataclass and silently
+             defeated the dispatcher.
           2. ``topology.model_for_route(route)`` — v1 single-model
              per-route mapping. Honored when no per-attempt override
              is set (legacy path; default behavior when sentinel is
@@ -247,11 +254,22 @@ class DoublewordProvider:
         Falls back to ``self._model`` when the topology is disabled,
         the route is unmapped, or the ctx lacks a ``provider_route``
         attribute — identical to the pre-topology behavior.
+
+        NEVER raises — every layer is defensive.
         """
-        # (1) Per-attempt override from sentinel-driven dispatch.
-        attempt_override = getattr(ctx, "_dw_model_override", None)
-        if isinstance(attempt_override, str) and attempt_override:
-            return attempt_override
+        # (1) Per-attempt override from sentinel-driven dispatch via
+        # ContextVar (async-safe; survives the frozen-ctx contract).
+        try:
+            from backend.core.ouroboros.governance.topology_sentinel import (
+                get_dw_model_override,
+            )
+            attempt_override = get_dw_model_override()
+            if isinstance(attempt_override, str) and attempt_override:
+                return attempt_override
+        except Exception:  # noqa: BLE001 — defensive
+            # Sentinel module not importable (test environment, branch
+            # without Slice 1) → silently fall through to legacy.
+            pass
         # (2) v1 route → model mapping.
         route = getattr(ctx, "provider_route", "") or ""
         if not route:
