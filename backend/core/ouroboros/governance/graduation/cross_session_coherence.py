@@ -302,9 +302,13 @@ def _check_user_preference_carryover(
         )
     # Step 1: seed during session N.
     try:
-        store_n = UserPreferenceStore(root=store_root)
-        ok = store_n.add(
-            kind=MemoryType.USER,
+        store_n = UserPreferenceStore(
+            project_root=store_root,
+            auto_register_protected_paths=False,
+            auto_register_protected_apps=False,
+        )
+        memory = store_n.add(
+            memory_type=MemoryType.USER,
             name=marker_name,
             description=(
                 "Cross-session coherence harness marker "
@@ -312,11 +316,11 @@ def _check_user_preference_carryover(
             ),
             content="signal-carryover-marker",
         )
-        if not ok:
+        if memory is None:
             return PrimitiveResult(
                 primitive_name="user_preference_memory",
                 status=PrimitiveStatus.HARNESS_ERROR,
-                detail="store_n.add returned False",
+                detail="store_n.add returned None",
             )
     except Exception as exc:  # noqa: BLE001
         return PrimitiveResult(
@@ -326,7 +330,11 @@ def _check_user_preference_carryover(
         )
     # Step 2: simulate restart (new instance, same root).
     try:
-        store_n_plus_1 = UserPreferenceStore(root=store_root)
+        store_n_plus_1 = UserPreferenceStore(
+            project_root=store_root,
+            auto_register_protected_paths=False,
+            auto_register_protected_apps=False,
+        )
         memories = store_n_plus_1.list_all()
     except Exception as exc:  # noqa: BLE001
         return PrimitiveResult(
