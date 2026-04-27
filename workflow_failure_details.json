@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24973220019",
-  "branch": "chore/prd-brutal-review-and-phase-7-8-roadmap",
-  "commit_sha": "f32a295",
-  "run_number": 43984,
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24974247106",
+  "branch": "fix/ci/pr-automation-validation-run43984-20260427-025009",
+  "commit_sha": "1ecbced",
+  "run_number": 44125,
   "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run43984-20260427-025009",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #43984)",
+  "fix_branch": "fix/ci/pr-automation-validation-run44125-20260427-033921",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #44125)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,14 +14,14 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 23,
-              "content": "2026-04-27T02:14:01.9994158Z   subjectPatternError: The PR title must start with a capital letter.",
+              "line_number": 30,
+              "content": "2026-04-27T02:59:50.0995701Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 35,
-              "content": "2026-04-27T02:14:02.6019117Z ##[error]The PR title must start with a capital letter.",
+              "line_number": 42,
+              "content": "2026-04-27T02:59:50.7441456Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #43984)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -32,8 +32,8 @@
           "pattern": "WARN|Warning|warning",
           "matches": [
             {
-              "line_number": 44,
-              "content": "2026-04-27T02:14:02.6516756Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "line_number": 58,
+              "content": "2026-04-27T02:59:50.7894168Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -44,19 +44,13 @@
           "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 27,
-              "content": "- fix: Resolve database connection timeout",
-              "severity": "medium",
-              "emoji": "\u23f1\ufe0f"
-            },
-            {
-              "line_number": 39,
+              "line_number": 34,
               "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
               "emoji": "\u23f1\ufe0f"
             }
           ],
-          "count": 2
+          "count": 1
         }
       ],
       "suggested_fixes": [
@@ -68,5 +62,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-04-27T02:50:09.961640"
+  "timestamp": "2026-04-27T03:39:21.616806"
 }
