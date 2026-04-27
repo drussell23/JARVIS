@@ -248,7 +248,14 @@ class ASTChunker:
         target_names: Optional[Set[str]] = None,
         include_all: bool = False,
     ) -> List[CodeChunk]:
-        """Extract code chunks from a Python file.
+        """Async — read the file, then extract chunks.
+
+        Thin wrapper over :meth:`extract_chunks_from_source`. Used by
+        ``SmartContextSelector``'s prompt-builder pipeline. Sync
+        consumers (the Slice 11.2 ``read_file(target_symbol=...)``
+        tool handler) call ``extract_chunks_from_source`` directly to
+        avoid having to re-enter an event loop from inside a
+        synchronous Venom tool handler.
 
         Args:
           file_path: Path to Python file
@@ -259,6 +266,40 @@ class ASTChunker:
         Returns:
           List of ``CodeChunk`` objects. Empty list on parse failure.
         """
+        try:
+            source = await self._read_file(file_path)
+        except OSError as exc:
+            logger.warning(
+                "[ASTChunker] Cannot read %s: %s", file_path, exc,
+            )
+            return []
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.warning(
+                "[ASTChunker] Async read failed for %s: %s",
+                file_path, exc,
+            )
+            return []
+        return self.extract_chunks_from_source(
+            source, file_path, target_names, include_all,
+        )
+
+    def extract_chunks_from_source(
+        self,
+        source: str,
+        file_path: Path,
+        target_names: Optional[Set[str]] = None,
+        include_all: bool = False,
+    ) -> List[CodeChunk]:
+        """Sync — extract chunks from already-read source.
+
+        Slice 11.2 entry point for the ``read_file(target_symbol=...)``
+        tool handler, which reads the file synchronously and then
+        slices. Sharing this body with :meth:`extract_chunks` is the
+        whole point of Slice 11.1's extraction — both async and sync
+        consumers exercise identical chunk-extraction logic.
+
+        NEVER raises — ``SyntaxError`` and other parse failures
+        return ``[]``."""
         # Check cache
         cache_key = (
             f"{file_path}:{hash(frozenset(target_names or []))}"
@@ -268,7 +309,6 @@ class ASTChunker:
             return self._chunk_cache[cache_key]
 
         try:
-            source = await self._read_file(file_path)
             tree = ast.parse(source, filename=str(file_path))
         except SyntaxError as e:
             logger.warning(

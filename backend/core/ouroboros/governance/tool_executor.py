@@ -92,6 +92,34 @@ class ToolResult:
 
 
 # ---------------------------------------------------------------------------
+# Slice 11.2 — read_file(target_symbol=...) AST slicing helpers.
+# ---------------------------------------------------------------------------
+
+
+def _ast_slice_enabled() -> bool:
+    """``JARVIS_TOOL_AST_SLICE_ENABLED`` (default ``false``).
+
+    When off, ``read_file(target_symbol=...)`` ignores the
+    target_symbol argument and falls through to legacy full-file
+    behavior — byte-identical pre/post-Slice-11.2."""
+    raw = os.environ.get(
+        "JARVIS_TOOL_AST_SLICE_ENABLED", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+class _NoOpTokenCounter:
+    """Sync stub satisfying ``ast_slicer.TokenCounterProtocol``. The
+    Slice 11.2 read_file path doesn't need accurate token counts
+    (we measure char-savings instead), so we avoid spinning up
+    smart_context.TokenCounter (which has tiktoken bootstrap cost +
+    cache state we don't want polluted by tool-loop reads)."""
+
+    def count(self, text: str) -> int:
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # L1 Tool-Use: Typed Contracts
 # ---------------------------------------------------------------------------
 
@@ -489,12 +517,20 @@ def _validate_python_syntax(rel_path: str, content: str) -> Optional[str]:
 
 _L1_MANIFESTS: Dict[str, ToolManifest] = {
     "read_file": ToolManifest(
-        name="read_file", version="1.1",
-        description="Read a file within the repository (full content by default)",
+        name="read_file", version="1.2",
+        description=(
+            "Read a file within the repository. By default returns full "
+            "content; pass target_symbol to extract only a specific "
+            "function/class/method via AST (Phase 11 P11.2; gated by "
+            "JARVIS_TOOL_AST_SLICE_ENABLED)."
+        ),
         arg_schema={
-            "path":       {"type": "string"},
-            "lines_from": {"type": "integer", "default": 1},
-            "lines_to":   {"type": "integer", "default": 2000},
+            "path":           {"type": "string"},
+            "lines_from":     {"type": "integer", "default": 1},
+            "lines_to":       {"type": "integer", "default": 2000},
+            # Slice 11.2 additions — surgical AST extraction.
+            "target_symbol":  {"type": "string", "default": ""},
+            "include_imports": {"type": "boolean", "default": True},
         },
         capabilities=frozenset({"read"}),
     ),
@@ -1062,6 +1098,9 @@ class ToolExecutor:
         path_str: str = args["path"]
         lines_from: int = max(1, int(args.get("lines_from", 1)))
         lines_to: int = int(args.get("lines_to", 2000))  # CC-parity: was 200
+        # Slice 11.2 additions — surgical AST extraction
+        target_symbol: str = (args.get("target_symbol") or "").strip()
+        include_imports: bool = bool(args.get("include_imports", True))
 
         resolved = self._safe_resolve(path_str)
 
@@ -1093,11 +1132,158 @@ class ToolExecutor:
             pass
         self._files_read.add(path_str.replace("\\", "/"))
 
+        # Slice 11.2 — surgical AST extraction path. Gated by master
+        # flag so master-flag-off behavior is byte-identical legacy.
+        if target_symbol and _ast_slice_enabled():
+            sliced = self._read_file_sliced(
+                resolved, path_str, target_symbol,
+                full_text=text, include_imports=include_imports,
+            )
+            if sliced is not None:
+                return sliced
+            # Fallback path took care of metrics ledger; continue to
+            # full-file return below.
+
         all_lines = text.splitlines(keepends=True)
         total = len(all_lines)
         selected = all_lines[lines_from - 1 : lines_to]
         header = f"# {path_str}  (lines {lines_from}-{min(lines_to, total)} of {total})\n"
         return header + "".join(f"{lines_from + i}: {line}" for i, line in enumerate(selected))
+
+    def _read_file_sliced(
+        self,
+        resolved: Path,
+        path_str: str,
+        target_symbol: str,
+        *,
+        full_text: str,
+        include_imports: bool,
+    ) -> Optional[str]:
+        """Slice 11.2 — extract just the target symbol via AST.
+
+        Returns the sliced text payload on success, or ``None`` to
+        signal "fall back to full-file read" (caller's existing
+        behavior). Always records a metrics row so the operator can
+        later quantify token savings vs fallbacks.
+
+        Fallback reasons (recorded in slicing_metrics.jsonl):
+          * ``not_python`` — non-.py extension
+          * ``parse_failed`` — SyntaxError or generic parse error
+          * ``symbol_not_found`` — target_symbol not in file's AST
+          * ``slicer_disabled`` — caller didn't pass target_symbol OR
+            JARVIS_TOOL_AST_SLICE_ENABLED is false (handled in caller;
+            metrics not recorded for this case to avoid dilution)
+        """
+        from backend.core.ouroboros.governance.ast_slicer import (
+            ASTChunker, ChunkType,
+        )
+        from backend.core.ouroboros.governance.slicing_metrics import (
+            SliceMetric, record_slice,
+        )
+
+        full_chars = len(full_text)
+
+        # (a) Non-Python files cannot be sliced via Python ast.
+        if resolved.suffix.lower() != ".py":
+            record_slice(SliceMetric(
+                file_path=path_str, target_symbol=target_symbol,
+                full_chars=full_chars, sliced_chars=full_chars,
+                include_imports=include_imports,
+                outcome="fallback", fallback_reason="not_python",
+            ))
+            return None
+
+        # (b) Parse + extract. ASTChunker is sync via
+        # extract_chunks_from_source so we don't have to enter an
+        # event loop from this synchronous handler. ``include_all``
+        # is True when imports are requested so the module-header
+        # chunk gets extracted for the imports prepend below.
+        try:
+            chunker = ASTChunker(_NoOpTokenCounter())
+            chunks = chunker.extract_chunks_from_source(
+                full_text, resolved,
+                target_names={target_symbol.split(".")[-1]},
+                include_all=include_imports,
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            record_slice(SliceMetric(
+                file_path=path_str, target_symbol=target_symbol,
+                full_chars=full_chars, sliced_chars=full_chars,
+                include_imports=include_imports,
+                outcome="fallback",
+                fallback_reason=f"slicer_error:{type(exc).__name__}",
+            ))
+            return None
+
+        if not chunks:
+            record_slice(SliceMetric(
+                file_path=path_str, target_symbol=target_symbol,
+                full_chars=full_chars, sliced_chars=full_chars,
+                include_imports=include_imports,
+                outcome="fallback", fallback_reason="parse_failed",
+            ))
+            return None
+
+        # Match priority: exact qualified_name match > name match > any
+        # method/function chunk. Ensures "ClassName.method" disambiguates
+        # from a top-level "method" with the same short name.
+        target_lower = target_symbol.lower()
+        match: Optional[Any] = None
+        for c in chunks:
+            if c.qualified_name.lower() == target_lower:
+                match = c
+                break
+        if match is None:
+            short_name = target_symbol.split(".")[-1].lower()
+            for c in chunks:
+                if (
+                    c.name.lower() == short_name
+                    and c.chunk_type in (
+                        ChunkType.FUNCTION, ChunkType.METHOD,
+                        ChunkType.CLASS, ChunkType.CLASS_SKELETON,
+                    )
+                ):
+                    match = c
+                    break
+
+        if match is None:
+            record_slice(SliceMetric(
+                file_path=path_str, target_symbol=target_symbol,
+                full_chars=full_chars, sliced_chars=full_chars,
+                include_imports=include_imports,
+                outcome="fallback", fallback_reason="symbol_not_found",
+            ))
+            return None
+
+        # (c) Optional imports prepend — the audit recommended including
+        # the file's import block by default so the sliced symbol is
+        # readable in isolation (caller can see what's available).
+        imports_block = ""
+        if include_imports:
+            for c in chunks:
+                if c.chunk_type == ChunkType.MODULE_HEADER:
+                    imports_block = c.source_code + "\n\n"
+                    break
+
+        body = match.source_code
+        sliced_text = imports_block + body
+        sliced_chars = len(sliced_text)
+
+        # Header mirrors the legacy read_file format so consumers
+        # (Venom prompt builders) recognize the shape, but tagged as
+        # SLICED so the model knows it's seeing a partial view.
+        header = (
+            f"# {path_str}  (SLICED: {match.qualified_name}, "
+            f"lines {match.start_line}-{match.end_line}, "
+            f"~{sliced_chars} chars of {full_chars})\n"
+        )
+        record_slice(SliceMetric(
+            file_path=path_str, target_symbol=target_symbol,
+            full_chars=full_chars, sliced_chars=sliced_chars,
+            include_imports=include_imports,
+            outcome="ok", fallback_reason=None,
+        ))
+        return header + sliced_text
 
     def _list_symbols(self, args: Dict[str, Any]) -> str:
         path_str: str = args["module_path"]
