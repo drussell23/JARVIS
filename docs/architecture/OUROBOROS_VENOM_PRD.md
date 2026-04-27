@@ -62,12 +62,31 @@
 
 Ouroboros + Venom (O+V) is the autonomous self-development governance engine of JARVIS. It is the **proactive autonomous opposite of Claude Code (CC)** — where CC requires a human to ask, O+V should observe, hypothesize, propose, validate, and ship without prompting (with human-in-loop escalation only when context warrants it).
 
-### Where we stand (2026-04-26)
+### Where we stand (2026-04-26 — post-Pass-C-structural-completion)
 
-- **Architecture**: A− — sophisticated, composable, observability-rich, financial-circuit-breaker-protected. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all compose correctly. **Order-2 governance cage shipped (Pass B closed 2026-04-26)** — O+V can now safely propose changes to its own cognitive substrate (FSM, immune-system gates) under operator-only authorization with locked-true `amendment_requires_operator()` invariant. **Pass C Adaptive Anti-Venom in flight (4 of 6 slices landed same day)** — substrate + 4 adaptive surfaces all enforcing the monotonic-tightening invariant (would-loosen proposals are NOT persisted).
-- **Cognitive depth**: B − sensors fire on hardcoded conditions BUT 3 deferred-follow-up wirings landed 2026-04-26 closing the "shipped & dormant" gap: AdversarialReviewer auto-invokes per-op (P5), MetricsSessionObserver fires per session-end (P4), `/chat` REPL has 3 concrete executors against backlog/subagent-queue/Claude (P2). Cross-session feedback loops live: PostmortemRecall (P0), DirectionInferrer arc-context (P0.5), SelfGoalFormation (P1), Hypothesis pairing (P1.5), CognitiveMetrics (P3), MetricsSuite (P4). Adaptive immune system *under construction* (Pass C).
-- **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); Wave 3 architecturally complete (W3(7) graduated, W3(6) closed-pending-external-API-stability per operator binding 2026-04-25). **Pass B graduation soak in flight**: agent-conducted twice-daily cadence (`trig_012EvEDkABy2u5PSSs3xK5C4`) — first ledger entry expected 2026-04-27 09:03 UTC.
+- **Architecture**: A− — sophisticated, composable, observability-rich, financial-circuit-breaker-protected. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all compose correctly. **Order-2 governance cage shipped (Pass B closed 2026-04-26)** — O+V can now safely propose changes to its own cognitive substrate (FSM, immune-system gates) under operator-only authorization with locked-true `amendment_requires_operator()` invariant. **Pass C Adaptive Anti-Venom STRUCTURALLY COMPLETE 2026-04-26 (all 6 slices landed same day)** — substrate + 5 adaptive surfaces + MetaAdaptationGovernor REPL all enforcing the monotonic-tightening invariant (would-loosen proposals are NOT persisted).
+- **Cognitive depth**: B — sensors fire on hardcoded conditions BUT 3 deferred-follow-up wirings landed 2026-04-26 closing the "shipped & dormant" gap: AdversarialReviewer auto-invokes per-op (P5), MetricsSessionObserver fires per session-end (P4), `/chat` REPL has 3 concrete executors against backlog/subagent-queue/Claude (P2). Cross-session feedback loops live: PostmortemRecall (P0), DirectionInferrer arc-context (P0.5), SelfGoalFormation (P1), Hypothesis pairing (P1.5), CognitiveMetrics (P3), MetricsSuite (P4). **Adaptive immune system substrate complete; activation gap is the next critical-path item** (see §3.6).
+- **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); Wave 3 architecturally complete (W3(7) graduated, W3(6) closed-pending-external-API-stability per operator binding 2026-04-25). **Pass B graduation soak in flight**: agent-conducted twice-daily cadence (`trig_012EvEDkABy2u5PSSs3xK5C4`).
 - **RSI scaffolding**: 6 Wang modules verified (Phase 0 audit, 2026-04-25); 4 wired into live FSM via Phase 4 P3+P4 graduation (2026-04-26). 2 stranded modules (oracle_prescorer + vindication_reflector) un-stranded via `cognitive_metrics.py` wrapper. Wang's composite_score + 5 net-new operator metrics now surfaced via summary.json + `/metrics` REPL + IDE GET + SSE event by default.
+
+### Grade summary table (current vs A-level target)
+
+Color legend: 🟢 = at target / done · 🟡 = in progress / partial · 🔴 = not at target / critical gap.
+
+| Dimension | Current | A-Level Target | Gap to close |
+|---|---|---|---|
+| **Architecture** | 🟢 A− | A | Sandbox hardening (§3.6 vector 1) + activation pipeline shipped |
+| **Cognitive depth** | 🟡 B | A | Activation pipeline + bounded hypothesis-probe loop |
+| **Production track record** | 🔴 C+ | A | New multi-file APPLY landmarks (only 1 verified, 2026-04-15) |
+| **RSI scaffolding** | 🟡 B+ | A | Pass C surfaces actually consumed by gates (not theater) |
+| **Operator UX vs CC** | 🟢 A− | A | Per-action permission granularity + interleaved reasoning visibility |
+| **Self-tightening immunity** | 🟡 B | A | Activation pipeline (Pass C theater → real); mining-source wiring |
+| **Sandbox safety boundary** | 🔴 C | A− | Object-graph escape vector documented OR hardened (§3.6 vector 1) |
+| **Cross-process safety** | 🟡 B− | A | Advisory file-locking on AdaptationLedger writes (§3.6 vector 3) |
+| **Long-horizon semantic stability** | 🔴 C+ | A | Stale-pattern sunset signal (§3.6 vector 4) |
+| **Net overall grade vs "95%+ sovereign autonomous developer"** | 🔴 **B−** | A | See §3.6 critical path |
+
+**The gap is honest.** O+V has A-level architecture and A-level vision. Execution sits at B− because (a) Pass C is structurally complete but not yet activated in any actual gate, (b) sandbox has a documented-here-for-the-first-time object-graph escape vector, (c) only 1 verified multi-file APPLY landmark.
 
 ### Where we're going
 
@@ -179,82 +198,86 @@ Next open phase items per the Forward-Looking Priority Roadmap: **Reverse Russia
 
 Update discipline: each closing slice updates this section in the same PR. Status is the source of truth for "what's next" — when in doubt, the lowest-numbered `[ ]` row in the lowest-numbered active phase is the next slice.
 
-### Forward-Looking Priority Roadmap (chronological, impact-weighted)
+### Forward-Looking Priority Roadmap (rewritten 2026-04-26 post-Pass-C-structural-completion)
 
-This section is the **canonical "what's next" ordering** for everything still on the board after Phase 3's full graduation (2026-04-26). Each item is scored by:
-- **Impact**: how much the operator-visible system improves once the item lands.
-- **Dependency depth**: how many downstream items it unblocks (a high-leverage prerequisite outranks a high-impact terminal).
-- **Cost-of-delay**: how stale / load-bearing the item becomes if deferred (Order-2 governance designed against a moving Order-1 target ages badly).
-- **Risk surface**: novel cognitive layers (P5/P6/Pass C) ship safer when the measurement substrate (P4) is in place to detect regressions.
+This section is the **canonical "what's next" ordering** after Pass B + Pass C structural completion. Reflects the brutal review in §3.6.
 
-The list below resolves the four-way ordering for: **P4** (Convergence metrics), **P5** (Adversarial reviewer), **P6** (Self-narrative), **Reverse Russian Doll Pass B** (Order-2 governance), **Reverse Russian Doll Pass C** (Adaptive Anti-Venom). Anything not in this list is either complete or out of scope.
+**Color legend**: 🔴 = highest priority (do first) · 🟡 = medium priority · 🟢 = least priority (defer).
+
+#### Priority summary table (sortable)
+
+| Rank | Item | Status | Why this rank | Estimate |
+|---|---|---|---|---|
+| 🔴 **#1** | **Phase 7.1-7.5 — Pass C activation pipeline** (5 surface boot loaders) | 🔴 Not started | Closes the activation gap. Pass C is theater until each gate's boot loader lands. **No A-level RSI claim possible without this.** | ~1 week |
+| 🔴 **#2** | **Phase 7.6 — Bounded hypothesis-probe loop** | 🔴 Not started | Closes the autonomous-curiosity gap. Composes existing HypothesisLedger + PostmortemRecall + read-only Venom into a closing loop. Required for "scientific method as a loop". | ~1 week |
+| 🔴 **#3** | **Phase 7.7 — Sandbox hardening** (AST-block `__subclasses__` / `__bases__` / `__class__` access) | 🔴 Not started | Closes the only known structural sandbox-escape vector. Operator-authorization is currently the SOLE defense after approval. | ~2 days |
+| 🟡 **#4** | **Phase 7.8 — Cross-process AdaptationLedger advisory locking** | 🔴 Not started | Closes vector #3. Safety-net for parallel agent-conducted soak runs. | ~1 day |
+| 🟡 **#5** | **Phase 7.9 — Stale-pattern sunset signal** | 🔴 Not started | Closes vector #4. Long-horizon adaptive-surface hygiene. | ~3 days |
+| 🟡 **#6** | **Phase 8 — Temporal Observability** (5 sub-deliverables) | 🔴 Not started | Decision causal-trace + latent-confidence ring + multi-op timeline + flag-changed SSE + latency-SLO breach. Operator-UX-meaningful. | ~2 weeks (parallel to Phase 7) |
+| 🟡 **#7** | **Pass B per-slice graduation cadence** (9 flag flips) | 🟡 In flight | Agent-conducted twice-daily soak (`trig_012EvEDkABy2u5PSSs3xK5C4`); ~14 days minimum to flip all 9. | Background |
+| 🟡 **#8** | **Pass C per-slice graduation cadence** (~10 flag flips across 6 slices) | 🔴 Not started | 5 clean sessions per slice (Pass C §4.6). Higher bar than Pass B. Starts after Phase 7 lands. | Background |
+| 🟢 **#9** | **Phase 6 P6 — Self-narrative** | 🔴 Not started | Now blocked by Phase 7 (needs *real* adaptation history, not just substrate). Long-horizon (3-6 months). | ~3 weeks (after Phase 7) |
+| 🟢 **#10** | **Skills/workflows surface** (CC parity item) | 🔴 Not started | Nice-to-have UX. No PRD priority assigned. | Future |
+| 🟢 **#11** | **Per-action permission granularity** (CC parity item) | 🔴 Not started | Tradeoff against autonomy; likely operator-rejected as anti-vision. | Possibly never |
+
+**Critical-path summary**: Phase 7 (#1-#5) **converts O+V from B− to A−**. Phase 8 (#6) makes the system debuggable at A-level. Phase 6 P6 lands AFTER Phase 7 because self-narrative needs real adaptive history.
 
 ---
 
-#### Priority 1 — Phase 4 P4: Convergence metrics suite ⭐ **NEXT**
+#### Priority 1 (🔴 highest) — Phase 7 — Activation & Hardening
 
-**Why first**: foundational — everything below this line needs measurable convergence to claim it worked.
+**Goal**: convert Pass C from substrate-only ("observable theater") to real (gates actually consume adapted state). Close 3 critical-path systemic upgrades from §3.6.3.
 
-- **Impact (high)**: replaces `convergence_state: "INSUFFICIENT_DATA"` (the most-cited "unprovable" gap in the RSI claim) with 7 concrete metrics + Wang's composite score. Operator gets `/metrics 7d`, IDE GET `/observability/metrics`, SSE `metrics_updated` event. Every `summary.json` gets a `metrics: {…}` block.
-- **Dependency leverage (highest)**: unblocks P5 (need metrics to validate that AdversarialReviewer findings actually move the score) and P6 (self-narrative needs metric history to narrate). Also un-strands the existing `composite_score.py` + `convergence_tracker.py` primitives (305 + 354 LOC already on disk, currently unsurfaced).
-- **Cost of delay (high)**: every Phase 5/6 PR shipped without P4 gets a "did this actually help?" question we can't answer. Ad-hoc metrics added later won't be cross-comparable to the framework spec.
-- **Risk (low)**: pure observability layer. No authority crossings. Hot-revert single env knob. Mirrors Phase 4 P3 cognitive_metrics graduation pattern (proven 2026-04-26).
-- **Scope**: 5 slices (~1,230 LOC + ~145 tests + graduation pins + live-fire). See §9 P4.
-- **Status**: 📋 plan briefed; Slice 1 (`metrics_engine.py` primitive) starting.
+**Sub-priorities** (ordered for landing):
 
-#### Priority 2 — Phase 5 P5: AdversarialReviewer subagent
+| Slice | What | Why first | Estimate |
+|---|---|---|---|
+| 7.1 | SemanticGuardian boot-time loader | Highest single-impact (most-cited adaptive surface) | 1 day |
+| 7.2 | IronGate adapted-floor loader | Second-most-impactful surface (gates every op) | 1 day |
+| 7.3 | Per-Order mutation budget activation | Lowest-risk activation (Order-2 ops only) | 1 day |
+| 7.4 | Risk-tier ladder activation | Higher-risk (mutates canonical enum) | 2 days |
+| 7.5 | Category-weight rebalance activation | Composes with 7.2 (same module) | 1 day |
+| 7.6 | Bounded hypothesis-probe loop | Independent (different module); can ship in parallel with 7.1-7.5 | 5 days |
+| 7.7 | Sandbox hardening (AST validator Rule 7) | Independent (extends Slice 3 validator); can ship in parallel | 2 days |
+| 7.8 | Cross-process AdaptationLedger flock | Independent; can ship anytime | 1 day |
+| 7.9 | Stale-pattern sunset signal | Depends on 7.1 (needs to read adapted patterns to detect staleness) | 3 days |
 
-**Why second**: highest-impact NEW cognitive layer the system can grow once measurable.
+**Total Phase 7 estimate**: ~3 weeks of focused work; 9 PRs.
 
-- **Impact (high)**: closes the "Iron Gate enforces hygiene; SemanticGuardian matches patterns; *neither thinks adversarially*" gap. AdversarialReviewer activates post-PLAN/pre-GENERATE, prompted as "find at least 3 failure modes," structured findings injected into GENERATE prompt as `Reviewer raised:`. Catches the class of bug that passes static analysis + tests but fails on a thoughtful read.
-- **Dependency leverage (medium)**: P4 metrics let us prove AdversarialReviewer findings → composite score moves up. Without P4 baseline this is unprovable folklore.
-- **Cost of delay (medium)**: the system is currently shipping plans that escape adversarial review entirely; deferring keeps a known cognitive gap open.
-- **Risk (medium-high)**: novel side-stream Claude call (cost-budgeted at $0.05/op default). Reviewer hallucinations are a real failure mode (must reference specific files; ungrounded findings filtered). Telemetry-heavy.
-- **Scope**: ~1,000 LOC + 40 tests per PRD §9; will need 4-5 sub-slices: (1) `adversarial_reviewer.py` primitive (Tier -1 sanitized findings JSON), (2) Claude side-stream caller + cost budget enforcement, (3) GENERATE-prompt injection wiring, (4) telemetry + REPL surface, (5) graduation.
-- **Status**: ❌ not started (PRD §9 P5 spec landed; no code yet).
+**Why this is Priority 1**:
+- **Without Phase 7, Pass C is theater.** `/adapt approve` writes APPROVED to the ledger but NO actual gate state changes. The entire Pass C arc (294 tests, 6 slices, today's session) is structurally complete but functionally inert.
+- The novel architectural claim (per Pass A: "Anti-Venom adaptive thesis is genuinely novel") cannot be defended until at least one adaptive surface is consuming its YAML.
+- The sandbox-escape vector (§3.6.2 row #1) is currently UNMITIGATED — operator-authorization is the only defense. Phase 7.7 closes that.
 
-#### Priority 3 — Reverse Russian Doll Pass B: Order-2 governance (Order-1 freeze) ✅ STRUCTURALLY COMPLETE
+#### Priority 2 (🟡 medium) — Phase 8 — Temporal Observability
 
-**Status (2026-04-26)**: ✅ **ALL 6 SLICES SHIPPED.** 438/438 tests green. Defaults still `false` pending per-slice graduation cadence (W1 + W2(5) soak discipline).
+Per §3.6.4. Can ship in parallel with Phase 7 (different modules; no dependency overlap).
 
-- **Impact (high, delivered)**: the **Order-2** vocabulary is now in the live system: `MetaPhaseRunner` + Order-2 manifest + `ORDER_2_GOVERNANCE` risk class + AST validator + shadow replay + locked-true amendment protocol + sandboxed replay executor + `/order2` REPL. Distinguishes "the FSM ran a phase" (Order-1) from "the rules-of-the-FSM changed" (Order-2). The architectural prerequisite for Pass C is now in place.
-- **Dependency leverage**: Pass C is now structurally unblocked.
-- **Cost of delay**: NONE — closure landed 2026-04-26 in 9 PRs (#22298 / #22320 / #22329 / #22347 / #22375 / #22396 / #22475 / #22517 / #22535).
-- **Risk discipline that held throughout**: every slice shipped behind a master flag default `false`; AST-pinned authority invariants on every module (no banned governance imports); locked-true `amendment_requires_operator()` cage invariant; `operator_authorized=True` only ever passed by `/order2 amend` (source-grep-pinned).
-- **Cage's whole point** (Slice 5 deferred → Slice 6.1 resolved): arbitrary candidate Python is NOT compiled or evaluated without operator authorization. The replay executor is the ONLY place in O+V that compiles a candidate `PhaseRunner` subclass, and only when 5 preconditions (master flag + literal `operator_authorized=True` + size cap + parse/compile success + exactly-one PhaseRunner subclass with phase match) are all met.
-- **Scope shipped**: 6 slices (Slice 6 split into 6.1/6.2/6.3 mid-arc); 438 regression tests; full Pass B regression spine green.
-- **Next**: per-slice graduation cadence (3-clean-session arc per slice). All 9 master flags can flip independently.
+#### Priority 3 (🟡 medium) — Pass B + Pass C graduation soak cadences (in flight + scheduled)
 
-#### Priority 4 — Reverse Russian Doll Pass C: Adaptive Anti-Venom (NOW UNBLOCKED)
+- Pass B: agent-conducted twice-daily soak running now; 9 master flag flips pending.
+- Pass C: 6 slices × 5 clean sessions each ≈ 30 minimum sessions. Starts after Phase 7 lands (proves activation).
 
-**Why fourth**: this is **the** novel architectural contribution per `memory/project_reverse_russian_doll_pass_a.md` ("Anti-Venom adaptive thesis is genuinely novel"). The Pass B prerequisites have all landed; only operator authorization remains.
+#### Priority 4 (🟢 least) — Phase 6 P6 (Self-narrative)
 
-- **Impact (highest long-term, lowest short-term)**: the system **adapts its own gates** within bounds — `AdaptationLedger` + 5 surfaces (SemanticGuardian patterns, IronGate floors, per-Order budgets, risk-tier ladder, ExplorationLedger weights) + `MetaAdaptationGovernor`. This is the closest existing item to genuine RSI: not just *measuring* convergence (P4) but *responding to it by tightening rules*. Per `memory/project_reverse_russian_doll_pass_c.md`: "monotonic-tightening invariant; operator-approval required; zero-LLM in cage." The "zero-LLM in cage" constraint is what makes it provably safe.
-- **Dependency leverage (none — terminal)**: nothing downstream depends on Pass C in the current PRD. It's the **endgame** of the cognitive-substrate work.
-- **Cost of delay (low)**: every other item in this list ships value before Pass C. Pass C is the multiplicative finisher, not a prerequisite for anything else.
-- **Risk (highest)**: the system actively rewrites its own governance gates. The full safety stack (monotonic-tightening invariant + operator-approval per amendment + zero-LLM-in-cage + AdaptationLedger immutable audit) is what makes this defensible — but every safety pin must hold under live operation.
-- **Scope**: 6 slices per `memory/project_reverse_russian_doll_pass_c.md` draft.
-- **Status**: 📋 DESIGN COMPLETE; **structurally unblocked 2026-04-26 (Pass B Slice 1 + 6 prerequisites all landed)**; execution held pending operator authorization.
+Now blocked by Phase 7 per the new sequencing rule: self-narrative needs *real* adaptation history (not substrate-only). Re-rank when Phase 7 ships.
 
-#### Priority 5 — Phase 6 P6: Behavior summarizer + self-narrative
+#### Priority 5 (🟢 least) — CC-parity polish items
 
-**Why last (not lowest impact — longest horizon)**: PRD §9 P6 explicitly tags this as **"target: 3–6 months, long-horizon"**. The reason is depth, not lack of value: self-narrative requires sustained metric history (P4) + adversarial-finding history (P5) + Order-2 amendment history (Pass B/C) to have anything substantial to narrate.
-
-- **Impact (medium-high but slow-burning)**: system gets a model of its own behavior over time. Operator + audit get a "who is this AI becoming?" view that's grounded in actual data, not anthropomorphism.
-- **Dependency leverage (low)**: nothing else depends on P6.
-- **Cost of delay (low)**: per the PRD's own 3-6 month horizon, this is intentionally back-loaded.
-- **Risk (medium)**: surface is small but the failure mode (self-narrative drifting from actual behavior, becoming hallucinated) requires careful pinning. Easier once P4 metrics provide ground truth.
-- **Status**: ❌ not started; do not start until P4 + P5 are graduated.
+Skills/workflows surface, per-action permission granularity, etc. Tracked but no PRD priority.
 
 ---
 
 #### Cross-priority sequencing rules (binding)
 
-1. ✅ **Pass C unblocked from Pass B's primitives** (2026-04-26 — all 6 Pass B slices shipped). Original rule "Never ship Pass C before Pass B Slice 1" is now structurally satisfied.
-2. ✅ **Pass B prerequisites met** (W2(5) Slice 5b dependency was deferred-then-resolved during Pass B execution; all Pass B slices landed without further W2(5) blocks).
-3. **P4 first, always.** Every novel cognitive layer (P5, Pass B, Pass C, P6) needs the metric substrate to claim it worked. ✅ Satisfied — Phase 4 P4 graduated 2026-04-26.
-4. ✅ **P5 shipped before Pass B/C.** Adversarial findings + metrics are natural inputs to `MetaAdaptationGovernor`'s "should we tighten?" decision (P5 graduated 2026-04-26, before Pass B closed).
-5. **P6 after the adaptive substrate exists.** Narrating a system that doesn't adapt is less interesting than narrating one that does. Still binding — P6 deferred until Pass C ships.
+1. ✅ **Pass C unblocked from Pass B's primitives** (2026-04-26 — all 6 Pass B slices shipped).
+2. ✅ **Pass B prerequisites met** (W2(5) Slice 5b dependency was deferred-then-resolved during Pass B execution).
+3. ✅ **P4 first, always.** Phase 4 P4 graduated 2026-04-26 — every novel cognitive layer can now claim measurable convergence.
+4. ✅ **P5 shipped before Pass B/C.** Phase 5 P5 graduated 2026-04-26.
+5. **P6 after the adaptive substrate is FUNCTIONAL.** *(Updated 2026-04-26)* Originally "after Pass C ships." Now: after **Phase 7 ships** — Pass C structural completion alone is insufficient; self-narrative needs real adaptation history to narrate, which requires the activation pipeline.
+6. **(NEW) Phase 7 is the new Priority 1.** Phase 7 converts Pass C from substrate to functional. Without it, no A-level RSI claim is defensible.
+7. **(NEW) Phase 8 can ship in parallel with Phase 7.** Different modules, no overlap. Pinning this to prevent operator from sequencing them serially.
+8. **(NEW) Sandbox escape vector (§3.6.2 #1) is critical-path.** Cannot graduate Pass C activation without either Phase 7.7 hardening OR explicit accepted-risk documentation.
 
 The "lowest-numbered `[ ]` row" heuristic (above) still applies *within* a phase. This priority list is the **between-phase** ordering when multiple phases are simultaneously eligible.
 
@@ -382,9 +405,96 @@ This section captures the architectural delta the Reverse Russian Doll arc adds 
 | Pass C Slice 5 | ExplorationLedger category-weight auto-rebalance | pending | — |
 | Pass C Slice 6 | MetaAdaptationGovernor + `/adapt` REPL + observability | pending | — |
 
-**Combined Pass B + Pass C regression spine (today): 670+ tests** (438 Pass B + 232 Pass C through Slice 4).
+**Combined Pass B + Pass C regression spine (2026-04-26): 1004+ tests** (438 Pass B + 349 Pass C across all 6 slices + 217 deferred-follow-up wirings).
 
 The novel architectural claim: **the adaptive surface can only tighten, never loosen**. Loosening operations (deprecating a SemanticGuardian pattern, lowering an exploration floor, raising a mutation budget, removing a risk tier) MUST go through Pass B's `/order2 amend` operator-only authorization. Pass C's substrate REFUSES TO PERSIST a would-loosen proposal — it's structurally impossible to loosen the cage via the adaptive surface.
+
+### 3.6 Brutal architectural review (2026-04-26 self-assessment)
+
+*This section is the post-Pass-C-structural-completion honest take. It exists because the substrate is rich; the activation lag is the gap; the vision is A; the execution is B−.*
+
+#### 3.6.1 Capability matrix vs CC (status + grade)
+
+Color legend: 🟢 = parity-or-better · 🟡 = partial · 🔴 = real gap.
+
+| Capability | CC | O+V | Status | Notes |
+|---|---|---|---|---|
+| Self-initiating work loop | ❌ none | 16 sensors → UnifiedIntakeRouter | 🟢 O+V wins | CC requires human invocation |
+| Cost-as-first-class governance | ❌ none | cost_governor with route × complexity × headroom × parallel_factor | 🟢 O+V wins | CC has no per-op budget |
+| Multi-file APPLY with batch rollback | partial | `files: [...]` schema + ChangeEngine | 🟢 O+V wins | Proven Sessions Q-S 2026-04-15 |
+| L3 worktree parallel fan-out | ❌ none | parallel_dispatch + isolated worktrees | 🟢 O+V wins | CC has no parallel ops model |
+| Order-2 governance cage | ❌ none | Pass B (manifest + AST validator + sandboxed replay + locked-true `amendment_requires_operator`) | 🟢 O+V wins | Novel architecture |
+| Adaptive Anti-Venom (self-tightening immune system) | ❌ none | Pass C (substrate + 5 surfaces + meta-governor) | 🟡 substrate-only | Activation pipeline pending |
+| Cross-session memory (multiple surfaces) | ⚠️ context-window only | UserPreferenceMemory + SemanticIndex + LastSessionSummary | 🟢 O+V wins | CC is per-session |
+| **Interleaved reasoning between tool calls** | 🟢 mature | ⚠️ tool loop without explicit progress monitor | 🔴 **CC wins** | Need "did I make progress?" check between rounds |
+| **Speculative branching with rollback** | 🟢 "let me try a different angle" | ❌ L2 repair is fixed FSM (5 iterations) | 🔴 **CC wins** | No branched speculation |
+| **Per-action permission granularity** | 🟢 per-tool-use | ⚠️ per-op risk_tier | 🟡 partial | Tradeoff: O+V favors autonomy; consider per-tool granularity in future |
+| **Streaming intermediate model thinking** | 🟢 always | ⚠️ phase HEARTBEAT only in headless | 🟡 partial | Token-by-token streaming gap |
+| Conversational mode | 🟢 default | ✅ `/chat` + 3 concrete executors (Phase 3 P2) | 🟢 parity | Concrete executors landed 2026-04-26 |
+| Inline approval UX | 🟢 inline `[y/N]` | ✅ inline `[y]/[n]/[s]/[e]/[w]` (Phase 3 P3) | 🟢 parity | Graduated 2026-04-26 |
+| MCP tool ecosystem | 🟢 first-class | ✅ Gap #7 wiring | 🟢 parity | — |
+| Skills/workflows surface | 🟢 rich | ❌ none | 🔴 **CC wins** | Future scope, no PRD priority |
+| `/help` discoverability | 🟢 rich | ✅ FlagRegistry + `/help` + Levenshtein typo detection | 🟢 parity | Wave 1 #2 graduated 2026-04-21 |
+| Background tasks with notify | 🟢 run_in_background | ✅ scheduled remote agents (routine API) | 🟢 parity | Pass B soak conductor running |
+
+**Net functional parity vs CC: ~70%. Conceptual ambition vs CC: 110%+** (O+V has architectural surfaces CC fundamentally lacks).
+
+#### 3.6.2 Five known structural fragility vectors (ranked by severity)
+
+| # | Vector | Severity | Why it matters | Mitigation status |
+|---|---|---|---|---|
+| **1** | **Sandbox escape via object-graph traversal** in operator-approved candidates. `_SAFE_BUILTIN_NAMES` includes `object` + `type`; once approved, `object.__subclasses__()` walks to `subprocess.Popen` etc. | 🔴 Critical | The operator-authorization gate is currently the ONLY defense; the cage is "trust the operator" not "structural sandbox" | 🔴 Not mitigated. Either harden allowlist OR add SemanticGuardian pattern that AST-rejects `__subclasses__`/`__bases__` access in candidate source |
+| **2** | **Pass C activation gap** — proposal pipeline shipped, but NO surface actually reads its `.jarvis/adapted_<surface>.yaml` at boot yet | 🔴 Critical | Pass C is observable theater until each gate's boot loader lands. RSI claim cannot be defended without this | 🔴 Not started. **This is Phase 7 in the new roadmap below** |
+| **3** | **Cross-process AdaptationLedger race** — `threading.RLock` + `os.fsync` only; no advisory file lock | 🟡 Medium | Two processes mining concurrently could write conflicting records; substrate dedupes at read-time but write path is race-prone | 🟡 Partial — current behavior is race-resistant by accident, not by construction. Add `fcntl.flock` advisory locking |
+| **4** | **Semantic drift over long horizons** — mined SemanticGuardian patterns are additive forever; no sunset signal | 🟡 Medium | Stale patterns accumulate; operator must manually trigger Pass B `/order2 amend` to remove. No "this pattern hasn't matched in 30 days" signal | 🔴 Not started. Add stale-pattern detector + advisory sunset proposal |
+| **5** | **Multi-file APPLY proven once** — Sessions Q-S, 2026-04-15 | 🔴 Critical | 12+ days since last verified landmark. Pass B graduation soak just kicked off | 🟡 Soak in flight via agent-conducted twice-daily cadence |
+
+#### 3.6.3 Critical path to A-level RSI (top 3 systemic upgrades, ranked)
+
+Color legend: 🔴 = highest priority (do first) · 🟡 = medium priority · 🟢 = least priority (defer).
+
+| Priority | Upgrade | Status | Impact-per-week | Why this rank |
+|---|---|---|---|---|
+| 🔴 **#1** | **Pass C activation pipeline** (Phase 7) — wire `.jarvis/adapted_<surface>.yaml` consumption into all 5 gates' boot loaders | Not started | **Highest**: closes the activation gap; transforms Pass C from theater → real | Without this, the entire Pass C arc is observable performance. RSI claim cannot be defended |
+| 🔴 **#2** | **Bounded hypothesis-probe loop** (Phase 7.6) — extend HypothesisLedger with read-only Venom probe + structural termination | Not started | **High**: closes the autonomous-curiosity gap §3.6.1 row "interleaved reasoning" surfaced | The "Curiosity Primitive" the operator describes exists in pieces; this composes them |
+| 🔴 **#3** | **Sandbox hardening OR explicit accepted-risk documentation** (Phase 7.7) — close vector #1 above | Not started | **High**: removes the only known structural escape vector; or pins it as accepted with operator-authorization as the boundary | Honest choice: AST-validator addition that rejects `__subclasses__`/`__bases__`/`__class__` access in candidate source. ~2 days work |
+| 🟡 #4 | **Phase 8 — Temporal Observability** — decision causal-trace ledger + latent-confidence ring + synchronized timeline + flag-changed SSE | Designed (PRD §3.6.4 below) | Medium: meaningful operator UX improvement; not load-bearing for RSI | Enables time-travel debugging on autonomic decisions. ~2 weeks |
+| 🟡 #5 | **Cross-process AdaptationLedger advisory locking** — fix vector #3 | Not started | Medium: safety-net for parallel agent-conducted soaks | `fcntl.flock` add. ~1 day |
+| 🟡 #6 | **Stale-pattern sunset signal** — fix vector #4 | Not started | Medium: prevents long-horizon adaptive-surface bloat | Generates `/adapt sunset-candidate` signals after 30d-no-match |
+| 🟢 #7 | **Skills/workflows surface (CC parity)** — operator-authored playbooks | Not started | Low: nice-to-have UX; CC parity item | No PRD priority assigned |
+| 🟢 #8 | **Per-action permission granularity** — per-tool-use prompt vs per-op risk-tier | Not started | Low: tradeoff against autonomy | Likely operator-rejected as anti-vision |
+| 🟢 #9 | **Phase 6 P6 — Self-narrative** | Not started, long-horizon | Low **for now**: blocked by sequencing rule until Pass C is functionally complete (not just structurally) | Becomes high after Phase 7 lands |
+
+#### 3.6.4 Temporal Observability (proposed Phase 8)
+
+Operator brief: SerpentFlow + replay.html + 41 SSE events + 10+ JSONL ledgers gives **what happened**, not **why it happened in this specific causal order**. Phase 8 closes this gap.
+
+| Surface | What it adds | Estimate |
+|---|---|---|
+| Decision causal-trace ledger | `.jarvis/decision_trace.jsonl` per-op append-only with `{phase, decision, factors, weights}` | 3 days |
+| Latent-confidence ring buffer | bounded ledger of every classifier confidence + threshold + outcome | 2 days |
+| Synchronized multi-op timeline | extend SerpentFlow with `--multi-op` mode interleaving N op streams by timestamp | 4 days |
+| Master-flag change SSE event | new `flag_changed` event when any `JARVIS_*` env mutates mid-session | 1 day |
+| Latency-SLO breach detector | bounded ledger of phase-level p95 + alert event when SLO violated | 3 days |
+
+#### 3.6.5 Honest assessment vs "95%+ sovereign autonomous developer"
+
+**Letter grade: B−.** The vision is A. The execution is B− because:
+
+| Reason | Severity | Closeable by |
+|---|---|---|
+| Pass C activation gap (substrate vs functional) | 🔴 Critical | Phase 7 (#1 above) |
+| One verified multi-file APPLY landmark | 🔴 Critical | Sustained soak + new landmark beyond Sessions Q-S |
+| Sandbox object-graph escape vector | 🔴 Critical | Phase 7 (#3 above) |
+| Cross-process race (vector #3) | 🟡 Medium | Phase 7 (#5 above) |
+| Long-horizon stale-pattern accumulation | 🟡 Medium | Phase 7 (#6 above) |
+| No bounded hypothesis-test loop | 🟡 Medium | Phase 7 (#2 above) |
+
+**To reach A:**
+1. Phase 7 ships (activation pipeline + hypothesis loop + sandbox hardening) — converts Pass C from theater → real
+2. Phase 8 ships (Temporal Observability) — operator can debug autonomic decisions
+3. ≥ 5 new battle-test landmarks proving sustained multi-file APPLY across diverse domains
+4. 90-day soak with operator-approval rate ≥ 70% on adaptation proposals (Pass C arc-closure criterion per `memory/project_reverse_russian_doll_pass_c.md` §10.3)
 
 ---
 
@@ -851,6 +961,171 @@ Surface in `summary.json` + `/metrics` REPL + IDE observability stream.
 - Auto-PR'd for operator review
 
 **Effort**: ~1500 LOC + 50 tests + new doc convention.
+
+**Note (2026-04-26)**: Phase 6 is now blocked by Phase 7 per the new sequencing rule — the self-narrative needs *real* adaptation history (not just substrate) to narrate. Phase 7 must complete first.
+
+---
+
+### Phase 7 — Activation & Hardening *(NEW 2026-04-26 — derived from §3.6 brutal review)*
+
+**Goal**: Convert Pass C from substrate-only ("observable theater") to real (gates actually consume adapted state). Close the 3 critical-path systemic upgrades from §3.6.3.
+
+**Why this phase exists**: Pass C shipped all 6 slices in one day (2026-04-26). The substrate is correct; the cage rules are load-bearing; the operator REPL works. But NO adaptive surface actually reads its `.jarvis/adapted_<surface>.yaml` at boot yet. Until that changes, `/adapt approve` writes APPROVED to the ledger but NOTHING in the actual cage changes. Phase 7 closes that gap and the two adjacent critical-path items.
+
+#### P7.1 — SemanticGuardian boot-time loader (highest single-impact item)
+
+**Problem**: Pass C Slice 2 mines patterns; Slice 6 REPL approves them. But `semantic_guardian.py` doesn't read `.jarvis/adapted_guardian_patterns.yaml` at boot.
+
+**Solution**: extend SemanticGuardian's pattern-load path to merge static `_PATTERNS` + adapted YAML (additive only, never substitutive per Pass C §6.3). Add boot-time log line `[SemanticGuardian] loaded N hand-written + M adapted patterns`. Add a per-pattern source attribution so operator can see which pattern caught a finding.
+
+**Acceptance criteria**:
+- `SemanticGuardian.__init__` reads `.jarvis/adapted_guardian_patterns.yaml`
+- Empty/missing file → no-op (back-compat)
+- Adapted patterns are appended to `_PATTERNS`, never replace
+- Per-pattern `source` attribution: `"hand_written"` or `"adapted:<proposal_id>"`
+- Master flag `JARVIS_SEMANTIC_GUARDIAN_LOAD_ADAPTED_PATTERNS` (default false until graduation)
+
+**Effort**: ~200 LOC + 25 tests.
+
+#### P7.2 — IronGate adapted-floor loader
+
+**Problem**: Pass C Slice 3 proposes floor raises; ExplorationLedger doesn't read `.jarvis/adapted_iron_gate_floors.yaml` at boot.
+
+**Solution**: ExplorationLedger merges `max(env_floor, adapted_floor)` per category. Static env-tuned floor stays as hard lower bound; adapted floors can only raise above it.
+
+**Acceptance criteria**:
+- ExplorationLedger boot wires the YAML merge
+- `/posture` REPL surfaces effective per-category floor + source attribution
+- Hot-revert: `JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_FLOORS=false`
+
+**Effort**: ~200 LOC + 25 tests.
+
+#### P7.3 — Per-Order mutation budget activation
+
+**Problem**: Pass C Slice 4a proposes lower budgets; `scoped_tool_backend.py` doesn't read `.jarvis/adapted_mutation_budgets.yaml`.
+
+**Solution**: ScopedToolBackend merges `min(env_budget, adapted_budget)` per Order. Adapted budgets can only LOWER below env-tuned static value.
+
+**Effort**: ~200 LOC + 25 tests.
+
+#### P7.4 — Risk-tier ladder activation
+
+**Problem**: Pass C Slice 4b proposes new tier insertions; `risk_tier_floor.py` doesn't load `.jarvis/adapted_risk_tiers.yaml`.
+
+**Solution**: risk_tier_floor merges adapted tiers into the canonical ladder enum at boot. Existing tiers preserved; new tiers slot between two existing ones (strictly tightening per §8.3).
+
+**Effort**: ~250 LOC + 30 tests.
+
+#### P7.5 — Category-weight rebalance activation
+
+**Problem**: Pass C Slice 5 proposes weight rebalances; ExplorationLedger doesn't read `.jarvis/adapted_category_weights.yaml`.
+
+**Solution**: ExplorationLedger applies adapted weights multiplicatively over env-tuned base. Mass-conservation invariant preserved by miner.
+
+**Effort**: ~200 LOC + 25 tests.
+
+#### P7.6 — Bounded hypothesis-probe loop (closes the curiosity gap)
+
+**Problem**: HypothesisLedger (Phase 2 P1.5) records hypotheses but has no closing loop — no "test the hypothesis with a probe."
+
+**Solution**: `HypothesisProbe` primitive + bounded probe runner with 3 termination guarantees:
+- Hard call cap (≤5 reads per probe via `JARVIS_HYPOTHESIS_PROBE_MAX_CALLS`)
+- Per-probe wall-clock cap (≤30s via `JARVIS_HYPOTHESIS_PROBE_TIMEOUT_S`)
+- Diminishing-returns detector (terminate `inconclusive` if probe round N+1 returns same evidence fingerprint as N)
+
+Bridge to Pass C: confirmed hypotheses become adaptation proposals (feeds Slice 2 + 3 mining surfaces). Refuted hypotheses become POSTMORTEMs (feeds PostmortemRecall).
+
+**Acceptance criteria**:
+- `HypothesisProbe.test(hypothesis) -> ProbeVerdict`
+- Read-only Venom tool subset (`read_file`, `search_code`, `get_callers`, `glob_files`, `list_dir`)
+- 3 termination guarantees AST-pinned by tests
+- Master flag `JARVIS_HYPOTHESIS_PROBE_ENABLED` (default false)
+
+**Effort**: ~400 LOC + 50 tests.
+
+#### P7.7 — Sandbox hardening OR explicit accepted-risk documentation (closes vector #1)
+
+**Problem**: `replay_executor.py:_SAFE_BUILTIN_NAMES` includes `object` + `type`; once a candidate is operator-approved, `object.__subclasses__()` walks to `subprocess.Popen` etc.
+
+**Solution (recommended)**: extend Slice 3 AST validator to AST-reject candidates that contain `__subclasses__` / `__bases__` / `__class__` access — hard-block at validation time, before the candidate ever reaches the sandbox.
+
+**Acceptance criteria**:
+- `ast_phase_runner_validator.py` adds Rule 7: no `__subclasses__` / `__bases__` / `__class__` attribute access in any function body
+- Test corpus expanded with adversarial candidates that exercise the escape vector
+- Master flag `JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_ESCAPE` (default true post-hardening)
+- §3.6.2 vector #1 row marked 🟢 mitigated
+
+**Alternative**: document operator-authorization as the sole structural trust boundary in the PRD with explicit accepted-risk language. (Recommended only if the AST hardening proves to break legitimate runners.)
+
+**Effort**: ~150 LOC + 30 tests (most is adversarial test corpus).
+
+#### P7.8 — Cross-process AdaptationLedger advisory locking (closes vector #3)
+
+**Problem**: `threading.RLock` only serializes within-process; concurrent miners across processes race.
+
+**Solution**: add `fcntl.flock` advisory file lock around append paths. Best-effort fallback to current behavior if `fcntl` unavailable (Windows).
+
+**Effort**: ~100 LOC + 15 tests.
+
+#### P7.9 — Stale-pattern sunset signal (closes vector #4)
+
+**Problem**: Mined SemanticGuardian patterns are additive forever; no signal when a pattern hasn't matched anything in N days.
+
+**Solution**: `StalePatternDetector` runs at adaptation window cadence; for each adapted pattern, check `.jarvis/semantic_guardian_match_history.jsonl` (new) for last-match timestamp. If > 30 days, emit advisory `/adapt sunset-candidate` signal — operator chooses whether to file a Pass B `/order2 amend` to remove.
+
+**Effort**: ~250 LOC + 35 tests.
+
+**Phase 7 total estimate**: ~2,000 LOC + ~260 tests + 4 new env flags + 1 boot-time invariant pin per surface. Approximately **3 weeks of focused work**.
+
+---
+
+### Phase 8 — Temporal Observability *(NEW 2026-04-26 — derived from §3.6 brutal review)*
+
+**Goal**: Time-travel debugging on autonomic decisions. Operator can reconstruct the causal chain behind any phase transition, classifier verdict, or circuit-breaker trip.
+
+**Why this phase exists**: SerpentFlow + replay.html + 41 SSE events + 10+ JSONL ledgers gives **what happened**. Phase 8 surfaces **why it happened in this specific causal order**.
+
+#### P8.1 — Decision causal-trace ledger
+
+**Problem**: When PhaseDispatcher routes CLASSIFY → ROUTE, no record of which factors weighed in. We have telemetry of the decision; we don't have the reasoning trace.
+
+**Solution**: `.jarvis/decision_trace.jsonl` per-op append-only with `{phase, decision, factors: {factor_name: weight}, verdict}`.
+
+**Effort**: ~300 LOC + 30 tests.
+
+#### P8.2 — Latent-confidence ring buffer
+
+**Problem**: We log `confidence=0.7` from IntentClassifier but don't ledger it. Can't grep "find every decision made with confidence < 0.5 over the last 30 days."
+
+**Solution**: bounded `.jarvis/latent_confidence.jsonl` ledger of every classifier confidence + threshold + outcome.
+
+**Effort**: ~200 LOC + 20 tests.
+
+#### P8.3 — Synchronized multi-op timeline
+
+**Problem**: Each L3 unit has its own debug.log; there's no "show me the synchronized timeline of all 4 units running in parallel."
+
+**Solution**: extend SerpentFlow with `--multi-op` mode that interleaves N op streams by timestamp.
+
+**Effort**: ~400 LOC + 40 tests.
+
+#### P8.4 — Master-flag change SSE event
+
+**Problem**: If `JARVIS_ADAPTIVE_SEMANTIC_GUARDIAN_ENABLED` flips false mid-session, the next mining call returns `[]` with no signal.
+
+**Solution**: new `flag_changed` event when any `JARVIS_*` env mutates mid-session.
+
+**Effort**: ~150 LOC + 15 tests.
+
+#### P8.5 — Latency-SLO breach detector
+
+**Problem**: No alert when phase-level p95 latency creeps up.
+
+**Solution**: bounded ledger of phase-level p95 + alert event when SLO violated.
+
+**Effort**: ~250 LOC + 25 tests.
+
+**Phase 8 total estimate**: ~1,300 LOC + ~130 tests. Approximately **2 weeks of work**. Can ship in parallel with Phase 7.
 
 ---
 
@@ -1714,6 +1989,7 @@ When §5.4 MVP RSI conditions all met → claim Wang-grounded RSI.
 | 2026-04-26 | 2.7 | **Phase 2 P1.5 GRADUATED.** 2-slice arc landed (Slice 1 hypothesis_ledger primitive + REPL → Slice 2 engine integration + validator + graduation). `JARVIS_HYPOTHESIS_PAIRING_ENABLED` default flipped `false`→`true`. Engine extends model prompt to emit paired Hypothesis (claim + expected_outcome); auto-validator does token-overlap matching (overlap≥0.5 → True; ≤0.1 → False; middle band → None) + records back to ledger. Layered evidence: 74 deterministic tests + 15 in-process live-fire + end-to-end integration (engine emit → validator decide → ledger updated → stats reflected). Bounded-by-construction safety stack from P1 unchanged. Hot-revert: single env knob. **Phase 2 entirely closed** — every self-formed goal now testable by construction. | Claude Opus 4.7 (P1.5 Slice 2 graduation PR) |
 | 2026-04-26 | 2.8 | **Phase 4 P3 GRADUATED — both stranded RSI modules un-stranded.** 2-slice arc landed (Slice 1 cognitive_metrics wrapper + `/cognitive` REPL → Slice 2 orchestrator integration + graduation). `JARVIS_COGNITIVE_METRICS_ENABLED` default flipped `false`→`true`. Orchestrator boot wires `CognitiveMetricsService` singleton with the live Oracle; CONTEXT_EXPANSION calls `_score_cognitive_metrics_pre_apply_impl` after PostmortemRecall (advisory-only, never blocks FSM). Both `OraclePreScorer` + `VindicationReflector` accessible via REPL even when wrapper short-circuits. Layered evidence: 63 deterministic tests (43 wrapper + 19 graduation pins + 1 sequence) + 15 in-process live-fire. Vindication call site at post-APPLY tracked as future work — wrapper itself is graduated. Hot-revert: single env knob. | Claude Opus 4.7 (P3 Slice 2 graduation PR) |
 | 2026-04-26 | 2.9 | Doc-only fix to §23.8 Phase × Order composition table — Phase 1 / Order 1 cell now matches §9 truth: drops "SelfRAG over commit history" (never adopted into canonical roadmap; was speculative content from PRD v2.1) and changes the §9 reference from "P0–P1.5" to "P0–P0.5" (Phase 1 in §9 contains only P0 + P0.5; the canonical P1.5 is the Hypothesis ledger under Phase 2). Zero behavior change. Operator-binding: do not reintroduce a "Phase 1 P1.5" label anywhere. | Claude Opus 4.7 (post-P3 cleanup) |
+| 2026-04-26 | 2.27 | **Brutal architectural review + Phase 7+8 roadmap added (doc-only).** Operator requested an unvarnished post-Pass-C self-assessment with grade tables + priority tables + color coding. **§1 Where We Stand** now includes a Grade Summary Table (architecture A−, cognitive depth B, production track record C+, etc. — net B− vs A-level target) with color-coded gap-to-close column. **§3.6 Brutal Architectural Review (NEW SECTION)** added: §3.6.1 Capability matrix vs CC (~70% functional parity, 110% conceptual ambition); §3.6.2 Five known structural fragility vectors (sandbox object-graph escape via `__subclasses__`, Pass C activation gap, cross-process AdaptationLedger race, semantic drift over long horizons, single multi-file APPLY landmark) ranked by severity; §3.6.3 Critical path to A-level RSI (top 3: Phase 7 activation pipeline + Phase 7.6 hypothesis-probe loop + Phase 7.7 sandbox hardening) + 3 medium-priority + 3 least-priority items in color-coded table; §3.6.4 Phase 8 Temporal Observability proposal; §3.6.5 honest grade reconciliation (B− → A path). **§9 Roadmap** adds Phase 7 (Activation & Hardening — 9 sub-slices) + Phase 8 (Temporal Observability — 5 sub-deliverables); updated Phase 6 P6 to acknowledge it's now blocked by Phase 7 (needs real adaptation history, not just substrate). **§1 Forward-Looking Priority Roadmap** rewritten with color-coded sortable table (🔴 Phase 7.1-7.5 = highest priority; 🟡 Phase 8 + soak cadences = medium; 🟢 P6 + CC-parity polish = least). **Cross-priority sequencing rules** updated: rule 5 now reads "P6 after the adaptive substrate is FUNCTIONAL" (not just "ships"); 3 new binding rules added. Zero behavior change. CLAUDE.md verified under 40K. | Claude Opus 4.7 (PRD brutal review + Phase 7+8 roadmap) |
 | 2026-04-26 | 2.26 | **Reverse Russian Doll Pass C Slice 6 — MetaAdaptationGovernor + `/adapt` REPL shipped. CLOSES Pass C ARC.** New module `backend/core/ouroboros/governance/adaptation/meta_governor.py`: operator-facing `/adapt {pending,show,approve,reject,history,stats,help}` REPL dispatcher mirroring Pass B's `/order2` REPL pattern. 12-status DispatchStatus + frozen DispatchResult + 7 subcommand handlers + render helpers + `compute_stats()` aggregator. `--surface` filter on history. Substrate master-off short-circuit (LEDGER_DISABLED). help bypasses master flag. AST-pinned: NO imports of the 4 mining-surface modules (each registered its own validator at its own import; substrate stays acyclic). 55 regression pins covering full subcommand path matrix + end-to-end (mining → propose → REPL approve → APPLIED) + 5 authority invariants. Combined: **349/349 tests green across all 6 Pass C slices**. `JARVIS_ADAPT_REPL_ENABLED` default false. Deferred follow-ups (per module docstring): GET endpoints + SSE event emission + weekly background analyzer + actual gate-state mutation on approve. **Pass C arc structurally complete** — operator can now review + approve/reject the full mining-output stream from all 5 surfaces. Loosening cannot happen via this REPL (Pass B `/order2 amend` is the only loosening path). | Claude Opus 4.7 (Pass C Slice 6 PR — closes Pass C arc) |
 | 2026-04-26 | 2.25 | **Reverse Russian Doll Pass C Slice 5 — ExplorationLedger category-weight auto-rebalance shipped. ONLY Slice 6 MetaGovernor remains.** New module `backend/core/ouroboros/governance/adaptation/category_weight_rebalancer.py`: the only Pass C surface where the proposal *appears* to lower something — mass-conservation makes it net-tighten. Pure stdlib Pearson correlation kernel (Py 3.9 compat manual implementation since `statistics.correlation` was added in 3.10) computes per-category correlation between exploration score and verify_passed binary. Identifies high-value + low-value categories. If correlation gap ≥ delta (default 0.3) AND ≥ threshold (default 10) ops in window, proposes raise-high (20%) + lower-low (10%, hard-floored at 50% of original AND MIN_WEIGHT_VALUE=0.01 absolute). Net-tighten guarantee enforced at three layers: (a) DEFAULT_LOWER_PCT < DEFAULT_RAISE_PCT constants pin; (b) caller-clamp (lower clamped to raise//2 if ≥ raise); (c) defensive mine-time mass-conservation check refuses to propose if Σ(new) < Σ(old). Surface validator: kind=rebalance_weight + sha256-hash + threshold + summary contains BOTH ↑ AND ↓ AND "net +" indicators (defense-in-depth). Idempotent proposal_id (sha256 of high+low+new_weights vector rounded 6dp). Pearson kernel handles edge cases (short input / mismatched lengths / zero-variance returns 0.0; never raises). Master flag `JARVIS_ADAPTIVE_CATEGORY_WEIGHTS_ENABLED` (default false). **62 regression pins** (12 constants + master flag + 8 env overrides + **7 Pearson kernel pins** + 3 per-category correlation pins + 5 weight-rebalance computation pins + 11 mine pipeline pins inc. mass-conservation-invariant + low-floor-invariant + lower-pct-clamp + 3 ledger integration + 8 surface validator + 3 authority invariants + 1 substrate integration). Combined regression spine: **294/294 tests green** across Pass C Slice 1-5. Only Slice 6 (MetaAdaptationGovernor + /adapt REPL + observability) remains. | Claude Opus 4.7 (Pass C Slice 5 PR) |
 | 2026-04-26 | 2.24 | **Doc-only sweep — Current State Assessment + adjacent sections updated to reflect post-Pass-B + Pass-C-in-flight state.** §1 architecture grade B+→A−, cognitive depth C+→B; §2 added 7th success criterion "self-tightening immune system"; §3.1 expanded "what O+V uniquely does" table with 7 new capabilities (PostmortemRecall + SelfGoalFormation + Conversational mode + Inline approval + HEARTBEAT + Wang composite metrics + AdversarialReviewer auto-injection + Order-2 cage + Adaptive Anti-Venom); §3.2 marked 7 of 10 prior CC-superiority items as ✅ delivered or ✅ partial; §3.3 added 5 new "live count" metrics + repositioned the closing claim; **new §3.5 Pass B + Pass C status tables** with all 14 PRs landed today + 670+ test count; §4 intro acknowledges Phase 0-5 graduations + Pass B closure; §4.1 lab-analogy expanded; §5.2 audit status verified with 2 stranded modules un-stranded; §5.5 gap analysis 6/7 rows ✅ closed (P6 deferred + new Adaptive immune system row added). Zero behavior change. CLAUDE.md verified under 40K. | Claude Opus 4.7 (PRD sweep) |
