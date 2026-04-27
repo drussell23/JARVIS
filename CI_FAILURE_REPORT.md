@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: 🎨 Advanced Auto-Diagram Generator
-- **Run Number**: #2707
-- **Branch**: `feat/mining-surface-payload-population`
-- **Commit**: `e8d4c8d1f595ba7e2cae5b2d35b5e03bc6b1f64d`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #44913
+- **Branch**: `fix/ci/advanced-auto-diagram-generator-run2707-20260427-070434`
+- **Commit**: `8a0b01f0b22116070a2edba250e9381af41b29df`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-27T05:54:39Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24978901411)
+- **Timestamp**: 2026-04-27T07:06:52Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24981335459)
 
 ## Failure Overview
 
@@ -17,23 +17,23 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | 🔍 Discover & Analyze Diagrams | linting_error | high | 24s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
-### 1. 🔍 Discover & Analyze Diagrams
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Linting Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-27T06:09:47Z
-**Completed**: 2026-04-27T06:10:11Z
-**Duration**: 24 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24978901411/job/73136500937)
+**Started**: 2026-04-27T07:24:52Z
+**Completed**: 2026-04-27T07:24:55Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24981335459/job/73144013941)
 
 #### Failed Steps
 
-- **Step 3**: 🔍 Discover diagram files
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
@@ -42,24 +42,23 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 81: `2026-04-27T06:10:10.2162826Z ##[error]Unable to process file command 'output' successfully.`
-    - Line 82: `2026-04-27T06:10:10.2172016Z ##[error]Invalid format '  "docs/architecture/OUROBOROS_VENOM_PRD.md"'`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 67: `2026-04-27T06:10:08.7249479Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}`
-    - Line 92: `2026-04-27T06:10:10.3824446Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 30: `2026-04-27T07:24:54.0004137Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-04-27T07:24:54.5368744Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: 🎨 Ad`
 
 - Pattern: `WARN|Warning|warning`
-  - Occurrences: 2
+  - Occurrences: 1
   - Sample matches:
-    - Line 92: `2026-04-27T06:10:10.3824446Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-    - Line 98: `2026-04-27T06:10:10.4136488Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-04-27T07:24:54.5807738Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
 1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -79,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-04-27T07:04:34.033613*
+📊 *Report generated on 2026-04-27T08:23:55.424312*
 🤖 *JARVIS CI/CD Auto-PR Manager*
