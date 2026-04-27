@@ -69,6 +69,29 @@ def webhook_enabled() -> bool:
     ).lower() in ("true", "1", "yes")
 
 
+# Slice 11.6.b — Merkle Cartographer consultation. When the per-sensor
+# flag JARVIS_DOCSTALE_USE_MERKLE is on AND the cartographer's master
+# flag is on, the scan loop short-circuits to the cached prior findings
+# when nothing under ``_scan_paths`` has changed since the last
+# successful scan. Cuts O(N) AST parses to O(1) on the steady state —
+# DocStalenessSensor's 24h poll cycle is dominated by no-change days,
+# and even FS-event triggers re-scan the full subtree (not the changed
+# file alone), so this dwarfs the win on TodoScanner.
+#
+# Default false to preserve byte-identical legacy behavior. Per-sensor
+# graduation: each Slice 11.6.{a,b,c,d} flag flips independently after
+# its own forced-clean once-proof cadence.
+
+
+def merkle_consult_enabled() -> bool:
+    """Re-read ``JARVIS_DOCSTALE_USE_MERKLE`` at call time so monkeypatch
+    works in tests + operator can flip live without re-init."""
+    raw = os.environ.get(
+        "JARVIS_DOCSTALE_USE_MERKLE", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 @dataclass
 class DocFinding:
     """One documentation gap detected."""
@@ -117,6 +140,15 @@ class DocStalenessSensor:
         # graduation arc so operators can read the signal:noise ratio.
         self._webhooks_handled: int = 0
         self._webhooks_ignored: int = 0
+        # Slice 11.6.b — Merkle cartographer consultation state.
+        # ``_merkle_cached_findings`` is the last full-scan output, replayed
+        # on short-circuit cycles. ``_merkle_last_seen_root_hash`` is the
+        # cartographer root hash at the end of the last full scan; the
+        # next cycle compares against ``current_root_hash()`` to decide.
+        self._merkle_cached_findings: List[DocFinding] = []
+        self._merkle_last_seen_root_hash: str = ""
+        self._merkle_short_circuits: int = 0
+        self._merkle_full_scans: int = 0
 
     async def start(self) -> None:
         self._running = True
@@ -285,9 +317,36 @@ class DocStalenessSensor:
             return False
 
     async def scan_once(self) -> List[DocFinding]:
-        """Scan Python files for documentation gaps via AST analysis."""
+        """Scan Python files for documentation gaps via AST analysis.
+
+        Slice 11.6.b — when ``JARVIS_DOCSTALE_USE_MERKLE=true`` AND the
+        Merkle Cartographer says nothing has changed under ``_scan_paths``
+        since the last successful scan, short-circuit to the cached
+        findings (skip AST parsing + emission). When master flag(s) off
+        OR cartographer reports change → full scan as legacy behavior.
+        """
+        current_hash = self._merkle_current_root_hash()
+        if self._merkle_should_short_circuit(current_hash):
+            self._merkle_short_circuits += 1
+            logger.debug(
+                "[DocSensor] Merkle short-circuit "
+                "(scan #%d skipped, %d cached findings)",
+                self._merkle_short_circuits + self._merkle_full_scans,
+                len(self._merkle_cached_findings),
+            )
+            return list(self._merkle_cached_findings)
+
+        self._merkle_full_scans += 1
         loop = asyncio.get_running_loop()
         findings = await loop.run_in_executor(None, self._scan_files_sync)
+        # Cache the result so a subsequent merkle-says-no-change cycle
+        # has accurate state to return. Stored regardless of merkle
+        # flag so flipping the flag mid-session doesn't blank state.
+        self._merkle_cached_findings = list(findings)
+        # Refresh baseline AFTER the scan completes — captures the
+        # cartographer's current state so the next cycle can detect
+        # post-scan changes.
+        self._merkle_last_seen_root_hash = current_hash
 
         # Emit envelopes
         emitted = 0
@@ -327,6 +386,49 @@ class DocStalenessSensor:
                 len(findings), emitted,
             )
         return findings
+
+    def _merkle_current_root_hash(self) -> str:
+        """Read the cartographer's current root hash. Returns empty
+        string on any failure path — fail-safe to legacy scan."""
+        if not merkle_consult_enabled():
+            return ""
+        try:
+            from backend.core.ouroboros.governance.merkle_cartographer import (
+                get_default_cartographer,
+            )
+            c = get_default_cartographer(repo_root=self._project_root)
+            return c.current_root_hash()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[DocSensor] current_root_hash read failed; "
+                "falling through to full scan", exc_info=True,
+            )
+            return ""
+
+    def _merkle_should_short_circuit(self, current_hash: str) -> bool:
+        """Decide whether to skip the AST sweep based on cartographer
+        state. Returns False (i.e. proceed with full scan) on any
+        failure path — fail-safe to legacy behavior.
+
+        Conditions for short-circuit:
+          1. Per-sensor flag ``JARVIS_DOCSTALE_USE_MERKLE`` is true
+          2. Cartographer master flag enabled (its
+             ``current_root_hash`` returns "" when off — sensor
+             treats empty as "always changed" → fail-safe)
+          3. The cartographer's current root hash equals the hash
+             we recorded after the last full scan
+          4. We have a prior cached scan result (no point short-
+             circuiting on cold-start since cache is empty)
+        """
+        if not merkle_consult_enabled():
+            return False
+        if not self._merkle_cached_findings:
+            return False  # cold start — must populate cache
+        if not current_hash:
+            return False  # cartographer disabled / cold-start / error
+        if not self._merkle_last_seen_root_hash:
+            return False  # first scan — no baseline yet
+        return current_hash == self._merkle_last_seen_root_hash
 
     def _scan_files_sync(self) -> List[DocFinding]:
         """CPU-bound scan — runs in a thread via run_in_executor."""
@@ -422,4 +524,10 @@ class DocStalenessSensor:
             "running": self._running,
             "findings_seen": len(self._seen_findings),
             "poll_interval_s": self._poll_interval_s,
+            # Slice 11.6.b — Merkle consultation telemetry
+            "merkle_consult_enabled": merkle_consult_enabled(),
+            "merkle_short_circuits": self._merkle_short_circuits,
+            "merkle_full_scans": self._merkle_full_scans,
+            "merkle_last_seen_root_hash": self._merkle_last_seen_root_hash,
+            "merkle_cached_findings": len(self._merkle_cached_findings),
         }
