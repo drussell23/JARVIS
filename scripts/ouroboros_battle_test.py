@@ -423,6 +423,24 @@ def _print_preflight() -> None:
     print()
 
 
+def _render_multi_op_and_exit(arg: str, *, color: bool) -> None:
+    """Phase 8 Slice 3 — render a multi-op timeline view via the
+    observability/multi_op_renderer module and print to stdout.
+
+    NEVER boots the battle-test stack. Lazy-imports the renderer so
+    this CLI path doesn't pay the substrate import cost when unused.
+    """
+    try:
+        from backend.core.ouroboros.governance.observability.multi_op_renderer import (  # noqa: E501
+            dispatch_cli_argument,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        print(f"  {_RED}multi-op renderer unavailable: {exc}{_RESET}")
+        return
+    text = dispatch_cli_argument(arg, color=color)
+    print(text)
+
+
 def _replay_session(session_ref: str) -> None:
     """Replay a previous battle test session timeline.
 
@@ -756,6 +774,32 @@ def main() -> None:
             "summary.json. Lists available sessions when set to 'list'."
         ),
     )
+    # Phase 8 surface wiring Slice 3 — multi-op timeline renderer.
+    # Read-only over the decision-trace ledger; never boots the
+    # battle-test stack. Default false until graduation; respects
+    # JARVIS_PHASE8_MULTI_OP_RENDERER_ENABLED.
+    parser.add_argument(
+        "--multi-op",
+        type=str,
+        default=None,
+        metavar="REF",
+        help=(
+            "Render a chronological multi-op timeline from the "
+            "decision-trace ledger and exit. REF can be: 'list' to "
+            "show recent op_ids; 'op-A,op-B,op-C' for a comma-list "
+            "(<=16 ops); '@last:N' for the most-recent N ops; "
+            "'session:bt-...' for ops in a battle-test session "
+            "summary. Requires JARVIS_PHASE8_MULTI_OP_RENDERER_ENABLED."
+        ),
+    )
+    parser.add_argument(
+        "--multi-op-no-color",
+        action="store_true",
+        help=(
+            "Disable ANSI color in --multi-op output (default: color "
+            "ON when stdout is a TTY)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -764,6 +808,16 @@ def main() -> None:
     # ------------------------------------------------------------------
     if args.replay is not None:
         _replay_session(args.replay)
+        return
+
+    # ------------------------------------------------------------------
+    # Phase 8 Slice 3 — multi-op timeline render-and-exit
+    # ------------------------------------------------------------------
+    if args.multi_op is not None:
+        _render_multi_op_and_exit(
+            args.multi_op,
+            color=(not args.multi_op_no_color) and sys.stdout.isatty(),
+        )
         return
 
     # ------------------------------------------------------------------
