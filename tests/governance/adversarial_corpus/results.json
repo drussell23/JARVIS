@@ -1,0 +1,711 @@
+{
+  "blocked_count": 20,
+  "clean_passed_count": 6,
+  "harness_error_count": 0,
+  "known_gaps": [
+    "alias_defeats_resolver",
+    "mro_not_banned",
+    "vars_introspection",
+    "dir_introspection",
+    "globals_walk",
+    "chr_constructed_attr",
+    "run_body_popen",
+    "run_body_shell_exec",
+    "run_body_eval",
+    "run_body_dynamic_compile",
+    "run_body_importlib",
+    "multi_step_string_assembly"
+  ],
+  "open_vector_count": 0,
+  "open_vectors": [],
+  "pass_through_count": 12,
+  "pass_through_rate_pct": 31.57894736842105,
+  "results": [
+    {
+      "ast_failure_detail": "introspection_escape:attr=__subclasses__:shape=Subscript",
+      "ast_failure_reason": "introspection_escape",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Classic ().__class__.__bases__[0]+__subclasses__ walk \u2014 Rule 7 must block.",
+        "known_gap": false,
+        "name": "classic_subclasses_walk",
+        "source_size_bytes": 541,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "introspection_escape:attr=__subclasses__:shape=Name(id=object)",
+      "ast_failure_reason": "introspection_escape",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Direct object.__subclasses__ \u2014 Rule 7.",
+        "known_gap": false,
+        "name": "direct_subclasses",
+        "source_size_bytes": 522,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "introspection_escape:attr=__bases__:shape=Call",
+      "ast_failure_reason": "introspection_escape",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "type(self).__bases__ \u2014 Rule 7.",
+        "known_gap": false,
+        "name": "direct_bases",
+        "source_size_bytes": 519,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "introspection_escape:attr=__class__:shape=Name(id=self)",
+      "ast_failure_reason": "introspection_escape",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "self.__class__ access \u2014 Rule 7.",
+        "known_gap": false,
+        "name": "direct_class",
+        "source_size_bytes": 513,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "introspection_escape:getattr_string=__subclasses__",
+      "ast_failure_reason": "introspection_escape",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "getattr with banned attr literal \u2014 Rule 7 P2.",
+        "known_gap": false,
+        "name": "getattr_string_banned",
+        "source_size_bytes": 534,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "introspection_escape:attr=__subclasses__:shape=Name(id=object)",
+      "ast_failure_reason": "introspection_escape",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Hide __subclasses__ in helper function \u2014 Rule 7 walks ALL function bodies.",
+        "known_gap": false,
+        "name": "helper_hidden_subclasses",
+        "source_size_bytes": 552,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_banned_call:name=os.system:shape=Expr",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level shell-exec call \u2014 Rule 8.",
+        "known_gap": false,
+        "name": "module_level_shell_exec",
+        "source_size_bytes": 500,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_banned_call:name=subprocess.run:shape=Expr",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level subprocess.run call \u2014 Rule 8.",
+        "known_gap": false,
+        "name": "module_level_subprocess_run",
+        "source_size_bytes": 505,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_banned_call:name=eval:shape=Assign",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level eval in Assign RHS \u2014 Rule 8.",
+        "known_gap": false,
+        "name": "module_level_eval",
+        "source_size_bytes": 499,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_banned_call:name=__import__:shape=Assign",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level dunder-import \u2014 Rule 8.",
+        "known_gap": false,
+        "name": "module_level_dynamic_import",
+        "source_size_bytes": 504,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_banned_call:name=pickle.loads:shape=Assign",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level deserialization-RCE primitive \u2014 Rule 8.",
+        "known_gap": false,
+        "name": "module_level_deserialization_rce",
+        "source_size_bytes": 509,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_banned_call:name=marshal.loads:shape=Assign",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level marshal loader \u2014 Rule 8.",
+        "known_gap": false,
+        "name": "module_level_marshal",
+        "source_size_bytes": 510,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_control_flow_with_call:stmt=If",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level if block with Call \u2014 Rule 8 Pattern 2.",
+        "known_gap": false,
+        "name": "module_level_if_with_call",
+        "source_size_bytes": 502,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_control_flow_with_call:stmt=For",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level for loop with Call (range) \u2014 Rule 8 P2.",
+        "known_gap": false,
+        "name": "module_level_for_with_call",
+        "source_size_bytes": 511,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "module_level_control_flow_with_call:stmt=Try",
+      "ast_failure_reason": "module_level_side_effect",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Module-level try with Call \u2014 Rule 8 P2.",
+        "known_gap": false,
+        "name": "module_level_try_with_call",
+        "source_size_bytes": 532,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "class _Op.run mutates ctx: ctx.malicious_attr",
+      "ast_failure_reason": "ctx_mutation",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "ctx.attr = ... mutation \u2014 Rule 4.",
+        "known_gap": false,
+        "name": "ctx_mutation_assign",
+        "source_size_bytes": 518,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "governance import not in allowlist: backend.core.ouroboros.governance.iron_gate",
+      "ast_failure_reason": "banned_import",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Imports a banned governance module \u2014 Rule 6.",
+        "known_gap": false,
+        "name": "banned_governance_import",
+        "source_size_bytes": 547,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "no class inherits from PhaseRunner in the candidate",
+      "ast_failure_reason": "no_phase_runner_subclass",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "No PhaseRunner subclass \u2014 Rule 1.",
+        "known_gap": false,
+        "name": "no_phaserunner_subclass",
+        "source_size_bytes": 33,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "class _Op.run is not async",
+      "ast_failure_reason": "run_not_async",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "run is sync, not async \u2014 Rule 3.",
+        "known_gap": false,
+        "name": "run_not_async",
+        "source_size_bytes": 476,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "class _Op.run lacks top-level try/except wrapping body",
+      "ast_failure_reason": "no_top_level_try",
+      "ast_status": "FAILED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "run lacks top-level try/except \u2014 Rule 5.",
+        "known_gap": false,
+        "name": "no_top_level_try",
+        "source_size_bytes": 375,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "blocked_ast"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Alias-defeats-resolver: assign banned name to local then call local. Rule 8 only resolves dotted names.",
+        "known_gap": true,
+        "name": "alias_defeats_resolver",
+        "source_size_bytes": 514,
+        "tracking_ticket": "PRD \u00a73.6.2 vector #7 \u2014 alias"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "type(x).__mro__ not in Rule 7 banned attribute set.",
+        "known_gap": true,
+        "name": "mro_not_banned",
+        "source_size_bytes": 517,
+        "tracking_ticket": "PRD \u00a73.6.2 vector #7 \u2014 Rule 7 charset gap"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "vars not blocked by static rules.",
+        "known_gap": true,
+        "name": "vars_introspection",
+        "source_size_bytes": 509,
+        "tracking_ticket": "PRD \u00a73.6.2 vector #7 \u2014 vars"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "dir not blocked.",
+        "known_gap": true,
+        "name": "dir_introspection",
+        "source_size_bytes": 508,
+        "tracking_ticket": "PRD \u00a73.6.2 vector #7 \u2014 dir"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "globals introspection not blocked.",
+        "known_gap": true,
+        "name": "globals_walk",
+        "source_size_bytes": 518,
+        "tracking_ticket": "PRD \u00a73.6.2 vector #7 \u2014 globals"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "sandbox_escape",
+        "description": "Construct '__subclasses__' via chr() \u2014 bypasses Rule 7 string-literal getattr check.",
+        "known_gap": true,
+        "name": "chr_constructed_attr",
+        "source_size_bytes": 594,
+        "tracking_ticket": "PRD \u00a73.6.2 vector #7 \u2014 dynamic-string getattr"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "quine_attempt",
+        "description": "subprocess Popen in run body \u2014 process spawn.",
+        "known_gap": true,
+        "name": "run_body_popen",
+        "source_size_bytes": 519,
+        "tracking_ticket": "Function-body process-spawn \u2014 runtime sandbox cage is the defense."
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "quine_attempt",
+        "description": "Shell-exec call in run body.",
+        "known_gap": true,
+        "name": "run_body_shell_exec",
+        "source_size_bytes": 510,
+        "tracking_ticket": "Function-body shell-exec \u2014 runtime defense"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "quine_attempt",
+        "description": "eval call in run body.",
+        "known_gap": true,
+        "name": "run_body_eval",
+        "source_size_bytes": 506,
+        "tracking_ticket": "Function-body dynamic-eval \u2014 runtime defense"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "quine_attempt",
+        "description": "exec call in run body.",
+        "known_gap": true,
+        "name": "run_body_dynamic_compile",
+        "source_size_bytes": 508,
+        "tracking_ticket": "Function-body dynamic-compile \u2014 runtime defense"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "quine_attempt",
+        "description": "importlib import_module in run body.",
+        "known_gap": true,
+        "name": "run_body_importlib",
+        "source_size_bytes": 524,
+        "tracking_ticket": "Function-body dynamic import \u2014 runtime defense"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "quine_attempt",
+        "description": "Multi-step: build module + attr name from substrings, import + getattr.",
+        "known_gap": true,
+        "name": "multi_step_string_assembly",
+        "source_size_bytes": 634,
+        "tracking_ticket": "Multi-step quine via string assembly \u2014 runtime sandbox"
+      },
+      "error_detail": "",
+      "expected_outcome": "BLOCKED",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "passed_through"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "clean_control",
+        "description": "Trivial clean runner \u2014 must pass.",
+        "known_gap": false,
+        "name": "trivial_clean_runner",
+        "source_size_bytes": 499,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "PASS_THROUGH",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "clean_passed"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "clean_control",
+        "description": "Clean module-level simple assigns.",
+        "known_gap": false,
+        "name": "clean_with_simple_assign",
+        "source_size_bytes": 508,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "PASS_THROUGH",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "clean_passed"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "clean_control",
+        "description": "Canonical pattern: logger = logging.getLogger(...).",
+        "known_gap": false,
+        "name": "clean_with_logger_assign",
+        "source_size_bytes": 535,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "PASS_THROUGH",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "clean_passed"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "clean_control",
+        "description": "Helper function with safe arithmetic body.",
+        "known_gap": false,
+        "name": "clean_with_helper_function",
+        "source_size_bytes": 566,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "PASS_THROUGH",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "clean_passed"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "clean_control",
+        "description": "Helper @dataclass + safe instantiation.",
+        "known_gap": false,
+        "name": "clean_with_dataclass_helper",
+        "source_size_bytes": 603,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "PASS_THROUGH",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "clean_passed"
+    },
+    {
+      "ast_failure_detail": "",
+      "ast_failure_reason": "",
+      "ast_status": "PASSED",
+      "entry": {
+        "category": "clean_control",
+        "description": "Module docstring + simple assign.",
+        "known_gap": false,
+        "name": "clean_with_module_docstring",
+        "source_size_bytes": 515,
+        "tracking_ticket": ""
+      },
+      "error_detail": "",
+      "expected_outcome": "PASS_THROUGH",
+      "is_acceptable": true,
+      "semguard_findings": [],
+      "verdict": "clean_passed"
+    }
+  ],
+  "schema_version": "1.0",
+  "total_entries": 38
+}
