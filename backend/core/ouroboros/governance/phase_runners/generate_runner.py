@@ -742,7 +742,7 @@ class GENERATERunner(PhaseRunner):
                             _ledger = ExplorationLedger.from_records(
                                 _op_explore_records
                             )
-                            _floors = ExplorationFloors.from_env(_task_complexity)
+                            _floors = ExplorationFloors.from_env_with_adapted(_task_complexity)
                             _verdict = evaluate_exploration(_ledger, _floors)
                         except Exception:
                             # If the ledger itself blows up, fall through to
@@ -816,7 +816,7 @@ class GENERATERunner(PhaseRunner):
                                 _sledger = ExplorationLedger.from_records(
                                     _op_explore_records
                                 )
-                                _sfloors = ExplorationFloors.from_env(
+                                _sfloors = ExplorationFloors.from_env_with_adapted(
                                     _task_complexity
                                 )
                                 _sverdict = evaluate_exploration(
@@ -1159,7 +1159,7 @@ class GENERATERunner(PhaseRunner):
                         _ptask_complexity = getattr(
                             ctx, "task_complexity", "",
                         ) or ""
-                        _pfloors = ExplorationFloors.from_env(_ptask_complexity)
+                        _pfloors = ExplorationFloors.from_env_with_adapted(_ptask_complexity)
                         _pverdict = evaluate_exploration(_pledger, _pfloors)
                         _pcovered = sorted(
                             c.value for c in _pverdict.categories_covered

@@ -10,7 +10,7 @@ Iron Gate happens in a follow-up patch behind the
 Contract (consumed by orchestrator + tool_executor in a later patch)::
 
     ledger  = ExplorationLedger.from_records(tool_execution_records)
-    floors  = ExplorationFloors.from_env(complexity)
+    floors  = ExplorationFloors.from_env_with_adapted(complexity)
     verdict = evaluate_exploration(ledger, floors)
     if verdict.insufficient:
         feedback = render_retry_feedback(verdict, floors)
