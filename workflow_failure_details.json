@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24978666660",
-  "branch": "fix/ci/advanced-auto-diagram-generator-run2695-20260427-054549",
-  "commit_sha": "5faac52",
-  "run_number": 44674,
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24980978761",
+  "branch": "fix/ci/pr-automation-validation-run44674-20260427-065620",
+  "commit_sha": "5e7d825",
+  "run_number": 44889,
   "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run44674-20260427-065620",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #44674)",
+  "fix_branch": "fix/ci/pr-automation-validation-run44889-20260427-081525",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #44889)",
   "analyses": [
     {
       "error_patterns": [
@@ -15,13 +15,13 @@
           "matches": [
             {
               "line_number": 30,
-              "content": "2026-04-27T06:02:49.5551340Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2026-04-27T07:14:28.8719890Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 42,
-              "content": "2026-04-27T06:02:50.1213278Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: \ud83c\udfa8 Advanced Auto-Diagram Generator (Run #2695)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2026-04-27T07:14:29.6462315Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #44674)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -33,7 +33,7 @@
           "matches": [
             {
               "line_number": 58,
-              "content": "2026-04-27T06:02:50.1686852Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "content": "2026-04-27T07:14:29.7110595Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -62,5 +62,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-04-27T06:56:20.752220"
+  "timestamp": "2026-04-27T08:15:25.429198"
 }
