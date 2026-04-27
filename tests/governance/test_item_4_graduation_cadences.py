@@ -124,13 +124,15 @@ class TestPath:
 
 
 class TestCadencePolicy:
-    def test_15_known_flags(self):
+    def test_24_known_flags(self):
         # 10 Pass B (Phase 7.1-7.6 + 7.9 + Items 2 + Item 3 prober +
-        # Item 3 bridges) + 5 Pass C mining surfaces.
-        # NOTE: 7.7+7.8 are not in the policy because they're already
+        # Item 3 bridges) + 5 Pass C mining surfaces + 9 added in
+        # Phase 9.1 (5 Phase 8 substrate + 3 Phase 8 surface +
+        # CuriosityEngine).
+        # NOTE: 7.7+7.8 + AST Rule 7+8 not in policy because already
         # default-true (security hardening on by default).
-        assert len(CADENCE_POLICY) == 15
-        assert len(known_flags()) == 15
+        assert len(CADENCE_POLICY) == 24
+        assert len(known_flags()) == 24
 
     def test_pass_b_default_3_clean(self):
         # All Pass B entries require 3 clean sessions.

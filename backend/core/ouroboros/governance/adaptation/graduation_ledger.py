@@ -262,6 +262,77 @@ CADENCE_POLICY: Tuple[CadencePolicyEntry, ...] = (
         cadence_class=CadenceClass.PASS_C,
         description="Pass C Slice 5 — category-weight rebalancer",
     ),
+    # ----------------------------------------------------------------
+    # Phase 8 — Temporal Observability substrate (5 modules from v2.44)
+    # ----------------------------------------------------------------
+    CadencePolicyEntry(
+        flag_name="JARVIS_DECISION_TRACE_LEDGER_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description="Phase 8.1 — DecisionTraceLedger append-only JSONL",
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_LATENT_CONFIDENCE_RING_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description="Phase 8.2 — LatentConfidenceRing in-memory ring buffer",
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_MULTI_OP_TIMELINE_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description="Phase 8.3 — multi-op timeline merger",
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_FLAG_CHANGE_EMITTER_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description="Phase 8.4 — FlagChangeMonitor snapshot+diff",
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_LATENCY_SLO_DETECTOR_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description="Phase 8.5 — LatencySLODetector per-phase p95",
+    ),
+    # ----------------------------------------------------------------
+    # Phase 8 surface wiring (3 slices from v2.48-2.50)
+    # ----------------------------------------------------------------
+    CadencePolicyEntry(
+        flag_name="JARVIS_PHASE8_IDE_OBSERVABILITY_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Phase 8 Slice 1 — Phase8ObservabilityRouter (8 GET endpoints)"
+        ),
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_PHASE8_SSE_BRIDGE_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Phase 8 Slice 2 — SSE event bridges (5 new event types)"
+        ),
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_PHASE8_MULTI_OP_RENDERER_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Phase 8 Slice 3 — multi-op CLI renderer + battle-test --multi-op"
+        ),
+    ),
+    # ----------------------------------------------------------------
+    # CuriosityEngine v2.45 (autonomous hypothesis-generation primitive)
+    # ----------------------------------------------------------------
+    CadencePolicyEntry(
+        flag_name="JARVIS_CURIOSITY_ENGINE_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "CuriosityEngine — POSTMORTEM clusters → falsifiable hypotheses"
+        ),
+    ),
 )
 
 
