@@ -1195,12 +1195,15 @@ class ToolExecutor:
 
         # (b) Parse + extract. ASTChunker is sync via
         # extract_chunks_from_source so we don't have to enter an
-        # event loop from this synchronous handler.
+        # event loop from this synchronous handler. ``include_all``
+        # is True when imports are requested so the module-header
+        # chunk gets extracted for the imports prepend below.
         try:
             chunker = ASTChunker(_NoOpTokenCounter())
             chunks = chunker.extract_chunks_from_source(
                 full_text, resolved,
                 target_names={target_symbol.split(".")[-1]},
+                include_all=include_imports,
             )
         except Exception as exc:  # noqa: BLE001 — defensive
             record_slice(SliceMetric(
