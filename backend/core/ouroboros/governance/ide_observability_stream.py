@@ -197,6 +197,22 @@ EVENT_TYPE_METRICS_UPDATED = "metrics_updated"
 # ``/observability/adversarial/{op_id}`` GET.
 EVENT_TYPE_ADVERSARIAL_FINDINGS_EMITTED = "adversarial_findings_emitted"
 
+# Phase 8 surface wiring Slice 2 — Temporal Observability stream
+# vocabulary. Five event types bridge the 5 Phase 8 substrate
+# modules (decision_trace_ledger / latent_confidence_ring /
+# latency_slo_detector / flag_change_emitter) onto the existing
+# StreamEventBroker. Bridge functions live in
+# ``observability/sse_bridge.py``; producers (orchestrator code +
+# classifiers + periodic monitors) call those bridges after the
+# substrate's record/check methods. Best-effort, never raise. All
+# 5 are gated by ``JARVIS_PHASE8_SSE_BRIDGE_ENABLED`` (default
+# false until graduation) AND per-event sub-flags.
+EVENT_TYPE_DECISION_RECORDED = "decision_recorded"
+EVENT_TYPE_CONFIDENCE_OBSERVED = "confidence_observed"
+EVENT_TYPE_CONFIDENCE_DROP_DETECTED = "confidence_drop_detected"
+EVENT_TYPE_SLO_BREACHED = "slo_breached"
+EVENT_TYPE_FLAG_CHANGED = "flag_changed"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -241,6 +257,11 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CURIOSITY_QUESTION_EMITTED,  # W2(4) Slice 3
     EVENT_TYPE_METRICS_UPDATED,  # Phase 4 P4 Slice 4
     EVENT_TYPE_ADVERSARIAL_FINDINGS_EMITTED,  # Phase 5 P5 Slice 4
+    EVENT_TYPE_DECISION_RECORDED,             # Phase 8 Slice 2
+    EVENT_TYPE_CONFIDENCE_OBSERVED,           # Phase 8 Slice 2
+    EVENT_TYPE_CONFIDENCE_DROP_DETECTED,      # Phase 8 Slice 2
+    EVENT_TYPE_SLO_BREACHED,                  # Phase 8 Slice 2
+    EVENT_TYPE_FLAG_CHANGED,                  # Phase 8 Slice 2
 })
 
 
