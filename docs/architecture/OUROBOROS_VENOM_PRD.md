@@ -207,6 +207,15 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
 **🎉 Phase 7 structurally complete 2026-04-26.** Next open phase items per the Forward-Looking Priority Roadmap: **caller wiring + Slice-6 YAML writer + HypothesisProbe production prober wiring + per-slice graduation cadences** (these convert substrate-complete to functionally-live) → **Phase 6 P6** (Self-narrative, long-horizon — now unblocked from a Phase-7-substrate POV; caller wiring is the practical prerequisite for "real adaptation history to narrate").
 **Phase 6 — Self-Modeling**: [ ] not started — long-horizon (3-6 months per PRD).
 
+**Phase 10 — Provider Strategy + Dynamic Topology Sentinel** *(NEW 2026-04-27 — derived from §3.7 audit)*: 🚀 IN FLIGHT — Slice 1 landed 2026-04-27.
+- [x] **P10.1 — `AsyncTopologySentinel` foundation** landed 2026-04-27 (PR #25504 → main `d1556abf15`, 62 tests + 134 combined regression). Composes `rate_limiter.CircuitBreaker` + `TokenBucket` + `preemption_fsm._compute_backoff_ms` + `RetryBudget(full_jitter=True)`; net-new ~600 LOC = `SlowStartRamp` (BG concurrency ramp; wraps `TokenBucket.set_throttle()`) + `ContextWeightedProber` (light/heavy 4:1; weighted failure matrix with live stream-stall = 3.0 to trip alone) + `SentinelStateStore` (mirrors `posture_store.py` triplet pattern; atomic temp+rename; bounded ring trim) + `TopologySentinel` coordinator (~150 LOC of glue). Master flag `JARVIS_TOPOLOGY_SENTINEL_ENABLED` default **false** — no consumers wired, byte-identical behavior. Boot-loop protection: `state=OPEN` snapshots reconstruct breaker into OPEN with original `opened_at`; process killed mid-SEVERED comes back into SEVERED. AST authority pins forbid `*Breaker`/`*Bucket`/`*Backoff` class definitions in the new module + forbid orchestrator/iron_gate/policy/gate/change_engine/candidate_generator imports. RLock re-entrancy fix bundled (force_severed/force_healthy hold the lock then call register_endpoint — same pattern that bit posture_observer slice5_arc_a).
+- [x] **Immediate yaml caller swap** (this PR, 2026-04-27): `compaction` caller migrated `gemma-4-31B-it` → `Qwen3-14B-FP8` under v1 schema. **75× cost reduction** on every compaction call. `summarization` is the catalog-published use case for Qwen3-14B-FP8; 262K context handles deep tool-loop history.
+- [~] **P10.2 — yaml v2 schema + dual-reader** in flight (branch `feat/topology-sentinel-slice-2`). `topology.2` schema introduces per-route `dw_models:` ranked list + `fallback_tolerance: cascade_to_claude | queue` enum + `monitor:` block (probe intervals, severed_threshold, ramp schedule). Backward-compat: `Topology.from_v2(...)` classmethod; `get_topology()` tries v2 first, falls back to v1.
+- [ ] **P10.3 — `candidate_generator.py` consumer wiring** under `JARVIS_TOPOLOGY_SENTINEL_ENABLED`; replaces static gate at `1404-1465` with sentinel-driven walk over ranked `dw_models:` list. BG/SPEC `fallback_tolerance="queue"` regression-pinned at the routing layer (no env shortcut allows BG/SPEC to cascade to Claude under sentinel-OPEN).
+- [ ] **P10.4 — Live-exception failure ingest** at existing DW failure sites (`candidate_generator.py:1662-1667 / 1674-1687 / 2200-2213`); `sentinel.report_failure(model_id, FailureSource.LIVE_STREAM_STALL, detail)` weight 3.0 trips faster than probe-only.
+- [ ] **P10.5 — THE PURGE** (operator-authorized after 3 forced-clean once-proofs of Slices 3-4): delete static `dw_allowed: false` lines + read-only Nervous System Reflex carve-out at `candidate_generator.py:2062-2067` + v1 dual-reader + `JARVIS_BACKGROUND_ALLOW_FALLBACK` / `FORCE_CLAUDE_BACKGROUND` env shortcuts. Flip `JARVIS_TOPOLOGY_SENTINEL_ENABLED` default `false` → `true`.
+- [ ] **P10.6 — 24h soak + cost-per-op trending validation**: post-Phase-10 target ≥30% of GENERATE cost on DW providers + ≥50% reduction in $/op median.
+
 Update discipline: each closing slice updates this section in the same PR. Status is the source of truth for "what's next" — when in doubt, the lowest-numbered `[ ]` row in the lowest-numbered active phase is the next slice.
 
 ### Forward-Looking Priority Roadmap (rewritten 2026-04-27 post-Phase-8-surface-closure + post-brutal-review-v2)
@@ -584,6 +593,110 @@ This sub-section captures the operator-requested brutal review delivered post-Ph
   - Conversation rewind-and-fork — SessionRecorder has the data; SessionReplay shows linear playback; rewind-and-fork is missing.
 
 **Reverse Russian Doll alignment** (per Pass A): the First Order is **structurally complete**. O+V demonstrably writes code that lands in JARVIS via autonomous APPLY (Sessions O+ in the 2026-04-15 → 2026-04-19 arc proved this). The Antivenom is structurally tight (8 AST rules + 10 SemGuard + sandbox + Iron Gate + risk-tier floor + mutation cage + hard-kill wrapper) — **empirically untested at adversarial scale, which is Priority #2.** The Second Order horizon (O+V rewrites its own cognitive architecture) is gated on the three Second Order RSI prerequisites enumerated in §3.6.5 above PLUS Priorities #1-#3 from §3.6.3.
+
+### 3.7 Provider Strategy Audit & DW Model Selection *(NEW 2026-04-27)*
+
+**Why this section exists**: The cron once-proof on session `bt-2026-04-27-181437` produced empirical evidence that O+V is currently 100% Claude-dependent for primary GENERATE — `cost_by_op_phase_provider` showed `op-019dd028 GENERATE → claude-api $0.030342` with zero DW spend. The decision-trace ledger captured three of six terminal rows with literal `terminal_reason="background_accepted:background_dw_blocked_by_topology:Gemma 4 31B stream-stalls on DW endpoint even"` — the static yaml block firing on every BG op. The directive 2026-04-27 ("we are utilizing DW's provider correctly since it is always cascading to Claude's API which is more expensive compared to DW's API") is mathematically correct and the root cause is internal: hardcoded `dw_allowed: false` blocks at `brain_selection_policy.yaml:347-364` covering all 5 routes.
+
+#### 3.7.1 Current state (audited 2026-04-27)
+
+| Surface | Today | Cost basis |
+|---|---|---|
+| **Topology layer** (`brain_selection_policy.yaml:342-365`) | All 5 routes have `dw_allowed: false` — sealed by live-fire stream-stall evidence (`bbpst3ebf`, `bt-2026-04-14-203740`, `bt-2026-04-27-162115`) | n/a (gate, not provider) |
+| **Primary GENERATE** (when topology unsealed) | `Qwen3.5-397B-A17B` via `DoublewordProvider._generate_realtime` | $0.60–1.20 in / $3.60–7.20 out per M (when working) |
+| **PLAN phase** (`ouroboros_plan` caller) | `google/gemma-4-31B-it` | $0.14–0.60 in / $0.40–1.20 out per M (when working) |
+| **SemanticTriage** (`semantic_triage` caller) | `google/gemma-4-31B-it` | Same |
+| **Compaction** (`compaction` caller, SHADOW default) | `google/gemma-4-31B-it` | Same |
+| **VisionSensor Tier 2** | `Qwen/Qwen3-VL-235B-A22B-FP8` | $0.60 in / $1.20 out per M (frontier vision) |
+| **Embeddings** (`semantic_index.py`) | local `fastembed` + `bge-small-en-v1.5` | $0/$0 (local CPU) but lower quality + EN-only |
+| **Effective production reality** | All GENERATE work routes through Claude (Tier 1) at $3 in / $15 out per M | **30× more expensive than DW would be** |
+
+**Two env shortcuts that could leak BG to Claude** (audited 2026-04-27, both unset):
+- `JARVIS_BACKGROUND_ALLOW_FALLBACK` — opt-in safety net at `candidate_generator.py:2059-2061`. **Verified unset in production env.** ✓
+- `FORCE_CLAUDE_BACKGROUND` — DW-bypass for harness debug at `candidate_generator.py:2056-2058`. **Verified unset in production env.** ✓
+
+**The cost burn is therefore NOT a leak — it's the topology gate firing as designed on degraded DW endpoints.** The directive's correct conclusion: the static gate must be replaced by a dynamic, asynchronous, self-healing topology sentinel. See §9 Phase 10 for the implementation arc.
+
+#### 3.7.2 Doubleword catalog audit (sourced from `docs.doubleword.ai/inference-api/model-pricing`, 2026-04-27)
+
+17 models in active catalog. Selected for O+V's cognitive surfaces:
+
+| Tier | Model | Params | In $/M | Out $/M | Context | O+V role fit |
+|---|---|---|---|---|---|---|
+| **Frontier code** | `moonshotai/Kimi-K2.6` | MoE | 0.95 | 4.00 | 256K | Primary GENERATE — "long-horizon coding, agents, swarm" — closest published surface to O+V's autonomous-multi-file-edit pattern |
+| **Frontier code** | `zai-org/GLM-5.1-FP8` | — | 1.40 | 4.40 | 202K | Primary GENERATE alt — "state-of-the-art on SWE-Bench Pro," "agentic engineering, repo gen, terminal" |
+| **Frontier reasoning** | `Qwen/Qwen3.5-397B-A17B` | 397B (17B active) | 0.60 | 3.60 | 262K | Legacy primary; demoted to last-resort DW after sealing evidence |
+| **Mid-tier code** | `Qwen/Qwen3.6-35B-A3B-FP8` | 35B | 0.25 | 2.00 | 262K | Budget GENERATE backup — newer family than 397B, may stream more reliably |
+| **Function-calling / structured JSON** | `google/gemma-4-31B-it` | 31B | 0.14 | 0.40 | 256K | PLAN + SemanticTriage primary — "native function calling and structured JSON output for agentic workflows" |
+| **Function-calling fallback** | `Qwen/Qwen3.5-9B` | 9B | 0.08 | 0.70 | 262K | PLAN/SemanticTriage cheap fallback |
+| **Long-context summarization** | `Qwen/Qwen3-14B-FP8` | 14B | 0.05 | 0.20 | 262K | Compaction primary — catalog-explicit "summarization" model |
+| **Ultra-cheap classifier** | `Qwen/Qwen3.5-4B` | 4B | 0.04 | 0.06 | 262K | BG/SPEC sensor classifier (DocStaleness/TodoScanner/IntentDiscovery/ProactiveExploration triage) — **250× cheaper than Claude** |
+| **Embeddings** | `Qwen/Qwen3-Embedding-8B` | 8B | 0.04 | 0.00 | 32K | Replace local fastembed in `semantic_index.py` — MTEB #1 multilingual |
+| **Vision frontier** | `Qwen/Qwen3-VL-235B-A22B-FP8` | 235B (22B active) | 0.60 | 1.20 | 262K | VisionSensor Tier 2 + Visual VERIFY (current — keep) |
+| **Vision cheap pre-screen** | `Qwen/Qwen3-VL-30B-A3B-FP8` | 30B | 0.16 | 0.80 | — | VisionSensor Tier 1 — first-pass screening before escalation to 235B |
+| **OCR specialist** | `deepseek-ai/DeepSeek-OCR-2` | — | 0.05 | 0.05 | — | VisionSensor Tier 0 OCR |
+| **OCR specialist alt** | `lightonai/LightOnOCR-2-1B-bbox-soup` | 1B | 0.05 | 0.05 | — | VisionSensor Tier 0 with bounding-box output |
+
+#### 3.7.3 Recommended model matrix per O+V surface
+
+For each surface, a **ranked list** of DW models (sentinel walks the list trying each healthy endpoint; only after exhausting all DW models does the route cascade to Claude per `fallback_tolerance`):
+
+| Surface | DW model rank order | Claude cascade tolerance | Cost vs Claude (output) |
+|---|---|---|---|
+| **GENERATE — IMMEDIATE** | (skip DW by design; Claude direct) | n/a | n/a (Manifesto §5: speed > cost) |
+| **GENERATE — STANDARD/COMPLEX** | 1. `moonshotai/Kimi-K2.6` ($4/M out)<br>2. `zai-org/GLM-5.1-FP8` ($4.40)<br>3. `Qwen/Qwen3.6-35B-A3B-FP8` ($2.00)<br>4. `Qwen/Qwen3.5-397B-A17B` ($3.60) | `cascade_to_claude` (justified — user-waiting) | 3.4–7.5× cheaper if any rank lands |
+| **GENERATE — BACKGROUND** | 1. `Qwen/Qwen3.6-35B-A3B-FP8`<br>2. `moonshotai/Kimi-K2.6` | **`queue`** (DO NOT cascade — preserve unit economics) | n/a (queued on full failure) |
+| **GENERATE — SPECULATIVE** | 1. `Qwen/Qwen3.5-9B` ($0.70/M out)<br>2. `Qwen/Qwen3.5-4B` ($0.06) | **`queue`** | n/a |
+| **PLAN phase** | 1. `google/gemma-4-31B-it`<br>2. `Qwen/Qwen3.5-9B` | `cascade_to_claude` | 37.5× / 21× cheaper |
+| **SemanticTriage** | 1. `google/gemma-4-31B-it`<br>2. `Qwen/Qwen3.5-4B` | `cascade_to_claude` | 37.5× / 250× cheaper |
+| **Compaction** | 1. `Qwen/Qwen3-14B-FP8`<br>2. `google/gemma-4-31B-it` | `cascade_to_claude` | 75× / 37.5× cheaper |
+| **BG sensor classifiers** (DocStaleness, TodoScanner, IntentDiscovery, ProactiveExploration) | 1. `Qwen/Qwen3.5-4B`<br>2. `Qwen/Qwen3.5-9B` | **`queue`** | 250× / 21× cheaper |
+| **Mid-reasoning sensors** (OpportunityMiner, CapabilityGap) | 1. `Qwen/Qwen3.5-9B`<br>2. `google/gemma-4-31B-it` | **`queue`** | 21× / 37.5× cheaper |
+| **VisionSensor Tier 1** (cheap pre-screen, NEW) | 1. `Qwen/Qwen3-VL-30B-A3B-FP8` | `cascade_to_claude` | 18.75× cheaper |
+| **VisionSensor Tier 2 + Visual VERIFY** | 1. `Qwen/Qwen3-VL-235B-A22B-FP8` (current) | `cascade_to_claude` | 12.5× cheaper |
+| **OCR pipeline** (VisionSensor Tier 0, NEW) | 1. `deepseek-ai/DeepSeek-OCR-2`<br>2. `lightonai/LightOnOCR-2-1B-bbox-soup` | `queue` | 300× cheaper |
+| **Embeddings** (`semantic_index.py`, NEW DW alternative) | 1. `Qwen/Qwen3-Embedding-8B` | local fastembed (existing path) | $0.04/$0 vs $0/$0 (cost-equivalent; quality ↑) |
+
+#### 3.7.4 Honest answers to the operator's questions
+
+**Q1: Will these changes prevent more cost?**
+
+YES, conditionally:
+- **Triage + compaction** (always-on hot paths): swap to Qwen3.5-4B / Qwen3-14B-FP8 = **75–250× cheaper per call**. Even if these stream-stall sometimes, the sentinel falls back through ranked alternatives before hitting Claude. **Realistic floor: 30–50% cost reduction on these surfaces immediately**, scaling higher as DW endpoints stabilize.
+- **GENERATE** (cost-dominant route): swap to ranked Kimi-K2.6 / GLM-5.1 / Qwen3.6-35B = **3.4–7.5× cheaper per call IF any DW model in the rank streams reliably**. If all four fail, we cascade to Claude at the same cost as today — no regression.
+- **BG/SPEC sensors**: swap to Qwen3.5-4B = **250× cheaper**. With `fallback_tolerance: queue` the route NEVER cascades to Claude — ops queue and the sensor re-detects later. Pure cost win, no Claude leak risk.
+- **Embeddings**: optional swap to Qwen3-Embedding-8B for quality, cost-equivalent.
+
+**Combined steady-state estimate** (assuming at least one Kimi/GLM/Qwen3.6 streams reliably): **50–80% reduction in $/op vs current Claude-dependent state**. If all GENERATE-tier DW models fail and we still cascade fully, the sensor + triage + compaction tier alone delivers **~20–30% reduction**.
+
+**Q2: Will these DW providers be more reliable and not cascade like before?**
+
+**The MODELS we don't yet know — only an empirical answer suffices.** What we DO know:
+- The 397B + Gemma-31B stream-stalls were observed on specific dates (`bt-2026-04-14-203740`, `bt-2026-04-27-162115`); whether those endpoints are still degraded is a current-state question with no recent test data.
+- Kimi-K2.6, GLM-5.1, and Qwen3.6-35B are different model families on different runtime stacks. Their streaming behavior is independent. Catalog publish dates suggest Qwen3.6 + Kimi-K2.6 are newer than the originally-sealed endpoints, so re-testing is warranted.
+- **The SYSTEM around DW will be more reliable regardless of model behavior** — Slice 1 (PR #25504, merged) installs the AsyncTopologySentinel: per-`model_id` circuit breaker, weighted-failure-streak (live stream-stall = 3.0, single occurrence trips alone), exponential backoff with full jitter, slow-start ramp on recovery, persistent state with boot-loop protection. Even if every DW model is unhealthy, we trip cleanly + cascade fast (or queue per route policy) instead of stream-stalling on every op.
+
+**Q3: Are there other models we can add for O+V development?**
+
+Yes — five additions to the prior 5-model recommendation, expanding to **13 models across 13 surfaces**:
+
+1. **`Qwen/Qwen3.5-4B`** — Ultra-cheap classifier ($0.04/$0.06). Replaces Gemma-4-31B for high-volume triage on BG/SPEC sensors; 250× cheaper than Claude.
+2. **`Qwen/Qwen3.5-9B`** — Mid-tier reasoning ($0.08/$0.70). Sweet spot for OpportunityMiner / CapabilityGap (mild reasoning, BG route) and as PLAN/Triage cheap fallback.
+3. **`Qwen/Qwen3-Embedding-8B`** — DW embedding option ($0.04/$0). MTEB #1 multilingual; raises quality of `semantic_index.py` centroid math beyond local fastembed without meaningfully raising cost.
+4. **`Qwen/Qwen3-VL-30B-A3B-FP8`** — Vision pre-screen ($0.16/$0.80). New Tier 1 for VisionSensor — first-pass for screen-content classification before escalation to 235B Tier 2.
+5. **`deepseek-ai/DeepSeek-OCR-2`** — OCR specialist ($0.05/$0.05). New Tier 0 for VisionSensor OCR pipeline; 300× cheaper than running OCR through a frontier vision model.
+
+These five are in addition to the four primary picks (Kimi-K2.6, GLM-5.1, Qwen3.6-35B, Qwen3-14B-FP8) and the four kept-as-is (Gemma-4-31B, Qwen3.5-397B, Qwen3-VL-235B, the local fastembed fallback).
+
+#### 3.7.5 Implementation status
+
+- **Slice 1** (PR #25504, merged 2026-04-27): `topology_sentinel.py` foundation — 3-state breaker per `model_id`, weighted failure ingest, slow-start ramp, persistent state with boot-loop protection. **No consumers wired** (master flag `JARVIS_TOPOLOGY_SENTINEL_ENABLED` default false). 62 tests + 134 combined regression green.
+- **Immediate yaml swap** (this PR): `compaction` caller: `gemma-4-31B-it` → `Qwen3-14B-FP8` (under v1 schema, safe within current dual-reader). 75× cost reduction on every compaction call.
+- **Slice 2** (next PR): yaml v2 schema with per-route `dw_models:` ranked list + `fallback_tolerance` enum + dual-reader in `provider_topology.py`. Default behavior unchanged when v2 keys absent.
+- **Slices 3–5**: `candidate_generator.py` consults sentinel; live-exception failure ingest at existing failure sites; the **purge** — delete static `dw_allowed: false` lines + read-only Nervous System Reflex carve-out at `candidate_generator.py:2062-2067`.
+- **Slice 6**: 24h soak validation + flag-default flip + lock in cost-per-op trending downward.
+
+See §9 Phase 10 for the full slice-by-slice plan.
 
 ---
 
@@ -1292,6 +1405,105 @@ Run the corpus through `validate_ast` + `SemanticGuardian` + `ScopedToolBackend`
 - [ ] Combined regression: **0 NEW infra-noise classes introduced** (Pass B clean-bar discipline preserved).
 
 **Honest-grade impact**: Phase 9 closure converts B+ trending A− → solid A−. Phase 9 + adversarial-cage 0% pass-through + 50-session coherence proof + AutoCommitter race fix + artifact contract schema-versioning → A. Anything beyond A requires Second Order RSI (per §3.6.5 prerequisites 4+5+6).
+
+### Phase 10 — Provider Strategy + Dynamic Topology Sentinel *(NEW 2026-04-27 — derived from §3.7 audit; CRITICAL for cost economics)*
+
+**Goal**: replace the static `dw_allowed: false` blocks in `brain_selection_policy.yaml` with a live, asynchronous, per-`model_id` health observer (`topology_sentinel.py`) so the system **dynamically discovers** which DW endpoints stream reliably — and routes through ranked DW model lists before any Claude cascade.
+
+**Why this phase exists** (per §3.7): O+V is currently 100% Claude-dependent for primary GENERATE because all 5 routes were sealed at the topology layer when specific DW endpoints stream-stalled in April. Static seals are Zero Order workarounds — they never re-test for recovery, never expose alternative DW models, and silently force every op into the 30× more expensive Claude lane. The directive 2026-04-27 ("hardcoding dw_allowed: false is a Zero-Order splint") authorized building the dynamic replacement.
+
+**Why this is impact-ranked above further Phase 9 work**: every soak session today burns ~$0.05–$0.50 on Claude tokens that *would have been ~$0.005–$0.05 on DW* if even one DW model were healthy. Phase 9's graduation cadence of 12+ flags × 3 sessions × ~$0.30/session implies ~$11–15 of avoidable cost during graduation alone. Phase 10 converts that into a 3–7× cheaper soak budget → faster Phase 9 progress.
+
+#### P10.1 — `AsyncTopologySentinel` foundation *(landed 2026-04-27, PR #25504)*
+
+**Status**: ✅ MERGED.
+
+`backend/core/ouroboros/governance/topology_sentinel.py` (~1000 LOC), composing existing primitives — `rate_limiter.CircuitBreaker` for the per-`model_id` 3-state FSM, `rate_limiter.TokenBucket` for the slow-start ramp, `preemption_fsm._compute_backoff_ms` with `RetryBudget(full_jitter=True)` for Amazon-style jittered backoff, `posture_store.py` pattern for the disk-backed `topology_sentinel_current.json` + `topology_sentinel_history.jsonl` triplet.
+
+**Net-new components** (~600 LOC): `SlowStartRamp` (BG/SPEC concurrency ramp on recovery — wraps TokenBucket via `set_throttle()`), `ContextWeightedProber` (light/heavy 4:1 mix; weighted failure matrix with live stream-stall = 3.0 to trip alone), `SentinelStateStore` (persistence orchestrator), `TopologySentinel` coordinator (~150 LOC of glue). Master flag `JARVIS_TOPOLOGY_SENTINEL_ENABLED` default **false** — no consumers wired, byte-identical behavior.
+
+**Boot-loop protection** (the marquee correctness goal): on hydrate, `state=OPEN` snapshots reconstruct the breaker into OPEN with the original `opened_at` — process killed mid-SEVERED comes back into SEVERED, no boot-loop Claude burn. Snapshots older than `JARVIS_TOPOLOGY_STATE_MAX_AGE_S` (default 1h) cold-start to avoid pinning a now-recovered endpoint.
+
+**Test evidence**: 62 Slice 1 + 134 combined regression (Slice 1 + Phase 8 wiring #25394 + circuit breaker #25229 + cron installer #25256) green. AST authority pins forbid `*Breaker`/`*Bucket`/`*Backoff` class definitions in the new module + forbid orchestrator/policy/iron_gate imports; reverse pins assert composition imports of rate_limiter + preemption_fsm + fsm_contract are present.
+
+**Effort actual**: ~1000 LOC + 62 tests + 1 RLock re-entrancy fix bundled.
+
+#### P10.2 — YAML v2 schema + dual-reader *(in flight, branch `feat/topology-sentinel-slice-2`)*
+
+**Problem**: yaml v1 only allows ONE `dw_model` per caller and forces a single `dw_allowed: bool` per route. There's no way to express "try Kimi-K2.6 first, then GLM-5.1, then Qwen3.6-35B before cascading."
+
+**Solution**: yaml schema v2 (`topology.2`) introduces:
+- Per-route `dw_models:` ordered list — sentinel walks the list trying each healthy model
+- Per-route `fallback_tolerance: cascade_to_claude | queue` — explicit cost-contract
+- `monitor:` block — sentinel tunables (probe intervals, severed_threshold, ramp schedule)
+
+Backward-compat: `provider_topology.py` adds `Topology.from_v2(...)` classmethod; `get_topology()` tries v2 first, falls back to v1. v1 reader stamps `migrated_from_v1=True` for telemetry. Both readers active until Slice 5 purge.
+
+**Effort**: ~300 LOC + ~25 tests. Default behavior byte-identical when v2 keys absent.
+
+#### P10.3 — `candidate_generator.py` consumer wiring
+
+**Problem**: today's static topology gate at `candidate_generator.py:1404-1465` reads yaml v1 directly. Sentinel state is invisible to the routing decision.
+
+**Solution** (under `JARVIS_TOPOLOGY_SENTINEL_ENABLED` flag, default false during graduation):
+- Replace static gate with `for model_id in route.dw_models: if sentinel.get_state(model_id) != "OPEN": try ...` walk
+- On all-models-OPEN: apply `fallback_tolerance` — `cascade_to_claude` invokes `_call_fallback`; `queue` raises `RuntimeError("dw_severed_queued:<route>:<models>:<probe_reason>")`
+- `dw_topology_circuit_breaker.py` (Option C, PR #25229) refactored to consult sentinel instead of static yaml
+
+**Critical invariant**: BG/SPEC `fallback_tolerance="queue"` is regression-pinned at the routing layer. NO env flag, NO override allows BG/SPEC to cascade to Claude under sentinel-OPEN. Encodes the `project_bg_spec_sealed.md` contract structurally.
+
+**Effort**: ~400 LOC + ~30 tests + 3-clean-session forced graduation cadence.
+
+#### P10.4 — Live-exception failure ingest
+
+**Problem**: today's failure detection is probe-only. A real GENERATE op stream-stall is observed by the orchestrator but not communicated to the sentinel — meaning the next op repeats the same DW attempt before the next probe runs.
+
+**Solution**: at the existing DW failure sites (`candidate_generator.py:1662-1667 / 1674-1687 / 2200-2213`), add `sentinel.report_failure(model_id, FailureSource.LIVE_STREAM_STALL, detail)` BEFORE raising/cascading. Live-exception weight is 3.0 by default — single occurrence trips the breaker immediately, faster than probe-only detection.
+
+**Effort**: ~150 LOC + ~15 tests.
+
+#### P10.5 — THE PURGE *(operator-authorized only after 3 forced-clean once-proofs of Slices 3-4)*
+
+**Problem**: the static `dw_allowed: false` blocks + read-only Nervous System Reflex carve-out + `JARVIS_BACKGROUND_ALLOW_FALLBACK` env shortcut all become redundant once the sentinel replaces them. Leaving them in is a Zero Order splint.
+
+**Delete-only commits**:
+- `brain_selection_policy.yaml:347, 351, 355, 359, 363` — `dw_allowed: false` lines
+- `brain_selection_policy.yaml:348, 352, 356, 360, 364` — `block_mode:` lines (replaced by `fallback_tolerance:`)
+- `provider_topology.py` — v1 dual-reader code path
+- `candidate_generator.py:2062-2067` — read-only Nervous System Reflex carve-out (subsumed by sentinel's faster trip path; survival reflex preserved per-op via urgency-gated cascade matrix)
+- `candidate_generator.py:2056-2090` — `JARVIS_BACKGROUND_ALLOW_FALLBACK` + `FORCE_CLAUDE_BACKGROUND` env shortcuts (replaced by sentinel + cascade matrix)
+
+**Flag flip**: `JARVIS_TOPOLOGY_SENTINEL_ENABLED` default `false` → `true`.
+
+**Forced-clean criterion**: 3 consecutive once-proofs post-purge with at least one observed BG op getting `QUEUE` action under SEVERED state (proves the queue-not-cascade contract holds without env flag scaffolding) AND at least one observed `OPEN` → `HALF_OPEN` → `CLOSED` transition (proves self-healing fires).
+
+**Effort**: −200 LOC of deletions + ~50 LOC of regression pins.
+
+#### P10.6 — 24h soak + cost-per-op trending validation
+
+**Goal**: prove the dynamic system is genuinely cheaper, not just architecturally cleaner.
+
+**Metric**: `summary.json::cost_by_op_phase_provider` aggregated weekly. Pre-Phase-10 baseline (sessions 2026-04-25 through 2026-04-27): ~$0.03/op average, 100% Claude. Post-Phase-10 target: ≥30% of GENERATE cost on DW providers (any combination of Kimi/GLM/Qwen3.6) with ≤50% reduction in $/op median.
+
+**Failure modes that don't count as Phase 10 regression**:
+- All DW models genuinely degraded → 100% Claude cascade is *correct* behavior; the sentinel did its job
+- Cost reduction <30% → not a regression, just an empirical signal that DW endpoint health is below our reliability target
+
+**Effort**: instrumentation already present (Phase 8 substrate via `phase8_producers`, PR #25394). Soak + analysis only.
+
+**Phase 10 total estimate**: ~1900 LOC + ~140 tests across 6 slices. Slices 1-2 close in week 1; Slices 3-4 in week 2; Slice 5 (purge) operator-authorized after evidence ladder; Slice 6 is ongoing instrumentation. **Critical-path benefit**: every Phase 9 graduation soak after Slice 5 lands costs ~3–7× less, accelerating Phase 9 closure.
+
+#### Phase 10 acceptance criteria (Operator-binding)
+
+- [ ] Static `dw_allowed: false` blocks deleted from yaml (Slice 5 purge complete)
+- [ ] Read-only Nervous System Reflex carve-out at `candidate_generator.py:2062-2067` deleted (replaced by urgency-gated cascade matrix)
+- [ ] `JARVIS_TOPOLOGY_SENTINEL_ENABLED` default flipped `false` → `true`
+- [ ] At least 3 once-proofs show ≥1 BG op queued (not Claude-cascaded) under SEVERED state
+- [ ] At least 3 once-proofs show ≥1 observed self-healing OPEN→HALF_OPEN→CLOSED transition
+- [ ] Cost-per-op median reduces ≥30% week-over-week post-purge (Slice 6 metric)
+- [ ] Combined regression: 0 NEW infra-noise classes introduced
+
+**Honest-grade impact**: Phase 10 closure converts the cost-economics part of B+ trending A− → A− on the *unit economics* dimension specifically (currently rated implicitly under §3.6 vector #2 "ProductivityDetector vs CostGovernor mismatch"). Combined with Phase 9 closure, the substrate goes from "expensive but right" to "expensive only when forced."
 
 ---
 

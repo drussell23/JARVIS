@@ -371,8 +371,20 @@ doubleword_topology:
       dw_model: "google/gemma-4-31B-it"
       reason: "Basal ganglia — structured JSON plan generation during PLAN phase."
     compaction:
-      dw_model: "google/gemma-4-31B-it"
-      reason: "Functions-not-Agents Phase 0. Structured summary over ToolLoop memory entries — fully-bounded input, short output (<1KB), trivial anti-hallucination check (subset of entry-keys). First non-streaming complete_sync() caller. SHADOW mode by default (JARVIS_COMPACTION_CALLER_ENABLED)."
+      # Migrated 2026-04-27 (PRD §3.7) — gemma-4-31B-it → Qwen3-14B-FP8.
+      # Qwen3-14B-FP8 is the catalog-published "summarization" model
+      # (docs.doubleword.ai/inference-api/model-pricing); 262K context
+      # handles deep tool-loop history; pricing $0.05 in / $0.20 out
+      # per M tokens vs gemma-4-31B's $0.14 in / $0.40 out — 2-3× cheaper
+      # input + 2× cheaper output, AND the model was specifically tuned
+      # for summarization rather than function-calling. Compaction's
+      # workload (deterministic structured summary over bounded tool-
+      # loop memory) doesn't need gemma's function-calling strength.
+      # vs Claude Sonnet 4.6 ($3 / $15 per M): ~75× cheaper output.
+      # SHADOW mode by default (JARVIS_COMPACTION_CALLER_ENABLED) so this
+      # swap is observation-only until the caller flag flips.
+      dw_model: "Qwen/Qwen3-14B-FP8"
+      reason: "Functions-not-Agents Phase 0. Structured summary over ToolLoop memory entries — fully-bounded input, short output (<1KB), trivial anti-hallucination check (subset of entry-keys). First non-streaming complete_sync() caller. SHADOW mode by default (JARVIS_COMPACTION_CALLER_ENABLED). Migrated from google/gemma-4-31B-it on 2026-04-27 (PRD §3.7) — Qwen3-14B-FP8 is catalog-tuned for summarization at $0.05 in / $0.20 out per M (~75× cheaper output than Claude Sonnet 4.6, ~2× cheaper than gemma-4-31B-it)."
 
 error_codes:
   - "CONTRACT_SCHEMA_INVALID"
