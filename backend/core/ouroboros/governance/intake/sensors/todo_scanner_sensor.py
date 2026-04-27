@@ -102,6 +102,27 @@ _SKIP_DIRS = frozenset({
 })
 
 
+# Slice 11.6.a — Merkle Cartographer consultation. When the per-sensor
+# flag JARVIS_TODO_USE_MERKLE is on AND the cartographer's master flag
+# is on, the scan loop short-circuits to the cached prior result when
+# nothing under _SCAN_DIRS has changed since the last successful scan.
+# Cuts O(N) disk reads to O(1) on the steady state — most poll cycles
+# in JARVIS are no-op (no code changed in the last 24h between scans).
+#
+# Default false to preserve byte-identical legacy behavior. Per-sensor
+# graduation: each Slice 11.6.{a,b,c,d} flag flips independently after
+# its own forced-clean once-proof cadence.
+
+
+def merkle_consult_enabled() -> bool:
+    """Re-read ``JARVIS_TODO_USE_MERKLE`` at call time so monkeypatch
+    works in tests + operator can flip live without re-init."""
+    raw = os.environ.get(
+        "JARVIS_TODO_USE_MERKLE", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 @dataclass
 class TodoItem:
     """One TODO/FIXME/HACK found in the codebase."""
@@ -170,6 +191,21 @@ class TodoScannerSensor:
         self._fs_events_mode: bool = fs_events_enabled()
         self._fs_events_handled: int = 0
         self._fs_events_ignored: int = 0
+        # Slice 11.6.a — cached scan result for merkle short-circuit.
+        # When JARVIS_TODO_USE_MERKLE is on AND the cartographer's
+        # current root hash matches what we recorded after the last
+        # full scan, we skip the disk walk and return cached items.
+        # The "baseline tracking" pattern: sensor records the
+        # cartographer's root hash at the END of each successful scan,
+        # then compares against current_root_hash() at the start of
+        # the next cycle. Decoupled from cartographer's persisted-vs-
+        # in-memory comparison so sensors detect changes between two
+        # sensor cycles regardless of whether the persisted snapshot
+        # has been updated.
+        self._merkle_cached_items: List[TodoItem] = []
+        self._merkle_last_seen_root_hash: str = ""
+        self._merkle_short_circuits: int = 0
+        self._merkle_full_scans: int = 0
 
     async def start(self) -> None:
         self._running = True
@@ -312,11 +348,85 @@ class TodoScannerSensor:
                 break
 
     async def scan_once(self) -> List[TodoItem]:
-        """Scan all Python files for TODO markers. Returns found items."""
+        """Scan all Python files for TODO markers. Returns found items.
+
+        Slice 11.6.a — when ``JARVIS_TODO_USE_MERKLE=true`` AND the
+        Merkle Cartographer says nothing has changed under ``_SCAN_DIRS``
+        since the last successful scan, short-circuit to the cached
+        items (skip disk walk + emission). Reduces O(N) full-tree walks
+        to O(1) for the typical no-change case (most poll cycles in
+        JARVIS find no new TODOs between intervals).
+
+        When master flag(s) off OR cartographer reports change → full
+        scan as legacy behavior.
+        """
+        current_hash = self._merkle_current_root_hash()
+        if self._merkle_should_short_circuit(current_hash):
+            self._merkle_short_circuits += 1
+            logger.debug(
+                "[TodoScanner] Merkle short-circuit "
+                "(scan #%d skipped, %d cached items)",
+                self._merkle_short_circuits + self._merkle_full_scans,
+                len(self._merkle_cached_items),
+            )
+            return list(self._merkle_cached_items)
+
+        self._merkle_full_scans += 1
         loop = asyncio.get_running_loop()
         items = await loop.run_in_executor(None, self._scan_files_sync)
+        # Cache the result so a subsequent merkle-says-no-change cycle
+        # has accurate state to return. Stored regardless of merkle
+        # flag so flipping the flag mid-session doesn't blank state.
+        self._merkle_cached_items = list(items)
+        # Refresh baseline AFTER the scan completes — captures the
+        # cartographer's current state so the next cycle can detect
+        # post-scan changes.
+        self._merkle_last_seen_root_hash = current_hash
         await self._emit_items(items)
         return items
+
+    def _merkle_current_root_hash(self) -> str:
+        """Read the cartographer's current root hash. Returns empty
+        string on any failure path — fail-safe to legacy scan."""
+        if not merkle_consult_enabled():
+            return ""
+        try:
+            from backend.core.ouroboros.governance.merkle_cartographer import (
+                get_default_cartographer,
+            )
+            c = get_default_cartographer(repo_root=self._root)
+            return c.current_root_hash()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[TodoScanner] current_root_hash read failed; "
+                "falling through to full scan", exc_info=True,
+            )
+            return ""
+
+    def _merkle_should_short_circuit(self, current_hash: str) -> bool:
+        """Decide whether to skip the disk walk based on cartographer
+        state. Returns False (i.e. proceed with full scan) on any
+        failure path — fail-safe to legacy behavior.
+
+        Conditions for short-circuit:
+          1. Per-sensor flag ``JARVIS_TODO_USE_MERKLE`` is true
+          2. Cartographer master flag enabled (its
+             ``current_root_hash`` returns "" when off — sensor
+             treats empty as "always changed" → fail-safe)
+          3. The cartographer's current root hash equals the hash
+             we recorded after the last full scan
+          4. We have a prior cached scan result (no point short-
+             circuiting on cold-start since cache is empty)
+        """
+        if not merkle_consult_enabled():
+            return False
+        if not self._merkle_cached_items:
+            return False  # cold start — must populate cache
+        if not current_hash:
+            return False  # cartographer disabled / cold-start / error
+        if not self._merkle_last_seen_root_hash:
+            return False  # first scan — no baseline yet
+        return current_hash == self._merkle_last_seen_root_hash
 
     def _scan_files_sync(self) -> List[TodoItem]:
         """CPU-bound scan — runs in a thread via run_in_executor."""
@@ -459,4 +569,9 @@ class TodoScannerSensor:
             "repo": self._repo,
             "running": self._running,
             "items_seen": len(self._seen),
+            # Slice 11.6.a — Merkle consultation observability
+            "merkle_consult_enabled": merkle_consult_enabled(),
+            "merkle_short_circuits": self._merkle_short_circuits,
+            "merkle_full_scans": self._merkle_full_scans,
+            "merkle_cached_items": len(self._merkle_cached_items),
         }

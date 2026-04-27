@@ -603,12 +603,57 @@ class MerkleCartographer:
             self._leaf_index = self._build_leaf_index(loaded)
         return len(self._leaf_index)
 
+    def current_root_hash(self) -> str:
+        """O(1) — the current Merkle root hash. Empty string when the
+        cartographer hasn't been hydrated / walked yet, or when the
+        master flag is off (no caching authority).
+
+        Sensors (Slice 11.6.x) use this for baseline-based change
+        detection: store the hash from one scan, compare against
+        ``current_root_hash()`` on the next; if they differ, do a
+        full scan AND refresh the baseline.
+
+        Master-flag-off → returns empty string. Sensors treat that
+        as "always changed" so legacy O(N) scans preserved.
+        """
+        if not is_cartographer_enabled():
+            return ""
+        with self._lock:
+            if self._root is None:
+                return ""
+            return self._root.hash
+
+    def subtree_hash(self, relpath: str) -> str:
+        """O(log N) — hash of a subtree rooted at ``relpath``. Empty
+        string when the path isn't in the tree OR master flag is off.
+
+        Mirrors ``current_root_hash`` but scoped to a directory so
+        sensors can baseline-track only the dirs they care about
+        (e.g. ``backend/`` + ``tests/`` + ``scripts/``)."""
+        if not is_cartographer_enabled():
+            return ""
+        with self._lock:
+            if self._root is None:
+                return ""
+            node = self._find_node(
+                relpath.replace("\\", "/").strip("/"),
+            )
+            if node is None:
+                return ""
+            return node.hash
+
     def has_changed(self, paths: Optional[Sequence[str]] = None) -> bool:
         """O(1) — has any leaf under any of ``paths`` changed since
         the last persisted snapshot?
 
         Master-flag-off short-circuit: returns True so the caller's
         legacy O(N) scan path runs (no false negatives possible).
+
+        **Note**: this compares in-memory tree to last-persisted
+        snapshot. Sensors should prefer ``current_root_hash()`` /
+        ``subtree_hash(relpath)`` + their own baseline tracking —
+        which lets them detect changes that happened between two
+        sensor cycles, not just changes that haven't been persisted.
         """
         if not is_cartographer_enabled():
             return True
@@ -623,15 +668,6 @@ class MerkleCartographer:
                 node = self._find_node(normalized)
                 if node is None:
                     return True   # path unmapped — assume changed
-                # Compare to the cached subtree hash from the same
-                # tree. Since we always update_full() before persist,
-                # the in-memory tree IS the cached state; this method
-                # is effectively "is the root different from what's
-                # been observed?" — which is True iff a pending
-                # update_incremental hasn't been persisted yet.
-                # Without external evidence the answer is False; the
-                # contract is "changed since the LAST update_*".
-                pass
             return False
 
     def changed_descendants(self, relpath: str) -> Set[str]:
