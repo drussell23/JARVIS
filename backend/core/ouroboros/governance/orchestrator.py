@@ -1582,9 +1582,25 @@ class GovernedOrchestrator:
         OperationContext
             The terminal context after pipeline completion or failure.
         """
+        # Phase 9.5 Part B — Phase 8 producer wiring (op-level).
+        # Each call NEVER raises and gates on its own substrate master
+        # flag (default false). Cost is microseconds when off — the
+        # imports are lazy inside the producer module.
+        _phase8_op_t0 = time.monotonic()
+        _phase8_terminal_ctx = ctx
+        try:
+            from backend.core.ouroboros.governance.observability.phase8_producers import (
+                check_flag_changes_and_publish as _phase8_flag_scan,
+            )
+            _phase8_flag_scan()
+        except Exception:
+            logger.debug(
+                "[Phase8Wiring] op-start flag scan failed", exc_info=True,
+            )
         try:
             try:
-                return await self._run_pipeline(ctx)
+                _phase8_terminal_ctx = await self._run_pipeline(ctx)
+                return _phase8_terminal_ctx
             except Exception as exc:
                 logger.error(
                     "Unhandled exception in pipeline for %s: %s",
@@ -1614,8 +1630,50 @@ class GovernedOrchestrator:
                     OperationState.FAILED,
                     {"error": str(exc), "phase": ctx.phase.name},
                 )
+                _phase8_terminal_ctx = ctx
                 return ctx
         finally:
+            # Phase 9.5 Part B — terminal-phase Phase 8 producer hooks.
+            # NEVER raises. Records (a) op-level latency for the
+            # terminal phase, (b) one decision-trace row tagged
+            # OP_TERMINAL with the final phase + reason. Substrate
+            # master flags (default false) gate the writes; calls are
+            # microseconds when off.
+            try:
+                from backend.core.ouroboros.governance.observability.phase8_producers import (
+                    record_decision as _phase8_record_decision,
+                    record_phase_latency as _phase8_record_latency,
+                )
+                _phase8_elapsed_s = max(
+                    0.0, time.monotonic() - _phase8_op_t0,
+                )
+                _phase8_final_ctx = _phase8_terminal_ctx
+                _phase8_final_phase_name = (
+                    _phase8_final_ctx.phase.name
+                    if hasattr(_phase8_final_ctx, "phase") else "UNKNOWN"
+                )
+                _phase8_record_latency(
+                    "OP_TERMINAL", _phase8_elapsed_s,
+                )
+                _phase8_record_decision(
+                    op_id=getattr(_phase8_final_ctx, "op_id", ""),
+                    phase="OP_TERMINAL",
+                    decision=_phase8_final_phase_name,
+                    factors={
+                        "terminal_reason": (
+                            getattr(
+                                _phase8_final_ctx,
+                                "terminal_reason_code", "",
+                            ) or ""
+                        ),
+                        "elapsed_s": round(_phase8_elapsed_s, 3),
+                    },
+                    rationale="op terminal",
+                )
+            except Exception:
+                logger.debug(
+                    "[Phase8Wiring] terminal hooks failed", exc_info=True,
+                )
             # Finalize the cost-governor entry no matter how the op ended.
             # This also logs the full summary (cap, cumulative, per-provider
             # breakdown) at DEBUG for postmortem analysis.
