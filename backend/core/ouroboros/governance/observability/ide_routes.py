@@ -591,13 +591,32 @@ class Phase8ObservabilityRouter:
         masked = {
             k: ("<set>" if v else "<empty>") for k, v in snap.items()
         }
+        # Mask delta values too — raw FlagChangeEvent.to_dict()
+        # echoes prev_value/next_value verbatim. Replace those with
+        # presence markers so secrets stored in JARVIS_* never leak.
+        masked_deltas: List[Dict[str, Any]] = []
+        for d in deltas:
+            d_dict = d.to_dict()
+            d_dict["prev_value"] = (
+                None if d_dict.get("prev_value") is None
+                else (
+                    "<set>" if d_dict.get("prev_value") else "<empty>"
+                )
+            )
+            d_dict["next_value"] = (
+                None if d_dict.get("next_value") is None
+                else (
+                    "<set>" if d_dict.get("next_value") else "<empty>"
+                )
+            )
+            masked_deltas.append(d_dict)
         return self._json_response(
             request, 200,
             {
                 "snapshot": masked,
                 "snapshot_size": len(snap),
-                "deltas": [d.to_dict() for d in deltas],
-                "delta_count": len(deltas),
+                "deltas": masked_deltas,
+                "delta_count": len(masked_deltas),
                 "emitter_enabled": True,
             },
         )
