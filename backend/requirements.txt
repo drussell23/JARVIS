@@ -71,7 +71,7 @@ langchain>=0.2.0
 langchain-core>=0.2.0
 langchain-community>=0.2.0
 langchain-experimental>=0.0.60
-langgraph>=0.2.0  # State machine for autonomous reasoning
+langgraph>=1.1.9  # State machine for autonomous reasoning
 langgraph-checkpoint>=1.0.0  # Checkpointing for LangGraph
 duckduckgo-search==4.1.1
 numexpr==2.8.8  # For calculator tool
