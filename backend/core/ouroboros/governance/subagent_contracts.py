@@ -474,7 +474,14 @@ class SubagentRequest:
     #  "allowed_tools": Tuple[str, ...],          # explicit subset
     #  "invocation_reason": str,                  # ≤ 200 chars, sanitized
     #  "parent_op_risk_tier": str,                # must be ≥ NOTIFY_APPLY
-    #  "goal": str}                               # the task itself (sanitized)
+    #  "goal": str,                               # the task itself (sanitized)
+    #  "order": int,                              # OPTIONAL — Order-1 (default) or
+    #                                             # Order-2; Phase 7.3 caller wiring
+    #                                             # consumes this in general_driver to
+    #                                             # apply adapted per-Order budget via
+    #                                             # compute_effective_max_mutations(...)
+    #                                             # Master-off byte-identical to
+    #                                             # max_mutations alone}
     general_invocation: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
