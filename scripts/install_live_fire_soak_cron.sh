@@ -85,12 +85,40 @@ EOF
 }
 
 build_cron_block() {
+    # Three master flags armed in the cron entry:
+    #
+    # 1. JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true — original P9.1
+    #    master switch. Cron-only authority; no production-runtime side
+    #    effect when off.
+    #
+    # 2. JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true — P9.2 contract
+    #    consultation. Without this, the default classifier silently
+    #    graduates 0-op sessions as CLEAN (the once-proof on session
+    #    bt-2026-04-27-162115 demonstrated this: outcome=clean,
+    #    ops_count=0, $0.0299 cost — would have ticked the flag's
+    #    clean-count by 1 toward graduation despite the substrate
+    #    never actually firing). Contract consultation forces the
+    #    P9.2 predicate_requires_decision_trace_rows guard to
+    #    DOWNGRADE 0-op CLEAN to RUNNER, blocking false graduation.
+    #
+    # 3. JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true — Option C
+    #    circuit breaker. When DW topology blocks BG generation
+    #    (e.g. Gemma 4 31B stream-stalls), op skips GENERATE phase
+    #    entirely + emits ONE clean [CircuitBreaker] log line vs
+    #    today's multi-line cascade. Late-detection path remains
+    #    the fallback if circuit-breaker raises (try/except wrap
+    #    in orchestrator).
+    #
+    # All three default OFF in the codebase. Cron sets them locally
+    # for the subprocess invocation only — no global state mutation.
     cat <<EOF
 $BEGIN_MARKER
 # Phase 9.1 — Live-Fire Graduation Soak Harness (auto-installed)
 # Master flag JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED gates execution.
 # Operator pause: export JARVIS_LIVE_FIRE_GRADUATION_SOAK_PAUSED=true
-$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
+# Contract consultation (P9.2) blocks 0-op false-graduation.
+# Circuit breaker (Option C) keeps logs mathematically pure on DW topology block.
+$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
 $END_MARKER
 EOF
 }
@@ -172,7 +200,11 @@ run_once() {
         echo -e "${DIM}  setting=true for this single invocation${RESET}"
     fi
     cd "$REPO_ROOT"
+    # --once mirrors the cron entry's three master flags so a
+    # first-proof run reproduces production cadence behavior.
     JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true \
+        JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true \
+        JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true \
         python3 "$HARNESS_SCRIPT" run \
         --cost-cap "$COST_CAP" \
         --max-wall-seconds "$WALL_CAP" \
