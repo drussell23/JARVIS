@@ -90,13 +90,14 @@ def test_dispatcher_returns_none_to_signal_fall_through() -> None:
     assert "fall through to legacy" in src.lower()
 
 
-def test_dispatcher_stamps_dw_model_override_on_ctx() -> None:
-    """Each attempt must stamp ``ctx._dw_model_override`` so the
-    DW provider's ``_resolve_effective_model`` picks up the chosen
-    model_id."""
+def test_dispatcher_stamps_dw_model_override_via_contextvar() -> None:
+    """Slice 3.6: each attempt must set the ContextVar so the DW
+    provider's ``_resolve_effective_model`` picks up the chosen
+    model_id. Replaces Slice 3's ``setattr(ctx, ...)`` which raised
+    FrozenInstanceError on the frozen OperationContext (caught
+    silently) and defeated the dispatcher."""
     src = inspect.getsource(cg.CandidateGenerator._dispatch_via_sentinel)
-    assert '"_dw_model_override"' in src
-    assert "setattr(context" in src
+    assert "set_dw_model_override" in src or "_set_override" in src
 
 
 def test_dispatcher_reports_success_on_dw_win() -> None:
@@ -132,13 +133,15 @@ def test_dispatcher_applies_fallback_tolerance_cascade() -> None:
     assert "_call_fallback" in src
 
 
-def test_dispatcher_per_attempt_override_uses_setattr() -> None:
-    """Stamping must use setattr (resilient to slotted contexts) AND
-    swallow AttributeError/TypeError so a slotted dataclass doesn't
-    crash the sentinel path. Falls through to legacy on rejection."""
+def test_dispatcher_per_attempt_override_resets_in_finally() -> None:
+    """Slice 3.6: per-attempt override is set via ContextVar and
+    reset in a finally block — the boundary contract that survives
+    OperationContext being a frozen dataclass. Replaces Slice 3's
+    setattr-on-frozen pattern that silently defeated the dispatcher."""
     src = inspect.getsource(cg.CandidateGenerator._dispatch_via_sentinel)
-    assert "setattr(context" in src
-    assert "(AttributeError, TypeError)" in src
+    assert "set_dw_model_override" in src or "_set_override" in src
+    assert "reset_dw_model_override" in src or "_reset_override" in src
+    assert "finally:" in src
 
 
 # ---------------------------------------------------------------------------
