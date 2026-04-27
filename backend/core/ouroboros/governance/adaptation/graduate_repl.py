@@ -90,16 +90,28 @@ def render_help() -> str:
     return (
         "/graduate — track per-loader graduation cadences\n"
         "\n"
+        "Read-side (Item #4):\n"
         "  list                              — show all known flags\n"
         "  status <flag>                     — show one flag's progress\n"
+        "  eligible                          — show flags ready to flip\n"
         "  record <flag> <session_id> <outcome> [reason]\n"
         "                                    — record one session outcome\n"
         "                                      (outcome: clean|infra|runner|migration)\n"
-        "  eligible                          — show flags ready to flip\n"
+        "\n"
+        "Live-fire (Phase 9.3 extensions, read-only over harness state):\n"
+        "  live-queue                        — show 24-flag soak queue + dep state\n"
+        "  live-evidence <flag>              — show all evidence rows for flag\n"
+        "  live-next                         — what pick-next would return (dry run)\n"
+        "  live-contracts                    — show flags with custom GraduationContracts\n"
+        "  live-pause                        — print pause-env command\n"
+        "  live-resume                       — print resume-env command\n"
+        "\n"
         "  help                              — this message\n"
         "\n"
         "Master flag: JARVIS_GRADUATE_REPL_ENABLED\n"
-        "Ledger flag: JARVIS_GRADUATION_LEDGER_ENABLED"
+        "Ledger flag: JARVIS_GRADUATION_LEDGER_ENABLED\n"
+        "Live-fire master: JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED (run via cron only)\n"
+        "Contract consult: JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT (default off)"
     )
 
 
@@ -146,6 +158,158 @@ def render_status(ledger: GraduationLedger, flag_name: str) -> str:
         f"eligible_to_flip: {eligible}",
     ]
     return "\n".join(parts)
+
+
+def _render_live_queue() -> str:
+    """Phase 9.3 — render the live-fire soak queue. Lazy-imports the
+    harness module so a `--help`-style invocation doesn't pay the
+    substrate cost. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
+            get_default_harness,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        return f"  (live-fire harness unavailable: {exc})"
+    try:
+        rows = get_default_harness().queue_view()
+    except Exception as exc:  # noqa: BLE001
+        return f"  (queue_view raised: {exc})"
+    n_total = len(rows)
+    n_grad = sum(1 for r in rows if r.get("graduated"))
+    n_pending = sum(
+        1 for r in rows
+        if not r.get("graduated") and r.get("deps_satisfied")
+    )
+    n_blocked = sum(
+        1 for r in rows
+        if not r.get("graduated") and not r.get("deps_satisfied")
+    )
+    parts = [
+        f"# /graduate live-queue — {n_total} flags  "
+        f"(graduated={n_grad} pending={n_pending} blocked={n_blocked})",
+    ]
+    for r in rows:
+        progress = r.get("progress") or {}
+        clean = progress.get("clean", 0)
+        required = progress.get("required", 3)
+        runner = progress.get("runner", 0)
+        if r.get("graduated"):
+            marker = "[GRAD ]"
+        elif not r.get("deps_satisfied"):
+            marker = "[BLKD ]"
+        elif runner > 0:
+            marker = "[RNRBL]"
+        else:
+            marker = "[PEND ]"
+        deps = r.get("deps") or []
+        deps_str = "-" if not deps else f"deps={len(deps)}"
+        parts.append(
+            f"  {marker} {r.get('flag_name', '?'):60s}  "
+            f"{clean}/{required}  runner={runner}  {deps_str}"
+        )
+    return "\n".join(parts)
+
+
+def _render_live_evidence(flag_name: str) -> str:
+    """Phase 9.3 — render evidence rows for one flag. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
+            get_default_harness,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"  (live-fire harness unavailable: {exc})"
+    try:
+        rows = get_default_harness().evidence_for_flag(flag_name)
+    except Exception as exc:  # noqa: BLE001
+        return f"  (evidence_for_flag raised: {exc})"
+    if not rows:
+        return f"  (no evidence rows for {flag_name})"
+    parts = [
+        f"# /graduate live-evidence {flag_name} — {len(rows)} sessions",
+    ]
+    for r in rows:
+        parts.append(
+            f"  [{r.get('outcome', '?'):>9}]  "
+            f"{r.get('finished_at_iso', '?')}  "
+            f"sid={r.get('session_id', '?')}  "
+            f"stop={r.get('stop_reason', '?')}  "
+            f"cost=${r.get('cost_total_usd', 0):.4f}  "
+            f"dur={r.get('duration_s', 0):.1f}s  "
+            f"ops={r.get('ops_count', 0)}"
+        )
+        notes = r.get("notes") or ""
+        if notes:
+            parts.append(f"    notes: {notes[:160]}")
+    return "\n".join(parts)
+
+
+def _render_live_next() -> str:
+    """Phase 9.3 — dry-run pick-next. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
+            get_default_harness,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"  (live-fire harness unavailable: {exc})"
+    try:
+        flag = get_default_harness().pick_next_flag()
+    except Exception as exc:  # noqa: BLE001
+        return f"  (pick_next_flag raised: {exc})"
+    if flag is None:
+        return (
+            "  (no eligible flag — all graduated OR all blocked by "
+            "ungraduated dependencies)"
+        )
+    return f"  next pickable flag: {flag}"
+
+
+def _render_live_contracts() -> str:
+    """Phase 9.3 — render flags with custom GraduationContracts.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.graduation.graduation_contract import (  # noqa: E501
+            all_contracts_metadata, is_contract_consultation_enabled,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"  (graduation_contract module unavailable: {exc})"
+    try:
+        meta = all_contracts_metadata()
+    except Exception as exc:  # noqa: BLE001
+        return f"  (all_contracts_metadata raised: {exc})"
+    if not meta:
+        return "  (no flags with custom contracts)"
+    consultation = is_contract_consultation_enabled()
+    parts = [
+        f"# /graduate live-contracts — {len(meta)} flag(s) with "
+        f"custom contracts",
+        f"  consultation_enabled: {consultation}  "
+        f"(JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT)",
+    ]
+    for flag in sorted(meta.keys()):
+        c = meta[flag]
+        parts.append(f"  {flag}")
+        parts.append(
+            f"    has_custom_predicate={c.get('has_custom_predicate')}  "
+            f"re_arm_s={c.get('re_arm_after_runner_seconds')}"
+        )
+        if c.get("description"):
+            parts.append(f"    {c.get('description')}")
+    return "\n".join(parts)
+
+
+def _render_live_pause() -> str:
+    return (
+        "  Set the env var to pause the live-fire soak cron:\n"
+        "    export JARVIS_LIVE_FIRE_GRADUATION_SOAK_PAUSED=true\n"
+        "  (REPL is read-only — cannot mutate parent shell env.)"
+    )
+
+
+def _render_live_resume() -> str:
+    return (
+        "  Clear the env var to resume the live-fire soak cron:\n"
+        "    unset JARVIS_LIVE_FIRE_GRADUATION_SOAK_PAUSED"
+    )
 
 
 def render_eligible(ledger: GraduationLedger) -> str:
@@ -248,6 +412,66 @@ def dispatch_graduate(
             subcommand=subcmd,
             status=DispatchStatus.OK,
             output=render_eligible(ledger),
+        )
+
+    # Phase 9.3 — live-fire read-only subcommands (read over harness
+    # state; cannot fire soaks — that's cron-only authority).
+    if subcmd == "live-queue":
+        return DispatchResult(
+            schema_version=GRADUATE_REPL_SCHEMA_VERSION,
+            subcommand=subcmd,
+            status=DispatchStatus.OK,
+            output=_render_live_queue(),
+        )
+    if subcmd == "live-evidence":
+        if len(argv) < 2:
+            return DispatchResult(
+                schema_version=GRADUATE_REPL_SCHEMA_VERSION,
+                subcommand=subcmd,
+                status=DispatchStatus.INVALID_ARGS,
+                detail="usage: live-evidence <flag>",
+            )
+        flag = argv[1].strip()
+        if get_policy(flag) is None:
+            return DispatchResult(
+                schema_version=GRADUATE_REPL_SCHEMA_VERSION,
+                subcommand=subcmd,
+                status=DispatchStatus.UNKNOWN_FLAG,
+                detail=f"unknown flag: {flag}",
+            )
+        return DispatchResult(
+            schema_version=GRADUATE_REPL_SCHEMA_VERSION,
+            subcommand=subcmd,
+            status=DispatchStatus.OK,
+            output=_render_live_evidence(flag),
+        )
+    if subcmd == "live-next":
+        return DispatchResult(
+            schema_version=GRADUATE_REPL_SCHEMA_VERSION,
+            subcommand=subcmd,
+            status=DispatchStatus.OK,
+            output=_render_live_next(),
+        )
+    if subcmd == "live-contracts":
+        return DispatchResult(
+            schema_version=GRADUATE_REPL_SCHEMA_VERSION,
+            subcommand=subcmd,
+            status=DispatchStatus.OK,
+            output=_render_live_contracts(),
+        )
+    if subcmd == "live-pause":
+        return DispatchResult(
+            schema_version=GRADUATE_REPL_SCHEMA_VERSION,
+            subcommand=subcmd,
+            status=DispatchStatus.OK,
+            output=_render_live_pause(),
+        )
+    if subcmd == "live-resume":
+        return DispatchResult(
+            schema_version=GRADUATE_REPL_SCHEMA_VERSION,
+            subcommand=subcmd,
+            status=DispatchStatus.OK,
+            output=_render_live_resume(),
         )
 
     if subcmd == "record":
