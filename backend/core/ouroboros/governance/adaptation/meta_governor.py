@@ -628,10 +628,46 @@ def _handle_decision(
             proposal=res.proposal,
         )
 
+    # Item #2 (2026-04-26): on APPROVE, materialize the proposal's
+    # proposed_state_payload into the live gate's adapted YAML via
+    # the YAML writer. Best-effort — writer failures DO NOT roll
+    # back the ledger approval (the audit trail of the approval
+    # decision must persist regardless).
+    yaml_writer_summary = ""
+    if (
+        decision_kind == "approve"
+        and res.proposal is not None
+    ):
+        try:
+            from backend.core.ouroboros.governance.adaptation.yaml_writer import (  # noqa: E501
+                write_proposal_to_yaml,
+            )
+            write_result = write_proposal_to_yaml(res.proposal)
+            yaml_writer_summary = (
+                f" yaml_write_status={write_result.status.value}"
+            )
+            if not (write_result.is_ok or write_result.is_skipped):
+                logger.warning(
+                    "[MetaAdaptationGovernor] yaml_writer FAILED for "
+                    "proposal_id=%s: status=%s detail=%s",
+                    proposal_id, write_result.status.value,
+                    write_result.detail,
+                )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.warning(
+                "[MetaAdaptationGovernor] yaml_writer raised %s for "
+                "proposal_id=%s — ledger approval preserved",
+                exc, proposal_id,
+            )
+            yaml_writer_summary = (
+                f" yaml_write_status=raised:{type(exc).__name__}"
+            )
+
     logger.info(
         "[MetaAdaptationGovernor] %sd proposal_id=%s operator=%s "
-        "reason_chars=%d",
+        "reason_chars=%d%s",
         decision_kind, proposal_id, operator, len(reason),
+        yaml_writer_summary,
     )
     return DispatchResult(
         schema_version=DISPATCH_SCHEMA_VERSION,
@@ -640,6 +676,7 @@ def _handle_decision(
         output=(
             f"{decision_kind.capitalize()}d {proposal_id} "
             f"(operator={operator}). Reason: {reason}"
+            + yaml_writer_summary
         ),
         proposal=res.proposal,
     )

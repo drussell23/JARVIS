@@ -127,7 +127,9 @@ def _propose(
 
 
 def test_schema_version_pinned():
-    assert ADAPTATION_SCHEMA_VERSION == "1.0"
+    # Item #2 (2026-04-26) bumped 1.0 → 2.0 (added optional
+    # proposed_state_payload field). Pre-Item-#2 rows still readable.
+    assert ADAPTATION_SCHEMA_VERSION == "2.0"
 
 
 def test_caps_pinned():
