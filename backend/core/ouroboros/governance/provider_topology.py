@@ -7,6 +7,9 @@ and exposes a deterministic, zero-LLM API for resolving:
   * Which DW model (if any) should handle a given :class:`ProviderRoute`
   * Whether DW is permitted on that route at all
   * Which DW model named callers (semantic_triage, ouroboros_plan) should use
+  * **(v2 schema, 2026-04-27)** Per-route ranked ``dw_models:`` lists so
+    the AsyncTopologySentinel can walk multiple DW model candidates
+    before any Claude cascade.
 
 The module is consumed by three downstream sites:
 
@@ -28,6 +31,38 @@ Cortex entirely. Gemma 4 31B is still a strong fit for high-volume,
 structured-JSON tasks — it is retained as the Basal Ganglia engine for
 BACKGROUND / SPECULATIVE / semantic_triage / ouroboros_plan.
 
+Schema versions
+---------------
+``topology.1`` (legacy, current production): per-route ``dw_allowed`` +
+single ``dw_model`` + ``block_mode``. Single-model-per-route — when the
+configured DW model stream-stalls, the route hard-fails to its
+``block_mode`` (cascade or skip_and_queue).
+
+``topology.2`` (additive, 2026-04-27, gated by Slice 2 of Phase 10):
+introduces three additive concepts:
+
+  * Per-route ``dw_models:`` — ordered list of DW model_ids; the
+    AsyncTopologySentinel walks the list trying each healthy model.
+    The first model whose breaker is CLOSED (or HALF_OPEN per recovery
+    semantics) wins. Only after exhausting all DW models does the route
+    fall through to ``fallback_tolerance``.
+  * ``fallback_tolerance:`` — explicit cost-contract. ``cascade_to_claude``
+    routes the op to Claude on full DW failure; ``queue`` raises a
+    ``RuntimeError`` that the orchestrator's existing accept-failure
+    branch handles. Replaces v1's ``block_mode`` with sharper semantics.
+  * ``monitor:`` — sentinel tunables (probe intervals, severed threshold,
+    ramp schedule). Routes the AsyncTopologySentinel's own configuration
+    through the same yaml that defines the routes.
+
+**Backward compatibility**: v1 keys remain authoritative when v2 keys
+are absent. ``dw_models`` defaults to a single-element list of
+``[dw_model]`` when v2 omitted; ``fallback_tolerance`` derives from
+``block_mode`` (``skip_and_queue`` → ``queue``, else ``cascade_to_claude``).
+Existing call-sites continue to read v1 methods (``dw_allowed_for_route``,
+``block_mode_for_route``) without behavior change. Slice 3 will wire
+new consumers to the v2 methods (``dw_models_for_route``,
+``fallback_tolerance_for_route``).
+
 Contract
 --------
 This module is pure and side-effect-free after import. The yaml is
@@ -41,7 +76,21 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+
+# Schema-version sentinels emitted by the YAML reader. Consumers can
+# inspect ``ProviderTopology.schema_version`` to branch behavior.
+SCHEMA_VERSION_V1 = "topology.1"
+SCHEMA_VERSION_V2 = "topology.2"
+
+
+# Valid values for ``fallback_tolerance``. Operator-typed strings outside
+# this set get coerced to the "cascade_to_claude" default rather than
+# raising — same fail-open posture as the rest of this module.
+_VALID_FALLBACK_TOLERANCES = frozenset(
+    ("cascade_to_claude", "queue"),
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +154,8 @@ class RouteTopology:
 
     ``dw_allowed=False`` is a hard block — callers MUST NOT attempt any
     DoubleWord call for operations on this route. ``dw_model`` is the
-    model identifier passed to the DoubleWord API when DW is allowed.
+    single model identifier passed to the DoubleWord API when DW is
+    allowed under the v1 schema.
 
     ``block_mode`` controls what happens when DW is disallowed:
 
@@ -120,12 +170,68 @@ class RouteTopology:
 
     Default is ``"cascade_to_claude"`` so existing Prefrontal Cortex
     blocks keep working when the yaml is from before this field existed.
+
+    **v2 schema additions** (additive, optional):
+
+    * ``dw_models`` — ordered tuple of DW model_ids. When non-empty, the
+      AsyncTopologySentinel walks the list trying each healthy model
+      before falling through to ``fallback_tolerance``. Empty (default)
+      means the route is single-model under the v1 schema; the
+      ``dw_model`` field is the canonical (and only) model.
+    * ``fallback_tolerance`` — explicit cost-contract.
+      ``"cascade_to_claude"`` (default for v1 routes whose ``block_mode``
+      is ``cascade_to_claude``) or ``"queue"`` (default derived from
+      ``block_mode="skip_and_queue"``). Slice 3 (`candidate_generator`
+      consumer wiring) is the first call site that branches on this.
     """
 
     dw_allowed: bool
     dw_model: Optional[str]
     reason: str
     block_mode: str = "cascade_to_claude"
+    # v2 additive — empty tuple when reading v1-only yaml.
+    dw_models: Tuple[str, ...] = field(default_factory=tuple)
+    # v2 additive — defaults derive from block_mode at construction time.
+    fallback_tolerance: str = "cascade_to_claude"
+
+    @property
+    def effective_dw_models(self) -> Tuple[str, ...]:
+        """Returns the model rank order to walk, with v1 backward-compat.
+
+        v2 yaml: returns the explicit ``dw_models`` list.
+        v1 yaml: returns ``(dw_model,)`` — single-element tuple — when DW
+        is allowed AND ``dw_model`` is set; empty tuple otherwise. Same
+        semantics as v1 callers' single-model behavior, but exposed
+        through the v2-shaped accessor so Slice 3+ consumers can use
+        one code path."""
+        if self.dw_models:
+            return self.dw_models
+        if self.dw_allowed and self.dw_model:
+            return (self.dw_model,)
+        return ()
+
+
+@dataclass(frozen=True)
+class MonitorConfig:
+    """Sentinel tunables loaded from yaml v2 ``monitor:`` block.
+
+    All fields are optional with sensible defaults. The
+    AsyncTopologySentinel reads these via :meth:`ProviderTopology.monitor_config`
+    on boot and uses them for probe scheduling, the severed-threshold
+    weighted streak, and the slow-start ramp schedule.
+
+    When yaml v2 ``monitor:`` is absent, every field is ``None`` and
+    the sentinel falls back to its env-knob defaults (whose names match
+    the keys here, prefixed with ``JARVIS_TOPOLOGY_``).
+    """
+
+    probe_interval_healthy_s: Optional[float] = None
+    probe_backoff_base_s: Optional[float] = None
+    probe_backoff_cap_s: Optional[float] = None
+    severed_threshold_weighted: Optional[float] = None
+    heavy_probe_ratio: Optional[float] = None
+    ramp_schedule_csv: Optional[str] = None  # "0:1.0,10:2.0,..." form
+    schema_version: str = SCHEMA_VERSION_V2
 
 
 @dataclass(frozen=True)
@@ -142,11 +248,18 @@ class ProviderTopology:
 
     ``enabled=False`` means the yaml section is missing or disabled;
     callers should fall back to their pre-topology defaults.
+
+    ``schema_version`` reflects which yaml schema produced this topology
+    object. Slice 3+ consumers can branch on it (e.g. AsyncTopologySentinel
+    only walks ``dw_models`` lists when v2 — under v1 it stays observer-
+    only against the single ``dw_model``).
     """
 
     enabled: bool
     routes: Mapping[str, RouteTopology] = field(default_factory=dict)
     callers: Mapping[str, CallerTopology] = field(default_factory=dict)
+    schema_version: str = SCHEMA_VERSION_V1
+    monitor: Optional[MonitorConfig] = None
 
     def dw_allowed_for_route(self, route: str) -> bool:
         """Return True if DW may be attempted on *route*.
@@ -232,6 +345,62 @@ class ProviderTopology:
             return None
         return entry.dw_model
 
+    # ------------------------------------------------------------------
+    # v2 schema accessors (additive — Slice 3+ consumes these)
+    # ------------------------------------------------------------------
+
+    def dw_models_for_route(self, route: str) -> Tuple[str, ...]:
+        """Return the v2 ranked ``dw_models`` list for *route*.
+
+        Backward-compat: when the yaml is v1 (no ``dw_models`` key for
+        the route), returns a single-element tuple ``(dw_model,)`` if DW
+        is allowed AND a ``dw_model`` is configured; empty tuple
+        otherwise. This lets Slice 3 consumers always iterate the
+        result without branching on schema_version.
+
+        Returns the empty tuple when topology is disabled OR the route
+        is unmapped — Slice 3's cascade-matrix interprets this as
+        "no DW path, use fallback_tolerance directly."
+        """
+        if not self.enabled:
+            return ()
+        entry = self.routes.get((route or "").strip().lower())
+        if entry is None:
+            return ()
+        return entry.effective_dw_models
+
+    def fallback_tolerance_for_route(self, route: str) -> str:
+        """Return the v2 ``fallback_tolerance`` for *route*.
+
+        Backward-compat:
+          * v1 yaml with ``block_mode: skip_and_queue`` → ``"queue"``
+          * v1 yaml with ``block_mode: cascade_to_claude`` (or default)
+            → ``"cascade_to_claude"``
+          * v2 yaml with explicit ``fallback_tolerance`` key → that value
+
+        Same dev-override behavior as :meth:`block_mode_for_route`:
+        ``JARVIS_TOPOLOGY_BG_CASCADE_ENABLED=true`` flips ``"queue"``
+        to ``"cascade_to_claude"`` at read-time so a single
+        verification session can cascade BG/SPEC ops to Claude.
+        """
+        if not self.enabled:
+            return "cascade_to_claude"
+        entry = self.routes.get((route or "").strip().lower())
+        if entry is None:
+            return "cascade_to_claude"
+        effective = entry.fallback_tolerance or "cascade_to_claude"
+        if effective == "queue" and _bg_cascade_override_enabled():
+            _warn_once_bg_override()
+            return "cascade_to_claude"
+        return effective
+
+    def monitor_config(self) -> Optional[MonitorConfig]:
+        """Return the v2 ``monitor:`` block, or None.
+
+        AsyncTopologySentinel reads this once at boot to override its
+        env-knob defaults with yaml-driven values."""
+        return self.monitor
+
 
 _EMPTY_TOPOLOGY = ProviderTopology(enabled=False)
 
@@ -255,6 +424,87 @@ def _locate_policy_yaml() -> Optional[Path]:
     return None
 
 
+def _parse_dw_models(raw_value: Any) -> Tuple[str, ...]:
+    """Parse a v2 ``dw_models:`` list — accepts list/tuple of strings.
+
+    Malformed entries (non-strings, empty strings) are silently skipped
+    (fail-open posture). Result is ``Tuple`` for hashability inside the
+    frozen dataclass.
+    """
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, (list, tuple)):
+        return ()
+    out: List[str] = []
+    for item in raw_value:
+        if isinstance(item, str):
+            cleaned = item.strip()
+            if cleaned:
+                out.append(cleaned)
+    return tuple(out)
+
+
+def _resolve_fallback_tolerance(
+    explicit_value: Any,
+    block_mode: str,
+) -> str:
+    """Pick the v2 ``fallback_tolerance`` string with v1-derivation
+    fallback.
+
+    Precedence:
+      1. Explicit ``fallback_tolerance`` key in yaml → validated against
+         the allowlist; invalid values fall through to derivation.
+      2. Derive from ``block_mode``: ``"skip_and_queue"`` → ``"queue"``;
+         everything else → ``"cascade_to_claude"``.
+    """
+    if isinstance(explicit_value, str):
+        cleaned = explicit_value.strip().lower()
+        if cleaned in _VALID_FALLBACK_TOLERANCES:
+            return cleaned
+    return "queue" if block_mode == "skip_and_queue" else "cascade_to_claude"
+
+
+def _parse_monitor_block(
+    raw_value: Any,
+) -> Optional[MonitorConfig]:
+    """Parse the v2 ``monitor:`` block into a MonitorConfig.
+
+    Returns None when the block is missing or malformed. Each field is
+    individually parsed — a typo in one field doesn't disable the rest.
+    """
+    if not isinstance(raw_value, Mapping):
+        return None
+
+    def _opt_float(key: str) -> Optional[float]:
+        v = raw_value.get(key)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _opt_str(key: str) -> Optional[str]:
+        v = raw_value.get(key)
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            return None
+        cleaned = v.strip()
+        return cleaned or None
+
+    return MonitorConfig(
+        probe_interval_healthy_s=_opt_float("probe_interval_healthy_s"),
+        probe_backoff_base_s=_opt_float("probe_backoff_base_s"),
+        probe_backoff_cap_s=_opt_float("probe_backoff_cap_s"),
+        severed_threshold_weighted=_opt_float(
+            "severed_threshold_weighted",
+        ),
+        heavy_probe_ratio=_opt_float("heavy_probe_ratio"),
+        ramp_schedule_csv=_opt_str("ramp_schedule_csv"),
+    )
+
+
 def _parse_topology(raw: Mapping[str, Any]) -> ProviderTopology:
     section = raw.get("doubleword_topology")
     if not isinstance(section, Mapping):
@@ -263,6 +513,17 @@ def _parse_topology(raw: Mapping[str, Any]) -> ProviderTopology:
     enabled = bool(section.get("enabled", False))
     if not enabled:
         return _EMPTY_TOPOLOGY
+
+    # Schema-version detection. v2 yaml MUST set ``schema_version:
+    # "topology.2"`` to opt in. Any other value (including missing)
+    # parses as v1 — additive v2 keys are still parsed when present
+    # so an operator can stage v2 keys in the file before flipping
+    # ``schema_version``.
+    raw_schema = section.get("schema_version")
+    if isinstance(raw_schema, str) and raw_schema.strip() == SCHEMA_VERSION_V2:
+        schema_version = SCHEMA_VERSION_V2
+    else:
+        schema_version = SCHEMA_VERSION_V1
 
     routes: Dict[str, RouteTopology] = {}
     raw_routes = section.get("routes")
@@ -278,11 +539,20 @@ def _parse_topology(raw: Mapping[str, Any]) -> ProviderTopology:
             ).strip().lower()
             if block_mode_raw not in {"cascade_to_claude", "skip_and_queue"}:
                 block_mode_raw = "cascade_to_claude"
+            # v2 additive — both keys are read regardless of
+            # schema_version so operators can stage them in advance.
+            dw_models = _parse_dw_models(body.get("dw_models"))
+            fallback_tolerance = _resolve_fallback_tolerance(
+                body.get("fallback_tolerance"),
+                block_mode_raw,
+            )
             routes[str(name).strip().lower()] = RouteTopology(
                 dw_allowed=allowed,
                 dw_model=str(model) if model else None,
                 reason=reason,
                 block_mode=block_mode_raw,
+                dw_models=dw_models,
+                fallback_tolerance=fallback_tolerance,
             )
 
     callers: Dict[str, CallerTopology] = {}
@@ -300,10 +570,14 @@ def _parse_topology(raw: Mapping[str, Any]) -> ProviderTopology:
                 reason=reason,
             )
 
+    monitor_cfg = _parse_monitor_block(section.get("monitor"))
+
     return ProviderTopology(
         enabled=True,
         routes=routes,
         callers=callers,
+        schema_version=schema_version,
+        monitor=monitor_cfg,
     )
 
 
