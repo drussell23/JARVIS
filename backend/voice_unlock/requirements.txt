@@ -13,7 +13,7 @@ speechrecognition>=3.8.1
 
 # ML optimization
 psutil>=5.9.0
-matplotlib>=3.5.0
+matplotlib>=3.10.9
 
 # Bluetooth for Apple Watch
 bleak>=0.20.0  # Cross-platform Bluetooth LE
