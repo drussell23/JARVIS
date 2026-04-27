@@ -613,13 +613,23 @@ class AdaptationLedger:
             return False
         try:
             with self._path.open("a", encoding="utf-8") as f:
-                f.write(line)
-                f.write("\n")
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
+                # Phase 7.8 — cross-process advisory lock. Best-effort:
+                # no-op fallback when fcntl unavailable (Windows) or
+                # JARVIS_ADAPTATION_LEDGER_FLOCK_ENABLED=false. The
+                # exclusive lock serializes append paths across
+                # processes (within-process serialization remains
+                # threading.RLock at the call site).
+                from backend.core.ouroboros.governance.adaptation._file_lock import (  # noqa: E501
+                    flock_exclusive,
+                )
+                with flock_exclusive(f.fileno()):
+                    f.write(line)
+                    f.write("\n")
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
         except OSError as exc:
             logger.warning(
                 "[AdaptationLedger] append failed (proposal_id=%s): %s",
