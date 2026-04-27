@@ -77,4 +77,4 @@ bitsandbytes>=0.41.0  # For 4-bit quantization (requires CUDA)
 transformers>=4.36.2  # Already included above, but ensure latest
 accelerate>=0.25.0  # Already included above
 torch>=2.1.2  # Already included above
-safetensors>=0.4.0  # For fast model loading
+safetensors>=0.7.0  # For fast model loading
