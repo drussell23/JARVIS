@@ -148,20 +148,74 @@ def test_min_chars_invalid_falls_back_to_default(
     assert pv._gen_ast_slice_min_chars() == 8000
 
 
-def test_fn_max_chars_default_1500(
+def test_chars_per_token_default_3_5(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Slice 11.4.1: dynamic budget formula uses chars/token ratio.
+    Default 3.5 matches DW pricing assumption used elsewhere."""
     monkeypatch.delenv(
-        "JARVIS_GEN_AST_SLICE_FN_MAX_CHARS", raising=False,
+        "JARVIS_GEN_AST_SLICE_CHARS_PER_TOKEN", raising=False,
     )
-    assert pv._gen_ast_slice_fn_max_chars() == 1500
+    assert pv._gen_ast_slice_chars_per_token() == 3.5
 
 
-def test_fn_max_chars_floor_100(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Per-function threshold must have a sane minimum so a misconfig
-    can't reduce it to ~0 (which would skeleton-everything)."""
-    monkeypatch.setenv("JARVIS_GEN_AST_SLICE_FN_MAX_CHARS", "1")
-    assert pv._gen_ast_slice_fn_max_chars() == 100
+def test_input_budget_ratio_default_0_25(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slice 11.4.1: 25% of provider context budget reserved for
+    file content (rest = output reservation + scaffolding)."""
+    monkeypatch.delenv(
+        "JARVIS_GEN_AST_SLICE_INPUT_BUDGET_RATIO", raising=False,
+    )
+    assert pv._gen_ast_slice_input_budget_ratio() == 0.25
+
+
+def test_input_budget_ratio_clamped_to_unit_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_GEN_AST_SLICE_INPUT_BUDGET_RATIO", "5.0")
+    assert pv._gen_ast_slice_input_budget_ratio() == 0.95
+    monkeypatch.setenv("JARVIS_GEN_AST_SLICE_INPUT_BUDGET_RATIO", "0.0")
+    assert pv._gen_ast_slice_input_budget_ratio() == 0.05
+
+
+def test_target_chars_dw_routes_derive_from_dw_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slice 11.4.1: target_chars derived dynamically from
+    _DW_MAX_TOKENS (not hardcoded). With defaults: 16384 × 0.25 ×
+    3.5 / 1 file = 14336 chars."""
+    monkeypatch.delenv(
+        "JARVIS_GEN_AST_SLICE_INPUT_BUDGET_RATIO", raising=False,
+    )
+    monkeypatch.delenv(
+        "JARVIS_GEN_AST_SLICE_CHARS_PER_TOKEN", raising=False,
+    )
+    target = pv._codegen_target_chars_for_route("background", 1)
+    # 16384 × 0.25 × 3.5 = 14336
+    assert 12000 <= target <= 16000
+
+
+def test_target_chars_immediate_route_uses_claude_budget() -> None:
+    """Claude routes get a generous budget (200K context)."""
+    target = pv._codegen_target_chars_for_route("immediate", 1)
+    # 200000 × 0.25 × 3.5 = 175000
+    assert target >= 100000
+
+
+def test_target_chars_scales_inverse_with_num_files() -> None:
+    """N target_files share the budget — per-file budget shrinks."""
+    one_file = pv._codegen_target_chars_for_route("background", 1)
+    four_files = pv._codegen_target_chars_for_route("background", 4)
+    assert four_files < one_file
+    # Approximately 1/4 the budget (with floor)
+    assert four_files * 4 <= one_file + 100  # tolerance for floor
+
+
+def test_target_chars_floor_2000() -> None:
+    """Even with high num_files, never go below 2000 chars per file."""
+    target = pv._codegen_target_chars_for_route("background", 1000)
+    assert target >= 2000
 
 
 # ---------------------------------------------------------------------------
@@ -169,17 +223,44 @@ def test_fn_max_chars_floor_100(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _outline_text(result):
+    """Slice 11.4.1: _ast_outline_python_file returns
+    (outline_str, tier_used, full_n, skel_n) tuple. This helper
+    extracts the outline string for tests that only care about
+    content."""
+    if result is None:
+        return None
+    return result[0]
+
+
 def test_outline_emits_summary_marker(large_py_file: Path) -> None:
     content = large_py_file.read_text(encoding="utf-8")
-    outline = pv._ast_outline_python_file(content, large_py_file)
+    result = pv._ast_outline_python_file(content, large_py_file)
+    outline = _outline_text(result)
     assert outline is not None
     assert "[AST-OUTLINE:" in outline
-    assert "skeletons" in outline
+    # Slice 11.4.1: tier metadata replaces "skeletons" word
+    assert "tier=" in outline
+
+
+def test_outline_returns_tuple(large_py_file: Path) -> None:
+    """Slice 11.4.1: return shape is (outline, tier, full_n, skel_n)."""
+    content = large_py_file.read_text(encoding="utf-8")
+    result = pv._ast_outline_python_file(content, large_py_file)
+    assert result is not None
+    assert len(result) == 4
+    outline, tier, full_n, skel_n = result
+    assert isinstance(outline, str)
+    assert tier.startswith("tier_")
+    assert isinstance(full_n, int)
+    assert isinstance(skel_n, int)
 
 
 def test_outline_module_header_preserved(large_py_file: Path) -> None:
     content = large_py_file.read_text(encoding="utf-8")
-    outline = pv._ast_outline_python_file(content, large_py_file)
+    outline = _outline_text(
+        pv._ast_outline_python_file(content, large_py_file),
+    )
     assert outline is not None
     # Imports retained verbatim (module header chunk is full).
     assert "import os" in outline
@@ -187,51 +268,110 @@ def test_outline_module_header_preserved(large_py_file: Path) -> None:
 
 
 def test_outline_small_function_full_body(large_py_file: Path) -> None:
+    """With NO target_chars constraint, the slicer picks tier 0
+    (full bodies) and small functions stay full."""
     content = large_py_file.read_text(encoding="utf-8")
-    outline = pv._ast_outline_python_file(content, large_py_file)
+    outline = _outline_text(
+        pv._ast_outline_python_file(content, large_py_file),
+    )
     assert outline is not None
-    # small_top_level is small — should be full body.
     assert "def small_top_level" in outline
     assert "return x + 1" in outline
 
 
-def test_outline_large_method_skeletonized(large_py_file: Path) -> None:
+def test_outline_progressive_skeletonization_under_pressure(
+    large_py_file: Path,
+) -> None:
+    """Slice 11.4.1: with a tight target_chars, the slicer must
+    progressively skeletonize until the result fits."""
     content = large_py_file.read_text(encoding="utf-8")
-    outline = pv._ast_outline_python_file(content, large_py_file)
-    assert outline is not None
-    # Each method has 50+ padding lines → exceeds fn_max_chars.
-    # Skeleton marker present.
-    assert "[AST-SKELETON:" in outline
-    # The padding strings (real bodies) should be ABSENT for at least
-    # some methods.
-    skeleton_count = outline.count("[AST-SKELETON:")
-    assert skeleton_count >= 5
+    # Set a tight target — 30% of the original size
+    tight_target = int(len(content) * 0.3)
+    result = pv._ast_outline_python_file(
+        content, large_py_file, target_chars=tight_target,
+    )
+    assert result is not None
+    outline, tier, full_n, skel_n = result
+    # Should have skeletonized
+    assert skel_n > 0
+    # Tier reflects the level of skeletonization applied
+    assert tier in (
+        "tier_2_25pct_skeletons", "tier_3_50pct_skeletons",
+        "tier_4_75pct_skeletons", "tier_5_max_skeletal",
+    )
+    # The outline marker reflects the tier
+    assert tier in outline
+
+
+def test_outline_picks_smallest_tier_that_fits(
+    large_py_file: Path,
+) -> None:
+    """The slicer must NOT over-skeletonize. If tier 0 fits, use
+    tier 0. If tier 0 doesn't fit but tier 1 does, use tier 1. Etc."""
+    content = large_py_file.read_text(encoding="utf-8")
+    # Very generous target — 5x file size (clearly room for tier 0).
+    generous = int(len(content) * 5.0)
+    result = pv._ast_outline_python_file(
+        content, large_py_file, target_chars=generous,
+    )
+    assert result is not None
+    outline, tier, full_n, skel_n = result
+    # With a generous target, tier 0 (no skeletonization) wins.
+    assert tier == "tier_0_full"
+    # And no skeletons applied
+    assert skel_n == 0
+
+
+def test_outline_tier_escalates_under_tighter_target(
+    large_py_file: Path,
+) -> None:
+    """Empirical pin: progressively tighter targets pick higher tiers."""
+    content = large_py_file.read_text(encoding="utf-8")
+    # Very tight target — 10% of file size; should force tier 4 or 5
+    tight = int(len(content) * 0.10)
+    result = pv._ast_outline_python_file(
+        content, large_py_file, target_chars=tight,
+    )
+    assert result is not None
+    outline, tier, full_n, skel_n = result
+    # Aggressive skeletonization
+    assert tier in (
+        "tier_3_50pct_skeletons", "tier_4_75pct_skeletons",
+        "tier_5_max_skeletal",
+    )
+    # Most functions skeletonized
+    assert skel_n >= full_n
 
 
 def test_outline_returns_none_on_parse_error(broken_py_file: Path) -> None:
     content = broken_py_file.read_text(encoding="utf-8")
-    outline = pv._ast_outline_python_file(content, broken_py_file)
-    assert outline is None
+    result = pv._ast_outline_python_file(content, broken_py_file)
+    assert result is None
 
 
 def test_outline_returns_none_on_empty(tmp_path: Path) -> None:
     p = tmp_path / "empty.py"
     p.write_text("", encoding="utf-8")
-    outline = pv._ast_outline_python_file("", p)
+    result = pv._ast_outline_python_file("", p)
     # Empty file produces no chunks → fallback
-    assert outline is None
+    assert result is None
 
 
-def test_outline_smaller_than_full_for_large_file(
+def test_outline_smaller_than_full_under_target(
     large_py_file: Path,
 ) -> None:
-    """The whole point — outline must reduce char count for large files."""
+    """With a tight target_chars, the outline MUST be smaller than
+    the original (the whole point)."""
     content = large_py_file.read_text(encoding="utf-8")
-    outline = pv._ast_outline_python_file(content, large_py_file)
-    assert outline is not None
+    target = int(len(content) * 0.4)
+    result = pv._ast_outline_python_file(
+        content, large_py_file, target_chars=target,
+    )
+    assert result is not None
+    outline = result[0]
     assert len(outline) < len(content), (
         f"outline ({len(outline)}) must be smaller than full "
-        f"({len(content)}) for a file with >5 large methods"
+        f"({len(content)}) under a tight target_chars constraint"
     )
 
 
@@ -343,7 +483,9 @@ def test_dispatcher_records_success_metric(
     rows = list(_read_jsonl(tmp_path / "m.jsonl"))
     assert len(rows) == 1
     row = rows[0]
-    assert row["target_symbol"] == "__codegen_outline__"
+    # Slice 11.4.1: target_symbol carries the tier suffix
+    # (e.g. "__codegen_outline__:tier_3_50pct_skeletons")
+    assert row["target_symbol"].startswith("__codegen_outline__")
     assert row["outcome"] == "ok"
     assert row["op_id"] == "op-test-113"
     assert row["sliced_chars"] < row["full_chars"]
@@ -455,5 +597,104 @@ def test_outline_function_never_raises() -> None:
     result = pv._ast_outline_python_file(
         "completely \x00 bogus \x01 source", Path("/tmp/fake.py"),
     )
-    # Either None (parse failed) OR a string. Must NOT raise.
-    assert result is None or isinstance(result, str)
+    # Either None (parse failed) OR a tuple. Must NOT raise.
+    assert result is None or isinstance(result, tuple)
+
+
+# ---------------------------------------------------------------------------
+# §8 — Slice 11.4.1 honest savings_ratio (drop the clamp)
+# ---------------------------------------------------------------------------
+
+
+def test_savings_ratio_negative_when_outline_is_larger() -> None:
+    """Slice 11.4.1 honesty pin: a sliced outline LARGER than the
+    original surfaces as a NEGATIVE savings ratio. Clamping to 0 hid
+    this empirical reality from the operator's ledger."""
+    from backend.core.ouroboros.governance.slicing_metrics import (
+        SliceMetric,
+    )
+    metric = SliceMetric(
+        file_path="x.py", target_symbol="foo",
+        full_chars=1000, sliced_chars=1500,  # outline is LARGER
+    )
+    assert metric.savings_ratio < 0
+    assert metric.savings_ratio == pytest.approx(-0.5, abs=0.01)
+
+
+def test_savings_ratio_positive_when_outline_is_smaller() -> None:
+    from backend.core.ouroboros.governance.slicing_metrics import (
+        SliceMetric,
+    )
+    metric = SliceMetric(
+        file_path="x.py", target_symbol="foo",
+        full_chars=1000, sliced_chars=200,
+    )
+    assert metric.savings_ratio == pytest.approx(0.8, abs=0.01)
+
+
+def test_savings_ratio_zero_when_full_chars_zero() -> None:
+    """Defensive: div-by-zero guard."""
+    from backend.core.ouroboros.governance.slicing_metrics import (
+        SliceMetric,
+    )
+    metric = SliceMetric(
+        file_path="x.py", target_symbol="foo",
+        full_chars=0, sliced_chars=0,
+    )
+    assert metric.savings_ratio == 0.0
+
+
+def test_dispatcher_records_outline_not_smaller_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slice 11.4.1: when even max-skeletal tier produces an outline
+    >= original size, the dispatcher records a fallback metric AND
+    returns None so caller takes legacy truncation path.
+
+    Hardest case to construct deterministically — depends on the
+    specific layout of small files where the outline footer +
+    chunk-joins exceed the original size. We accept either a
+    successful slice (smaller outline) OR a fallback row, but
+    REQUIRE that if the dispatcher returned None, it logged the
+    reason."""
+    monkeypatch.setenv("JARVIS_GEN_AST_SLICE_ENABLED", "true")
+    monkeypatch.setenv(
+        "JARVIS_SLICING_METRICS_PATH", str(tmp_path / "m.jsonl"),
+    )
+    monkeypatch.setenv("JARVIS_GEN_AST_SLICE_MIN_CHARS", "200")
+    # Build a file ~500 chars with NO skeletonizable content (just
+    # imports + many tiny functions) — outline will add the footer +
+    # newlines + ChunkType.MODULE_HEADER chunk and likely be larger.
+    p = tmp_path / "tiny.py"
+    body = '"""Module docstring for fallback test."""\n'
+    body += "import os\nimport sys\nimport json\n\n"
+    for i in range(8):
+        body += f"def fn_{i}() -> int:\n    return {i}\n\n"
+    p.write_text(body, encoding="utf-8")
+    content = p.read_text(encoding="utf-8")
+    result = pv._maybe_ast_outline(
+        p, "tiny.py", content, provider_route="background",
+    )
+    # Either the outline was smaller (slicer succeeded — fine) OR
+    # it was larger and dispatcher returned None with a fallback
+    # row recorded. EITHER way, a metric row exists.
+    metrics_path = tmp_path / "m.jsonl"
+    if metrics_path.exists():
+        rows = [
+            json.loads(line)
+            for line in metrics_path.read_text("utf-8").splitlines()
+            if line.strip()
+        ]
+        assert rows, "expected at least one metric row recorded"
+        if result is None:
+            # Fallback path — verify a fallback_reason was captured
+            assert any(
+                r.get("fallback_reason") for r in rows
+            )
+    else:
+        # No metrics file written — dispatcher must have returned a
+        # successful outline (which records via record_slice). If
+        # result is None AND no metrics, that's a contract violation.
+        assert result is not None, (
+            "dispatcher returned None but did not record a metric row"
+        )

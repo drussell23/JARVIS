@@ -149,13 +149,28 @@ class SliceMetric:
 
     @property
     def savings_ratio(self) -> float:
-        """Fraction of source-text NOT injected. 0.95 means 95%
-        of the file was clipped. Returns 0 when full_chars is 0
-        (defensive — prevents div-by-zero)."""
+        """Signed fraction of source-text NOT injected.
+
+        Positive means the outline was smaller than the original
+        (e.g. 0.95 = 95% of file was clipped). **Negative means the
+        outline was LARGER** (e.g. -0.20 = outline 20% bigger than
+        the original; happens for test files with many small
+        functions where the outline-footer + chunk-joins exceed the
+        original size).
+
+        Slice 11.4.1 (per directive 2026-04-27) drops the
+        ``max(0, ...)`` clamp — clamping hid the empirical reality
+        from the once-proof on bt-2026-04-27-220201, where 6 of 13
+        slicing dispatches were silently "0% savings" but actually
+        producing larger outlines. Negative values are diagnostic
+        signals downstream consumers (Phase 11 P11.7 graduation
+        gate, RL telemetry) MUST see truthfully.
+
+        Returns 0 when full_chars is 0 (defensive — prevents
+        div-by-zero)."""
         if self.full_chars <= 0:
             return 0.0
-        saved = max(0, self.full_chars - self.sliced_chars)
-        return saved / self.full_chars
+        return (self.full_chars - self.sliced_chars) / self.full_chars
 
     def to_json(self) -> Dict[str, Any]:
         return {

@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -375,22 +375,32 @@ def _read_with_truncation(
 
 
 # ---------------------------------------------------------------------------
-# Slice 11.3 — AST-aware codegen-prompt slicing.
+# Slice 11.3 + 11.4.1 — AST-aware codegen-prompt slicing.
 # ---------------------------------------------------------------------------
 #
-# When ``JARVIS_GEN_AST_SLICE_ENABLED=true`` AND a target file is Python AND
-# the file is larger than ``JARVIS_GEN_AST_SLICE_MIN_CHARS`` (default 8000),
-# replace the raw fenced file content with a structured AST outline:
-# module header (full), then per function/method either the full body (if
-# under ``JARVIS_GEN_AST_SLICE_FN_MAX_CHARS``, default 1500) or a
-# signature-only skeleton.
+# Slice 11.3 introduced a static-threshold-based outline. Slice 11.4.1
+# (per directive 2026-04-27 — "Dynamic Payload Economics") rejected the
+# static ``fn_max_chars`` knob because it's a Zero-Order shortcut. The
+# replacement architecture:
 #
-# This composes ``ast_slicer.ASTChunker`` (Slice 11.1's shared module) — no
-# duplicate parsing logic. Token-savings come from large files where
-# helper functions get skeleton treatment while the operationally
-# relevant ones stay full-body.
+#   1. **Dynamic provider budgeting** — target_max_chars is derived from
+#      the active provider's effective context window. BG/SPEC routes
+#      use the DW max-tokens budget (Gemma 4 31B / Qwen3-14B); Claude
+#      routes use a wider budget. NO HARDCODED THRESHOLDS.
 #
-# Master-flag-off path is byte-identical legacy: ``_build_codegen_prompt``
+#   2. **Progressive skeletonization** — when the initial full outline
+#      exceeds the target, the slicer recursively walks tiers of
+#      skeletonization (tier 0 = full bodies; tier 1 = drop docstrings;
+#      tier 2-5 = progressively skeletonize larger functions; tier 6 =
+#      everything skeletal except module header). Picks the SMALLEST
+#      tier that fits the target. NEVER falls through to line-truncation
+#      (which destroys syntactic boundaries).
+#
+#   3. **Honest metrics** — slicing_metrics.SliceMetric.savings_ratio
+#      now surfaces NEGATIVE ratios when the outline is larger than
+#      the original. The ledger no longer lies.
+#
+# Master-flag-off path remains byte-identical legacy: ``_build_codegen_prompt``
 # never enters the slicing branch.
 
 
@@ -415,39 +425,224 @@ def _gen_ast_slice_min_chars() -> int:
         return 8000
 
 
-def _gen_ast_slice_fn_max_chars() -> int:
-    """Per-function/method threshold for full-body inclusion.
-    Functions ABOVE this size get signature-only skeleton treatment.
-    Default 1500 chars (~40 lines)."""
-    raw = os.environ.get("JARVIS_GEN_AST_SLICE_FN_MAX_CHARS")
+def _gen_ast_slice_chars_per_token() -> float:
+    """Heuristic conversion factor: ~3.5 chars per token for code (DW
+    pricing assumption used elsewhere). Env-overrideable for
+    operators tuning the dynamic budget formula."""
+    raw = os.environ.get("JARVIS_GEN_AST_SLICE_CHARS_PER_TOKEN")
     if raw is None:
-        return 1500
+        return 3.5
     try:
-        return max(100, int(raw))
+        return max(1.0, float(raw))
     except (TypeError, ValueError):
-        return 1500
+        return 3.5
+
+
+def _gen_ast_slice_input_budget_ratio() -> float:
+    """Fraction of provider context-budget reserved for FILE CONTENT
+    (vs schema, description, prompt scaffolding, output reservation).
+    Default 0.25 — conservative; the prompt has ~50% output reserve +
+    25% scaffolding + 25% file content."""
+    raw = os.environ.get("JARVIS_GEN_AST_SLICE_INPUT_BUDGET_RATIO")
+    if raw is None:
+        return 0.25
+    try:
+        v = float(raw)
+        return max(0.05, min(0.95, v))
+    except (TypeError, ValueError):
+        return 0.25
+
+
+def _codegen_target_chars_for_route(
+    provider_route: str, num_files: int = 1,
+) -> int:
+    """Per-file char budget derived from the active provider.
+
+    DW routes (background, speculative, standard, complex when DW
+    healthy) — derived from ``_DW_MAX_TOKENS`` (default 16384). Input
+    budget = max_tokens * input_budget_ratio (default 0.25); convert
+    to chars at chars_per_token (default 3.5); divide by num_files;
+    floor at 2000 chars.
+
+    Immediate (Claude direct) — Claude has 200K context; per-file
+    budget is generous (~30K chars).
+
+    No hardcoded "fn_max_chars" — the budget IS the threshold.
+
+    NEVER raises. Returns ``int`` chars for one file."""
+    route_norm = (provider_route or "").strip().lower()
+    chars_per_tok = _gen_ast_slice_chars_per_token()
+    input_ratio = _gen_ast_slice_input_budget_ratio()
+    n = max(1, num_files)
+    # Claude routes — large context window
+    if route_norm in ("immediate",):
+        # Claude Sonnet 4.6 has 200K input context. Reserve ratio of
+        # that for file content per file.
+        claude_max_tokens = 200_000
+        target_tok = int(
+            claude_max_tokens * input_ratio / n,
+        )
+        return max(2000, int(target_tok * chars_per_tok))
+    # DW routes — derive from _DW_MAX_TOKENS
+    try:
+        from .doubleword_provider import _DW_MAX_TOKENS as _dw_max_tok
+    except Exception:  # noqa: BLE001 — defensive
+        _dw_max_tok = 16384
+    target_tok = int(_dw_max_tok * input_ratio / n)
+    return max(2000, int(target_tok * chars_per_tok))
+
+
+def _render_outline(
+    chunks: Sequence[Any],
+    skeleton_chunk_ids: Set[str],
+    drop_docstrings: bool,
+) -> Tuple[str, int, int]:
+    """Render an outline given a set of chunks to skeletonize.
+
+    Returns ``(rendered_string, fullbody_count, skeleton_count)``.
+    NEVER raises. Used by the progressive skeletonizer to render
+    candidate tiers."""
+    from backend.core.ouroboros.governance.ast_slicer import (
+        ChunkType,
+    )
+    parts: List[str] = []
+    skeletons_count = 0
+    fullbody_count = 0
+    for chunk in chunks:
+        if chunk.chunk_type == ChunkType.MODULE_HEADER:
+            # Module header always retained, but docstring may be dropped
+            if drop_docstrings and chunk.docstring:
+                # Keep imports only — strip docstring lines
+                imports_only = "\n".join(sorted(chunk.imports))
+                parts.append(imports_only)
+            else:
+                parts.append(chunk.source_code)
+            continue
+        if chunk.chunk_type in (
+            ChunkType.CLASS_SKELETON, ChunkType.CLASS,
+        ):
+            parts.append(chunk.source_code)
+            continue
+        # FUNCTION or METHOD
+        if chunk.chunk_id in skeleton_chunk_ids:
+            sig = chunk.signature or f"def {chunk.name}(...)"
+            indent = (
+                "    " if chunk.chunk_type == ChunkType.METHOD else ""
+            )
+            skeleton_lines = [f"{indent}{sig}"]
+            if chunk.docstring and not drop_docstrings:
+                skeleton_lines.append(
+                    f'{indent}    """{chunk.docstring[:80]}"""'
+                )
+            skeleton_lines.append(
+                f"{indent}    ...  "
+                f"# [AST-SKELETON: {len(chunk.source_code)} chars omitted]"
+            )
+            parts.append("\n".join(skeleton_lines))
+            skeletons_count += 1
+        else:
+            # Full body. Optionally strip the function-level docstring.
+            body = chunk.source_code
+            if drop_docstrings and chunk.docstring:
+                # Naive docstring strip — replace """...""" with ...
+                # Keeps the function callable; losing the docstring is
+                # the goal for token reduction.
+                body = body.replace(
+                    f'"""{chunk.docstring}"""', "...", 1,
+                )
+            parts.append(body)
+            fullbody_count += 1
+    return "\n\n".join(parts), fullbody_count, skeletons_count
+
+
+def _progressive_skeletonize(
+    chunks: Sequence[Any],
+    target_chars: int,
+) -> Tuple[str, str, int, int]:
+    """Walk skeletonization tiers until the rendered outline fits the
+    target char budget. Returns ``(outline, tier_used, fullbody_count,
+    skeleton_count)``.
+
+    Tiers (most-keep → most-aggressive):
+      0. full bodies + all docstrings (Slice 11.3 default)
+      1. full bodies + DROP docstrings
+      2. skeletonize 25% of fns by size + DROP docstrings
+      3. skeletonize 50%
+      4. skeletonize 75%
+      5. ALL fn/methods skeletal (module header + class skeletons + signatures)
+
+    Picks the SMALLEST tier whose render is ≤ target. If no tier
+    fits, returns the most aggressive tier's render with
+    ``tier_used="tier_5_max_skeletal"`` so the caller still gets a
+    valid outline (better than legacy truncation which would destroy
+    syntactic boundaries).
+
+    NEVER raises."""
+    from backend.core.ouroboros.governance.ast_slicer import (
+        ChunkType,
+    )
+    fn_chunks = [
+        c for c in chunks
+        if c.chunk_type in (ChunkType.FUNCTION, ChunkType.METHOD)
+    ]
+    fn_chunks_by_size = sorted(
+        fn_chunks, key=lambda c: -len(c.source_code),
+    )
+
+    def _try(skeleton_set: Set[str], drop_ds: bool, label: str):
+        rendered, full_n, skel_n = _render_outline(
+            chunks, skeleton_set, drop_ds,
+        )
+        return rendered, label, full_n, skel_n
+
+    # Tier 0: full bodies, all docstrings retained.
+    out, label, full_n, skel_n = _try(set(), False, "tier_0_full")
+    if len(out) <= target_chars:
+        return out, label, full_n, skel_n
+
+    # Tier 1: full bodies, drop docstrings.
+    out, label, full_n, skel_n = _try(
+        set(), True, "tier_1_no_docstrings",
+    )
+    if len(out) <= target_chars:
+        return out, label, full_n, skel_n
+
+    # Tier 2-4: progressive skeletonization 25% / 50% / 75%
+    for tier_idx, frac in enumerate([0.25, 0.5, 0.75]):
+        n_to_skeleton = max(
+            1, int(len(fn_chunks_by_size) * frac),
+        )
+        skeleton_set = {
+            c.chunk_id for c in fn_chunks_by_size[:n_to_skeleton]
+        }
+        out, label, full_n, skel_n = _try(
+            skeleton_set, True,
+            f"tier_{tier_idx+2}_{int(frac*100)}pct_skeletons",
+        )
+        if len(out) <= target_chars:
+            return out, label, full_n, skel_n
+
+    # Tier 5: ALL fn/methods skeletal — last resort
+    skeleton_set = {c.chunk_id for c in fn_chunks}
+    out, label, full_n, skel_n = _try(
+        skeleton_set, True, "tier_5_max_skeletal",
+    )
+    return out, label, full_n, skel_n
 
 
 def _ast_outline_python_file(
     content: str,
     file_path: Path,
-    fn_max_chars: Optional[int] = None,
-) -> Optional[str]:
-    """Produce an AST-aware outline of a Python file.
+    target_chars: Optional[int] = None,
+) -> Optional[Tuple[str, str, int, int]]:
+    """Produce an AST-aware outline of a Python file with progressive
+    skeletonization to fit ``target_chars``.
 
-    Module header (always full), then per function/method/class either
-    full body or signature-only skeleton based on ``fn_max_chars``.
-    Returns ``None`` on parse failure so caller falls back to legacy
-    ``_read_with_truncation``.
-
-    NEVER raises.
-    """
-    if fn_max_chars is None:
-        fn_max_chars = _gen_ast_slice_fn_max_chars()
-
+    Returns ``(outline, tier_used, fullbody_count, skeleton_count)``
+    or ``None`` on parse failure. NEVER raises."""
     try:
         from backend.core.ouroboros.governance.ast_slicer import (
-            ASTChunker, ChunkType,
+            ASTChunker,
         )
     except ImportError:
         return None
@@ -461,60 +656,26 @@ def _ast_outline_python_file(
         chunks = chunker.extract_chunks_from_source(
             content, file_path, target_names=None, include_all=True,
         )
-    except Exception:  # noqa: BLE001 — defensive, fallback to legacy
+    except Exception:  # noqa: BLE001 — defensive
         return None
 
     if not chunks:
         return None
 
-    # Emit module header (always full), then walk function/method
-    # chunks. CLASS / CLASS_SKELETON chunks are emitted in-place; for
-    # method chunks under the parent class we collapse to a "..."
-    # skeleton if the method's source exceeds fn_max_chars.
-    parts: List[str] = []
-    skeletons_count = 0
-    fullbody_count = 0
+    # Default target = full content size if not provided (effectively
+    # tier 0 always wins). Useful for unit tests that don't care about
+    # the skeleton-progression machinery.
+    if target_chars is None or target_chars <= 0:
+        target_chars = len(content) + 1
 
-    for chunk in chunks:
-        if chunk.chunk_type == ChunkType.MODULE_HEADER:
-            parts.append(chunk.source_code)
-            continue
-        if chunk.chunk_type in (
-            ChunkType.CLASS_SKELETON, ChunkType.CLASS,
-        ):
-            # Class skeleton — already a signature outline.
-            parts.append(chunk.source_code)
-            continue
-        # FUNCTION or METHOD
-        body_chars = len(chunk.source_code)
-        if body_chars <= fn_max_chars:
-            parts.append(chunk.source_code)
-            fullbody_count += 1
-        else:
-            # Skeleton: signature + docstring + ellipsis
-            sig = chunk.signature or f"def {chunk.name}(...)"
-            ds_line = (
-                f'    """{(chunk.docstring or "...")[:80]}"""'
-                if chunk.docstring else ""
-            )
-            indent = (
-                "    " if chunk.chunk_type == ChunkType.METHOD else ""
-            )
-            skeleton_lines = [f"{indent}{sig}"]
-            if ds_line:
-                skeleton_lines.append(ds_line)
-            skeleton_lines.append(
-                f"{indent}    ...  # [AST-SKELETON: {body_chars} chars omitted]"
-            )
-            parts.append("\n".join(skeleton_lines))
-            skeletons_count += 1
-
-    outline = "\n\n".join(parts)
-    summary_marker = (
-        f"\n# [AST-OUTLINE: {fullbody_count} fn/method full bodies, "
-        f"{skeletons_count} skeletons]"
+    out, tier_used, full_n, skel_n = _progressive_skeletonize(
+        chunks, target_chars,
     )
-    return outline + summary_marker
+    summary_marker = (
+        f"\n# [AST-OUTLINE: tier={tier_used} "
+        f"full={full_n} skel={skel_n}]"
+    )
+    return out + summary_marker, tier_used, full_n, skel_n
 
 
 def _maybe_ast_outline(
@@ -522,20 +683,33 @@ def _maybe_ast_outline(
     raw_path: str,
     full_content: str,
     op_id: str = "",
+    provider_route: str = "",
+    num_files: int = 1,
 ) -> Optional[str]:
-    """Slice 11.3 dispatcher — returns AST outline string or None to
-    fall through to legacy truncation. Records metrics on every
-    dispatch (success or fallback) so operators can quantify the
-    token reduction empirically before flipping the master flag's
-    default in P11.7. NEVER raises."""
+    """Slice 11.4.1 dispatcher — dynamic-budget AST outline.
+
+    Returns the AST outline string when slicing helps OR ``None`` to
+    fall through to legacy ``_read_with_truncation``. Records every
+    dispatch (success / fallback) in slicing_metrics.jsonl for
+    empirical verification.
+
+    Fallback reasons surface in the ledger:
+      * ``flag_off`` — master flag disabled (no metric recorded)
+      * ``not_python`` — non-.py file
+      * ``below_min_chars`` — file smaller than threshold (no metric)
+      * ``parse_failed_or_empty`` — AST parse failed
+      * ``outline_not_smaller`` — even max-skeleton tier exceeded
+                                   target AND was not smaller than
+                                   the original content (caller takes
+                                   legacy truncation path)
+
+    NEVER raises."""
     if not _gen_ast_slice_enabled():
         return None
     if abs_path.suffix.lower() != ".py":
         return None
     full_chars = len(full_content)
     if full_chars < _gen_ast_slice_min_chars():
-        # Small file — cheaper to inject in full. Skip slicing without
-        # logging (avoids ledger pollution from sub-threshold cases).
         return None
 
     try:
@@ -545,9 +719,14 @@ def _maybe_ast_outline(
     except ImportError:
         return None
 
-    outlined = _ast_outline_python_file(full_content, abs_path)
-    if outlined is None:
-        # Parse failure or empty chunk list — fall back.
+    target_chars = _codegen_target_chars_for_route(
+        provider_route, num_files,
+    )
+
+    outlined_tuple = _ast_outline_python_file(
+        full_content, abs_path, target_chars=target_chars,
+    )
+    if outlined_tuple is None:
         record_slice(SliceMetric(
             file_path=raw_path,
             target_symbol="__codegen_outline__",
@@ -559,10 +738,30 @@ def _maybe_ast_outline(
             op_id=op_id,
         ))
         return None
+
+    outlined, tier_used, full_n, skel_n = outlined_tuple
     sliced_chars = len(outlined)
+
+    # Skip-when-not-smaller guard (Slice 11.4.1) — if the maximally-
+    # skeletal outline is STILL larger than the original, the slicer
+    # genuinely cannot help this file. Fall through to legacy
+    # truncation; record the empirical reason so operators see it.
+    if sliced_chars >= full_chars:
+        record_slice(SliceMetric(
+            file_path=raw_path,
+            target_symbol=f"__codegen_outline__:{tier_used}",
+            full_chars=full_chars,
+            sliced_chars=sliced_chars,  # honest — might be > full
+            include_imports=True,
+            outcome="fallback",
+            fallback_reason="outline_not_smaller",
+            op_id=op_id,
+        ))
+        return None
+
     record_slice(SliceMetric(
         file_path=raw_path,
-        target_symbol="__codegen_outline__",
+        target_symbol=f"__codegen_outline__:{tier_used}",
         full_chars=full_chars,
         sliced_chars=sliced_chars,
         include_imports=True,
@@ -1810,15 +2009,22 @@ def _build_codegen_prompt(
         size_bytes = len(content.encode())
         line_count = content.count("\n")
 
-        # Slice 11.3 — try AST-aware outline first when master flag is on
-        # AND content is Python AND large enough. Returns None for the
-        # fallback path (which preserves byte-identical legacy behavior).
+        # Slice 11.3 + 11.4.1 — try AST-aware outline first when master
+        # flag is on AND content is Python AND large enough. Returns
+        # None for the fallback path (preserves byte-identical legacy).
+        # Slice 11.4.1 wires provider_route + num_files so the outline
+        # target is dynamically derived from the active provider's
+        # context budget instead of a hardcoded fn_max_chars threshold.
         _op_id_short = (
             getattr(ctx, "op_id", "")[:24]
             if hasattr(ctx, "op_id") else ""
         )
+        _num_files = max(1, len(ctx.target_files))
         ast_outlined = _maybe_ast_outline(
-            abs_path, str(raw_path), content, op_id=_op_id_short,
+            abs_path, str(raw_path), content,
+            op_id=_op_id_short,
+            provider_route=provider_route,
+            num_files=_num_files,
         )
         if ast_outlined is not None:
             truncated = ast_outlined
