@@ -940,7 +940,10 @@ class TopologySentinel:
         self._breakers: Dict[str, Any] = {}     # model_id -> CircuitBreaker
         self._snapshots: Dict[str, EndpointSnapshot] = {}
         self._ramps: Dict[str, SlowStartRamp] = {}
-        self._lock = threading.Lock()
+        # RLock — force_severed/force_healthy hold the lock then call
+        # register_endpoint which also acquires it. Same re-entrancy
+        # pattern that bit posture_observer (slice5_arc_a fix).
+        self._lock = threading.RLock()
         self._probe_task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
         self._daily_probe_cost_usd = 0.0
