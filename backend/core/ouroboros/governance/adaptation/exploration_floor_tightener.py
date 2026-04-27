@@ -427,6 +427,14 @@ def propose_floor_raises_from_events(
             summary=c.summary,
         )
         proposed_hash = c.proposed_state_hash(current_state_hash)
+        # Mining-surface payload (Item #2 yaml_writer schema):
+        # `floors: [{category, floor, ...prov}]`. Loader reads
+        # `category` (validated against _KNOWN_CATEGORIES) + `floor`
+        # (numeric > 0). Provenance auto-enriched by yaml_writer.
+        payload = {
+            "category": c.category,
+            "floor": c.proposed_floor,
+        }
         res = ledger.propose(
             proposal_id=c.proposal_id(),
             surface=AdaptationSurface.IRON_GATE_EXPLORATION_FLOORS,
@@ -434,6 +442,7 @@ def propose_floor_raises_from_events(
             evidence=evidence,
             current_state_hash=current_state_hash or "sha256:initial",
             proposed_state_hash=proposed_hash,
+            proposed_state_payload=payload,
         )
         results.append(res)
         if res.status is ProposeStatus.OK:

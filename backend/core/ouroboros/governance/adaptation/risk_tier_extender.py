@@ -347,6 +347,16 @@ def propose_tier_extensions_from_events(
             summary=c.summary,
         )
         proposed_hash = c.proposed_state_hash(current_state_hash)
+        # Mining-surface payload (Item #2 yaml_writer schema):
+        # `tiers: [{tier_name, insert_after, failure_class, ...prov}]`.
+        # Loader validates tier_name + insert_after match [A-Z0-9_]+
+        # charset (Slice 4b miner already produces uppercase output).
+        # Provenance auto-enriched by yaml_writer.
+        payload = {
+            "tier_name": c.proposed_tier_name,
+            "insert_after": c.insert_after_tier,
+            "failure_class": c.failure_class,
+        }
         res = ledger.propose(
             proposal_id=c.proposal_id(),
             surface=AdaptationSurface.RISK_TIER_FLOOR_TIERS,
@@ -354,6 +364,7 @@ def propose_tier_extensions_from_events(
             evidence=evidence,
             current_state_hash=current_state_hash or "sha256:initial",
             proposed_state_hash=proposed_hash,
+            proposed_state_payload=payload,
         )
         results.append(res)
         if res.status is ProposeStatus.OK:

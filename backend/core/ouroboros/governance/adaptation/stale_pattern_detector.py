@@ -430,6 +430,22 @@ def propose_sunset_candidates_from_events(
             summary=c.summary,
         )
         try:
+            # Sunset candidate payload: yaml_writer doesn't have a
+            # dedicated "sunset" YAML schema (the sunset signal is
+            # advisory — Pass C cannot REMOVE patterns; removal
+            # requires Pass B /order2 amend). The payload carries the
+            # pattern_name + days_since for /adapt show audit
+            # rendering. yaml_writer will append into the
+            # SEMANTIC_GUARDIAN_PATTERNS file but the actual loader
+            # ignores entries with kind="sunset_candidate" (loader
+            # only consumes add_pattern). The audit trail is the
+            # value here, not behavior change.
+            payload = {
+                "pattern_name": c.pattern_name,
+                "days_since_last_match": c.days_since_last_match,
+                "last_match_unix": c.last_match_unix,
+                "kind": "sunset_candidate",
+            }
             result = ledger.propose(
                 proposal_id=c.proposal_id(),
                 surface=AdaptationSurface.SEMANTIC_GUARDIAN_PATTERNS,
@@ -439,6 +455,7 @@ def propose_sunset_candidates_from_events(
                 proposed_state_hash=c.proposed_state_hash(
                     current_state_hash,
                 ),
+                proposed_state_payload=payload,
             )
         except Exception as exc:  # noqa: BLE001 — defensive
             logger.warning(
