@@ -415,6 +415,79 @@ class ExplorationFloors:
             required_categories=req_cats,  # type: ignore[arg-type]
         )
 
+    @classmethod
+    def from_env_with_adapted(cls, complexity: str) -> "ExplorationFloors":
+        """Phase 7.2 — env floors + Pass C adapted floors merged.
+
+        Reads `.jarvis/adapted_iron_gate_floors.yaml` (when env flag
+        `JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_FLOORS` is on) and
+        merges the adapted required-categories into the env baseline.
+
+        Cage discipline (load-bearing per Pass C §7.3):
+          * Adapted floors can only RAISE coverage requirements —
+            new entries are added to `required_categories`; never
+            removed.
+          * Default-off + fail-open: when the env flag is off OR the
+            YAML is missing/malformed, this method returns the same
+            ExplorationFloors `from_env` would.
+          * `min_score` and `min_categories` are NOT modified by
+            adapted floors (the adapted-floor surface is structurally
+            categorical-coverage; numeric thresholds stay env-driven).
+            Operator visibility for the per-category numeric value
+            is via `/posture` REPL surfacing in a follow-up.
+        """
+        base = cls.from_env(complexity)
+        try:
+            from backend.core.ouroboros.governance.adaptation.adapted_iron_gate_loader import (  # noqa: E501
+                compute_adapted_required_categories,
+                is_loader_enabled,
+                load_adapted_floors,
+            )
+        except Exception:  # noqa: BLE001 — fail-open
+            return base
+        if not is_loader_enabled():
+            return base
+        try:
+            adapted_floors = load_adapted_floors()
+        except Exception:  # noqa: BLE001 — fail-open
+            return base
+        if not adapted_floors:
+            return base
+        adapted_cat_names = compute_adapted_required_categories(
+            adapted_floors,
+        )
+        # Translate category-name strings → ExplorationCategory enum
+        # values. Unknown values (which the loader already filters)
+        # are tolerated here too as defense-in-depth.
+        adapted_required: set = set()
+        for name in adapted_cat_names:
+            try:
+                adapted_required.add(ExplorationCategory(name))
+            except ValueError:
+                continue
+        if not adapted_required:
+            return base
+        merged = frozenset(base.required_categories) | frozenset(
+            adapted_required,
+        )
+        # Adapted floors are additive only — return a new instance
+        # with the union; never remove existing required categories.
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "[ExplorationFloors] merged %d adapted floor(s) into "
+            "required_categories (env=%d, adapted=%d, merged=%d)",
+            len(adapted_required),
+            len(base.required_categories),
+            len(adapted_required),
+            len(merged),
+        )
+        return cls(
+            complexity=base.complexity,
+            min_score=base.min_score,
+            min_categories=base.min_categories,
+            required_categories=merged,  # type: ignore[arg-type]
+        )
+
 
 # ---------------------------------------------------------------------------
 # Gate evaluation + retry feedback
