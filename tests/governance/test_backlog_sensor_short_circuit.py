@@ -105,9 +105,12 @@ def _disable_auto_proposed_by_default(monkeypatch: pytest.MonkeyPatch):
 # ===========================================================================
 
 
-def test_short_circuit_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_short_circuit_default_on_post_graduation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slice 11.7 graduation flip: unset/empty env returns True."""
     monkeypatch.delenv("JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", raising=False)
-    assert short_circuit_enabled() is False
+    assert short_circuit_enabled() is True
 
 
 def test_short_circuit_truthy_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -117,7 +120,9 @@ def test_short_circuit_truthy_values(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_short_circuit_falsy_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    for val in ("0", "false", "no", "off", "", "garbage"):
+    """Post-graduation: empty string is the unset-marker for default
+    True. Hot-revert requires an explicit ``false``-class string."""
+    for val in ("0", "false", "no", "off", "garbage"):
         monkeypatch.setenv("JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", val)
         assert short_circuit_enabled() is False
 
@@ -136,7 +141,11 @@ async def test_cold_start_full_scan_even_with_flag_on(
     envelopes = await sensor.scan_once()
     assert sensor._sc_full_scans == 1  # noqa: SLF001
     assert sensor._sc_short_circuits == 0  # noqa: SLF001
-    assert sensor._sc_cached_envelopes == envelopes  # noqa: SLF001
+    # Cold scan emits real envelopes (router calls bypass dedup the
+    # first time). The cache itself is intentionally not populated —
+    # short-circuit returns [] (dedup-equivalent), so _sc_cached_envelopes
+    # stays default-empty (see scan_once docstring).
+    assert len(envelopes) >= 1
     # Baseline populated for next cycle
     assert sensor._sc_last_state  # noqa: SLF001
 
@@ -150,16 +159,23 @@ async def test_cold_start_full_scan_even_with_flag_on(
 async def test_short_circuit_when_no_changes(
     make_sensor, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Short-circuit returns [] (NOT the cached prior list).
+    ``scan_once``'s contract is ``envelopes ingested THIS cycle`` —
+    on unchanged input dedup would yield 0 anyway, so [] is the
+    semantically correct return."""
     monkeypatch.setenv("JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", "true")
     sensor = make_sensor()
     first = await sensor.scan_once()
+    assert len(first) >= 1  # cold scan emitted real envelopes
 
     router_calls_before = sensor._router.ingest.call_count
 
     second = await sensor.scan_once()
     assert sensor._sc_short_circuits == 1  # noqa: SLF001
     assert sensor._sc_full_scans == 1  # noqa: SLF001 (unchanged)
-    assert second == first
+    # Short-circuit returns [] — matches the dedup-filtered semantic
+    # of the legacy scan path on a no-change cycle.
+    assert second == []
     # Router NOT called on short-circuit
     assert sensor._router.ingest.call_count == router_calls_before
 
@@ -363,9 +379,7 @@ async def test_health_after_scan_reflects_metrics(
 async def test_flag_off_full_scan_every_cycle(
     make_sensor, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv(
-        "JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", raising=False,
-    )
+    monkeypatch.setenv("JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", "false")
     sensor = make_sensor()
     await sensor.scan_once()
     await sensor.scan_once()
@@ -380,9 +394,7 @@ async def test_flag_off_does_not_stat_watched_files(
 ) -> None:
     """When the per-sensor flag is off, _sc_current_state returns ()
     immediately — the stat syscalls are skipped entirely."""
-    monkeypatch.delenv(
-        "JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", raising=False,
-    )
+    monkeypatch.setenv("JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", "false")
     sensor = make_sensor()
     state = sensor._sc_current_state()  # noqa: SLF001
     assert state == ()
