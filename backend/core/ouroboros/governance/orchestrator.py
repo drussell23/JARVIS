@@ -3223,6 +3223,73 @@ class GovernedOrchestrator:
                             )
             ctx = ctx.advance(OperationPhase.GENERATE)
 
+            # ── Option C: DW topology early-detection circuit breaker ──
+            # Pre-GENERATE check: if route=BACKGROUND AND topology says
+            # skip_and_queue AND op is NOT read-only, the op is
+            # structurally doomed (CandidateGenerator will raise
+            # background_dw_blocked_by_topology when invoked). Skip
+            # the GENERATE phase entirely and go straight to the same
+            # graceful-accept path the late-detection branch already
+            # uses (CANCELLED + FAILED ledger). Outcome is byte-
+            # identical to today's late-detection path; the difference
+            # is "[CircuitBreaker] pre-GENERATE skip" log instead of
+            # "BACKGROUND route: DW failed... accepting" after a
+            # generation hot-path entry.
+            #
+            # Master flag JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED
+            # (default false). When off, this block is a no-op and
+            # the late-detection path runs exactly as before.
+            try:
+                from backend.core.ouroboros.governance.dw_topology_circuit_breaker import (  # noqa: E501
+                    is_circuit_breaker_enabled as _cb_enabled,
+                    ledger_reason_label as _cb_ledger_label,
+                    should_circuit_break as _cb_should_break,
+                    terminal_reason_code as _cb_terminal_code,
+                )
+                if _cb_enabled():
+                    _cb_break, _cb_reason = _cb_should_break(
+                        provider_route=getattr(
+                            ctx, "provider_route", "",
+                        ) or "",
+                        is_read_only=bool(
+                            getattr(ctx, "is_read_only", False),
+                        ),
+                    )
+                    if _cb_break:
+                        logger.info(
+                            "[CircuitBreaker] pre-GENERATE skip: "
+                            "route=%s reason=%s op=%s",
+                            getattr(ctx, "provider_route", "?"),
+                            _cb_reason[:120],
+                            (ctx.op_id or "?")[:16],
+                        )
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code=(
+                                _cb_terminal_code(_cb_reason)
+                            ),
+                        )
+                        await self._record_ledger(
+                            ctx, OperationState.FAILED,
+                            {
+                                "reason": _cb_ledger_label(_cb_reason),
+                                "topology_reason": _cb_reason[:200],
+                                "route": getattr(
+                                    ctx, "provider_route", "",
+                                ),
+                                "circuit_breaker_fired": True,
+                            },
+                        )
+                        return ctx
+            except Exception:  # noqa: BLE001 — never let circuit
+                # breaker crash GENERATE entry. The late-detection
+                # path remains the authoritative behavior.
+                logger.debug(
+                    "[CircuitBreaker] consultation raised — falling "
+                    "through to late-detection path",
+                    exc_info=True,
+                )
+
             # ── PreActionNarrator: voice WHAT before GENERATE ──
             if self._pre_action_narrator is not None:
                 try:
