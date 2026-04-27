@@ -44,7 +44,7 @@ pyttsx3>=2.90
 pygame>=2.5.0
 
 # Anthropic API
-anthropic>=0.7.0
+anthropic>=0.97.0
 
 # Utilities
 python-dotenv>=1.0.0

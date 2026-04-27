@@ -23,7 +23,7 @@ bleak>=0.20.0  # Cross-platform Bluetooth LE
 fastapi>=0.100.0
 uvicorn>=0.23.0
 httpx>=0.24.0
-anthropic>=0.7.0
+anthropic>=0.97.0
 
 # Async support
 asyncio
