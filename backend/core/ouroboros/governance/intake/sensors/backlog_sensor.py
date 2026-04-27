@@ -74,6 +74,43 @@ _BACKLOG_FALLBACK_INTERVAL_S: float = float(
 )
 
 
+# ---------------------------------------------------------------------------
+# Slice 11.6.d — File-stat short-circuit (peer of 11.6.a/b/c merkle consult)
+# ---------------------------------------------------------------------------
+#
+# Why stat instead of MerkleCartographer? BacklogSensor's two watched files
+# live under ``.jarvis/`` (state, not code) — outside the cartographer's
+# tracked include set ``("backend", "tests", "scripts", "docs", "config")``.
+# Hidden dot-dirs are correctly excluded from the cartographer (they store
+# session blobs, posture history, etc. — high churn, no semantic value).
+# The cartographer can't see backlog.json; subtree_hash(".jarvis/backlog.json")
+# returns "" by design.
+#
+# Same architectural spirit as 11.6.a/b/c: cheap pre-emption of an expensive
+# read + JSON parse + envelope build. Different mechanism appropriate to the
+# watched data class:
+#
+#   11.6.a/b/c: code subtrees → merkle hash (handles N files cheaply)
+#   11.6.d:     state files   → file stat (handles 2 files trivially)
+#
+# Stat tuple: (exists, mtime_ns, size). A change in any field → full scan.
+# Atomic-rename (write-temp + os.rename) flips inode → mtime resets → stat
+# changes. Identical-content rewrite still triggers full scan via mtime
+# delta — caught and dedup'd by ``_seen_task_ids`` ledger downstream.
+#
+# Default false to preserve byte-identical legacy behavior. Phase 11.7
+# graduation flips this alongside the three merkle flags.
+
+
+def short_circuit_enabled() -> bool:
+    """Re-read ``JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED`` at call time so
+    monkeypatch works in tests + operator can flip live without re-init."""
+    raw = os.environ.get(
+        "JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 _PRIORITY_URGENCY: Dict[int, str] = {
     5: "high",
     4: "high",
@@ -305,6 +342,17 @@ class BacklogSensor:
         self._fs_events_handled: int = 0
         self._fs_events_ignored: int = 0
 
+        # --- Slice 11.6.d — File-stat short-circuit state ------------
+        # Tuple-of-tuples baseline: stat snapshot for each watched file.
+        # Empty tuple = cold start. A mismatch on the next scan triggers
+        # a full read; equal stats short-circuit to the cached envelope
+        # list. The (auto_proposed_enabled,) suffix captures the env flag
+        # so flipping the proposals-ledger source busts the cache.
+        self._sc_last_state: tuple = ()
+        self._sc_cached_envelopes: List[IntentEnvelope] = []
+        self._sc_short_circuits: int = 0
+        self._sc_full_scans: int = 0
+
     async def scan_once(self) -> List[IntentEnvelope]:
         """Run one scan. Returns list of envelopes produced and ingested
         across BOTH the manual ``backlog.json`` source and (P1 Slice 3,
@@ -314,11 +362,34 @@ class BacklogSensor:
         The two scans are independent — a missing ``backlog.json`` does
         not block the proposals scan, and vice versa — so operators can
         rely on the auto-proposed pipeline even before they create their
-        first manual backlog entry."""
+        first manual backlog entry.
+
+        Slice 11.6.d — when ``JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED=true``
+        AND the (mtime_ns, size, exists) stat tuple of every watched
+        file is unchanged since the last scan, short-circuit to the
+        cached envelope list (skip read + JSON parse + envelope build).
+        File-stat is the analogue of the cartographer hash for state
+        files that the cartographer correctly excludes from its tree.
+        """
+        current_state = self._sc_current_state()
+        if self._sc_should_short_circuit(current_state):
+            self._sc_short_circuits += 1
+            logger.debug(
+                "[BacklogSensor] Stat short-circuit "
+                "(scan #%d skipped, %d cached envelopes)",
+                self._sc_short_circuits + self._sc_full_scans,
+                len(self._sc_cached_envelopes),
+            )
+            return list(self._sc_cached_envelopes)
+
+        self._sc_full_scans += 1
         produced: List[IntentEnvelope] = []
         produced.extend(await self._scan_backlog_json())
         if _auto_proposed_enabled():
             produced.extend(await self._scan_proposals_ledger())
+        # Refresh cache + baseline AFTER the scan completes so the next
+        # cycle's stat read sees the same files we just digested.
+        self._sc_refresh_baseline(produced, current_state)
         return produced
 
     async def _scan_backlog_json(self) -> List[IntentEnvelope]:
@@ -590,6 +661,128 @@ class BacklogSensor:
                 emitted_log_count,
             )
         return produced
+
+    # ------------------------------------------------------------------
+    # Slice 11.6.d — File-stat short-circuit (peer of 11.6.a/b/c merkle)
+    # ------------------------------------------------------------------
+
+    def _sc_watched_paths(self) -> List[Path]:
+        """Files whose stat tuples form the short-circuit baseline.
+
+        Always includes the manual ``backlog.json``. The proposals
+        ledger is only watched when its source is enabled — flipping
+        ``JARVIS_BACKLOG_AUTO_PROPOSED_ENABLED`` mid-session adds/drops
+        the file from the watch set, which is captured in the state
+        signature via the auto-proposed flag suffix below."""
+        paths: List[Path] = [self._backlog_path]
+        if _auto_proposed_enabled():
+            paths.append(self._proposals_ledger_path)
+        return paths
+
+    def _sc_stat_tuple(self, path: Path) -> tuple:
+        """(exists, mtime_ns, size) snapshot for a single file.
+        Returns (False, 0, 0) for any read error — fail-safe."""
+        try:
+            st = path.stat()
+            return (True, st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            return (False, 0, 0)
+        except OSError:  # noqa: BLE001 — defensive (perm errors etc.)
+            logger.debug(
+                "[BacklogSensor] stat failed for %s; "
+                "falling through to full scan", path, exc_info=True,
+            )
+            # Sentinel that won't equal any real stat tuple → forces
+            # full scan on the comparison branch.
+            return ("__sc_error__",)
+
+    def _sc_current_state(self) -> tuple:
+        """Frozen, hashable signature of the watched file set.
+
+        Returns empty tuple if short-circuit is disabled — sentinel
+        consumed by ``_sc_should_short_circuit`` to fail-safe."""
+        if not short_circuit_enabled():
+            return ()
+        try:
+            file_stats = tuple(
+                (str(p), self._sc_stat_tuple(p))
+                for p in self._sc_watched_paths()
+            )
+            # Suffix the auto-proposed flag so flipping the source set
+            # busts the cache (watched-path topology changed — same
+            # invariant as the OpportunityMiner scan-path topology guard).
+            return (file_stats, _auto_proposed_enabled())
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[BacklogSensor] current_state read failed; "
+                "falling through to full scan", exc_info=True,
+            )
+            return ()
+
+    def _sc_should_short_circuit(self, current_state: tuple) -> bool:
+        """Decide whether to skip the read+JSON+envelope build.
+        Returns False (i.e. proceed with full scan) on any failure
+        path — fail-safe to legacy behavior.
+
+        Conditions for short-circuit (ALL must hold):
+          1. Per-sensor flag ``JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED``
+             is true (empty current_state from
+             ``_sc_current_state`` indicates flag off → fail-safe)
+          2. We have a recorded baseline (cold-start guard)
+          3. The current state tuple equals the recorded baseline
+
+        Note: an empty cached envelope list with a populated baseline
+        IS a valid short-circuit state (correct semantic ported from
+        Slice 11.6.c — "scan found 0 envelopes" is a legitimate
+        steady-state answer, not a cold-start signal)."""
+        if not short_circuit_enabled():
+            return False
+        if not current_state:
+            return False  # short-circuit disabled / error
+        if not self._sc_last_state:
+            return False  # cold start — no baseline yet
+        return current_state == self._sc_last_state
+
+    def _sc_refresh_baseline(
+        self,
+        produced: List[IntentEnvelope],
+        current_state: tuple,
+    ) -> None:
+        """Snapshot the freshly-scanned envelopes + stat signature as
+        the new baseline. Always-safe — never raises."""
+        try:
+            self._sc_cached_envelopes = list(produced)
+            self._sc_last_state = current_state
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[BacklogSensor] short-circuit baseline refresh failed",
+                exc_info=True,
+            )
+
+    def health(self) -> Dict[str, Any]:
+        """Operator-visible health snapshot. Slice 11.6.d added —
+        exposes file-stat short-circuit telemetry for graduation
+        observability, alongside pre-existing FS-event counters."""
+        return {
+            "sensor": "BacklogSensor",
+            "running": self._running,
+            "seen_tasks": len(self._seen_task_ids),
+            "poll_interval_s": self._poll_interval_s,
+            "fs_events_mode": self._fs_events_mode,
+            "fs_events_handled": self._fs_events_handled,
+            "fs_events_ignored": self._fs_events_ignored,
+            # Slice 11.6.d — short-circuit telemetry (peer of merkle metrics
+            # on Todo / Doc / Miner; uses file-stat instead of merkle hash
+            # because watched files live under .jarvis/ which the
+            # cartographer correctly excludes by design).
+            "short_circuit_enabled": short_circuit_enabled(),
+            "short_circuit_short_circuits": self._sc_short_circuits,
+            "short_circuit_full_scans": self._sc_full_scans,
+            "short_circuit_watched_files": [
+                str(p) for p in self._sc_watched_paths()
+            ],
+            "short_circuit_cached_envelopes": len(self._sc_cached_envelopes),
+        }
 
     async def start(self) -> None:
         """Start background polling loop."""
