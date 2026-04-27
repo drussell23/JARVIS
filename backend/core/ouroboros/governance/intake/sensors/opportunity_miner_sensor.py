@@ -79,6 +79,43 @@ _OPP_MINER_FALLBACK_INTERVAL_S: float = float(
     os.environ.get("JARVIS_OPPORTUNITY_MINER_FALLBACK_INTERVAL_S", "21600")
 )
 
+
+# ---------------------------------------------------------------------------
+# Slice 11.6.c — Merkle Cartographer consultation (subtree-scoped)
+# ---------------------------------------------------------------------------
+#
+# When the per-sensor flag JARVIS_OPPMINER_USE_MERKLE is on AND the
+# cartographer's master flag is on, the scan loop short-circuits to the
+# cached prior selection when nothing under the sensor's _scan_paths has
+# changed since the last successful scan.
+#
+# Beef vs. Slices 11.6.a/b: this sensor uses *per-watched-path* subtree
+# hashes rather than a single root hash. A change in ``docs/`` (outside
+# the miner's scope) does NOT invalidate the cache. Only mutations under
+# a watched path bust short-circuit. This matters because the miner runs
+# AST-heavy analysis across multiple strategies — every avoided no-op
+# scan saves real CPU, not just a directory walk.
+#
+# The cache stores the *full ingested-candidate list* from the last scan.
+# A short-circuit replays nothing through the router (envelopes are not
+# re-emitted; the dedup ledger handled them already). The cycle counter
+# DOES still advance so the strategy-rotation index advances on every
+# call — the next non-short-circuit cycle picks up the rotated strategy
+# without skipping any.
+#
+# Default false to preserve byte-identical legacy behavior. Per-sensor
+# graduation: each Slice 11.6.{a,b,c,d} flag flips independently after
+# its own forced-clean once-proof cadence.
+
+
+def merkle_consult_enabled() -> bool:
+    """Re-read ``JARVIS_OPPMINER_USE_MERKLE`` at call time so monkeypatch
+    works in tests + operator can flip live without re-init."""
+    raw = os.environ.get(
+        "JARVIS_OPPMINER_USE_MERKLE", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
 # Per-file debounce: suppress repeat events on the same file within this
 # window. 30s is long enough to absorb an editor's atomic-save spray
 # (save → backup → rename → chmod → fsync) but short enough that a genuine
@@ -471,6 +508,19 @@ class OpportunityMinerSensor:
         self._storm_window_count: int = 0
         self._storm_active_until: float = 0.0
 
+        # --- Slice 11.6.c — Merkle cartographer consultation ----------
+        # Per-watched-path baseline: { rel_scan_path → subtree_hash }.
+        # Short-circuit only when ALL watched subtree hashes match.
+        # Empty dict on cold-start → first scan always runs.
+        self._merkle_last_seen_subtree_hashes: Dict[str, str] = {}
+        # Cached candidate list from the last full scan. Replayed on
+        # short-circuit cycles so caller sees the same prior result.
+        # Stored regardless of merkle flag so flipping the flag mid-
+        # session doesn't blank state.
+        self._merkle_cached_candidates: List[StaticCandidate] = []
+        self._merkle_short_circuits: int = 0
+        self._merkle_full_scans: int = 0
+
     # v350.4: Third-party / non-project directory segments
     _NON_PROJECT_SEGMENTS = frozenset({
         "venv", ".venv", "env", ".env",
@@ -598,7 +648,27 @@ class OpportunityMinerSensor:
 
         Rotates through analysis strategies each cycle, applies cooldowns,
         and uses exploit/explore selection for diverse coverage.
+
+        Slice 11.6.c — when ``JARVIS_OPPMINER_USE_MERKLE=true`` AND the
+        Merkle Cartographer reports ALL watched scan-path subtree hashes
+        unchanged since the last successful scan, short-circuit to the
+        cached candidate list (skip filesystem walk + AST parse + ingest).
+        Subtree-scoped: a change outside the miner's ``_scan_paths`` does
+        NOT bust the cache.
         """
+        current_subtree_hashes = self._merkle_subtree_hashes()
+        if self._merkle_should_short_circuit(current_subtree_hashes):
+            self._merkle_short_circuits += 1
+            logger.debug(
+                "OpportunityMinerSensor: Merkle short-circuit "
+                "(scan #%d skipped, %d cached candidates, %d watched paths)",
+                self._merkle_short_circuits + self._merkle_full_scans,
+                len(self._merkle_cached_candidates),
+                len(current_subtree_hashes),
+            )
+            return list(self._merkle_cached_candidates)
+
+        self._merkle_full_scans += 1
         self._scan_cycle += 1
 
         # Pick the strategy for this cycle (round-robin)
@@ -663,6 +733,9 @@ class OpportunityMinerSensor:
                         ingested, errors, skipped_non_package,
                     )
                     self._emit_cycle_summary(counters, strategy_name)
+                    self._merkle_refresh_baseline(
+                        ingested, current_subtree_hashes,
+                    )
                     return ingested
                 # Coalescing envelope was rejected — fall through to per-file
                 # ingest as a best-effort fallback.
@@ -745,7 +818,144 @@ class OpportunityMinerSensor:
             ingested, errors, skipped_non_package,
         )
         self._emit_cycle_summary(counters, strategy_name)
+        self._merkle_refresh_baseline(ingested, current_subtree_hashes)
         return ingested
+
+    # ------------------------------------------------------------------
+    # Slice 11.6.c — Merkle Cartographer consultation (subtree-scoped)
+    # ------------------------------------------------------------------
+
+    def _merkle_normalized_scan_paths(self) -> List[str]:
+        """Project ``self._scan_paths`` into the cartographer's relpath
+        namespace (POSIX, no leading/trailing slash, ``"."`` → root).
+
+        Stable order: same iteration order as ``_scan_paths`` so the
+        baseline dict stays comparable across cycles even if the path
+        list is reordered (it shouldn't be, but defensive)."""
+        out: List[str] = []
+        for raw in self._scan_paths:
+            s = str(raw).replace("\\", "/").strip()
+            if s in ("", ".", "./"):
+                out.append("")  # root marker
+                continue
+            out.append(s.strip("/"))
+        return out
+
+    def _merkle_subtree_hashes(self) -> Dict[str, str]:
+        """Read per-watched-path subtree hashes from the cartographer.
+        Empty dict on any failure path — fail-safe to legacy scan.
+
+        For each scan path: empty-string relpath means "use root hash"
+        (i.e. ``_scan_paths == ["."]``); any other relpath uses
+        ``subtree_hash(relpath)``. A missing/unhashable subtree returns
+        empty string, which the comparison treats as 'always changed'
+        (fail-safe).
+        """
+        if not merkle_consult_enabled():
+            return {}
+        try:
+            from backend.core.ouroboros.governance.merkle_cartographer import (
+                get_default_cartographer,
+            )
+            c = get_default_cartographer(repo_root=self._repo_root)
+            out: Dict[str, str] = {}
+            for relpath in self._merkle_normalized_scan_paths():
+                if relpath == "":
+                    out[relpath] = c.current_root_hash()
+                else:
+                    out[relpath] = c.subtree_hash(relpath)
+            return out
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "OpportunityMinerSensor: subtree hash read failed; "
+                "falling through to full scan", exc_info=True,
+            )
+            return {}
+
+    def _merkle_should_short_circuit(
+        self, current_hashes: Dict[str, str],
+    ) -> bool:
+        """Decide whether to skip the multi-strategy scan based on
+        cartographer state. Returns False (i.e. proceed with full scan)
+        on any failure path — fail-safe to legacy behavior.
+
+        Conditions for short-circuit (ALL must hold):
+          1. Per-sensor flag ``JARVIS_OPPMINER_USE_MERKLE`` is true
+          2. Cartographer master flag enabled (empty hashes dict from
+             ``_merkle_subtree_hashes`` indicates flag off / error /
+             cold-cartographer → fail-safe)
+          3. Every watched subtree hash matches the recorded baseline
+          4. We have a recorded baseline (cold-start guard — the
+             baseline dict is empty until the first full scan
+             completes; an *empty cache* with a populated baseline
+             is a legitimate "scan found 0 candidates" state and
+             SHOULD short-circuit)
+          5. The set of watched paths is unchanged since last scan
+             (operator may have added/removed paths via reconfig —
+             a different shape means we cannot trust the baseline)
+          6. No watched subtree returned an empty hash (would mean
+             cartographer cannot resolve that path — e.g. it doesn't
+             exist on disk yet, fail-safe to full scan)
+        """
+        if not merkle_consult_enabled():
+            return False
+        if not current_hashes:
+            return False  # cartographer disabled / cold-start / error
+        if not self._merkle_last_seen_subtree_hashes:
+            return False  # cold start — no baseline yet
+        if (
+            set(current_hashes.keys())
+            != set(self._merkle_last_seen_subtree_hashes.keys())
+        ):
+            return False  # scan-path topology changed
+        if any(not h for h in current_hashes.values()):
+            return False  # at least one subtree unresolved
+        return all(
+            current_hashes[k] == self._merkle_last_seen_subtree_hashes[k]
+            for k in current_hashes
+        )
+
+    def _merkle_refresh_baseline(
+        self,
+        ingested: List[StaticCandidate],
+        current_hashes: Dict[str, str],
+    ) -> None:
+        """Snapshot the freshly-scanned cartographer state + ingested
+        candidates as the new baseline for the next cycle's
+        short-circuit decision. Always-safe — never raises."""
+        try:
+            self._merkle_cached_candidates = list(ingested)
+            self._merkle_last_seen_subtree_hashes = dict(current_hashes)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "OpportunityMinerSensor: merkle baseline refresh failed",
+                exc_info=True,
+            )
+
+    def health(self) -> Dict[str, Any]:
+        """Operator-visible health snapshot. Slice 11.6.c added — exposes
+        merkle short-circuit telemetry for graduation observability."""
+        return {
+            "sensor": "OpportunityMinerSensor",
+            "repo": self._repo,
+            "running": self._running,
+            "scan_cycle": self._scan_cycle,
+            "cooldown_files": len(self._cooldown_map),
+            "seen_files": len(self._seen_file_paths),
+            "fs_events_mode": self._fs_events_mode,
+            "fs_events_handled": self._fs_events_handled,
+            "fs_events_ignored": self._fs_events_ignored,
+            "fs_events_debounced": self._fs_events_debounced,
+            "fs_events_storm_dropped": self._fs_events_storm_dropped,
+            # Slice 11.6.c — Merkle consultation telemetry
+            "merkle_consult_enabled": merkle_consult_enabled(),
+            "merkle_short_circuits": self._merkle_short_circuits,
+            "merkle_full_scans": self._merkle_full_scans,
+            "merkle_watched_paths": list(
+                self._merkle_last_seen_subtree_hashes.keys()
+            ),
+            "merkle_cached_candidates": len(self._merkle_cached_candidates),
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers (shared between coalesced and per-file paths)
