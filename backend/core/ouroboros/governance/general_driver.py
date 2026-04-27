@@ -306,9 +306,39 @@ async def run_general_tool_loop(
         str(t) for t in (invocation.get("allowed_tools", ()) or ())
     )
     max_mutations = int(invocation.get("max_mutations", 0) or 0)
+
+    # Phase 7.3 wiring (Caller Wiring PR #2 — 2026-04-26): apply the
+    # adapted per-Order mutation budget loader on top of the env-
+    # supplied max_mutations. Cage rule (load-bearing): the helper
+    # ALWAYS returns min(env_default, adapted_budget) — defense-in-
+    # depth ensures even a doctored YAML cannot LOOSEN the cage.
+    # Master-off byte-identical: when JARVIS_SCOPED_TOOL_BACKEND_LOAD_
+    # ADAPTED_BUDGETS is false (default), adapted dict is empty →
+    # returns env_default unchanged → ToolScope + ScopedToolBackend
+    # behave identically to pre-wiring.
+    #
+    # Order is supplied by the upstream invocation builder (orchestrator
+    # / subagent_orchestrator). Currently only Orders 1 + 2 are
+    # recognized; unknown / missing / invalid order defaults to 1
+    # (Order-1 is the safer assumption — Order-2 ops are rare governance-
+    # mutating dispatches that explicitly opt in).
+    order_raw = invocation.get("order", 1)
+    try:
+        order = int(order_raw) if order_raw is not None else 1
+    except (TypeError, ValueError):
+        order = 1
+    if order not in (1, 2):
+        order = 1
+    from backend.core.ouroboros.governance.adaptation.adapted_mutation_budget_loader import (  # noqa: E501
+        compute_effective_max_mutations,
+    )
+    effective_max_mutations = compute_effective_max_mutations(
+        order, max_mutations,
+    )
+
     scope = ToolScope(
         allowed_tools=allowed_tools,
-        read_only=(max_mutations == 0),
+        read_only=(effective_max_mutations == 0),
     )
     gate = ScopedToolGate(scope)
 
@@ -348,7 +378,7 @@ async def run_general_tool_loop(
     scoped_backend = ScopedToolBackend(
         inner=inner_backend,
         gate=gate,
-        max_mutations=max_mutations,
+        max_mutations=effective_max_mutations,
         state_mirror=state_mirror,
     )
     # Attach the backend reference to the mirror so the executor can
