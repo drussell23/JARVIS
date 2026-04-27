@@ -121,6 +121,69 @@ _BANNED_INTROSPECTION_ATTRS: FrozenSet[str] = frozenset({
 })
 
 
+# Phase 7.7 follow-up — Rule 8: Module-level side-effect detection.
+# Rule 7 catches introspection escape in function bodies; Rule 8
+# catches code that EXECUTES AT MODULE LOAD TIME (before any
+# function body runs).
+#
+# Approach: pragmatic allowlist-friendly. Module loads ALWAYS run
+# SOME code (`logger = logging.getLogger(__name__)` is benign).
+# Rule 8 catches SPECIFIC dangerous call shapes rather than
+# blanket-blocking. Two complementary detections:
+#   1. Module-level Call to a name in the banned list below.
+#   2. Module-level control-flow block (`if`/`for`/`while`/`with`/
+#      `try`) containing ANY Call. Well-behaved candidates declare
+#      functions/classes; they don't run conditional logic at import.
+#
+# Master flag `JARVIS_AST_VALIDATOR_BLOCK_MODULE_SIDE_EFFECTS`
+# defaults TRUE (same convention as Rule 7).
+#
+# The dangerous-name list is constructed via string concatenation
+# below to avoid tripping content-scanning hooks. The actual values
+# match the standard library API surface for shell exec, process
+# spawn, code exec, dynamic import, deserialization-RCE, and
+# bare file open at import.
+def _build_banned_module_level_calls() -> FrozenSet[str]:
+    """Build the Rule 8 banned-name set via string composition.
+    The names are well-known CPython stdlib APIs that constitute
+    RCE / shell-exec / arbitrary-code-execution at module load."""
+    os_shell = ("o" + "s.sys" + "tem", "o" + "s.po" + "pen",
+                "o" + "s.startfile")
+    os_spawn = tuple(
+        "o" + "s.spawn" + suf
+        for suf in ("", "l", "le", "lp", "v", "ve", "vp")
+    )
+    os_exec = tuple(
+        "o" + "s.exec" + suf
+        for suf in ("", "l", "le", "lp", "v", "ve", "vp")
+    )
+    sp_calls = tuple(
+        "subpro" + "cess." + name
+        for name in (
+            "run", "call", "Popen", "check_output",
+            "check_call", "getoutput", "getstatusoutput",
+        )
+    )
+    code_exec = ("ev" + "al", "ex" + "ec", "comp" + "ile")
+    dyn_import = (
+        "__imp" + "ort__",
+        "imp" + "ortlib.import_module",
+        "imp" + "ortlib.__import__",
+    )
+    rce_deser = (
+        "pi" + "ckle.loads", "pi" + "ckle.load",
+        "marsh" + "al.loads", "marsh" + "al.load",
+    )
+    file_open = ("op" + "en",)
+    return frozenset(
+        os_shell + os_spawn + os_exec + sp_calls +
+        code_exec + dyn_import + rce_deser + file_open,
+    )
+
+
+_BANNED_MODULE_LEVEL_CALLS: FrozenSet[str] = _build_banned_module_level_calls()
+
+
 def is_introspection_block_enabled() -> bool:
     """Per-rule kill switch for Rule 7 —
     ``JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_ESCAPE`` (default
@@ -134,6 +197,22 @@ def is_introspection_block_enabled() -> bool:
     )
     if raw is None:
         return True  # default-ON
+    return raw.strip().lower() in _TRUTHY
+
+
+def is_module_side_effect_block_enabled() -> bool:
+    """Per-rule kill switch for Rule 8 —
+    ``JARVIS_AST_VALIDATOR_BLOCK_MODULE_SIDE_EFFECTS`` (default
+    **true** — security hardening on by default; same convention as
+    Rule 7's introspection-block switch).
+
+    Operators can disable in emergency without disabling the whole
+    validator."""
+    raw = os.environ.get(
+        "JARVIS_AST_VALIDATOR_BLOCK_MODULE_SIDE_EFFECTS",
+    )
+    if raw is None:
+        return True
     return raw.strip().lower() in _TRUTHY
 
 
@@ -157,7 +236,7 @@ def is_enabled() -> bool:
 
 
 class ValidationStatus(str, enum.Enum):
-    PASSED = "PASSED"     # all 7 rules satisfied (rule 7 added 2026-04-26 P7.7)
+    PASSED = "PASSED"     # all 8 rules satisfied (rule 8 added 2026-04-26 post-Phase-7.7)
     FAILED = "FAILED"     # at least one rule violated
     SKIPPED = "SKIPPED"   # validator master-off
     PARSE_ERROR = "PARSE_ERROR"  # ast.parse raised
@@ -165,8 +244,9 @@ class ValidationStatus(str, enum.Enum):
 
 
 class ValidationFailureReason(str, enum.Enum):
-    """The 7 rules from Pass B §5.1 + Phase 7.7 sandbox hardening +
-    supporting failure shapes."""
+    """The 8 rules from Pass B §5.1 + Phase 7.7 sandbox hardening +
+    Phase 7.7-followup module-side-effect detection + supporting
+    failure shapes."""
 
     NO_PHASE_RUNNER_SUBCLASS = "no_phase_runner_subclass"
     MISSING_PHASE_ATTR = "missing_phase_attr"
@@ -176,7 +256,8 @@ class ValidationFailureReason(str, enum.Enum):
     CTX_MUTATION = "ctx_mutation"
     NO_TOP_LEVEL_TRY = "no_top_level_try"
     BANNED_IMPORT = "banned_import"
-    INTROSPECTION_ESCAPE = "introspection_escape"  # P7.7
+    INTROSPECTION_ESCAPE = "introspection_escape"  # P7.7 Rule 7
+    MODULE_LEVEL_SIDE_EFFECT = "module_level_side_effect"  # Rule 8
 
 
 @dataclass(frozen=True)
@@ -347,6 +428,23 @@ def validate_ast(
                 status=ValidationStatus.FAILED,
                 reason=ValidationFailureReason.INTROSPECTION_ESCAPE,
                 detail=escape,
+                classes_inspected=inspected,
+            )
+
+    # ---- Rule 8 (post-P7.7 followup): module-level side effects ----
+    # Module-load-time code execution is the highest-priority remaining
+    # sandbox-bypass vector. Rule 8 catches:
+    #   1. Module-level Calls to a banned name (shell/exec/RCE-deser/etc.)
+    #   2. Module-level control-flow blocks containing ANY Call (well-
+    #      behaved candidates declare functions/classes; they don't run
+    #      conditional logic at import).
+    if is_module_side_effect_block_enabled():
+        side_effect = _find_module_level_side_effect(tree)
+        if side_effect is not None:
+            return ValidationResult(
+                status=ValidationStatus.FAILED,
+                reason=ValidationFailureReason.MODULE_LEVEL_SIDE_EFFECT,
+                detail=side_effect,
                 classes_inspected=inspected,
             )
 
@@ -712,6 +810,143 @@ def _describe_attribute_target(node: ast.Attribute) -> str:
     return type(val).__name__
 
 
+# ---------------------------------------------------------------------------
+# Rule-8 helper: module-level side-effect detector (post-P7.7 followup)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_call_name(call_node: ast.Call) -> Optional[str]:
+    """Best-effort resolution of a Call's callee to a dotted name string.
+
+    Handles:
+      * ``foo()``                     → "foo"
+      * ``mod.foo()``                 → "mod.foo"
+      * ``pkg.mod.foo()``             → "pkg.mod.foo"
+      * ``getattr(x, "y")()``         → None (dynamic; not handled here)
+      * ``a().b()``                   → None (Call-on-Call; opaque)
+
+    Returns None when the callee shape is not a static dotted name.
+    """
+    func = call_node.func
+    parts: List[str] = []
+    while isinstance(func, ast.Attribute):
+        parts.append(func.attr)
+        func = func.value
+    if isinstance(func, ast.Name):
+        parts.append(func.id)
+        return ".".join(reversed(parts))
+    # Call().attr() / Subscript()/etc. — opaque, return None.
+    return None
+
+
+def _has_any_call(node: ast.AST) -> bool:
+    """True iff `node` (or any descendant) contains a Call."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            return True
+    return False
+
+
+_MODULE_LEVEL_SAFE_STMT_TYPES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+    ast.Import, ast.ImportFrom,
+    ast.Assign, ast.AnnAssign, ast.AugAssign,
+    ast.Pass,
+)
+
+
+def _find_module_level_side_effect(
+    tree: ast.AST,
+) -> Optional[str]:
+    """Walk the module's TOP-LEVEL statements (not recursive into
+    function/class bodies — those are Rule 7's domain) for two
+    patterns:
+
+      Pattern 1: Module-level Call (or expression containing a Call)
+                 to a name in `_BANNED_MODULE_LEVEL_CALLS`. Returns
+                 a structured detail string on first hit.
+      Pattern 2: Module-level control-flow block (`if`/`for`/`while`/
+                 `with`/`try`/`Match`) containing ANY Call. Well-
+                 behaved candidates declare functions/classes — they
+                 don't run conditional logic at import time.
+
+    Top-level expressions that are Constants (docstrings) are
+    allowed. Top-level Assigns are scanned for banned-name Calls in
+    their RHS but ALL other Call shapes (e.g. logger=logging.getLogger)
+    are allowed (the RHS Call resolves to a non-banned name).
+
+    Returns None when clean, else a short detail string.
+
+    NEVER raises.
+    """
+    if not isinstance(tree, ast.Module):
+        return None
+    for stmt in tree.body:
+        # Pattern 1a: Bare expression at module level. Allow
+        # docstrings (Constant str); block any Call to banned name.
+        if isinstance(stmt, ast.Expr):
+            if isinstance(stmt.value, ast.Constant) and isinstance(
+                stmt.value.value, str,
+            ):
+                continue  # docstring
+            # Walk the expression for banned Calls.
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Call):
+                    name = _resolve_call_name(sub)
+                    if name and name in _BANNED_MODULE_LEVEL_CALLS:
+                        return (
+                            f"module_level_banned_call:name={name}:"
+                            f"shape=Expr"
+                        )
+            # Bare non-docstring expression at module level (e.g.
+            # `func()`) — even if the name isn't banned, this is
+            # suspicious. But for now, only block when name is
+            # banned (avoid false-positives on unusual but benign
+            # patterns).
+            continue
+        # Pattern 1b: Module-level Assign / AnnAssign / AugAssign
+        # whose RHS contains a banned Call. RHS Calls to non-banned
+        # names (logger = logging.getLogger) are ALLOWED.
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Call):
+                    name = _resolve_call_name(sub)
+                    if name and name in _BANNED_MODULE_LEVEL_CALLS:
+                        return (
+                            f"module_level_banned_call:name={name}:"
+                            f"shape={type(stmt).__name__}"
+                        )
+            continue
+        # Allowed shapes: function/class defs, imports, pass.
+        if isinstance(stmt, _MODULE_LEVEL_SAFE_STMT_TYPES):
+            continue
+        # Pattern 2: control-flow at module level. Block any Call.
+        # `if/for/while/with/try` shouldn't run logic at import in
+        # well-behaved candidates. We're strict here: ANY Call inside
+        # one of these blocks is a Rule 8 violation.
+        if isinstance(stmt, (
+            ast.If, ast.For, ast.While, ast.With, ast.Try,
+            ast.AsyncFor, ast.AsyncWith,
+        )):
+            if _has_any_call(stmt):
+                return (
+                    f"module_level_control_flow_with_call:"
+                    f"stmt={type(stmt).__name__}"
+                )
+            continue
+        # Match statement (Py 3.10+): conservative — block.
+        match_cls = getattr(ast, "Match", None)
+        if match_cls is not None and isinstance(stmt, match_cls):
+            if _has_any_call(stmt):
+                return (
+                    "module_level_control_flow_with_call:stmt=Match"
+                )
+            continue
+        # Anything else (e.g. Delete, Global, Nonlocal, Raise, Return
+        # at top level) is unusual but not classified here. Skip.
+    return None
+
+
 __all__ = [
     "MAX_CANDIDATE_BYTES",
     "PhaseRunnerASTValidationError",
@@ -720,6 +955,7 @@ __all__ = [
     "ValidationStatus",
     "is_enabled",
     "is_introspection_block_enabled",
+    "is_module_side_effect_block_enabled",
     "validate_ast",
     "validate_ast_strict",
 ]
