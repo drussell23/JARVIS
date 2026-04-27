@@ -1944,6 +1944,8 @@ class CandidateGenerator:
         from backend.core.ouroboros.governance.topology_sentinel import (
             FailureSource,
             get_default_sentinel,
+            reset_dw_model_override as _reset_override,
+            set_dw_model_override as _set_override,
         )
 
         topology = _get_topology()
@@ -1991,42 +1993,47 @@ class CandidateGenerator:
                 attempts.append(f"{model_id}:skipped_open")
                 continue
             attempts.append(f"{model_id}:attempted")
-            # Stamp the per-attempt override on context. Each attempt
-            # mutates the same context attribute; on success / cascade
-            # we leave it set (downstream telemetry sees which model
-            # actually fired); on failure we move on and the next
-            # iteration overwrites.
-            try:
-                setattr(context, "_dw_model_override", model_id)
-            except (AttributeError, TypeError):
-                # Slotted dataclass refusing setattr — retreat to the
-                # legacy single-model dispatch.
-                logger.debug(
-                    "[CandidateGenerator] Sentinel dispatch: ctx "
-                    "rejected _dw_model_override; falling through",
-                )
-                return None
+            # Stamp the per-attempt override via ContextVar (async-safe
+            # per asyncio task, survives the frozen OperationContext
+            # contract). The ContextVar is reset in the finally block
+            # so the next iteration's set is a clean state, and so
+            # cascade-to-Claude after exhaustion doesn't carry a stale
+            # override into the fallback provider.
+            _override_token = _set_override(model_id)
             logger.info(
                 "[CandidateGenerator] Sentinel dispatch: route=%s "
                 "attempting model=%s (state=%s, op=%s)",
                 provider_route, model_id, state, op_id_short,
             )
+            _attempt_result: Any = None
+            _attempt_exc: Optional[BaseException] = None
             try:
                 if provider_route == "background":
-                    result = await self._generate_background(
+                    _attempt_result = await self._generate_background(
                         context, deadline,
                     )
                 elif provider_route == "speculative":
-                    result = await self._generate_speculative(
+                    _attempt_result = await self._generate_speculative(
                         context, deadline,
                     )
                 else:
                     # standard / complex / unknown — use the primary-
                     # first cascade. This walks the existing tier-0
-                    # → tier-1 logic which honors ctx._dw_model_override.
-                    result = await self._try_primary_then_fallback(
+                    # → tier-1 logic which honors the ContextVar via
+                    # DoublewordProvider._resolve_effective_model.
+                    _attempt_result = await self._try_primary_then_fallback(
                         context, deadline,
                     )
+            except Exception as exc:
+                _attempt_exc = exc
+            finally:
+                # Reset ContextVar before either success-return or
+                # failure-continue so the next iteration starts with a
+                # clean slate AND the post-loop cascade-to-Claude
+                # doesn't carry a stale override into the fallback.
+                _reset_override(_override_token)
+
+            if _attempt_result is not None:
                 # Success — let the sentinel know. Phase 10 P10.4
                 # also wires report_failure at existing failure sites
                 # so a stream-stall mid-generation also lands in the
@@ -2039,8 +2046,10 @@ class CandidateGenerator:
                         "[CandidateGenerator] sentinel.report_success raised",
                         exc_info=True,
                     )
-                return result
-            except Exception as exc:
+                return _attempt_result
+
+            if _attempt_exc is not None:
+                exc = _attempt_exc
                 # Classify the failure for the sentinel. Stream-stall
                 # exceptions get LIVE_STREAM_STALL (weight 3.0 — single
                 # occurrence trips); transport/HTTP get LIVE_TRANSPORT;
@@ -2087,13 +2096,10 @@ class CandidateGenerator:
                 )
                 attempts[-1] = f"{model_id}:failed:{failure_source.value}"
                 continue
-        # All DW models exhausted (either OPEN or failed). Clear the
-        # per-attempt override so any downstream telemetry doesn't
-        # falsely attribute the cascade to the last attempted model.
-        try:
-            setattr(context, "_dw_model_override", None)
-        except (AttributeError, TypeError):
-            pass
+        # All DW models exhausted (either OPEN or failed). The
+        # per-attempt ContextVar was already reset by each loop
+        # iteration's finally block (Slice 3.6) — no further cleanup
+        # needed before cascade-to-Claude / queue.
         logger.warning(
             "[CandidateGenerator] Sentinel dispatch: route=%s exhausted "
             "all %d DW models [%s] — applying fallback_tolerance=%s "

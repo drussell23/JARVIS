@@ -78,6 +78,7 @@ that's the cascade-matrix in candidate_generator's job.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import enum
 import json
 import logging
@@ -91,6 +92,84 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Slice 3.6 — ContextVar for per-attempt DW model override
+# ---------------------------------------------------------------------------
+#
+# Slice 3 stamped ``ctx._dw_model_override`` directly on the
+# OperationContext, but that dataclass is frozen — setattr raised
+# FrozenInstanceError (subclass of AttributeError), the dispatcher
+# caught it silently, returned None, and fell through to the legacy
+# yaml gate. Session bt-2026-04-27-203746 demonstrated this with
+# Slice 3.5's preflight loud signal: 5 healthy preflight log lines +
+# 0 sentinel dispatch attempts. Slice 3.5's value: it surfaced the
+# defect; Slice 3.6's value: it fixes it without breaking the frozen
+# contract.
+#
+# ``contextvars.ContextVar`` is Python's async-safe per-task storage.
+# Each asyncio task gets its own value (no thread leakage); each
+# .set() returns a token that .reset() restores; recursion-safe via
+# the contextvar context inheritance. The dispatcher stamps the var
+# before each per-attempt DW call; the DoublewordProvider's
+# ``_resolve_effective_model`` reads the var; the dispatcher resets
+# the var on attempt completion (success / failure / cascade).
+#
+# Bonus: ContextVar is observable via /sentinel REPL (Slice 4 hook).
+# A future operator can ``DW_MODEL_OVERRIDE_VAR.get()`` to see what
+# model the current task is attempting WITHOUT having to thread it
+# through every API call.
+
+DW_MODEL_OVERRIDE_VAR: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar(
+        "dw_model_override", default=None,
+    )
+)
+
+
+def get_dw_model_override() -> Optional[str]:
+    """Read the per-task DW model override.
+
+    Returns the value the dispatcher most recently set for the
+    current asyncio task (or ``None`` if the dispatcher hasn't
+    stamped it). The DW provider's ``_resolve_effective_model``
+    consults this BEFORE the legacy ``model_for_route`` mapping so
+    sentinel-driven dispatch wins.
+
+    NEVER raises. ContextVar API is exception-free for ``get`` /
+    ``set`` / ``reset``."""
+    try:
+        return DW_MODEL_OVERRIDE_VAR.get()
+    except LookupError:
+        # Cannot happen with a default-set ContextVar, but defensive.
+        return None
+
+
+def set_dw_model_override(model_id: Optional[str]) -> Any:
+    """Stamp the per-task DW model override. Returns the
+    ``contextvars.Token`` the caller MUST pass to
+    :func:`reset_dw_model_override` in a finally block to restore
+    the previous value (typically ``None`` outside any attempt).
+
+    Async-safe: each asyncio task has its own value. Calling this
+    inside a task does NOT leak to sibling tasks.
+    """
+    return DW_MODEL_OVERRIDE_VAR.set(model_id)
+
+
+def reset_dw_model_override(token: Any) -> None:
+    """Restore the per-task DW model override to its prior value.
+    NEVER raises. Token-mismatch / wrong-type is silently ignored
+    (defensive — caller might pass a stale token from a prior task,
+    or a non-Token sentinel during test teardown)."""
+    try:
+        DW_MODEL_OVERRIDE_VAR.reset(token)
+    except (ValueError, LookupError, TypeError):
+        logger.debug(
+            "[TopologySentinel] dw_model_override reset_token mismatch — "
+            "ignored (likely test fixture cleanup race)",
+        )
 
 
 SCHEMA_VERSION = "topology_sentinel.1"
@@ -1782,13 +1861,17 @@ def reset_default_sentinel_for_tests() -> None:
 
 __all__ = [
     "ContextWeightedProber",
+    "DW_MODEL_OVERRIDE_VAR",
     "EndpointSnapshot",
     "FailureSource",
     "ProbeFn",
     "SentinelInitializationError",
     "SentinelPreflightResult",
+    "get_dw_model_override",
     "preflight_check",
+    "reset_dw_model_override",
     "sentinel_propagated_vars",
+    "set_dw_model_override",
     "ProbeOutcome",
     "ProbeResult",
     "ProbeWeight",
