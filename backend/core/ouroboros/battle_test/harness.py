@@ -3904,6 +3904,71 @@ class BattleTestHarness:
         except Exception as exc:
             logger.warning("Failed to save session summary: %s", exc)
 
+        # --- Phase 4 P4 Slice 5 follow-up: MetricsSessionObserver ---
+        # Wires the metrics observer at the harness session-end site
+        # (deferred from Slice 5 graduation 2026-04-26). Reads the
+        # ops list captured by the SessionRecorder + the cost-tracker
+        # totals + branch_stats commits, asks the observer to compute
+        # a MetricsSnapshot, and lets the observer:
+        #   1. append the snapshot to the JSONL ledger (Slice 2),
+        #   2. merge it into the per-session summary.json under a
+        #      top-level "metrics" key (Slice 4),
+        #   3. publish the EVENT_TYPE_METRICS_UPDATED SSE event for
+        #      live IDE consumers (Slice 4).
+        # All three steps are best-effort inside the observer; this
+        # wiring is also try/except wrapped so any failure NEVER
+        # blocks the rest of _generate_report (replay viewer + terminal
+        # summary still run).
+        # Master flag JARVIS_METRICS_SUITE_ENABLED is checked inside
+        # the observer; when off, record_session_end short-circuits
+        # with notes=("master_off",) and this wiring no-ops.
+        try:
+            from backend.core.ouroboros.governance.metrics_observability import (
+                get_default_observer,
+            )
+            _metrics_observer = get_default_observer()
+            _ops_for_metrics = getattr(
+                self._session_recorder, "_operations", [],
+            ) or []
+            _metrics_observation = _metrics_observer.record_session_end(
+                session_id=self._session_id,
+                session_dir=self._session_dir,
+                ops=_ops_for_metrics,
+                sessions_history=(),
+                posture_dwells=(),
+                total_cost_usd=self._cost_tracker.total_spent,
+                commits=branch_stats.get("commits", 0),
+            )
+            if _metrics_observation.snapshot is not None:
+                logger.info(
+                    "[Harness] MetricsObserver: snapshot recorded "
+                    "(ledger=%s summary=%s sse=%s notes=%s)",
+                    _metrics_observation.ledger_appended,
+                    _metrics_observation.summary_merged,
+                    _metrics_observation.sse_published,
+                    _metrics_observation.notes or "()",
+                )
+            elif "master_off" in _metrics_observation.notes:
+                logger.debug(
+                    "[Harness] MetricsObserver: master_off — skipped",
+                )
+            else:
+                logger.debug(
+                    "[Harness] MetricsObserver: no snapshot "
+                    "(notes=%s)",
+                    _metrics_observation.notes,
+                )
+        except ImportError:
+            logger.debug(
+                "[Harness] MetricsObserver module unavailable — skipping",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Harness] MetricsObserver session-end wiring failed: %s",
+                exc,
+                exc_info=True,
+            )
+
         # --- Session replay viewer (Priority 3 §8 observability) ---
         # Consolidate debug.log + summary.json + cost_tracker.json +
         # per-op ledger into one standalone replay.html. Written after
