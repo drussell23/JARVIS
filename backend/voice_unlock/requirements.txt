@@ -30,7 +30,7 @@ asyncio
 aiofiles>=23.1.0
 
 # Security
-cryptography>=41.0.0
+cryptography>=47.0.0
 
 # Optional optimizations
 # tensorflow-macos==2.13.0  # For M1/M2 Macs (optional)
