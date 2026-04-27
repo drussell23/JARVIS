@@ -374,6 +374,205 @@ def _read_with_truncation(
     return head + marker + tail
 
 
+# ---------------------------------------------------------------------------
+# Slice 11.3 — AST-aware codegen-prompt slicing.
+# ---------------------------------------------------------------------------
+#
+# When ``JARVIS_GEN_AST_SLICE_ENABLED=true`` AND a target file is Python AND
+# the file is larger than ``JARVIS_GEN_AST_SLICE_MIN_CHARS`` (default 8000),
+# replace the raw fenced file content with a structured AST outline:
+# module header (full), then per function/method either the full body (if
+# under ``JARVIS_GEN_AST_SLICE_FN_MAX_CHARS``, default 1500) or a
+# signature-only skeleton.
+#
+# This composes ``ast_slicer.ASTChunker`` (Slice 11.1's shared module) — no
+# duplicate parsing logic. Token-savings come from large files where
+# helper functions get skeleton treatment while the operationally
+# relevant ones stay full-body.
+#
+# Master-flag-off path is byte-identical legacy: ``_build_codegen_prompt``
+# never enters the slicing branch.
+
+
+def _gen_ast_slice_enabled() -> bool:
+    """``JARVIS_GEN_AST_SLICE_ENABLED`` (default ``false``)."""
+    raw = os.environ.get(
+        "JARVIS_GEN_AST_SLICE_ENABLED", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _gen_ast_slice_min_chars() -> int:
+    """File size below which we DON'T bother slicing — small files are
+    cheap to inject in full and the model gets useful surrounding
+    context. Default 8000 chars (~200 lines)."""
+    raw = os.environ.get("JARVIS_GEN_AST_SLICE_MIN_CHARS")
+    if raw is None:
+        return 8000
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 8000
+
+
+def _gen_ast_slice_fn_max_chars() -> int:
+    """Per-function/method threshold for full-body inclusion.
+    Functions ABOVE this size get signature-only skeleton treatment.
+    Default 1500 chars (~40 lines)."""
+    raw = os.environ.get("JARVIS_GEN_AST_SLICE_FN_MAX_CHARS")
+    if raw is None:
+        return 1500
+    try:
+        return max(100, int(raw))
+    except (TypeError, ValueError):
+        return 1500
+
+
+def _ast_outline_python_file(
+    content: str,
+    file_path: Path,
+    fn_max_chars: Optional[int] = None,
+) -> Optional[str]:
+    """Produce an AST-aware outline of a Python file.
+
+    Module header (always full), then per function/method/class either
+    full body or signature-only skeleton based on ``fn_max_chars``.
+    Returns ``None`` on parse failure so caller falls back to legacy
+    ``_read_with_truncation``.
+
+    NEVER raises.
+    """
+    if fn_max_chars is None:
+        fn_max_chars = _gen_ast_slice_fn_max_chars()
+
+    try:
+        from backend.core.ouroboros.governance.ast_slicer import (
+            ASTChunker, ChunkType,
+        )
+    except ImportError:
+        return None
+
+    class _NoOpCounter:
+        def count(self, text: str) -> int:
+            return 0
+
+    try:
+        chunker = ASTChunker(_NoOpCounter())
+        chunks = chunker.extract_chunks_from_source(
+            content, file_path, target_names=None, include_all=True,
+        )
+    except Exception:  # noqa: BLE001 — defensive, fallback to legacy
+        return None
+
+    if not chunks:
+        return None
+
+    # Emit module header (always full), then walk function/method
+    # chunks. CLASS / CLASS_SKELETON chunks are emitted in-place; for
+    # method chunks under the parent class we collapse to a "..."
+    # skeleton if the method's source exceeds fn_max_chars.
+    parts: List[str] = []
+    skeletons_count = 0
+    fullbody_count = 0
+
+    for chunk in chunks:
+        if chunk.chunk_type == ChunkType.MODULE_HEADER:
+            parts.append(chunk.source_code)
+            continue
+        if chunk.chunk_type in (
+            ChunkType.CLASS_SKELETON, ChunkType.CLASS,
+        ):
+            # Class skeleton — already a signature outline.
+            parts.append(chunk.source_code)
+            continue
+        # FUNCTION or METHOD
+        body_chars = len(chunk.source_code)
+        if body_chars <= fn_max_chars:
+            parts.append(chunk.source_code)
+            fullbody_count += 1
+        else:
+            # Skeleton: signature + docstring + ellipsis
+            sig = chunk.signature or f"def {chunk.name}(...)"
+            ds_line = (
+                f'    """{(chunk.docstring or "...")[:80]}"""'
+                if chunk.docstring else ""
+            )
+            indent = (
+                "    " if chunk.chunk_type == ChunkType.METHOD else ""
+            )
+            skeleton_lines = [f"{indent}{sig}"]
+            if ds_line:
+                skeleton_lines.append(ds_line)
+            skeleton_lines.append(
+                f"{indent}    ...  # [AST-SKELETON: {body_chars} chars omitted]"
+            )
+            parts.append("\n".join(skeleton_lines))
+            skeletons_count += 1
+
+    outline = "\n\n".join(parts)
+    summary_marker = (
+        f"\n# [AST-OUTLINE: {fullbody_count} fn/method full bodies, "
+        f"{skeletons_count} skeletons]"
+    )
+    return outline + summary_marker
+
+
+def _maybe_ast_outline(
+    abs_path: Path,
+    raw_path: str,
+    full_content: str,
+    op_id: str = "",
+) -> Optional[str]:
+    """Slice 11.3 dispatcher — returns AST outline string or None to
+    fall through to legacy truncation. Records metrics on every
+    dispatch (success or fallback) so operators can quantify the
+    token reduction empirically before flipping the master flag's
+    default in P11.7. NEVER raises."""
+    if not _gen_ast_slice_enabled():
+        return None
+    if abs_path.suffix.lower() != ".py":
+        return None
+    full_chars = len(full_content)
+    if full_chars < _gen_ast_slice_min_chars():
+        # Small file — cheaper to inject in full. Skip slicing without
+        # logging (avoids ledger pollution from sub-threshold cases).
+        return None
+
+    try:
+        from backend.core.ouroboros.governance.slicing_metrics import (
+            SliceMetric, record_slice,
+        )
+    except ImportError:
+        return None
+
+    outlined = _ast_outline_python_file(full_content, abs_path)
+    if outlined is None:
+        # Parse failure or empty chunk list — fall back.
+        record_slice(SliceMetric(
+            file_path=raw_path,
+            target_symbol="__codegen_outline__",
+            full_chars=full_chars,
+            sliced_chars=full_chars,
+            include_imports=True,
+            outcome="fallback",
+            fallback_reason="parse_failed_or_empty",
+            op_id=op_id,
+        ))
+        return None
+    sliced_chars = len(outlined)
+    record_slice(SliceMetric(
+        file_path=raw_path,
+        target_symbol="__codegen_outline__",
+        full_chars=full_chars,
+        sliced_chars=sliced_chars,
+        include_imports=True,
+        outcome="ok",
+        fallback_reason=None,
+        op_id=op_id,
+    ))
+    return outlined
+
+
 def _build_function_index(content: str, file_path: str) -> str:
     """Build a structural index of functions/classes in a Python file.
 
@@ -1610,26 +1809,42 @@ def _build_codegen_prompt(
         source_hash = _file_source_hash(content)
         size_bytes = len(content.encode())
         line_count = content.count("\n")
-        if _is_bg_route:
+
+        # Slice 11.3 — try AST-aware outline first when master flag is on
+        # AND content is Python AND large enough. Returns None for the
+        # fallback path (which preserves byte-identical legacy behavior).
+        _op_id_short = (
+            getattr(ctx, "op_id", "")[:24]
+            if hasattr(ctx, "op_id") else ""
+        )
+        ast_outlined = _maybe_ast_outline(
+            abs_path, str(raw_path), content, op_id=_op_id_short,
+        )
+        if ast_outlined is not None:
+            truncated = ast_outlined
+            slice_marker = " [AST-SLICED]"
+        elif _is_bg_route:
             truncated = _read_with_truncation(
                 abs_path,
                 max_chars=_BG_MAX_TARGET_FILE_CHARS,
                 head_chars=_BG_TARGET_FILE_HEAD_CHARS,
                 tail_chars=_BG_TARGET_FILE_TAIL_CHARS,
             )
+            slice_marker = ""
         else:
             truncated = _read_with_truncation(abs_path)
+            slice_marker = ""
 
         # Build the section header — include [repo_name] label for cross-repo ops
         if repo_label is not None:
             header = (
                 f"## File: {raw_path} [{repo_label}] [SHA-256: {source_hash[:12]}]"
-                f" [{size_bytes} bytes, {line_count} lines]"
+                f" [{size_bytes} bytes, {line_count} lines]{slice_marker}"
             )
         else:
             header = (
                 f"## File: {raw_path} [SHA-256: {source_hash[:12]}]"
-                f" [{size_bytes} bytes, {line_count} lines]"
+                f" [{size_bytes} bytes, {line_count} lines]{slice_marker}"
             )
 
         file_sections.append(f"{header}\n```\n{truncated}\n```")
