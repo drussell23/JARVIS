@@ -105,3 +105,78 @@ def test_dry_run_includes_log_redirect():
 def test_dry_run_carries_pause_documentation():
     r = _run(["--dry-run"])
     assert "JARVIS_LIVE_FIRE_GRADUATION_SOAK_PAUSED" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 2026-04-27 update — three-master-flag cron entry
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_arms_graduation_contract():
+    """JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true is set in the
+    cron entry. Without this flag, the default classifier silently
+    graduates 0-op sessions as CLEAN — once-proof on session
+    bt-2026-04-27-162115 demonstrated this explicitly."""
+    r = _run(["--dry-run"])
+    assert (
+        "JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true" in r.stdout
+    )
+
+
+def test_dry_run_arms_circuit_breaker():
+    """JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true is set in the
+    cron entry so Option C circuit breaker fires pre-GENERATE on
+    DW topology block (vs late-detection messy-log path)."""
+    r = _run(["--dry-run"])
+    assert (
+        "JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true" in r.stdout
+    )
+
+
+def test_dry_run_three_master_flags_in_correct_order():
+    """The cron entry must arm all three master flags BEFORE
+    invoking python — env-on-prefix syntax. Order: soak, contract,
+    circuit-breaker. Not strictly required, but pinned for review-
+    friendly diffs."""
+    r = _run(["--dry-run"])
+    soak_idx = r.stdout.index(
+        "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true",
+    )
+    contract_idx = r.stdout.index(
+        "JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true",
+    )
+    cb_idx = r.stdout.index(
+        "JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true",
+    )
+    py_idx = r.stdout.index("/usr/bin/env python3")
+    assert soak_idx < contract_idx < cb_idx < py_idx
+
+
+def test_dry_run_documents_contract_in_comment_block():
+    """Operators reading the crontab should see why each flag is
+    set. Pin the comment block."""
+    r = _run(["--dry-run"])
+    assert "Contract consultation (P9.2) blocks 0-op" in r.stdout
+    assert "Circuit breaker (Option C)" in r.stdout
+
+
+def test_dry_run_only_one_set_of_three_flags():
+    """Bit-rot guard: re-running --dry-run after a refactor must
+    NOT accidentally double the flag block (e.g. a buggy edit that
+    appends a second cron line). Each master flag literal appears
+    EXACTLY ONCE in the rendered cron entry."""
+    r = _run(["--dry-run"])
+    for flag in [
+        "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true",
+        "JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true",
+        "JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true",
+    ]:
+        # The `=true` literal appears EXACTLY ONCE — on the cron
+        # line itself. The comment block names the flags by name
+        # only (without `=true` suffix). A buggy refactor that
+        # appends a second cron line would surface as count > 1.
+        count = r.stdout.count(flag)
+        assert count == 1, (
+            f"flag {flag!r} appeared {count}× in dry-run; expected 1 "
+            "(cron line only)"
+        )
