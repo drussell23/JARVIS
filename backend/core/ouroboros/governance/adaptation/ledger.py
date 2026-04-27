@@ -92,7 +92,10 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 
 # Schema stamped into every AdaptationProposal; bump on field changes.
-ADAPTATION_SCHEMA_VERSION: str = "1.0"
+ADAPTATION_SCHEMA_VERSION: str = "2.0"
+# Older rows from pre-Item-#2 (without `proposed_state_payload`) are
+# still readable — from_dict() defaults the missing field to None.
+ADAPTATION_SCHEMA_VERSIONS_READABLE: Tuple[str, ...] = ("1.0", "2.0")
 
 # Soft caps (substrate is bounded).
 MAX_PENDING_PROPOSALS: int = 256
@@ -275,6 +278,17 @@ class AdaptationProposal:
     operator_decision_by: Optional[str] = None
     applied_at: Optional[str] = None
     record_sha256: str = ""
+    # Item #2 schema extension (2026-04-26): per-surface JSON-
+    # serializable payload that carries the FULL proposed state
+    # (not just the hash). The hash is for tamper-detection;
+    # the payload is for materialization. Backward-compat: existing
+    # rows without this field load with `None` (older miners just
+    # didn't populate it). YAML writer (`adaptation/yaml_writer.py`)
+    # consumes this on `/adapt approve` to materialize the state
+    # into `.jarvis/adapted_<surface>.yaml`. Bumped
+    # ADAPTATION_SCHEMA_VERSION 1.0 → 2.0; older "1.0" rows still
+    # readable.
+    proposed_state_payload: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -296,6 +310,10 @@ class AdaptationProposal:
             "applied_at": self.applied_at,
             "rollback_via": "pass_b_manifest_amendment",
         }
+        # Item #2: serialize the payload only when populated. Keeps
+        # pre-extension rows byte-identical for back-compat tests.
+        if self.proposed_state_payload is not None:
+            out["proposed_state_payload"] = self.proposed_state_payload
         out["record_sha256"] = self.record_sha256 or _hash_record(out)
         return out
 
@@ -348,6 +366,13 @@ class AdaptationProposal:
                 if data.get("applied_at") else None
             ),
             record_sha256=str(data.get("record_sha256") or ""),
+            proposed_state_payload=(
+                dict(data["proposed_state_payload"])
+                if isinstance(
+                    data.get("proposed_state_payload"), Mapping,
+                )
+                else None
+            ),
         )
 
     def verify_integrity(self) -> bool:
@@ -648,11 +673,21 @@ class AdaptationLedger:
         evidence: AdaptationEvidence,
         current_state_hash: str,
         proposed_state_hash: str,
+        proposed_state_payload: Optional[Dict[str, Any]] = None,
     ) -> ProposeResult:
         """Author a new proposal. Validates monotonic-tightening
         BEFORE persistence. Loosening proposals are rejected with
         WOULD_LOOSEN and NOT written to disk (the universal cage
-        rule per Pass C §4.1)."""
+        rule per Pass C §4.1).
+
+        ``proposed_state_payload`` (Item #2 — 2026-04-26) is an
+        OPTIONAL JSON-serializable dict carrying the FULL proposed
+        state — used by the YAML writer at /adapt approve time to
+        materialize the state into the live gate's adapted YAML.
+        Backward-compat: pre-Item-#2 callers omit this kwarg and
+        get the same behavior as before (payload=None → writer
+        skips with SKIPPED_NO_PAYLOAD).
+        """
         if not is_enabled():
             return ProposeResult(
                 status=ProposeStatus.DISABLED, proposal_id=proposal_id,
@@ -720,6 +755,20 @@ class AdaptationLedger:
             # Construct the proposal so the validator can examine it.
             now_iso = _utc_now_iso()
             now_epoch = _utc_now_epoch()
+            # Item #2: validate payload shape (must be Mapping if
+            # supplied — defends against caller-supplied garbage).
+            normalized_payload: Optional[Dict[str, Any]] = None
+            if proposed_state_payload is not None:
+                if not isinstance(proposed_state_payload, Mapping):
+                    return ProposeResult(
+                        status=ProposeStatus.INVALID_PROPOSAL,
+                        proposal_id=pid,
+                        detail=(
+                            "proposed_state_payload_must_be_mapping:"
+                            f"{type(proposed_state_payload).__name__}"
+                        ),
+                    )
+                normalized_payload = dict(proposed_state_payload)
             base = AdaptationProposal(
                 schema_version=ADAPTATION_SCHEMA_VERSION,
                 proposal_id=pid,
@@ -734,6 +783,7 @@ class AdaptationLedger:
                 ),
                 proposed_at=now_iso,
                 proposed_at_epoch=now_epoch,
+                proposed_state_payload=normalized_payload,
             )
             verdict, detail = validate_monotonic_tightening(base)
             if verdict is MonotonicTighteningVerdict.REJECTED_WOULD_LOOSEN:
@@ -761,6 +811,7 @@ class AdaptationLedger:
                 monotonic_tightening_verdict=verdict,
                 proposed_at=base.proposed_at,
                 proposed_at_epoch=base.proposed_at_epoch,
+                proposed_state_payload=base.proposed_state_payload,
             )
             payload = stamped.to_dict()
             final = AdaptationProposal(
@@ -781,6 +832,7 @@ class AdaptationLedger:
                 operator_decision_by=stamped.operator_decision_by,
                 applied_at=stamped.applied_at,
                 record_sha256=payload["record_sha256"],
+                proposed_state_payload=stamped.proposed_state_payload,
             )
             ok = self._append(final)
             if not ok:
@@ -882,6 +934,9 @@ class AdaptationLedger:
                 operator_decision_at=now_iso,
                 operator_decision_by=op_clean,
                 applied_at=applied_at,
+                # Item #2: preserve payload across state transitions
+                # so /adapt approve sees it.
+                proposed_state_payload=existing.proposed_state_payload,
             )
             payload = base.to_dict()
             final = AdaptationProposal(
@@ -902,6 +957,7 @@ class AdaptationLedger:
                 operator_decision_by=base.operator_decision_by,
                 applied_at=base.applied_at,
                 record_sha256=payload["record_sha256"],
+                proposed_state_payload=base.proposed_state_payload,
             )
             if not self._append(final):
                 return DecisionResult(
