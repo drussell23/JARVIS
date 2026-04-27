@@ -26,7 +26,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import FrozenSet, Iterable, Mapping, Tuple
+import logging
+from typing import Dict, FrozenSet, Iterable, Mapping, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +126,68 @@ _DUPLICATE_WEIGHT_FACTOR: float = 0.0
 # still cannot dominate a diverse ledger because spam stays at 1.0
 # multiplier (1 category) while diverse patterns climb to 2.0–3.0×.
 _BASE_SCORE_CAP: float = 15.0
+
+
+# Phase 7.5 caller wiring (Caller Wiring PR #4 — 2026-04-26):
+# Per-category weight registry. Baseline weight is 1.0 for every
+# known category — the diversity-scoring formula multiplies each
+# call's `base_weight` (per-tool) by the per-category weight from
+# this registry. Master-off byte-identical: when no adapted weights
+# are loaded, every multiplier is 1.0, so the formula degenerates
+# to the pre-wiring `sum(base_weight)` arithmetic exactly.
+#
+# Adapted entries arrive via `compute_effective_category_weights()`
+# (Phase 7.5 substrate). The Slice 5 miner's mass-conservation cage
+# (Σ(new) ≥ Σ(base) + per-category floor at HALF_OF_BASE) ensures
+# every adapted vector NET-tightens the exploration cage — even when
+# individual category weights drop below 1.0 (low-value categories),
+# the corresponding rises (high-value categories) more than
+# compensate.
+def _baseline_category_weights() -> "Dict[str, float]":
+    """Return the canonical per-category baseline: every known
+    category at weight 1.0. Excludes UNCATEGORIZED — uncategorized
+    calls are silently treated as multiplier=1.0 by the helper.
+    """
+    return {
+        c.value: 1.0
+        for c in ExplorationCategory
+        if c is not ExplorationCategory.UNCATEGORIZED
+    }
+
+
+def _compute_active_category_weights() -> "Dict[str, float]":
+    """Compose Phase 7.5 adapted category weights with the canonical
+    baseline.
+
+    Master-off byte-identical: when
+    ``JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_CATEGORY_WEIGHTS=false``
+    (default), the substrate's `compute_effective_category_weights()`
+    returns `dict(baseline)` unchanged → every multiplier in the
+    diversity-scoring loop is 1.0 → byte-identical to pre-wiring
+    score arithmetic.
+
+    Defense-in-depth: substrate raise → caught here → falls back to
+    the canonical baseline (NEVER raises into the caller).
+
+    Per Pass C §4.1 cage rule, the substrate already enforces three
+    layers of mass-conservation defense BEFORE returning to us:
+      - Sum invariant: Σ(new) ≥ Σ(base)
+      - Per-category floor: each new ≥ HALF_OF_BASE × base[k]
+      - Absolute floor: each new ≥ MIN_WEIGHT_VALUE
+    Our wiring just consumes the result; no need to re-validate.
+    """
+    base = _baseline_category_weights()
+    try:
+        from backend.core.ouroboros.governance.adaptation.adapted_category_weight_loader import (  # noqa: E501
+            compute_effective_category_weights,
+        )
+        return compute_effective_category_weights(base)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[ExplorationEngine] compute_effective_category_weights "
+            "raised %s — falling back to canonical baseline", exc,
+        )
+        return base
 
 
 # ---------------------------------------------------------------------------
@@ -232,15 +297,29 @@ class ExplorationLedger:
         has ``n_cats == 0`` and multiplies to zero, a STRONGER anti-
         gaming property than the pre-multiplier formula provided.
         """
+        # Phase 7.5 caller wiring: per-category weight multipliers.
+        # Master-off byte-identical → all multipliers == 1.0 →
+        # this loop is arithmetically equivalent to the pre-wiring
+        # `base += call.base_weight` form. Master-on with adapted
+        # rebalance → high-value category contributions scale up,
+        # low-value contributions scale down (per Slice 5 cage rule
+        # the NET effect is tightening — Σ-invariant + per-cat floor
+        # enforced at the substrate).
+        cat_weights = _compute_active_category_weights()
         seen: set = set()
         base = 0.0
         for call in self.calls:
+            cat_multiplier = cat_weights.get(call.category.value, 1.0)
             key = (call.tool_name, call.arguments_hash)
             if key in seen:
-                base += call.base_weight * _DUPLICATE_WEIGHT_FACTOR
+                base += (
+                    call.base_weight
+                    * _DUPLICATE_WEIGHT_FACTOR
+                    * cat_multiplier
+                )
             else:
                 seen.add(key)
-                base += call.base_weight
+                base += call.base_weight * cat_multiplier
 
         base = min(base, _BASE_SCORE_CAP)
         n_cats = len(self.categories_covered())
