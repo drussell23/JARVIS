@@ -339,6 +339,26 @@ class MerkleNode:
 
 
 @dataclass(frozen=True)
+class MerkleFsEvent:
+    """Slice 11.5 — minimal event shape for ``update_incremental``.
+
+    Decoupled from TrinityEventBus on purpose: the cartographer's
+    incremental API takes ANY object with these three fields, so
+    callers (the bus subscriber, tests, custom watchers) construct
+    them directly. The bus subscriber translates published events
+    into this shape via ``MerkleEventSubscriber.handle``.
+
+    ``kind`` is one of ``"created" | "modified" | "deleted" |
+    "moved"``. Other strings are accepted but treated as upserts
+    (NEVER raises on unknown kinds — fail-safe to "rebuild leaf").
+    """
+
+    kind: str
+    relpath: str
+    is_directory: bool = False
+
+
+@dataclass(frozen=True)
 class MerkleTransitionRecord:
     """One row of the history log."""
 
@@ -628,6 +648,194 @@ class MerkleCartographer:
                 return set()
             return node.all_leaf_paths()
 
+    async def update_incremental(
+        self, events: Sequence["MerkleFsEvent"],
+    ) -> Set[str]:
+        """O(log N) per-event recompute. Slice 11.5.
+
+        Each event carries (kind, relpath, is_directory). The
+        cartographer:
+
+          * created / modified  → re-hash leaf at relpath, propagate
+                                   up to root
+          * deleted             → drop leaf, propagate up
+          * moved               → delete source + create dest
+
+        Skips events whose relpath:
+          * falls outside the included top-level dirs
+          * lands inside an excluded directory
+          * points at a non-existent + non-prior-leaf path (no-op)
+
+        Returns the set of leaf relpaths whose hashes changed (subset
+        of the input event set after filtering). NEVER raises.
+
+        After processing the batch, the snapshot is persisted ONCE
+        (not per-event) — an audit row is appended to history with
+        ``transition_kind="incremental"``."""
+        if not events:
+            return set()
+        t0 = time.monotonic()
+        prev_root_hash = ""
+        with self._lock:
+            if self._root is None:
+                # Cold cache — incremental is a no-op; caller should
+                # invoke update_full first.
+                return set()
+            prev_root_hash = self._root.hash
+
+        changed: Set[str] = set()
+        # Group events by directory path to dedupe redundant work.
+        # If a single dir gets 5 events, we still only re-hash each
+        # leaf once and recompute the parent once.
+        seen_relpaths: Set[str] = set()
+        for ev in events:
+            relpath = (ev.relpath or "").replace("\\", "/").strip("/")
+            if not relpath or relpath in seen_relpaths:
+                continue
+            seen_relpaths.add(relpath)
+
+            # Skip excluded segments.
+            parts = relpath.split("/")
+            if any(p in self._excluded for p in parts):
+                continue
+
+            # Must be inside an included top-level dir.
+            top = parts[0] if parts else ""
+            if top not in self._included:
+                continue
+
+            # Apply the event.
+            if ev.kind in ("deleted",):
+                if self._apply_delete(relpath):
+                    changed.add(relpath)
+                continue
+
+            # Treat created / modified / moved-dest equivalently — a
+            # rebuild of that leaf node from disk.
+            if await self._apply_upsert(relpath):
+                changed.add(relpath)
+
+        # Rebuild leaf index + persist if anything actually changed.
+        if changed:
+            with self._lock:
+                if self._root is not None:
+                    self._leaf_index = self._build_leaf_index(self._root)
+                self._store.write_current(self._root)
+
+        elapsed = time.monotonic() - t0
+        with self._lock:
+            new_root_hash = (
+                self._root.hash if self._root is not None else ""
+            )
+        self._store.append_history(MerkleTransitionRecord(
+            ts_epoch=time.time(),
+            transition_kind="incremental",
+            root_hash_before=prev_root_hash,
+            root_hash_after=new_root_hash,
+            files_changed=len(changed),
+            files_total=len(self._leaf_index),
+            elapsed_s=elapsed,
+        ))
+        return changed
+
+    def _apply_delete(self, relpath: str) -> bool:
+        """Remove a leaf + propagate ancestor hashes. Returns True
+        if a leaf was actually deleted. NEVER raises."""
+        with self._lock:
+            if self._root is None:
+                return False
+            parts = relpath.split("/")
+            # Walk down to the parent of the leaf.
+            stack: List[Tuple[MerkleNode, str]] = []
+            node: Optional[MerkleNode] = self._root
+            for part in parts[:-1]:
+                if node is None or not node.is_dir:
+                    return False
+                child = node.children.get(part)
+                if child is None:
+                    return False
+                stack.append((node, part))
+                node = child
+            if node is None or not node.is_dir:
+                return False
+            leaf_name = parts[-1]
+            if leaf_name not in node.children:
+                return False
+            del node.children[leaf_name]
+            # Recompute parent + ancestors
+            self._propagate_up(node, stack)
+            return True
+
+    async def _apply_upsert(self, relpath: str) -> bool:
+        """Re-hash a single file and propagate parent hashes. Returns
+        True if the leaf hash actually changed (or was newly created).
+        NEVER raises."""
+        abs_path = self._repo_root / relpath
+        if not abs_path.exists() or not abs_path.is_file():
+            # Treat missing-file as delete.
+            return self._apply_delete(relpath)
+        if abs_path.is_symlink():
+            # Per walker contract, symlinks excluded.
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+            content = await loop.run_in_executor(
+                None, abs_path.read_bytes,
+            )
+            stat = abs_path.stat()
+        except OSError:
+            return False
+        new_hash = hash_file_content(content)
+        with self._lock:
+            if self._root is None:
+                return False
+            parts = relpath.split("/")
+            # Walk down, creating intermediate dir nodes if needed.
+            stack: List[Tuple[MerkleNode, str]] = []
+            node = self._root
+            for i, part in enumerate(parts[:-1]):
+                if not node.is_dir:
+                    return False
+                child = node.children.get(part)
+                if child is None:
+                    sub_relpath = "/".join(parts[: i + 1])
+                    child = MerkleNode(
+                        relpath=sub_relpath, is_dir=True, hash="",
+                    )
+                    node.children[part] = child
+                stack.append((node, part))
+                node = child
+
+            leaf_name = parts[-1]
+            existing = node.children.get(leaf_name)
+            if existing is not None and existing.hash == new_hash:
+                return False  # idempotent
+
+            new_leaf = MerkleNode(
+                relpath=relpath, is_dir=False,
+                hash=new_hash, mtime=stat.st_mtime, size=stat.st_size,
+            )
+            node.children[leaf_name] = new_leaf
+            self._propagate_up(node, stack)
+            return True
+
+    def _propagate_up(
+        self,
+        leaf_parent: MerkleNode,
+        stack: Sequence[Tuple[MerkleNode, str]],
+    ) -> None:
+        """Recompute hashes from leaf-parent up through ancestors to
+        root. Caller holds the lock. NEVER raises."""
+        # Recompute leaf-parent hash from its current children
+        leaf_parent.hash = hash_combine(
+            [c.hash for c in leaf_parent.children.values()]
+        )
+        # Walk back up through stack, recomputing each ancestor
+        for ancestor, _name in reversed(stack):
+            ancestor.hash = hash_combine(
+                [c.hash for c in ancestor.children.values()]
+            )
+
     async def update_full(self) -> Set[str]:
         """Walk the file tree, hash every file, rebuild the Merkle
         tree, persist the result. Returns the set of leaf relpaths
@@ -847,8 +1055,185 @@ def reset_default_cartographer_for_tests() -> None:
         _default_cartographer = None
 
 
+# ---------------------------------------------------------------------------
+# Slice 11.5 — TrinityEventBus subscriber.
+# ---------------------------------------------------------------------------
+#
+# The cartographer's ``update_incremental`` is event-source-agnostic:
+# any caller that can construct ``MerkleFsEvent`` objects can drive
+# it. ``MerkleEventSubscriber`` is the production wire-up to the
+# project's existing FS-event infrastructure (Gap #4 closed
+# 2026-04-20): subscribes to ``fs.changed.*`` topics on
+# TrinityEventBus, translates payloads, batches with debounce, and
+# dispatches to the cartographer.
+#
+# Subscriber NEVER raises into the bus's dispatch path. Failures
+# inside the cartographer's update degrade silently to a debug log.
+
+
+def _coerce_kind_from_topic(topic: str) -> str:
+    """Map ``fs.changed.modified`` → ``"modified"``; defensive
+    fallback to ``"modified"`` for anything else (treated as upsert
+    by ``update_incremental``)."""
+    if topic.startswith("fs.changed."):
+        return topic[len("fs.changed."):] or "modified"
+    return "modified"
+
+
+class MerkleEventSubscriber:
+    """Subscribes to ``fs.changed.*`` events on a
+    ``TrinityEventBus``-shaped object and forwards them to a
+    ``MerkleCartographer`` via batched ``update_incremental`` calls.
+
+    Decoupled from TrinityEventBus's concrete type — accepts any
+    object exposing ``async subscribe(topic_pattern, handler)``.
+    This keeps the cartographer module free of orchestrator imports.
+
+    Debouncing: events are buffered in memory; ``flush`` is called
+    after ``debounce_seconds`` of quiet OR when the buffer reaches
+    ``flush_threshold``. Both knobs are env-tunable.
+
+    Master-flag-aware: when ``is_cartographer_enabled()`` is False,
+    ``handle`` is a no-op so the subscriber can be wired at boot
+    without affecting behavior.
+    """
+
+    def __init__(
+        self,
+        cartographer: MerkleCartographer,
+        debounce_seconds: float = 1.0,
+        flush_threshold: int = 50,
+    ) -> None:
+        self._cartographer = cartographer
+        self._debounce_s = max(0.0, float(debounce_seconds))
+        self._flush_threshold = max(1, int(flush_threshold))
+        self._pending: List[MerkleFsEvent] = []
+        self._lock = threading.Lock()
+        self._flush_task: Optional[asyncio.Task] = None
+        self._events_received: int = 0
+        self._batches_flushed: int = 0
+
+    @property
+    def metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "events_received": self._events_received,
+                "batches_flushed": self._batches_flushed,
+                "pending_count": len(self._pending),
+            }
+
+    async def handle(self, topic: str, payload: Any) -> None:
+        """Bus event handler. NEVER raises into the bus dispatch."""
+        if not is_cartographer_enabled():
+            return
+        try:
+            relpath = ""
+            is_directory = False
+            if isinstance(payload, Mapping):
+                relpath = str(
+                    payload.get("relative_path")
+                    or payload.get("path")
+                    or "",
+                )
+                is_directory = bool(payload.get("is_directory", False))
+            else:
+                # Object-style payload — tolerant duck-typing
+                relpath = str(
+                    getattr(payload, "relative_path", "")
+                    or getattr(payload, "path", "")
+                    or "",
+                )
+                is_directory = bool(
+                    getattr(payload, "is_directory", False),
+                )
+            if not relpath:
+                return
+            if is_directory:
+                # Directory events are coarse-grained; we still
+                # care about them for delete events but skip
+                # creates/modifies (no leaf to hash).
+                kind = _coerce_kind_from_topic(topic)
+                if kind not in ("deleted", "moved"):
+                    return
+            else:
+                kind = _coerce_kind_from_topic(topic)
+            ev = MerkleFsEvent(
+                kind=kind, relpath=relpath, is_directory=is_directory,
+            )
+            with self._lock:
+                self._pending.append(ev)
+                self._events_received += 1
+                pending_n = len(self._pending)
+            if pending_n >= self._flush_threshold:
+                await self._flush_now()
+            else:
+                # Schedule a debounced flush.
+                self._schedule_debounced_flush()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[MerkleSubscriber] handle failed", exc_info=True,
+            )
+
+    async def subscribe_to_bus(self, event_bus: Any) -> bool:
+        """Wire the subscriber to a bus exposing
+        ``async subscribe(topic_pattern, handler)``. Returns True on
+        successful subscription; False on any failure. NEVER raises."""
+        try:
+            await event_bus.subscribe("fs.changed.*", self.handle)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[MerkleSubscriber] bus.subscribe failed", exc_info=True,
+            )
+            return False
+
+    async def flush(self) -> int:
+        """Drain the pending buffer to ``cartographer.update_incremental``.
+        Returns the number of events processed. NEVER raises."""
+        return await self._flush_now()
+
+    async def _flush_now(self) -> int:
+        with self._lock:
+            batch = list(self._pending)
+            self._pending.clear()
+        if not batch:
+            return 0
+        try:
+            await self._cartographer.update_incremental(batch)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[MerkleSubscriber] update_incremental failed",
+                exc_info=True,
+            )
+        with self._lock:
+            self._batches_flushed += 1
+        return len(batch)
+
+    def _schedule_debounced_flush(self) -> None:
+        """If no flush is currently scheduled, spawn one. NEVER raises."""
+        if self._flush_task is not None and not self._flush_task.done():
+            return  # already scheduled
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._flush_task = loop.create_task(self._debounced_flush())
+
+    async def _debounced_flush(self) -> None:
+        try:
+            await asyncio.sleep(self._debounce_s)
+            await self._flush_now()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[MerkleSubscriber] debounced_flush failed",
+                exc_info=True,
+            )
+
+
 __all__ = [
     "MerkleCartographer",
+    "MerkleEventSubscriber",
+    "MerkleFsEvent",
     "MerkleNode",
     "MerkleStateStore",
     "MerkleTransitionRecord",
