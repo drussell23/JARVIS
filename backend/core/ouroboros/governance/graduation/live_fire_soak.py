@@ -607,6 +607,20 @@ class LiveFireSoakHarness:
         outcome_str, runner_attributed, class_notes = classify_outcome(
             summary, debug_log_tail=debug_tail or "",
         )
+        # Phase 9.2 — consult per-flag GraduationContract (opt-in via
+        # JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT). Contract can:
+        #   * Override clean predicate (e.g. require ≥1 hypothesis
+        #     for CuriosityEngine flag).
+        #   * Override failure-class blocklist (treat specific runner-
+        #     class failures as INFRA waivers for this flag).
+        # When master-off, contract consultation is a no-op — behavior
+        # is byte-identical to pre-9.2.
+        outcome_str, runner_attributed, class_notes = (
+            self._maybe_apply_contract(
+                chosen, summary,
+                outcome_str, runner_attributed, class_notes,
+            )
+        )
         # Build evidence row.
         session_id = str(summary.get("session_id") or "unknown")
         cost_total = _safe_float(summary.get("cost_total"))
@@ -711,6 +725,85 @@ class LiveFireSoakHarness:
         # post-subprocess phase succeeds.
         env["JARVIS_GRADUATION_LEDGER_ENABLED"] = "true"
         return env
+
+    def _maybe_apply_contract(
+        self,
+        flag_name: str,
+        summary: Mapping[str, Any],
+        outcome_str: str,
+        runner_attributed: bool,
+        class_notes: str,
+    ) -> Tuple[str, bool, str]:
+        """Phase 9.2 — refine classification via per-flag contract.
+
+        When master flag ``JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT``
+        is off → no-op (returns inputs unchanged, byte-identical
+        behavior). When on:
+
+          1. Custom clean_predicate may DOWNGRADE a default-CLEAN
+             outcome to RUNNER (e.g. CuriosityEngine flag was on but
+             zero hypotheses generated → not actually clean).
+          2. ``failure_class_blocklist_overrides`` may UPGRADE a
+             default-RUNNER outcome to INFRA (waiver) for specific
+             flag-known infra-class failures.
+
+        Contract NEVER raises into the caller — try/except wraps
+        every consultation."""
+        try:
+            from backend.core.ouroboros.governance.graduation.graduation_contract import (  # noqa: E501
+                get_contract, is_contract_consultation_enabled,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return (outcome_str, runner_attributed, class_notes)
+        if not is_contract_consultation_enabled():
+            return (outcome_str, runner_attributed, class_notes)
+        try:
+            contract = get_contract(flag_name)
+        except Exception:  # noqa: BLE001
+            return (outcome_str, runner_attributed, class_notes)
+        notes_extra: List[str] = []
+        # Step 1: custom clean predicate downgrade.
+        if (
+            outcome_str == "clean"
+            and contract.clean_predicate is not None
+        ):
+            try:
+                still_clean = contract.is_clean(summary)
+            except Exception:  # noqa: BLE001
+                still_clean = True  # defensive: don't downgrade on error
+            if not still_clean:
+                outcome_str = "runner"
+                runner_attributed = True
+                notes_extra.append("contract_predicate_downgraded_clean")
+        # Step 2: blocklist override upgrade (RUNNER → INFRA).
+        if (
+            outcome_str == "runner"
+            and contract.failure_class_blocklist_overrides
+        ):
+            failure_counts = summary.get("failure_class_counts") or {}
+            if isinstance(failure_counts, dict):
+                positive_classes = {
+                    k for k, v in failure_counts.items()
+                    if _is_positive_int(v)
+                }
+                # If EVERY positive-count failure class is in the
+                # contract's blocklist, treat as INFRA waiver.
+                if (
+                    positive_classes
+                    and positive_classes.issubset(
+                        contract.failure_class_blocklist_overrides,
+                    )
+                ):
+                    outcome_str = "infra"
+                    runner_attributed = False
+                    notes_extra.append(
+                        "contract_blocklist_upgraded_runner_to_infra",
+                    )
+        if notes_extra:
+            class_notes = (
+                class_notes + "|" + ",".join(notes_extra)
+            )[:MAX_NOTES_CHARS]
+        return (outcome_str, runner_attributed, class_notes)
 
     def _truncate_failure_counts(
         self, raw: Mapping[str, Any],
