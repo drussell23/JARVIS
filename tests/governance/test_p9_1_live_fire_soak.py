@@ -872,10 +872,22 @@ def test_evidence_persisted_to_history_jsonl(
     assert history_p.exists()
     text = history_p.read_text()
     rows = [json.loads(line) for line in text.splitlines() if line.strip()]
-    assert len(rows) == 1
-    assert rows[0]["session_id"] == "bt-persist-1"
-    assert rows[0]["flag_name"] == "JARVIS_DECISION_TRACE_LEDGER_ENABLED"
-    assert rows[0]["outcome"] == "clean"
+    # Phase 9.1b — every soak now writes 2 rows: a SUBPROCESS_IN_FLIGHT
+    # breadcrumb BEFORE the runner returns + the completion row.
+    assert len(rows) == 2
+    breadcrumb = next(
+        r for r in rows
+        if r["harness_status"] == "subprocess_in_flight"
+    )
+    completion = next(
+        r for r in rows
+        if r["harness_status"] != "subprocess_in_flight"
+    )
+    assert breadcrumb["flag_name"] == "JARVIS_DECISION_TRACE_LEDGER_ENABLED"
+    assert breadcrumb["session_id"] == "in-flight"
+    assert completion["session_id"] == "bt-persist-1"
+    assert completion["flag_name"] == "JARVIS_DECISION_TRACE_LEDGER_ENABLED"
+    assert completion["outcome"] == "clean"
 
 
 def test_evidence_for_flag_returns_only_that_flag(
@@ -905,14 +917,22 @@ def test_evidence_for_flag_returns_only_that_flag(
         flag_name="JARVIS_LATENT_CONFIDENCE_RING_ENABLED",
         subprocess_runner=fake_b,
     )
-    rows_a = harness.evidence_for_flag(
-        "JARVIS_DECISION_TRACE_LEDGER_ENABLED",
-    )
+    # Phase 9.1b — filter out SUBPROCESS_IN_FLIGHT breadcrumb rows;
+    # the assertion is about completion-row carryover per flag.
+    rows_a = [
+        r for r in harness.evidence_for_flag(
+            "JARVIS_DECISION_TRACE_LEDGER_ENABLED",
+        )
+        if r.get("harness_status") != "subprocess_in_flight"
+    ]
     assert len(rows_a) == 1
     assert rows_a[0]["session_id"] == "bt-A"
-    rows_b = harness.evidence_for_flag(
-        "JARVIS_LATENT_CONFIDENCE_RING_ENABLED",
-    )
+    rows_b = [
+        r for r in harness.evidence_for_flag(
+            "JARVIS_LATENT_CONFIDENCE_RING_ENABLED",
+        )
+        if r.get("harness_status") != "subprocess_in_flight"
+    ]
     assert len(rows_b) == 1
     assert rows_b[0]["session_id"] == "bt-B"
 
@@ -1144,3 +1164,193 @@ def test_cli_subcommands_present():
     src = inspect.getsource(cli)
     for sub in ["queue", "evidence", "run", "status", "pause", "resume"]:
         assert f'"{sub}"' in src or f"'{sub}'" in src
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.1b — Fix B: breadcrumb persistence + INTERRUPTED status
+# ---------------------------------------------------------------------------
+
+
+def test_breadcrumb_written_before_subprocess_returns(
+    isolated_ledger, harness: LiveFireSoakHarness,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The breadcrumb evidence row must hit disk BEFORE the runner
+    is invoked — proves operator can grep for hung sessions even
+    when the process is later SIGKILL'd."""
+    monkeypatch.setenv(
+        "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED", "true",
+    )
+    history_path_at_runner_invocation: list = []
+
+    def runner_that_inspects_disk(**kwargs):
+        # Read the history file AT THE MOMENT the runner is invoked
+        # — must already contain the breadcrumb.
+        history_path_at_runner_invocation.append(
+            kwargs["project_root"]
+        )
+        history_p = isolated_ledger["history_path"]
+        if history_p.exists():
+            text = history_p.read_text()
+            history_path_at_runner_invocation.append(text)
+        return (0, {
+            "session_id": "bt-breadcrumb-test",
+            "session_outcome": "complete",
+            "stop_reason": "ok",
+            "failure_class_counts": {},
+        }, "")
+
+    harness.run_soak(
+        flag_name="JARVIS_DECISION_TRACE_LEDGER_ENABLED",
+        subprocess_runner=runner_that_inspects_disk,
+    )
+    # The runner saw a non-empty history file with the breadcrumb.
+    assert len(history_path_at_runner_invocation) >= 2
+    text_at_runner = history_path_at_runner_invocation[1]
+    assert "subprocess_in_flight" in text_at_runner
+
+
+def test_breadcrumb_row_has_correct_metadata(
+    isolated_ledger, harness: LiveFireSoakHarness,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv(
+        "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED", "true",
+    )
+    fake = _fake_runner_returning({
+        "session_id": "bt-bc-md",
+        "session_outcome": "complete",
+        "stop_reason": "ok",
+        "failure_class_counts": {},
+    })
+    harness.run_soak(
+        flag_name="JARVIS_DECISION_TRACE_LEDGER_ENABLED",
+        subprocess_runner=fake,
+    )
+    rows = harness.all_evidence()
+    breadcrumb = next(
+        r for r in rows
+        if r["harness_status"] == "subprocess_in_flight"
+    )
+    assert breadcrumb["flag_name"] == (
+        "JARVIS_DECISION_TRACE_LEDGER_ENABLED"
+    )
+    assert breadcrumb["session_id"] == "in-flight"
+    assert breadcrumb["outcome"] == "infra"
+    assert breadcrumb["runner_attributed"] is False
+    assert breadcrumb["stop_reason"] == "subprocess_in_flight"
+    assert breadcrumb["started_at_iso"]  # non-empty
+    # Breadcrumb has no finished_at (set after subprocess returns).
+    assert breadcrumb["finished_at_iso"] == ""
+
+
+def test_interrupted_status_persists_evidence_row(
+    isolated_ledger, harness: LiveFireSoakHarness,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """SystemExit / KeyboardInterrupt mid-subprocess must persist
+    an INTERRUPTED row before re-raising for the caller."""
+    monkeypatch.setenv(
+        "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED", "true",
+    )
+
+    def interrupted_runner(**kwargs):
+        raise KeyboardInterrupt("simulated SIGTERM")
+
+    with pytest.raises(KeyboardInterrupt):
+        harness.run_soak(
+            flag_name="JARVIS_DECISION_TRACE_LEDGER_ENABLED",
+            subprocess_runner=interrupted_runner,
+        )
+    # Two rows on disk: breadcrumb + INTERRUPTED.
+    rows = harness.all_evidence()
+    statuses = {r["harness_status"] for r in rows}
+    assert "subprocess_in_flight" in statuses
+    assert "interrupted" in statuses
+
+
+def test_interrupted_status_systemexit_persists():
+    """SystemExit (more direct SIGTERM mapping than KeyboardInterrupt)
+    also persists evidence."""
+    import tempfile
+    from backend.core.ouroboros.governance.adaptation import (
+        graduation_ledger as _ledger_mod,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        from pathlib import Path as _P
+        target = _P(td) / "grad.jsonl"
+        history = _P(td) / "live.jsonl"
+        os.environ["JARVIS_GRADUATION_LEDGER_PATH"] = str(target)
+        os.environ["JARVIS_GRADUATION_LEDGER_ENABLED"] = "true"
+        os.environ[
+            "JARVIS_LIVE_FIRE_GRADUATION_HISTORY_PATH"
+        ] = str(history)
+        os.environ["JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED"] = "true"
+        try:
+            _ledger_mod.reset_default_ledger()
+            reset_default_harness()
+            local_harness = get_default_harness()
+
+            def system_exit_runner(**kwargs):
+                raise SystemExit(1)
+
+            try:
+                local_harness.run_soak(
+                    flag_name=(
+                        "JARVIS_DECISION_TRACE_LEDGER_ENABLED"
+                    ),
+                    subprocess_runner=system_exit_runner,
+                )
+            except SystemExit:
+                pass
+            rows = local_harness.all_evidence()
+            statuses = {r["harness_status"] for r in rows}
+            assert "subprocess_in_flight" in statuses
+            assert "interrupted" in statuses
+        finally:
+            for k in [
+                "JARVIS_GRADUATION_LEDGER_PATH",
+                "JARVIS_GRADUATION_LEDGER_ENABLED",
+                "JARVIS_LIVE_FIRE_GRADUATION_HISTORY_PATH",
+                "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED",
+            ]:
+                os.environ.pop(k, None)
+            _ledger_mod.reset_default_ledger()
+            reset_default_harness()
+
+
+def test_two_status_values_added_in_phase_9_1b():
+    """Pin: HarnessStatus enum gained SUBPROCESS_IN_FLIGHT and
+    INTERRUPTED in Phase 9.1b. Bit-rot guard."""
+    values = {s.value for s in HarnessStatus}
+    assert "subprocess_in_flight" in values
+    assert "interrupted" in values
+
+
+def test_breadcrumb_does_not_count_as_runner_outcome(
+    isolated_ledger, harness: LiveFireSoakHarness,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The breadcrumb row's outcome=infra means a hung-then-killed
+    soak is classified as INFRA waiver (not RUNNER fault) at the
+    canonical graduation ledger — protects the flag's clean-count
+    from being unfairly blocked by harness-internal hangs."""
+    monkeypatch.setenv(
+        "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED", "true",
+    )
+
+    def interrupted_runner(**kwargs):
+        raise KeyboardInterrupt("simulated SIGTERM mid-subprocess")
+
+    with pytest.raises(KeyboardInterrupt):
+        harness.run_soak(
+            flag_name="JARVIS_DECISION_TRACE_LEDGER_ENABLED",
+            subprocess_runner=interrupted_runner,
+        )
+    # The INTERRUPTED row uses outcome=infra (waiver), not runner.
+    rows = harness.all_evidence()
+    interrupted_row = next(
+        r for r in rows if r["harness_status"] == "interrupted"
+    )
+    assert interrupted_row["outcome"] == "infra"
+    assert interrupted_row["runner_attributed"] is False
