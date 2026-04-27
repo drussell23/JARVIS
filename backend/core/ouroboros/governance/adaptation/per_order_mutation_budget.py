@@ -337,6 +337,14 @@ def propose_budget_lowerings_from_events(
             summary=c.summary,
         )
         proposed_hash = c.proposed_state_hash(current_state_hash)
+        # Mining-surface payload (Item #2 yaml_writer schema):
+        # `budgets: [{order, budget, ...prov}]`. Loader validates
+        # `order` ∈ {1, 2} + `budget` non-negative int + Order-2
+        # floor MIN_ORDER2_BUDGET. Provenance auto-enriched.
+        payload = {
+            "order": c.order,
+            "budget": c.proposed_budget,
+        }
         res = ledger.propose(
             proposal_id=c.proposal_id(),
             surface=AdaptationSurface.SCOPED_TOOL_BACKEND_MUTATION_BUDGET,
@@ -344,6 +352,7 @@ def propose_budget_lowerings_from_events(
             evidence=evidence,
             current_state_hash=current_state_hash or "sha256:initial",
             proposed_state_hash=proposed_hash,
+            proposed_state_payload=payload,
         )
         results.append(res)
         if res.status is ProposeStatus.OK:

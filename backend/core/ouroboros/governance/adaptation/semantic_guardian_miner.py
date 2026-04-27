@@ -445,6 +445,22 @@ def propose_patterns_from_events(
             summary=c.summary,
         )
         proposed_hash = c.proposed_state_hash(current_state_hash)
+        # Mining-surface payload (closes the producer-side gap end-to-
+        # end with Item #2 yaml_writer + Item #3 bridges). Shape MUST
+        # match yaml_writer's SEMANTIC_GUARDIAN_PATTERNS schema:
+        # `patterns: [{name, regex, severity, message, ...prov}]`.
+        # Provenance fields (proposal_id / approved_at / approved_by)
+        # are added by yaml_writer's `_enrich_with_provenance()`.
+        payload = {
+            "name": f"adapted_{c.group_key[0]}_{c.group_key[1]}"[:240],
+            "regex": c.proposed_pattern,
+            "severity": "warn",
+            "message": (
+                f"Adapted SemanticGuardian pattern from POSTMORTEM "
+                f"cluster ({c.group_key[0]}, {c.group_key[1]}); "
+                f"observations={c.excerpt_count}"
+            )[:240],
+        }
         res = ledger.propose(
             proposal_id=c.proposal_id(),
             surface=AdaptationSurface.SEMANTIC_GUARDIAN_PATTERNS,
@@ -452,6 +468,7 @@ def propose_patterns_from_events(
             evidence=evidence,
             current_state_hash=current_state_hash or "sha256:initial",
             proposed_state_hash=proposed_hash,
+            proposed_state_payload=payload,
         )
         results.append(res)
         if res.status is ProposeStatus.OK:

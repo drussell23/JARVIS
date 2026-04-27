@@ -494,6 +494,17 @@ def propose_weight_rebalances_from_events(
             summary=c.summary,
         )
         proposed_hash = c.proposed_state_hash(current_state_hash)
+        # Mining-surface payload (Item #2 yaml_writer schema):
+        # `rebalances: [{new_weights: {cat: float, ...}, high_value_
+        # category, low_value_category, ...prov}]`. Loader validates
+        # weights dict (positive floats, lowercased category keys) +
+        # enforces 3 net-tighten checks (sum / per-cat floor / abs
+        # floor). Provenance auto-enriched by yaml_writer.
+        payload = {
+            "new_weights": dict(c.new_weights),
+            "high_value_category": c.high_value_category,
+            "low_value_category": c.low_value_category,
+        }
         res = ledger.propose(
             proposal_id=c.proposal_id(),
             surface=AdaptationSurface.EXPLORATION_LEDGER_CATEGORY_WEIGHTS,
@@ -501,6 +512,7 @@ def propose_weight_rebalances_from_events(
             evidence=evidence,
             current_state_hash=current_state_hash or "sha256:initial",
             proposed_state_hash=proposed_hash,
+            proposed_state_payload=payload,
         )
         results.append(res)
         if res.status is ProposeStatus.OK:
