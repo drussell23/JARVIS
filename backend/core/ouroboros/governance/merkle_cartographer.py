@@ -152,13 +152,18 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 
 
 def is_cartographer_enabled() -> bool:
-    """``JARVIS_MERKLE_CARTOGRAPHER_ENABLED`` (default ``false``).
+    """``JARVIS_MERKLE_CARTOGRAPHER_ENABLED`` (default ``true`` — graduated
+    in Phase 11 Slice 11.7).
 
     When off, callers consulting ``has_changed`` get an unconditional
     ``True`` so existing O(N) sensor scans run as before — no false
-    negatives possible during graduation."""
+    negatives possible. Hot-revert: ``export
+    JARVIS_MERKLE_CARTOGRAPHER_ENABLED=false`` returns the entire
+    Phase 11 cartographer stack to dormant (per-sensor consumers all
+    fail-safe to legacy when ``current_root_hash``/``subtree_hash``
+    return empty)."""
     return _env_bool(
-        "JARVIS_MERKLE_CARTOGRAPHER_ENABLED", default=False,
+        "JARVIS_MERKLE_CARTOGRAPHER_ENABLED", default=True,
     )
 
 

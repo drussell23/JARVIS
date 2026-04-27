@@ -104,10 +104,16 @@ _BACKLOG_FALLBACK_INTERVAL_S: float = float(
 
 def short_circuit_enabled() -> bool:
     """Re-read ``JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED`` at call time so
-    monkeypatch works in tests + operator can flip live without re-init."""
+    monkeypatch works in tests + operator can flip live without re-init.
+
+    Default ``true`` — graduated in Phase 11 Slice 11.7 alongside the
+    cartographer master + 3 merkle consumers (Todo, Doc, OppMiner).
+    Hot-revert: ``export JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED=false``."""
     raw = os.environ.get(
         "JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
@@ -366,30 +372,37 @@ class BacklogSensor:
 
         Slice 11.6.d — when ``JARVIS_BACKLOG_SHORT_CIRCUIT_ENABLED=true``
         AND the (mtime_ns, size, exists) stat tuple of every watched
-        file is unchanged since the last scan, short-circuit to the
-        cached envelope list (skip read + JSON parse + envelope build).
-        File-stat is the analogue of the cartographer hash for state
-        files that the cartographer correctly excludes from its tree.
+        file is unchanged since the last scan, short-circuit to an
+        empty result (skip read + JSON parse + envelope build).
+
+        Why empty (not the cached prior envelope list)? ``scan_once``'s
+        contract is "envelopes ingested THIS cycle". On unchanged input
+        the dedup ledger (``_seen_task_ids``) would suppress every
+        re-emission anyway → real re-scan returns ``[]``. Returning the
+        cached list would lie about what the cycle ingested. File-stat
+        is the analogue of the cartographer hash for state files that
+        the cartographer correctly excludes from its tree.
         """
         current_state = self._sc_current_state()
         if self._sc_should_short_circuit(current_state):
             self._sc_short_circuits += 1
             logger.debug(
                 "[BacklogSensor] Stat short-circuit "
-                "(scan #%d skipped, %d cached envelopes)",
+                "(scan #%d skipped, returning [] — dedup-equivalent)",
                 self._sc_short_circuits + self._sc_full_scans,
-                len(self._sc_cached_envelopes),
             )
-            return list(self._sc_cached_envelopes)
+            return []
 
         self._sc_full_scans += 1
         produced: List[IntentEnvelope] = []
         produced.extend(await self._scan_backlog_json())
         if _auto_proposed_enabled():
             produced.extend(await self._scan_proposals_ledger())
-        # Refresh cache + baseline AFTER the scan completes so the next
-        # cycle's stat read sees the same files we just digested.
-        self._sc_refresh_baseline(produced, current_state)
+        # Refresh baseline AFTER the scan completes so the next cycle's
+        # stat read sees the same files we just digested. We don't
+        # cache the produced envelopes — short-circuit returns [] to
+        # match the dedup-filtered re-scan semantic (see docstring).
+        self._sc_refresh_baseline(current_state)
         return produced
 
     async def _scan_backlog_json(self) -> List[IntentEnvelope]:
@@ -743,15 +756,18 @@ class BacklogSensor:
             return False  # cold start — no baseline yet
         return current_state == self._sc_last_state
 
-    def _sc_refresh_baseline(
-        self,
-        produced: List[IntentEnvelope],
-        current_state: tuple,
-    ) -> None:
-        """Snapshot the freshly-scanned envelopes + stat signature as
-        the new baseline. Always-safe — never raises."""
+    def _sc_refresh_baseline(self, current_state: tuple) -> None:
+        """Snapshot the stat signature as the new baseline for the
+        next cycle's short-circuit decision. Always-safe — never
+        raises.
+
+        The cached envelope list is intentionally NOT updated here
+        (see ``scan_once`` docstring): ``scan_once``'s contract is
+        "ingested THIS cycle", and on a no-change re-scan the dedup
+        ledger would yield ``[]``. Short-circuit returns ``[]``
+        directly to match that semantic; the cache stays whatever it
+        was set to last (default ``[]``)."""
         try:
-            self._sc_cached_envelopes = list(produced)
             self._sc_last_state = current_state
         except Exception:  # noqa: BLE001 — defensive
             logger.debug(

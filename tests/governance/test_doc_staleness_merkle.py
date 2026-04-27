@@ -106,9 +106,12 @@ def isolated_cartographer(
 # ===========================================================================
 
 
-def test_merkle_consult_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_merkle_consult_default_on_post_graduation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slice 11.7 graduation flip: unset/empty env returns True."""
     monkeypatch.delenv("JARVIS_DOCSTALE_USE_MERKLE", raising=False)
-    assert merkle_consult_enabled() is False
+    assert merkle_consult_enabled() is True
 
 
 def test_merkle_consult_truthy_values(
@@ -122,7 +125,9 @@ def test_merkle_consult_truthy_values(
 def test_merkle_consult_falsy_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for val in ("0", "false", "no", "off", "", "garbage"):
+    """Post-graduation: empty string is the unset-marker for default
+    True. Hot-revert requires an explicit ``false``-class string."""
+    for val in ("0", "false", "no", "off", "garbage"):
         monkeypatch.setenv("JARVIS_DOCSTALE_USE_MERKLE", val)
         assert merkle_consult_enabled() is False
 
@@ -330,7 +335,7 @@ async def test_merkle_flag_off_full_scan_every_cycle(
 ) -> None:
     """When per-sensor flag is off, sensor must NEVER consult
     cartographer — legacy behavior preserved."""
-    monkeypatch.delenv("JARVIS_DOCSTALE_USE_MERKLE", raising=False)
+    monkeypatch.setenv("JARVIS_DOCSTALE_USE_MERKLE", "false")
     sensor = make_sensor()
     await sensor.scan_once()
     await sensor.scan_once()
@@ -347,7 +352,7 @@ async def test_merkle_flag_off_does_not_call_cartographer(
 
     Pinned at runtime by checking the monkeypatched import path
     isn't called."""
-    monkeypatch.delenv("JARVIS_DOCSTALE_USE_MERKLE", raising=False)
+    monkeypatch.setenv("JARVIS_DOCSTALE_USE_MERKLE", "false")
 
     call_count = 0
     original_get = mc.get_default_cartographer

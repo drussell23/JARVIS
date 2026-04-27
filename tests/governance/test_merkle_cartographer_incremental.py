@@ -399,7 +399,9 @@ async def test_subscriber_master_flag_off_handle_noop(
     repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("JARVIS_MERKLE_STATE_DIR", str(repo))
-    monkeypatch.delenv("JARVIS_MERKLE_CARTOGRAPHER_ENABLED", raising=False)
+    # Slice 11.7 graduation: master flag default-true, so explicit
+    # false-set is required to exercise the master-off path.
+    monkeypatch.setenv("JARVIS_MERKLE_CARTOGRAPHER_ENABLED", "false")
     c = MerkleCartographer(repo_root=repo)
     sub = MerkleEventSubscriber(c)
     await sub.handle("fs.changed.modified", {

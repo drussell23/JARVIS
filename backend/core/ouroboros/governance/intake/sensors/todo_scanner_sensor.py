@@ -116,10 +116,17 @@ _SKIP_DIRS = frozenset({
 
 def merkle_consult_enabled() -> bool:
     """Re-read ``JARVIS_TODO_USE_MERKLE`` at call time so monkeypatch
-    works in tests + operator can flip live without re-init."""
+    works in tests + operator can flip live without re-init.
+
+    Default ``true`` — graduated in Phase 11 Slice 11.7 alongside the
+    cartographer master, DocStaleness consumer, OpportunityMiner
+    consumer, and Backlog stat consumer. Hot-revert: ``export
+    JARVIS_TODO_USE_MERKLE=false``."""
     raw = os.environ.get(
         "JARVIS_TODO_USE_MERKLE", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
