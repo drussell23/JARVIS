@@ -22,7 +22,7 @@ torchaudio>=2.0.0  # For audio-specific models
 SpeechRecognition>=3.10.0
 
 # Optional: For better performance
-numba>=0.58.0  # Speeds up librosa
+numba>=0.65.1  # Speeds up librosa
 
 # Installation Instructions:
 # 1. Basic installation (without Picovoice):
