@@ -926,6 +926,37 @@ def main() -> None:
         interrupted = True
         print(f"\n{_YELLOW}Interrupted — shutting down gracefully...{_RESET}")
     finally:
+        # Phase 9.1c (Fix A) — arm the BoundedShutdownWatchdog BEFORE the
+        # post-asyncio teardown phase, regardless of stop_reason. The
+        # signal-handler arming at harness.py:3276 only fires on
+        # signal-induced shutdown — clean shutdowns (idle_timeout /
+        # budget_exhausted / wall_clock_cap) skip the arm and have NO
+        # escape hatch if shutdown_default_executor() wedges on a
+        # non-daemon ThreadPoolExecutor worker. The Phase 9.1 once-run
+        # (session bt-2026-04-27-085300) revealed exactly this hang:
+        # process completed _generate_report cleanly at 02:09:25, then
+        # sat for 1h 50m+ in the executor shutdown. Daemon-thread
+        # watchdog → no Py_FinalizeEx interference; if shutdown wedges
+        # past default_deadline_s (default 30s), os._exit(75) fires.
+        #
+        # arm() is first-wins-with-reset: if signal-handler already
+        # armed-then-disarmed earlier, this arm() re-arms cleanly.
+        # If everything below completes within deadline, the daemon
+        # thread dies with the interpreter — no os._exit fires.
+        try:
+            from backend.core.ouroboros.battle_test.shutdown_watchdog import (  # noqa: E501
+                default_deadline_s as _bsw_deadline_s,
+            )
+            _wdg = getattr(harness, "_shutdown_watchdog", None)
+            if _wdg is not None:
+                _wdg.arm(
+                    reason="post_asyncio_teardown",
+                    deadline_s=_bsw_deadline_s(),
+                )
+        except Exception:  # noqa: BLE001 — never let watchdog arm
+            # crash the script's clean-exit path.
+            pass
+
         # Shutdown hygiene (Python 3.9+): drain pending async generators
         # and thread-pool executor tasks before closing the loop. Without
         # this, background asyncio.to_thread / run_in_executor callbacks
