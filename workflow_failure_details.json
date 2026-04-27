@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24987441909",
-  "branch": "fix/ci/pr-automation-validation-run45116-20260427-093212",
-  "commit_sha": "8a40ff1",
-  "run_number": 45329,
-  "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run45329-20260427-100516",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #45329)",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24988914875",
+  "branch": "fix/ci/pr-automation-validation-run45329-20260427-100516",
+  "commit_sha": "7893346",
+  "run_number": 45537,
+  "failed_count": 3,
+  "fix_branch": "fix/ci/pr-automation-validation-run45537-20260427-104657",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #45537)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,14 +14,82 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
+              "line_number": 45,
+              "content": "2026-04-27T10:12:23.9952912Z RequestError [HttpError]: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 4401:2BD1E8:F548D:3DAA37:69EF3687 and timestamp 2026-04-27 10:12:23 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 79,
+              "content": "2026-04-27T10:12:24.0059095Z ##[error]Unhandled error: HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 4401:2BD1E8:F548D:3DAA37:69EF3687 and timestamp 2026-04-27 10:12:23 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 1,
+              "content": "${warning}",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2026-04-27T10:12:26.4041088Z RequestError [HttpError]: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 9019:E846:6D4250:1BB96DE:69EF368A and timestamp 2026-04-27 10:12:26 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 46,
+              "content": "2026-04-27T10:12:26.4086032Z ##[error]Unhandled error: HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 9019:E846:6D4250:1BB96DE:69EF368A and timestamp 2026-04-27 10:12:26 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
               "line_number": 30,
-              "content": "2026-04-27T09:40:24.5433543Z   subjectPatternError: The PR title must start with a capital letter.",
+              "content": "2026-04-27T10:12:37.9575381Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
               "line_number": 42,
-              "content": "2026-04-27T09:40:25.1287181Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #45116)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "content": "2026-04-27T10:12:38.6373798Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #45329)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -33,7 +101,7 @@
           "matches": [
             {
               "line_number": 58,
-              "content": "2026-04-27T09:40:25.1968447Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "content": "2026-04-27T10:12:38.6982934Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -62,5 +130,5 @@
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-04-27T10:05:16.431653"
+  "timestamp": "2026-04-27T10:46:57.716702"
 }
