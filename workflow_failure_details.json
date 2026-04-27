@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24989798710",
-  "branch": "fix/ci/pr-automation-validation-run45490-20260427-102656",
-  "commit_sha": "0a6b1c9",
-  "run_number": 45766,
-  "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run45766-20260427-125715",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #45766)",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/24996366918",
+  "branch": "fix/ci/pr-automation-validation-run45766-20260427-125715",
+  "commit_sha": "e8da83f",
+  "run_number": 46010,
+  "failed_count": 5,
+  "fix_branch": "fix/ci/pr-automation-validation-run46010-20260427-132626",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #46010)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,14 +14,70 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 30,
-              "content": "2026-04-27T11:13:45.7540796Z   subjectPatternError: The PR title must start with a capital letter.",
+              "line_number": 43,
+              "content": "2026-04-27T13:06:26.0266832Z RequestError [HttpError]: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID F941:358689:1902767:6504581:69EF5F51 and timestamp 2026-04-27 13:06:25 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 42,
-              "content": "2026-04-27T11:13:46.3366625Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #45490)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "line_number": 44,
+              "content": "2026-04-27T13:06:26.0306430Z ##[error]Unhandled error: HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID F941:358689:1902767:6504581:69EF5F51 and timestamp 2026-04-27 13:06:25 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2026-04-27T13:05:36.7582043Z RequestError [HttpError]: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID DC11:B00C0:1408775:50C8BC6:69EF5F20 and timestamp 2026-04-27 13:05:36 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 47,
+              "content": "2026-04-27T13:05:36.7634166Z ##[error]Unhandled error: HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID DC11:B00C0:1408775:50C8BC6:69EF5F20 and timestamp 2026-04-27 13:05:36 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 16,
+              "content": "2026-04-27T13:07:00.4860228Z   subjectPatternError: The PR title must start with a capital letter.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 28,
+              "content": "2026-04-27T13:07:00.7099049Z ##[error]API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 2C41:15084E:2FC35B0:C16A1BC:69EF5F74 and timestamp 2026-04-27 13:07:00 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -32,8 +88,8 @@
           "pattern": "WARN|Warning|warning",
           "matches": [
             {
-              "line_number": 58,
-              "content": "2026-04-27T11:13:46.3807886Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "line_number": 30,
+              "content": "2026-04-27T13:07:00.7649011Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -44,7 +100,7 @@
           "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 34,
+              "line_number": 20,
               "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
               "emoji": "\u23f1\ufe0f"
@@ -60,7 +116,99 @@
       "severity": "high",
       "category": "timeout",
       "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 35,
+              "content": "2026-04-27T13:07:04.0444882Z RequestError [HttpError]: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID CC33:2996CC:3E046:F81AA:69EF5F77 and timestamp 2026-04-27 13:07:04 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 87,
+              "content": "2026-04-27T13:07:04.0480944Z ##[error]Unhandled error: HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID CC33:2996CC:3E046:F81AA:69EF5F77 and timestamp 2026-04-27 13:07:04 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2026-04-27T13:07:04.2042394Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2026-04-27T13:07:04.2042394Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 45,
+              "content": "2026-04-27T13:07:02.9455347Z RequestError [HttpError]: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 7C01:1F7322:313D29A:320C9FC:69EF5F76 and timestamp 2026-04-27 13:07:02 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 97,
+              "content": "2026-04-27T13:07:02.9605149Z ##[error]Unhandled error: HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 7C01:1F7322:313D29A:320C9FC:69EF5F76 and timestamp 2026-04-27 13:07:02 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 1,
+              "content": "${warning}",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
     }
   ],
-  "timestamp": "2026-04-27T12:57:15.621992"
+  "timestamp": "2026-04-27T13:26:26.645783"
 }
