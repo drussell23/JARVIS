@@ -226,6 +226,15 @@ class HarnessStatus(str, enum.Enum):
     SUBPROCESS_TIMEOUT = "subprocess_timeout"
     SUMMARY_PARSE_FAILED = "summary_parse_failed"
     LEDGER_WRITE_FAILED = "ledger_write_failed"
+    # Phase 9.1b — breadcrumb persistence on hang/kill
+    SUBPROCESS_IN_FLIGHT = "subprocess_in_flight"  # written BEFORE
+                                                   # subprocess returns;
+                                                   # paired with later
+                                                   # OK / SUBPROCESS_*
+                                                   # row on same session
+    INTERRUPTED = "interrupted"          # caught SystemExit /
+                                         # KeyboardInterrupt mid-soak
+                                         # (operator SIGTERM, etc.)
 
 
 @dataclass(frozen=True)
@@ -568,30 +577,84 @@ class LiveFireSoakHarness:
         runner = subprocess_runner or _run_battle_test_subprocess
         started_at_epoch = time.time()
         started_at_iso = _utc_now_iso()
+        # Phase 9.1b — breadcrumb persistence:
+        # Write a SUBPROCESS_IN_FLIGHT row BEFORE invoking the runner.
+        # If the harness CLI is externally killed (SIGTERM / SIGKILL)
+        # mid-subprocess (e.g. when the battle-test hangs in atexit
+        # cleanup like Phase 9.1 once-run revealed), this breadcrumb
+        # row is the only evidence on disk. Operator can grep
+        # `harness_status=subprocess_in_flight` rows in the ledger
+        # and see hung soaks. On normal subprocess return, the
+        # finally-block doesn't add a duplicate (handled by
+        # `_persisted` flag).
+        self._append_history_row(EvidenceRow(
+            schema_version=EVIDENCE_SCHEMA_VERSION,
+            harness_status=HarnessStatus.SUBPROCESS_IN_FLIGHT.value,
+            flag_name=chosen,
+            session_id="in-flight",
+            outcome="infra",  # treated as waiver if no completion-pair
+            runner_attributed=False,
+            stop_reason="subprocess_in_flight",
+            cost_total_usd=0.0,
+            duration_s=0.0,
+            ops_count=0,
+            failure_class_counts={},
+            deps_set=deps_set,
+            started_at_iso=started_at_iso,
+            started_at_epoch=started_at_epoch,
+            finished_at_iso="",
+            finished_at_epoch=0.0,
+            notes="breadcrumb — written before subprocess returns",
+        ))
         try:
-            exit_code, summary, debug_tail = runner(
-                env=env,
-                cost_cap_usd=cost_cap_usd,
-                max_wall_seconds=max_wall_seconds,
-                timeout_s=subprocess_timeout_s,
-                project_root=self.project_root,
-            )
-        except subprocess.TimeoutExpired:
-            return self._persist_failure(
-                chosen, deps_set, started_at_iso, started_at_epoch,
-                HarnessStatus.SUBPROCESS_TIMEOUT,
-                "subprocess_timeout_expired",
-            )
-        except Exception as exc:  # noqa: BLE001 — defensive
-            logger.warning(
-                "[LiveFireSoak] subprocess invocation failed flag=%r: %s",
-                chosen, exc,
-            )
-            return self._persist_failure(
-                chosen, deps_set, started_at_iso, started_at_epoch,
-                HarnessStatus.SUBPROCESS_FAILED,
-                f"subprocess_exception:{type(exc).__name__}",
-            )
+            try:
+                exit_code, summary, debug_tail = runner(
+                    env=env,
+                    cost_cap_usd=cost_cap_usd,
+                    max_wall_seconds=max_wall_seconds,
+                    timeout_s=subprocess_timeout_s,
+                    project_root=self.project_root,
+                )
+            except subprocess.TimeoutExpired:
+                return self._persist_failure(
+                    chosen, deps_set, started_at_iso, started_at_epoch,
+                    HarnessStatus.SUBPROCESS_TIMEOUT,
+                    "subprocess_timeout_expired",
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.warning(
+                    "[LiveFireSoak] subprocess invocation failed "
+                    "flag=%r: %s", chosen, exc,
+                )
+                return self._persist_failure(
+                    chosen, deps_set, started_at_iso, started_at_epoch,
+                    HarnessStatus.SUBPROCESS_FAILED,
+                    f"subprocess_exception:{type(exc).__name__}",
+                )
+        except BaseException as exc:  # noqa: BLE001 — catches
+            # SystemExit / KeyboardInterrupt (SIGTERM-induced).
+            # Persist an INTERRUPTED row paired with the breadcrumb
+            # so operator can grep "this soak was killed mid-
+            # subprocess." Then re-raise so the caller's SystemExit
+            # / KeyboardInterrupt propagates cleanly.
+            try:
+                self._persist_failure(
+                    chosen, deps_set,
+                    started_at_iso, started_at_epoch,
+                    HarnessStatus.INTERRUPTED,
+                    (
+                        f"interrupted_mid_subprocess:"
+                        f"{type(exc).__name__}"
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                # Last-ditch swallow — interrupt propagation must
+                # not be blocked by a persistence failure.
+                logger.debug(
+                    "[LiveFireSoak] interrupt-persistence raised",
+                    exc_info=True,
+                )
+            raise
         finished_at_epoch = time.time()
         finished_at_iso = _utc_now_iso()
         # Validate parsed summary.
