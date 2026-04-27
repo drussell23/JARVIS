@@ -323,9 +323,8 @@ class TestLedgerIntegration:
         ledger_path = tmp_path / "ledger.jsonl"
         adapter = AdaptationLedger(path=ledger_path)
         evidence = AdaptationEvidence(
+            window_days=7,
             observation_count=5,
-            window_start_iso="2026-04-26T00:00:00Z",
-            window_end_iso="2026-04-26T01:00:00Z",
             source_event_ids=("e1",),
             summary="kill switch off → test",
         )
@@ -342,7 +341,7 @@ class TestLedgerIntegration:
             ProposeStatus,
         )
         assert result.status in (
-            ProposeStatus.OK, ProposeStatus.DUPLICATE,
+            ProposeStatus.OK, ProposeStatus.DUPLICATE_PROPOSAL_ID,
         ), f"unexpected status: {result.status} detail={result.detail}"
         assert ledger_path.exists()
 
