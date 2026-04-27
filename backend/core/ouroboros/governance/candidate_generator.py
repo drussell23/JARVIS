@@ -1377,31 +1377,56 @@ class CandidateGenerator:
         # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
         _provider_route = getattr(context, "provider_route", "") or "standard"
 
-        # ── Phase 10 P10.3 — AsyncTopologySentinel-driven dispatch ───
+        # ── Phase 10 P10.3+P10.3.5 — AsyncTopologySentinel gate ────
         # When ``JARVIS_TOPOLOGY_SENTINEL_ENABLED=true``, the sentinel
         # walks the route's ranked ``dw_models`` list (yaml v2) and
-        # picks the first model whose breaker is not OPEN. Each
-        # attempt stamps ``ctx._dw_model_override`` so the provider's
-        # ``_resolve_effective_model`` consumes it. On per-model
-        # failure, ``sentinel.report_failure(...)`` is called and the
-        # walk continues to the next model. After exhausting all DW
-        # models, the route applies its ``fallback_tolerance`` from
-        # yaml v2 (``cascade_to_claude`` or ``queue``).
+        # picks the first model whose breaker is not OPEN.
         #
-        # When the master flag is OFF (default), this branch is a
-        # no-op and the static yaml ``dw_allowed: false`` block below
-        # remains authoritative — byte-identical pre/post-Slice-3
-        # behavior. The static block is the deletion target for
-        # Phase 10 P10.5 (THE PURGE), operator-authorized after 3
-        # forced-clean once-proofs of this dynamic path.
-        try:
-            from backend.core.ouroboros.governance.topology_sentinel import (
-                is_sentinel_enabled as _sentinel_enabled,
+        # Pre-flight handshake (directive 2026-04-27): instead of a
+        # silent try/except that swallows boundary-isolation defects
+        # (which is what bit session bt-2026-04-27-194550), we run
+        # ``preflight_check()`` at the gate. If the sentinel fails to
+        # initialize inside this subprocess for ANY reason — module
+        # import, topology load, missing dw_models — we raise
+        # ``SentinelInitializationError`` so the operator sees the
+        # defect at the point of decision, not minutes later in the
+        # postmortem. Master-flag-off remains byte-identical legacy
+        # behavior: this entire block is bypassed.
+        _flag_raw = os.environ.get(
+            "JARVIS_TOPOLOGY_SENTINEL_ENABLED", "",
+        ).strip().lower()
+        if _flag_raw in ("1", "true", "yes", "on"):
+            try:
+                from backend.core.ouroboros.governance.topology_sentinel import (
+                    preflight_check as _sentinel_preflight,
+                    SentinelInitializationError as _SentinelInitError,
+                )
+            except ImportError as _imp_exc:
+                # Master flag explicitly true but the module is
+                # unimportable — this is a deployment defect, NOT a
+                # silent fall-through. Raise so the orchestrator's
+                # existing accept-failure branch records it visibly.
+                raise RuntimeError(
+                    f"sentinel_module_import_failed:"
+                    f"{type(_imp_exc).__name__}:"
+                    f"{str(_imp_exc)[:120]}"
+                ) from _imp_exc
+            _preflight = _sentinel_preflight()
+            if not _preflight.healthy:
+                raise _SentinelInitError(
+                    _preflight.failed_assertions,
+                    _preflight.diagnostics,
+                )
+            logger.info(
+                "[CandidateGenerator] Phase 10 sentinel preflight: "
+                "healthy=True schema=%s routes_with_dw_models=%s "
+                "monitor_config=%s event_loop_bound=%s diagnostics=%s",
+                _preflight.schema_version,
+                list(_preflight.routes_with_dw_models),
+                _preflight.monitor_config_present,
+                _preflight.event_loop_bound,
+                list(_preflight.diagnostics),
             )
-            _sentinel_active = _sentinel_enabled()
-        except Exception:
-            _sentinel_active = False
-        if _sentinel_active:
             _result = await self._dispatch_via_sentinel(
                 context, deadline, _provider_route,
             )

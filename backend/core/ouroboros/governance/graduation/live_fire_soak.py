@@ -767,12 +767,32 @@ class LiveFireSoakHarness:
 
     def _build_env_for_flag(self, flag_name: str) -> Dict[str, str]:
         """Build the env dict for the subprocess: inherit current
-        env + set ONLY (flag_name + dependencies) to ``true``.
+        env + set ONLY (flag_name + dependencies) to ``true`` + EXPLICITLY
+        forward AsyncTopologySentinel-related env vars.
 
         Other JARVIS_* substrate flags are NOT touched — the subprocess
         sees the inherited env exactly. This matches the contract that
         substrate flags are individually graduated; flipping multiple
         in one soak would muddle the evidence.
+
+        **Slice 3.5 — explicit sentinel env propagation** (directive
+        2026-04-27): Sentinel-related env vars are forwarded VIA AN
+        EXPLICIT ALLOWLIST (``topology_sentinel.sentinel_propagated_vars``)
+        rather than relying on ``dict(os.environ)`` inheritance alone.
+        This makes the propagation contract:
+
+          (a) Discoverable — operators grep ``_SENTINEL_PROPAGATED_VARS``
+              in topology_sentinel.py to see the full list.
+          (b) Defensible — if ``os.environ`` ever gets stripped or a
+              future refactor breaks the inherit-everything assumption,
+              the explicit forwarding still holds.
+          (c) Testable — ``test_sentinel_env_propagation_contract``
+              asserts the harness forwards every sentinel env var the
+              dispatcher reads.
+
+        Closes the boundary-isolation gap that bit session
+        bt-2026-04-27-194550 (sentinel module loaded inside the
+        subprocess but the dispatcher never entered its branch).
         """
         env = dict(os.environ)
         env[flag_name] = "true"
@@ -787,6 +807,30 @@ class LiveFireSoakHarness:
         # the canonical record_session call inside the harness's
         # post-subprocess phase succeeds.
         env["JARVIS_GRADUATION_LEDGER_ENABLED"] = "true"
+        # Explicit sentinel env propagation (Slice 3.5). Re-asserts
+        # the parent's value (or absence) for every sentinel-related
+        # env var. If the parent set JARVIS_TOPOLOGY_SENTINEL_ENABLED=true,
+        # the subprocess will see it; if unset in parent, it stays
+        # unset (default behavior). Same effect as inheritance, but
+        # explicit + AST-grep-able.
+        try:
+            from backend.core.ouroboros.governance.topology_sentinel import (
+                sentinel_propagated_vars,
+            )
+            for name in sentinel_propagated_vars():
+                value = os.environ.get(name)
+                if value is not None:
+                    env[name] = value
+                # If unset in parent, do NOT inject a default — the
+                # sentinel module's own defaults handle that.
+        except ImportError:
+            # Sentinel module not available (e.g. on a branch that
+            # hasn't merged Slice 1). Inheritance still applies via
+            # dict(os.environ) above; degrade gracefully.
+            logger.debug(
+                "[LiveFireSoak] sentinel_propagated_vars unavailable — "
+                "falling back to inheritance-only env propagation"
+            )
         return env
 
     def _maybe_apply_contract(

@@ -97,6 +97,66 @@ SCHEMA_VERSION = "topology_sentinel.1"
 
 
 # ---------------------------------------------------------------------------
+# Boundary isolation — explicit env propagation contract (Slice 3.5)
+# ---------------------------------------------------------------------------
+#
+# Per the 2026-04-27 directive ("Process Boundary Isolation & Pre-Flight
+# Handshake"): the harness MUST NOT rely on implicit env inheritance to
+# reach the orchestrator subprocess. Every env var the sentinel layer
+# consumes is enumerated here so ``live_fire_soak._build_env_for_flag``
+# can forward them explicitly + so a future operator can grep this
+# constant to discover the full sentinel-related env surface.
+#
+# Adding a new sentinel env var? Add it here AND update
+# ``test_sentinel_env_propagation_contract`` (which asserts every
+# JARVIS_TOPOLOGY_* var the module reads is in this list).
+
+_SENTINEL_PROPAGATED_VARS: Tuple[str, ...] = (
+    # Master flag
+    "JARVIS_TOPOLOGY_SENTINEL_ENABLED",
+    "JARVIS_TOPOLOGY_FORCE_SEVERED",
+    # Threshold + decay
+    "JARVIS_TOPOLOGY_SEVERED_THRESHOLD_WEIGHTED",
+    "JARVIS_TOPOLOGY_SUCCESS_DECAY",
+    # Probe schedule
+    "JARVIS_TOPOLOGY_HEALTHY_PROBE_INTERVAL_S",
+    "JARVIS_TOPOLOGY_PROBE_BACKOFF_BASE_S",
+    "JARVIS_TOPOLOGY_PROBE_BACKOFF_CAP_S",
+    "JARVIS_TOPOLOGY_HEAVY_PROBE_RATIO",
+    "JARVIS_TOPOLOGY_LIGHT_PROBE_FIRST_TOKEN_TIMEOUT_S",
+    "JARVIS_TOPOLOGY_HEAVY_PROBE_TOTAL_TIMEOUT_S",
+    "JARVIS_TOPOLOGY_HEAVY_PROBE_MAX_TOKENS",
+    "JARVIS_TOPOLOGY_PROBE_DAILY_USD_CAP",
+    # Slow-start ramp
+    "JARVIS_TOPOLOGY_RAMP_SCHEDULE",
+    "JARVIS_TOPOLOGY_RAMP_MAX_WAIT_S",
+    # State persistence
+    "JARVIS_TOPOLOGY_SENTINEL_STATE_DIR",
+    "JARVIS_TOPOLOGY_SENTINEL_HISTORY_SIZE",
+    "JARVIS_TOPOLOGY_STATE_MAX_AGE_S",
+    # Per-source weight overrides
+    "JARVIS_TOPOLOGY_WEIGHT_LIVE_STREAM_STALL",
+    "JARVIS_TOPOLOGY_WEIGHT_LIVE_TRANSPORT",
+    "JARVIS_TOPOLOGY_WEIGHT_LIVE_HTTP_5XX",
+    "JARVIS_TOPOLOGY_WEIGHT_LIVE_HTTP_429",
+    "JARVIS_TOPOLOGY_WEIGHT_LIVE_PARSE_ERROR",
+    "JARVIS_TOPOLOGY_WEIGHT_HEAVY_PROBE_FAIL",
+    "JARVIS_TOPOLOGY_WEIGHT_LIGHT_PROBE_FAIL",
+    "JARVIS_TOPOLOGY_WEIGHT_LIGHT_PROBE_TIMEOUT",
+)
+
+
+def sentinel_propagated_vars() -> Tuple[str, ...]:
+    """Tuple of env var names the harness MUST forward into the
+    orchestrator subprocess. Read by
+    ``live_fire_soak._build_env_for_flag`` for explicit propagation.
+
+    Never raises. Stable ordering — operators can diff this surface
+    over time without churning the harness."""
+    return _SENTINEL_PROPAGATED_VARS
+
+
+# ---------------------------------------------------------------------------
 # Env helpers — same idiom as posture_observer / posture_store
 # ---------------------------------------------------------------------------
 
@@ -1460,6 +1520,233 @@ class TopologySentinel:
 
 
 # ---------------------------------------------------------------------------
+# Slice 3.5 — Pre-flight handshake (boundary isolation diagnostic)
+# ---------------------------------------------------------------------------
+#
+# Per the 2026-04-27 directive: when the master flag is on, the
+# orchestrator MUST natively verify its sentinel state before accepting
+# traffic. Silent failure inside the dispatcher's lazy import was the
+# bug that caused the once-proof on session bt-2026-04-27-194550 to
+# never enter the sentinel branch despite env being set.
+#
+# ``preflight_check()`` runs at the moment the dispatcher gate fires.
+# If any assertion fails, the dispatcher raises
+# ``SentinelInitializationError`` so the operator sees the boundary
+# isolation defect at the point of decision, not minutes later in
+# the postmortem.
+
+
+class SentinelInitializationError(RuntimeError):
+    """Raised when ``preflight_check()`` detects a boundary-isolation
+    failure that prevents the AsyncTopologySentinel from making
+    correct routing decisions for the current operation.
+
+    Carries a structured failure list so the orchestrator's existing
+    accept-failure branch (and future SSE telemetry) can record
+    exactly what went wrong without parsing free-form strings.
+
+    Raised path: ``candidate_generator._generate_dispatch`` →
+    ``preflight_check()`` → if not healthy → raise. Caller may catch
+    + cascade-to-Claude OR re-raise depending on operator policy.
+    """
+
+    def __init__(
+        self, failed_assertions: Tuple[str, ...], diagnostics: Tuple[str, ...] = (),
+    ) -> None:
+        self.failed_assertions = tuple(failed_assertions)
+        self.diagnostics = tuple(diagnostics)
+        msg = (
+            "AsyncTopologySentinel boundary-isolation failure: "
+            + "; ".join(failed_assertions)
+        )
+        super().__init__(msg)
+
+
+@dataclass(frozen=True)
+class SentinelPreflightResult:
+    """Structured snapshot of the sentinel's readiness at one
+    decision point. Returned by ``preflight_check()``; consumed by
+    the dispatcher gate AND by tests + observability surfaces.
+
+    A "healthy" result means the dispatcher can proceed with full
+    confidence that:
+      * the master flag is on
+      * the topology yaml is loaded with v2 schema + ranked dw_models
+      * the singleton is hydrated (or hydration was attempted cleanly)
+      * the running asyncio event loop is the loop the sentinel will
+        attach its probe task to (no orphan-loop bug)
+
+    Any of the above missing → ``failed_assertions`` populated → the
+    dispatcher raises ``SentinelInitializationError``.
+    """
+
+    flag_enabled: bool
+    module_imported: bool
+    singleton_initialized: bool
+    topology_loaded: bool
+    schema_version: str
+    routes_with_dw_models: Tuple[str, ...]
+    monitor_config_present: bool
+    event_loop_bound: bool
+    state_dir_writable: bool
+    diagnostics: Tuple[str, ...] = ()
+    failed_assertions: Tuple[str, ...] = ()
+
+    @property
+    def healthy(self) -> bool:
+        return not self.failed_assertions
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Stable JSON shape for telemetry + audit."""
+        return {
+            "schema_version": "preflight.1",
+            "flag_enabled": self.flag_enabled,
+            "module_imported": self.module_imported,
+            "singleton_initialized": self.singleton_initialized,
+            "topology_loaded": self.topology_loaded,
+            "topology_schema_version": self.schema_version,
+            "routes_with_dw_models": list(self.routes_with_dw_models),
+            "monitor_config_present": self.monitor_config_present,
+            "event_loop_bound": self.event_loop_bound,
+            "state_dir_writable": self.state_dir_writable,
+            "diagnostics": list(self.diagnostics),
+            "failed_assertions": list(self.failed_assertions),
+            "healthy": self.healthy,
+        }
+
+
+def preflight_check(
+    *,
+    require_routes: bool = True,
+) -> SentinelPreflightResult:
+    """Native, structured initialization check.
+
+    Runs at the dispatcher gate; designed for the orchestrator
+    subprocess context (NOT pure-test ergonomics — tests mock the
+    pieces). NEVER raises directly — every check is bounded by
+    try/except + assertion accumulator. The CALLER decides whether
+    ``not healthy`` is fatal (dispatcher raises
+    ``SentinelInitializationError``; observability surfaces just
+    report).
+
+    Parameters:
+      ``require_routes`` — when True (default), at least one route
+      MUST have a non-empty ``dw_models`` list. The IMMEDIATE-only
+      degenerate case is caught by the dispatcher's per-route
+      empty-list fall-through and isn't a healthy sentinel system.
+      Tests pass False for the no-routes case.
+
+    Returns ``SentinelPreflightResult`` with explicit booleans +
+    diagnostics + failed_assertions list. ``healthy`` is True iff
+    failed_assertions is empty.
+    """
+    diagnostics: List[str] = []
+    failed: List[str] = []
+
+    flag_enabled = is_sentinel_enabled()
+    if not flag_enabled:
+        # Not an error — just informational. Dispatcher won't enter
+        # this code path in this case, but the helper still returns
+        # a complete shape for telemetry.
+        diagnostics.append("master_flag_off")
+
+    module_imported = True   # if this function is running, the module imported
+    singleton_initialized = False
+    topology_loaded = False
+    schema_version = ""
+    monitor_config_present = False
+    routes_with_dw_models: List[str] = []
+
+    try:
+        sentinel = get_default_sentinel()
+        singleton_initialized = sentinel is not None
+    except Exception as exc:  # noqa: BLE001
+        failed.append(
+            f"singleton_init_failed:{type(exc).__name__}:{str(exc)[:80]}"
+        )
+        sentinel = None
+
+    try:
+        from backend.core.ouroboros.governance.provider_topology import (
+            get_topology,
+        )
+        topo = get_topology()
+        topology_loaded = bool(getattr(topo, "enabled", False))
+        schema_version = str(getattr(topo, "schema_version", ""))
+        monitor_config_present = topo.monitor_config() is not None
+        for route in (
+            "immediate", "standard", "complex", "background", "speculative",
+        ):
+            try:
+                models = topo.dw_models_for_route(route)
+                if models:
+                    routes_with_dw_models.append(route)
+            except Exception as exc:  # noqa: BLE001
+                diagnostics.append(
+                    f"dw_models_query_failed:{route}:{type(exc).__name__}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        failed.append(
+            f"topology_load_failed:{type(exc).__name__}:{str(exc)[:80]}"
+        )
+
+    if not topology_loaded:
+        failed.append("topology_not_loaded")
+    if require_routes and not routes_with_dw_models:
+        failed.append("no_routes_have_dw_models")
+
+    # Event-loop binding probe — the directive's "async event loop
+    # binding" check. ``asyncio.get_running_loop()`` raises
+    # RuntimeError when called outside an active loop; if the
+    # dispatcher is calling this, an active loop exists. Any failure
+    # here = the sentinel's probe task would be orphaned.
+    event_loop_bound = False
+    try:
+        loop = asyncio.get_running_loop()
+        event_loop_bound = loop is not None and not loop.is_closed()
+    except RuntimeError:
+        # Called from a non-async context — preflight_check still
+        # works for synchronous callers (tests, /sentinel REPL); the
+        # dispatcher's call site is async so it'll always have a loop.
+        diagnostics.append("preflight_called_outside_async_loop")
+    except Exception as exc:  # noqa: BLE001
+        failed.append(
+            f"event_loop_probe_failed:{type(exc).__name__}"
+        )
+
+    # State dir writability — the persistence path. If the harness
+    # picked a state dir we can't write to, sentinel state wouldn't
+    # survive process restart (boot-loop protection broken).
+    state_dir_writable = False
+    try:
+        d = state_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        # Probe a lock file (cheap, doesn't pollute the real ledger).
+        probe = d / ".preflight_probe.tmp"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        state_dir_writable = True
+    except Exception as exc:  # noqa: BLE001
+        diagnostics.append(
+            f"state_dir_unwritable:{type(exc).__name__}"
+        )
+
+    return SentinelPreflightResult(
+        flag_enabled=flag_enabled,
+        module_imported=module_imported,
+        singleton_initialized=singleton_initialized,
+        topology_loaded=topology_loaded,
+        schema_version=schema_version,
+        routes_with_dw_models=tuple(routes_with_dw_models),
+        monitor_config_present=monitor_config_present,
+        event_loop_bound=event_loop_bound,
+        state_dir_writable=state_dir_writable,
+        diagnostics=tuple(diagnostics),
+        failed_assertions=tuple(failed),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Module-level singleton (Slice 5 wires GovernedLoopService to call .start)
 # ---------------------------------------------------------------------------
 
@@ -1498,6 +1785,10 @@ __all__ = [
     "EndpointSnapshot",
     "FailureSource",
     "ProbeFn",
+    "SentinelInitializationError",
+    "SentinelPreflightResult",
+    "preflight_check",
+    "sentinel_propagated_vars",
     "ProbeOutcome",
     "ProbeResult",
     "ProbeWeight",

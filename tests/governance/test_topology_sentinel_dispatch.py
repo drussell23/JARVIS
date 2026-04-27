@@ -60,16 +60,24 @@ def test_sentinel_branch_inserted_before_static_topology_gate() -> None:
 
 
 def test_sentinel_branch_gated_by_master_flag() -> None:
-    """The sentinel branch must be gated by ``is_sentinel_enabled()``
-    so it's a no-op when the master flag is off."""
+    """The sentinel branch must be gated by an explicit master-flag
+    check (post-Slice-3.5: an explicit ``os.environ.get`` read +
+    truthy-value comparison). Master-flag-off must short-circuit
+    BEFORE importing the sentinel module so legacy is byte-identical."""
     src = CANDIDATE_GEN_PATH.read_text(encoding="utf-8")
-    # Find the sentinel call site
-    site_idx = src.index("_dispatch_via_sentinel")
-    pre = src[max(0, site_idx - 600):site_idx]
-    assert "is_sentinel_enabled" in pre, (
-        "expected is_sentinel_enabled() check immediately before "
-        "_dispatch_via_sentinel — without it the new path runs "
-        "unconditionally"
+    # Anchor on the gate's own comment, not _dispatch_via_sentinel
+    # (which also appears in the method's own definition far below).
+    anchor_idx = src.index("Phase 10 P10.3+P10.3.5")
+    window = src[anchor_idx:anchor_idx + 2500]
+    assert "JARVIS_TOPOLOGY_SENTINEL_ENABLED" in window, (
+        "expected master-flag env-name in dispatcher gate block"
+    )
+    assert (
+        'in ("1", "true", "yes", "on")' in window
+        or 'is_sentinel_enabled' in window
+    ), (
+        "expected truthy-value parse OR is_sentinel_enabled() helper "
+        "call in the gate"
     )
 
 
