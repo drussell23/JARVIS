@@ -22,7 +22,7 @@ openai-whisper>=20231117  # Local Whisper support
 
 # Speaker Recognition
 speechbrain>=0.5.16  # Advanced speaker recognition with x-vectors
-resemblyzer>=0.1.1.dev0  # Lightweight voice encoder (fallback)
+resemblyzer>=0.1.4  # Lightweight voice encoder (fallback)
 
 # HTTP client for GCP Whisper
 aiohttp>=3.9.0
