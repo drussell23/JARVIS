@@ -90,6 +90,53 @@ _ALLOWED_GOVERNANCE_IMPORTS: FrozenSet[str] = frozenset({
 _GOVERNANCE_IMPORT_PREFIX: str = "backend.core.ouroboros.governance"
 
 
+# Phase 7.7 — Sandbox hardening (Rule 7).
+#
+# `replay_executor.py:_SAFE_BUILTIN_NAMES` includes `object` + `type`;
+# once a candidate is operator-approved, `object.__subclasses__()`
+# walks the entire class graph including `subprocess.Popen`, breaking
+# the cage. AST-block these introspection primitives at validation
+# time — BEFORE the candidate ever reaches the sandbox.
+#
+# Per `OUROBOROS_VENOM_PRD.md` §9 P7.7:
+#   > Rule 7: no `__subclasses__` / `__bases__` / `__class__` attribute
+#   > access in any function body
+#
+# Detection is breadth-first across three patterns:
+#   1. ast.Attribute access where `.attr` matches a banned name
+#      (e.g. `obj.__subclasses__()`, `cls.__bases__`)
+#   2. ast.Call to `getattr(x, "<banned>")` with a string literal
+#      second argument matching a banned name
+#   3. ast.Subscript (defense-in-depth — won't typically match these
+#      attrs but proves the walker is breadth-first)
+#
+# Master flag JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_ESCAPE defaults
+# to TRUE — security hardening is on by default once the validator
+# itself is enabled. Operators can toggle off in an emergency without
+# disabling the whole validator.
+_BANNED_INTROSPECTION_ATTRS: FrozenSet[str] = frozenset({
+    "__subclasses__",
+    "__bases__",
+    "__class__",
+})
+
+
+def is_introspection_block_enabled() -> bool:
+    """Per-rule kill switch for Rule 7 —
+    ``JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_ESCAPE`` (default
+    **true**, unlike most JARVIS flags — security hardening is on by
+    default).
+
+    Operators can disable in emergency without disabling the whole
+    validator (`JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED`)."""
+    raw = os.environ.get(
+        "JARVIS_AST_VALIDATOR_BLOCK_INTROSPECTION_ESCAPE",
+    )
+    if raw is None:
+        return True  # default-ON
+    return raw.strip().lower() in _TRUTHY
+
+
 def is_enabled() -> bool:
     """Master flag —
     ``JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED`` (default false
@@ -110,7 +157,7 @@ def is_enabled() -> bool:
 
 
 class ValidationStatus(str, enum.Enum):
-    PASSED = "PASSED"     # all 6 rules satisfied
+    PASSED = "PASSED"     # all 7 rules satisfied (rule 7 added 2026-04-26 P7.7)
     FAILED = "FAILED"     # at least one rule violated
     SKIPPED = "SKIPPED"   # validator master-off
     PARSE_ERROR = "PARSE_ERROR"  # ast.parse raised
@@ -118,7 +165,8 @@ class ValidationStatus(str, enum.Enum):
 
 
 class ValidationFailureReason(str, enum.Enum):
-    """The 6 rules from Pass B §5.1 + supporting failure shapes."""
+    """The 7 rules from Pass B §5.1 + Phase 7.7 sandbox hardening +
+    supporting failure shapes."""
 
     NO_PHASE_RUNNER_SUBCLASS = "no_phase_runner_subclass"
     MISSING_PHASE_ATTR = "missing_phase_attr"
@@ -128,6 +176,7 @@ class ValidationFailureReason(str, enum.Enum):
     CTX_MUTATION = "ctx_mutation"
     NO_TOP_LEVEL_TRY = "no_top_level_try"
     BANNED_IMPORT = "banned_import"
+    INTROSPECTION_ESCAPE = "introspection_escape"  # P7.7
 
 
 @dataclass(frozen=True)
@@ -284,6 +333,20 @@ def validate_ast(
                     f"class {cls.name}.run lacks top-level try/except "
                     "wrapping body"
                 ),
+                classes_inspected=inspected,
+            )
+
+    # ---- Rule 7 (P7.7 sandbox hardening): introspection escape ----
+    # Check ALL function bodies in the candidate, not just run methods.
+    # Per PRD spec: "no __subclasses__ / __bases__ / __class__ attribute
+    # access in any function body" — covers helper functions too.
+    if is_introspection_block_enabled():
+        escape = _find_introspection_escape(tree)
+        if escape is not None:
+            return ValidationResult(
+                status=ValidationStatus.FAILED,
+                reason=ValidationFailureReason.INTROSPECTION_ESCAPE,
+                detail=escape,
                 classes_inspected=inspected,
             )
 
@@ -558,6 +621,97 @@ def _check_module_name(
     return f"governance import not in allowlist: {module_name}"
 
 
+# ---------------------------------------------------------------------------
+# Rule-7 helper: introspection-escape detector (Phase 7.7)
+# ---------------------------------------------------------------------------
+
+
+def _find_introspection_escape(tree: ast.AST) -> Optional[str]:
+    """Walk every function body for the three introspection-escape
+    patterns. Returns a structured detail string on first hit, else
+    None.
+
+    Detected patterns:
+      1. ast.Attribute access where ``.attr in _BANNED_INTROSPECTION_ATTRS``
+         e.g. ``object.__subclasses__()``, ``cls.__bases__``,
+         ``instance.__class__``. Catches any Attribute node anywhere
+         in any function body.
+      2. ast.Call to ``getattr(x, "<banned>")`` with a string-literal
+         second argument matching a banned name. Defends against
+         operator string-encoding the attr to bypass Pattern 1.
+      3. ast.Call to ``__import__("...")`` / ``importlib.import_module``
+         with a string literal — these are NOT directly the introspection
+         vector but they're the *next-step* escape primitive (once you
+         have `subprocess.Popen` via __subclasses__, you still need to
+         resolve it). Out of scope for P7.7 — handled by the import
+         allowlist (Rule 6) for governance modules; stdlib import is
+         currently unrestricted, which is a known gap tracked separately.
+
+    All function bodies (top-level, nested, methods including the
+    candidate's PhaseRunner.run + helpers) are walked. Walking ALL
+    function bodies (not just `run` methods) defends against the
+    candidate hiding the escape in a helper called from `run`.
+
+    NEVER raises.
+    """
+    for node in ast.walk(tree):
+        # Pattern 1: direct Attribute access
+        if isinstance(node, ast.Attribute):
+            if node.attr in _BANNED_INTROSPECTION_ATTRS:
+                # Build a brief location/shape descriptor.
+                shape = _describe_attribute_target(node)
+                return (
+                    f"introspection_escape:attr={node.attr}:"
+                    f"shape={shape}"
+                )
+        # Pattern 2: getattr(x, "<banned>") with string literal
+        if isinstance(node, ast.Call):
+            if _is_getattr_call(node) and len(node.args) >= 2:
+                second = node.args[1]
+                attr_name = _string_constant_value(second)
+                if (
+                    attr_name is not None
+                    and attr_name in _BANNED_INTROSPECTION_ATTRS
+                ):
+                    return (
+                        f"introspection_escape:getattr_string="
+                        f"{attr_name}"
+                    )
+    return None
+
+
+def _is_getattr_call(node: ast.Call) -> bool:
+    """True iff the Call is ``getattr(...)`` (Name) — does NOT match
+    ``some_module.getattr(...)`` (Attribute) since that's a custom
+    function, not the builtin."""
+    if isinstance(node.func, ast.Name):
+        return node.func.id == "getattr"
+    return False
+
+
+def _string_constant_value(node: ast.AST) -> Optional[str]:
+    """Return the string value of a Constant node if it's a string
+    literal; else None. Defends against ast.Str (Py 3.8 deprecated
+    but still parseable on Py 3.9)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _describe_attribute_target(node: ast.Attribute) -> str:
+    """Best-effort shape descriptor for the Attribute's value.
+    Examples:
+      * ``obj.__subclasses__`` → ``Name(id=obj)``
+      * ``obj.x.__class__`` → ``Attribute``
+      * ``f().__bases__`` → ``Call``
+      * ``arr[0].__class__`` → ``Subscript``
+    """
+    val = node.value
+    if isinstance(val, ast.Name):
+        return f"Name(id={val.id})"
+    return type(val).__name__
+
+
 __all__ = [
     "MAX_CANDIDATE_BYTES",
     "PhaseRunnerASTValidationError",
@@ -565,6 +719,7 @@ __all__ = [
     "ValidationResult",
     "ValidationStatus",
     "is_enabled",
+    "is_introspection_block_enabled",
     "validate_ast",
     "validate_ast_strict",
 ]

@@ -126,9 +126,10 @@ def test_validation_status_five_values():
     }
 
 
-def test_validation_failure_reason_eight_values():
-    """Pin: 6 rules + 2 supporting failure shapes (RUN_NOT_ASYNC +
-    RUN_BAD_SIGNATURE split rule 3 into actionable detail)."""
+def test_validation_failure_reason_nine_values():
+    """Pin: 7 rules + 2 supporting failure shapes (RUN_NOT_ASYNC +
+    RUN_BAD_SIGNATURE split rule 3 into actionable detail).
+    Phase 7.7 (2026-04-26) added INTROSPECTION_ESCAPE as the 9th value."""
     assert {r.name for r in ValidationFailureReason} == {
         "NO_PHASE_RUNNER_SUBCLASS",
         "MISSING_PHASE_ATTR",
@@ -138,6 +139,7 @@ def test_validation_failure_reason_eight_values():
         "CTX_MUTATION",
         "NO_TOP_LEVEL_TRY",
         "BANNED_IMPORT",
+        "INTROSPECTION_ESCAPE",  # P7.7 sandbox hardening
     }
 
 
