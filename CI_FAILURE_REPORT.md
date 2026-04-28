@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: Unlock Integration E2E Testing
-- **Run Number**: #392
-- **Branch**: `main`
-- **Commit**: `74df0c2ffbb7b4bcd1aa716ed25c6dc4774a344c`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #48666
+- **Branch**: `fix/ci/unlock-integration-e2e-testing-run392-20260428-063437`
+- **Commit**: `f8e92d245ea56ed444540cb046e92c4734e3b62a`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-28T06:32:02Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25037684343)
+- **Timestamp**: 2026-04-28T06:35:13Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25037796837)
 
 ## Failure Overview
 
@@ -17,63 +17,48 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Integration Tests - macOS | dependency_error | high | 44s |
+| 1 | Validate PR Title | timeout | high | 6s |
 
 ## Detailed Analysis
 
-### 1. Integration Tests - macOS
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Dependency Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-28T06:32:16Z
-**Completed**: 2026-04-28T06:33:00Z
-**Duration**: 44 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25037684343/job/73333098803)
+**Started**: 2026-04-28T06:35:17Z
+**Completed**: 2026-04-28T06:35:23Z
+**Duration**: 6 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25037796837/job/73333437012)
 
 #### Failed Steps
 
-- **Step 4**: Install Dependencies
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 6
-  - Sample matches:
-    - Line 38: `2026-04-28T06:32:57.7315220Z   Getting requirements to build wheel: finished with status 'error'`
-    - Line 39: `2026-04-28T06:32:57.7343440Z   error: subprocess-exited-with-error`
-    - Line 60: `2026-04-28T06:32:57.7360860Z       ModuleNotFoundError: No module named 'pkg_resources'`
-
-- Pattern: `FAIL|Failed|failed`
   - Occurrences: 2
   - Sample matches:
-    - Line 64: `2026-04-28T06:32:57.7361930Z ERROR: Failed to build 'openai-whisper' when getting requirements to bu`
-    - Line 96: `2026-04-28T06:32:58.2177030Z ##[warning]The process '/opt/homebrew/bin/git' failed with exit code 12`
+    - Line 30: `2026-04-28T06:35:20.2151006Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-04-28T06:35:20.9678382Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Unlo`
 
 - Pattern: `WARN|Warning|warning`
-  - Occurrences: 4
+  - Occurrences: 1
   - Sample matches:
-    - Line 71: `2026-04-28T06:32:57.8266190Z   if-no-files-found: warn`
-    - Line 85: `2026-04-28T06:32:57.9950940Z ##[warning]No files were found with the provided path: test-results/unl`
-    - Line 96: `2026-04-28T06:32:58.2177030Z ##[warning]The process '/opt/homebrew/bin/git' failed with exit code 12`
-
-- Pattern: `AssertionError|Exception`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 4: `2026-04-28T06:32:54.3019580Z Installing collected packages: typing-extensions, tomli, pygments, prop`
-    - Line 6: `2026-04-28T06:32:55.2383840Z Successfully installed aiohappyeyeballs-2.6.1 aiohttp-3.13.5 aiosignal-`
+    - Line 58: `2026-04-28T06:35:21.0242258Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
-  - Occurrences: 2
+  - Occurrences: 1
   - Sample matches:
-    - Line 4: `2026-04-28T06:32:54.3019580Z Installing collected packages: typing-extensions, tomli, pygments, prop`
-    - Line 6: `2026-04-28T06:32:55.2383840Z Successfully installed aiohappyeyeballs-2.6.1 aiohttp-3.13.5 aiosignal-`
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
 1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -93,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-04-28T06:34:37.777915*
+📊 *Report generated on 2026-04-28T06:36:56.876013*
 🤖 *JARVIS CI/CD Auto-PR Manager*
