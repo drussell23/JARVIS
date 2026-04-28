@@ -104,6 +104,98 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
+# Phase 1 Slice 1.3.a — register the CLASSIFY/advisor_verdict adapter
+# at module load. The adapter converts an ``Advisory`` dataclass into
+# a JSON-friendly dict for storage, and reconstitutes the dataclass
+# on REPLAY so callers receive the same Python shape they'd have
+# received from the live ``_advisor.advise(...)`` call.
+def _register_classify_adapter() -> None:
+    """Idempotent — safe to import multiple times. Defensive
+    (NEVER raises) so a missing determinism module doesn't break
+    the classify runner import chain."""
+    try:
+        from backend.core.ouroboros.governance.determinism.phase_capture import (
+            OutputAdapter,
+            register_adapter,
+        )
+        from backend.core.ouroboros.governance.operation_advisor import (
+            Advisory,
+            AdvisoryDecision,
+        )
+
+        def _serialize(advisory: Any) -> Any:
+            try:
+                return {
+                    "decision": str(advisory.decision.value)
+                    if hasattr(advisory.decision, "value")
+                    else str(advisory.decision),
+                    "reasons": [str(r) for r in (advisory.reasons or [])],
+                    "blast_radius": int(advisory.blast_radius or 0),
+                    "test_coverage": float(advisory.test_coverage or 0.0),
+                    "chronic_entropy": float(
+                        advisory.chronic_entropy or 0.0,
+                    ),
+                    "risk_score": float(advisory.risk_score or 0.0),
+                    "voice_message": str(advisory.voice_message or ""),
+                }
+            except Exception:  # noqa: BLE001 — defensive
+                # Unknown shape — fall back to repr so storage
+                # succeeds even if the dataclass evolves.
+                return {
+                    "decision": "recommend",  # safe default
+                    "reasons": [],
+                    "blast_radius": 0,
+                    "test_coverage": 0.0,
+                    "chronic_entropy": 0.0,
+                    "risk_score": 0.0,
+                    "voice_message": str(advisory)[:200],
+                }
+
+        def _deserialize(stored: Any) -> Any:
+            try:
+                if not isinstance(stored, dict):
+                    return stored
+                decision_str = str(stored.get("decision", "recommend"))
+                # AdvisoryDecision is str-Enum
+                try:
+                    decision = AdvisoryDecision(decision_str)
+                except ValueError:
+                    decision = AdvisoryDecision.RECOMMEND
+                return Advisory(
+                    decision=decision,
+                    reasons=list(stored.get("reasons", [])),
+                    blast_radius=int(stored.get("blast_radius", 0)),
+                    test_coverage=float(
+                        stored.get("test_coverage", 0.0),
+                    ),
+                    chronic_entropy=float(
+                        stored.get("chronic_entropy", 0.0),
+                    ),
+                    risk_score=float(stored.get("risk_score", 0.0)),
+                    voice_message=str(stored.get("voice_message", "")),
+                )
+            except (ValueError, KeyError, TypeError):
+                return stored
+
+        register_adapter(
+            phase="CLASSIFY",
+            kind="advisor_verdict",
+            adapter=OutputAdapter(
+                serialize=_serialize,
+                deserialize=_deserialize,
+                name="advisor_verdict_adapter",
+            ),
+        )
+    except Exception:  # noqa: BLE001 — defensive (import-time)
+        # Determinism module unavailable — wiring still works as a
+        # pure passthrough via capture_phase_decision's internal
+        # short-circuit. No log spam at import time.
+        pass
+
+
+_register_classify_adapter()
+
+
 class CLASSIFYRunner(PhaseRunner):
     """Risk classification + prompt memory injection + ROUTE hand-off.
 
@@ -184,10 +276,51 @@ class CLASSIFYRunner(PhaseRunner):
                         ctx.op_id,
                     )
             _advisor = OperationAdvisor(orch._config.project_root)
-            _advisory = _advisor.advise(
-                ctx.target_files, ctx.description, ctx.op_id,
-                is_read_only=ctx.is_read_only,
-            )
+
+            # Phase 1 Slice 1.3.a — wrap the advisor verdict in
+            # capture_phase_decision so RECORD/REPLAY/VERIFY work for
+            # the CLASSIFY phase's load-bearing decision. When the
+            # master flag is off, this is a pure passthrough that
+            # calls _advisor.advise(...) directly with negligible
+            # overhead. Adapter is registered at module load below.
+            try:
+                from backend.core.ouroboros.governance.determinism.phase_capture import (
+                    capture_phase_decision,
+                )
+
+                async def _advise_op() -> Any:
+                    return _advisor.advise(
+                        ctx.target_files, ctx.description, ctx.op_id,
+                        is_read_only=ctx.is_read_only,
+                    )
+
+                _advisory = await capture_phase_decision(
+                    op_id=ctx.op_id,
+                    phase="CLASSIFY",
+                    kind="advisor_verdict",
+                    ctx=ctx,
+                    compute=_advise_op,
+                    extra_inputs={
+                        "description_hash": (
+                            len(ctx.description or "")
+                        ),
+                        "target_count": len(ctx.target_files or ()),
+                        "is_read_only": bool(ctx.is_read_only),
+                    },
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                # Capture wrapper failed → fall back to direct call.
+                # Determinism is best-effort; advisor verdict must
+                # always materialize.
+                logger.debug(
+                    "[Orchestrator] capture_phase_decision failed for "
+                    "CLASSIFY/advisor_verdict; falling back to direct "
+                    "advise call", exc_info=True,
+                )
+                _advisory = _advisor.advise(
+                    ctx.target_files, ctx.description, ctx.op_id,
+                    is_read_only=ctx.is_read_only,
+                )
 
             if _advisory.decision == AdvisoryDecision.BLOCK:
                 logger.warning(
