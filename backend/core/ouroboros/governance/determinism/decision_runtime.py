@@ -706,13 +706,24 @@ async def decide(
 def _peek_ordinal(
     runtime: DecisionRuntime, op_id: str, phase: str, kind: str,
 ) -> int:
-    """Return the next ordinal that would be assigned by RECORD mode
-    for this (op, phase, kind). REPLAY uses this to find the right
-    record without the caller having to track ordinals themselves."""
+    """Return the current ordinal for this (op, phase, kind) WITHOUT
+    advancing. REPLAY uses this to find the right record; the
+    advance happens explicitly via ``_advance_ordinal`` only on a
+    successful hit (otherwise the fall-through to RECORD path would
+    double-increment and skew the recorded ordinals)."""
     with runtime._sync_lock:  # noqa: SLF001
-        ordinal = runtime._ordinals.get((op_id, phase, kind), 0)  # noqa: SLF001
-        runtime._ordinals[(op_id, phase, kind)] = ordinal + 1  # noqa: SLF001
-        return ordinal
+        return runtime._ordinals.get((op_id, phase, kind), 0)  # noqa: SLF001
+
+
+def _advance_ordinal(
+    runtime: DecisionRuntime, op_id: str, phase: str, kind: str,
+) -> None:
+    """Advance the ordinal counter for this (op, phase, kind) by one.
+    Called by REPLAY-hit and VERIFY paths. RECORD path advances
+    internally inside ``DecisionRuntime.record``."""
+    with runtime._sync_lock:  # noqa: SLF001
+        cur = runtime._ordinals.get((op_id, phase, kind), 0)  # noqa: SLF001
+        runtime._ordinals[(op_id, phase, kind)] = cur + 1  # noqa: SLF001
 
 
 async def _maybe_await(compute: Callable[[], Any]) -> Any:
