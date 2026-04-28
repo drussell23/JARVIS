@@ -467,19 +467,31 @@ class HeavyProber:
                 error=f"unhandled:{type(exc).__name__}:{str(exc)[:80]}",
             )
 
-        # Feed observer on success. On failure we still feed a "slow"
-        # ttft signal asymmetrically — the goal is cold-storage
-        # detection, and a failed probe is at least as cold as a slow
-        # one. Caller can disambiguate via result.error.
+        # Slice G — Failure Ignorance (operator directive 2026-04-28).
+        # ConnectionTimeoutError + transport failures + empty-stream
+        # cases are NETWORK FAILURES, not TTFT measurements. Feeding
+        # them to the observer would poison the rolling stats — a
+        # uniform-30s-timeout sample stream looks "consistent" by CV
+        # math but is functionally meaningless. Only record genuine
+        # first-chunk arrival measurements.
+        #
+        # The asymmetric ceiling-on-failure pattern from initial Slice D
+        # was rejected: cold-storage detection should fall to the
+        # modality ledger / terminal breaker for "endpoint dead" cases,
+        # not to the TTFT observer.
+        if ok:
+            try:
+                self._feed_observer(
+                    model_id=model_id, ttft_ms=ttft_ms,
+                    explicit_observer=observer,
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+        # On failure: the observer is NOT updated. The HeavyProbeResult
+        # still reports the timeout-ceiling ttft_ms for caller
+        # introspection (logs, telemetry, debugging), but no sample
+        # enters the warmth dataset.
         recorded_ttft = ttft_ms if ok else int(_probe_timeout_s() * 1000)
-        try:
-            self._feed_observer(
-                model_id=model_id, ttft_ms=recorded_ttft,
-                explicit_observer=observer,
-            )
-        except Exception:  # noqa: BLE001 — defensive
-            pass
-
         return HeavyProbeResult(
             model_id=model_id,
             success=ok,
