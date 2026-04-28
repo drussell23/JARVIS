@@ -56,14 +56,34 @@ class TestDrainingProof:
             ConvergenceVerdict.OVERLOADED, ConvergenceVerdict.CONVERGED,
         )
 
-    def test_arrival_below_ok_cap_drains(self):
+    def test_arrival_below_ok_cap_drains_from_ok_pressure(self):
         from backend.core.ouroboros.governance.pressure_convergence_prover import (
             prove_convergence, ConvergenceVerdict, DEFAULT_CONFIG,
         )
-        # arrival < fanout_ok → system always drains
-        rate = DEFAULT_CONFIG.fanout_ok - 1
-        r = prove_convergence(arrival_rate=rate, initial_backlog=200)
+        # arrival < fanout_ok AND initial_backlog low enough to stay at OK
+        # → system drains because fanout_cap(OK)=16 > arrival=5
+        rate = 5
+        r = prove_convergence(
+            arrival_rate=rate,
+            initial_backlog=DEFAULT_CONFIG.backlog_warn - 1,
+        )
         assert r.verdict in (ConvergenceVerdict.DRAINED, ConvergenceVerdict.CONVERGED)
+
+    def test_arrival_below_ok_but_above_critical_trap(self):
+        from backend.core.ouroboros.governance.pressure_convergence_prover import (
+            prove_convergence, ConvergenceVerdict, DEFAULT_CONFIG,
+        )
+        # THIS IS THE §24.7.1 FEEDBACK TRAP:
+        # arrival=15 < fanout_ok=16, but initial_backlog=200 pushes to
+        # CRITICAL (cap=1). 15 > 1, so backlog grows forever.
+        # The prover correctly identifies this as overloaded.
+        rate = DEFAULT_CONFIG.fanout_ok - 1  # 15
+        r = prove_convergence(
+            arrival_rate=rate,
+            initial_backlog=200,
+            max_ticks=500,
+        )
+        assert r.verdict == ConvergenceVerdict.OVERLOADED
 
     def test_zero_backlog_zero_arrival(self):
         from backend.core.ouroboros.governance.pressure_convergence_prover import (
