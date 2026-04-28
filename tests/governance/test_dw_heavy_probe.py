@@ -71,11 +71,20 @@ def heavy_probe_on(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_flag_default_false(monkeypatch) -> None:
+def test_flag_default_on(monkeypatch) -> None:
+    """Phase 12.2 Slice E graduated default — env unset → True."""
     monkeypatch.delenv(
         "JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED", raising=False,
     )
-    assert heavy_probe_enabled() is False
+    assert heavy_probe_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " "])
+def test_flag_empty_reads_as_default_on(monkeypatch, val) -> None:
+    """Empty/whitespace values are the unset marker — read as True
+    post-graduation."""
+    monkeypatch.setenv("JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED", val)
+    assert heavy_probe_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "On"])
@@ -84,8 +93,9 @@ def test_flag_truthy_values(monkeypatch, val) -> None:
     assert heavy_probe_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "", " "])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off"])
 def test_flag_falsy_values(monkeypatch, val) -> None:
+    """Hot-revert: explicit false-class strings disable the feature."""
     monkeypatch.setenv("JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED", val)
     assert heavy_probe_enabled() is False
 

@@ -32,9 +32,17 @@ from backend.core.ouroboros.governance.full_jitter import (
 # ---------------------------------------------------------------------------
 
 
-def test_flag_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_flag_default_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 12.2 Slice E graduated default — env unset → True."""
     monkeypatch.delenv("JARVIS_TOPOLOGY_FULL_JITTER_ENABLED", raising=False)
-    assert full_jitter_enabled() is False
+    assert full_jitter_enabled() is True
+
+
+def test_flag_empty_string_reads_as_default_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_TOPOLOGY_FULL_JITTER_ENABLED", "")
+    assert full_jitter_enabled() is True
 
 
 def test_flag_truthy_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -44,7 +52,10 @@ def test_flag_truthy_values(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_flag_falsy_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    for v in ("0", "false", "no", "off", "", "garbage"):
+    """Hot-revert: explicit false-class strings disable the feature.
+    Empty string and whitespace are now the unset marker → graduated
+    default True; only explicit false-class strings still revert."""
+    for v in ("0", "false", "no", "off", "garbage"):
         monkeypatch.setenv("JARVIS_TOPOLOGY_FULL_JITTER_ENABLED", v)
         assert full_jitter_enabled() is False
 

@@ -49,11 +49,11 @@ from typing import Optional
 
 
 def full_jitter_enabled() -> bool:
-    """``JARVIS_TOPOLOGY_FULL_JITTER_ENABLED`` (default ``false``).
+    """``JARVIS_TOPOLOGY_FULL_JITTER_ENABLED`` (default ``true`` —
+    graduated in Phase 12.2 Slice E).
 
     Re-read at call time so monkeypatch works in tests + operators
-    can flip live without re-init. Default flips to ``true`` at
-    Phase 12.2 Slice E graduation. Hot-revert path: ``export
+    can flip live without re-init. Hot-revert path: ``export
     JARVIS_TOPOLOGY_FULL_JITTER_ENABLED=false`` returns retry sites
     to exact-exponential behavior immediately.
 
@@ -64,6 +64,8 @@ def full_jitter_enabled() -> bool:
     raw = os.environ.get(
         "JARVIS_TOPOLOGY_FULL_JITTER_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
