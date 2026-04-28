@@ -36,14 +36,28 @@ from backend.core.ouroboros.governance.verification.property_oracle import (
     oracle_enabled,
     register_evaluator,
 )
+from backend.core.ouroboros.governance.verification.repeat_runner import (
+    EvidenceCollector,
+    RepeatRunner,
+    RepeatVerdict,
+    RunBudget,
+    get_default_runner,
+    repeat_runner_enabled,
+)
 
 __all__ = [
+    "EvidenceCollector",
     "Property",
     "PropertyEvaluator",
     "PropertyOracle",
     "PropertyVerdict",
+    "RepeatRunner",
+    "RepeatVerdict",
+    "RunBudget",
     "VerdictKind",
     "get_default_oracle",
+    "get_default_runner",
     "oracle_enabled",
     "register_evaluator",
+    "repeat_runner_enabled",
 ]

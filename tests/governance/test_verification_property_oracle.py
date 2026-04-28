@@ -570,16 +570,20 @@ def test_no_provider_imports() -> None:
 
 
 def test_six_seed_evaluators_present_after_import() -> None:
-    """Fresh import must register the six seed evaluators."""
-    import importlib
-    import backend.core.ouroboros.governance.verification.property_oracle as po
-    importlib.reload(po)
+    """Module-level import must register the six seed evaluators.
+
+    Avoid importlib.reload: it breaks the cross-module reference
+    graph (RepeatRunner + package __init__ still hold stale
+    references to the OLD _EVALUATORS dict). Instead, verify the
+    seed kinds are present after a fresh registry reset (which
+    re-runs _register_seed_evaluators on the LIVE module)."""
+    reset_registry_for_tests()
     expected = {
         "test_passes", "key_present",
         "numeric_below_threshold", "numeric_above_threshold",
         "string_matches", "set_subset",
     }
-    assert expected <= set(po.known_kinds())
+    assert expected <= set(known_kinds())
 
 
 def test_oracle_singleton_returns_same_instance() -> None:
