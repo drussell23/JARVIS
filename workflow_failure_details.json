@@ -1,12 +1,12 @@
 {
   "workflow_name": "PR Automation & Validation",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25054220901",
-  "branch": "fix/ci/pr-automation-validation-run49396-20260428-125818",
-  "commit_sha": "e4d21dd",
-  "run_number": 49397,
-  "failed_count": 1,
-  "fix_branch": "fix/ci/pr-automation-validation-run49397-20260428-130110",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #49397)",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25054375773",
+  "branch": "fix/ci/pr-automation-validation-run49397-20260428-130110",
+  "commit_sha": "9ba69d9",
+  "run_number": 49398,
+  "failed_count": 3,
+  "fix_branch": "fix/ci/pr-automation-validation-run49398-20260428-130427",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #49398)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,14 +14,14 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 30,
-              "content": "2026-04-28T12:59:10.3106152Z   subjectPatternError: The PR title must start with a capital letter.",
+              "line_number": 23,
+              "content": "2026-04-28T13:02:19.3229406Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 42,
-              "content": "2026-04-28T12:59:20.0019646Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #49396)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "line_number": 35,
+              "content": "2026-04-28T13:02:19.6925940Z ##[error]<!DOCTYPE html>",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -32,8 +32,8 @@
           "pattern": "WARN|Warning|warning",
           "matches": [
             {
-              "line_number": 58,
-              "content": "2026-04-28T12:59:20.0425566Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "line_number": 98,
+              "content": "2026-04-28T13:02:19.7375001Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
             }
@@ -44,7 +44,7 @@
           "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 34,
+              "line_number": 27,
               "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
               "emoji": "\u23f1\ufe0f"
@@ -60,7 +60,51 @@
       "severity": "high",
       "category": "timeout",
       "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 36,
+              "content": "2026-04-28T13:02:31.8353206Z ##[error]Unhandled error: HttpError: <!DOCTYPE html>",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 36,
+              "content": "2026-04-28T13:02:33.5350891Z ##[error]Unhandled error: HttpError: <!DOCTYPE html>",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
     }
   ],
-  "timestamp": "2026-04-28T13:01:10.241129"
+  "timestamp": "2026-04-28T13:04:27.875144"
 }
