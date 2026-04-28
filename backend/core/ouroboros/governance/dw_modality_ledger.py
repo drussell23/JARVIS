@@ -557,6 +557,19 @@ class ModalityLedger:
     def is_unknown(self, model_id: str) -> bool:
         return self.verdict_for(model_id) == VERDICT_UNKNOWN
 
+    def has_record(self, model_id: str) -> bool:
+        """True iff the ledger has any record (verdict or unknown
+        registration) for ``model_id``. The classifier consults this
+        as the gate for applying modality restrictions: models with
+        no record at all fall through to legacy classifier logic.
+        Only ledger-known models get the modality gate applied.
+        NEVER raises."""
+        if not model_id or not model_id.strip():
+            return False
+        self._ensure_loaded()
+        with self._lock:
+            return model_id in self._records
+
     def chat_capable_models(self) -> Tuple[str, ...]:
         self._ensure_loaded()
         with self._lock:

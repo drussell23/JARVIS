@@ -383,27 +383,37 @@ class DwCatalogClassifier:
             mid = card.model_id
 
             # Phase 12 Slice G — modality hard gate (when ledger is
-            # provided). Three verdict outcomes:
+            # provided AND has a record for this model). Outcomes:
             #   NON_CHAT — exclude from EVERY route, including
             #              speculative. Ground-truth signal that this
             #              model can't accept chat-completions payloads.
             #   UNKNOWN — eligible for SPECULATIVE only (same pattern
             #             as ambiguous-metadata quarantine).
             #   CHAT_CAPABLE — fall through to existing logic.
+            #   NO RECORD AT ALL — ledger has no opinion → fall
+            #     through to legacy logic. The modality ledger only
+            #     RESTRICTS models it has explicit data on. Models
+            #     the discovery cycle hasn't yet probed don't get
+            #     accidentally quarantined.
             if modality_ledger is not None:
                 try:
-                    if modality_ledger.is_non_chat(mid):
-                        continue   # excluded from all routes
-                    if modality_ledger.is_unknown(mid):
-                        # Same SPECULATIVE-only treatment as quarantine
-                        if route == "speculative":
-                            eligible.append(
-                                (self._quarantine_score(card), mid),
-                            )
-                        continue
-                    # CHAT_CAPABLE → no modality restriction; fall through
+                    has_record = (
+                        hasattr(modality_ledger, "has_record")
+                        and modality_ledger.has_record(mid)
+                    )
+                    if has_record:
+                        if modality_ledger.is_non_chat(mid):
+                            continue   # excluded from all routes
+                        if modality_ledger.is_unknown(mid):
+                            # Same SPECULATIVE-only treatment as quarantine
+                            if route == "speculative":
+                                eligible.append(
+                                    (self._quarantine_score(card), mid),
+                                )
+                            continue
+                        # CHAT_CAPABLE → no restriction; fall through
                 except Exception:  # noqa: BLE001 — defensive
-                    # Ledger error → treat as UNKNOWN (don't block)
+                    # Ledger error → treat as no-record (don't block)
                     pass
 
             # Quarantine pin: quarantined models go SPECULATIVE only
