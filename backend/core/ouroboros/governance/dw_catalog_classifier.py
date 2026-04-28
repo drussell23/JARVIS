@@ -286,7 +286,31 @@ class DwCatalogClassifier:
         self,
         snapshot: CatalogSnapshot,
         ledger: PromotionLedger,
+        *,
+        modality_ledger: Optional[Any] = None,
     ) -> ClassificationOutcome:
+        """Phase 12 Slice G — when ``modality_ledger`` is provided, the
+        classifier consults it as a HARD GATE before any pricing /
+        param / quarantine logic:
+
+          * NON_CHAT verdict → model excluded from EVERY generative
+            route, including SPECULATIVE. The ledger has ground-truth
+            evidence (server 4xx with modality marker, or explicit
+            metadata flag) that this model can't accept chat-completions
+            payloads. Sending it real ops would be wasted work.
+          * UNKNOWN verdict → model routes to SPECULATIVE only (same
+            pattern as Zero-Trust ambiguous-metadata quarantine, but
+            triggered by a different ground-truth signal — pending
+            micro-probe rather than missing pricing/param data).
+          * CHAT_CAPABLE verdict → no extra restriction; standard
+            classifier gates apply.
+
+        ``modality_ledger=None`` preserves legacy behavior — no
+        modality filtering, classifier behaves exactly as before
+        Slice G. This is the rollout safety: Slice G can be wired
+        without flipping any defaults; Slice G's master flag (in
+        the runner, not here) decides whether to pass a non-None
+        ledger in production."""
         if snapshot is None or not snapshot.models:
             return ClassificationOutcome(
                 assignments=self._empty_assignments(),
@@ -325,6 +349,7 @@ class DwCatalogClassifier:
                 weights=weights,
                 family_bonus=family_bonus,
                 newly_quarantined=set(newly_quarantined),
+                modality_ledger=modality_ledger,
             )
             assignments[route] = RouteAssignment(
                 route=route, ranked_model_ids=ranked_ids,
@@ -349,12 +374,37 @@ class DwCatalogClassifier:
         weights: Mapping[str, float],
         family_bonus: Mapping[str, float],
         newly_quarantined: set,
+        modality_ledger: Optional[Any] = None,
     ) -> Tuple[str, ...]:
         prefer_cheap = route in ("background", "speculative")
         eligible: List[Tuple[float, str]] = []
 
         for card in snapshot.models:
             mid = card.model_id
+
+            # Phase 12 Slice G — modality hard gate (when ledger is
+            # provided). Three verdict outcomes:
+            #   NON_CHAT — exclude from EVERY route, including
+            #              speculative. Ground-truth signal that this
+            #              model can't accept chat-completions payloads.
+            #   UNKNOWN — eligible for SPECULATIVE only (same pattern
+            #             as ambiguous-metadata quarantine).
+            #   CHAT_CAPABLE — fall through to existing logic.
+            if modality_ledger is not None:
+                try:
+                    if modality_ledger.is_non_chat(mid):
+                        continue   # excluded from all routes
+                    if modality_ledger.is_unknown(mid):
+                        # Same SPECULATIVE-only treatment as quarantine
+                        if route == "speculative":
+                            eligible.append(
+                                (self._quarantine_score(card), mid),
+                            )
+                        continue
+                    # CHAT_CAPABLE → no modality restriction; fall through
+                except Exception:  # noqa: BLE001 — defensive
+                    # Ledger error → treat as UNKNOWN (don't block)
+                    pass
 
             # Quarantine pin: quarantined models go SPECULATIVE only
             is_q = (
