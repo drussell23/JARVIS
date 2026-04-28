@@ -352,6 +352,25 @@ class ProviderTopology:
     def dw_models_for_route(self, route: str) -> Tuple[str, ...]:
         """Return the v2 ranked ``dw_models`` list for *route*.
 
+        Phase 12 Slice D — when ``JARVIS_DW_CATALOG_AUTHORITATIVE=true``
+        AND the dynamic catalog holder is fresh AND the route has a
+        non-empty assignment, the holder is consulted FIRST. YAML
+        remains the fallback for every other path:
+
+          * authoritative flag off → YAML
+          * holder is None (no discovery cycle has populated it) → YAML
+          * holder is stale (older than ``JARVIS_DW_CATALOG_MAX_AGE_S``,
+            default 7200s = 2h) → YAML
+          * route missing from holder → YAML
+          * route present but empty list → YAML
+
+        ``fallback_tolerance``, ``block_mode``, ``dw_allowed``, and the
+        ``reason`` strings stay YAML-authored throughout — those encode
+        cost-contract policy, not catalog facts. Only the ``dw_models``
+        ranked list is dynamically substituted. BG/SPEC routes still
+        respect ``fallback_tolerance: queue`` after sentinel exhaustion
+        regardless of which models populated them.
+
         Backward-compat: when the yaml is v1 (no ``dw_models`` key for
         the route), returns a single-element tuple ``(dw_model,)`` if DW
         is allowed AND a ``dw_model`` is configured; empty tuple
@@ -364,6 +383,19 @@ class ProviderTopology:
         """
         if not self.enabled:
             return ()
+
+        # Phase 12 Slice D — catalog-first read with YAML fallback
+        if catalog_authoritative_enabled():
+            holder = get_dynamic_catalog()
+            if holder is not None and _holder_is_fresh(holder):
+                key = (route or "").strip().lower()
+                ranked = holder.assignments_by_route.get(key, ())
+                if ranked:
+                    return ranked
+            # Fall through to YAML — cold-start, stale, route missing,
+            # or route empty in catalog. YAML stays authoritative for
+            # all four fallback conditions
+
         entry = self.routes.get((route or "").strip().lower())
         if entry is None:
             return ()
@@ -663,6 +695,73 @@ def reload_topology() -> ProviderTopology:
 
 
 # ---------------------------------------------------------------------------
+# Phase 12 Slice D — Authoritative-mode flag + freshness helper
+# ---------------------------------------------------------------------------
+#
+# Two-flag separation (operator-controllable independently):
+#
+#   JARVIS_DW_CATALOG_DISCOVERY_ENABLED  (Slice A) — does discovery RUN?
+#                                                    fetch + classify + populate
+#                                                    holder. Master flag for the
+#                                                    end-to-end pipeline.
+#   JARVIS_DW_CATALOG_AUTHORITATIVE      (Slice D) — does dw_models_for_route
+#                                                    READ the holder first?
+#                                                    Slice C kept holder pure
+#                                                    observation; Slice D flips
+#                                                    the read order.
+#
+# Flag matrix (post-Slice-D, pre-Slice-E graduation):
+#
+#   discovery=off, authoritative=off  → legacy YAML-only (current main as of A)
+#   discovery=on,  authoritative=off  → shadow mode (Slice C — holder populated,
+#                                       dispatcher still reads YAML, operator
+#                                       can audit yaml_diff diagnostic)
+#   discovery=off, authoritative=on   → no-op in practice — holder stays empty,
+#                                       dw_models_for_route falls through to YAML
+#                                       on every call. Cost-safe by construction.
+#   discovery=on,  authoritative=on   → full Phase 12 (Slice E target). Catalog
+#                                       reads first, YAML is the fallback layer.
+
+
+def catalog_authoritative_enabled() -> bool:
+    """``JARVIS_DW_CATALOG_AUTHORITATIVE`` (default ``false``).
+
+    Re-read at call time so monkeypatch works in tests + operators
+    can flip live without re-init. Default flips to ``true`` at
+    Phase 12 Slice E graduation. Hot-revert path: ``export
+    JARVIS_DW_CATALOG_AUTHORITATIVE=false`` returns dispatcher to
+    YAML-authored dw_models lists immediately."""
+    raw = os.environ.get(
+        "JARVIS_DW_CATALOG_AUTHORITATIVE", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _catalog_max_age_s() -> float:
+    """Re-read ``JARVIS_DW_CATALOG_MAX_AGE_S`` (default 7200s = 2h)
+    at call time. Used by ``_holder_is_fresh``. Mirrors the same env
+    knob in ``dw_catalog_client.py`` so a single operator-tuned value
+    governs both the client cache + the dispatcher freshness gate."""
+    try:
+        return float(
+            os.environ.get("JARVIS_DW_CATALOG_MAX_AGE_S", "7200").strip(),
+        )
+    except (ValueError, TypeError):
+        return 7200.0
+
+
+def _holder_is_fresh(holder: "_DynamicCatalogHolder") -> bool:
+    """``True`` when the holder was populated within
+    ``_catalog_max_age_s`` seconds ago. Stale holder → caller falls
+    back to YAML. NEVER raises."""
+    import time as _time
+    try:
+        return (_time.time() - holder.fetched_at_unix) < _catalog_max_age_s()
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Phase 12 Slice C — Dynamic catalog holder (shadow mode)
 # ---------------------------------------------------------------------------
 #
@@ -812,6 +911,7 @@ __all__ = [
     "ProviderTopology",
     "RouteTopology",
     "RouteDiff",
+    "catalog_authoritative_enabled",
     "compute_yaml_diff",
     "get_topology",
     "reload_topology",
