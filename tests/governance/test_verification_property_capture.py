@@ -93,11 +93,20 @@ def isolated(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_capture_default_false(monkeypatch) -> None:
+def test_capture_default_true(monkeypatch) -> None:
+    """Phase 2 Slice 2.5 graduated default — env unset → True."""
     monkeypatch.delenv(
         "JARVIS_VERIFICATION_PROPERTY_CAPTURE_ENABLED", raising=False,
     )
-    assert property_capture_enabled() is False
+    assert property_capture_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " ", "  "])
+def test_capture_empty_reads_as_default_true(monkeypatch, val) -> None:
+    monkeypatch.setenv(
+        "JARVIS_VERIFICATION_PROPERTY_CAPTURE_ENABLED", val,
+    )
+    assert property_capture_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
@@ -108,7 +117,7 @@ def test_capture_truthy(monkeypatch, val) -> None:
     assert property_capture_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
 def test_capture_falsy(monkeypatch, val) -> None:
     monkeypatch.setenv(
         "JARVIS_VERIFICATION_PROPERTY_CAPTURE_ENABLED", val,

@@ -71,11 +71,20 @@ def fresh_registry():
 # ---------------------------------------------------------------------------
 
 
-def test_runner_default_false(monkeypatch) -> None:
+def test_runner_default_true(monkeypatch) -> None:
+    """Phase 2 Slice 2.5 graduated default — env unset → True."""
     monkeypatch.delenv(
         "JARVIS_VERIFICATION_REPEAT_RUNNER_ENABLED", raising=False,
     )
-    assert repeat_runner_enabled() is False
+    assert repeat_runner_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " ", "  "])
+def test_runner_empty_reads_as_default_true(monkeypatch, val) -> None:
+    monkeypatch.setenv(
+        "JARVIS_VERIFICATION_REPEAT_RUNNER_ENABLED", val,
+    )
+    assert repeat_runner_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
@@ -86,7 +95,7 @@ def test_runner_truthy(monkeypatch, val) -> None:
     assert repeat_runner_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
 def test_runner_falsy(monkeypatch, val) -> None:
     monkeypatch.setenv(
         "JARVIS_VERIFICATION_REPEAT_RUNNER_ENABLED", val,

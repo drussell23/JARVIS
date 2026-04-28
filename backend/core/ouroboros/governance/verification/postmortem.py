@@ -133,17 +133,20 @@ logger = logging.getLogger(__name__)
 
 
 def postmortem_enabled() -> bool:
-    """``JARVIS_VERIFICATION_POSTMORTEM_ENABLED`` (default ``false``).
+    """``JARVIS_VERIFICATION_POSTMORTEM_ENABLED`` (default ``true`` —
+    graduated in Phase 2 Slice 2.5).
 
-    Phase 2 Slice 2.4 master flag. Re-read at call time so monkeypatch
-    works in tests + operators can flip live without re-init. Default
-    flips to ``true`` at Phase 2 Slice 2.5 graduation.
-
-    When ``false``: producer returns an empty postmortem; persistence
-    is a no-op. When ``true``: full closed-loop verification fires."""
+    Re-read at call time so monkeypatch works in tests + operators
+    can flip live without re-init. Hot-revert path: ``export
+    JARVIS_VERIFICATION_POSTMORTEM_ENABLED=false`` returns the
+    producer to empty-postmortem mode + persistence to no-op. The
+    COMPLETE-runner wiring continues to call produce/persist; the
+    master flag governs whether real work happens."""
     raw = os.environ.get(
         "JARVIS_VERIFICATION_POSTMORTEM_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

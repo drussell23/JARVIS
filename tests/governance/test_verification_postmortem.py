@@ -130,11 +130,18 @@ def _make_claim(
 # ---------------------------------------------------------------------------
 
 
-def test_postmortem_default_false(monkeypatch) -> None:
+def test_postmortem_default_true(monkeypatch) -> None:
+    """Phase 2 Slice 2.5 graduated default — env unset → True."""
     monkeypatch.delenv(
         "JARVIS_VERIFICATION_POSTMORTEM_ENABLED", raising=False,
     )
-    assert postmortem_enabled() is False
+    assert postmortem_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " ", "  "])
+def test_postmortem_empty_reads_as_default_true(monkeypatch, val) -> None:
+    monkeypatch.setenv("JARVIS_VERIFICATION_POSTMORTEM_ENABLED", val)
+    assert postmortem_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
@@ -143,7 +150,7 @@ def test_postmortem_truthy(monkeypatch, val) -> None:
     assert postmortem_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
 def test_postmortem_falsy(monkeypatch, val) -> None:
     monkeypatch.setenv("JARVIS_VERIFICATION_POSTMORTEM_ENABLED", val)
     assert postmortem_enabled() is False

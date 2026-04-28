@@ -104,18 +104,20 @@ logger = logging.getLogger(__name__)
 
 def property_capture_enabled() -> bool:
     """``JARVIS_VERIFICATION_PROPERTY_CAPTURE_ENABLED`` (default
-    ``false``).
+    ``true`` — graduated in Phase 2 Slice 2.5).
 
-    Phase 2 Slice 2.3 master flag. Re-read at call time so monkeypatch
-    works in tests + operators can flip live without re-init. Default
-    flips to ``true`` at Phase 2 Slice 2.5 graduation.
-
-    When ``false``: capture is a pure passthrough (claims synthesized
-    + returned but NOT recorded). When ``true``: claims persisted
-    via Slice 1.3 capture_phase_decision."""
+    Re-read at call time so monkeypatch works in tests + operators
+    can flip live without re-init. Hot-revert path: ``export
+    JARVIS_VERIFICATION_PROPERTY_CAPTURE_ENABLED=false`` returns
+    capture to pure passthrough — claims synthesized + returned
+    but NOT persisted. The PLAN runner wiring continues to call
+    capture_claims; the master flag governs whether records actually
+    land in the ledger."""
     raw = os.environ.get(
         "JARVIS_VERIFICATION_PROPERTY_CAPTURE_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

@@ -89,20 +89,20 @@ logger = logging.getLogger(__name__)
 
 
 def oracle_enabled() -> bool:
-    """``JARVIS_VERIFICATION_ORACLE_ENABLED`` (default ``false``).
+    """``JARVIS_VERIFICATION_ORACLE_ENABLED`` (default ``true`` —
+    graduated in Phase 2 Slice 2.5).
 
-    Phase 2 Slice 2.1 master flag. Re-read at call time so monkeypatch
-    works in tests + operators can flip live without re-init. Default
-    flips to ``true`` at Phase 2 Slice 2.5 graduation.
-
-    When ``false``: callers can still construct properties + invoke
-    ``oracle.evaluate`` (the dispatcher always works), but verification
-    callers in production should treat oracle output as ADVISORY only.
-    Slice 2.5 flips the production wiring at the same time as the
-    default flag flip — until then this is shadow-mode infrastructure."""
+    Re-read at call time so monkeypatch works in tests + operators
+    can flip live without re-init. Hot-revert path: ``export
+    JARVIS_VERIFICATION_ORACLE_ENABLED=false`` returns the Oracle
+    to advisory-only mode. The dispatcher itself always works
+    regardless — the flag governs whether downstream consumers
+    treat oracle output as authoritative."""
     raw = os.environ.get(
         "JARVIS_VERIFICATION_ORACLE_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
