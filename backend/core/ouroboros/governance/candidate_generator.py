@@ -689,10 +689,32 @@ class FailbackStateMachine:
             self._last_failure_at = time.monotonic()
             self._reset_probe_counters()
             params = _RECOVERY_PARAMS.get(mode, _RECOVERY_PARAMS[FailureMode.TIMEOUT])
-            eta_s = min(
-                params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
-                params["max_s"],
-            )
+            # Phase 12.2 Slice C — full-jitter retrofit. Master-flag-off
+            # preserves exact-exponential bit-for-bit. When enabled,
+            # uniform jitter desynchronizes our probe waveform from
+            # other JARVIS-class clients hammering the same DW endpoint
+            # after recovery.
+            try:
+                from backend.core.ouroboros.governance.full_jitter import (
+                    full_jitter_backoff_s,
+                    full_jitter_enabled,
+                )
+                if full_jitter_enabled():
+                    eta_s = full_jitter_backoff_s(
+                        max(self._consecutive_failures - 1, 0),
+                        base_s=params["base_s"],
+                        cap_s=params["max_s"],
+                    )
+                else:
+                    eta_s = min(
+                        params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
+                        params["max_s"],
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                eta_s = min(
+                    params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
+                    params["max_s"],
+                )
             logger.warning(
                 "[FailbackFSM] Primary failure (mode=%s, consecutive=%d, "
                 "recovery_eta=+%.0fs) -> FALLBACK_ACTIVE",
@@ -869,10 +891,31 @@ class FailbackStateMachine:
         params = _RECOVERY_PARAMS.get(
             self._failure_mode, _RECOVERY_PARAMS[FailureMode.TIMEOUT],
         )
-        delay = min(
-            params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
-            params["max_s"],
-        )
+        # Phase 12.2 Slice C — full-jitter retrofit (matches the sister
+        # callsite in record_primary_failure). Master-flag-off preserves
+        # exact-exponential bit-for-bit; on, uniform random delay
+        # desynchronizes our probe schedule from the global herd.
+        try:
+            from backend.core.ouroboros.governance.full_jitter import (
+                full_jitter_backoff_s,
+                full_jitter_enabled,
+            )
+            if full_jitter_enabled():
+                delay = full_jitter_backoff_s(
+                    max(self._consecutive_failures - 1, 0),
+                    base_s=params["base_s"],
+                    cap_s=params["max_s"],
+                )
+            else:
+                delay = min(
+                    params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
+                    params["max_s"],
+                )
+        except Exception:  # noqa: BLE001 — defensive
+            delay = min(
+                params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
+                params["max_s"],
+            )
         return self._last_failure_at + delay
 
     def should_attempt_primary(self) -> bool:

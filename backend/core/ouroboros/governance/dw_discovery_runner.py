@@ -98,6 +98,7 @@ async def run_discovery(
     cache_path: Optional[Any] = None,   # Path | None
     classifier: Optional[DwCatalogClassifier] = None,
     modality_ledger: Optional[Any] = None,  # Slice G — ModalityLedger
+    ttft_observer: Optional[Any] = None,    # Slice 12.2.C — TtftObserver
 ) -> DiscoveryResult:
     """Run one full discovery cycle. NEVER raises.
 
@@ -228,7 +229,9 @@ async def run_discovery(
     classifier = classifier or DwCatalogClassifier()
     try:
         outcome = classifier.classify(
-            snapshot, ledger, modality_ledger=modality_ledger,
+            snapshot, ledger,
+            modality_ledger=modality_ledger,
+            ttft_observer=ttft_observer,
         )
     except Exception as exc:  # noqa: BLE001 — defensive
         logger.warning(
@@ -427,6 +430,7 @@ _BOOT_DISCOVERY_DONE: bool = False
 _REFRESH_TASK: Optional[asyncio.Task] = None
 _LEDGER_SINGLETON: Optional[PromotionLedger] = None
 _MODALITY_LEDGER_SINGLETON: Optional[Any] = None  # Slice G
+_TTFT_OBSERVER_SINGLETON: Optional[Any] = None  # Slice 12.2.C
 # Sync lock around the singleton hydration + boot flag — protects the
 # very first-call window before the asyncio.Lock has been touched.
 _BOOT_SYNC_LOCK = threading.Lock()
@@ -465,11 +469,43 @@ def _get_or_create_modality_ledger() -> Optional[Any]:
         return _MODALITY_LEDGER_SINGLETON
 
 
+def _get_or_create_ttft_observer() -> Optional[Any]:
+    """Slice 12.2.C — lazy TtftObserver singleton.
+
+    Returns None when ``tracking_enabled()`` is ``false`` OR import
+    fails. Hydrates from disk on first access. Defensive for older
+    deploys that haven't shipped the module yet."""
+    global _TTFT_OBSERVER_SINGLETON
+    try:
+        from backend.core.ouroboros.governance.dw_ttft_observer import (
+            TtftObserver,
+            tracking_enabled,
+        )
+    except ImportError:
+        return None
+    if not tracking_enabled():
+        return None
+    with _BOOT_SYNC_LOCK:
+        if _TTFT_OBSERVER_SINGLETON is None:
+            obs = TtftObserver()
+            obs.load()
+            _TTFT_OBSERVER_SINGLETON = obs
+        return _TTFT_OBSERVER_SINGLETON
+
+
+def get_ttft_observer() -> Optional[Any]:
+    """Public accessor for callers outside the runner (e.g. the DW
+    provider's first-chunk callsite). Same lazy-singleton semantics —
+    returns None when tracking flag is off."""
+    return _get_or_create_ttft_observer()
+
+
 def reset_boot_state_for_tests() -> None:
     """Test hook — clears the boot flag, cancels any refresh task,
     drops the ledger singletons. Production code MUST NOT call this."""
     global _BOOT_DISCOVERY_DONE, _REFRESH_TASK, _LEDGER_SINGLETON
-    global _MODALITY_LEDGER_SINGLETON, _LAST_SNAPSHOT_ID
+    global _MODALITY_LEDGER_SINGLETON, _TTFT_OBSERVER_SINGLETON
+    global _LAST_SNAPSHOT_ID
     with _BOOT_SYNC_LOCK:
         _BOOT_DISCOVERY_DONE = False
         if _REFRESH_TASK is not None and not _REFRESH_TASK.done():
@@ -477,6 +513,7 @@ def reset_boot_state_for_tests() -> None:
         _REFRESH_TASK = None
         _LEDGER_SINGLETON = None
         _MODALITY_LEDGER_SINGLETON = None
+        _TTFT_OBSERVER_SINGLETON = None
         _LAST_SNAPSHOT_ID = ""
 
 
@@ -510,12 +547,14 @@ async def boot_discovery_once(
             return None
         ledger = _get_or_create_ledger()
         modality_ledger = _get_or_create_modality_ledger()  # Slice G
+        ttft_observer = _get_or_create_ttft_observer()  # Slice 12.2.C
         first_result = await run_discovery(
             session=session,
             base_url=base_url,
             api_key=api_key,
             ledger=ledger,
             modality_ledger=modality_ledger,
+            ttft_observer=ttft_observer,
         )
         _BOOT_DISCOVERY_DONE = True
         # Spawn the refresh loop. We DON'T await; it runs forever
@@ -528,6 +567,7 @@ async def boot_discovery_once(
                     api_key=api_key,
                     ledger=ledger,
                     modality_ledger=modality_ledger,
+                    ttft_observer=ttft_observer,
                 ),
                 name="dw_discovery_refresh_loop",
             )
@@ -555,6 +595,7 @@ async def _discovery_refresh_loop(
     api_key: str,
     ledger: PromotionLedger,
     modality_ledger: Optional[Any] = None,  # Slice G
+    ttft_observer: Optional[Any] = None,    # Slice 12.2.C
 ) -> None:
     """Periodic refresh. Each cycle:
       1. Sleeps for JARVIS_DW_CATALOG_REFRESH_S (default 1800s)
@@ -581,6 +622,7 @@ async def _discovery_refresh_loop(
                 api_key=api_key,
                 ledger=ledger,
                 modality_ledger=modality_ledger,
+                ttft_observer=ttft_observer,
             )
         except asyncio.CancelledError:
             return
@@ -595,6 +637,7 @@ __all__ = [
     "DiscoveryResult",
     "boot_discovery_once",
     "catalog_discovery_enabled",
+    "get_ttft_observer",
     "reset_boot_state_for_tests",
     "run_discovery",
 ]
