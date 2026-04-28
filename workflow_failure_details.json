@@ -1,0 +1,149 @@
+{
+  "workflow_name": "Priority 2 - Biometric Voice Unlock E2E Testing",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25039917548",
+  "branch": "main",
+  "commit_sha": "74df0c2",
+  "run_number": 504,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/priority-2-biometric-voice-unlock-e2e-testing-run504-20260428-073329",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Priority 2 - Biometric Voice Unlock E2E Testing (Run #504)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 38,
+              "content": "2026-04-28T07:32:00.3964560Z   Getting requirements to build wheel: finished with status 'error'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 39,
+              "content": "2026-04-28T07:32:00.3991410Z   error: subprocess-exited-with-error",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 60,
+              "content": "2026-04-28T07:32:00.4030700Z       ModuleNotFoundError: No module named 'pkg_resources'",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 63,
+              "content": "2026-04-28T07:32:00.4031570Z   note: This error originates from a subprocess, and is likely not a problem with pip.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 64,
+              "content": "2026-04-28T07:32:00.4032030Z ERROR: Failed to build 'openai-whisper' when getting requirements to build wheel",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 65,
+              "content": "2026-04-28T07:32:00.5208060Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 6
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 64,
+              "content": "2026-04-28T07:32:00.4032030Z ERROR: Failed to build 'openai-whisper' when getting requirements to build wheel",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-04-28T07:32:01.0940790Z ##[warning]The process '/opt/homebrew/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 71,
+              "content": "2026-04-28T07:32:00.5440110Z   if-no-files-found: warn",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 85,
+              "content": "2026-04-28T07:32:00.7744180Z ##[warning]No files were found with the provided path: test-results/biometric-voice-e2e. No artifacts will be uploaded.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-04-28T07:32:01.0940790Z ##[warning]The process '/opt/homebrew/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 98,
+              "content": "2026-04-28T07:32:01.8064440Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/setup-python@v5, actions/upload-artifact@v4. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 4
+        },
+        {
+          "pattern": "AssertionError|Exception",
+          "matches": [
+            {
+              "line_number": 4,
+              "content": "2026-04-28T07:31:51.9718270Z Installing collected packages: typing-extensions, tomli, pygments, propcache, pluggy, packaging, numpy, iniconfig, idna, frozenlist, backports-asyncio-runner, attrs, async-timeout, aiohappyeyeballs, scipy, multidict, exceptiongroup, aiosignal, yarl, pytest, pytest-timeout, pytest-asyncio, aiohttp",
+              "severity": "high",
+              "emoji": "\ud83d\udd34"
+            },
+            {
+              "line_number": 6,
+              "content": "2026-04-28T07:31:57.6999820Z Successfully installed aiohappyeyeballs-2.6.1 aiohttp-3.13.5 aiosignal-1.4.0 async-timeout-5.0.1 attrs-26.1.0 backports-asyncio-runner-1.2.0 exceptiongroup-1.3.1 frozenlist-1.8.0 idna-3.13 iniconfig-2.3.0 multidict-6.7.1 numpy-2.2.6 packaging-26.2 pluggy-1.6.0 propcache-0.4.1 pygments-2.20.0 pytest-9.0.3 pytest-asyncio-1.3.0 pytest-timeout-2.4.0 scipy-1.15.3 tomli-2.4.1 typing-extensions-4.15.0 yarl-1.23.0",
+              "severity": "high",
+              "emoji": "\ud83d\udd34"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 4,
+              "content": "2026-04-28T07:31:51.9718270Z Installing collected packages: typing-extensions, tomli, pygments, propcache, pluggy, packaging, numpy, iniconfig, idna, frozenlist, backports-asyncio-runner, attrs, async-timeout, aiohappyeyeballs, scipy, multidict, exceptiongroup, aiosignal, yarl, pytest, pytest-timeout, pytest-asyncio, aiohttp",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            },
+            {
+              "line_number": 6,
+              "content": "2026-04-28T07:31:57.6999820Z Successfully installed aiohappyeyeballs-2.6.1 aiohttp-3.13.5 aiosignal-1.4.0 async-timeout-5.0.1 attrs-26.1.0 backports-asyncio-runner-1.2.0 exceptiongroup-1.3.1 frozenlist-1.8.0 idna-3.13 iniconfig-2.3.0 multidict-6.7.1 numpy-2.2.6 packaging-26.2 pluggy-1.6.0 propcache-0.4.1 pygments-2.20.0 pytest-9.0.3 pytest-asyncio-1.3.0 pytest-timeout-2.4.0 scipy-1.15.3 tomli-2.4.1 typing-extensions-4.15.0 yarl-1.23.0",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations"
+      ],
+      "severity": "high",
+      "category": "dependency_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-04-28T07:33:29.959181"
+}
