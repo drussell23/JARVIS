@@ -273,11 +273,35 @@ class TokenBucket:
 
 
 class BreakerState(str, enum.Enum):
-    """Circuit-breaker states."""
+    """Circuit-breaker states.
+
+    Phase 12 Slice H — added ``TERMINAL_OPEN`` for failure classes
+    that are NOT recoverable via probe-based retry:
+
+      * 4xx modality errors (model rejects /chat/completions payloads
+        via ground-truth body marker — `is_modality_error()` from
+        Slice F)
+      * 4xx auth errors (401/403 — credential failure for this
+        specific model_id)
+
+    TERMINAL_OPEN models are permanently banned from the cascade
+    until an explicit reset:
+      * ``CircuitBreaker.reset_terminal()`` (operator override)
+      * Catalog refresh hook in the discovery runner (when DW
+        catalog changes, the model_id may be a different model
+        under the same name — give it a fresh chance)
+
+    Crucially, TERMINAL_OPEN does NOT auto-transition to HALF_OPEN
+    via timeout. The sentinel's existing ``recovery_timeout_s``
+    schedule is for transient failures (5xx, stream-stall, 429).
+    Modality + auth errors are deterministic — retrying them with
+    the same model_id + same credentials produces the same failure.
+    """
 
     CLOSED = "CLOSED"
     OPEN = "OPEN"
     HALF_OPEN = "HALF_OPEN"
+    TERMINAL_OPEN = "TERMINAL_OPEN"
 
 
 class CircuitBreakerOpen(Exception):
@@ -318,11 +342,20 @@ class CircuitBreaker:
     # -- public API --------------------------------------------------------
 
     def check(self) -> None:
-        """Raise :class:`CircuitBreakerOpen` if the breaker is OPEN.
+        """Raise :class:`CircuitBreakerOpen` if the breaker is OPEN
+        or TERMINAL_OPEN.
 
-        If the recovery timeout has elapsed, auto-transition to HALF_OPEN
-        (lazy check via ``time.monotonic()``).
+        Slice H — TERMINAL_OPEN never auto-transitions to HALF_OPEN.
+        It bans the call indefinitely until explicit ``reset_terminal``.
+
+        OPEN auto-transitions to HALF_OPEN after ``recovery_timeout_s``.
         """
+        if self._state == BreakerState.TERMINAL_OPEN:
+            raise CircuitBreakerOpen(
+                "Circuit breaker is TERMINAL_OPEN — ground-truth signal "
+                "(modality 4xx or auth failure) bans this model until "
+                "reset_terminal() or catalog refresh"
+            )
         if self._state == BreakerState.OPEN:
             elapsed = time.monotonic() - self._opened_at
             if elapsed >= self._recovery_timeout_s:
@@ -333,15 +366,36 @@ class CircuitBreaker:
                 )
 
     def record_success(self) -> None:
-        """Record a successful call."""
+        """Record a successful call.
+
+        Slice H — TERMINAL_OPEN ignores success records. Once the
+        server has emitted a deterministic terminal signal (modality
+        4xx or 401/403), an in-flight success that races with the
+        record_failure call MUST NOT clear the terminal state — that
+        could be a different op invoked before the terminal verdict
+        propagated. Only explicit ``reset_terminal`` clears it."""
+        if self._state == BreakerState.TERMINAL_OPEN:
+            return  # terminal stays terminal
         if self._state == BreakerState.HALF_OPEN:
             self._failure_count = 0
             self._transition(BreakerState.CLOSED)
         elif self._state == BreakerState.CLOSED:
             self._failure_count = 0
 
-    def record_failure(self) -> None:
-        """Record a failed call."""
+    def record_failure(self, *, is_terminal: bool = False) -> None:
+        """Record a failed call.
+
+        Slice H — when ``is_terminal=True`` (4xx modality or 401/403
+        auth from Slice F's structured exception), flip directly to
+        TERMINAL_OPEN regardless of current state. This bypasses the
+        ``failure_threshold`` count: ground-truth deterministic
+        failures don't need 3 occurrences to be trusted."""
+        if is_terminal:
+            self._opened_at = time.monotonic()
+            self._transition(BreakerState.TERMINAL_OPEN)
+            return
+        if self._state == BreakerState.TERMINAL_OPEN:
+            return  # already terminal; further failures are no-op
         if self._state == BreakerState.HALF_OPEN:
             # Single failure in HALF_OPEN re-opens
             self._opened_at = time.monotonic()
@@ -351,6 +405,29 @@ class CircuitBreaker:
             if self._failure_count >= self._failure_threshold:
                 self._opened_at = time.monotonic()
                 self._transition(BreakerState.OPEN)
+
+    def reset_terminal(self) -> bool:
+        """Slice H — explicit reset of TERMINAL_OPEN to CLOSED.
+
+        Used by:
+          * Operator override (manual unban after fixing credentials
+            or DW endpoint config)
+          * Catalog refresh hook in the discovery runner (when DW's
+            catalog changes, model_id may be a renamed/new model
+            under the same id — give it a fresh chance)
+
+        Returns True if state changed (was TERMINAL_OPEN); False if
+        the breaker wasn't in terminal state. NEVER raises.
+
+        Does NOT clear the breaker for OPEN/HALF_OPEN/CLOSED — those
+        states recover via normal probe paths and don't need explicit
+        reset."""
+        if self._state == BreakerState.TERMINAL_OPEN:
+            self._failure_count = 0
+            self._opened_at = 0.0
+            self._transition(BreakerState.CLOSED)
+            return True
+        return False
 
     @staticmethod
     def is_retriable_failure(status: int) -> bool:

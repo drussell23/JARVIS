@@ -2015,13 +2015,20 @@ class CandidateGenerator:
         last_failure: Optional[str] = None
         for model_id in ranked_models:
             state = sentinel.get_state(model_id)
-            if state == "OPEN":
+            # Phase 12 Slice H — TERMINAL_OPEN bypasses dispatch
+            # entirely (deterministic ground-truth ban from a 4xx
+            # modality or 401/403 auth failure; doesn't auto-recover
+            # via probes, only via explicit reset / catalog refresh).
+            # Treated indistinguishably from OPEN at the dispatch
+            # gate — both are "do not attempt"; the difference is
+            # purely in the recovery model (probe vs explicit reset).
+            if state in ("OPEN", "TERMINAL_OPEN"):
                 logger.info(
                     "[CandidateGenerator] Sentinel dispatch: route=%s "
-                    "model=%s state=OPEN — skipping (op=%s)",
-                    provider_route, model_id, op_id_short,
+                    "model=%s state=%s — skipping (op=%s)",
+                    provider_route, model_id, state, op_id_short,
                 )
-                attempts.append(f"{model_id}:skipped_open")
+                attempts.append(f"{model_id}:skipped_{state.lower()}")
                 continue
             attempts.append(f"{model_id}:attempted")
             # Stamp the per-attempt override via ContextVar (async-safe
