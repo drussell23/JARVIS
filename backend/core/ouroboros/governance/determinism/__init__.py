@@ -31,6 +31,17 @@ from backend.core.ouroboros.governance.determinism.clock import (
     clock_enabled,
     clock_for_session,
 )
+from backend.core.ouroboros.governance.determinism.decision_runtime import (
+    DecisionMismatchError,
+    DecisionRecord,
+    DecisionRuntime,
+    LedgerMode,
+    VerifyResult,
+    decide,
+    ledger_enabled,
+    runtime_for_session,
+    runtime_session,
+)
 from backend.core.ouroboros.governance.determinism.entropy import (
     DeterministicEntropy,
     SessionEntropy,
@@ -39,12 +50,21 @@ from backend.core.ouroboros.governance.determinism.entropy import (
 )
 
 __all__ = [
+    "DecisionMismatchError",
+    "DecisionRecord",
+    "DecisionRuntime",
     "DeterministicEntropy",
     "FrozenClock",
+    "LedgerMode",
     "RealClock",
     "SessionEntropy",
+    "VerifyResult",
     "clock_enabled",
     "clock_for_session",
+    "decide",
     "entropy_enabled",
     "entropy_for",
+    "ledger_enabled",
+    "runtime_for_session",
+    "runtime_session",
 ]
