@@ -67,6 +67,7 @@ Manifesto Alignment
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -105,6 +106,7 @@ class CommitResult:
     push_branch: str = ""
     error: str = ""
     skipped_reason: str = ""
+    intent_token: str = ""  # §24.6.2 — content-addressed dedup token
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +171,24 @@ class AutoCommitter:
             )
 
         try:
+            # §24.6.2 — Commit-intent token: content-addressed
+            # dedup check BEFORE staging. Prevents double-apply
+            # from crash-recovery race.
+            intent_token = self._compute_intent_token(
+                op_id, target_files,
+            )
+            if await self._intent_token_exists(intent_token):
+                logger.info(
+                    "[AutoCommitter] Duplicate intent token %s for "
+                    "op=%s — skipping (crash-recovery dedup)",
+                    intent_token[:12], op_id,
+                )
+                return CommitResult(
+                    committed=False,
+                    skipped_reason="duplicate_intent_token",
+                    intent_token=intent_token,
+                )
+
             # Stage the target files
             staged = await self._stage_files(target_files)
             if not staged:
@@ -198,10 +218,14 @@ class AutoCommitter:
                     error="git commit returned no hash",
                 )
 
+            # §24.6.2 — Store intent token in git notes post-commit.
+            await self._store_intent_token(intent_token, commit_hash)
+
             result = CommitResult(
                 committed=True,
                 commit_hash=commit_hash,
                 commit_message=message,
+                intent_token=intent_token,
             )
 
             # Optional push
@@ -471,3 +495,95 @@ class AutoCommitter:
             )
             return False
         return True
+
+    # ------------------------------------------------------------------
+    # §24.6.2 — Commit-intent token (crash-recovery dedup)
+    # ------------------------------------------------------------------
+
+    # Notes ref used for intent token storage. Separate namespace from
+    # regular git notes so we don't pollute the default notes ref.
+    _INTENT_NOTES_REF = "refs/notes/ouroboros-applied"
+
+    @staticmethod
+    def _compute_intent_token(
+        op_id: str,
+        target_files: Tuple[str, ...],
+    ) -> str:
+        """Compute content-addressed intent token.
+
+        ``sha256(canonical_json({op_id, sorted_target_files}))``
+
+        The token uniquely identifies a specific APPLY attempt for
+        a specific op targeting specific files. Two APPLY attempts
+        for the same op + files produce the same token — the second
+        attempt is rejected as a duplicate.
+        """
+        try:
+            from backend.core.ouroboros.governance.observability.determinism_substrate import (  # noqa: E501
+                canonical_hash,
+            )
+            return canonical_hash({
+                "op_id": op_id,
+                "target_files": sorted(target_files),
+            })
+        except Exception:  # noqa: BLE001 — defensive
+            # Fallback: basic hash without canonical serializer.
+            h = hashlib.sha256()
+            h.update(op_id.encode("utf-8", errors="replace"))
+            for f in sorted(target_files):
+                h.update(f.encode("utf-8", errors="replace"))
+            return h.hexdigest()
+
+    async def _intent_token_exists(self, token: str) -> bool:
+        """Check if an intent token already exists in git notes.
+
+        Returns True if the token was already applied (duplicate).
+        Returns False on any error (fail-open — prefer to commit
+        and handle the error downstream rather than silently dropping
+        a legitimate commit).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "notes", "--ref", self._INTENT_NOTES_REF,
+                "list",
+                cwd=str(self._repo_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return False  # notes ref doesn't exist yet — no dupes
+            # Each line is "<note_hash> <annotated_object_hash>".
+            # We store the intent token as the annotated object name
+            # (a pseudo-ref). Check if any line ends with the token.
+            content = stdout.decode(errors="replace")
+            return token in content
+        except Exception:  # noqa: BLE001 — fail-open
+            return False
+
+    async def _store_intent_token(
+        self, token: str, commit_hash: str,
+    ) -> None:
+        """Store intent token in git notes for future dedup checks.
+
+        Best-effort — failure to store is logged but does NOT fail
+        the commit (the commit already succeeded at this point).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "notes", "--ref", self._INTENT_NOTES_REF,
+                "add", "-m", f"intent:{token}",
+                commit_hash,
+                cwd=str(self._repo_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if proc.returncode != 0:
+                logger.debug(
+                    "[AutoCommitter] Failed to store intent token for "
+                    "%s (non-critical)",
+                    commit_hash[:8],
+                )
+        except Exception:  # noqa: BLE001 — best-effort
+            pass

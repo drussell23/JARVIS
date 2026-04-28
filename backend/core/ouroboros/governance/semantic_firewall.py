@@ -135,6 +135,17 @@ _INJECTION_PATTERNS: Tuple[re.Pattern, ...] = (
     # XML/HTML injection of new instructions
     re.compile(r"(?i)<\s*system\s*>.*?</\s*system\s*>", re.UNICODE | re.DOTALL),
     re.compile(r"(?i)<\s*(critical|mandatory)_(system|admin|override)_directive\b", re.UNICODE),
+    # §24.8.5 — Gate-bypass instruction sanitizer (Slice AV.3)
+    # Detects attempts to instruct the model to bypass validation
+    # gates, skip safety checks, or ignore governance constraints.
+    # These patterns are conservative — false positives cause
+    # dispatch rejection, which is safer than letting a gate-bypass
+    # instruction reach the subagent.
+    re.compile(r"(?i)\b(skip|bypass|disable|circumvent|ignore|override)\s+(the\s+)?(validation|gate|safety|security|governance|guard|firewall|iron.?gate|risk.?tier|approval|review)", re.UNICODE),
+    re.compile(r"(?i)\b(do\s+not|don'?t|never)\s+(validate|check|verify|gate|review|audit|scan|sanitize|enforce)\b", re.UNICODE),
+    re.compile(r"(?i)\bset\s+(risk.?tier|approval|gate|validation)\s+(to\s+)?(safe.?auto|none|disabled|off|skip)\b", re.UNICODE),
+    re.compile(r"(?i)\b(force|always)\s+(approve|accept|pass|allow|merge|commit|apply)\b", re.UNICODE),
+    re.compile(r"(?i)\bwithout\s+(human|manual|operator|approval|review|validation|verification|gate|check)\b", re.UNICODE),
     # Credential / secret shapes (overlap with sanitize_for_log; we
     # check here so the rejection is at dispatch time, not buried
     # inside sanitized output).

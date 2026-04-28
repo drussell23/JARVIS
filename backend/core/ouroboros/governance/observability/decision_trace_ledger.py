@@ -82,7 +82,8 @@ MAX_RECORDS_LOADED: int = 100_000
 MAX_RECORDS_PER_OP: int = 200
 
 
-SCHEMA_VERSION: str = "1"
+SCHEMA_VERSION: str = "2"
+SCHEMA_VERSIONS_READABLE: Tuple[str, ...] = ("1", "2")
 
 
 def is_ledger_enabled() -> bool:
@@ -107,7 +108,14 @@ def ledger_path() -> Path:
 
 @dataclass(frozen=True)
 class DecisionRow:
-    """One causal-trace row. Frozen — append-only history."""
+    """One causal-trace row. Frozen — append-only history.
+
+    v2 fields (§24.5.1 Merkle DAG extension):
+      * ``predecessor_ids`` — Merkle DAG edges to causally-prior rows.
+      * ``payload_hash`` — sha256 of canonical JSON (content-addressing).
+      * ``decision_tier`` — noise-budget tier (§24.5.2).
+      * ``decision_hash_digest`` — from ``DecisionHash`` (Slice 1.2).
+    """
 
     op_id: str
     phase: str
@@ -117,9 +125,14 @@ class DecisionRow:
     rationale: str
     ts_iso: str
     ts_epoch: float
+    # v2 Merkle DAG fields (§24.5.1)
+    predecessor_ids: Tuple[str, ...] = ()
+    payload_hash: str = ""
+    decision_tier: str = "NORMAL"  # CRITICAL | HIGH | NORMAL | LOW
+    decision_hash_digest: str = ""  # from DecisionHash (Slice 1.2)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "op_id": self.op_id,
             "phase": self.phase,
@@ -130,6 +143,16 @@ class DecisionRow:
             "ts_iso": self.ts_iso,
             "ts_epoch": self.ts_epoch,
         }
+        # v2 fields — always emitted for v2 rows.
+        if self.predecessor_ids:
+            d["predecessor_ids"] = list(self.predecessor_ids)
+        if self.payload_hash:
+            d["payload_hash"] = self.payload_hash
+        if self.decision_tier and self.decision_tier != "NORMAL":
+            d["decision_tier"] = self.decision_tier
+        if self.decision_hash_digest:
+            d["decision_hash_digest"] = self.decision_hash_digest
+        return d
 
 
 def _utc_now_iso() -> str:
@@ -170,6 +193,9 @@ class DecisionTraceLedger:
         factors: Optional[Dict[str, Any]] = None,
         weights: Optional[Dict[str, float]] = None,
         rationale: str = "",
+        predecessor_ids: Optional[Tuple[str, ...]] = None,
+        decision_tier: str = "NORMAL",
+        decision_hash_digest: str = "",
     ) -> Tuple[bool, str]:
         """Append one decision row. Returns ``(ok, detail)``.
 
@@ -206,6 +232,43 @@ class DecisionTraceLedger:
             rationale=(rationale or "")[:MAX_RATIONALE_CHARS],
             ts_iso=_utc_now_iso(),
             ts_epoch=time.time(),
+            predecessor_ids=tuple(
+                str(p) for p in (predecessor_ids or ())
+            ),
+            decision_tier=(
+                (decision_tier or "NORMAL").strip().upper()
+            ),
+            decision_hash_digest=(
+                (decision_hash_digest or "").strip()
+            ),
+        )
+        # Compute payload_hash as content-addressed hash of the
+        # row's canonical JSON (§24.5.1). Uses the determinism
+        # substrate's canonical serializer for architecture stability.
+        row_dict_for_hash = row.to_dict()
+        # Remove payload_hash from input (chicken-and-egg).
+        row_dict_for_hash.pop("payload_hash", None)
+        try:
+            from backend.core.ouroboros.governance.observability.determinism_substrate import (  # noqa: E501
+                canonical_hash,
+            )
+            computed_hash = canonical_hash(row_dict_for_hash)
+        except Exception:  # noqa: BLE001 — defensive
+            computed_hash = ""
+        # Replace the row with payload_hash populated.
+        row = DecisionRow(
+            op_id=row.op_id,
+            phase=row.phase,
+            decision=row.decision,
+            factors=row.factors,
+            weights=row.weights,
+            rationale=row.rationale,
+            ts_iso=row.ts_iso,
+            ts_epoch=row.ts_epoch,
+            predecessor_ids=row.predecessor_ids,
+            payload_hash=computed_hash,
+            decision_tier=row.decision_tier,
+            decision_hash_digest=row.decision_hash_digest,
         )
         try:
             line = json.dumps(row.to_dict(), separators=(",", ":"))
@@ -272,6 +335,11 @@ class DecisionTraceLedger:
                 continue
             if str(obj.get("op_id") or "") != op_id:
                 continue
+            # Parse v2 fields with v1 fallback.
+            raw_pred = obj.get("predecessor_ids")
+            pred_ids: Tuple[str, ...] = ()
+            if isinstance(raw_pred, list):
+                pred_ids = tuple(str(p) for p in raw_pred)
             out.append(DecisionRow(
                 op_id=str(obj.get("op_id") or ""),
                 phase=str(obj.get("phase") or ""),
@@ -281,6 +349,10 @@ class DecisionTraceLedger:
                 rationale=str(obj.get("rationale") or ""),
                 ts_iso=str(obj.get("ts_iso") or ""),
                 ts_epoch=float(obj.get("ts_epoch") or 0.0),
+                predecessor_ids=pred_ids,
+                payload_hash=str(obj.get("payload_hash") or ""),
+                decision_tier=str(obj.get("decision_tier") or "NORMAL"),
+                decision_hash_digest=str(obj.get("decision_hash_digest") or ""),
             ))
         return out
 
