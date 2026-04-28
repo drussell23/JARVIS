@@ -175,6 +175,31 @@ async def run_discovery(
                 # Catalog snapshot id = stable hash of model_id set so
                 # ledger verdicts invalidate when DW catalog changes
                 _snapshot_id = _compute_snapshot_id(snapshot)
+
+                # Phase 12 Slice H — when the snapshot id changes,
+                # reset TERMINAL_OPEN breakers in the sentinel. DW
+                # may have replaced/renamed models under the same id;
+                # terminal verdicts deserve a fresh chance under the
+                # new snapshot. The modality ledger handles whether
+                # to re-classify on the next probe.
+                if _snapshot_id and _snapshot_id != _last_snapshot_id():
+                    _set_last_snapshot_id(_snapshot_id)
+                    try:
+                        from backend.core.ouroboros.governance.topology_sentinel import (  # noqa: E501
+                            get_default_sentinel as _get_sent,
+                        )
+                        _reset = _get_sent().reset_all_terminal_breakers()
+                        if _reset:
+                            diagnostics.append(
+                                f"terminal_breakers_reset:count={_reset}:"
+                                f"new_snapshot={_snapshot_id[:12]}"
+                            )
+                    except Exception:  # noqa: BLE001 — defensive
+                        logger.debug(
+                            "[DiscoveryRunner] terminal breaker reset failed",
+                            exc_info=True,
+                        )
+
                 _verify = await verify_catalog_modalities(
                     snapshot=snapshot,
                     ledger=modality_ledger,
@@ -307,6 +332,21 @@ def _diff_summary(yaml_diff: Mapping[str, RouteDiff]) -> str:
     return f"yaml_diff[{';'.join(parts)}]"
 
 
+# Phase 12 Slice H — track last seen catalog snapshot id so the runner
+# can detect catalog refresh and reset TERMINAL_OPEN breakers. Module-
+# level (process-lifetime) state; cleared by reset_boot_state_for_tests.
+_LAST_SNAPSHOT_ID: str = ""
+
+
+def _last_snapshot_id() -> str:
+    return _LAST_SNAPSHOT_ID
+
+
+def _set_last_snapshot_id(value: str) -> None:
+    global _LAST_SNAPSHOT_ID
+    _LAST_SNAPSHOT_ID = value or ""
+
+
 def _compute_snapshot_id(snapshot: Any) -> str:
     """Stable id for a catalog snapshot — used to invalidate stale
     modality ledger verdicts on catalog refresh. Hashes the sorted
@@ -429,7 +469,7 @@ def reset_boot_state_for_tests() -> None:
     """Test hook — clears the boot flag, cancels any refresh task,
     drops the ledger singletons. Production code MUST NOT call this."""
     global _BOOT_DISCOVERY_DONE, _REFRESH_TASK, _LEDGER_SINGLETON
-    global _MODALITY_LEDGER_SINGLETON
+    global _MODALITY_LEDGER_SINGLETON, _LAST_SNAPSHOT_ID
     with _BOOT_SYNC_LOCK:
         _BOOT_DISCOVERY_DONE = False
         if _REFRESH_TASK is not None and not _REFRESH_TASK.done():
@@ -437,6 +477,7 @@ def reset_boot_state_for_tests() -> None:
         _REFRESH_TASK = None
         _LEDGER_SINGLETON = None
         _MODALITY_LEDGER_SINGLETON = None
+        _LAST_SNAPSHOT_ID = ""
 
 
 async def boot_discovery_once(

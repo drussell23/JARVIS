@@ -1160,7 +1160,16 @@ class TopologySentinel:
         only here, in one isolated location, to avoid a parallel
         FSM."""
         BreakerState = self._BreakerStateCls()
-        if snap.state == "OPEN":
+        if snap.state == "TERMINAL_OPEN":
+            # Phase 12 Slice H — terminal verdicts MUST survive
+            # restart. A process crash mid-modality-rejection cannot
+            # accidentally re-attempt a known-bad model. Operator
+            # explicit reset_terminal() / catalog refresh is the only
+            # way out, by design.
+            breaker._state = BreakerState.TERMINAL_OPEN  # noqa: SLF001
+            breaker._failure_count = breaker._failure_threshold  # noqa: SLF001
+            breaker._opened_at = time.monotonic()  # noqa: SLF001
+        elif snap.state == "OPEN":
             breaker._state = BreakerState.OPEN  # noqa: SLF001
             breaker._failure_count = breaker._failure_threshold  # noqa: SLF001
             # Reconstruct opened_at in monotonic frame: offset by
@@ -1193,11 +1202,16 @@ class TopologySentinel:
 
     def get_state(self, model_id: str) -> str:
         """Synchronous, lock-free read. Returns the BreakerState value
-        as a string ("CLOSED" / "OPEN" / "HALF_OPEN").
+        as a string ("CLOSED" / "OPEN" / "HALF_OPEN" / "TERMINAL_OPEN").
 
         Uninitialized endpoint → "CLOSED" (fail-open to availability).
         Sentinel master flag off → "CLOSED" (legacy yaml authoritative).
-        Force-severed env → "OPEN" (operator panic switch)."""
+        Force-severed env → "OPEN" (operator panic switch).
+
+        Phase 12 Slice H — TERMINAL_OPEN is preserved through the
+        check()-raises path: read breaker.state.value AFTER catching
+        the exception so the dispatcher can distinguish OPEN (probe-
+        recoverable) from TERMINAL_OPEN (deterministic ban)."""
         if force_severed():
             return "OPEN"
         if not is_sentinel_enabled():
@@ -1209,21 +1223,48 @@ class TopologySentinel:
             breaker.check()
             return breaker.state.value
         except Exception:  # noqa: BLE001 — CircuitBreakerOpen + others
-            return "OPEN"
+            # Phase 12 Slice H — preserve the actual state instead of
+            # collapsing all raise paths to "OPEN". TERMINAL_OPEN must
+            # be reported distinctly so the dispatcher can apply
+            # different recovery semantics.
+            try:
+                return breaker.state.value
+            except Exception:  # noqa: BLE001 — defensive
+                return "OPEN"
 
     def is_dw_allowed(self, model_id: str) -> bool:
-        return self.get_state(model_id) != "OPEN"
+        # Phase 12 Slice H — TERMINAL_OPEN is also disallowed
+        state = self.get_state(model_id)
+        return state not in ("OPEN", "TERMINAL_OPEN")
 
     def report_failure(
         self,
         model_id: str,
         source: FailureSource,
         detail: str = "",
+        *,
+        status_code: Optional[int] = None,
+        response_body: str = "",
+        is_terminal: bool = False,
     ) -> None:
         """Ingest a live-traffic OR probe failure. Adds the source's
         weight to the model's weighted streak; trips CLOSED→OPEN
         when the streak reaches ``severed_threshold_weighted``.
-        NEVER raises."""
+        NEVER raises.
+
+        Phase 12 Slice H — accepts structured fields from Slice F's
+        unmasked DoublewordInfraError:
+
+          * ``status_code`` — actual HTTP status (when available)
+          * ``response_body`` — server's response body excerpt
+          * ``is_terminal`` — True when caller has classified this
+            as a deterministic terminal failure (4xx modality or
+            401/403 auth). When True, breaker flips DIRECTLY to
+            TERMINAL_OPEN regardless of weighted streak — single
+            ground-truth signal is enough.
+
+        Backward compatible: callers that pass only the legacy 3
+        args (model_id, source, detail) get exactly the prior behavior."""
         try:
             with self._lock:
                 if model_id not in self._breakers:
@@ -1248,7 +1289,12 @@ class TopologySentinel:
                     ramp.register_failure()
                 # Should we trip?
                 pre_state = breaker.state.value
-                if (
+                if is_terminal:
+                    # Slice H — bypass the weighted-streak threshold;
+                    # single ground-truth terminal signal flips to
+                    # TERMINAL_OPEN regardless of streak / state.
+                    breaker.record_failure(is_terminal=True)
+                elif (
                     pre_state == "CLOSED"
                     and snap.weighted_failure_streak >= self._threshold
                 ):
@@ -1262,30 +1308,49 @@ class TopologySentinel:
                 post_state = breaker.state.value
                 if post_state != pre_state:
                     snap.state = post_state
-                    if post_state == "OPEN":
+                    if post_state in ("OPEN", "TERMINAL_OPEN"):
                         snap.opened_at_epoch = time.time()
-                        snap.backoff_idx += 1
+                        if post_state == "OPEN":
+                            snap.backoff_idx += 1
                         if ramp is not None:
                             ramp.deactivate()
                     snap.last_transition_at_epoch = time.time()
                     self._store.write_current(self._snapshots)
+                    extra: Dict[str, Any] = {
+                        "weighted_failure_streak":
+                            snap.weighted_failure_streak,
+                        "failure_source": source.value,
+                        "failure_detail": detail,
+                    }
+                    if status_code is not None:
+                        extra["status_code"] = status_code
+                    if response_body:
+                        extra["response_body"] = response_body[:512]
+                    if is_terminal:
+                        extra["is_terminal"] = True
                     self._emit_transition(
                         model_id, "state_change",
                         from_state=pre_state, to_state=post_state,
-                        weighted_failure_streak=snap.weighted_failure_streak,
-                        failure_source=source.value,
-                        failure_detail=detail,
+                        **extra,
                     )
                 else:
                     # Persist updated streak even without transition;
                     # log a failure_report record for observability.
                     self._store.write_current(self._snapshots)
+                    extra2: Dict[str, Any] = {
+                        "weighted_failure_streak":
+                            snap.weighted_failure_streak,
+                        "failure_source": source.value,
+                        "failure_detail": detail,
+                    }
+                    if status_code is not None:
+                        extra2["status_code"] = status_code
+                    if response_body:
+                        extra2["response_body"] = response_body[:512]
                     self._emit_transition(
                         model_id, "failure_report",
                         from_state=pre_state, to_state=post_state,
-                        weighted_failure_streak=snap.weighted_failure_streak,
-                        failure_source=source.value,
-                        failure_detail=detail,
+                        **extra2,
                     )
         except Exception:  # noqa: BLE001
             logger.debug(
@@ -1336,6 +1401,81 @@ class TopologySentinel:
 
     def get_ramp(self, model_id: str) -> Optional[SlowStartRamp]:
         return self._ramps.get(model_id)
+
+    def reset_terminal_breaker(self, model_id: str) -> bool:
+        """Phase 12 Slice H — explicit reset of a TERMINAL_OPEN breaker
+        back to CLOSED. Used by:
+
+          * Operator override (manual unban after fixing credentials)
+          * Discovery runner's catalog-refresh hook (when DW catalog
+            changes and the modality ledger drops a stale verdict)
+
+        Returns True if state changed (was TERMINAL_OPEN); False
+        otherwise. NEVER raises.
+
+        Does NOT clear OPEN/HALF_OPEN/CLOSED — those recover via
+        normal probe paths and don't need explicit reset."""
+        try:
+            with self._lock:
+                if model_id not in self._breakers:
+                    return False
+                breaker = self._breakers[model_id]
+                if breaker.state.value != "TERMINAL_OPEN":
+                    return False
+                changed = breaker.reset_terminal()
+                if changed:
+                    snap = self._snapshots.get(model_id)
+                    if snap is not None:
+                        pre_state = snap.state
+                        snap.state = "CLOSED"
+                        snap.weighted_failure_streak = 0.0
+                        snap.consecutive_passes = 0
+                        snap.opened_at_epoch = 0.0
+                        snap.last_transition_at_epoch = time.time()
+                        self._store.write_current(self._snapshots)
+                        self._emit_transition(
+                            model_id, "state_change",
+                            from_state=pre_state, to_state="CLOSED",
+                            failure_source="terminal_reset",
+                            failure_detail="explicit reset",
+                        )
+                return changed
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[TopologySentinel] reset_terminal_breaker failed",
+                exc_info=True,
+            )
+            return False
+
+    def reset_all_terminal_breakers(self) -> int:
+        """Phase 12 Slice H — reset every breaker currently in
+        TERMINAL_OPEN. Returns the count reset.
+
+        Called by the discovery runner when a catalog refresh detects
+        a new snapshot id — DW may have renamed/replaced models, so
+        all terminal verdicts deserve a fresh chance under the new
+        snapshot. The modality ledger handles re-classification on
+        the next discovery cycle.
+
+        NEVER raises."""
+        try:
+            with self._lock:
+                terminal_ids = [
+                    mid for mid, b in self._breakers.items()
+                    if b.state.value == "TERMINAL_OPEN"
+                ]
+            count = 0
+            for mid in terminal_ids:
+                if self.reset_terminal_breaker(mid):
+                    count += 1
+            if count:
+                logger.info(
+                    "[TopologySentinel] catalog refresh reset %d "
+                    "TERMINAL_OPEN breaker(s)", count,
+                )
+            return count
+        except Exception:  # noqa: BLE001 — defensive
+            return 0
 
     def force_severed(self, model_id: str, reason: str) -> None:
         """Operator override — pin the endpoint OPEN immediately."""
