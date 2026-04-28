@@ -70,9 +70,17 @@ def isolated_state_dir(tmp_path, monkeypatch) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_flag_default_false(monkeypatch) -> None:
+def test_flag_default_true(monkeypatch) -> None:
+    """Phase 1 Slice 1.5 graduated default — env unset → True."""
     monkeypatch.delenv("JARVIS_DETERMINISM_ENTROPY_ENABLED", raising=False)
-    assert entropy_enabled() is False
+    assert entropy_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " ", "  "])
+def test_flag_empty_reads_as_default_true(monkeypatch, val) -> None:
+    """Empty/whitespace values are the unset marker post-graduation."""
+    monkeypatch.setenv("JARVIS_DETERMINISM_ENTROPY_ENABLED", val)
+    assert entropy_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on", "On"])
@@ -81,8 +89,11 @@ def test_flag_truthy(monkeypatch, val) -> None:
     assert entropy_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", "", " "])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
 def test_flag_falsy(monkeypatch, val) -> None:
+    """Hot-revert: explicit false-class strings disable the feature.
+    Empty/whitespace are no longer falsy post-graduation — they map
+    to the graduated default True."""
     monkeypatch.setenv("JARVIS_DETERMINISM_ENTROPY_ENABLED", val)
     assert entropy_enabled() is False
 

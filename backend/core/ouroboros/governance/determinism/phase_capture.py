@@ -72,23 +72,28 @@ logger = logging.getLogger(__name__)
 
 
 def phase_capture_enabled() -> bool:
-    """``JARVIS_DETERMINISM_PHASE_CAPTURE_ENABLED`` (default ``false``).
+    """``JARVIS_DETERMINISM_PHASE_CAPTURE_ENABLED`` (default ``true`` —
+    graduated in Phase 1 Slice 1.5).
 
-    Slice 1.3 master flag. Independent from
-    ``JARVIS_DETERMINISM_LEDGER_ENABLED`` (Slice 1.2) so operators
-    can record decisions WITHOUT firing the phase capture wrappers
-    (shadow recording on the runtime layer only) OR enable phase
-    capture WITHOUT fully enabling the ledger (PASSTHROUGH mode for
-    the wrappers themselves — no-op everywhere).
+    Independent from ``JARVIS_DETERMINISM_LEDGER_ENABLED`` (Slice 1.2)
+    so operators can record decisions WITHOUT firing the phase capture
+    wrappers (shadow recording on the runtime layer only) OR enable
+    phase capture WITHOUT fully enabling the ledger (PASSTHROUGH mode
+    for the wrappers themselves — no-op everywhere).
 
     Both flags must be ``true`` for capture to actually record; if
     either is off, ``capture_phase_decision`` is a pure passthrough.
 
     Re-read at call time so monkeypatch works in tests + operators
-    can flip live without re-init."""
+    can flip live without re-init. Hot-revert path: ``export
+    JARVIS_DETERMINISM_PHASE_CAPTURE_ENABLED=false`` returns the
+    wrappers to pure passthrough — production callsites continue to
+    work with bit-for-bit legacy behavior."""
     raw = os.environ.get(
         "JARVIS_DETERMINISM_PHASE_CAPTURE_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

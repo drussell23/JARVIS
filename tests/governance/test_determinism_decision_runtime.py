@@ -80,9 +80,16 @@ def isolated(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ledger_default_false(monkeypatch) -> None:
+def test_ledger_default_true(monkeypatch) -> None:
+    """Phase 1 Slice 1.5 graduated default — env unset → True."""
     monkeypatch.delenv("JARVIS_DETERMINISM_LEDGER_ENABLED", raising=False)
-    assert ledger_enabled() is False
+    assert ledger_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " ", "  "])
+def test_ledger_empty_reads_as_default_true(monkeypatch, val) -> None:
+    monkeypatch.setenv("JARVIS_DETERMINISM_LEDGER_ENABLED", val)
+    assert ledger_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
@@ -91,8 +98,10 @@ def test_ledger_truthy(monkeypatch, val) -> None:
     assert ledger_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
 def test_ledger_falsy(monkeypatch, val) -> None:
+    """Hot-revert: explicit false-class strings disable. Empty/
+    whitespace map to graduated default True post-Slice-1.5."""
     monkeypatch.setenv("JARVIS_DETERMINISM_LEDGER_ENABLED", val)
     assert ledger_enabled() is False
 

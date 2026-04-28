@@ -66,20 +66,24 @@ logger = logging.getLogger(__name__)
 
 
 def clock_enabled() -> bool:
-    """``JARVIS_DETERMINISM_CLOCK_ENABLED`` (default ``false``).
+    """``JARVIS_DETERMINISM_CLOCK_ENABLED`` (default ``true`` —
+    graduated in Phase 1 Slice 1.5).
 
-    Phase 1 Slice 1.1 master flag. Re-read at call time so monkeypatch
-    works in tests + operators can flip live without re-init. Default
-    flips to ``true`` at Phase 1 graduation slice.
+    Re-read at call time so monkeypatch works in tests + operators
+    can flip live without re-init. Hot-revert path: ``export
+    JARVIS_DETERMINISM_CLOCK_ENABLED=false`` returns ``clock_for_session``
+    to passthrough mode — RealClock without recording, bit-for-bit
+    identical to legacy ``time.monotonic()`` / ``time.time()``.
 
     When ``true``: ``clock_for_session`` returns a ``RealClock`` in
     RECORD mode (live) or ``FrozenClock`` (replay), depending on
     requested mode. When ``false``: returns a passthrough ``RealClock``
-    with recording disabled (bit-for-bit identical to legacy
-    ``time.monotonic()`` / ``time.time()``)."""
+    with recording disabled."""
     raw = os.environ.get(
         "JARVIS_DETERMINISM_CLOCK_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
