@@ -67,19 +67,25 @@ logger = logging.getLogger(__name__)
 
 
 def tracking_enabled() -> bool:
-    """``JARVIS_TOPOLOGY_TTFT_TRACKING_ENABLED`` (default ``false``).
+    """``JARVIS_TOPOLOGY_TTFT_TRACKING_ENABLED`` (default ``true`` —
+    graduated in Phase 12.2 Slice E).
 
     Re-read at call time so monkeypatch works in tests + operators
-    can flip live without re-init. Default flips to ``true`` at
-    Phase 12.2 Slice E graduation."""
+    can flip live without re-init. Hot-revert path: ``export
+    JARVIS_TOPOLOGY_TTFT_TRACKING_ENABLED=false`` returns the
+    observer to dormant — record_ttft becomes a no-op + the
+    promotion / cold-storage gates short-circuit to False."""
     raw = os.environ.get(
         "JARVIS_TOPOLOGY_TTFT_TRACKING_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
 def ttft_demotion_enabled() -> bool:
-    """``JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED`` (default ``false``).
+    """``JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED`` (default ``true`` —
+    graduated in Phase 12.2 Slice E).
 
     Phase 12.2 Slice C master flag. When ``true``:
 
@@ -90,14 +96,16 @@ def ttft_demotion_enabled() -> bool:
         as a soft gate — cold-storage models temporarily route to
         SPECULATIVE only until TTFT normalizes (auto-recovery).
 
-    When ``false``: legacy count-gate behavior preserved bit-for-bit.
-    Independent from ``tracking_enabled()`` — operators can record
-    TTFT samples without acting on them (shadow-mode observation).
-
-    Default flips to ``true`` at Phase 12.2 Slice E graduation."""
+    Hot-revert path: ``export JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED=
+    false`` returns the gate to legacy count-based behavior +
+    classifier ignores cold-storage signal. Independent from
+    ``tracking_enabled()`` — operators can disable acting on TTFT
+    without losing the observation stream."""
     raw = os.environ.get(
         "JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

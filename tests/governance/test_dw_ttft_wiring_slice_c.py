@@ -103,9 +103,18 @@ def _make_snapshot(*cards: ModelCard) -> CatalogSnapshot:
 # ---------------------------------------------------------------------------
 
 
-def test_demotion_flag_default_false(monkeypatch) -> None:
+def test_demotion_flag_default_on(monkeypatch) -> None:
+    """Phase 12.2 Slice E graduated default — env unset → True."""
     monkeypatch.delenv("JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED", raising=False)
-    assert ttft_demotion_enabled() is False
+    assert ttft_demotion_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " "])
+def test_demotion_flag_empty_reads_as_default_on(monkeypatch, val) -> None:
+    """Empty/whitespace values are the unset marker — read as True
+    post-graduation."""
+    monkeypatch.setenv("JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED", val)
+    assert ttft_demotion_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "YES", "on", "On"])
@@ -114,8 +123,9 @@ def test_demotion_flag_truthy_values(monkeypatch, val) -> None:
     assert ttft_demotion_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "FALSE", "no", "off", "", " "])
+@pytest.mark.parametrize("val", ["0", "false", "FALSE", "no", "off"])
 def test_demotion_flag_falsy_values(monkeypatch, val) -> None:
+    """Hot-revert: explicit false-class strings disable the feature."""
     monkeypatch.setenv("JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED", val)
     assert ttft_demotion_enabled() is False
 

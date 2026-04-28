@@ -62,15 +62,18 @@ logger = logging.getLogger(__name__)
 
 
 def heavy_probe_enabled() -> bool:
-    """``JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED`` (default ``false``).
+    """``JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED`` (default ``true`` —
+    graduated in Phase 12.2 Slice E).
 
-    Master kill switch. Off → scheduler refuses to spawn, ad-hoc
-    ``HeavyProber.probe()`` calls return a no-op result, budget ledger
-    untouched. Default flips to ``true`` at Phase 12.2 Slice E
-    graduation."""
+    Master kill switch. Hot-revert path: ``export
+    JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED=false`` → scheduler refuses
+    to spawn, ad-hoc ``HeavyProber.probe()`` calls return a no-op
+    result with ``error=master_flag_off``, budget ledger untouched."""
     raw = os.environ.get(
         "JARVIS_TOPOLOGY_HEAVY_PROBE_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
