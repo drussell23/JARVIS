@@ -340,15 +340,32 @@ gates:
 # callers (semantic_triage, ouroboros_plan) until DoubleWord repairs
 # their SSE generation endpoint.
 doubleword_topology:
-  # Bumped to topology.2 (PRD §3.7 + §9 Phase 10 P10.2, 2026-04-27).
-  # v2 adds per-route `dw_models:` ranked lists + `fallback_tolerance:`
-  # so the AsyncTopologySentinel can walk multiple DW model candidates
-  # before any Claude cascade. v1 keys (`dw_allowed`, `block_mode`)
-  # remain authoritative when JARVIS_TOPOLOGY_SENTINEL_ENABLED is off
-  # (current default). Slice 3 wires `candidate_generator` to consult
-  # the sentinel under that flag; Slice 5 (THE PURGE) deletes the v1
-  # keys after 3 forced-clean once-proofs prove the dynamic path
-  # produces correct routing decisions.
+  # Schema topology.2 — graduated 2026-04-27 at Phase 12 Slice E.
+  #
+  # PURGE NOTE (Slice E, 2026-04-27): the per-route `dw_models:` arrays
+  # have been DELIBERATELY REMOVED. The dynamic catalog discovery
+  # pipeline (dw_catalog_client + dw_catalog_classifier + dw_discovery_
+  # runner) now owns the ranking — fetched live from DW's /models
+  # endpoint, classified by deterministic per-route eligibility gates,
+  # surfaced via ProviderTopology._DYNAMIC_CATALOG, and consulted by
+  # dw_models_for_route() when both flags are on (default true post-
+  # graduation):
+  #
+  #   JARVIS_DW_CATALOG_DISCOVERY_ENABLED   (default true)
+  #   JARVIS_DW_CATALOG_AUTHORITATIVE        (default true)
+  #
+  # Hot-revert path: setting EITHER flag to false returns dw_models_for_
+  # route() to ``effective_dw_models`` from this YAML, which is now ()
+  # for every generative route (no static list to fall back on). Empty
+  # list means the dispatcher cascades per ``fallback_tolerance``:
+  #   * BG/SPEC stay queue-only (no Claude cascade — cost contract
+  #     preserved structurally per project_bg_spec_sealed.md)
+  #   * STANDARD/COMPLEX cascade to Claude until DISCOVERY is re-enabled
+  #
+  # The fields BELOW (dw_allowed, block_mode, reason, fallback_tolerance)
+  # are POLICY, not catalog. They encode operator-controlled cost
+  # contract decisions and stay YAML-authored. Only the *which models*
+  # decision is dynamic.
   schema_version: "topology.2"
   enabled: true
   routes:
@@ -356,62 +373,40 @@ doubleword_topology:
       dw_allowed: false
       block_mode: "cascade_to_claude"
       reason: "Prefrontal cortex — Claude only. 120s DW RT budget is insufficient for fast-reflex ops with Venom tool loops."
-      # v2 — IMMEDIATE intentionally has NO dw_models. Manifesto §5
+      # IMMEDIATE intentionally has NO dw_models — Manifesto §5
       # ("survival and execution speed permanently supersede cost
       # optimization") makes this a Claude-direct route by design,
-      # NOT a degradation seal. Preserved across the purge.
+      # NOT a degradation seal. The classifier (Phase 12 Slice B)
+      # never populates IMMEDIATE; this stays empty across the purge.
       dw_models: []
       fallback_tolerance: "cascade_to_claude"
     complex:
       dw_allowed: false
       block_mode: "cascade_to_claude"
-      reason: "Prefrontal cortex — Claude only. Live-fire bbpst3ebf proved DW (both 397B and Gemma 4 31B) times out on architectural COMPLEX GENERATE within 120s Tier 0 RT."
-      # v2 — ranked DW model list per PRD §3.7.3. The sentinel walks
-      # this list trying each healthy model before cascading to Claude.
-      # All three primary picks are different model families than the
-      # 397B that originally stream-stalled — different runtimes,
-      # different streaming pipelines.
-      dw_models:
-        - "moonshotai/Kimi-K2.6"           # Primary — "long-horizon coding, agents, swarm" — exact match for autonomous multi-file
-        - "zai-org/GLM-5.1-FP8"            # Secondary — leads SWE-Bench Pro, "agentic engineering, repo gen, terminal"
-        - "Qwen/Qwen3.6-35B-A3B-FP8"       # Budget tertiary — newer family than 397B
-        - "Qwen/Qwen3.5-397B-A17B"         # Legacy primary — demoted to last DW attempt
+      reason: "Catalog-driven (Phase 12). Static list purged; ranking authority is dw_catalog_classifier with per-route eligibility gates (default min_params_b=30B). When discovery is off, this empty list cascades per fallback_tolerance."
+      # PURGED 2026-04-27 — see header note
+      dw_models: []
       fallback_tolerance: "cascade_to_claude"
     standard:
       dw_allowed: false
       block_mode: "cascade_to_claude"
-      reason: "Qwen 397B verified stream-stalling without candidate generation in bt-2026-04-14-203740. DW Tier 0 sealed to prevent latency debt."
-      # v2 — same ranked list as COMPLEX (per PRD §3.7.3).
-      dw_models:
-        - "moonshotai/Kimi-K2.6"
-        - "zai-org/GLM-5.1-FP8"
-        - "Qwen/Qwen3.6-35B-A3B-FP8"
-        - "Qwen/Qwen3.5-397B-A17B"
+      reason: "Catalog-driven (Phase 12). Static list purged; ranking authority is dw_catalog_classifier (default min_params_b=14B, max_out_price=$2/M). When discovery is off, this empty list cascades per fallback_tolerance."
+      # PURGED 2026-04-27
+      dw_models: []
       fallback_tolerance: "cascade_to_claude"
     background:
       dw_allowed: false
       block_mode: "skip_and_queue"
-      reason: "Gemma 4 31B stream-stalls on DW endpoint even at <2K tokens. Background generation paused to preserve Claude compute runway."
-      # v2 — BG is cost-sensitive; cheap-first ranking. Kimi-K2.6 is
-      # second because long-horizon BG ops (e.g. doc staleness drafts)
-      # benefit from its agentic surface when 35B is unhealthy.
-      # `fallback_tolerance: "queue"` preserves the project_bg_spec_
-      # sealed.md contract — BG ops NEVER cascade to Claude on full
-      # DW failure; they queue and the sensor re-detects.
-      dw_models:
-        - "Qwen/Qwen3.6-35B-A3B-FP8"
-        - "moonshotai/Kimi-K2.6"
+      reason: "Catalog-driven (Phase 12). Static list purged; ranking authority is dw_catalog_classifier (default max_out_price=$0.5/M). fallback_tolerance: queue preserves the project_bg_spec_sealed.md contract — BG NEVER cascades to Claude on full DW failure."
+      # PURGED 2026-04-27
+      dw_models: []
       fallback_tolerance: "queue"
     speculative:
       dw_allowed: false
       block_mode: "skip_and_queue"
-      reason: "Gemma 4 31B stream-stalls on DW endpoint even at <2K tokens. Background generation paused to preserve Claude compute runway."
-      # v2 — SPECULATIVE is fire-and-forget pre-computation; ultra-cheap
-      # picks only. Qwen3.5-4B at $0.04/$0.06 per M is the cheapest
-      # usable model in the catalog. Same `queue` fallback contract.
-      dw_models:
-        - "Qwen/Qwen3.5-9B"
-        - "Qwen/Qwen3.5-4B"
+      reason: "Catalog-driven (Phase 12). Static list purged; ranking authority is dw_catalog_classifier (default max_out_price=$0.1/M). Same queue fallback contract as BACKGROUND. Zero-Trust §3.6 quarantine lands ambiguous-metadata models here."
+      # PURGED 2026-04-27
+      dw_models: []
       fallback_tolerance: "queue"
   monitor:
     # AsyncTopologySentinel tunables — yaml-driven so operators can

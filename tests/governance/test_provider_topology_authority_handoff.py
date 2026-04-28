@@ -60,9 +60,12 @@ def _yaml_has_complex_models() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_authoritative_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_authoritative_default_on_post_graduation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slice E graduation flip: unset/empty env returns True."""
     monkeypatch.delenv("JARVIS_DW_CATALOG_AUTHORITATIVE", raising=False)
-    assert catalog_authoritative_enabled() is False
+    assert catalog_authoritative_enabled() is True
 
 
 def test_authoritative_truthy_values(
@@ -76,7 +79,9 @@ def test_authoritative_truthy_values(
 def test_authoritative_falsy_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for val in ("0", "false", "no", "off", "", "garbage"):
+    """Post-graduation: empty string is the unset-marker for default
+    True. Hot-revert requires an explicit ``false``-class string."""
+    for val in ("0", "false", "no", "off", "garbage"):
         monkeypatch.setenv("JARVIS_DW_CATALOG_AUTHORITATIVE", val)
         assert catalog_authoritative_enabled() is False
 

@@ -724,16 +724,23 @@ def reload_topology() -> ProviderTopology:
 
 
 def catalog_authoritative_enabled() -> bool:
-    """``JARVIS_DW_CATALOG_AUTHORITATIVE`` (default ``false``).
+    """``JARVIS_DW_CATALOG_AUTHORITATIVE`` (default ``true`` —
+    graduated in Phase 12 Slice E alongside DISCOVERY_ENABLED).
 
     Re-read at call time so monkeypatch works in tests + operators
-    can flip live without re-init. Default flips to ``true`` at
-    Phase 12 Slice E graduation. Hot-revert path: ``export
+    can flip live without re-init. Hot-revert path: ``export
     JARVIS_DW_CATALOG_AUTHORITATIVE=false`` returns dispatcher to
-    YAML-authored dw_models lists immediately."""
+    YAML-authored dw_models lists. Note: at graduation, YAML's
+    dw_models arrays were purged — so the hot-revert lands on
+    ``effective_dw_models = ()`` per route, which means the
+    dispatcher cascades per ``fallback_tolerance``. BG/SPEC stay
+    queue-only (no Claude burn); STANDARD/COMPLEX cascade to
+    Claude until DISCOVERY is re-enabled."""
     raw = os.environ.get(
         "JARVIS_DW_CATALOG_AUTHORITATIVE", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

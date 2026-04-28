@@ -50,18 +50,20 @@ logger = logging.getLogger(__name__)
 
 
 def discovery_enabled() -> bool:
-    """``JARVIS_DW_CATALOG_DISCOVERY_ENABLED`` (default ``false``).
+    """``JARVIS_DW_CATALOG_DISCOVERY_ENABLED`` (default ``true`` —
+    graduated in Phase 12 Slice E).
 
     Re-read at call time so monkeypatch works in tests + operators
-    can flip live without re-init.
-
-    Default flips to ``true`` at Phase 12 Slice E graduation. Until
-    then, the catalog client may run but its output is not consumed
-    by the dispatcher — YAML stays authoritative.
-    """
+    can flip live without re-init. Hot-revert: ``export
+    JARVIS_DW_CATALOG_DISCOVERY_ENABLED=false`` returns the entire
+    Phase 12 catalog pipeline to dormant (per-route fallbacks all
+    return ``()`` since YAML's dw_models arrays were purged at
+    graduation; dispatcher cascades per ``fallback_tolerance``)."""
     raw = os.environ.get(
         "JARVIS_DW_CATALOG_DISCOVERY_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

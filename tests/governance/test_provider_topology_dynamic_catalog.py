@@ -281,11 +281,19 @@ def test_yaml_diff_excludes_immediate_route() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_shadow_mode_dw_models_for_route_still_reads_yaml() -> None:
-    """The whole point of Slice C: populating the dynamic catalog
-    must NOT change what the dispatcher sees. ``dw_models_for_route``
-    continues returning the YAML-authored list even with the holder
-    populated. Slice D will flip this to read the holder first."""
+def test_authoritative_off_dw_models_for_route_still_reads_yaml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hot-revert path post-graduation: with ``JARVIS_DW_CATALOG_
+    AUTHORITATIVE=false``, populating the dynamic catalog must NOT
+    change what the dispatcher sees. ``dw_models_for_route`` returns
+    YAML's empty list (post-purge ``dw_models: []``).
+
+    Originally pinned the Slice C shadow-mode contract; rewritten at
+    Slice E to pin the new authoritative-flag-off contract while
+    preserving the same architectural invariant: holder is NOT
+    consulted when authoritative is off."""
+    monkeypatch.setenv("JARVIS_DW_CATALOG_AUTHORITATIVE", "false")
     set_dynamic_catalog(
         {"complex": ("dynamic-only/exotic-99B",)},
         fetched_at_unix=time.time(),

@@ -179,7 +179,9 @@ def test_circuit_breaker_master_off_legacy_path_unchanged(
 ) -> None:
     """When master flag is OFF, the breaker's verdict for a sealed
     BG route must be byte-identical to pre-Slice-3 (skip_and_queue
-    + non-read-only → True with topology_reason)."""
+    + non-read-only → True with topology_reason). Slice E refreshed
+    the reason text — no longer says 'Gemma'; says 'catalog-driven'
+    instead. The breaker logic itself is unchanged."""
     monkeypatch.delenv("JARVIS_TOPOLOGY_SENTINEL_ENABLED", raising=False)
     pt._CACHED_TOPOLOGY = None
     fired, reason = cb.should_circuit_break(
@@ -187,7 +189,15 @@ def test_circuit_breaker_master_off_legacy_path_unchanged(
         is_read_only=False,
     )
     assert fired is True
-    assert "Gemma" in reason or "stream-stall" in reason or "topology" in reason.lower()
+    # Post-Slice-E reason text variants — match either old or new
+    # reason wording so the test survives reason-string refreshes
+    rl = reason.lower()
+    assert (
+        "gemma" in rl
+        or "stream-stall" in rl
+        or "topology" in rl
+        or "catalog" in rl
+    )
 
 
 def test_circuit_breaker_master_off_read_only_carve_out_preserved(
@@ -207,12 +217,22 @@ def test_circuit_breaker_sentinel_on_all_severed_queue_fires(
 ) -> None:
     """With sentinel ON + every model in the route OPEN + fallback=queue,
     the breaker MUST fire (`sentinel_all_severed:...`). This is the
-    new evidence path that defends BG/SPEC unit economics."""
+    new evidence path that defends BG/SPEC unit economics.
+
+    Phase 12 Slice E — YAML's dw_models is purged; populate the
+    dynamic catalog with the test's model_ids so dw_models_for_route
+    has a list to walk. JARVIS_DW_CATALOG_AUTHORITATIVE is on by
+    default post-graduation."""
+    import time as _time
     monkeypatch.setenv("JARVIS_TOPOLOGY_SENTINEL_ENABLED", "true")
     monkeypatch.setenv(
         "JARVIS_TOPOLOGY_SENTINEL_STATE_DIR", str(tmp_path),
     )
     pt._CACHED_TOPOLOGY = None
+    pt.set_dynamic_catalog(
+        {"background": ("Qwen/Qwen3.6-35B-A3B-FP8", "moonshotai/Kimi-K2.6")},
+        fetched_at_unix=_time.time(),
+    )
     ts.reset_default_sentinel_for_tests()
     sentinel = ts.get_default_sentinel()
     # Force every BG model to OPEN.
@@ -225,18 +245,26 @@ def test_circuit_breaker_sentinel_on_all_severed_queue_fires(
     assert fired is True
     assert "sentinel_all_severed" in reason
     ts.reset_default_sentinel_for_tests()
+    pt.clear_dynamic_catalog()
 
 
 def test_circuit_breaker_sentinel_on_one_model_healthy_holds_fire(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ) -> None:
     """Sentinel ON + at least one BG model not OPEN → breaker does
-    NOT fire. The dispatcher will try that model."""
+    NOT fire. The dispatcher will try that model.
+
+    Phase 12 Slice E — populate dynamic catalog (YAML purged)."""
+    import time as _time
     monkeypatch.setenv("JARVIS_TOPOLOGY_SENTINEL_ENABLED", "true")
     monkeypatch.setenv(
         "JARVIS_TOPOLOGY_SENTINEL_STATE_DIR", str(tmp_path),
     )
     pt._CACHED_TOPOLOGY = None
+    pt.set_dynamic_catalog(
+        {"background": ("Qwen/Qwen3.6-35B-A3B-FP8", "moonshotai/Kimi-K2.6")},
+        fetched_at_unix=_time.time(),
+    )
     ts.reset_default_sentinel_for_tests()
     sentinel = ts.get_default_sentinel()
     # Force only the first BG model OPEN; second remains CLOSED.
@@ -249,6 +277,7 @@ def test_circuit_breaker_sentinel_on_one_model_healthy_holds_fire(
     assert fired is False
     assert reason == "sentinel_dw_available"
     ts.reset_default_sentinel_for_tests()
+    pt.clear_dynamic_catalog()
 
 
 def test_circuit_breaker_sentinel_on_severed_cascade_holds_fire(
@@ -256,12 +285,24 @@ def test_circuit_breaker_sentinel_on_severed_cascade_holds_fire(
 ) -> None:
     """Sentinel ON + every STANDARD model OPEN + fallback=cascade_to_claude:
     breaker does NOT fire (cascade is the contract). The caller's
-    late-detection path will route to Claude."""
+    late-detection path will route to Claude.
+
+    Phase 12 Slice E — populate dynamic catalog (YAML purged)."""
+    import time as _time
     monkeypatch.setenv("JARVIS_TOPOLOGY_SENTINEL_ENABLED", "true")
     monkeypatch.setenv(
         "JARVIS_TOPOLOGY_SENTINEL_STATE_DIR", str(tmp_path),
     )
     pt._CACHED_TOPOLOGY = None
+    pt.set_dynamic_catalog(
+        {"standard": (
+            "moonshotai/Kimi-K2.6",
+            "zai-org/GLM-5.1-FP8",
+            "Qwen/Qwen3.6-35B-A3B-FP8",
+            "Qwen/Qwen3.5-397B-A17B",
+        )},
+        fetched_at_unix=_time.time(),
+    )
     ts.reset_default_sentinel_for_tests()
     sentinel = ts.get_default_sentinel()
     # Force every STANDARD model OPEN.
@@ -279,6 +320,7 @@ def test_circuit_breaker_sentinel_on_severed_cascade_holds_fire(
     assert fired is False
     assert "sentinel_severed_cascade_to_claude" in reason
     ts.reset_default_sentinel_for_tests()
+    pt.clear_dynamic_catalog()
 
 
 # ---------------------------------------------------------------------------
@@ -292,49 +334,72 @@ def test_production_yaml_immediate_has_no_dw_models() -> None:
     assert topo.dw_models_for_route("immediate") == ()
 
 
-def test_production_yaml_standard_complex_share_ranked_list() -> None:
+def test_production_yaml_standard_complex_post_purge_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 12 Slice E — STANDARD/COMPLEX YAML dw_models lists are
+    purged (catalog is the source). With authoritative=false (hot-
+    revert) AND no catalog populated, both routes return ().
+
+    Pre-purge this test pinned 'Kimi-K2.6 first in STANDARD'; that
+    ranking is now the classifier's responsibility (covered by
+    test_dw_catalog_classifier.py)."""
+    monkeypatch.setenv("JARVIS_DW_CATALOG_AUTHORITATIVE", "false")
     pt._CACHED_TOPOLOGY = None
+    pt.clear_dynamic_catalog()
     topo = pt.get_topology()
-    assert topo.dw_models_for_route("standard") == (
-        topo.dw_models_for_route("complex")
-    )
-    # Pin first model to Kimi-K2.6 — the audit's primary pick.
-    assert topo.dw_models_for_route("standard")[0] == "moonshotai/Kimi-K2.6"
+    assert topo.dw_models_for_route("standard") == ()
+    assert topo.dw_models_for_route("complex") == ()
 
 
-def test_production_yaml_bg_cheap_first_ordering() -> None:
-    """BG is cost-sensitive; cheapest model first per PRD §3.7.3."""
+def test_production_yaml_bg_post_purge_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 12 Slice E — BG YAML dw_models is purged. Cheap-first
+    ordering is now classifier's responsibility (BACKGROUND gate
+    max_out_price=$0.5/M)."""
+    monkeypatch.setenv("JARVIS_DW_CATALOG_AUTHORITATIVE", "false")
     pt._CACHED_TOPOLOGY = None
+    pt.clear_dynamic_catalog()
     topo = pt.get_topology()
-    bg_models = topo.dw_models_for_route("background")
-    # Qwen3.6-35B is the cheapest in the BG list ($0.25/$2.00 per M).
-    assert bg_models[0] == "Qwen/Qwen3.6-35B-A3B-FP8"
+    assert topo.dw_models_for_route("background") == ()
 
 
-def test_production_yaml_speculative_only_ultra_cheap() -> None:
-    """SPECULATIVE must contain only the cheapest models in the
-    catalog — fire-and-forget pre-computation can't justify $1/M
-    output spend."""
+def test_production_yaml_speculative_post_purge_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 12 Slice E — SPECULATIVE YAML dw_models is purged.
+    Ultra-cheap-only constraint is now classifier's responsibility
+    (SPECULATIVE gate max_out_price=$0.1/M + Zero-Trust §3.6
+    quarantine pin for ambiguous-metadata models)."""
+    monkeypatch.setenv("JARVIS_DW_CATALOG_AUTHORITATIVE", "false")
     pt._CACHED_TOPOLOGY = None
+    pt.clear_dynamic_catalog()
     topo = pt.get_topology()
-    spec_models = topo.dw_models_for_route("speculative")
-    assert "Qwen/Qwen3.5-9B" in spec_models
-    assert "Qwen/Qwen3.5-4B" in spec_models
-    # No frontier-tier models slip in.
-    assert "moonshotai/Kimi-K2.6" not in spec_models
-    assert "Qwen/Qwen3.5-397B-A17B" not in spec_models
+    assert topo.dw_models_for_route("speculative") == ()
 
 
-def test_production_yaml_legacy_397b_demoted_to_last() -> None:
-    """The model that originally stream-stalled (Qwen3.5-397B) must
-    not be promoted ahead of the newer model families. Pin it last
-    in the STANDARD/COMPLEX rank — present (operators may want to
-    re-test it once stabilized) but not preferred."""
+def test_production_yaml_post_purge_no_static_curation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 12 Slice E PURGE invariant: no model_ids hardcoded in
+    YAML for any generative route. Catalog is the source. This test
+    is the source-level pin that prevents accidental re-introduction
+    of static curation in a future PR.
+
+    Pre-purge variants asserted 'Qwen3.5-397B-A17B demoted to last'
+    in STANDARD; that's now covered by classifier ranking weights."""
+    monkeypatch.setenv("JARVIS_DW_CATALOG_AUTHORITATIVE", "false")
     pt._CACHED_TOPOLOGY = None
+    pt.clear_dynamic_catalog()
     topo = pt.get_topology()
-    standard = topo.dw_models_for_route("standard")
-    if "Qwen/Qwen3.5-397B-A17B" in standard:
-        assert standard[-1] == "Qwen/Qwen3.5-397B-A17B"
+    for route in ("standard", "complex", "background", "speculative"):
+        entry = topo.routes.get(route)
+        assert entry is not None
+        assert entry.dw_models == (), (
+            f"Slice E purge: yaml dw_models for {route!r} should be "
+            f"empty — got {entry.dw_models}"
+        )
 
 
 def test_production_yaml_no_claude_models_in_dw_lists() -> None:

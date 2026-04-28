@@ -97,10 +97,12 @@ def _client(session: Any, cache_path: Optional[Path] = None) -> DwCatalogClient:
 # ===========================================================================
 
 
-def test_discovery_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Slice A ships default-off; Slice E flips."""
+def test_discovery_default_on_post_graduation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slice E graduation flip: unset/empty env returns True."""
     monkeypatch.delenv("JARVIS_DW_CATALOG_DISCOVERY_ENABLED", raising=False)
-    assert discovery_enabled() is False
+    assert discovery_enabled() is True
 
 
 def test_discovery_truthy_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -110,7 +112,10 @@ def test_discovery_truthy_values(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_discovery_falsy_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    for val in ("0", "false", "no", "off", "", "garbage"):
+    """Post-graduation: empty string is the unset-marker for default
+    True, so it's NOT in the falsy list. Hot-revert requires an
+    explicit ``false``-class string."""
+    for val in ("0", "false", "no", "off", "garbage"):
         monkeypatch.setenv("JARVIS_DW_CATALOG_DISCOVERY_ENABLED", val)
         assert discovery_enabled() is False
 

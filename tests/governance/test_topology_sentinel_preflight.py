@@ -68,6 +68,10 @@ def test_sentinel_init_error_empty_assertions() -> None:
 def test_preflight_returns_healthy_with_master_flag_on(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    """Phase 12 Slice E — post-purge YAML has empty dw_models on all
+    generative routes; preflight tolerates this with a
+    ``dw_models_pending_discovery`` diagnostic when discovery is
+    enabled. Healthy still True (boot hook fires after preflight)."""
     monkeypatch.setenv("JARVIS_TOPOLOGY_SENTINEL_ENABLED", "true")
     monkeypatch.setenv(
         "JARVIS_TOPOLOGY_SENTINEL_STATE_DIR", str(tmp_path),
@@ -81,7 +85,10 @@ def test_preflight_returns_healthy_with_master_flag_on(
     assert result.flag_enabled is True
     assert result.topology_loaded is True
     assert result.schema_version == "topology.2"
-    assert "background" in result.routes_with_dw_models
+    # Post-purge: no routes have YAML-authored dw_models. Discovery
+    # populates them async; preflight runs before boot hook.
+    assert result.routes_with_dw_models == ()
+    assert "dw_models_pending_discovery" in result.diagnostics
     assert result.monitor_config_present is True
     assert result.state_dir_writable is True
     ts.reset_default_sentinel_for_tests()
@@ -102,11 +109,14 @@ def test_preflight_with_master_flag_off_still_returns_result(
     assert "master_flag_off" in result.diagnostics
 
 
-def test_preflight_routes_with_dw_models_drops_immediate(
+def test_preflight_routes_with_dw_models_post_purge(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """IMMEDIATE has empty dw_models by design (Manifesto §5 — Claude
-    direct). It must NOT appear in routes_with_dw_models."""
+    """Phase 12 Slice E — post-purge YAML has empty dw_models on
+    every generative route. The dynamic catalog populates them after
+    boot. Pre-purge this test pinned ``standard`` and ``background``
+    in routes_with_dw_models; that assertion is now the catalog's
+    job (covered by Phase 12 graduation pin suite)."""
     monkeypatch.setenv("JARVIS_TOPOLOGY_SENTINEL_ENABLED", "true")
     monkeypatch.setenv(
         "JARVIS_TOPOLOGY_SENTINEL_STATE_DIR", str(tmp_path),
@@ -115,9 +125,13 @@ def test_preflight_routes_with_dw_models_drops_immediate(
     pt._CACHED_TOPOLOGY = None
     ts.reset_default_sentinel_for_tests()
     result = ts.preflight_check()
+    # IMMEDIATE has empty dw_models by Manifesto §5 design (NOT just
+    # by purge) — that invariant survives Slice E
     assert "immediate" not in result.routes_with_dw_models
-    assert "standard" in result.routes_with_dw_models
-    assert "background" in result.routes_with_dw_models
+    # Post-purge YAML: all generative routes are empty until catalog
+    # populates them. preflight tolerates with a pending diagnostic
+    assert result.routes_with_dw_models == ()
+    assert "dw_models_pending_discovery" in result.diagnostics
     ts.reset_default_sentinel_for_tests()
 
 
