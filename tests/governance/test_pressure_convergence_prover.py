@@ -352,10 +352,25 @@ class TestCustomConfig:
             backlog_warn=3, backlog_high=6, backlog_critical=10,
             fanout_ok=8, fanout_warn=4, fanout_high=2, fanout_critical=1,
         )
+        # arrival=1 == fanout_critical → always drains
         r = prove_convergence(
-            arrival_rate=3, initial_backlog=50, config=config,
+            arrival_rate=1, initial_backlog=50, config=config,
         )
         assert r.verdict in (ConvergenceVerdict.DRAINED, ConvergenceVerdict.CONVERGED)
+
+    def test_tight_thresholds_trapped(self):
+        from backend.core.ouroboros.governance.pressure_convergence_prover import (
+            prove_convergence, PressureConfig, ConvergenceVerdict,
+        )
+        config = PressureConfig(
+            backlog_warn=3, backlog_high=6, backlog_critical=10,
+            fanout_ok=8, fanout_warn=4, fanout_high=2, fanout_critical=1,
+        )
+        # arrival=3 > fanout_critical=1, backlog=50 → CRITICAL trap
+        r = prove_convergence(
+            arrival_rate=3, initial_backlog=50, config=config, max_ticks=200,
+        )
+        assert r.verdict == ConvergenceVerdict.OVERLOADED
 
 
 # ---------------------------------------------------------------------------
