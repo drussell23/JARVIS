@@ -64,6 +64,66 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
+# Phase 1 Slice 1.3 — register the route-decision adapter at module
+# load. The adapter converts a ``(ProviderRoute, reason_str)`` tuple
+# into a JSON-friendly dict for storage, and reconstitutes the tuple
+# on REPLAY so callers receive the same Python shape they'd have
+# received from the live UrgencyRouter call.
+def _register_route_adapter() -> None:
+    """Idempotent — safe to import multiple times. Defensive
+    (NEVER raises) so a missing determinism module doesn't break
+    the route runner import chain."""
+    try:
+        from backend.core.ouroboros.governance.determinism.phase_capture import (
+            OutputAdapter,
+            register_adapter,
+        )
+        from backend.core.ouroboros.governance.urgency_router import (
+            ProviderRoute,
+        )
+
+        def _serialize(route_tuple: Any) -> Any:
+            try:
+                route, reason = route_tuple
+                return {
+                    "route": str(route.value) if hasattr(route, "value")
+                    else str(route),
+                    "reason": str(reason or ""),
+                }
+            except Exception:  # noqa: BLE001 — defensive
+                return {"route": "", "reason": str(route_tuple)[:200]}
+
+        def _deserialize(stored: Any) -> Any:
+            try:
+                if not isinstance(stored, dict):
+                    return stored
+                route_str = str(stored.get("route", ""))
+                reason = str(stored.get("reason", ""))
+                # ProviderRoute is a str-Enum so this constructor
+                # accepts the raw string value.
+                return (ProviderRoute(route_str), reason)
+            except (ValueError, KeyError, TypeError):
+                return stored
+
+        register_adapter(
+            phase="ROUTE",
+            kind="route_assignment",
+            adapter=OutputAdapter(
+                serialize=_serialize,
+                deserialize=_deserialize,
+                name="route_assignment_adapter",
+            ),
+        )
+    except Exception:  # noqa: BLE001 — defensive (import-time)
+        # Determinism module unavailable — wiring still works as a
+        # pure passthrough via capture_phase_decision's internal
+        # short-circuit. No log spam at import time.
+        pass
+
+
+_register_route_adapter()
+
+
 class ROUTERunner(PhaseRunner):
     """Verbatim transcription of orchestrator.py ROUTE block (~2048-2141/2257)."""
 
@@ -108,10 +168,47 @@ class ROUTERunner(PhaseRunner):
         # ── Urgency-aware provider routing (Manifesto §5 Tier 0) ──
         try:
             from backend.core.ouroboros.governance.urgency_router import (
+                ProviderRoute,
                 UrgencyRouter,
             )
             _urgency_router = UrgencyRouter()
-            _provider_route, _route_reason = _urgency_router.classify(ctx)
+
+            # Phase 1 Slice 1.3 — wrap the route decision in
+            # capture_phase_decision so RECORD/REPLAY/VERIFY work.
+            # When the master flag is off, this is a pure passthrough
+            # that calls _urgency_router.classify(ctx) directly with
+            # negligible overhead. Adapter is registered at module
+            # load below.
+            try:
+                from backend.core.ouroboros.governance.determinism.phase_capture import (
+                    capture_phase_decision,
+                )
+
+                async def _classify_route() -> Any:
+                    return _urgency_router.classify(ctx)
+
+                _route_tuple = await capture_phase_decision(
+                    op_id=ctx.op_id,
+                    phase="ROUTE",
+                    kind="route_assignment",
+                    ctx=ctx,
+                    compute=_classify_route,
+                )
+                _provider_route, _route_reason = _route_tuple
+            except Exception:  # noqa: BLE001 — defensive
+                # Capture wrapper failed → fall back to direct call.
+                # Determinism is best-effort; routing must always
+                # succeed. Operators see the warning in capture's
+                # internal logging.
+                logger.debug(
+                    "[Orchestrator] capture_phase_decision failed; "
+                    "falling back to direct UrgencyRouter call",
+                    exc_info=True,
+                )
+                _provider_route, _route_reason = (
+                    _urgency_router.classify(ctx)
+                )
+
             object.__setattr__(ctx, "provider_route", _provider_route.value)
             object.__setattr__(ctx, "provider_route_reason", _route_reason)
             logger.info(

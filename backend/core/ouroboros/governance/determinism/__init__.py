@@ -48,6 +48,12 @@ from backend.core.ouroboros.governance.determinism.entropy import (
     entropy_enabled,
     entropy_for,
 )
+from backend.core.ouroboros.governance.determinism.phase_capture import (
+    OutputAdapter,
+    capture_phase_decision,
+    phase_capture_enabled,
+    register_adapter,
+)
 
 __all__ = [
     "DecisionMismatchError",
@@ -56,15 +62,19 @@ __all__ = [
     "DeterministicEntropy",
     "FrozenClock",
     "LedgerMode",
+    "OutputAdapter",
     "RealClock",
     "SessionEntropy",
     "VerifyResult",
+    "capture_phase_decision",
     "clock_enabled",
     "clock_for_session",
     "decide",
     "entropy_enabled",
     "entropy_for",
     "ledger_enabled",
+    "phase_capture_enabled",
+    "register_adapter",
     "runtime_for_session",
     "runtime_session",
 ]
