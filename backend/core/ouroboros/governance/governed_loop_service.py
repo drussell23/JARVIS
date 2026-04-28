@@ -2894,6 +2894,70 @@ class GovernedLoopService:
                     "[GovernedLoop] DoublewordProvider: configured (model=%s, mode=%s)",
                     tier0._model, _mode,
                 )
+
+                # ============================================================
+                # Phase 12.2 Slice F — Autonomic Pacemaker
+                # ============================================================
+                # Eradicate the lazy-boot deadlock: in an idle dev environment
+                # the only sensor that fires is BacklogSensor (BG-only route).
+                # BG never cascades to Claude (project_bg_spec_sealed.md). BG
+                # depends on the dynamic catalog. Lazy-boot wires discovery to
+                # fire on first DW dispatch — but the empty catalog short-
+                # circuits dispatch BEFORE the boot hook runs, deadlocking the
+                # entire Phase 12.2 cognitive substrate.
+                #
+                # The fix: arm discovery EAGERLY at orchestrator startup,
+                # asynchronously, BEFORE pulling ops from any queue. Once
+                # boot_discovery_once fires, it both:
+                #   1. populates the dynamic catalog (one-shot inline cycle)
+                #   2. spawns the periodic refresh task (30-min cadence per
+                #      JARVIS_DW_CATALOG_REFRESH_S, default 1800s) — a true
+                #      autonomic heartbeat independent of operator traffic.
+                #
+                # Fire-and-forget: never blocks the boot sequence. Worst case
+                # (DW endpoint down) the catalog stays empty + retry refresh
+                # task keeps trying every 30 min. Exception is swallowed at
+                # this seam — orchestrator boot must NEVER fail because
+                # discovery had a bad day.
+                try:
+                    from backend.core.ouroboros.governance.dw_catalog_client import (
+                        discovery_enabled as _discovery_enabled,
+                    )
+                    from backend.core.ouroboros.governance.dw_discovery_runner import (
+                        boot_discovery_once as _boot_discovery_once,
+                    )
+                    if (
+                        _discovery_enabled()
+                        and getattr(tier0, "is_available", True)
+                    ):
+                        _pacemaker_session = await tier0._get_session()
+                        asyncio.create_task(
+                            _boot_discovery_once(
+                                session=_pacemaker_session,
+                                base_url=tier0._base_url,
+                                api_key=tier0._api_key,
+                            ),
+                            name="dw_autonomic_pacemaker",
+                        )
+                        logger.info(
+                            "[GovernedLoop] Autonomic Pacemaker armed — "
+                            "DW catalog discovery + 30-min refresh cadence "
+                            "running asynchronously (Phase 12.2 Slice F)",
+                        )
+                    else:
+                        logger.info(
+                            "[GovernedLoop] Autonomic Pacemaker skipped "
+                            "(discovery_enabled=%s, dw_available=%s)",
+                            _discovery_enabled(),
+                            getattr(tier0, "is_available", True),
+                        )
+                except Exception as _pacemaker_exc:  # noqa: BLE001
+                    logger.warning(
+                        "[GovernedLoop] Autonomic Pacemaker arm failed "
+                        "(non-fatal): %s — DW dispatch will fall back to "
+                        "lazy boot on first op", _pacemaker_exc,
+                    )
+
                 # Boot Semantic Triage Engine (DW 35B pre-analysis)
                 try:
                     from backend.core.ouroboros.governance.semantic_triage import (

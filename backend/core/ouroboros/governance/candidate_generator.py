@@ -1991,36 +1991,15 @@ class CandidateGenerator:
             set_dw_model_override as _set_override,
         )
 
-        # Phase 12 Slice E — boot-time discovery hook. Idempotent:
-        # only the first dispatch in a process boots; subsequent
-        # calls fast-path return None. When discovery is off (hot-
-        # revert path), this is a no-op. Boot includes both an
-        # inline first cycle (catalog populated before the read
-        # below) AND spawning the periodic refresh task.
-        try:
-            from backend.core.ouroboros.governance.dw_discovery_runner import (
-                boot_discovery_once as _boot_discovery_once,
-            )
-            _dw_provider = self._tier0
-            if (
-                _dw_provider is not None
-                and hasattr(_dw_provider, "_get_session")
-                and hasattr(_dw_provider, "_base_url")
-                and hasattr(_dw_provider, "_api_key")
-                and getattr(_dw_provider, "is_available", True)
-            ):
-                _session = await _dw_provider._get_session()  # noqa: SLF001
-                await _boot_discovery_once(
-                    session=_session,
-                    base_url=_dw_provider._base_url,  # noqa: SLF001
-                    api_key=_dw_provider._api_key,    # noqa: SLF001
-                )
-        except Exception:  # noqa: BLE001 — defensive; boot hook NEVER blocks dispatch
-            logger.debug(
-                "[CandidateGenerator] boot_discovery_once raised "
-                "unexpectedly — dispatch continues with current state",
-                exc_info=True,
-            )
+        # Phase 12.2 Slice F — discovery is now armed eagerly by the
+        # Autonomic Pacemaker in GovernedLoopService at orchestrator
+        # boot, before any sensor signal is pulled. The dynamic catalog
+        # is populated + the 30-min refresh task is heartbeating before
+        # the dispatcher runs, so this code path never needs to bootstrap
+        # discovery itself. Operator directive 2026-04-28 mandates a
+        # single source of truth — the Pacemaker. If the Pacemaker fails
+        # to arm, operators see the warning at boot rather than a silent
+        # failure on first dispatch.
 
         topology = _get_topology()
         if not topology.enabled:
