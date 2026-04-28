@@ -64,9 +64,16 @@ def fresh_registry():
 # ---------------------------------------------------------------------------
 
 
-def test_oracle_default_false(monkeypatch) -> None:
+def test_oracle_default_true(monkeypatch) -> None:
+    """Phase 2 Slice 2.5 graduated default — env unset → True."""
     monkeypatch.delenv("JARVIS_VERIFICATION_ORACLE_ENABLED", raising=False)
-    assert oracle_enabled() is False
+    assert oracle_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " ", "  "])
+def test_oracle_empty_reads_as_default_true(monkeypatch, val) -> None:
+    monkeypatch.setenv("JARVIS_VERIFICATION_ORACLE_ENABLED", val)
+    assert oracle_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
@@ -75,8 +82,10 @@ def test_oracle_truthy(monkeypatch, val) -> None:
     assert oracle_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
 def test_oracle_falsy(monkeypatch, val) -> None:
+    """Hot-revert: explicit false-class strings disable. Empty/
+    whitespace map to graduated default True post-Slice-2.5."""
     monkeypatch.setenv("JARVIS_VERIFICATION_ORACLE_ENABLED", val)
     assert oracle_enabled() is False
 
