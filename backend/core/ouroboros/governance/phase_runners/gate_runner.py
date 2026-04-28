@@ -671,6 +671,44 @@ class GATERunner(PhaseRunner):
                     )
         # ---- end verbatim transcription ----
 
+        # Phase 1 Slice 1.3.c — capture the GATE risk-tier verdict.
+        # Audit-only: risk_tier mutates through 7+ sites inside this
+        # runner (SimilarityGate, frozen_tier, RISK_CEILING,
+        # SemanticGuardian, MutationGate, MIN_RISK_TIER floor); we
+        # capture the FINAL value at the success path. Fail paths
+        # have their own structured reason codes already.
+        # Closure-over-risk_tier means REPLAY does NOT alter the
+        # mutation flow — gate logic always runs live; only the
+        # terminal verdict is recorded/replayed/verified.
+        try:
+            from backend.core.ouroboros.governance.determinism.phase_capture import (
+                capture_phase_decision,
+            )
+
+            async def _gate_digest_compute() -> Any:
+                return {
+                    "risk_tier": (
+                        risk_tier.name
+                        if hasattr(risk_tier, "name")
+                        else str(risk_tier)
+                    ),
+                    "has_best_candidate": bool(best_candidate),
+                }
+
+            await capture_phase_decision(
+                op_id=ctx.op_id,
+                phase="GATE",
+                kind="risk_tier_assignment",
+                ctx=ctx,
+                compute=_gate_digest_compute,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[Orchestrator] capture_phase_decision failed for "
+                "GATE/risk_tier_assignment; gate verdict still applies",
+                exc_info=True,
+            )
+
         return PhaseResult(
             next_ctx=ctx,
             next_phase=OperationPhase.APPROVE,
