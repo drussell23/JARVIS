@@ -97,6 +97,7 @@ async def run_discovery(
     ledger: PromotionLedger,
     cache_path: Optional[Any] = None,   # Path | None
     classifier: Optional[DwCatalogClassifier] = None,
+    modality_ledger: Optional[Any] = None,  # Slice G — ModalityLedger
 ) -> DiscoveryResult:
     """Run one full discovery cycle. NEVER raises.
 
@@ -105,6 +106,14 @@ async def run_discovery(
     consistent. ``ledger`` mutations (newly_quarantined registration)
     happen here — the runner is the side-effect coordinator that
     keeps the classifier itself pure.
+
+    Phase 12 Slice G — when ``modality_ledger`` is provided AND
+    ``JARVIS_DW_MODALITY_VERIFICATION_ENABLED=true``, the runner
+    invokes ``verify_catalog_modalities`` after fetch (parses metadata
+    + fires micro-probes for ambiguous models), then passes the
+    ledger to the classifier as a HARD GATE excluding NON_CHAT
+    models from generative routes. modality_ledger=None preserves
+    legacy classifier behavior — no modality filtering.
 
     Returns a DiscoveryResult; check ``result.ok`` to know whether
     the holder was populated with a fresh snapshot or whether the
@@ -140,10 +149,62 @@ async def run_discovery(
             f"catalog_fetch_failed:{snapshot.fetch_failure_reason}"
         )
 
+    # Step 1.5: Slice G — modality verification (metadata + probes)
+    # Runs BEFORE classify so the ledger is populated with verdicts
+    # the classifier can consult. Gated by master flag — when off,
+    # modality_ledger stays empty and the classifier behaves legacy.
+    if modality_ledger is not None:
+        try:
+            from backend.core.ouroboros.governance.dw_modality_ledger import (
+                modality_verification_enabled,
+            )
+            from backend.core.ouroboros.governance.dw_modality_probe import (
+                verify_catalog_modalities,
+            )
+        except ImportError as exc:
+            logger.debug(
+                "[DiscoveryRunner] modality module import failed: %s", exc,
+            )
+            modality_verification_enabled = lambda: False  # noqa: E731
+            verify_catalog_modalities = None
+        if (
+            verify_catalog_modalities is not None
+            and modality_verification_enabled()
+        ):
+            try:
+                # Catalog snapshot id = stable hash of model_id set so
+                # ledger verdicts invalidate when DW catalog changes
+                _snapshot_id = _compute_snapshot_id(snapshot)
+                _verify = await verify_catalog_modalities(
+                    snapshot=snapshot,
+                    ledger=modality_ledger,
+                    session=session,
+                    base_url=base_url,
+                    api_key=api_key,
+                    catalog_snapshot_id=_snapshot_id,
+                )
+                diagnostics.append(
+                    f"modality_verify:metadata={_verify.metadata_verdicts}:"
+                    f"probes={_verify.probes_fired}:"
+                    f"chat_capable={_verify.probes_succeeded}:"
+                    f"non_chat={_verify.probes_rejected}:"
+                    f"unknown={_verify.probes_inconclusive}:"
+                    f"skipped={_verify.skipped_already_known}:"
+                    f"latency_ms={_verify.duration_ms}"
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[DiscoveryRunner] modality verification failed",
+                    exc_info=True,
+                )
+                diagnostics.append("modality_verify_failed")
+
     # Step 2: classify
     classifier = classifier or DwCatalogClassifier()
     try:
-        outcome = classifier.classify(snapshot, ledger)
+        outcome = classifier.classify(
+            snapshot, ledger, modality_ledger=modality_ledger,
+        )
     except Exception as exc:  # noqa: BLE001 — defensive
         logger.warning(
             "[DiscoveryRunner] classify raised unexpectedly: %s", exc,
@@ -246,6 +307,25 @@ def _diff_summary(yaml_diff: Mapping[str, RouteDiff]) -> str:
     return f"yaml_diff[{';'.join(parts)}]"
 
 
+def _compute_snapshot_id(snapshot: Any) -> str:
+    """Stable id for a catalog snapshot — used to invalidate stale
+    modality ledger verdicts on catalog refresh. Hashes the sorted
+    model_id list so a re-fetch with identical contents produces the
+    same id (no spurious invalidation), but a model add/remove flips
+    the id and triggers ledger reset for that model.
+
+    Returns first 16 chars of sha256 hex (collision-tolerant — false
+    invalidation just means re-running the modality probe). NEVER
+    raises."""
+    import hashlib
+    try:
+        ids = sorted(m.model_id for m in getattr(snapshot, "models", ()))
+        joined = ",".join(ids).encode("utf-8")
+        return hashlib.sha256(joined).hexdigest()[:16]
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
+
+
 def _failed_result(
     *,
     fetch_failure_reason: str,
@@ -306,6 +386,7 @@ _BOOT_DISCOVERY_LOCK = asyncio.Lock()
 _BOOT_DISCOVERY_DONE: bool = False
 _REFRESH_TASK: Optional[asyncio.Task] = None
 _LEDGER_SINGLETON: Optional[PromotionLedger] = None
+_MODALITY_LEDGER_SINGLETON: Optional[Any] = None  # Slice G
 # Sync lock around the singleton hydration + boot flag — protects the
 # very first-call window before the asyncio.Lock has been touched.
 _BOOT_SYNC_LOCK = threading.Lock()
@@ -322,16 +403,40 @@ def _get_or_create_ledger() -> PromotionLedger:
         return _LEDGER_SINGLETON
 
 
+def _get_or_create_modality_ledger() -> Optional[Any]:
+    """Slice G — lazy ModalityLedger singleton. Returns None when the
+    master flag is off OR import fails (defensive for older deploys
+    that haven't shipped the module yet)."""
+    global _MODALITY_LEDGER_SINGLETON
+    try:
+        from backend.core.ouroboros.governance.dw_modality_ledger import (
+            ModalityLedger,
+            modality_verification_enabled,
+        )
+    except ImportError:
+        return None
+    if not modality_verification_enabled():
+        return None
+    with _BOOT_SYNC_LOCK:
+        if _MODALITY_LEDGER_SINGLETON is None:
+            mled = ModalityLedger()
+            mled.load()
+            _MODALITY_LEDGER_SINGLETON = mled
+        return _MODALITY_LEDGER_SINGLETON
+
+
 def reset_boot_state_for_tests() -> None:
     """Test hook — clears the boot flag, cancels any refresh task,
-    drops the ledger singleton. Production code MUST NOT call this."""
+    drops the ledger singletons. Production code MUST NOT call this."""
     global _BOOT_DISCOVERY_DONE, _REFRESH_TASK, _LEDGER_SINGLETON
+    global _MODALITY_LEDGER_SINGLETON
     with _BOOT_SYNC_LOCK:
         _BOOT_DISCOVERY_DONE = False
         if _REFRESH_TASK is not None and not _REFRESH_TASK.done():
             _REFRESH_TASK.cancel()
         _REFRESH_TASK = None
         _LEDGER_SINGLETON = None
+        _MODALITY_LEDGER_SINGLETON = None
 
 
 async def boot_discovery_once(
@@ -363,11 +468,13 @@ async def boot_discovery_once(
         if _BOOT_DISCOVERY_DONE:
             return None
         ledger = _get_or_create_ledger()
+        modality_ledger = _get_or_create_modality_ledger()  # Slice G
         first_result = await run_discovery(
             session=session,
             base_url=base_url,
             api_key=api_key,
             ledger=ledger,
+            modality_ledger=modality_ledger,
         )
         _BOOT_DISCOVERY_DONE = True
         # Spawn the refresh loop. We DON'T await; it runs forever
@@ -379,6 +486,7 @@ async def boot_discovery_once(
                     base_url=base_url,
                     api_key=api_key,
                     ledger=ledger,
+                    modality_ledger=modality_ledger,
                 ),
                 name="dw_discovery_refresh_loop",
             )
@@ -405,6 +513,7 @@ async def _discovery_refresh_loop(
     base_url: str,
     api_key: str,
     ledger: PromotionLedger,
+    modality_ledger: Optional[Any] = None,  # Slice G
 ) -> None:
     """Periodic refresh. Each cycle:
       1. Sleeps for JARVIS_DW_CATALOG_REFRESH_S (default 1800s)
@@ -430,6 +539,7 @@ async def _discovery_refresh_loop(
                 base_url=base_url,
                 api_key=api_key,
                 ledger=ledger,
+                modality_ledger=modality_ledger,
             )
         except asyncio.CancelledError:
             return

@@ -119,7 +119,7 @@ def extract_metadata_verdict(card: ModelCard) -> Optional[bool]:
       * ``False`` — explicit non-chat signal in metadata
       * ``None`` — no recognized signal (defer to micro-probe)
 
-    NEVER reads ``card.model_id`` for inference. NEVER raises."""
+    NEVER reads the model id field for inference. NEVER raises."""
     try:
         raw = json.loads(card.raw_metadata_json or "{}")
     except (json.JSONDecodeError, TypeError):
