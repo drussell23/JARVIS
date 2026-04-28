@@ -428,9 +428,11 @@ from backend.core.ouroboros.governance.dw_catalog_client import (
 _BOOT_DISCOVERY_LOCK = asyncio.Lock()
 _BOOT_DISCOVERY_DONE: bool = False
 _REFRESH_TASK: Optional[asyncio.Task] = None
+_HEAVY_PROBE_TASK: Optional[asyncio.Task] = None  # Slice 12.2.D
 _LEDGER_SINGLETON: Optional[PromotionLedger] = None
 _MODALITY_LEDGER_SINGLETON: Optional[Any] = None  # Slice G
 _TTFT_OBSERVER_SINGLETON: Optional[Any] = None  # Slice 12.2.C
+_HEAVY_PROBE_BUDGET_SINGLETON: Optional[Any] = None  # Slice 12.2.D
 # Sync lock around the singleton hydration + boot flag — protects the
 # very first-call window before the asyncio.Lock has been touched.
 _BOOT_SYNC_LOCK = threading.Lock()
@@ -500,20 +502,55 @@ def get_ttft_observer() -> Optional[Any]:
     return _get_or_create_ttft_observer()
 
 
+def _get_or_create_heavy_probe_budget() -> Optional[Any]:
+    """Slice 12.2.D — lazy HeavyProbeBudget singleton.
+
+    Returns None when ``heavy_probe_enabled()`` is ``false`` OR import
+    fails. Hydrates from disk on first access. Defensive for older
+    deploys that haven't shipped the module yet."""
+    global _HEAVY_PROBE_BUDGET_SINGLETON
+    try:
+        from backend.core.ouroboros.governance.dw_heavy_probe import (
+            HeavyProbeBudget,
+            heavy_probe_enabled,
+        )
+    except ImportError:
+        return None
+    if not heavy_probe_enabled():
+        return None
+    with _BOOT_SYNC_LOCK:
+        if _HEAVY_PROBE_BUDGET_SINGLETON is None:
+            bud = HeavyProbeBudget()
+            bud.load()
+            _HEAVY_PROBE_BUDGET_SINGLETON = bud
+        return _HEAVY_PROBE_BUDGET_SINGLETON
+
+
+def get_heavy_probe_budget() -> Optional[Any]:
+    """Public accessor for the HeavyProbeBudget singleton. Returns
+    None when the heavy-probe master flag is off."""
+    return _get_or_create_heavy_probe_budget()
+
+
 def reset_boot_state_for_tests() -> None:
     """Test hook — clears the boot flag, cancels any refresh task,
     drops the ledger singletons. Production code MUST NOT call this."""
     global _BOOT_DISCOVERY_DONE, _REFRESH_TASK, _LEDGER_SINGLETON
     global _MODALITY_LEDGER_SINGLETON, _TTFT_OBSERVER_SINGLETON
+    global _HEAVY_PROBE_TASK, _HEAVY_PROBE_BUDGET_SINGLETON
     global _LAST_SNAPSHOT_ID
     with _BOOT_SYNC_LOCK:
         _BOOT_DISCOVERY_DONE = False
         if _REFRESH_TASK is not None and not _REFRESH_TASK.done():
             _REFRESH_TASK.cancel()
         _REFRESH_TASK = None
+        if _HEAVY_PROBE_TASK is not None and not _HEAVY_PROBE_TASK.done():
+            _HEAVY_PROBE_TASK.cancel()
+        _HEAVY_PROBE_TASK = None
         _LEDGER_SINGLETON = None
         _MODALITY_LEDGER_SINGLETON = None
         _TTFT_OBSERVER_SINGLETON = None
+        _HEAVY_PROBE_BUDGET_SINGLETON = None
         _LAST_SNAPSHOT_ID = ""
 
 
@@ -578,6 +615,34 @@ async def boot_discovery_once(
             logger.debug(
                 "[DiscoveryRunner] no running loop — refresh skipped",
             )
+
+        # Slice 12.2.D — spawn heavy-probe scheduler when master flag
+        # is on. Same pattern as refresh loop: best-effort, swallows
+        # missing-loop errors. Skipped silently when flag off so
+        # master-off boot is bit-for-bit identical to pre-Slice-D.
+        global _HEAVY_PROBE_TASK
+        try:
+            from backend.core.ouroboros.governance.dw_heavy_probe import (
+                heavy_probe_enabled,
+            )
+            if heavy_probe_enabled():
+                _HEAVY_PROBE_TASK = asyncio.create_task(
+                    _heavy_probe_loop(
+                        session=session,
+                        base_url=base_url,
+                        api_key=api_key,
+                    ),
+                    name="dw_heavy_probe_loop",
+                )
+        except RuntimeError:
+            logger.debug(
+                "[DiscoveryRunner] no running loop — heavy probe skipped",
+            )
+        except Exception:  # noqa: BLE001 — defensive (import / other)
+            logger.debug(
+                "[DiscoveryRunner] heavy probe spawn failed",
+                exc_info=True,
+            )
         logger.info(
             "[DiscoveryRunner] boot complete: ok=%s models=%d "
             "newly_quarantined=%d routes_assigned=%s",
@@ -633,10 +698,90 @@ async def _discovery_refresh_loop(
             )
 
 
+async def _heavy_probe_loop(
+    *,
+    session: Any,
+    base_url: str,
+    api_key: str,
+) -> None:
+    """Slice 12.2.D — heavy-probe scheduler loop.
+
+    Each cycle:
+      1. Sleeps for ``_scheduler_cycle_s()`` (default 120s)
+      2. Re-checks the master flag (operator may have flipped off)
+      3. Reads the dynamic catalog for SPECULATIVE-route candidates
+         (the exact set we want VRAM-warmth signal on — promoted +
+         cold-storage models are skipped via HeavyProbeScheduler's
+         eligibility rules)
+      4. Calls scheduler.run_cycle to fire at most one probe
+
+    NEVER raises out — every failure caught + logged + continues.
+    Loop survives until task cancellation."""
+    try:
+        from backend.core.ouroboros.governance.dw_heavy_probe import (
+            HeavyProber,
+            HeavyProbeScheduler,
+            _scheduler_cycle_s,
+            heavy_probe_enabled,
+        )
+    except ImportError:
+        logger.debug(
+            "[HeavyProbeLoop] module unavailable — exiting cleanly",
+        )
+        return
+
+    budget = _get_or_create_heavy_probe_budget()
+    if budget is None:
+        logger.debug(
+            "[HeavyProbeLoop] budget unavailable — exiting cleanly",
+        )
+        return
+    prober = HeavyProber(budget=budget)
+    scheduler = HeavyProbeScheduler(prober=prober, budget=budget)
+
+    while True:
+        try:
+            await asyncio.sleep(_scheduler_cycle_s())
+        except asyncio.CancelledError:
+            return
+        if not heavy_probe_enabled():
+            # Hot-revert in flight — keep loop alive so re-flip picks
+            # up immediately. Same pattern as discovery refresh.
+            continue
+        try:
+            from backend.core.ouroboros.governance.provider_topology import (
+                get_dynamic_catalog,
+            )
+            cat = get_dynamic_catalog()
+            # Heavy probes target the SPECULATIVE route — those are
+            # the models in quarantine / cold-storage / unknown state
+            # for which we want VRAM-warm signal.
+            if cat is not None:
+                candidates = cat.assignments_by_route.get(
+                    "speculative", (),
+                )
+            else:
+                candidates = ()
+            await scheduler.run_cycle(
+                session=session,
+                base_url=base_url,
+                api_key=api_key,
+                candidate_ids=tuple(candidates),
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 — defensive
+            logger.exception(
+                "[HeavyProbeLoop] cycle failed; "
+                "next cycle will retry on schedule",
+            )
+
+
 __all__ = [
     "DiscoveryResult",
     "boot_discovery_once",
     "catalog_discovery_enabled",
+    "get_heavy_probe_budget",
     "get_ttft_observer",
     "reset_boot_state_for_tests",
     "run_discovery",
