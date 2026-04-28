@@ -267,8 +267,183 @@ def _failed_result(
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 12 Slice E — Boot-time hook + periodic refresh loop
+# ---------------------------------------------------------------------------
+#
+# The dispatcher (candidate_generator._dispatch_via_sentinel) calls
+# ``boot_discovery_once`` on every dispatch when discovery is enabled.
+# The first call:
+#   1. Acquires the boot lock
+#   2. Ensures the singleton ledger is hydrated from disk
+#   3. Awaits one full discovery cycle inline (~200ms typical) so the
+#      catalog holder is populated BEFORE the dispatcher's first
+#      cascade walks dw_models_for_route
+#   4. Spawns a background refresh task on JARVIS_DW_CATALOG_REFRESH_S
+#      cadence (default 1800s = 30min)
+# Subsequent calls in the same process see the boot flag set and
+# return immediately — idempotent, hot-path-safe.
+#
+# When discovery is OFF, ``boot_discovery_once`` is a no-op — Phase 12
+# graduation hot-revert path stays clean.
+#
+# The refresh loop NEVER raises out of an iteration; every cycle's
+# exceptions are caught + logged + the next refresh fires on schedule.
+# Operator can hot-revert via JARVIS_DW_CATALOG_DISCOVERY_ENABLED=false
+# at runtime; the loop checks the flag each cycle and skips the fetch
+# when off (it does NOT cancel itself — staying alive lets a re-flip
+# pick up immediately without process restart).
+
+import asyncio
+import threading
+
+from backend.core.ouroboros.governance.dw_catalog_client import (
+    _refresh_interval_s as _refresh_interval_s_internal,
+)
+
+
+_BOOT_DISCOVERY_LOCK = asyncio.Lock()
+_BOOT_DISCOVERY_DONE: bool = False
+_REFRESH_TASK: Optional[asyncio.Task] = None
+_LEDGER_SINGLETON: Optional[PromotionLedger] = None
+# Sync lock around the singleton hydration + boot flag — protects the
+# very first-call window before the asyncio.Lock has been touched.
+_BOOT_SYNC_LOCK = threading.Lock()
+
+
+def _get_or_create_ledger() -> PromotionLedger:
+    """Lazy singleton — hydrates from disk on first access."""
+    global _LEDGER_SINGLETON
+    with _BOOT_SYNC_LOCK:
+        if _LEDGER_SINGLETON is None:
+            led = PromotionLedger()
+            led.load()
+            _LEDGER_SINGLETON = led
+        return _LEDGER_SINGLETON
+
+
+def reset_boot_state_for_tests() -> None:
+    """Test hook — clears the boot flag, cancels any refresh task,
+    drops the ledger singleton. Production code MUST NOT call this."""
+    global _BOOT_DISCOVERY_DONE, _REFRESH_TASK, _LEDGER_SINGLETON
+    with _BOOT_SYNC_LOCK:
+        _BOOT_DISCOVERY_DONE = False
+        if _REFRESH_TASK is not None and not _REFRESH_TASK.done():
+            _REFRESH_TASK.cancel()
+        _REFRESH_TASK = None
+        _LEDGER_SINGLETON = None
+
+
+async def boot_discovery_once(
+    *,
+    session: Any,
+    base_url: str,
+    api_key: str,
+) -> Optional[DiscoveryResult]:
+    """Fire-once boot hook. Idempotent: subsequent calls in the same
+    process see the boot flag set and return None immediately
+    (hot-path-safe).
+
+    The first call:
+      * runs one full discovery cycle inline (caller awaits)
+      * populates the dynamic catalog holder
+      * spawns the periodic refresh task
+
+    NEVER raises. Discovery off → returns None. Discovery enabled but
+    fetch failed → returns the failure-marked DiscoveryResult; refresh
+    task is still spawned so a recovering DW endpoint gets re-tried."""
+    global _BOOT_DISCOVERY_DONE, _REFRESH_TASK
+    if not catalog_discovery_enabled():
+        return None
+    # Fast-path no-op when already booted (avoids acquiring the lock
+    # on every dispatch).
+    if _BOOT_DISCOVERY_DONE:
+        return None
+    async with _BOOT_DISCOVERY_LOCK:
+        if _BOOT_DISCOVERY_DONE:
+            return None
+        ledger = _get_or_create_ledger()
+        first_result = await run_discovery(
+            session=session,
+            base_url=base_url,
+            api_key=api_key,
+            ledger=ledger,
+        )
+        _BOOT_DISCOVERY_DONE = True
+        # Spawn the refresh loop. We DON'T await; it runs forever
+        # until cancellation. Capture in module-level for shutdown.
+        try:
+            _REFRESH_TASK = asyncio.create_task(
+                _discovery_refresh_loop(
+                    session=session,
+                    base_url=base_url,
+                    api_key=api_key,
+                    ledger=ledger,
+                ),
+                name="dw_discovery_refresh_loop",
+            )
+        except RuntimeError:
+            # No running loop → caller is sync-only; refresh disabled.
+            # Boot still counts as done; operator can re-enable via
+            # reset_boot_state_for_tests + re-call from async ctx.
+            logger.debug(
+                "[DiscoveryRunner] no running loop — refresh skipped",
+            )
+        logger.info(
+            "[DiscoveryRunner] boot complete: ok=%s models=%d "
+            "newly_quarantined=%d routes_assigned=%s",
+            first_result.ok, first_result.model_count,
+            len(first_result.newly_quarantined),
+            list(first_result.routes_assigned),
+        )
+        return first_result
+
+
+async def _discovery_refresh_loop(
+    *,
+    session: Any,
+    base_url: str,
+    api_key: str,
+    ledger: PromotionLedger,
+) -> None:
+    """Periodic refresh. Each cycle:
+      1. Sleeps for JARVIS_DW_CATALOG_REFRESH_S (default 1800s)
+      2. Re-checks discovery flag (operator may have flipped off)
+      3. Runs a full discovery cycle
+      4. NEVER raises — all exceptions caught + logged
+
+    Loop survives forever until task cancellation (which happens on
+    process shutdown via reset_boot_state_for_tests or natural
+    asyncio cleanup)."""
+    while True:
+        try:
+            await asyncio.sleep(_refresh_interval_s_internal())
+        except asyncio.CancelledError:
+            return
+        if not catalog_discovery_enabled():
+            # Hot-revert in flight — skip the fetch but stay alive
+            # so a re-flip picks up immediately.
+            continue
+        try:
+            await run_discovery(
+                session=session,
+                base_url=base_url,
+                api_key=api_key,
+                ledger=ledger,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 — defensive
+            logger.exception(
+                "[DiscoveryRunner] refresh cycle failed; "
+                "next cycle will retry on schedule",
+            )
+
+
 __all__ = [
     "DiscoveryResult",
+    "boot_discovery_once",
     "catalog_discovery_enabled",
+    "reset_boot_state_for_tests",
     "run_discovery",
 ]

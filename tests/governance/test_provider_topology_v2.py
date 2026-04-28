@@ -539,33 +539,29 @@ def test_production_yaml_parses_as_v2(
     assert topo.schema_version == pt.SCHEMA_VERSION_V2
 
 
-def test_production_yaml_routes_have_audit_recommended_dw_models() -> None:
-    """Slice 3 populated each route's v2 ``dw_models`` ranked list per
-    PRD §3.7.3 audit recommendations. Pin the exact rank order so an
-    accidental yaml refactor can't silently swap models."""
+def test_production_yaml_routes_post_purge_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 12 Slice E — YAML's per-route ``dw_models`` arrays were
+    purged. Catalog is now the source of truth. With authoritative=
+    false (hot-revert) AND no dynamic catalog populated, every route
+    returns ().
+
+    Pre-purge this test pinned the audit-recommended Kimi/GLM/Qwen
+    rank order; that ranking is now the deterministic classifier's
+    responsibility (covered by tests/governance/test_dw_catalog_
+    classifier.py). Slice E's responsibility is the purge invariant."""
+    monkeypatch.setenv("JARVIS_DW_CATALOG_AUTHORITATIVE", "false")
     pt._CACHED_TOPOLOGY = None
+    pt.clear_dynamic_catalog()
     topo = pt.get_topology()
-    # IMMEDIATE intentionally has NO dw_models (Manifesto §5 — Claude direct by design).
+    # IMMEDIATE was always empty by design (Manifesto §5 Claude-direct)
     assert topo.dw_models_for_route("immediate") == ()
-    # STANDARD + COMPLEX share the same ranked list.
-    expected_prefrontal = (
-        "moonshotai/Kimi-K2.6",
-        "zai-org/GLM-5.1-FP8",
-        "Qwen/Qwen3.6-35B-A3B-FP8",
-        "Qwen/Qwen3.5-397B-A17B",
-    )
-    assert topo.dw_models_for_route("standard") == expected_prefrontal
-    assert topo.dw_models_for_route("complex") == expected_prefrontal
-    # BACKGROUND is cost-sensitive — cheap-first ordering.
-    assert topo.dw_models_for_route("background") == (
-        "Qwen/Qwen3.6-35B-A3B-FP8",
-        "moonshotai/Kimi-K2.6",
-    )
-    # SPECULATIVE is fire-and-forget — ultra-cheap only.
-    assert topo.dw_models_for_route("speculative") == (
-        "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.5-4B",
-    )
+    # The four generative routes are now empty post-purge
+    assert topo.dw_models_for_route("standard") == ()
+    assert topo.dw_models_for_route("complex") == ()
+    assert topo.dw_models_for_route("background") == ()
+    assert topo.dw_models_for_route("speculative") == ()
 
 
 def test_production_yaml_v1_block_mode_methods_unchanged() -> None:

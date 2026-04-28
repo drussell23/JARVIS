@@ -100,11 +100,12 @@ def _mock_session(json_body: Any = None, status: int = 200,
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_discovery_enabled_default_off(
+def test_catalog_discovery_enabled_default_on_post_graduation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Slice E graduation flip: unset/empty env returns True."""
     monkeypatch.delenv("JARVIS_DW_CATALOG_DISCOVERY_ENABLED", raising=False)
-    assert catalog_discovery_enabled() is False
+    assert catalog_discovery_enabled() is True
 
 
 def test_catalog_discovery_enabled_truthy(
@@ -112,6 +113,14 @@ def test_catalog_discovery_enabled_truthy(
 ) -> None:
     monkeypatch.setenv("JARVIS_DW_CATALOG_DISCOVERY_ENABLED", "true")
     assert catalog_discovery_enabled() is True
+
+
+def test_catalog_discovery_enabled_falsy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hot-revert path."""
+    monkeypatch.setenv("JARVIS_DW_CATALOG_DISCOVERY_ENABLED", "false")
+    assert catalog_discovery_enabled() is False
 
 
 # ---------------------------------------------------------------------------
@@ -362,12 +371,20 @@ async def test_run_discovery_returns_discovery_result_type(
 
 
 @pytest.mark.asyncio
-async def test_run_discovery_does_not_change_dispatcher_view(
+async def test_run_discovery_authoritative_off_yaml_still_authoritative(
     isolated_cache: Path,
     isolated_ledger: PromotionLedger,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SHADOW MODE: discovery populates the holder; dispatcher's
-    ``dw_models_for_route`` still returns YAML-authored lists."""
+    """Hot-revert path post-graduation: with authoritative flag OFF,
+    discovery populates the holder but dispatcher's
+    ``dw_models_for_route`` still returns YAML's purged-empty list.
+
+    Originally pinned Slice C shadow-mode invariant (authoritative
+    didn't exist yet); rewritten at Slice E to pin the explicit-off
+    hot-revert path. Same architectural invariant: holder is NOT
+    consulted when authoritative is off."""
+    monkeypatch.setenv("JARVIS_DW_CATALOG_AUTHORITATIVE", "false")
     body = {"data": [
         {"id": "dynamic-vendor/m-99B", "parameter_count_b": 99,
          "pricing": {"output": 0.30}},
@@ -384,10 +401,11 @@ async def test_run_discovery_does_not_change_dispatcher_view(
         ledger=isolated_ledger,
         cache_path=isolated_cache,
     )
-    # YAML view UNCHANGED
+    # YAML view UNCHANGED (post-purge it's () — same before + after)
     yaml_complex_after = yaml_topo.dw_models_for_route("complex")
     assert yaml_complex_before == yaml_complex_after
-    # But the dynamic holder now has the new model
+    # But the dynamic holder DOES have the new model — discovery
+    # populated it; the authoritative flag just gated the read
     holder = get_dynamic_catalog()
     assert holder is not None
     assert (

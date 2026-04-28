@@ -1772,7 +1772,23 @@ def preflight_check(
     if not topology_loaded:
         failed.append("topology_not_loaded")
     if require_routes and not routes_with_dw_models:
-        failed.append("no_routes_have_dw_models")
+        # Phase 12 Slice E — post-purge YAML has empty dw_models on
+        # all generative routes; discovery populates the catalog
+        # asynchronously after the boot hook fires. Preflight runs
+        # BEFORE the boot hook, so empty-routes is the legitimate
+        # cold-start state when discovery is enabled. Tolerate it as
+        # a diagnostic; treat as failed only when discovery is OFF
+        # AND YAML has nothing — that's a genuine misconfiguration.
+        try:
+            from backend.core.ouroboros.governance.dw_catalog_client import (
+                discovery_enabled as _disc_enabled,
+            )
+            if _disc_enabled():
+                diagnostics.append("dw_models_pending_discovery")
+            else:
+                failed.append("no_routes_have_dw_models")
+        except Exception:  # noqa: BLE001 — fail closed on import error
+            failed.append("no_routes_have_dw_models")
 
     # Event-loop binding probe — the directive's "async event loop
     # binding" check. ``asyncio.get_running_loop()`` raises
