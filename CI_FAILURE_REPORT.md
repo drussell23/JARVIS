@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: Priority 2 - Biometric Voice Unlock E2E Testing
-- **Run Number**: #504
-- **Branch**: `main`
-- **Commit**: `74df0c2ffbb7b4bcd1aa716ed25c6dc4774a344c`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #48890
+- **Branch**: `fix/ci/priority-2-biometric-voice-unlock-e2e-testing-run504-20260428-073329`
+- **Commit**: `802a1d651745d7c383e3c989769f6955eed871fc`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-28T07:30:58Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25039917548)
+- **Timestamp**: 2026-04-28T07:34:11Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25040046459)
 
 ## Failure Overview
 
@@ -17,63 +17,48 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Integration Biometric Tests - macOS | dependency_error | high | 48s |
+| 1 | Validate PR Title | timeout | high | 5s |
 
 ## Detailed Analysis
 
-### 1. Integration Biometric Tests - macOS
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Dependency Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-28T07:31:15Z
-**Completed**: 2026-04-28T07:32:03Z
-**Duration**: 48 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25039917548/job/73340383154)
+**Started**: 2026-04-28T07:34:16Z
+**Completed**: 2026-04-28T07:34:21Z
+**Duration**: 5 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25040046459/job/73340782074)
 
 #### Failed Steps
 
-- **Step 4**: Install Dependencies
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 6
-  - Sample matches:
-    - Line 38: `2026-04-28T07:32:00.3964560Z   Getting requirements to build wheel: finished with status 'error'`
-    - Line 39: `2026-04-28T07:32:00.3991410Z   error: subprocess-exited-with-error`
-    - Line 60: `2026-04-28T07:32:00.4030700Z       ModuleNotFoundError: No module named 'pkg_resources'`
-
-- Pattern: `FAIL|Failed|failed`
   - Occurrences: 2
   - Sample matches:
-    - Line 64: `2026-04-28T07:32:00.4032030Z ERROR: Failed to build 'openai-whisper' when getting requirements to bu`
-    - Line 96: `2026-04-28T07:32:01.0940790Z ##[warning]The process '/opt/homebrew/bin/git' failed with exit code 12`
+    - Line 30: `2026-04-28T07:34:18.5530734Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-04-28T07:34:19.0990357Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Prio`
 
 - Pattern: `WARN|Warning|warning`
-  - Occurrences: 4
+  - Occurrences: 1
   - Sample matches:
-    - Line 71: `2026-04-28T07:32:00.5440110Z   if-no-files-found: warn`
-    - Line 85: `2026-04-28T07:32:00.7744180Z ##[warning]No files were found with the provided path: test-results/bio`
-    - Line 96: `2026-04-28T07:32:01.0940790Z ##[warning]The process '/opt/homebrew/bin/git' failed with exit code 12`
-
-- Pattern: `AssertionError|Exception`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 4: `2026-04-28T07:31:51.9718270Z Installing collected packages: typing-extensions, tomli, pygments, prop`
-    - Line 6: `2026-04-28T07:31:57.6999820Z Successfully installed aiohappyeyeballs-2.6.1 aiohttp-3.13.5 aiosignal-`
+    - Line 58: `2026-04-28T07:34:19.1572696Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
-  - Occurrences: 2
+  - Occurrences: 1
   - Sample matches:
-    - Line 4: `2026-04-28T07:31:51.9718270Z Installing collected packages: typing-extensions, tomli, pygments, prop`
-    - Line 6: `2026-04-28T07:31:57.6999820Z Successfully installed aiohappyeyeballs-2.6.1 aiohttp-3.13.5 aiosignal-`
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
 1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -93,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-04-28T07:33:29.958907*
+📊 *Report generated on 2026-04-28T07:36:10.660681*
 🤖 *JARVIS CI/CD Auto-PR Manager*
