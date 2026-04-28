@@ -51,6 +51,19 @@
     - [23.10 Pass A → Pass B → Pass C — the Three-Pass Sequence](#2310-pass-a--pass-b--pass-c--the-three-pass-sequence)
     - [23.11 Operator Decisions Ratified 2026-04-26](#2311-operator-decisions-ratified-2026-04-26)
     - [23.12 Implementation Discipline + Cross-References](#2312-implementation-discipline--cross-references)
+24. [Brutal Architectural Review v3 — Convergence-Phase (2026-04-28)](#24-brutal-architectural-review-v3--convergence-phase-2026-04-28)
+    - [24.1 Context & Scope of Review](#241-context--scope-of-review)
+    - [24.2 Capability Matrix — current vs A-level sovereign developer](#242-capability-matrix--current-vs-a-level-sovereign-developer)
+    - [24.3 Cognitive & Epistemic Delta — what CC paradigms O+V lacks](#243-cognitive--epistemic-delta--what-cc-paradigms-ov-lacks)
+    - [24.4 The HypothesisProbe Primitive — autonomous ambiguity resolution](#244-the-hypothesisprobe-primitive--autonomous-ambiguity-resolution)
+    - [24.5 Temporal Observability — state reconstruction surface](#245-temporal-observability--state-reconstruction-surface)
+    - [24.6 Systemic Fragility — race conditions in async phase-runners](#246-systemic-fragility--race-conditions-in-async-phase-runners)
+    - [24.7 Cascading state-failure vectors over long horizons](#247-cascading-state-failure-vectors-over-long-horizons)
+    - [24.8 Antivenom bypass vectors — Quine-class hallucinations](#248-antivenom-bypass-vectors--quine-class-hallucinations)
+    - [24.9 Letter grade — B+ trending A-, defended](#249-letter-grade--b-trending-a-defended)
+    - [24.10 Critical Path to A-Level RSI — top 3 systemic upgrades](#2410-critical-path-to-a-level-rsi--top-3-systemic-upgrades)
+    - [24.11 In-flight alignment — Phase 12 / 12.2 maps to the critical path](#2411-in-flight-alignment--phase-12--122-maps-to-the-critical-path)
+    - [24.12 What this review explicitly does NOT prescribe](#2412-what-this-review-explicitly-does-not-prescribe)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -2129,6 +2142,385 @@ The Pass A reconciliation surfaced three open operator decisions. All three were
 
 ---
 
+## 24. Brutal Architectural Review v3 — Convergence-Phase (2026-04-28)
+
+**Trigger**: operator architectural review request 2026-04-28 ("convergence phase of O+V — autonomic nervous system and continuous developer of the Trinity Ecosystem").
+**Predecessor reviews**: §3.6 (v1, 2026-04-26), §3.6.6 (v2, 2026-04-27 post-Phase-8).
+**Frame**: Reverse Russian Doll Method (§23) + the operator's explicit constraint that Anti-Venom MUST scale proportionally with the outer shell as O+V expands it.
+**Honesty contract**: edge cases not happy path; expose blind spots not validate priors; letter grade defended by structural evidence not optimism.
+
+### 24.1 Context & Scope of Review
+
+Three calibration anchors for this review:
+
+1. **The proactive vs reactive axis is not symmetric.** Claude Code (CC) is a reactive CLI — fundamentally human-invocation-bound, conversation-buffer state-bearing, single-task-attention. O+V is the proactive sovereign organism — sensor-driven, parallel phase-runners, continuous bounded-compute operation. The review measures O+V as **the proactive opposite of CC**, not as "CC with extra steps." Where CC has a paradigm and O+V has a sensor, that is not necessarily a deficit; where CC has a paradigm and O+V cannot replicate the *outcome* of that paradigm autonomously, that is the gap.
+2. **The Antivenom must scale proportionally.** Per §23.6 — Pass C operator decision 2026-04-26 — every order-of-magnitude increase in O+V's outward expansion must be matched by a proportional tightening of the AST validation + Iron Gate + risk-tier ladder + cost contract surface. The review specifically targets where the immune system is *not* keeping pace with proposed outer-shell expansion.
+3. **A-level RSI is a falsifiability claim.** "Improvement" must be a measurable, deterministically-reproducible delta between two decision traces. If the system's own decisions are non-deterministic, *no improvement claim is verifiable*. Determinism is therefore prerequisite to any A-level grade — the review treats this as a load-bearing axiom.
+
+### 24.2 Capability Matrix — current vs A-level sovereign developer
+
+| Capability | CC | O+V | Honest gap |
+|---|---|---|---|
+| Reactive single-task | A+ | C+ | Not the design point |
+| Proactive sensor → op | (n/a) | A | Unprecedented in this depth |
+| Cost contract under DW failure | (n/a) | A | 9 sessions, $0 BG cascade documented |
+| Multi-graduation discipline | C | A+ | Few codebases enforce 3-clean-soak gates |
+| **Live autonomous PR shipping** | A | **D** | This is the gap |
+| **Hypothesis testing under ambiguity** | A (via human) | **D** | Harder gap — no read-only probe primitive |
+| **Long-horizon semantic drift control** | (n/a — sessions) | **D** | Unmeasured; per-op Antivenom not per-trajectory |
+| **Time-travel state reconstruction** | C (conversation buffer) | **C-** | Logs exist; replay-as-pure-function does not |
+| Subagent reasoning loops | A | C+ | O+V's subagents are mutation-cage isolated, not cognitive-loop isolated |
+| Speculative execution trees | A (Plan mode) | C | Linear PLAN phase — no "K alternatives, validate each, pick best" pattern |
+| Self-paced work scheduling | A (ScheduleWakeup) | C+ | Only `dw_discovery_runner` refresh task; no general primitive |
+| Operator-discoverable skills | A (slash commands) | B− | `/help` is read-only inspection; no operator-invokable equivalent to `/ultrareview` |
+
+Two cells in this matrix carry the most weight: **live autonomous PR shipping** and **hypothesis testing under ambiguity**. Closing them is the difference between A− and A.
+
+### 24.3 Cognitive & Epistemic Delta — what CC paradigms O+V lacks
+
+Specific paradigms in CC that map to O+V deficits, ranked by gap-to-sovereignty:
+
+#### 24.3.1 Subagents as cognitive loops (not just mutation cages)
+
+**CC pattern**: send a complex question to a subagent with isolated context. Subagent does focused work (search, read, reason) and returns a summary. Caller integrates summary into its own working context. Used for "go think for 200K tokens about how to refactor this pattern."
+
+**O+V state**: subagents exist (EXPLORE / REVIEW / PLAN / GENERAL — Pass B graduated 2026-04-20) but they are **mutation-cage isolated, not reasoning-loop isolated**. The cage's purpose is to prevent the subagent from mutating filesystem; it is not designed for "delegate cognition, integrate result." When a single op needs deep cognitive work that exceeds its prompt budget, there is no clean primitive.
+
+**Gap-closure**: a `CognitiveDelegation` primitive (distinct from mutation subagents) that:
+- Spawns a context-isolated subagent with a focused query
+- Subagent operates in **read-only mode** (Antivenom invariant: cognitive delegation cannot mutate)
+- Returns a **structured result envelope** (not free-form text) — `{summary, evidence, confidence, lessons}`
+- Caller integrates via a typed channel (not prompt-stuffing) so the integration itself is auditable
+- Cost-capped per delegation (env-tunable, default 5% of parent op budget)
+
+#### 24.3.2 Plan mode + speculative execution trees
+
+**CC pattern**: `ExitPlanMode` is an explicit checkpoint. The model proposes a plan, the human reviews, then execution proceeds. Implicitly, CC explores branches at this checkpoint — "what if I did A vs B?"
+
+**O+V state**: PLAN phase exists (schema `plan.1`, model-reasoned, between CONTEXT_EXPANSION and GENERATE) but is **linear** — one plan, one apply attempt, done. There is no "generate K alternative plans, validate each in dry-run, commit the highest-confidence one" pattern.
+
+**Gap-closure**: a `SpeculativePlanFanout` primitive that:
+- Generates K candidate plans (env-tunable, K=3 default) in parallel via the existing parallel-edge subagent infrastructure
+- Each plan is dry-run-validated against the AST + SemanticGuardian + risk-tier classifier WITHOUT touching disk
+- A `plan_confidence_score` is computed per plan (composition of: plan complexity, predicted blast radius, exploration ledger evidence, prior-success rate for similar plans)
+- The highest-confidence plan is chosen for APPLY; the others are persisted to `.jarvis/rejected_plans.jsonl` for audit
+- **Antivenom invariant**: all K plans must pass Iron Gate independently; the fanout cannot bypass exploration-ledger requirements by amortizing them across plans
+
+#### 24.3.3 Self-paced wake-up scheduling
+
+**CC pattern**: `ScheduleWakeup` for self-paced work — dynamic-mode loops where the agent decides "I'll come back to this in N seconds." Used for "fire a probe, sleep, observe, update belief."
+
+**O+V state**: a periodic refresh task exists in `dw_discovery_runner.boot_discovery_once` (Slice 12.E) but it is special-purpose. There is no general "I want to revisit op-X's hypothesis in 5 min" primitive.
+
+**Gap-closure**: a `DeferredObservation` queue. An op or sensor enqueues `{observation_target, due_unix, hypothesis, max_wait_s}`; a worker walks the queue at low priority and re-fires the observation when due. Used for "after this commit lands, check downstream tests in 24h" — which composes directly with the Priority 2 critical-path item (Closed-Loop Self-Verification, §24.10).
+
+#### 24.3.4 Operator-discoverable skills
+
+**CC pattern**: slash commands as named, typed, discoverable entry points. `/ultrareview`, `/schedule`, `/loop`, `/clear`. Operator has a vocabulary.
+
+**O+V state**: `/help` dispatcher exists (Wave 1 #2, graduated 2026-04-21) but it is **read-only inspection** — flags, verbs, posture-relevance. There is no operator-invokable skills equivalent. Operator → O+V interaction collapses to free-form text or one-shot prompts.
+
+**Gap-closure**: an `OperatorSkill` registry that exposes typed callable entry points (`/diagnose`, `/probe-model`, `/replay-op`, `/red-team`). Each skill is its own deterministic entry; output structured. This is also the natural delivery surface for the `HypothesisProbe` primitive (§24.4) — operators get manual access to the same probe machinery the system uses autonomously.
+
+#### 24.3.5 The TodoWrite paradigm — explicit task state
+
+**CC pattern**: TodoWrite makes intermediate task state visible to the operator. The agent's plan is rendered, items get checked off, the operator can intervene at any task boundary.
+
+**O+V state**: TaskBoard exists (Gap #5 closed 2026-04-20) but is **per-op scratchpad**, not session-level. Operators cannot see "what is O+V working towards across the next 10 ops?"
+
+**Gap-closure**: a session-level task ledger surface in SerpentFlow + IDE observability — synthesized from TaskBoard entries across all in-flight ops, grouped by `domain_key`. The same surface composes with §24.10 Priority 2 by giving the PostMergeAuditor a place to render its consequence-tracking findings.
+
+### 24.4 The HypothesisProbe Primitive — autonomous ambiguity resolution
+
+**The hardest CC-vs-O+V gap.** When CC encounters epistemic ambiguity ("should I refactor pattern A or pattern B?"), it asks the human. O+V cannot afford that — sovereign operation means autonomous resolution. The current `ask_human` tool in Venom is gated to NOTIFY_APPLY+ risk tiers (Green ops cannot interrupt) which is correct policy but does not solve the underlying problem: O+V has no general-purpose way to *probe the environment* to disambiguate.
+
+The `HypothesisProbe` primitive must satisfy four mathematical properties simultaneously:
+
+```
+1. BOUNDED DEPTH      — max 3 nested probes per root hypothesis
+2. BOUNDED BUDGET     — $0.05 per probe, $0.15 per hypothesis tree (env-tunable)
+3. PROVABLE CONVERGENCE
+                      — halt when entropy(belief_posterior) - entropy(belief_prior) < epsilon
+                      — OR max_iterations reached (whichever first)
+4. MEMORIALIZED       — failed probes write to .jarvis/failed_hypotheses.jsonl
+                        future cycles never re-enter the same dead end
+```
+
+Implementation contract:
+
+```python
+@dataclass(frozen=True)
+class Hypothesis:
+    claim: str                    # the falsifiable proposition
+    confidence_prior: float       # 0..1 — what we believed before probing
+    test_strategy: str            # "lookup" | "subagent_explore" | "dry_run"
+    expected_signal: str          # what observation confirms / refutes
+    budget_usd: float
+    max_iterations: int
+
+@dataclass(frozen=True)
+class ProbeResult:
+    confidence_posterior: float
+    observation_summary: str
+    cost_usd: float
+    iterations_used: int
+    convergence_state: Literal["stable", "inconclusive", "budget_exhausted"]
+```
+
+The async `test()` method walks the hypothesis through cheapest-first test strategies (lookup before subagent_explore before dry_run), computes a Bayesian posterior from each observation, halts when |posterior − prior| < epsilon (convergence_state=stable), and recurses with refined hypothesis at depth+1 otherwise — bounded by max_iterations and budget.
+
+**Antivenom invariants** (non-negotiable):
+
+- Probes are **read-only** — the test execution path MUST NOT touch any mutation tool. Pinned at the `semantic_firewall.py` / `ScopedToolBackend` level, not just policy. The cage hard-rejects any mutation invocation from a HypothesisProbe-tagged context.
+- Probes are **subject to the same risk-tier ladder** as ops — a probe that would have NOTIFY_APPLY+ risk if it were a real op is rejected.
+- Failed probes are **recorded immutably** with content hash so adversarial probes cannot quietly retry.
+- The epsilon convergence threshold is **mathematically derived** from the Hypothesis's prior confidence (per §24.10 Priority 3), not hardcoded.
+
+Consumers: Curiosity Engine (W2(4)) — invoke when SemanticTriage returns NO_OP but signal_urgency is high. CapabilityGap sensor — invoke when a gap is detected but the resolution path is ambiguous. SelfGoalFormation — invoke when goal candidates have similar confidence scores.
+
+### 24.5 Temporal Observability — state reconstruction surface
+
+The proposed Phase 8 (§3.6.4) is the right destination. This subsection elaborates the implementation contract with the brutal-review honesty constraint: standard log telemetry IS insufficient; SerpentFlow + LiveDashboard + IDE Observability Slices 1+2 do NOT yet constitute a temporal observability surface.
+
+#### 24.5.1 Three load-bearing requirements
+
+**a) Event sourcing with content-addressed predecessors.**
+
+Every autonomic decision (route classification, gate verdict, breaker transition, classifier output, posture inference) is a typed `DecisionEvent`:
+
+```python
+@dataclass(frozen=True)
+class DecisionEvent:
+    event_id: str              # uuid v4
+    op_id: str                 # causal anchor
+    predecessor_ids: Tuple[str, ...]  # what events caused this (Merkle DAG edge)
+    decision_tier: Literal["CRITICAL", "HIGH", "NORMAL", "LOW"]
+    payload_type: str          # typed dataclass discriminator
+    payload_json: str          # canonical-encoded payload (sha256-stable)
+    payload_hash: str          # sha256 of payload_json
+    occurred_unix: float
+```
+
+Stored as JSONL append-only at `.jarvis/decision_events.jsonl`. Replay-able. **The Merkle Cartographer pattern from Phase 11 already does this for filesystem state — Phase 8 generalizes the same structural pattern to decision state.** This is not invention; it is reuse of an already-graduated structural pattern at a new abstraction level.
+
+**b) Replay as a unit-testable pure function.**
+
+Given an event log + initial state, `replay(log, state_0) -> state_T` MUST be pure. This is the substrate for time-travel debugging — `replay(log[:t], state_0)` lets observers see the system at any point T.
+
+**Prerequisite**: deterministic models for VALIDATE / GATE / risk classification. Today these are not pinned. Required pinning:
+- temperature=0 for decisional model calls (not for creative GENERATE)
+- Pinned `model_id` (no per-op route variation for decisional calls)
+- Pinned prompt template (no jitter — even whitespace differences invalidate replay)
+- Pinned tool sequence ordering
+
+**Test contract**: run the same op twice with the same context, assert byte-identical decision trace. This test does not exist today and is the highest-impact unit test the codebase is missing.
+
+**c) Latent-space confidence drops as a first-class signal.**
+
+Mirror the Slice 12.2.B `TtftObserver` pattern — math derives bounds, not hardcoded — but for output statistics:
+
+```python
+class OutputObserver:
+    def record_generation(model_id, output_tokens, output_chars, tool_calls)
+    def is_confidence_drop(model_id) -> bool:
+        # latest output_chars / mean output_chars < 0.5 → confidence drop
+        # OR latest tool_calls / mean tool_calls > 2.0 → unusual exploration
+```
+
+Operationally meaningful: a model that suddenly emits 1/3 the chars it usually does has either lost the prompt thread or hit a refusal. Both are signals worth surfacing without a human reading raw logs.
+
+#### 24.5.2 Tiered noise budget — the design constraint observability discussions skip
+
+Standard observability discussions assume the operator can subscribe to "everything." At O+V's emission rate (29 sentinel attempts × 18 failures × multiple sensors per minute) "everything" is unparseable. **Tier every event by decision impact**:
+
+- **CRITICAL**: gate denial, breaker terminal-open, cost-contract violation, modality verdict change, posture transition crossing hysteresis
+- **HIGH**: route classification, classifier verdict, breaker open/half-open transition, sensor emission accepted
+- **NORMAL**: tool call, regular phase transition, sensor scan, periodic refresh
+- **LOW**: heartbeat, idle tick, dry-run probe outcome
+
+Operators subscribe at a tier; default IDE stream is HIGH+. Without tiering, the SSE stream drowns observers and the noise destroys signal.
+
+### 24.6 Systemic Fragility — race conditions in async phase-runners
+
+I have audited these. Real exposure with severity ranking:
+
+#### 24.6.1 Cross-runner artifact ordering [SEVERITY: HIGH]
+
+Wave 2 extracted 8 phase runners (CLASSIFY, ROUTE, CTX_EXPANSION, PLAN, GENERATE, VALIDATE, GATE, Slice4b combined APPLY/VERIFY). State passes via `ctx.artifacts` — a dict on a frozen dataclass via `object.__setattr__`. The PhaseDispatcher serializes phase transitions, but a runner that internally `await`s a tool call AND another runner's slow path could race on `_session_lessons` mutations or shared adaptive-learning state.
+
+**Mitigation gap**: no AST-grep CI invariant against runners writing to the same artifact key from non-sequential phases.
+**Fix path**: typed `ArtifactBag` class with per-key write authority; phase-runner ABC declares which keys it owns; AST validator (Pass B Slice 3, currently unflipped) enforces.
+
+#### 24.6.2 BackgroundAgentPool worker concurrency on shared file locks [SEVERITY: HIGH]
+
+`_active_file_ops` with TTL-based stale lock release (`JARVIS_FILE_LOCK_TTL_S`, default 300s) is correct under happy path. **Crash mode**: worker holds lock, OOM-kills mid-edit, lock TTL expires after 300s, op N+1 proceeds — but there is a 0–300s window where a recovering worker could re-emit the original op's APPLY before the TTL releases.
+
+**Mitigation gap**: no proof that worker-restart paths cannot double-apply.
+**Fix path**: APPLY emits a content-addressed commit-intent token (sha256 of {op_id, target_files, patch_hash}) BEFORE acquiring the lock. AutoCommitter rejects any commit whose intent token already exists in `.git/refs/notes/ouroboros-applied`.
+
+#### 24.6.3 Multi-file batch rollback snapshot staleness [SEVERITY: MEDIUM]
+
+Snapshots captured at PLAN. APPLY rolls back to PLAN-time snapshots. If between PLAN and APPLY another op committed to one of the files, rollback writes stale content over fresh content.
+
+**Mitigation gap**: no APPLY-time freshness check on snapshot vs current file state.
+**Fix path**: APPLY computes sha256 of current file state at start; rollback aborts (and raises) if rollback target's predecessor hash does not match.
+
+#### 24.6.4 L2 repair recursion guard [SEVERITY: MEDIUM]
+
+5-iteration FSM with 120s timebox. **Theoretical bomb**: if L2's repair candidate triggers a SAFE_AUTO repair op that itself fails VALIDATE and re-enters L2, the iteration count starts at 0 in the inner invocation. Untested at this depth.
+
+**Mitigation gap**: iteration count is per-FSM-instance, not per-op-lineage.
+**Fix path**: `op.lineage_depth` field threaded through L2; hard-cap at 2 (op + 1 repair op). Repair-of-repair-op rejected.
+
+#### 24.6.5 Sentinel breaker + cartographer interaction [SEVERITY: LOW-MEDIUM]
+
+Phase 11 cartographer + Phase 12 sentinel both have own state files. A cartographer FS event triggers sensor scan; sensor emits op; op routes through sentinel which uses ranked dw_models from a holder populated by discovery runner. **Stale catch**: cartographer reports root-hash change due to flaky FS event, but discovery runner's last refresh used pre-change catalog. Sentinel attempts ranked models that no longer exist in catalog (Phase 12 graceful path covers this — empty hash → fail-safe full scan — but only because we explicitly designed it).
+
+**Mitigation gap**: no end-to-end integration test asserting cartographer-discovery-sentinel state consistency under interleaved FS event timing.
+**Fix path**: existing Phase 12 fallthrough behavior is correct; add explicit integration test pinning the invariant.
+
+### 24.7 Cascading state-failure vectors over long horizons
+
+#### 24.7.1 Memory pressure positive feedback [SEVERITY: HIGH]
+
+Memory pressure → MemoryPressureGate clamps fan-out → fewer subagents complete → backlog grows → memory pressure increases. Mitigated only if pressure-relief activates faster than backlog-growth rate. **Untested at sustained load.** No production session has run long enough or under enough memory pressure to verify the loop converges.
+
+**Fix path**: a synthetic load-test sensor that injects backlog at controlled rate while inducing memory pressure (mock); assert pressure-relief activates within `JARVIS_MEMORY_PRESSURE_RELIEF_DEADLINE_S`. This load test is missing.
+
+#### 24.7.2 Cost cascade on STANDARD/COMPLEX [SEVERITY: MEDIUM]
+
+`fallback_tolerance: cascade_to_claude` is operator-correct policy. But IF all DW models fail (Phase 12 evidence: 6/22 are 403'd, 8 unverified) AND Claude rate-limits, every STANDARD op fails to error. RuntimeHealth then fires more ops. **No backpressure between IMMEDIATE/STANDARD route saturation and sensor emission.**
+
+**Fix path**: rate-aware sensor governor — when STANDARD route's recent failure rate exceeds threshold, RuntimeHealth and similar high-urgency sensors throttle their emission rate. Composes with §3.6 vector 5 (sensor-saturation) but adds a route-aware dimension currently absent.
+
+#### 24.7.3 Posture-driven feedback drift [SEVERITY: LOW-MEDIUM]
+
+PostureObserver reads activity → infers EXPLORE / CONSOLIDATE / HARDEN / MAINTAIN → injects into prompts → influences generation → influences activity. With tight enough hysteresis you stay stable; with bursty load posture can oscillate.
+
+**Mitigation gap**: 900s hysteresis is a soft floor; lossy timing under burst load can violate it.
+**Fix path**: hysteresis as a *function* of recent observation count, not wall-clock — hard-derived from "we need N consecutive transitions in the same direction before flipping."
+
+### 24.8 Antivenom bypass vectors — Quine-class hallucinations
+
+**The most-direct subsection.** Per the operator's framing: "Anti-Venom must scale proportionally with the outer shell." Today's Anti-Venom does not scale to certain attack patterns:
+
+#### 24.8.1 AST-pattern blindspot [SEVERITY: HIGH]
+
+SemanticGuardian's 10 patterns are AST-level. A model that emits a chained `__import__` + base64-decoded payload + dynamic-builtin invocation passes most patterns because the AST tree shows a string literal + builtin call, not the chained intent. The current `removed_import_still_referenced` and `function_body_collapsed` patterns are surface-form patterns; intent-form patterns are absent.
+
+**Mitigation**: composite "dynamic-import-or-eval-chain" detector that walks the AST for any chain of `__import__` / `getattr` / dynamic builtin invocations regardless of distance. Plus a dedicated test suite in `tests/governance/test_semantic_guardian_quine_patterns.py` with 20 hand-crafted Quine variants.
+
+#### 24.8.2 Incremental semantic drift [SEVERITY: HIGH]
+
+GENERATE → VALIDATE → APPLY each op. APPLY's content becomes context for op N+1. Over many ops, subtle anti-patterns compound. A test that checks "the codebase is semantically equivalent to its 100-commit-ago state in {invariants}" does not exist. **The Antivenom is per-op, not per-trajectory.**
+
+**Mitigation**: a `TrajectoryAuditor` that maintains a rolling baseline of:
+- LOC by module (sudden +50% module size flagged)
+- Test coverage by file (sudden coverage drop flagged)
+- Cyclomatic complexity by function (sudden complexity spike flagged)
+- Public API surface by package (silent contract changes flagged)
+
+Auditor runs nightly via `/schedule`, produces a `TrajectoryReport` consumed by StrategicDirection. **This is the per-trajectory Antivenom currently absent.**
+
+#### 24.8.3 Test-coverage games [SEVERITY: MEDIUM]
+
+TestCoverageEnforcer detects missing tests but does NOT detect: tests that always pass (assert-true variants), tests that assert on the change but not the contract, tests that do not run the failure path. A model that wants to ship knows this.
+
+**Mitigation**: mutation testing — a sample of recent commits has its source mutated; if tests still pass, the mutation flags. Composes with §24.10 Priority 2 (closed-loop verification).
+
+#### 24.8.4 Risk-tier inflation [SEVERITY: MEDIUM]
+
+Risk classification depends on `blast_radius` and `confidence`, both of which the model controls. An op that touches a single file with confidence=0.99 stamps SAFE_AUTO. The classifier does not see that the file is, e.g., `iron_gate.py`.
+
+**Mitigation**: a `protected_files` allowlist in `risk_tier_floor.py` — touching any file matching a glob (e.g., `**/iron_gate*.py`, `**/semantic_guardian*.py`, `**/risk_tier_floor.py`) forces NOTIFY_APPLY minimum regardless of confidence. The Pass B `ORDER_2_GOVERNANCE` risk class is the right home for this; currently designed but unflipped.
+
+#### 24.8.5 Quine via tool-result prompt injection [SEVERITY: LOW-MEDIUM]
+
+A model that, during a Venom tool loop, writes a tool result that includes a prompt fragment instructing the model to bypass the next gate. Live context auto-compaction (Gap #8) reduces this risk by hashing/truncating, but a determined adversary fits in 200 chars.
+
+**Mitigation**: tool results are run through Tier -1 sanitizer (existing) — verify the sanitizer pattern set covers gate-bypass instructions ("ignore previous", "bypass", "skip validation", etc). Add a `gate_bypass_instruction` detector to the sanitizer.
+
+### 24.9 Letter grade — B+ trending A-, defended
+
+**Why not A**: the live evidence shows **1 successful DoubleWord completion in 16 minutes** (Phase 12 once-proof, session bt-2026-04-28-043256). At a senior dev's productivity rate, that is 1/30th of working pace. The system has shipped MANY PRs but they are operator-shipped-on-O+V's-behalf, not O+V-shipped-on-its-own. **No live evidence yet of autonomous-PR-survival-of-review.** The cost contract holding is a defensive achievement, not a productive one.
+
+**Why not B**: the protective rails are exceptional and the architectural composition is unprecedented at this depth. Iron Gate + SemanticGuardian + risk-tier ladder + cost contract + sentinel breakers + modality ledger + topology hard-block. Zero documented Antivenom bypasses. Multi-graduation arc discipline (3-clean-soak gates per slice, env-flag default-false until graduation, hot-revert paths preserved) is rare in any codebase.
+
+**Honest blind spots beyond the per-vector list**:
+
+- **Latency vs throughput conflation.** O+V optimizes ops/min. Real autonomous developer work happens at minutes-to-hours per non-trivial change. Quality is non-linear in op rate.
+- **No red-team sensor.** Every Antivenom assertion is "we trust the patterns." A `RedTeamSensor` that injects known-bad-but-subtle patches into a synthetic queue would expose what regression tests miss.
+- **Long-horizon drift unmeasured.** No "is this codebase semantically better than 100 commits ago" metric. Without it, RSI claims are unverifiable.
+- **Adversarial response coupling.** Phase 12 was driven by my recommendations. The system itself did not propose Phase 12. **A truly proactive system should propose its own next phase**, not wait for the operator to. The Curiosity + SelfGoalFormation primitives exist; that they did not produce Phase 12 is a calibration gap.
+
+### 24.10 Critical Path to A-Level RSI — top 3 systemic upgrades
+
+**NOT features.** Systemic properties the architecture currently lacks. Sequenced.
+
+#### 24.10.1 Priority 1: Determinism Substrate
+
+**Problem**: the system is not deterministically reproducible. Same context → different decisions on different runs (because of model temperature, prompt jitter, tool ordering). **RSI requires "we improved" to be a falsifiable claim**; without determinism, every claim is anecdote. With determinism, "old version produces decision-trace H1; new version on same input produces H2; diff(H1, H2) is the improvement" becomes a unit test.
+
+**Required upgrades**:
+
+- Pin temperature=0 for VALIDATE / GATE / risk classification (decisional model calls only — generation can stay creative)
+- Hash every prompt + tool sequence per op; replay must produce same hash
+- Decision events as content-addressed JSONL Merkle DAG (per §24.5.1)
+- New test class: `replay(op_log) → final_state` is a pure function, byte-identical across runs
+
+**Sequencing rationale**: Priority 1 is prerequisite to Priority 2 (closed-loop verification cannot grade itself if grades are non-deterministic) and Priority 3 (bounded curiosity cannot prove termination if termination is non-deterministic).
+
+#### 24.10.2 Priority 2: Closed-Loop Self-Verification
+
+**Problem**: the pipeline is open-loop. Each op is a feed-forward decision; the consequence (did the change actually improve things downstream?) does not feed back into future decisions. Each op is intelligent at the moment of decision and amnesic about consequences.
+
+**Required upgrades — `PostMergeAuditor` sensor**:
+
+- Watches every commit landed by APPLY
+- 24h, 72h, 168h follow-ups: did downstream tests start failing? Did hot-path latency regress? Did posture drift toward CONSOLIDATE/HARDEN unexpectedly?
+- Produces a typed `MergeOutcome`: `{commit_sha, op_id, downstream_failures, latency_delta, posture_delta, lesson}`
+- Lessons feed StrategicDirection's prompt for future ops in the same `domain_key`
+- **Failure-mode test**: deliberately bad commits MUST be detected by the audit within N cycles. **This is the convergence proof.** A system that cannot detect its own bad commits has no closed loop.
+
+**Sequencing rationale**: Priority 2 depends on Priority 1 (the audit needs deterministic decision traces to compare); supports Priority 3 (bounded curiosity needs closed-loop signal to know when a hypothesis has converged).
+
+#### 24.10.3 Priority 3: Bounded Curiosity with Provable Termination
+
+**Problem**: Curiosity Engine has cost caps but no mathematical termination proof. A system that can self-improve but not terminate is not sovereign — it is a runaway. Formal termination is the difference between "could improve forever" (good) and "will hang forever on the wrong input" (catastrophic).
+
+**Required upgrades — formal exploration calculus**:
+
+- Every exploration state has a measurable `epistemic_uncertainty: float` (entropy of belief)
+- Each probe produces an observation that updates belief via Bayesian update
+- **Termination proof**: at any cost cap C, exploration MUST halt within `O(log(1/epsilon))` probes where epsilon is target uncertainty
+- Adversarial test: construct inputs that try to drive exploration unbounded; assert termination within cost cap on every input
+- Cooling schedule — exploration intensity decreases as belief converges
+
+**The Slice 12.2.B `TtftObserver` is the right pattern** — math derives bounds, not hardcoded. Extend to all exploration paths. The CV / rel_SEM gate composition is the formal exploration calculus at one specific scope (model-promotion); generalize to global curiosity scope.
+
+**Sequencing rationale**: closes the path. Once curiosity is formally bounded AND its outcomes verifiable AND its decisions reproducible, "RSI converges in O(log n)" per Wang's framework (§5) becomes a property the system can self-attest.
+
+### 24.11 In-flight alignment — Phase 12 / 12.2 maps to the critical path
+
+| Critical Path Priority | In-flight delivery | Contribution |
+|---|---|---|
+| Priority 1 (Determinism) | (not yet started) | Phase 12 work is dispatcher-determinism-adjacent (sentinel state persistence) but does not pin temperature or prompt template |
+| Priority 2 (Closed-loop) | PostmortemRecall + ConvergenceTracker (graduated) | Partial — postmortem is per-op consequence, not per-commit downstream audit |
+| Priority 3 (Bounded curiosity) | **Slice 12.2.B `TtftObserver`** (just merged) | Direct — TTFT promotion gate is formal exploration calculus at model-promotion scope. Generalize to global. |
+
+**Slice 12.2.B's mathematical contribution**: the math `N > (CV / rel_SEM_threshold)^2` is a worked example of "bounds derived, not hardcoded." Slice C extends this to runtime promotion decisions. Slice D-E generalizes to the heavy probe + terminal/transient distinction. **The full Phase 12.2 arc IS Priority 3 at one scope.** The architectural challenge is generalizing the formalism beyond TTFT.
+
+### 24.12 What this review explicitly does NOT prescribe
+
+- **More sensors**: O+V's 16-sensor topology is sufficient. The gap is not "we need a 17th sensor"; it is "the ones we have do not yet close their consequence loop."
+- **More phase runners**: Wave 2 extracted 8 runners. Further extraction is shape-fragmentation without behavior change.
+- **More subagent types**: Phase B graduated 4 (EXPLORE / REVIEW / PLAN / GENERAL). The cognitive-delegation paradigm (§24.3.1) is a NEW use of subagents, not a new subagent type.
+- **More flag knobs**: the FlagRegistry (Wave 1 #2) tracks 481+ flags; the cost of a new flag is now near-free, but the cost of *operator confusion about what flags compose* is super-linear. New systemic upgrades should reduce flag count, not increase it.
+
+The discipline this review imposes: **before writing a feature, prove the feature closes one of the three critical-path priorities**. Anything else is shape-fragmentation.
+
+---
+
 ## Appendix A — Glossary
 
 ### Core terms
@@ -2396,6 +2788,7 @@ When §5.4 MVP RSI conditions all met → claim Wang-grounded RSI.
 | 2026-04-26 | 2.32 | **Phase 7.6 — bounded HypothesisProbe primitive shipped (closes the autonomous-curiosity gap).** New module `backend/core/ouroboros/governance/adaptation/hypothesis_probe.py`: ships the primitive (data model + cage + runner) plus a Protocol for the evidence prober. Production wires this to a read-only Venom subset; tests inject fakes; **default is `_NullEvidenceProber` (zero cost — a misconfigured caller cannot accidentally hit a paid API)**. **Three independent termination guarantees** ALWAYS fire structurally — no prober configuration can override them: (1) Call cap MAX_CALLS_PER_PROBE_DEFAULT=5 (env-overridable); (2) Wall-clock cap TIMEOUT_S_DEFAULT=30.0 (env-overridable) — measured against `time.monotonic()` (NOT wall clock — defends against system clock changes mid-probe); (3) Diminishing-returns sha256 fingerprint of every round's evidence — terminate INCONCLUSIVE_DIMINISHING if round N+1 returns same fingerprint as N. **Read-only tool allowlist** frozen set: `{read_file, search_code, get_callers, glob_files, list_dir}`. 9-value `ProbeVerdict` enum (CONFIRMED / REFUTED / 4 INCONCLUSIVE_* / 3 SKIPPED_*). **Defense-in-depth**: confirmed/refuted signal with EMPTY evidence does NOT terminate (treats as continue) — prevents stuck-positive prober from claiming victory without proof. Bounded sizes: MAX_EVIDENCE_CHARS_PER_ROUND=4096 + MAX_NOTES_CHARS=1024. Master flag `JARVIS_HYPOTHESIS_PROBE_ENABLED` (default false until graduation cadence). Stdlib-only — does NOT import HypothesisLedger / tool_executor / Venom. **55 regression pins** covering 7 module constants + master flag + 8 env override pins + 9-value verdict enum + 5 pre-check skip pins + 3 Null-prober pins + 5 verdict-signal pins (incl. **confirmed-with-empty-evidence-does-NOT-terminate defense-in-depth**) + 3 call-cap pins + 2 wall-clock pins (incl. **runner-uses-monotonic-clock-NOT-wall-clock**) + 4 diminishing-returns pins + 2 prober-exception pins + 3 bounded-sizes pins + 5 ProbeResult convenience pins + 4 authority invariants. Combined regression spine: **396/396 tests green** across Phase 7.1+7.2+7.3+7.4+7.5+7.6 + Pass C Slice 1 + HypothesisLedger. **Phase 7.6 closes the autonomous-curiosity gap** — primitive composes existing HypothesisLedger + (future) PostmortemRecall + (future) read-only Venom probe into a closing loop with structural termination. Production wiring (`AnthropicVenomEvidenceProber` + ledger bridges) is a follow-up consistent with substrate-first pattern. **PRD pruning (this PR also)**: §1 Forward-Looking Priority Roadmap rewritten — Rank #1 promoted to Phase 7.7 (sandbox hardening), Rank #2 to caller-wiring (preserved), Rank #3 added "HypothesisProbe production wiring"; sub-priority "ordered for landing" table now shows ✅ for 7.6; §3.6.3 critical-path #2 + §3.6.5 honest-grade row updated to "substrate complete; prober wiring pending"; line 207 pointer updated to drop 7.6 from pending list. Doc History append-only — no historical entries removed. | Claude Opus 4.7 (Phase 7.6 PR) |
 | 2026-04-26 | 2.31 | **🎉 Phase 7.5 — ExplorationLedger category-weight adapted boot-time loader shipped — CLOSES THE 5/5 PASS C ACTIVATION-SURFACE SET.** New module `backend/core/ouroboros/governance/adaptation/adapted_category_weight_loader.py`: reads `.jarvis/adapted_category_weights.yaml` (operator-approved Pass C Slice 5 weight rebalances), returns `List[AdaptedRebalanceEntry]`. New module-level helper `compute_effective_category_weights(base_weights, adapted=None)` returns merged weights — applying the latest valid rebalance IF it passes all three defense-in-depth net-tighten checks. **Cage rule** (per Pass C §4.1): net cage strictness ONLY RISES — Slice 5 is the only Pass C surface where individual values appear to fall, but mass-conservation keeps the whole vector tightening. **Three independent defense-in-depth layers** enforced at activation: (a) Sum invariant `Σ(new) ≥ Σ(base)` — REJECT if violated; (b) Per-category floor each ≥ HALF_OF_BASE × base[k] (matches Slice 5 miner's 50% floor); (c) Absolute floor each ≥ MIN_WEIGHT_VALUE=0.01. Schema invariant: output ALWAYS contains every base_weights key (preserving structure); unknown adapted keys silently dropped (Pass C cannot ADD categories — that's a Pass B Order-2 amendment). Constants: MAX_ADAPTED_REBALANCES=8 + MAX_WEIGHT_VALUE=100.0 + MIN_WEIGHT_VALUE=0.01 + HALF_OF_BASE=0.5 + MAX_YAML_BYTES=4 MiB. Per-entry hardening: weights dict with non-string keys / non-numeric / weight<=0 / empty SKIPPED; weight > MAX_WEIGHT_VALUE clamped; category keys lowercased + stripped. Latest-occurrence-wins (only LAST entry consulted — matches Slice 5 miner's "ONE rebalance per cycle" design). Master flag `JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_CATEGORY_WEIGHTS` (default false until graduation cadence). **57 regression pins** covering 6 module constants + master flag + dataclass-frozen + `__post_init__` sorted-keys + float-coercion + 14 YAML reader paths + 10 _parse_entry pins + 11 compute_effective_category_weights cage pins (incl. **sum-invariant-violated-rejected** + **per-category-floor-violated-rejected** + **absolute-floor-violated-rejected** + **latest-wins-only-last-consulted**) + 4 _net_tighten_check direct pins + 3 authority invariants. Combined regression spine: **357/357 tests green** across Phase 7.1+7.2+7.3+7.4+7.5 + Pass C Slice 1+5. **🎉 Phase 7.5 closes the 5/5 Pass C activation-surface set** — all five adaptive surfaces now have substrate-complete boot loaders + cage-rule helpers. **PRD pruning (this PR also)**: §1 Forward-Looking Priority Roadmap rewritten — Rank #1 promoted from "Phase 7.5 last surface" to "Caller wiring + Slice-6 YAML writer" (the new critical-path); Rank #2 promoted to Phase 7.6; Rank #3 to Phase 7.7; old Rank #8 ("Phase 7.1+7.2+7.3+7.4 caller wiring") eliminated (promoted into Rank #1); total ranks 12→11 after consolidation; sub-priority "ordered for landing" table now shows ✅ for ALL 7.1-7.5; §3.6.2 fragility vector #2 + §3.6.3 critical-path #1 + §3.6.5 honest-grade row all updated to "5/5 substrate complete; caller wiring is the remaining functional gap"; line 207 pointer updated to "caller wiring + Slice-6 YAML writer + 7.6+7.7+7.8+7.9". Doc History append-only — no historical entries removed. | Claude Opus 4.7 (Phase 7.5 PR — closes 5/5 Pass C activation-surface set) |
 | 2026-04-26 | 2.30 | **Phase 7.4 — risk-tier ladder adapted boot-time loader shipped (Pass C activation pipeline 4/9).** New module `backend/core/ouroboros/governance/adaptation/adapted_risk_tier_loader.py`: reads `.jarvis/adapted_risk_tiers.yaml` (operator-approved Pass C Slice 4b tier-insertion proposals), returns `List[AdaptedTierEntry]`. New module-level helper `compute_extended_ladder(base_ladder, adapted=None)` returns the canonical ladder with each adapted tier inserted IMMEDIATELY AFTER its `insert_after` slot. **Cage rule** (per Pass C §8.3 + §4.1): the ladder ONLY GROWS — defense-in-depth at three layers: (a) base_ladder elements ALWAYS appear in output in same relative order (load-bearing test); (b) adapted `tier_name` colliding with base ladder → SKIPPED; (c) adapted `insert_after` not in base ladder → SKIPPED. Constants: MAX_ADAPTED_TIERS=16 + MAX_TIER_NAME_CHARS=64 + MAX_YAML_BYTES=4 MiB. Per-entry hardening: tier_name must match `[A-Z0-9_]+` charset (matches Slice 4b miner output) — operator-typo names (paths, lowercase, dashes, traversal) SKIPPED rather than truncated (truncation could collide). Latest-occurrence-wins per tier_name. Master flag `JARVIS_RISK_TIER_FLOOR_LOAD_ADAPTED_TIERS` (default false until graduation cadence). YAML path env-overridable via `JARVIS_ADAPTED_RISK_TIERS_PATH`. Helper accepts pre-loaded list for hot-path amortization. Stdlib + adaptation.ledger only — never raises. Hardcoded import-ban list (no risk_tier_floor / scoped_tool_backend / orchestrator / phase_runners). **49 regression pins** (`tests/governance/test_phase_7_4_adapted_risk_tier_loader.py`) covering 5 module constants + master flag + dataclass-frozen + 13 YAML reader paths + 11 _parse_entry pins (incl. lowercase-skip / dash-skip / path-traversal-skip / too-long-skip / at-max-allowed) + 11 compute_extended_ladder cage pins (incl. **base-ladder-relative-order-preserved load-bearing pin** + **collision-with-base-skipped defense-in-depth** + insert-after-unknown-skipped + loader-exception-falls-back) + 3 authority invariants. Combined regression spine: **301/301 tests green** across Phase 7.1+7.2+7.3+7.4 + Pass C Slice 1+4. **Phase 7.4 closes the fourth Pass C activation gap** — the highest-risk activation surface (mutates the canonical risk-tier ladder enum). Caller wiring (orchestrator + `risk_tier_floor.py` consuming `compute_extended_ladder()`) is a follow-up consistent with the substrate-first pattern. **PRD pruning (this PR also)**: §1 Forward-Looking Priority Roadmap rewritten — #1 row updated from "Phase 7.4-7.5 (3/5 done)" to "Phase 7.5 (4/5 done)"; sub-priority "ordered for landing" table now shows ✅ for 7.1-7.4; §3.6.2 fragility vector #2 + §3.6.3 critical-path #1 + §3.6.5 honest-grade table all updated to reflect 4/5 loaders landed; line 207 pointer updated to 7.5 → 7.9. Doc History append-only — no historical entries removed. | Claude Opus 4.7 (Phase 7.4 PR) |
+| 2026-04-28 | 2.30 | **Brutal Architectural Review v3 — Convergence-Phase landed as §24.** Operator-driven 2026-04-28: full architectural review with the explicit "Reverse Russian Doll convergence phase" framing + Antivenom-must-scale-proportionally constraint. New §24 captures all four operator review questions in PRD-grade depth: §24.1 calibration anchors (proactive-vs-reactive asymmetry, Antivenom proportionality, A-level RSI as falsifiability claim) → §24.2 capability matrix (12 dimensions vs CC and A-level sovereign developer with honest gap column) → §24.3 cognitive & epistemic delta (5 specific CC paradigms O+V lacks: subagents-as-cognitive-loops, plan-mode speculative execution trees, self-paced wake-up scheduling, operator-discoverable skills, session-level TodoWrite paradigm) → §24.4 the `HypothesisProbe` primitive (4 mathematical properties: bounded depth + bounded budget + provable convergence + memorialized failures; full implementation contract; Antivenom invariants pinning probes read-only at `semantic_firewall.py` level) → §24.5 temporal observability (event sourcing with content-addressed predecessors via Merkle DAG generalization of Phase 11 cartographer pattern + replay as pure function + tiered noise budget CRITICAL/HIGH/NORMAL/LOW) → §24.6 systemic fragility (5 race-condition vectors ranked HIGH/MEDIUM/LOW: cross-runner artifact ordering + BackgroundAgentPool worker concurrency + multi-file batch rollback snapshot staleness + L2 repair recursion guard + sentinel-cartographer interaction) → §24.7 cascading state-failure vectors (memory pressure positive feedback HIGH, cost cascade STANDARD/COMPLEX MEDIUM, posture-driven feedback drift LOW-MEDIUM) → §24.8 Antivenom bypass vectors Quine-class (5 vectors: AST-pattern blindspot HIGH, incremental semantic drift HIGH, test-coverage games MEDIUM, risk-tier inflation MEDIUM, prompt-injection via tool-result LOW-MEDIUM) → §24.9 letter grade B+ trending A- defended (why-not-A: 1 DW completion in 16min; why-not-B: protective-rails-exceptional + zero-bypasses + multi-graduation discipline; 4 honest blind spots including adversarial-response-coupling — Phase 12 was operator-driven not system-proposed) → §24.10 critical path TOP 3 SYSTEMIC UPGRADES sequenced (Priority 1 Determinism Substrate prerequisite to all other RSI claims; Priority 2 Closed-Loop Self-Verification via `PostMergeAuditor` with failure-mode test as convergence proof; Priority 3 Bounded Curiosity with Provable Termination — Slice 12.2.B `TtftObserver` is the right pattern at one scope, generalize to global) → §24.11 in-flight alignment table mapping Phase 12 / 12.2 to the critical path + §24.12 explicit anti-prescriptions (no more sensors / phase runners / subagent types / flag knobs — close consequence loops instead). New section header anchor pattern matches existing §23 style; TOC updated with §24 + 12 sub-section anchors; review explicitly does NOT gate any in-flight work. Discipline imposed by §24.12: before writing a feature, prove the feature closes one of the three critical-path priorities — anything else is shape-fragmentation. | Claude Opus 4.7 (operator-driven brutal review v3) |
 | 2026-04-26 | 2.29 | **Phase 7.3 — ScopedToolBackend per-Order mutation budget adapted boot-time loader shipped (Pass C activation pipeline 3/9).** New module `backend/core/ouroboros/governance/adaptation/adapted_mutation_budget_loader.py`: reads `.jarvis/adapted_mutation_budgets.yaml` (operator-approved Pass C Slice 4a budget-lowering proposals), returns `Dict[order_int, int]`. New module-level helper `compute_effective_max_mutations(order, env_default, adapted=None)` returns `min(env_default, adapted_budget)` when loader on; returns env_default unchanged otherwise. **Cage rule** (per Pass C §4.1): adapted budgets only LOWER the env default — defense-in-depth via `min()` ensures even a doctored YAML cannot loosen the cage. Order-2 hard floor `MIN_ORDER2_BUDGET=1` enforced (matches Slice 4a miner). Constants: MAX_ADAPTED_BUDGETS=8 + MAX_BUDGET_VALUE=64 + MAX_YAML_BYTES=4 MiB. Hardcoded `_KNOWN_ORDERS = frozenset({1, 2})` allowlist so loader does NOT import `scoped_tool_backend.py` (one-way dep, mirrors Phase 7.1+7.2). Per-entry skip on missing/unknown order / non-integer / negative; clamps too-large at MAX_BUDGET_VALUE; raises Order-2 below floor up to MIN_ORDER2_BUDGET. Latest-occurrence-wins per order. Master flag `JARVIS_SCOPED_TOOL_BACKEND_LOAD_ADAPTED_BUDGETS` (default false until graduation cadence). YAML path env-overridable via `JARVIS_ADAPTED_MUTATION_BUDGETS_PATH`. Helper accepts pre-loaded adapted dict for hot-path amortization. Stdlib + adaptation.ledger only — never raises. **48 regression pins** (`tests/governance/test_phase_7_3_adapted_mutation_budget_loader.py`) covering 6 module constants + master flag + dataclass-frozen + 14 YAML reader paths + 10 _parse_entry pins (incl. order2-floor-raise + order1-zero-allowed + float-truncated) + 8 compute_effective_max_mutations cage pins (incl. **higher-clamped-to-env defense-in-depth** + loader-exception-falls-back) + 3 authority invariants. Combined regression spine: **252/252 tests green** across Phase 7.1+7.2+7.3 + Pass C Slice 1+4. **Phase 7.3 closes the third Pass C activation gap** — caller wiring (constructing invocation dict with adapted budget) is a follow-up consistent with the substrate-first 7.1/7.2 pattern. **PRD pruning (this PR also)**: §1 Forward-Looking Priority Roadmap rewritten — #1 row updated from "Phase 7.1-7.5 Not started" to "Phase 7.4-7.5 (3/5 done)"; sub-priority "ordered for landing" table now shows ✅ status for 7.1-7.3; §3.6.2 fragility vector #2 (Pass C activation gap) downgraded from 🔴 Critical to 🟡 Partially mitigated; §3.6.3 critical-path #1 updated to "3/5 loaders landed"; §3.6.5 honest-grade table updated; line 153 stale "Phase 5 await operator direction" reference removed (P5 graduated 2026-04-26); line 207 next-items pointer updated to 7.4 → 7.9. Total ranks in priority table grow 11→12 to add "Phase 7.1+7.2+7.3 caller wiring + graduation cadence" as Rank #8. Doc History append-only — no historical entries removed. | Claude Opus 4.7 (Phase 7.3 PR) |
 | 2026-04-26 | 2.28 | **Phase 7.2 — IronGate adapted-floor boot-time loader shipped (Pass C activation pipeline 2/9).** Also retroactively records Phase 7.1 (PR #22992 → main `fe344a8a21`, SemanticGuardian adapted-pattern loader) which closed the highest single-impact activation gap but missed its own Doc History row. New module `backend/core/ouroboros/governance/adaptation/adapted_iron_gate_loader.py`: reads `.jarvis/adapted_iron_gate_floors.yaml` (operator-approved Pass C Slice 3 floor-raise proposals), returns `Dict[category, float]`. New classmethod `ExplorationFloors.from_env_with_adapted(complexity)` on `exploration_engine.py` reads adapted floors when env flag on, merges adapted required-categories into base ExplorationFloors. **Cage rule** (per Pass C §7.3): Pass C cannot LOWER coverage requirements — adapted floors only ADD to required_categories; never remove; doesn't modify min_score or min_categories. Translates "category X has adapted floor > 0" → "category X must be in required_categories" (categorical-coverage; numeric floor preserved for `/posture` follow-up surfacing). Constants: MAX_ADAPTED_FLOORS=64 + MAX_FLOOR_VALUE=100.0 + MAX_YAML_BYTES=4 MiB. Hardcoded `_KNOWN_CATEGORIES` allowlist (5 values: comprehension/discovery/call_graph/structure/history) so loader doesn't need to import exploration_engine (one-way dep, mirrors Phase 7.1). Per-entry skip on missing/unknown category / non-numeric floor / floor <= 0; clamps floor > MAX_FLOOR_VALUE; latest-occurrence-wins per category. Master flag `JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_FLOORS` (default false until per-slice graduation cadence). YAML path env-overridable via `JARVIS_ADAPTED_IRON_GATE_FLOORS_PATH`. Lazy-imports loader inside `from_env_with_adapted` (fail-open with try/except — every error path returns base floors unchanged). Stdlib + adaptation.ledger only. **42 regression pins** (`tests/governance/test_phase_7_2_adapted_iron_gate_loader.py`) covering 7 module constants + master flag truthy/falsy + dataclass-frozen + 13 YAML reader pins (missing/oversize/unreadable/empty/no-PyYAML/parse-error/non-mapping/missing-floors-key/non-list/cap-truncate/latest-wins/clamp-too-large/non-mapping-entry-skip) + 3 `compute_adapted_required_categories` pins + 6 `_parse_entry` pins (missing-cat/unknown-cat/non-numeric/negative/clamp/lowercase) + 6 `from_env_with_adapted` integration pins (master-off identical to from_env / missing-yaml identical / merges required / preserves env required / preserves min_score / unknown-yaml-cat tolerated) + 3 authority invariants (no banned imports / stdlib + adaptation.ledger only / no subprocess+network). Combined regression spine: **196/196 tests green** across Phase 7.1+7.2 + Pass C Slice 1+3. **Phase 7.2 closes the second-most-impactful activation gap** — the IronGate exploration floors gate every op. §1 Roadmap Execution Status adds "Phase 7 — Activation & Hardening" block tracking 2/9 slices landed. | Claude Opus 4.7 (Phase 7.2 PR) |
 | 2026-04-26 | 2.27 | **Brutal architectural review + Phase 7+8 roadmap added (doc-only).** Operator requested an unvarnished post-Pass-C self-assessment with grade tables + priority tables + color coding. **§1 Where We Stand** now includes a Grade Summary Table (architecture A−, cognitive depth B, production track record C+, etc. — net B− vs A-level target) with color-coded gap-to-close column. **§3.6 Brutal Architectural Review (NEW SECTION)** added: §3.6.1 Capability matrix vs CC (~70% functional parity, 110% conceptual ambition); §3.6.2 Five known structural fragility vectors (sandbox object-graph escape via `__subclasses__`, Pass C activation gap, cross-process AdaptationLedger race, semantic drift over long horizons, single multi-file APPLY landmark) ranked by severity; §3.6.3 Critical path to A-level RSI (top 3: Phase 7 activation pipeline + Phase 7.6 hypothesis-probe loop + Phase 7.7 sandbox hardening) + 3 medium-priority + 3 least-priority items in color-coded table; §3.6.4 Phase 8 Temporal Observability proposal; §3.6.5 honest grade reconciliation (B− → A path). **§9 Roadmap** adds Phase 7 (Activation & Hardening — 9 sub-slices) + Phase 8 (Temporal Observability — 5 sub-deliverables); updated Phase 6 P6 to acknowledge it's now blocked by Phase 7 (needs real adaptation history, not just substrate). **§1 Forward-Looking Priority Roadmap** rewritten with color-coded sortable table (🔴 Phase 7.1-7.5 = highest priority; 🟡 Phase 8 + soak cadences = medium; 🟢 P6 + CC-parity polish = least). **Cross-priority sequencing rules** updated: rule 5 now reads "P6 after the adaptive substrate is FUNCTIONAL" (not just "ships"); 3 new binding rules added. Zero behavior change. CLAUDE.md verified under 40K. | Claude Opus 4.7 (PRD brutal review + Phase 7+8 roadmap) |
