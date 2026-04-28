@@ -97,11 +97,83 @@ class DoublewordInfraError(Exception):
     classify the failure mode (rate limit vs timeout vs connection error)
     and predict recovery timing.  The ``status_code`` field carries the
     HTTP status (429, 500, etc.) or 0 for non-HTTP failures.
+
+    Phase 12 Slice F — Substrate Error Unmasking (operator-mandated
+    2026-04-27): added ``response_body`` and ``model_id`` so the
+    sentinel + classifier can distinguish 4xx modality errors (NON_CHAT
+    models silently slotted into generative routes) from 5xx transport
+    errors (genuine endpoint instability) without regex-matching on the
+    string repr.
+
+    Failure-class taxonomy carried structurally:
+      * ``status_code in (400, 404, 422)`` AND modality body markers
+        → terminal/modality error, model permanently excluded by
+        Slice H breaker until next catalog refresh
+      * ``status_code in (429, 503)`` → rate limit / overload, retry
+      * ``status_code in (500, 502, 504)`` → transient transport
+      * ``status_code == 401`` / ``403`` → auth failure, terminal
+      * ``status_code == 0`` → non-HTTP (DNS/TLS/timeout)
     """
 
-    def __init__(self, reason: str, status_code: int = 0) -> None:
+    def __init__(
+        self,
+        reason: str,
+        status_code: int = 0,
+        *,
+        response_body: str = "",
+        model_id: str = "",
+    ) -> None:
         super().__init__(reason)
         self.status_code = status_code
+        self.response_body = (response_body or "")[:1024]  # bounded
+        self.model_id = (model_id or "")[:128]
+
+    def is_modality_error(self) -> bool:
+        """True iff the response indicates the model can't accept
+        ``/chat/completions`` payloads. Used by Slice H breaker to
+        decide TERMINAL_OPEN vs transient.
+
+        Heuristic on KNOWN-AT-RUNTIME signals (NOT regex on model id):
+          * status_code in {400, 404, 422} — bad request / not found /
+            unprocessable entity (classic OpenAI-compat modality 4xx)
+          * AND response_body contains a modality marker the DW server
+            actually emits
+        Both required: a 400 about a bad max_tokens is NOT modality.
+        """
+        if self.status_code not in (400, 404, 422):
+            return False
+        body_lower = (self.response_body or "").lower()
+        # These markers are observed in DW + OpenAI-compat error
+        # responses for modality-mismatched calls. Matched on the
+        # SERVER's response body (which is ground truth from DW),
+        # NOT on our local model_id string. If DW returns a body
+        # without these markers, we conservatively treat it as
+        # transient — we don't infer modality from absence.
+        markers = (
+            "does not support chat",
+            "not a chat model",
+            "endpoint not supported",
+            "embedding only",
+            "model_not_chat",
+            "task mismatch",
+            "wrong endpoint",
+            "unsupported endpoint",
+            "model is not available for chat",
+        )
+        return any(m in body_lower for m in markers)
+
+    def is_terminal_auth_error(self) -> bool:
+        """401/403 → permanent auth failure for this model_id."""
+        return self.status_code in (401, 403)
+
+    def is_transient(self) -> bool:
+        """5xx + 429 → transient; should retry per backoff schedule."""
+        if self.status_code in (429, 503, 500, 502, 504):
+            return True
+        # Non-HTTP failures (status_code == 0) — DNS/TLS/timeout —
+        # treated as transient unless the reason text indicates
+        # something terminal. Conservative: assume transient.
+        return self.status_code == 0
 
 
 @dataclass
@@ -985,9 +1057,16 @@ class DoublewordProvider:
                     if resp.status >= 300:
                         self._last_error_status = resp.status
                         err_body = await resp.text()
+                        # Phase 12 Slice F — Substrate Error Unmasking.
+                        # Preserve full response body + model_id so
+                        # downstream classifier can distinguish modality
+                        # 4xx from transient 5xx without regex on str(exc).
                         raise DoublewordInfraError(
-                            f"Chat completions (stream) failed: {resp.status} {err_body[:200]}",
+                            f"Chat completions (stream) failed: "
+                            f"{resp.status} {err_body[:200]}",
                             status_code=resp.status,
+                            response_body=err_body,
+                            model_id=_effective_model,
                         )
 
                     # Parse SSE stream with per-chunk timeout to detect stalled streams
@@ -1036,9 +1115,13 @@ class DoublewordProvider:
                     if resp.status >= 300:
                         self._last_error_status = resp.status
                         err_body = await resp.text()
+                        # Slice F — preserve full body + model_id
                         raise DoublewordInfraError(
-                            f"Chat completions failed: {resp.status} {err_body[:200]}",
+                            f"Chat completions failed: "
+                            f"{resp.status} {err_body[:200]}",
                             status_code=resp.status,
+                            response_body=err_body,
+                            model_id=_effective_model,
                         )
 
                     data = await resp.json()
