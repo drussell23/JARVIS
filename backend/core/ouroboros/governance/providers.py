@@ -5326,7 +5326,31 @@ class ClaudeProvider:
                 # ── Budget-aware backoff computation ──
                 # Classic exponential delay, then capped to a fraction of
                 # whatever budget remains. Never backoff past the grave.
-                delay = base_delay * (2 ** attempt)
+                # Phase 12.2 Slice C — full-jitter retrofit. Master-flag-off
+                # preserves exact-exponential bit-for-bit; on, the uniform
+                # random delay desynchronizes our retry waveform from the
+                # global herd retrying the same Anthropic endpoint after
+                # an outage. Cap is applied AFTER jitter (budget guard
+                # fence), so jitter never breaches the budget fraction.
+                try:
+                    from backend.core.ouroboros.governance.full_jitter import (
+                        full_jitter_backoff_s,
+                        full_jitter_enabled,
+                    )
+                    if full_jitter_enabled():
+                        # Use a generous cap_s — the budget guard below
+                        # is the actual ceiling that matters; the helper
+                        # just needs a non-zero cap to compute the upper
+                        # bound. base_delay * 2^attempt is the exact form
+                        # legacy used as its theoretical upper bound.
+                        _scaled = base_delay * (2 ** attempt)
+                        delay = full_jitter_backoff_s(
+                            attempt, base_s=base_delay, cap_s=max(_scaled, 1.0),
+                        )
+                    else:
+                        delay = base_delay * (2 ** attempt)
+                except Exception:  # noqa: BLE001 — defensive
+                    delay = base_delay * (2 ** attempt)
                 rem_post = _remaining_s()
                 capped = delay
                 if rem_post is not None:

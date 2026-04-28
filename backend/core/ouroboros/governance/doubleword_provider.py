@@ -404,6 +404,50 @@ class DoublewordProvider:
     def _last_chunk_at(self, value: float) -> None:
         self._state.counters.last_chunk_at = value
 
+    def _record_ttft_safely(
+        self,
+        *,
+        model_id: str,
+        ttft_ms: int,
+        op_id: str = "",
+    ) -> None:
+        """Phase 12.2 Slice C — feed first-chunk latency into:
+
+          1. ``TtftObserver`` (rolling stats for promotion + cold-
+             storage gates) — only when tracking_enabled() is true.
+          2. ``PromotionLedger`` ``record_success`` (legacy count gate
+             keep-alive so master-flag-off path stays bit-for-bit
+             unchanged from Phase 12 Slice B).
+
+        NEVER raises. All faults swallowed at this seam — a broken
+        observer or ledger must NEVER take down the SSE stream.
+        Singleton lookup is lazy (deferred until first call) so
+        master-flag-off + tracking-off → zero observer instantiated."""
+        if not model_id or ttft_ms < 0:
+            return
+        # Observer feed (TTFT mode)
+        try:
+            from backend.core.ouroboros.governance.dw_discovery_runner import (
+                get_ttft_observer,
+            )
+            obs = get_ttft_observer()
+            if obs is not None:
+                obs.record_ttft(model_id, ttft_ms, op_id=op_id)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        # Ledger feed (legacy count gate keep-alive). The ledger's
+        # auto-register-on-first-success path means we don't need to
+        # know whether the model was previously quarantined — the
+        # ledger handles it.
+        try:
+            from backend.core.ouroboros.governance.dw_discovery_runner import (
+                _get_or_create_ledger,
+            )
+            led = _get_or_create_ledger()
+            led.record_success(model_id, ttft_ms)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
     @property
     def provider_name(self) -> str:
         """Human-readable name for CandidateProvider protocol."""
@@ -1047,6 +1091,12 @@ class DoublewordProvider:
                 input_tokens = 0
                 output_tokens = 0
                 _PER_CHUNK_TIMEOUT = 30.0  # seconds between SSE chunks
+                # Phase 12.2 Slice C — TTFT measurement window opens
+                # the moment we issue the request and closes on first
+                # non-empty content chunk. monotonic() is jump-proof
+                # under wall-clock corrections.
+                _ttft_request_start_monotonic = time.monotonic()
+                _ttft_first_chunk_seen = False
 
                 async with session.post(
                     f"{self._base_url}/chat/completions",
@@ -1093,6 +1143,28 @@ class DoublewordProvider:
                             if token:
                                 content += token
                                 self._last_chunk_at = time.monotonic()
+                                # Phase 12.2 Slice C — record TTFT once
+                                # per request on first non-empty content
+                                # chunk. NEVER raises into the SSE loop:
+                                # observer faults are swallowed so a
+                                # broken observer can't kill generation.
+                                if not _ttft_first_chunk_seen:
+                                    _ttft_first_chunk_seen = True
+                                    try:
+                                        _ttft_ms = int(
+                                            (self._last_chunk_at
+                                             - _ttft_request_start_monotonic)
+                                            * 1000.0
+                                        )
+                                        self._record_ttft_safely(
+                                            model_id=_effective_model,
+                                            ttft_ms=_ttft_ms,
+                                            op_id=getattr(
+                                                context, "op_id", "",
+                                            ) or "",
+                                        )
+                                    except Exception:  # noqa: BLE001
+                                        pass
                                 try:
                                     _stream_callback(token)
                                 except Exception:

@@ -78,6 +78,29 @@ def tracking_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def ttft_demotion_enabled() -> bool:
+    """``JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED`` (default ``false``).
+
+    Phase 12.2 Slice C master flag. When ``true``:
+
+      * ``PromotionLedger.is_eligible_for_promotion`` consults
+        ``observer.is_promotion_ready(model_id)`` instead of the
+        legacy count gate — N derives mathematically from observed CV.
+      * ``DwCatalogClassifier`` consults ``observer.is_cold_storage``
+        as a soft gate — cold-storage models temporarily route to
+        SPECULATIVE only until TTFT normalizes (auto-recovery).
+
+    When ``false``: legacy count-gate behavior preserved bit-for-bit.
+    Independent from ``tracking_enabled()`` — operators can record
+    TTFT samples without acting on them (shadow-mode observation).
+
+    Default flips to ``true`` at Phase 12.2 Slice E graduation."""
+    raw = os.environ.get(
+        "JARVIS_TOPOLOGY_TTFT_DEMOTION_ENABLED", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _cv_threshold() -> float:
     """``JARVIS_TOPOLOGY_TTFT_CV_THRESHOLD`` (default 0.15).
 
@@ -548,4 +571,5 @@ __all__ = [
     "TtftSample",
     "TtftStats",
     "tracking_enabled",
+    "ttft_demotion_enabled",
 ]

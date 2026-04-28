@@ -288,6 +288,7 @@ class DwCatalogClassifier:
         ledger: PromotionLedger,
         *,
         modality_ledger: Optional[Any] = None,
+        ttft_observer: Optional[Any] = None,
     ) -> ClassificationOutcome:
         """Phase 12 Slice G — when ``modality_ledger`` is provided, the
         classifier consults it as a HARD GATE before any pricing /
@@ -310,7 +311,22 @@ class DwCatalogClassifier:
         Slice G. This is the rollout safety: Slice G can be wired
         without flipping any defaults; Slice G's master flag (in
         the runner, not here) decides whether to pass a non-None
-        ledger in production."""
+        ledger in production.
+
+        Phase 12.2 Slice C — when ``ttft_observer`` is provided AND
+        ``ttft_demotion_enabled()`` is ``true``, models in
+        cold-storage state (latest TTFT > mean+2σ, indicating their
+        weights have just been loaded from NVMe) are temporarily
+        demoted to SPECULATIVE-only routing. Auto-recovery: as soon
+        as TTFT normalizes (next stable observation under the
+        rolling mean+2σ threshold), the demotion lifts on the next
+        ``classify()`` call. NO explicit ledger mutation — the
+        observer's rolling stats are the source of truth.
+
+        ``ttft_observer=None`` OR flag-off preserves legacy behavior.
+        Cold-storage check fires only when the observer has enough
+        samples to compute a non-degenerate σ (N≥3) — below that, no
+        demotion (mathematical floor)."""
         if snapshot is None or not snapshot.models:
             return ClassificationOutcome(
                 assignments=self._empty_assignments(),
@@ -338,6 +354,25 @@ class DwCatalogClassifier:
             ):
                 newly_quarantined.append(card.model_id)
 
+        # Phase 12.2 Slice C — pre-compute cold-storage set once per
+        # classify() call. The observer is consulted lazily; if the
+        # demotion flag is off OR the observer is None, the set stays
+        # empty and behavior is byte-for-byte legacy.
+        cold_storage_ids: set = set()
+        if ttft_observer is not None:
+            try:
+                from backend.core.ouroboros.governance.dw_ttft_observer import (
+                    ttft_demotion_enabled,
+                )
+                if ttft_demotion_enabled():
+                    cold_storage_ids = set(
+                        ttft_observer.cold_storage_models() or ()
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                # Observer fault → treat as no cold-storage signal.
+                # The dispatcher continues; legacy gates still apply.
+                pass
+
         # Build per-route candidate sets
         assignments: Dict[str, RouteAssignment] = {}
         for route in _GENERATIVE_ROUTES:
@@ -350,6 +385,7 @@ class DwCatalogClassifier:
                 family_bonus=family_bonus,
                 newly_quarantined=set(newly_quarantined),
                 modality_ledger=modality_ledger,
+                cold_storage_ids=cold_storage_ids,
             )
             assignments[route] = RouteAssignment(
                 route=route, ranked_model_ids=ranked_ids,
@@ -375,9 +411,11 @@ class DwCatalogClassifier:
         family_bonus: Mapping[str, float],
         newly_quarantined: set,
         modality_ledger: Optional[Any] = None,
+        cold_storage_ids: Optional[set] = None,
     ) -> Tuple[str, ...]:
         prefer_cheap = route in ("background", "speculative")
         eligible: List[Tuple[float, str]] = []
+        cold_ids = cold_storage_ids if cold_storage_ids is not None else set()
 
         for card in snapshot.models:
             mid = card.model_id
@@ -415,6 +453,19 @@ class DwCatalogClassifier:
                 except Exception:  # noqa: BLE001 — defensive
                     # Ledger error → treat as no-record (don't block)
                     pass
+
+            # Phase 12.2 Slice C — cold-storage soft gate. Applied
+            # AFTER modality (NON_CHAT remains a hard exclude that
+            # cold-storage cannot override) and BEFORE the quarantine
+            # pin so it composes with quarantine without contradicting
+            # it. Models with latest TTFT > mean+2σ route to SPECULATIVE
+            # only this cycle; auto-recovery on next stable observation.
+            if mid in cold_ids:
+                if route == "speculative":
+                    eligible.append(
+                        (self._quarantine_score(card), mid),
+                    )
+                continue
 
             # Quarantine pin: quarantined models go SPECULATIVE only
             is_q = (

@@ -451,13 +451,35 @@ class PromotionLedger:
     # Promotion gate
     # ------------------------------------------------------------------
 
-    def is_eligible_for_promotion(self, model_id: str) -> bool:
-        """All criteria must hold:
-          * ring buffer at >= min_successes capacity
-          * EVERY latency <= max_latency_ms
-          * 0 failures in current ring window
-          * not already promoted
-        NEVER raises."""
+    def is_eligible_for_promotion(
+        self,
+        model_id: str,
+        *,
+        observer: Optional[Any] = None,
+    ) -> bool:
+        """Check whether ``model_id`` is eligible for graduation from
+        SPECULATIVE quarantine to BACKGROUND.
+
+        Two gating modes — selected at call time, not at construction
+        (so operators can flip live):
+
+          1. **TTFT mode** (Phase 12.2 Slice C): when ``observer`` is
+             provided AND ``ttft_demotion_enabled()`` is ``true``, the
+             gate defers to ``observer.is_promotion_ready(model_id)``.
+             N derives mathematically from observed CV — no hardcoded
+             count required (operator directive 2026-04-27).
+
+          2. **Legacy count mode** (Phase 12 Slice B, default): the
+             ring buffer + EVERY-latency-below-threshold gate. Still
+             requires the model to be registered + non-promoted.
+
+        Both modes filter out:
+          * unknown ``model_id`` (record never created)
+          * already-promoted models (no double-promote)
+
+        NEVER raises. ``observer=None`` OR flag-off → legacy gate.
+        Defensive try/except around the observer call so a faulty
+        observer can't take down the dispatcher."""
         if not model_id or not model_id.strip():
             return False
         self._ensure_loaded()
@@ -467,6 +489,21 @@ class PromotionLedger:
                 return False
             if rec.promoted:
                 return False
+
+            # TTFT mode (operator directive 2026-04-27, Slice C)
+            if observer is not None:
+                try:
+                    from backend.core.ouroboros.governance.dw_ttft_observer import (
+                        ttft_demotion_enabled,
+                    )
+                    if ttft_demotion_enabled():
+                        return bool(observer.is_promotion_ready(model_id))
+                except Exception:  # noqa: BLE001 — defensive
+                    # Observer fault → fall through to legacy gate.
+                    # Don't take down the dispatcher.
+                    pass
+
+            # Legacy count gate (Phase 12 Slice B)
             min_n = _min_successes()
             max_lat = _max_latency_ms()
             if len(rec.success_latencies_ms) < min_n:
@@ -475,11 +512,18 @@ class PromotionLedger:
                 return False
             return all(lat <= max_lat for lat in rec.success_latencies_ms)
 
-    def promote(self, model_id: str) -> bool:
+    def promote(
+        self,
+        model_id: str,
+        *,
+        observer: Optional[Any] = None,
+    ) -> bool:
         """Explicit graduation event. Returns True if state changed,
         False if not eligible / already promoted / unknown.
-        NEVER raises."""
-        if not self.is_eligible_for_promotion(model_id):
+
+        ``observer`` forwarded to the eligibility gate — same TTFT-vs-
+        count-mode selection. NEVER raises."""
+        if not self.is_eligible_for_promotion(model_id, observer=observer):
             return False
         with self._lock:
             rec = self._records.get(model_id)

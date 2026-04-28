@@ -332,7 +332,8 @@ async def test_run_discovery_with_classifier_that_raises(
     session = _mock_session(body)
 
     class _BrokenClassifier:
-        def classify(self, snap, ledger, *, modality_ledger=None):  # noqa: ARG002
+        def classify(self, snap, ledger, *,  # noqa: ARG002
+                     modality_ledger=None, ttft_observer=None):
             raise RuntimeError("classifier blew up")
 
     result = await run_discovery(
