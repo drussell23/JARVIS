@@ -313,8 +313,14 @@ async def test_prober_success_records_into_observer(
 async def test_prober_failure_records_ceiling_ttft(
     isolated_budget: HeavyProbeBudget, heavy_probe_on, monkeypatch,
 ) -> None:
-    """A 500 response → prober records the timeout ceiling as TTFT
-    (asymmetric cold-storage signal)."""
+    """Phase 12.2 Slice G — Failure Ignorance.
+
+    A 500 response (or transport error / empty stream) is a NETWORK
+    FAILURE, not a TTFT measurement. The observer MUST NOT receive a
+    sample for failed probes — the rolling stats would be poisoned by
+    uniform-timeout false positives. The HeavyProbeResult still
+    reports the timeout ceiling for caller introspection (logs,
+    debugging) but no sample enters the warmth dataset."""
     monkeypatch.setenv("JARVIS_TOPOLOGY_HEAVY_PROBE_TIMEOUT_S", "5")
     fake_session = _SessionWith(status=500, chunks=())
     fake_obs = MagicMock()
@@ -328,10 +334,10 @@ async def test_prober_failure_records_ceiling_ttft(
     )
     assert result.success is False
     assert "status_500" in result.error
-    fake_obs.record_ttft.assert_called_once()
-    args, _ = fake_obs.record_ttft.call_args
-    # Ceiling = timeout_ms (5000)
-    assert args[1] == 5000
+    # Slice G: observer NOT called on failure (failure ignorance)
+    fake_obs.record_ttft.assert_not_called()
+    # But the result still reports the ceiling for introspection
+    assert result.ttft_ms == 5000
 
 
 @pytest.mark.asyncio

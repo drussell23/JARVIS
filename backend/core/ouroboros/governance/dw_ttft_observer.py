@@ -143,6 +143,36 @@ def _rel_sem_threshold() -> float:
         return 0.05
 
 
+def _promotion_ceiling_ms() -> int:
+    """``JARVIS_TOPOLOGY_TTFT_PROMOTION_CEILING_MS`` (default 5000).
+
+    Phase 12.2 Slice G — Absolute Ceiling Gate. A model whose mean
+    TTFT exceeds this ceiling is **functionally dead** regardless of
+    how tight its variance is. Mathematical stability (low CV, low
+    rel_SEM) is necessary but NOT sufficient for promotion — the
+    mean itself must indicate the model is actually responsive.
+
+    Operator directive 2026-04-28: a model returning uniform 30-second
+    timeouts has CV=0 and rel_SEM=0, which would pass the variance
+    gates trivially, but it is not warm — it is dead. The absolute
+    ceiling fires BEFORE variance math to reject this class of false
+    positive.
+
+    5000ms default chosen to be generous: a typical warm-VRAM DW model
+    returns first chunk in <500ms; a model loading from cold NVMe can
+    take 2-3s; anything above 5s is so far outside the warm distribution
+    that promotion would be a routing error. Operators can tune via
+    env if their endpoint has different latency characteristics."""
+    try:
+        return max(1, int(
+            os.environ.get(
+                "JARVIS_TOPOLOGY_TTFT_PROMOTION_CEILING_MS", "5000",
+            ).strip()
+        ))
+    except (ValueError, TypeError):
+        return 5000
+
+
 def _cold_sigma() -> float:
     """``JARVIS_TOPOLOGY_TTFT_COLD_SIGMA`` (default 2.0).
 
@@ -478,7 +508,16 @@ class TtftObserver:
         """True iff ``model_id`` has demonstrated TTFT consistency
         sufficient for graduation from SPECULATIVE to BACKGROUND.
 
-        Two gates, both must hold:
+        Three gates, all must hold:
+
+          * **Absolute ceiling gate** (Phase 12.2 Slice G): mean_ms <
+            promotion_ceiling_ms. A model whose mean TTFT exceeds the
+            ceiling is functionally dead — uniform 30-second timeouts
+            have CV=0 (trivially "consistent") but are not warm. The
+            ceiling rejects this class of false positive BEFORE any
+            variance math runs. Mathematical stability is necessary
+            but NOT sufficient — the mean itself must indicate the
+            model is actually responsive.
 
           * **Coefficient of variation gate**: CV < cv_threshold.
             The model's TTFT noise (1σ) is bounded relative to its
@@ -490,10 +529,11 @@ class TtftObserver:
             trustworthy. Mathematically equivalent to:
               N > (CV / sem_threshold)^2
 
-        Together they encode: "the mean is stable AND the model is
-        consistent." NO hardcoded count required — the math derives N
-        dynamically from observed CV. A consistent model graduates
-        with few samples; a noisy model needs more.
+        Together they encode: "the mean is stable AND below the
+        responsiveness ceiling AND the model is consistent." NO
+        hardcoded count required — the math derives N dynamically
+        from observed CV. A consistent model graduates with few
+        samples; a noisy model needs more.
 
         NEVER raises."""
         if not tracking_enabled():
@@ -502,6 +542,12 @@ class TtftObserver:
         if s is None:
             return False
         if s.mean_ms <= 0 or s.n < 2:
+            return False
+        # Slice G — Absolute Ceiling Gate (operator directive 2026-04-28).
+        # Fires BEFORE variance math so a uniform-timeout false positive
+        # cannot pass through the CV gate. Critical: a model returning
+        # 30s timeouts has CV=0 but is not warm — it is dead.
+        if s.mean_ms >= _promotion_ceiling_ms():
             return False
         return s.cv < _cv_threshold() and s.rel_sem < _rel_sem_threshold()
 
