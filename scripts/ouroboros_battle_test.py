@@ -774,6 +774,36 @@ def main() -> None:
             "summary.json. Lists available sessions when set to 'list'."
         ),
     )
+    # Phase 1 Slice 1.4 — deterministic re-execution.
+    # Distinct from --replay (which is a read-only timeline display).
+    # --rerun re-boots the harness in REPLAY mode against the recorded
+    # decisions ledger so every captured decision is replayed without
+    # calling its compute() function. The resulting session can then be
+    # diffed against the original to prove determinism.
+    parser.add_argument(
+        "--rerun",
+        type=str,
+        default=None,
+        metavar="SESSION_ID",
+        help=(
+            "Deterministic re-execution. Locates the session's persisted "
+            "seed + decisions ledger under .jarvis/determinism/<id>/, "
+            "applies the replay env vars, and runs the harness in "
+            "REPLAY (or VERIFY) mode. Fails fast if the session has no "
+            "recorded state. Pair with --rerun-mode for verify."
+        ),
+    )
+    parser.add_argument(
+        "--rerun-mode",
+        type=str,
+        default="replay",
+        choices=("replay", "verify"),
+        help=(
+            "When --rerun is set: 'replay' (default) returns recorded "
+            "decisions without calling compute(); 'verify' runs live AND "
+            "asserts each decision matches the recorded output."
+        ),
+    )
     # Phase 8 surface wiring Slice 3 — multi-op timeline renderer.
     # Read-only over the decision-trace ledger; never boots the
     # battle-test stack. Default false until graduation; respects
@@ -802,6 +832,40 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Phase 1 Slice 1.4 — deterministic re-execution (--rerun)
+    # ------------------------------------------------------------------
+    # Resolve + apply replay env vars BEFORE any harness module is
+    # imported / instantiated. The phase capture wrapper + decision
+    # runtime read env at call time, so as long as we set env before
+    # the first decide() call the harness boots in REPLAY mode
+    # transparently. Fails fast on missing state — operator gets a
+    # clear diagnostic instead of silent fall-through to fresh session.
+    if args.rerun is not None:
+        try:
+            from backend.core.ouroboros.governance.determinism.session_replay import (
+                render_plan_summary,
+                setup_replay_from_cli,
+            )
+            _plan = setup_replay_from_cli(
+                args.rerun, mode=args.rerun_mode, raise_on_failure=True,
+            )
+            print(render_plan_summary(_plan))
+            print(
+                f"  rerun_mode:     {args.rerun_mode}\n"
+                f"  → harness will boot in {args.rerun_mode.upper()} "
+                f"mode against the recorded ledger.\n"
+            )
+        except ValueError as exc:
+            print(f"\n  {_RED}Replay setup failed:{_RESET}\n  {exc}\n")
+            sys.exit(2)
+        except Exception as exc:
+            print(
+                f"\n  {_RED}Replay subsystem unavailable:{_RESET} "
+                f"{type(exc).__name__}: {exc}\n"
+                "  Continuing with fresh-session boot.\n"
+            )
 
     # ------------------------------------------------------------------
     # Replay mode — show a previous session timeline and exit

@@ -54,6 +54,13 @@ from backend.core.ouroboros.governance.determinism.phase_capture import (
     phase_capture_enabled,
     register_adapter,
 )
+from backend.core.ouroboros.governance.determinism.session_replay import (
+    ReplaySessionPlan,
+    SessionReplayer,
+    render_plan_summary,
+    replay_cli_enabled,
+    setup_replay_from_cli,
+)
 
 __all__ = [
     "DecisionMismatchError",
@@ -64,7 +71,9 @@ __all__ = [
     "LedgerMode",
     "OutputAdapter",
     "RealClock",
+    "ReplaySessionPlan",
     "SessionEntropy",
+    "SessionReplayer",
     "VerifyResult",
     "capture_phase_decision",
     "clock_enabled",
@@ -75,6 +84,9 @@ __all__ = [
     "ledger_enabled",
     "phase_capture_enabled",
     "register_adapter",
+    "render_plan_summary",
+    "replay_cli_enabled",
     "runtime_for_session",
     "runtime_session",
+    "setup_replay_from_cli",
 ]
