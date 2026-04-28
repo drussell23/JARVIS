@@ -862,6 +862,111 @@ def _pat_docstring_only_delete(
 
 
 # ---------------------------------------------------------------------------
+# PATTERN 11 — dynamic_import_chain (§24.8.1 AST-pattern blindspot)
+# ---------------------------------------------------------------------------
+# HARD: new code introduces a dynamic import/eval/exec chain that bypasses
+# static analysis. Walks the AST for __import__, eval, exec, compile,
+# getattr (with dangerous target), importlib.import_module, base64/codecs
+# decode chains, and open().read() chains.
+# Only flags NEW introductions (count in new > count in old).
+
+_DYNAMIC_EXEC_BUILTINS: frozenset = frozenset({
+    "__import__", "eval", "exec", "compile",
+})
+
+_DYNAMIC_ATTR_CALLS: frozenset = frozenset({
+    ("importlib", "import_module"),
+    ("importlib", "__import__"),
+    ("base64", "b64decode"),
+    ("base64", "b64encode"),
+    ("base64", "decodebytes"),
+    ("codecs", "decode"),
+    ("codecs", "encode"),
+    ("builtins", "__import__"),
+    ("builtins", "eval"),
+    ("builtins", "exec"),
+    ("builtins", "compile"),
+})
+
+_DANGEROUS_GETATTR_TARGETS: frozenset = frozenset({
+    "__import__", "eval", "exec", "compile", "system", "popen",
+    "run", "call", "check_output", "check_call", "Popen",
+    "getattr", "setattr", "delattr", "__subclasses__",
+    "__globals__", "__builtins__", "__code__", "__class__",
+})
+
+
+def _count_dynamic_chains(module: Optional[ast.Module]) -> int:
+    if module is None:
+        return 0
+    count = 0
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in _DYNAMIC_EXEC_BUILTINS:
+            count += 1
+            continue
+        if isinstance(func, ast.Attribute):
+            root: ast.AST = func.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name):
+                pair = (root.id, func.attr)
+                if pair in _DYNAMIC_ATTR_CALLS:
+                    count += 1
+                    continue
+        if (
+            isinstance(func, ast.Name)
+            and func.id == "getattr"
+            and len(node.args) >= 2
+        ):
+            second_arg = node.args[1]
+            if (
+                isinstance(second_arg, ast.Constant)
+                and isinstance(second_arg.value, str)
+                and second_arg.value in _DANGEROUS_GETATTR_TARGETS
+            ):
+                count += 1
+                continue
+        if isinstance(func, ast.Attribute) and func.attr == "read":
+            inner = func.value
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "open"
+            ):
+                count += 1
+                continue
+    return count
+
+
+def _pat_dynamic_import_chain(
+    *, file_path: str, old_content: str, new_content: str,
+) -> Optional[Detection]:
+    old_tree = _safe_parse(old_content)
+    new_tree = _safe_parse(new_content)
+    if new_tree is None:
+        return None
+    old_count = _count_dynamic_chains(old_tree)
+    new_count = _count_dynamic_chains(new_tree)
+    delta = new_count - old_count
+    if delta <= 0:
+        return None
+    return Detection(
+        pattern="dynamic_import_chain",
+        severity="hard",
+        message=(
+            f"Dynamic import/exec chain introduced "
+            f"({delta} new node{'s' if delta != 1 else ''}: "
+            f"__import__/eval/exec/compile/getattr/importlib)"
+        ),
+        file_path=file_path,
+        snippet=f"old_count={old_count} new_count={new_count} delta={delta}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pattern registry
 # ---------------------------------------------------------------------------
 
@@ -878,6 +983,7 @@ _ALL_PATTERNS: Tuple[str, ...] = (
     "silent_exception_swallow",
     "hardcoded_url_swap",
     "docstring_only_delete",
+    "dynamic_import_chain",
 )
 
 
@@ -892,6 +998,7 @@ _PATTERNS: dict = {
     "silent_exception_swallow": _pat_silent_exception_swallow,
     "hardcoded_url_swap": _pat_hardcoded_url_swap,
     "docstring_only_delete": _pat_docstring_only_delete,
+    "dynamic_import_chain": _pat_dynamic_import_chain,
 }
 
 
