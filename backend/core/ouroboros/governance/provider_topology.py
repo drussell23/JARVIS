@@ -662,10 +662,160 @@ def reload_topology() -> ProviderTopology:
     return get_topology()
 
 
+# ---------------------------------------------------------------------------
+# Phase 12 Slice C — Dynamic catalog holder (shadow mode)
+# ---------------------------------------------------------------------------
+#
+# In shadow mode (default for Slice C), the catalog discovery pipeline
+# fetches DW's /models endpoint, runs the classifier, and populates the
+# in-memory holder below. The dispatcher continues consuming the YAML
+# ranked lists via :meth:`ProviderTopology.dw_models_for_route` — the
+# dynamic catalog is OBSERVATION-ONLY this slice. Slice D flips
+# ``dw_models_for_route`` to read the dynamic holder first.
+#
+# The holder is a module-level singleton (not a ProviderTopology field)
+# because ProviderTopology is ``@dataclass(frozen=True)``. Keeping the
+# mutable runtime state separate from the YAML-derived immutable view
+# preserves the contract that ``get_topology()`` returns the same
+# bit-for-bit object across calls.
+
+import threading as _threading
+
+
+@dataclass(frozen=True)
+class _DynamicCatalogHolder:
+    """Frozen view of the latest discovery cycle's output. Replaced
+    atomically — never mutated in place — so concurrent readers always
+    see a consistent snapshot."""
+    assignments_by_route: Mapping[str, Tuple[str, ...]]  # route → ranked model_ids
+    fetched_at_unix: float
+    fetch_failure_reason: Optional[str] = None
+    schema_version: str = "dynamic_catalog.1"
+
+
+_DYNAMIC_CATALOG: Optional[_DynamicCatalogHolder] = None
+_DYNAMIC_CATALOG_LOCK = _threading.Lock()
+
+
+def set_dynamic_catalog(
+    assignments_by_route: Mapping[str, Tuple[str, ...]],
+    *,
+    fetched_at_unix: float,
+    fetch_failure_reason: Optional[str] = None,
+) -> None:
+    """Replace the in-memory dynamic catalog. Called by the discovery
+    runner (Phase 12 Slice C) after a successful or failed catalog
+    fetch + classification.
+
+    Atomic-replace contract: the holder is never partially updated; a
+    concurrent ``get_dynamic_catalog()`` either sees the prior holder
+    or the new one, never an in-progress mutation.
+
+    NEVER raises on bad input — coerces to a defensive frozen mapping."""
+    global _DYNAMIC_CATALOG
+    safe: Dict[str, Tuple[str, ...]] = {}
+    if isinstance(assignments_by_route, Mapping):
+        for k, v in assignments_by_route.items():
+            try:
+                key = str(k).strip().lower()
+                if not key:
+                    continue
+                if isinstance(v, (list, tuple)):
+                    safe[key] = tuple(str(m) for m in v if m)
+            except Exception:  # noqa: BLE001 — defensive
+                continue
+    holder = _DynamicCatalogHolder(
+        assignments_by_route=safe,
+        fetched_at_unix=float(fetched_at_unix),
+        fetch_failure_reason=fetch_failure_reason,
+    )
+    with _DYNAMIC_CATALOG_LOCK:
+        _DYNAMIC_CATALOG = holder
+
+
+def get_dynamic_catalog() -> Optional[_DynamicCatalogHolder]:
+    """Return the most recent dynamic catalog snapshot, or None when
+    discovery has never run / has been cleared. NEVER raises."""
+    with _DYNAMIC_CATALOG_LOCK:
+        return _DYNAMIC_CATALOG
+
+
+def clear_dynamic_catalog() -> None:
+    """Reset the holder to None — for tests + explicit operator
+    invalidation. NEVER raises."""
+    global _DYNAMIC_CATALOG
+    with _DYNAMIC_CATALOG_LOCK:
+        _DYNAMIC_CATALOG = None
+
+
+@dataclass(frozen=True)
+class RouteDiff:
+    """Per-route comparison of YAML-authored vs. dynamically-discovered
+    ranked model lists. Surfaced by ``compute_yaml_diff`` for operator
+    review during shadow-mode rollout.
+
+    ``yaml_only`` — model_ids YAML wires that the catalog doesn't
+        expose (likely renamed / removed upstream)
+    ``catalog_only`` — model_ids the catalog exposes but YAML doesn't
+        wire (the 14 missing models from the 22-model catalog)
+    ``both`` — model_ids that overlap. Order may still differ; the
+        ``yaml_order`` and ``catalog_order`` tuples preserve the
+        ranking from each source for comparison.
+    """
+    route: str
+    yaml_only: Tuple[str, ...]
+    catalog_only: Tuple[str, ...]
+    both: Tuple[str, ...]
+    yaml_order: Tuple[str, ...]
+    catalog_order: Tuple[str, ...]
+
+
+def compute_yaml_diff(
+    *,
+    catalog_assignments: Mapping[str, Tuple[str, ...]],
+    yaml_topology: Optional[ProviderTopology] = None,
+) -> Dict[str, RouteDiff]:
+    """Compare dynamic catalog assignments against the YAML topology's
+    ranked lists, per route. Returns a ``Dict[route, RouteDiff]``.
+
+    Pure function — does NOT mutate state. Used by the discovery runner
+    to surface diagnostic strings for the sentinel preflight result,
+    and by future operator tooling for shadow-mode review.
+
+    Routes considered: ``standard``, ``complex``, ``background``,
+    ``speculative``. IMMEDIATE is intentionally excluded (Claude-direct
+    by Manifesto §5; the catalog never assigns models to it)."""
+    if yaml_topology is None:
+        yaml_topology = get_topology()
+    out: Dict[str, RouteDiff] = {}
+    for route in ("standard", "complex", "background", "speculative"):
+        try:
+            yaml_list = yaml_topology.dw_models_for_route(route)
+        except Exception:  # noqa: BLE001 — defensive
+            yaml_list = ()
+        catalog_list = tuple(catalog_assignments.get(route, ()))
+        yaml_set = set(yaml_list)
+        catalog_set = set(catalog_list)
+        out[route] = RouteDiff(
+            route=route,
+            yaml_only=tuple(sorted(yaml_set - catalog_set)),
+            catalog_only=tuple(sorted(catalog_set - yaml_set)),
+            both=tuple(sorted(yaml_set & catalog_set)),
+            yaml_order=tuple(yaml_list),
+            catalog_order=catalog_list,
+        )
+    return out
+
+
 __all__ = [
     "CallerTopology",
     "ProviderTopology",
     "RouteTopology",
+    "RouteDiff",
+    "compute_yaml_diff",
     "get_topology",
     "reload_topology",
+    "set_dynamic_catalog",
+    "get_dynamic_catalog",
+    "clear_dynamic_catalog",
 ]
