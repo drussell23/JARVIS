@@ -3,23 +3,22 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #49398
-- **Branch**: `fix/ci/pr-automation-validation-run49397-20260428-130110`
-- **Commit**: `9ba69d989fee82b38ba6ab6d16f74c65903718fa`
+- **Run Number**: #49399
+- **Branch**: `fix/ci/pr-automation-validation-run49398-20260428-130427`
+- **Commit**: `1a8583977b5a86cb39fde7b048d3ccc39f220445`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-28T13:02:13Z
+- **Timestamp**: 2026-04-28T13:05:44Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25054375773)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25054545858)
 
 ## Failure Overview
 
-Total Failed Jobs: **3**
+Total Failed Jobs: **2**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
 | 1 | Validate PR Title | timeout | high | 3s |
-| 2 | Check for Conflicts | permission_error | high | 15s |
-| 3 | PR Size Check | permission_error | high | 14s |
+| 2 | PR Size Check | permission_error | low | 7s |
 
 ## Detailed Analysis
 
@@ -28,10 +27,10 @@ Total Failed Jobs: **3**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-28T13:02:17Z
-**Completed**: 2026-04-28T13:02:20Z
+**Started**: 2026-04-28T13:05:49Z
+**Completed**: 2026-04-28T13:05:52Z
 **Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25054375773/job/73390478720)
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25054545858/job/73391081640)
 
 #### Failed Steps
 
@@ -44,13 +43,13 @@ Total Failed Jobs: **3**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 23: `2026-04-28T13:02:19.3229406Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 35: `2026-04-28T13:02:19.6925940Z ##[error]<!DOCTYPE html>`
+    - Line 23: `2026-04-28T13:05:50.9570365Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 35: `2026-04-28T13:05:51.5944377Z ##[error]<!DOCTYPE html>`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 98: `2026-04-28T13:02:19.7375001Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 98: `2026-04-28T13:05:51.6540661Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -64,44 +63,15 @@ Total Failed Jobs: **3**
 
 ---
 
-### 2. Check for Conflicts
+### 2. PR Size Check
 
 **Status**: ❌ failure
 **Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-04-28T13:02:18Z
-**Completed**: 2026-04-28T13:02:33Z
-**Duration**: 15 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25054375773/job/73390478766)
-
-#### Failed Steps
-
-- **Step 2**: Check Merge Conflicts
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 36: `2026-04-28T13:02:31.8353206Z ##[error]Unhandled error: HttpError: <!DOCTYPE html>`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
-
----
-
-### 3. PR Size Check
-
-**Status**: ❌ failure
-**Category**: Permission Error
-**Severity**: HIGH
-**Started**: 2026-04-28T13:02:20Z
-**Completed**: 2026-04-28T13:02:34Z
-**Duration**: 14 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25054375773/job/73390478808)
+**Severity**: LOW
+**Started**: 2026-04-28T13:05:49Z
+**Completed**: 2026-04-28T13:05:56Z
+**Duration**: 7 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25054545858/job/73391081654)
 
 #### Failed Steps
 
@@ -109,12 +79,7 @@ Total Failed Jobs: **3**
 
 #### Error Analysis
 
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 36: `2026-04-28T13:02:33.5350891Z ##[error]Unhandled error: HttpError: <!DOCTYPE html>`
+*No specific error patterns detected*
 
 #### Suggested Fixes
 
@@ -138,5 +103,5 @@ Total Failed Jobs: **3**
 
 ---
 
-📊 *Report generated on 2026-04-28T13:04:27.874951*
+📊 *Report generated on 2026-04-28T13:08:03.605028*
 🤖 *JARVIS CI/CD Auto-PR Manager*
