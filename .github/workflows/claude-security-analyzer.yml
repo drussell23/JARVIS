@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -182,7 +182,7 @@ jobs:
           PYTHON_SCRIPT
 
       - name: Post Security Analysis
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         if: github.event_name == 'pull_request'
         with:
           script: |
@@ -228,7 +228,7 @@ jobs:
 
       - name: Add Security Labels
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           CRITICAL_COUNT: ${{ steps.ai_analysis.outputs.critical_count }}
         with:
@@ -253,7 +253,7 @@ jobs:
         if: |
           github.event_name == 'pull_request' &&
           steps.ai_analysis.outputs.has_critical == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -272,7 +272,7 @@ jobs:
         if: |
           github.event_name == 'schedule' &&
           steps.ai_analysis.outputs.has_critical == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
