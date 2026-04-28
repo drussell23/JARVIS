@@ -36,6 +36,18 @@ from backend.core.ouroboros.governance.verification.property_oracle import (
     oracle_enabled,
     register_evaluator,
 )
+from backend.core.ouroboros.governance.verification.property_capture import (
+    CANONICAL_SEVERITIES,
+    PropertyClaim,
+    SEVERITY_IDEAL,
+    SEVERITY_MUST_HOLD,
+    SEVERITY_SHOULD_HOLD,
+    capture_claims,
+    filter_load_bearing,
+    get_recorded_claims,
+    property_capture_enabled,
+    synthesize_claims_from_plan,
+)
 from backend.core.ouroboros.governance.verification.repeat_runner import (
     EvidenceCollector,
     RepeatRunner,
@@ -46,18 +58,28 @@ from backend.core.ouroboros.governance.verification.repeat_runner import (
 )
 
 __all__ = [
+    "CANONICAL_SEVERITIES",
     "EvidenceCollector",
     "Property",
+    "PropertyClaim",
     "PropertyEvaluator",
     "PropertyOracle",
     "PropertyVerdict",
     "RepeatRunner",
     "RepeatVerdict",
     "RunBudget",
+    "SEVERITY_IDEAL",
+    "SEVERITY_MUST_HOLD",
+    "SEVERITY_SHOULD_HOLD",
     "VerdictKind",
+    "capture_claims",
+    "filter_load_bearing",
     "get_default_oracle",
     "get_default_runner",
+    "get_recorded_claims",
     "oracle_enabled",
+    "property_capture_enabled",
     "register_evaluator",
     "repeat_runner_enabled",
+    "synthesize_claims_from_plan",
 ]

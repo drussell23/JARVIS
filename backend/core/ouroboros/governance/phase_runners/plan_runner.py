@@ -862,6 +862,43 @@ class PLANRunner(PhaseRunner):
             )
         # ---- end verbatim transcription ----
 
+        # Phase 2 Slice 2.3 — synthesize + capture property claims
+        # from the plan output. Audit-only: the planner's output is
+        # not modified; we extract claims via a deterministic pure-
+        # function synthesizer, persist them via Slice 1.3's
+        # capture_phase_decision (each claim → one ledger record).
+        # Closure-over-_plan_result means REPLAY mode does NOT alter
+        # the planner; only the claim records are recorded/replayed.
+        try:
+            from backend.core.ouroboros.governance.verification.property_capture import (
+                capture_claims,
+                synthesize_claims_from_plan,
+            )
+            if (
+                _plan_result is not None
+                and not getattr(_plan_result, "skipped", False)
+                and getattr(_plan_result, "plan_json", None)
+            ):
+                _plan_dict = _plan_result.plan_json
+                if isinstance(_plan_dict, dict):
+                    _claims = synthesize_claims_from_plan(
+                        _plan_dict, op_id=ctx.op_id,
+                    )
+                    if _claims:
+                        await capture_claims(
+                            op_id=ctx.op_id,
+                            claims=_claims,
+                            ctx=ctx,
+                        )
+        except Exception:  # noqa: BLE001 — defensive
+            # Capture failure does NOT propagate — the plan already
+            # succeeded; claim audit is best-effort.
+            logger.debug(
+                "[Orchestrator] property_capture failed for PLAN; "
+                "plan still applies",
+                exc_info=True,
+            )
+
         return PhaseResult(
             next_ctx=ctx,
             next_phase=OperationPhase.GENERATE,
