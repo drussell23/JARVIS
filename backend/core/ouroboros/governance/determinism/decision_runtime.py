@@ -85,17 +85,23 @@ logger = logging.getLogger(__name__)
 
 
 def ledger_enabled() -> bool:
-    """``JARVIS_DETERMINISM_LEDGER_ENABLED`` (default ``false``).
+    """``JARVIS_DETERMINISM_LEDGER_ENABLED`` (default ``true`` —
+    graduated in Phase 1 Slice 1.5).
 
-    Phase 1 Slice 1.2 master kill switch. Re-read at call time so
-    monkeypatch works in tests + operators can flip live without
-    re-init. Default flips to ``true`` at Phase 1 graduation.
+    Re-read at call time so monkeypatch works in tests + operators
+    can flip live without re-init. Hot-revert path: ``export
+    JARVIS_DETERMINISM_LEDGER_ENABLED=false`` short-circuits
+    ``decide()`` to PASSTHROUGH (compute runs, no recording, no
+    lookup) regardless of mode env.
 
-    When ``false``: ``decide()`` short-circuits to PASSTHROUGH (just
-    runs compute, no recording, no lookup) regardless of mode env."""
+    When ``true``: ``decide()`` engages the configured mode
+    (RECORD/REPLAY/VERIFY/PASSTHROUGH per
+    JARVIS_DETERMINISM_LEDGER_MODE)."""
     raw = os.environ.get(
         "JARVIS_DETERMINISM_LEDGER_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

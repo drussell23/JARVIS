@@ -74,19 +74,22 @@ logger = logging.getLogger(__name__)
 
 
 def entropy_enabled() -> bool:
-    """``JARVIS_DETERMINISM_ENTROPY_ENABLED`` (default ``false``).
+    """``JARVIS_DETERMINISM_ENTROPY_ENABLED`` (default ``true`` —
+    graduated in Phase 1 Slice 1.5).
 
-    Phase 1 Slice 1.1 master flag. Re-read at call time so monkeypatch
-    works in tests + operators can flip live without re-init. Default
-    flips to ``true`` at Phase 1 graduation slice.
+    Re-read at call time so monkeypatch works in tests + operators
+    can flip live without re-init. Hot-revert path: ``export
+    JARVIS_DETERMINISM_ENTROPY_ENABLED=false`` returns ``entropy_for``
+    to fresh non-deterministic streams (legacy bit-for-bit behavior).
 
     When ``true``: ``entropy_for(op_id)`` returns a deterministic
     stream. Replay-safe. When ``false``: returns a fresh non-
-    deterministic ``random.Random`` instance per call (legacy
-    behavior preserved bit-for-bit)."""
+    deterministic ``random.Random`` instance per call."""
     raw = os.environ.get(
         "JARVIS_DETERMINISM_ENTROPY_ENABLED", "",
     ).strip().lower()
+    if raw == "":
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

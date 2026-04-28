@@ -58,8 +58,17 @@ def clean_clock_state(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_flag_default_false(clean_clock_state) -> None:
-    assert clock_enabled() is False
+def test_flag_default_true(clean_clock_state) -> None:
+    """Phase 1 Slice 1.5 graduated default — env unset → True."""
+    assert clock_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " ", "  "])
+def test_flag_empty_reads_as_default_true(
+    monkeypatch, clean_clock_state, val,
+) -> None:
+    monkeypatch.setenv("JARVIS_DETERMINISM_CLOCK_ENABLED", val)
+    assert clock_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "On"])
@@ -68,8 +77,10 @@ def test_flag_truthy(monkeypatch, clean_clock_state, val) -> None:
     assert clock_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
 def test_flag_falsy(monkeypatch, clean_clock_state, val) -> None:
+    """Hot-revert: explicit false-class strings disable. Empty/
+    whitespace are no longer falsy post-graduation."""
     monkeypatch.setenv("JARVIS_DETERMINISM_CLOCK_ENABLED", val)
     assert clock_enabled() is False
 
@@ -102,8 +113,13 @@ def test_master_flag_default_when_no_overrides(
     assert _resolve_mode(None) is ClockMode.RECORD
 
 
-def test_passthrough_when_flag_off(clean_clock_state) -> None:
-    """No env, flag off → PASSTHROUGH."""
+def test_passthrough_when_flag_off(
+    clean_clock_state, monkeypatch,
+) -> None:
+    """Explicit ``false`` for the master flag → PASSTHROUGH.
+    Post-Slice-1.5 the default is True, so 'flag off' must be set
+    explicitly via the hot-revert path."""
+    monkeypatch.setenv("JARVIS_DETERMINISM_CLOCK_ENABLED", "false")
     assert _resolve_mode(None) is ClockMode.PASSTHROUGH
 
 
