@@ -161,6 +161,44 @@ class COMPLETERunner(PhaseRunner):
                 pass
         # ---- end verbatim transcription --------------------------------
 
+        # Phase 2 Slice 2.4 — verification postmortem (loop-closing).
+        # Walk recorded claims (Slice 2.3) for this op, evaluate each
+        # via the Oracle (Slice 2.1) using ctx-derived evidence,
+        # aggregate into a VerificationPostmortem, persist it via
+        # Slice 1.3's capture_phase_decision so the lesson is
+        # permanent in the per-session ledger.
+        #
+        # Defensive at every layer — postmortem failure NEVER blocks
+        # op closure. The op already succeeded; this is consequence
+        # tracking, not gate enforcement (auto-revert on blocking
+        # failures is a future-phase concern).
+        try:
+            from backend.core.ouroboros.governance.verification.postmortem import (
+                log_postmortem_summary,
+                persist_postmortem,
+                produce_verification_postmortem,
+            )
+            _pm = await produce_verification_postmortem(
+                op_id=ctx.op_id, ctx=ctx,
+            )
+            log_postmortem_summary(_pm)
+            await persist_postmortem(pm=_pm, op_id=ctx.op_id, ctx=ctx)
+            if _pm.has_blocking_failures:
+                # Surface the blocking signal at WARNING — operator
+                # sees that must_hold claims diverged. Future phase
+                # may auto-revert; for now, audit only.
+                logger.warning(
+                    "[Orchestrator] verification postmortem reports "
+                    "blocking failures: op=%s must_hold_failed=%d/%d",
+                    ctx.op_id, _pm.must_hold_failed, _pm.must_hold_count,
+                )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[Orchestrator] verification postmortem failed for "
+                "op=%s — op closure unaffected",
+                ctx.op_id, exc_info=True,
+            )
+
         return PhaseResult(
             next_ctx=ctx,
             next_phase=None,

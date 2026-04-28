@@ -48,6 +48,16 @@ from backend.core.ouroboros.governance.verification.property_capture import (
     property_capture_enabled,
     synthesize_claims_from_plan,
 )
+from backend.core.ouroboros.governance.verification.postmortem import (
+    ClaimOutcome,
+    VerificationPostmortem,
+    ctx_evidence_collector,
+    get_recorded_postmortem,
+    log_postmortem_summary,
+    persist_postmortem,
+    postmortem_enabled,
+    produce_verification_postmortem,
+)
 from backend.core.ouroboros.governance.verification.repeat_runner import (
     EvidenceCollector,
     RepeatRunner,
@@ -59,6 +69,7 @@ from backend.core.ouroboros.governance.verification.repeat_runner import (
 
 __all__ = [
     "CANONICAL_SEVERITIES",
+    "ClaimOutcome",
     "EvidenceCollector",
     "Property",
     "PropertyClaim",
@@ -72,12 +83,19 @@ __all__ = [
     "SEVERITY_MUST_HOLD",
     "SEVERITY_SHOULD_HOLD",
     "VerdictKind",
+    "VerificationPostmortem",
     "capture_claims",
+    "ctx_evidence_collector",
     "filter_load_bearing",
     "get_default_oracle",
     "get_default_runner",
     "get_recorded_claims",
+    "get_recorded_postmortem",
+    "log_postmortem_summary",
     "oracle_enabled",
+    "persist_postmortem",
+    "postmortem_enabled",
+    "produce_verification_postmortem",
     "property_capture_enabled",
     "register_evaluator",
     "repeat_runner_enabled",
