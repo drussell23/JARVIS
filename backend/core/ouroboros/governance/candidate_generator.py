@@ -2081,35 +2081,94 @@ class CandidateGenerator:
 
             if _attempt_exc is not None:
                 exc = _attempt_exc
-                # Classify the failure for the sentinel. Stream-stall
-                # exceptions get LIVE_STREAM_STALL (weight 3.0 — single
-                # occurrence trips); transport/HTTP get LIVE_TRANSPORT;
-                # everything else falls through to LIVE_TRANSPORT as a
-                # catch-all (better to over-trip than under-trip on
-                # uncategorized errors).
                 err_str = str(exc)
                 err_lower = err_str.lower()
-                if (
-                    "stream" in err_lower
-                    and ("stall" in err_lower or "timeout" in err_lower)
-                ) or "streamtimeouterror" in err_lower:
-                    failure_source = FailureSource.LIVE_STREAM_STALL
-                elif "429" in err_str:
-                    failure_source = FailureSource.LIVE_HTTP_429
-                elif "5" in err_str[:5] and (
-                    "500" in err_str or "502" in err_str
-                    or "503" in err_str or "504" in err_str
-                ):
-                    failure_source = FailureSource.LIVE_HTTP_5XX
-                elif "parse" in err_lower or "json" in err_lower:
-                    failure_source = FailureSource.LIVE_PARSE_ERROR
-                else:
+
+                # Phase 12 Slice F — Substrate Error Unmasking. When
+                # the exception is a DoublewordInfraError (or any
+                # structurally-unmasked equivalent that carries a
+                # ``status_code`` attribute), classify FROM THE
+                # STRUCTURED FIELD instead of regex on str(exc). This
+                # is the substrate of Slice H's terminal-vs-transient
+                # distinction — we MUST know the actual HTTP status to
+                # decide TERMINAL_OPEN vs OPEN.
+                _status_code = getattr(exc, "status_code", None)
+                _response_body = getattr(exc, "response_body", "") or ""
+                _is_modality = bool(
+                    getattr(exc, "is_modality_error", lambda: False)()
+                )
+                _is_auth_terminal = bool(
+                    getattr(exc, "is_terminal_auth_error", lambda: False)()
+                )
+
+                if _is_modality or _is_auth_terminal:
+                    # Slice H — terminal failure class. Even though we
+                    # report it as LIVE_HTTP_5XX semantics here for
+                    # back-compat, the breaker (Slice H wiring) will
+                    # read the structured exception fields when
+                    # available and flip the model's state to
+                    # TERMINAL_OPEN. For now, classify with a body-
+                    # accurate failure source so observers can audit
+                    # the unmasked status.
                     failure_source = FailureSource.LIVE_TRANSPORT
+                elif _status_code is not None:
+                    # Structured HTTP status drives classification
+                    if _status_code == 429:
+                        failure_source = FailureSource.LIVE_HTTP_429
+                    elif _status_code in (500, 502, 503, 504):
+                        failure_source = FailureSource.LIVE_HTTP_5XX
+                    elif _status_code == 0:
+                        # Non-HTTP failure: stream stall / DNS / TLS
+                        if (
+                            "stream" in err_lower
+                            and ("stall" in err_lower or "timeout" in err_lower)
+                        ) or "streamtimeouterror" in err_lower:
+                            failure_source = FailureSource.LIVE_STREAM_STALL
+                        else:
+                            failure_source = FailureSource.LIVE_TRANSPORT
+                    else:
+                        failure_source = FailureSource.LIVE_TRANSPORT
+                else:
+                    # No status_code attribute → fall back to regex on
+                    # str(exc) (legacy path for non-DW exceptions).
+                    if (
+                        "stream" in err_lower
+                        and ("stall" in err_lower or "timeout" in err_lower)
+                    ) or "streamtimeouterror" in err_lower:
+                        failure_source = FailureSource.LIVE_STREAM_STALL
+                    elif "429" in err_str:
+                        failure_source = FailureSource.LIVE_HTTP_429
+                    elif "5" in err_str[:5] and (
+                        "500" in err_str or "502" in err_str
+                        or "503" in err_str or "504" in err_str
+                    ):
+                        failure_source = FailureSource.LIVE_HTTP_5XX
+                    elif "parse" in err_lower or "json" in err_lower:
+                        failure_source = FailureSource.LIVE_PARSE_ERROR
+                    else:
+                        failure_source = FailureSource.LIVE_TRANSPORT
                 try:
-                    sentinel.report_failure(
-                        model_id, failure_source,
-                        f"{type(exc).__name__}:{err_str[:120]}",
-                    )
+                    # Pass structured fields to the sentinel so Slice H
+                    # can use them for terminal-vs-transient decisions.
+                    # Backward-compatible: legacy report_failure
+                    # signature is preserved; structured fields are
+                    # added via best-effort kwargs that the sentinel
+                    # silently drops if it doesn't yet support them.
+                    try:
+                        sentinel.report_failure(
+                            model_id, failure_source,
+                            f"{type(exc).__name__}:{err_str[:120]}",
+                            status_code=_status_code,
+                            response_body=_response_body,
+                            is_terminal=(_is_modality or _is_auth_terminal),
+                        )
+                    except TypeError:
+                        # Sentinel doesn't accept new kwargs yet (pre-
+                        # Slice-H sentinel) — fall back to legacy call
+                        sentinel.report_failure(
+                            model_id, failure_source,
+                            f"{type(exc).__name__}:{err_str[:120]}",
+                        )
                 except Exception:
                     logger.debug(
                         "[CandidateGenerator] sentinel.report_failure raised",
@@ -2119,12 +2178,27 @@ class CandidateGenerator:
                     f"{model_id}:{failure_source.value}:"
                     f"{type(exc).__name__}"
                 )
-                logger.warning(
-                    "[CandidateGenerator] Sentinel dispatch: model=%s "
-                    "FAILED (source=%s, exc=%s) — trying next (op=%s)",
-                    model_id, failure_source.value,
-                    type(exc).__name__, op_id_short,
-                )
+                # Slice F — log the unmasked status_code + body excerpt
+                # alongside the legacy WARNING line so operators see
+                # ground truth in debug.log immediately.
+                if _status_code is not None and _status_code > 0:
+                    logger.warning(
+                        "[CandidateGenerator] Sentinel dispatch: model=%s "
+                        "FAILED (source=%s, http_%d, body=%r%s%s) — "
+                        "trying next (op=%s)",
+                        model_id, failure_source.value, _status_code,
+                        _response_body[:160],
+                        ", modality_terminal=true" if _is_modality else "",
+                        ", auth_terminal=true" if _is_auth_terminal else "",
+                        op_id_short,
+                    )
+                else:
+                    logger.warning(
+                        "[CandidateGenerator] Sentinel dispatch: model=%s "
+                        "FAILED (source=%s, exc=%s) — trying next (op=%s)",
+                        model_id, failure_source.value,
+                        type(exc).__name__, op_id_short,
+                    )
                 attempts[-1] = f"{model_id}:failed:{failure_source.value}"
                 continue
         # All DW models exhausted (either OPEN or failed). The
@@ -2458,6 +2532,16 @@ class CandidateGenerator:
         _dw_error: Optional[str] = None
 
         # DW attempt — RT SSE preferred, batch fallback.
+        # Phase 12 Slice F — Substrate Error Unmasking. Preserve the
+        # underlying DoublewordInfraError on this attempt so the
+        # sentinel-driven dispatcher can read its status_code +
+        # response_body fields directly. The exception is still
+        # caught here (so the legacy non-sentinel path can fall
+        # through to Claude as before via _dw_error string), but
+        # _structured_error captures the structured object for the
+        # caller — when present, the caller re-raises it instead of
+        # stringifying it through RuntimeError(_dw_error).
+        _structured_error: Optional[Exception] = None
         if getattr(self._tier0, "_realtime_enabled", False):
             try:
                 result = await asyncio.wait_for(
@@ -2477,9 +2561,21 @@ class CandidateGenerator:
             except asyncio.TimeoutError:
                 _dw_error = f"background_dw_timeout:{_dw_timeout:.0f}s"
             except Exception as exc:
-                _dw_error = (
-                    f"background_dw_error:{type(exc).__name__}:{exc}"
-                )
+                _structured_error = exc  # Slice F preserves the object
+                # Build a richer _dw_error that surfaces status_code
+                # + a body excerpt when available (DoublewordInfraError),
+                # so legacy log-line consumers see ground truth too.
+                _status = getattr(exc, "status_code", None)
+                _body = getattr(exc, "response_body", "") or ""
+                if _status is not None:
+                    _dw_error = (
+                        f"background_dw_error:{type(exc).__name__}:"
+                        f"http_{_status}:{_body[:120]}"
+                    )
+                else:
+                    _dw_error = (
+                        f"background_dw_error:{type(exc).__name__}:{exc}"
+                    )
         else:
             # Legacy batch path
             try:
@@ -2522,6 +2618,15 @@ class CandidateGenerator:
                     f"{type(exc).__name__}:{str(exc)[:80]}"
                 ) from exc
 
+        # Phase 12 Slice F — Substrate Error Unmasking. When DW raised
+        # a structured DoublewordInfraError (status_code + response_body
+        # available), re-raise the ORIGINAL object so the sentinel
+        # dispatch classifier can introspect status_code directly
+        # without regex on str(exc). Falls through to RuntimeError when
+        # the failure was a timeout / empty-result (no structured
+        # exception to preserve).
+        if _structured_error is not None:
+            raise _structured_error
         raise RuntimeError(_dw_error)
 
     async def _generate_speculative(
