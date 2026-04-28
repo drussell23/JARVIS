@@ -493,6 +493,69 @@ class GENERATERunner(PhaseRunner):
                             orch._generator.generate(ctx, deadline),
                             timeout=_gen_timeout + _OUTER_GATE_GRACE_S,
                         )
+
+                    # Phase 1 Slice 1.3.b — capture the provider
+                    # selection digest. Audit-only: the actual
+                    # generation always runs live (LLM output isn't
+                    # deterministic-replayable in this slice). The
+                    # closure-over-`generation` pattern means
+                    # capture_phase_decision just records the digest
+                    # without re-invoking .generate(). RECORD writes;
+                    # REPLAY looks up + verifies; VERIFY warns on
+                    # provider drift.
+                    try:
+                        from backend.core.ouroboros.governance.determinism.phase_capture import (
+                            capture_phase_decision,
+                        )
+
+                        async def _digest_compute() -> Any:
+                            return {
+                                "provider_name": str(
+                                    getattr(
+                                        generation, "provider_name", "",
+                                    ) or "",
+                                ),
+                                "model_id": str(
+                                    getattr(
+                                        generation, "model_id", "",
+                                    ) or "",
+                                ),
+                                "candidate_count": int(len(
+                                    getattr(
+                                        generation, "candidates", (),
+                                    ) or (),
+                                )),
+                                "is_noop": bool(
+                                    getattr(generation, "is_noop", False),
+                                ),
+                            }
+
+                        await capture_phase_decision(
+                            op_id=ctx.op_id,
+                            phase="GENERATE",
+                            kind="provider_selection",
+                            ctx=ctx,
+                            compute=_digest_compute,
+                            extra_inputs={
+                                "provider_route": str(
+                                    getattr(
+                                        ctx, "provider_route", "",
+                                    ) or "",
+                                ),
+                                "parallel_gen_used": bool(
+                                    _parallel_gen is not None,
+                                ),
+                            },
+                        )
+                    except Exception:  # noqa: BLE001 — defensive
+                        # Capture failure does NOT propagate — the
+                        # generation already succeeded, audit capture
+                        # is best-effort.
+                        logger.debug(
+                            "[Orchestrator] capture_phase_decision "
+                            "failed for GENERATE/provider_selection",
+                            exc_info=True,
+                        )
                 finally:
                     # End the stream regardless of success / failure so the
                     # Live widget closes and the observability INFO line
