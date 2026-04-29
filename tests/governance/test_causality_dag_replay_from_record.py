@@ -100,9 +100,9 @@ def replay_env(monkeypatch, tmp_path):
 # §1-§2 — Master flag
 # ===========================================================================
 
-def test_master_flag_default_false(monkeypatch):
+def test_master_flag_default_true_post_graduation(monkeypatch):
     monkeypatch.delenv("JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED", raising=False)
-    assert replay_from_record_enabled() is False
+    assert replay_from_record_enabled() is True
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes"])
 def test_master_flag_truthy(monkeypatch, val):
@@ -403,3 +403,125 @@ def test_session_zero_decisions(monkeypatch, tmp_path):
     plan = prepare_replay_from_record(sid, "r1")
     assert not plan.is_replayable
     assert "dag_empty" in plan.failure_reason
+
+
+# ===========================================================================
+# Cost contract preservation under replay (Slice 5 critical pin)
+# ===========================================================================
+#
+# The §26.6 four-layer defense MUST hold even under fork replay.
+# These tests verify that:
+#   1. apply_replay_from_record_env() sets ONLY env vars; it does
+#      not invoke any provider directly
+#   2. The replay path never imports provider modules
+#   3. A synthetic BG/SPEC op replay attempt still hits the
+#      Layer 4 advisor structural guard
+
+
+def test_replay_apply_env_only_sets_env_vars(
+    monkeypatch, tmp_path,
+):
+    """apply_replay_from_record_env MUST NOT invoke any provider
+    directly. Pure env-overlay — the orchestrator's existing
+    --rerun path is what dispatches, and that path goes through
+    the four-layer cost contract defense unchanged."""
+    monkeypatch.setenv("JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_CAUSALITY_DAG_QUERY_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_DETERMINISM_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("JARVIS_DETERMINISM_LEDGER_DIR", str(tmp_path))
+    sid = "cost-test-s"
+    _write_seed(tmp_path / sid / "seed.json")
+    ledger = tmp_path / sid / "decisions.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "record_id": "r1", "session_id": sid, "op_id": "op-test",
+        "phase": "ROUTE", "kind": "route", "ordinal": 0,
+        "inputs_hash": "h", "output_repr": '"x"',
+        "monotonic_ts": 1.0, "wall_ts": 2.0,
+        "schema_version": "decision_record.1",
+    }
+    ledger.write_text(json.dumps(rec) + "\n")
+    plan = prepare_replay_from_record(sid, "r1")
+    assert plan.is_replayable
+    # Snapshot env BEFORE applying
+    pre = set(os.environ.keys())
+    result = apply_replay_from_record_env(plan)
+    assert result is True
+    # The ONLY env vars added must be Slice 5's documented overlay
+    # vars + standard replay env vars (e.g. JARVIS_DETERMINISM_*)
+    # — never a provider-routing flag.
+    post = set(os.environ.keys())
+    new_vars = post - pre
+    forbidden_provider_env = (
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+        "JARVIS_PROVIDER_OVERRIDE", "JARVIS_FORCE_CLAUDE",
+    )
+    for k in forbidden_provider_env:
+        assert k not in new_vars, (
+            f"replay env apply set forbidden provider env {k!r}"
+        )
+
+
+def test_replay_module_does_not_import_providers() -> None:
+    """AST authority pin: replay_from_record.py MUST NOT import
+    any provider module. The replay overlay is purely annotation-
+    based; dispatch happens through the orchestrator's existing
+    --rerun path."""
+    import inspect
+    import ast as _ast
+    from pathlib import Path
+    from backend.core.ouroboros.governance.verification import (
+        replay_from_record,
+    )
+    src = Path(inspect.getfile(replay_from_record)).read_text()
+    tree = _ast.parse(src)
+    forbidden = (
+        "providers",
+        "doubleword_provider",
+        "candidate_generator",
+        "orchestrator",
+    )
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                for fb in forbidden:
+                    assert fb not in alias.name, (
+                        f"replay_from_record imports forbidden module "
+                        f"{alias.name!r}"
+                    )
+        elif isinstance(node, _ast.ImportFrom) and node.module:
+            for fb in forbidden:
+                assert fb not in node.module, (
+                    f"replay_from_record imports forbidden module "
+                    f"{node.module!r}"
+                )
+
+
+def test_cost_contract_layer_4_fires_under_synthetic_bg_replay() -> None:
+    """The §26.6 four-layer defense holds even when replay is
+    "active". Synthetic BG → STANDARD escalation attempt routed
+    through the advisor structural guard MUST raise
+    CostContractViolation regardless of any DAG / replay flag
+    state. Proof: the replay path is annotation-only and goes
+    through the orchestrator's existing dispatch — no shortcut
+    exists."""
+    from backend.core.ouroboros.governance.cost_contract_assertion import (
+        CostContractViolation,
+    )
+    from backend.core.ouroboros.governance.verification.confidence_route_advisor import (
+        _propose_route_change,
+    )
+    # Set replay env vars as if we were mid-replay
+    os.environ["JARVIS_CAUSALITY_FORK_FROM_RECORD_ID"] = "r1"
+    os.environ["JARVIS_CAUSALITY_FORK_COUNTERFACTUAL_OF"] = "r1"
+    try:
+        with pytest.raises(CostContractViolation):
+            _propose_route_change(
+                current_route="background",
+                proposed_route="immediate",  # ESCALATION
+                reason_code="should_not_happen_under_replay",
+                confidence_basis="post_slice6_cost_contract_test",
+            )
+    finally:
+        os.environ.pop("JARVIS_CAUSALITY_FORK_FROM_RECORD_ID", None)
+        os.environ.pop("JARVIS_CAUSALITY_FORK_COUNTERFACTUAL_OF", None)

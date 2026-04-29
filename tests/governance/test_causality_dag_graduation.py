@@ -282,3 +282,359 @@ def test_counterfactual_end_to_end(full_env):
     text = render_dag_counterfactuals(dag, "r1")
     assert "cf1" in text
     assert "cf2" in text
+
+
+# ===========================================================================
+# §16-§19 — shipped_code_invariants seeds registered + holding
+# ===========================================================================
+#
+# Slice 6 graduation adds 4 new structural invariants pinning the
+# Causality DAG arc's authority + read-only + cost-contract contracts.
+# These are AST-walked at boot + APPLY; future refactors that violate
+# them fail the build.
+
+
+_EXPECTED_DAG_INVARIANTS = (
+    "causality_dag_no_authority_imports",
+    "causality_dag_bounded_traversal",
+    "dag_navigation_no_ctx_mutation",
+    "dag_replay_cost_contract_preserved",
+)
+
+
+def test_all_four_dag_invariants_registered() -> None:
+    from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+        list_shipped_code_invariants,
+    )
+    invs = list_shipped_code_invariants()
+    names = {inv.invariant_name for inv in invs}
+    for expected in _EXPECTED_DAG_INVARIANTS:
+        assert expected in names, (
+            f"missing invariant: {expected}"
+        )
+
+
+def test_causality_dag_no_authority_imports_invariant_holds() -> None:
+    from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+        validate_all,
+    )
+    violations = validate_all()
+    matches = [
+        v for v in violations
+        if v.invariant_name == "causality_dag_no_authority_imports"
+    ]
+    assert matches == [], (
+        f"causality_dag authority pin violated: "
+        f"{[v.detail for v in matches]}"
+    )
+
+
+def test_causality_dag_bounded_traversal_invariant_holds() -> None:
+    from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+        validate_all,
+    )
+    violations = validate_all()
+    matches = [
+        v for v in violations
+        if v.invariant_name == "causality_dag_bounded_traversal"
+    ]
+    assert matches == [], (
+        f"bounded traversal pin violated: "
+        f"{[v.detail for v in matches]}"
+    )
+
+
+def test_dag_navigation_no_ctx_mutation_invariant_holds() -> None:
+    from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+        validate_all,
+    )
+    violations = validate_all()
+    matches = [
+        v for v in violations
+        if v.invariant_name == "dag_navigation_no_ctx_mutation"
+    ]
+    assert matches == [], (
+        f"navigation read-only pin violated: "
+        f"{[v.detail for v in matches]}"
+    )
+
+
+def test_dag_replay_cost_contract_preserved_invariant_holds() -> None:
+    """The replay-from-record path MUST go through the existing
+    orchestrator entry point — no shortcut bypass of §26.6 four-layer
+    defense. Pinned by validating that scripts/ouroboros_battle_test.py
+    references prepare_replay_from_record + apply_replay_from_record_env
+    AND requires --rerun for session identity AND contains zero
+    direct provider construction tokens."""
+    from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+        validate_all,
+    )
+    violations = validate_all()
+    matches = [
+        v for v in violations
+        if v.invariant_name == "dag_replay_cost_contract_preserved"
+    ]
+    assert matches == [], (
+        f"cost contract preservation pin violated: "
+        f"{[v.detail for v in matches]}"
+    )
+
+
+# ===========================================================================
+# §20-§22 — Master flag default-true source-grep pins
+# ===========================================================================
+
+
+def test_decision_runtime_source_has_graduated_literals() -> None:
+    """decision_runtime.py — schema + per-worker master + per-worker
+    enforce all carry `return True  # graduated default` post-Slice-6."""
+    from backend.core.ouroboros.governance.determinism import decision_runtime
+    src = Path(inspect.getfile(decision_runtime)).read_text()
+    occurrences = src.count("return True  # graduated default")
+    assert occurrences >= 3, (
+        f"expected >= 3 graduated-default literals in decision_runtime "
+        f"(schema + per_worker_enabled + per_worker_enforce), "
+        f"found {occurrences}"
+    )
+    # Source-grep the Slice 6 graduation marker
+    assert src.count("Slice 6") >= 3
+
+
+def test_dag_modules_source_have_graduated_literals() -> None:
+    """causality_dag + dag_navigation + replay_from_record all carry
+    the graduated literal post-Slice-6."""
+    from backend.core.ouroboros.governance.verification import (
+        causality_dag, dag_navigation, replay_from_record,
+    )
+    total = 0
+    for mod in (causality_dag, dag_navigation, replay_from_record):
+        src = Path(inspect.getfile(mod)).read_text()
+        total += src.count("return True  # graduated default")
+    assert total >= 3, (
+        f"expected >= 3 graduated-default literals across "
+        f"causality_dag + dag_navigation + replay_from_record, "
+        f"found {total}"
+    )
+
+
+def test_six_master_flags_default_true_at_runtime() -> None:
+    """End-to-end runtime check — all 6 Causality DAG master flags
+    default true after the Slice 6 graduation flip."""
+    import os
+    for k in (
+        "JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED",
+        "JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED",
+        "JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE",
+        "JARVIS_CAUSALITY_DAG_QUERY_ENABLED",
+        "JARVIS_DAG_NAVIGATION_ENABLED",
+        "JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED",
+    ):
+        os.environ.pop(k, None)
+    from backend.core.ouroboros.governance.determinism.decision_runtime import (
+        causality_dag_schema_enabled, per_worker_ordinals_enabled,
+        per_worker_ordinals_enforce,
+    )
+    from backend.core.ouroboros.governance.verification.causality_dag import (
+        dag_query_enabled,
+    )
+    from backend.core.ouroboros.governance.verification.dag_navigation import (
+        dag_navigation_enabled,
+    )
+    from backend.core.ouroboros.governance.verification.replay_from_record import (
+        replay_from_record_enabled,
+    )
+    assert causality_dag_schema_enabled() is True
+    assert per_worker_ordinals_enabled() is True
+    assert per_worker_ordinals_enforce() is True
+    assert dag_query_enabled() is True
+    assert dag_navigation_enabled() is True
+    assert replay_from_record_enabled() is True
+
+
+# ===========================================================================
+# §23 — FlagRegistry seeds for all 9 Causality DAG flags
+# ===========================================================================
+
+
+_EXPECTED_REGISTERED_DAG_FLAGS = {
+    "JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED": True,
+    "JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED": True,
+    "JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE": True,
+    "JARVIS_CAUSALITY_DAG_QUERY_ENABLED": True,
+    "JARVIS_DAG_NAVIGATION_ENABLED": True,
+    "JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED": True,
+    "JARVIS_DAG_MAX_RECORDS": 100_000,
+    "JARVIS_DAG_MAX_DEPTH": 8,
+    "JARVIS_DAG_DRIFT_NODE_DELTA_THRESHOLD": 0.25,
+}
+
+
+def test_flag_registry_has_all_nine_dag_flags() -> None:
+    from backend.core.ouroboros.governance.flag_registry import ensure_seeded
+    registry = ensure_seeded()
+    for flag_name, expected_default in _EXPECTED_REGISTERED_DAG_FLAGS.items():
+        assert flag_name in registry._specs, (
+            f"flag {flag_name} not registered in FlagRegistry"
+        )
+        spec = registry._specs[flag_name]
+        assert spec.default == expected_default, (
+            f"{flag_name}: default mismatch (got {spec.default}, "
+            f"expected {expected_default})"
+        )
+
+
+# ===========================================================================
+# §24-§26 — COST CONTRACT load-bearing tests (4-layer defense-in-depth)
+# ===========================================================================
+#
+# Critical: the Causality DAG arc must NOT introduce any path that
+# escalates a BG/SPEC op to Claude. The §26.6 four-layer defense
+# (AST invariant + runtime CostContractViolation + Property Oracle
+# claim + advisor structural guard) MUST hold under all DAG /
+# replay states.
+
+
+def test_cost_contract_layer_4_advisor_guard_still_fires() -> None:
+    """Layer 4 — confidence_route_advisor structural guard fires
+    regardless of any DAG / replay flag state. Synthetic
+    BG/SPEC → escalation attempt MUST raise CostContractViolation."""
+    from backend.core.ouroboros.governance.cost_contract_assertion import (
+        CostContractViolation,
+    )
+    from backend.core.ouroboros.governance.verification.confidence_route_advisor import (
+        _propose_route_change,
+    )
+    with pytest.raises(CostContractViolation):
+        _propose_route_change(
+            current_route="background",
+            proposed_route="standard",  # ESCALATION
+            reason_code="should_not_happen_under_dag_arc",
+            confidence_basis="post_slice6_graduation_test",
+        )
+
+
+def test_cost_contract_layer_2_runtime_assertion_still_fires() -> None:
+    """Layer 2 — providers.py runtime CostContractViolation gate
+    fires on any BG/SPEC + Claude + non-read-only attempt,
+    independent of DAG / replay flags."""
+    from backend.core.ouroboros.governance.cost_contract_assertion import (
+        CostContractViolation, assert_provider_route_compatible,
+    )
+    with pytest.raises(CostContractViolation):
+        assert_provider_route_compatible(
+            op_id="op-test",
+            provider_route="speculative",
+            provider_tier="claude",
+            is_read_only=False,
+        )
+
+
+def test_cost_contract_replay_path_does_not_introduce_bypass() -> None:
+    """Slice 5 replay path goes through the existing orchestrator
+    entry point — pinned by the dag_replay_cost_contract_preserved
+    shipped_code_invariants seed. Re-validate at runtime."""
+    from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+        validate_all,
+    )
+    violations = validate_all()
+    assert violations == (), (
+        f"shipped_code_invariants violations against main: "
+        f"{[v.invariant_name + ': ' + v.detail for v in violations]}"
+    )
+
+
+def test_total_invariant_count_post_slice_6_graduation() -> None:
+    """Pre-Slice-6: 7 invariants (Priority 1 Slice 5 + §26.6 seeds).
+    Post-Slice-6: 11 invariants (4 new DAG seeds added)."""
+    from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+        list_shipped_code_invariants,
+    )
+    invs = list_shipped_code_invariants()
+    assert len(invs) >= 11, (
+        f"expected >= 11 shipped_code_invariants post-Slice-6, "
+        f"found {len(invs)}"
+    )
+
+
+# ===========================================================================
+# §27-§29 — Cross-slice authority survival
+# ===========================================================================
+
+
+_FORBIDDEN_DAG_IMPORTS = (
+    "backend.core.ouroboros.governance.orchestrator",
+    "backend.core.ouroboros.governance.phase_runners",
+    "backend.core.ouroboros.governance.candidate_generator",
+    "backend.core.ouroboros.governance.iron_gate",
+    "backend.core.ouroboros.governance.change_engine",
+    "backend.core.ouroboros.governance.policy",
+    "backend.core.ouroboros.governance.semantic_guardian",
+    "backend.core.ouroboros.governance.providers",
+    "backend.core.ouroboros.governance.doubleword_provider",
+    "backend.core.ouroboros.governance.urgency_router",
+)
+
+
+def _no_forbidden_imports(mod) -> None:
+    src = Path(inspect.getfile(mod)).read_text()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                for forbidden in _FORBIDDEN_DAG_IMPORTS:
+                    assert forbidden not in alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for forbidden in _FORBIDDEN_DAG_IMPORTS:
+                assert forbidden not in node.module
+
+
+def test_causality_dag_authority_isolation() -> None:
+    from backend.core.ouroboros.governance.verification import causality_dag
+    _no_forbidden_imports(causality_dag)
+
+
+def test_dag_navigation_authority_isolation() -> None:
+    from backend.core.ouroboros.governance.verification import dag_navigation
+    _no_forbidden_imports(dag_navigation)
+
+
+def test_replay_from_record_authority_isolation() -> None:
+    from backend.core.ouroboros.governance.verification import replay_from_record
+    _no_forbidden_imports(replay_from_record)
+
+
+# ===========================================================================
+# §30 — Hot-revert proof for all 6 master flags
+# ===========================================================================
+
+
+def test_six_master_flags_hot_revert_via_explicit_false(monkeypatch) -> None:
+    """Operator can hot-revert each graduated flag independently
+    via `export FLAG=false`. Critical for incident response."""
+    from backend.core.ouroboros.governance.determinism.decision_runtime import (
+        causality_dag_schema_enabled, per_worker_ordinals_enabled,
+        per_worker_ordinals_enforce,
+    )
+    from backend.core.ouroboros.governance.verification.causality_dag import (
+        dag_query_enabled,
+    )
+    from backend.core.ouroboros.governance.verification.dag_navigation import (
+        dag_navigation_enabled,
+    )
+    from backend.core.ouroboros.governance.verification.replay_from_record import (
+        replay_from_record_enabled,
+    )
+    flag_pairs = [
+        ("JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED", causality_dag_schema_enabled),
+        ("JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED", per_worker_ordinals_enabled),
+        ("JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE", per_worker_ordinals_enforce),
+        ("JARVIS_CAUSALITY_DAG_QUERY_ENABLED", dag_query_enabled),
+        ("JARVIS_DAG_NAVIGATION_ENABLED", dag_navigation_enabled),
+        ("JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED", replay_from_record_enabled),
+    ]
+    for env_name, flag_fn in flag_pairs:
+        monkeypatch.setenv(env_name, "false")
+        assert flag_fn() is False, (
+            f"hot-revert failed for {env_name}"
+        )
+        monkeypatch.delenv(env_name, raising=False)

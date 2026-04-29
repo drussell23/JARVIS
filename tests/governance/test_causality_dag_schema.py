@@ -52,15 +52,17 @@ from backend.core.ouroboros.governance.determinism.decision_runtime import (
 # ===========================================================================
 
 
-def test_schema_flag_default_false(monkeypatch) -> None:
+def test_schema_flag_default_true_post_graduation(monkeypatch) -> None:
     monkeypatch.delenv("JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED", raising=False)
-    assert causality_dag_schema_enabled() is False
+    assert causality_dag_schema_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["", " ", "  ", "\t"])
-def test_schema_flag_empty_default_false(monkeypatch, val) -> None:
+def test_schema_flag_empty_default_true_post_graduation(
+    monkeypatch, val,
+) -> None:
     monkeypatch.setenv("JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED", val)
-    assert causality_dag_schema_enabled() is False
+    assert causality_dag_schema_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])

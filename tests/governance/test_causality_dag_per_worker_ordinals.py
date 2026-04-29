@@ -65,17 +65,19 @@ from backend.core.ouroboros.governance.worktree_manager import (
 # ===========================================================================
 
 
-def test_master_flag_default_false(monkeypatch) -> None:
+def test_master_flag_default_true_post_graduation(monkeypatch) -> None:
     monkeypatch.delenv(
         "JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED", raising=False,
     )
-    assert per_worker_ordinals_enabled() is False
+    assert per_worker_ordinals_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["", " ", "  ", "\t"])
-def test_master_flag_empty_default_false(monkeypatch, val) -> None:
+def test_master_flag_empty_default_true_post_graduation(
+    monkeypatch, val,
+) -> None:
     monkeypatch.setenv("JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED", val)
-    assert per_worker_ordinals_enabled() is False
+    assert per_worker_ordinals_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])
@@ -90,11 +92,11 @@ def test_master_flag_falsy(monkeypatch, val) -> None:
     assert per_worker_ordinals_enabled() is False
 
 
-def test_enforce_subflag_default_false(monkeypatch) -> None:
+def test_enforce_subflag_default_true_post_graduation(monkeypatch) -> None:
     monkeypatch.delenv(
         "JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE", raising=False,
     )
-    assert per_worker_ordinals_enforce() is False
+    assert per_worker_ordinals_enforce() is True
 
 
 def test_enforce_subflag_explicit_true(monkeypatch) -> None:

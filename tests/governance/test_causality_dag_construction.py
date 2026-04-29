@@ -88,17 +88,17 @@ def ledger_dir(tmp_path, monkeypatch):
     return tmp_path / "test-session" / "decisions.jsonl"
 
 # ---------------------------------------------------------------------------
-# §1 — Master flag default false
+# §1 — Master flag default true (Slice 6 graduation, was false in Slice 3)
 # ---------------------------------------------------------------------------
 
-def test_master_flag_default_false(monkeypatch):
+def test_master_flag_default_true_post_graduation(monkeypatch):
     monkeypatch.delenv("JARVIS_CAUSALITY_DAG_QUERY_ENABLED", raising=False)
-    assert dag_query_enabled() is False
+    assert dag_query_enabled() is True
 
 @pytest.mark.parametrize("val", ["", " ", "\t"])
-def test_master_flag_empty_default_false(monkeypatch, val):
+def test_master_flag_empty_default_true_post_graduation(monkeypatch, val):
     monkeypatch.setenv("JARVIS_CAUSALITY_DAG_QUERY_ENABLED", val)
-    assert dag_query_enabled() is False
+    assert dag_query_enabled() is True
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])
 def test_master_flag_truthy(monkeypatch, val):

@@ -114,12 +114,12 @@ def _make_dag(*recs):
     )
 
 # ===========================================================================
-# §1 — Master flag default false
+# §1 — Master flag default true (Slice 6 graduation, was false in Slice 4)
 # ===========================================================================
 
-def test_master_flag_default_false(monkeypatch):
+def test_master_flag_default_true_post_graduation(monkeypatch):
     monkeypatch.delenv("JARVIS_DAG_NAVIGATION_ENABLED", raising=False)
-    assert dag_navigation_enabled() is False
+    assert dag_navigation_enabled() is True
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE"])
 def test_master_flag_truthy(monkeypatch, val):
