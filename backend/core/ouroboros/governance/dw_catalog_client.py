@@ -226,6 +226,26 @@ class ModelCard:
             if isinstance(top, (int, float)) and top >= 0:
                 price_out = float(top)
 
+        # Pricing Oracle fallback (Option α — closes the Static Pricing
+        # Blindspot diagnosed in soak #6). When DW's /models response
+        # omits pricing for a known model family (e.g., Qwen 3.5 397B),
+        # the family-pattern oracle resolves the published price so
+        # has_ambiguous_metadata() returns False and BG-route admits
+        # the model. Master-flag-gated; never raises.
+        if price_in is None or price_out is None:
+            try:
+                from backend.core.ouroboros.governance.pricing_oracle import (
+                    resolve_pricing,
+                )
+                resolved = resolve_pricing(model_id)
+                if resolved is not None:
+                    if price_in is None:
+                        price_in = resolved[0]
+                    if price_out is None:
+                        price_out = resolved[1]
+            except Exception:  # noqa: BLE001 — defensive: oracle MUST NOT break catalog parse
+                pass
+
         # supports_streaming defaults True (most modern OpenAI-compat
         # models stream); only flip false when API explicitly says so
         streaming = True
