@@ -449,6 +449,7 @@ def _failed_result(
 # pick up immediately without process restart).
 
 import asyncio
+import os
 import threading
 
 from backend.core.ouroboros.governance.dw_catalog_client import (
@@ -467,6 +468,114 @@ _HEAVY_PROBE_BUDGET_SINGLETON: Optional[Any] = None  # Slice 12.2.D
 # Sync lock around the singleton hydration + boot flag — protects the
 # very first-call window before the asyncio.Lock has been touched.
 _BOOT_SYNC_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Sentinel-Pacemaker Handshake — force-refresh trigger
+# ---------------------------------------------------------------------------
+#
+# Closes the catalog-deadlock loop diagnosed in soaks #2-#5: when the
+# topology layer blocks BG ops because the catalog is purged, no DW
+# calls happen → no breaker transitions → catalog stays purged →
+# blocked ops keep accumulating until idle_timeout.
+#
+# Mechanism: the block site (candidate_generator) calls
+# `request_force_refresh()`, which sets a module-level asyncio.Event.
+# The discovery refresh loop awaits EITHER the cadence sleep OR this
+# event — whichever fires first. On wake, it does an immediate
+# /models probe; if DW is reachable, it repopulates the catalog and
+# the next op flows normally. Rate-limited to once per
+# JARVIS_FORCE_REFRESH_MIN_INTERVAL_S (default 30s) so block-storms
+# don't thrash the endpoint.
+_FORCE_REFRESH_EVENT: Optional[asyncio.Event] = None
+_FORCE_REFRESH_LOCK = threading.Lock()
+_LAST_FORCE_REFRESH_TS: float = 0.0
+
+
+def _force_refresh_min_interval_s() -> float:
+    """``JARVIS_FORCE_REFRESH_MIN_INTERVAL_S`` (default 30s) — minimum
+    seconds between accepted force-refresh requests. Prevents block-
+    storms from thrashing /models when many BG ops queue up
+    simultaneously."""
+    raw = os.environ.get("JARVIS_FORCE_REFRESH_MIN_INTERVAL_S", "30")
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def sentinel_pacemaker_handshake_enabled() -> bool:
+    """``JARVIS_SENTINEL_PACEMAKER_HANDSHAKE_ENABLED`` (default
+    ``true``). When off, ``request_force_refresh`` is a no-op and the
+    refresh loop ignores the event channel — legacy 30-min cadence
+    is the only refresh trigger."""
+    raw = os.environ.get(
+        "JARVIS_SENTINEL_PACEMAKER_HANDSHAKE_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return True
+    return raw in ("1", "true", "yes", "on")
+
+
+def _get_or_create_force_refresh_event() -> "asyncio.Event":
+    """Lazy-init the module-level event. Defensive in case the loop
+    binding rules change across Python versions."""
+    global _FORCE_REFRESH_EVENT
+    with _FORCE_REFRESH_LOCK:
+        if _FORCE_REFRESH_EVENT is None:
+            _FORCE_REFRESH_EVENT = asyncio.Event()
+        return _FORCE_REFRESH_EVENT
+
+
+def request_force_refresh(*, reason: str = "") -> bool:
+    """Trigger the discovery loop to skip its sleep and probe DW
+    immediately. Best-effort, NEVER raises.
+
+    Returns True iff the event was actually set (i.e., handshake
+    enabled, rate-limit not hit, asyncio context available); False
+    otherwise. Callers should NOT branch on the return value for
+    correctness — the handshake is a hint, not a contract.
+
+    Rate-limited to one call per ``_force_refresh_min_interval_s()``
+    so a storm of blocked ops doesn't thrash /models. The first
+    request in a window wins; subsequent requests in the same window
+    return False without setting the event.
+    """
+    global _LAST_FORCE_REFRESH_TS
+    if not sentinel_pacemaker_handshake_enabled():
+        return False
+    try:
+        import time as _t
+        now = _t.monotonic()
+        with _FORCE_REFRESH_LOCK:
+            if (
+                _LAST_FORCE_REFRESH_TS
+                and (now - _LAST_FORCE_REFRESH_TS)
+                < _force_refresh_min_interval_s()
+            ):
+                return False
+            _LAST_FORCE_REFRESH_TS = now
+        evt = _get_or_create_force_refresh_event()
+        evt.set()
+        logger.info(
+            "[DiscoveryRunner] force_refresh requested reason=%s",
+            (reason or "unspecified")[:120],
+        )
+        return True
+    except Exception:  # noqa: BLE001 — never raise into caller
+        logger.debug(
+            "[DiscoveryRunner] request_force_refresh failed",
+            exc_info=True,
+        )
+        return False
+
+
+def reset_force_refresh_for_tests() -> None:
+    """Test isolation — clear the event + last-ts."""
+    global _FORCE_REFRESH_EVENT, _LAST_FORCE_REFRESH_TS
+    with _FORCE_REFRESH_LOCK:
+        _FORCE_REFRESH_EVENT = None
+        _LAST_FORCE_REFRESH_TS = 0.0
 
 
 def _get_or_create_ledger() -> PromotionLedger:
@@ -694,17 +803,50 @@ async def _discovery_refresh_loop(
     ttft_observer: Optional[Any] = None,    # Slice 12.2.C
 ) -> None:
     """Periodic refresh. Each cycle:
-      1. Sleeps for JARVIS_DW_CATALOG_REFRESH_S (default 1800s)
+      1. Sleeps for JARVIS_DW_CATALOG_REFRESH_S (default 1800s) OR
+         until the force-refresh event fires (Sentinel-Pacemaker
+         handshake — whichever comes first)
       2. Re-checks discovery flag (operator may have flipped off)
       3. Runs a full discovery cycle
       4. NEVER raises — all exceptions caught + logged
 
     Loop survives forever until task cancellation (which happens on
     process shutdown via reset_boot_state_for_tests or natural
-    asyncio cleanup)."""
+    asyncio cleanup).
+
+    Sentinel-Pacemaker handshake (2026-04-29): when the topology layer
+    blocks an op because the catalog is purged/empty, it calls
+    ``request_force_refresh()`` which sets the module-level event.
+    This loop's wait pattern races the event against the cadence
+    sleep so a blocked op triggers an immediate /models probe instead
+    of waiting up to 30 minutes for the next cycle. The event is
+    cleared after each wake so subsequent requests can re-trigger."""
     while True:
+        # Race: either the cadence sleep completes OR the force-refresh
+        # event fires (Sentinel-Pacemaker handshake). The event is
+        # rate-limited at the trigger site (request_force_refresh) so
+        # we don't thrash /models on a block-storm.
+        cadence_s = _refresh_interval_s_internal()
+        evt = _get_or_create_force_refresh_event()
         try:
-            await asyncio.sleep(_refresh_interval_s_internal())
+            sleep_task = asyncio.ensure_future(asyncio.sleep(cadence_s))
+            event_task = asyncio.ensure_future(evt.wait())
+            done, pending = await asyncio.wait(
+                (sleep_task, event_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
+            # If the event fired, log + clear so the next cycle waits
+            # cleanly. If the sleep completed, the event stays in
+            # whatever state it was (typically already cleared from
+            # a prior wake).
+            if event_task in done:
+                logger.info(
+                    "[DiscoveryRunner] force_refresh wake — "
+                    "bypassing %.0fs cadence sleep", cadence_s,
+                )
+                evt.clear()
         except asyncio.CancelledError:
             return
         if not catalog_discovery_enabled():
