@@ -74,6 +74,25 @@ entries:
     added: "2026-04-26"
     added_by: operator
 
+  # --- Priority A + E (default-claim density + structural pins, 2026-04-29) ---
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/verification/default_claims.py
+    rationale: Default-claim seed registry (Priority A.2) — changing what's mandatory is governance
+    added: "2026-04-29"
+    added_by: operator
+
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/plan_generator.py
+    rationale: trivial-op classifier — changing the threshold alters PLAN-skip surface (Priority E)
+    added: "2026-04-29"
+    added_by: operator
+
+  - repo: jarvis
+    path_glob: backend/core/ouroboros/governance/meta/shipped_code_invariants.py
+    rationale: Shipped-code structural pins — disabling these breaks the cage (Priority E)
+    added: "2026-04-29"
+    added_by: operator
+
   # --- Self-reference ---
   - repo: jarvis
     path_glob: .jarvis/order2_manifest.yaml
