@@ -5527,7 +5527,34 @@ class ClaudeProvider:
             ``claude-api_tool_loop_budget_exceeded`` if the accumulated prompt
             exceeds ``MAX_TOOL_LOOP_CHARS``.
             ``claude-api_schema_invalid:...`` on schema validation failure.
+
+        Cost contract gate (PRD §26.6.2):
+            ``CostContractViolation`` if the op's provider_route is in
+            BG/SPEC AND the op is not read-only — fatal exception that
+            the orchestrator terminates the op on (failure_class=
+            cost_contract_violation). This is Layer 2 of the §26.6
+            structural reinforcement; Layer 1 (AST) and Layer 3 (claim)
+            compose for defense-in-depth.
         """
+        # PRD §26.6.2 — Layer 2 cost contract runtime gate. The
+        # ClaudeProvider is the canonical Claude-tier entry point;
+        # this barrier catches any path that misroutes a BG/SPEC op
+        # to Claude outside the read-only Nervous System Reflex
+        # (Manifesto §5). Master-flag-gated; raises CostContractViolation
+        # when on AND contract is violated. Hot-revert via
+        # JARVIS_COST_CONTRACT_RUNTIME_ASSERT_ENABLED=false.
+        from backend.core.ouroboros.governance.cost_contract_assertion import (
+            assert_provider_route_compatible,
+        )
+        assert_provider_route_compatible(
+            op_id=str(getattr(context, "op_id", "") or ""),
+            provider_route=getattr(context, "provider_route", ""),
+            provider_tier="claude",
+            is_read_only=getattr(context, "is_read_only", False),
+            provider_name="claude-api",
+            detail="ClaudeProvider.generate dispatch boundary",
+        )
+
         self._maybe_reset_daily_budget()
 
         if self._daily_spend >= self._daily_budget:

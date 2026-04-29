@@ -431,6 +431,32 @@ def _register_seed_specs() -> None:
             file_pattern_filter=None,
         ),
     )
+    # PRD §26.6.3 — Layer 3 cost contract claim. Attaches to every op
+    # unconditionally; the evaluator itself short-circuits to PASSED
+    # for non-Claude dispatches and for non-BG/SPEC routes. The claim
+    # is empirically auditable per-op via the existing Property Oracle
+    # ledger — Priority B's MetaSensor will catch any non-zero failure
+    # rate as a P1 alarm.
+    register_default_claim_spec(
+        DefaultClaimSpec(
+            claim_kind="cost_contract_bg_op_did_not_use_claude",
+            severity=SEVERITY_MUST_HOLD,
+            evidence_required=(
+                "provider_route", "is_read_only", "providers_used",
+            ),
+            rationale=(
+                "Cost contract structural reinforcement per PRD §26.6.3 "
+                "+ project_bg_spec_sealed.md — every BG/SPEC op MUST NOT "
+                "dispatch to Claude (with Manifesto §5 read-only Nervous "
+                "System Reflex exception for BG only). Attaches to every "
+                "op; non-Claude dispatches and non-BG/SPEC routes pass "
+                "trivially. Priority B MetaSensor alarms on any failure."
+            ),
+            # No file_pattern_filter: contract applies to ALL ops
+            # because the claim is route-shaped, not file-shaped.
+            file_pattern_filter=None,
+        ),
+    )
 
 
 _register_seed_specs()

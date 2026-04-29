@@ -891,6 +891,113 @@ def _eval_no_new_credential_shapes(
     )
 
 
+def _eval_cost_contract_bg_op_did_not_use_claude(
+    prop: Property, evidence: Mapping[str, Any],
+) -> PropertyVerdict:
+    """PRD §26.6.3 — Layer 3 Property Oracle claim. Cost contract
+    structural reinforcement: every BG/SPEC op MUST NOT have
+    dispatched to Claude (with the documented Manifesto §5
+    Nervous System Reflex exception for read-only BG ops).
+
+    Required evidence keys:
+      * ``provider_route`` — the op's route ("background" /
+        "speculative" / "standard" / "complex" / "immediate").
+      * ``provider_tier`` — the dispatching provider's tier
+        ("claude" / "doubleword" / "prime"). Some op contexts
+        instead provide ``providers_used`` as a sequence of tier
+        strings (the phase trace); either is accepted.
+      * ``is_read_only`` — boolean (default false on missing).
+
+    Verdict semantics:
+      * PASSED iff ``classify_route_compatibility`` returns one of
+        ``ok`` / ``reflex_allowed`` / ``non_claude``.
+      * FAILED iff classification returns ``violation`` — Claude
+        was used on a non-read-only BG/SPEC op.
+      * INSUFFICIENT_EVIDENCE if neither ``provider_tier`` nor
+        ``providers_used`` is provided.
+
+    The claim is bundled-in via default_claims (Slice A2 registry).
+    Layer 1 (AST) prevents the wiring regression upstream; Layer 2
+    (runtime CostContractViolation) prevents in-flight violation;
+    this Layer 3 catches the empirical signal *if both upstream
+    layers somehow fail simultaneously*."""
+    # Late import to avoid circular dependency surface.
+    try:
+        from backend.core.ouroboros.governance.cost_contract_assertion import (
+            classify_route_compatibility,
+        )
+    except ImportError as exc:
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.EVALUATOR_ERROR,
+            confidence=0.0,
+            reason=f"cost_contract_assertion unavailable: {exc}",
+        )
+
+    provider_route = evidence.get("provider_route", "")
+    is_read_only = evidence.get("is_read_only", False)
+
+    # Two evidence shapes accepted:
+    #   * provider_tier: single tier string (point-in-time dispatch)
+    #   * providers_used: sequence of tier strings (phase trace,
+    #     more reliable since it captures every dispatch in the op)
+    providers_to_check: list = []
+    if "provider_tier" in evidence:
+        providers_to_check.append(evidence["provider_tier"])
+    if "providers_used" in evidence:
+        try:
+            for entry in evidence["providers_used"] or ():
+                providers_to_check.append(entry)
+        except TypeError:
+            pass  # not iterable; skip
+
+    if not providers_to_check:
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.INSUFFICIENT_EVIDENCE,
+            confidence=0.0,
+            reason=(
+                "missing keys: provider_tier or providers_used "
+                "(at least one required)"
+            ),
+        )
+
+    # If ANY dispatch in the op trace classifies as 'violation',
+    # the claim FAILS — even one Claude call on a non-read-only
+    # BG/SPEC op is the contract violation.
+    violations: list = []
+    for tier in providers_to_check:
+        verdict_str = classify_route_compatibility(
+            provider_route=provider_route,
+            provider_tier=tier,
+            is_read_only=is_read_only,
+        )
+        if verdict_str == "violation":
+            violations.append(str(tier))
+
+    if violations:
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.FAILED,
+            confidence=1.0,
+            reason=(
+                f"cost contract violated: route={provider_route} "
+                f"is_read_only={is_read_only} claude_dispatches="
+                f"{violations}"
+            ),
+        )
+
+    return PropertyVerdict(
+        property_name=prop.name, kind=prop.kind,
+        verdict=VerdictKind.PASSED,
+        confidence=1.0,
+        reason=(
+            f"route={provider_route} is_read_only={is_read_only} "
+            f"providers_checked={len(providers_to_check)}"
+        ),
+    )
+
+
 def _register_seed_evaluators() -> None:
     """Module-load: register the seed evaluators. Idempotent —
     re-registering the same callable is a silent no-op."""
@@ -943,6 +1050,19 @@ def _register_seed_evaluators() -> None:
         description=(
             "Verify the diff_text contains no credential/secret "
             "regex shape (5 canonical patterns from semantic_firewall)."
+        ),
+    )
+    # PRD §26.6.3 — Layer 3 cost contract claim. Composes with the
+    # default_claims spec registered below (so every BG/SPEC op
+    # automatically gets this must_hold claim attached at PLAN exit).
+    register_evaluator(
+        kind="cost_contract_bg_op_did_not_use_claude",
+        evaluate=_eval_cost_contract_bg_op_did_not_use_claude,
+        description=(
+            "Verify that BG/SPEC ops did NOT dispatch to Claude "
+            "(with documented Manifesto §5 read-only Nervous System "
+            "Reflex exception for BG only). Cost contract per "
+            "project_bg_spec_sealed.md + PRD §26.6.3."
         ),
     )
 

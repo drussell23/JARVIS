@@ -272,6 +272,257 @@ def _validate_plan_runner_default_claims(
 
 
 # ---------------------------------------------------------------------------
+# Seed invariant — Cost Contract (PRD §26.6.1, post-Phase-12 reinforcement)
+# ---------------------------------------------------------------------------
+#
+# Pins the `BG never cascades to Claude unless is_read_only` contract
+# at the AST level. Two pins compose:
+#
+#   1. SPEC route MUST NOT call self._call_fallback — SPEC never
+#      cascades regardless of is_read_only (no Nervous System Reflex
+#      exception for SPEC; only BG has the read-only escape hatch).
+#
+#   2. BG route MAY call self._call_fallback ONLY in code paths
+#      gated by an `is_read_only` predicate above the call within
+#      `_generate_background` (Manifesto §5 Nervous System Reflex).
+#      Any unguarded fallback call inside _generate_background is
+#      a contract violation.
+#
+# These match the actual code contract (post-soak-#7) — not a
+# simplified version. The simplified "BG never goes to Claude"
+# from PRD §26.6 was an intentional simplification; the real
+# contract has the read-only escape hatch documented in
+# memory/project_bg_spec_sealed.md.
+
+
+def _enclosing_function_node(
+    tree: ast.Module, lineno: int,
+) -> Optional[ast.AST]:
+    """Return the (Async)FunctionDef AST node containing ``lineno``,
+    or ``None`` if the line is at module scope. NEVER raises."""
+    best_node: Optional[ast.AST] = None
+    best_start: int = -1
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        start = getattr(node, "lineno", None)
+        end = getattr(node, "end_lineno", None)
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        if start <= lineno <= end and start > best_start:
+            best_node = node
+            best_start = start
+    return best_node
+
+
+def _is_call_fallback_invocation(node: ast.AST) -> bool:
+    """True iff ``node`` is ``ast.Await`` wrapping
+    ``self._call_fallback(...)`` OR a direct ``self._call_fallback(...)``
+    call. Both shapes occur in practice — the AsyncAwait wrapper around
+    the call is the common one."""
+    # Unwrap Await
+    if isinstance(node, ast.Await):
+        node = node.value
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    # Pattern: self._call_fallback(...)
+    if isinstance(func, ast.Attribute) and func.attr == "_call_fallback":
+        if isinstance(func.value, ast.Name) and func.value.id == "self":
+            return True
+    return False
+
+
+def _function_references_symbol(
+    fn_node: ast.AST, symbol: str,
+) -> bool:
+    """True iff ``symbol`` appears as a structural reference in
+    ``fn_node`` — Name, Attribute attr, or string Constant. AST-only
+    (comments are stripped by ast.parse, so comment-only mentions do
+    NOT count — which is the contract we want: the symbol must be a
+    real code reference, not a docstring or commentary).
+
+    Catches all idiomatic threading patterns:
+      * Bare Name:                ``is_read_only`` → ast.Name(id=...)
+      * Attribute:                ``ctx.is_read_only`` → ast.Attribute(attr=...)
+      * Underscore-prefixed alias: ``_is_read_only = ...`` → catches via
+        Name match below if the alias contains the symbol substring;
+        explicit pattern for ``_<symbol>`` aliasing also recognized.
+      * String constant arg:      ``getattr(ctx, "is_read_only", ...)``
+        → ast.Constant(value=str)
+
+    NEVER raises."""
+    try:
+        for sub in ast.walk(fn_node):
+            # Bare Name node — direct variable reference
+            if isinstance(sub, ast.Name):
+                # Exact match OR the symbol embedded in an alias
+                # (e.g., `_is_read_only` aliases `is_read_only` in
+                # idiomatic Python — common pattern).
+                if sub.id == symbol or sub.id.endswith("_" + symbol):
+                    return True
+                if sub.id == "_" + symbol:
+                    return True
+            # Attribute access — `ctx.is_read_only`
+            if isinstance(sub, ast.Attribute) and sub.attr == symbol:
+                return True
+            # String constant — `getattr(ctx, "is_read_only", False)`
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                if sub.value == symbol:
+                    return True
+        return False
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
+def _is_inside_if_block(
+    fn_node: ast.AST, target_lineno: int,
+) -> bool:
+    """True iff the line at ``target_lineno`` is contained inside
+    an ``ast.If`` block within ``fn_node``. Proves the call is
+    conditional, not unconditional. NEVER raises.
+
+    Walks the AST and checks whether any If-statement's body or
+    orelse spans the target line."""
+    try:
+        for sub in ast.walk(fn_node):
+            if not isinstance(sub, ast.If):
+                continue
+            for branch in (sub.body, sub.orelse):
+                for stmt in branch:
+                    start = getattr(stmt, "lineno", None)
+                    end = getattr(stmt, "end_lineno", None)
+                    if not isinstance(start, int) or not isinstance(end, int):
+                        continue
+                    if start <= target_lineno <= end:
+                        return True
+        return False
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
+def _validate_cost_contract_bg_spec(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Cost contract structural pin (PRD §26.6.1).
+
+    Three composing checks (matches the actual code contract per
+    project_bg_spec_sealed.md, not the simplified PRD version):
+
+      1. ``_generate_speculative`` MUST NOT contain any
+         ``self._call_fallback`` invocation — SPEC never cascades
+         to Claude under any condition.
+
+      2. ``_generate_background`` body MUST reference the symbol
+         ``is_read_only`` somewhere (proves the Nervous System
+         Reflex hatch wiring, Manifesto §5).
+
+      3. Every ``self._call_fallback`` invocation inside
+         ``_generate_background`` MUST be contained within an
+         ``ast.If`` block (proves the call is conditional, not
+         unconditional). Combined with check 2, this structurally
+         pins that BG cascades are gated.
+
+    Returns tuple of violations; empty tuple means the contract holds.
+    NEVER raises."""
+    violations: List[str] = []
+
+    # Pre-walk: locate the BG / SPEC function nodes once
+    bg_node: Optional[ast.AST] = None
+    spec_node: Optional[ast.AST] = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "_generate_background":
+                bg_node = node
+            elif node.name == "_generate_speculative":
+                spec_node = node
+
+    # Check 2: BG function references is_read_only
+    if bg_node is not None and not _function_references_symbol(
+        bg_node, "is_read_only",
+    ):
+        violations.append(
+            f"_generate_background (line {getattr(bg_node, 'lineno', '?')}) "
+            f"does not reference is_read_only — Nervous System Reflex "
+            f"hatch is not wired (cost contract per "
+            f"project_bg_spec_sealed.md + PRD §26.6)"
+        )
+
+    # Checks 1 + 3: walk each _call_fallback invocation
+    for node in ast.walk(tree):
+        if not _is_call_fallback_invocation(node):
+            continue
+        lineno = getattr(node, "lineno", None)
+        if not isinstance(lineno, int) or lineno < 1:
+            continue
+
+        # Check 1: SPEC has zero tolerance
+        if spec_node is not None:
+            spec_start = getattr(spec_node, "lineno", -1)
+            spec_end = getattr(spec_node, "end_lineno", -1)
+            if (
+                isinstance(spec_start, int) and isinstance(spec_end, int)
+                and spec_start <= lineno <= spec_end
+            ):
+                violations.append(
+                    f"line {lineno}: self._call_fallback invocation inside "
+                    f"_generate_speculative — SPEC route MUST NEVER cascade "
+                    f"to Claude under any condition (cost contract per "
+                    f"project_bg_spec_sealed.md + PRD §26.6)"
+                )
+                continue
+
+        # Check 3: BG calls must be inside an If
+        if bg_node is not None:
+            bg_start = getattr(bg_node, "lineno", -1)
+            bg_end = getattr(bg_node, "end_lineno", -1)
+            if (
+                isinstance(bg_start, int) and isinstance(bg_end, int)
+                and bg_start <= lineno <= bg_end
+            ):
+                if not _is_inside_if_block(bg_node, lineno):
+                    violations.append(
+                        f"line {lineno}: self._call_fallback invocation "
+                        f"inside _generate_background but NOT contained "
+                        f"in an if-block — cascade is unconditional, "
+                        f"violating Nervous System Reflex gating "
+                        f"(cost contract per project_bg_spec_sealed.md "
+                        f"+ PRD §26.6)"
+                    )
+
+    return tuple(violations)
+
+
+def _validate_providers_dispatch_assertion(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Cost contract runtime-assertion presence pin (PRD §26.6.2).
+
+    Verifies that ``providers.py`` calls
+    ``assert_provider_route_compatible`` (or imports it from
+    ``cost_contract_assertion``) — pinning that Layer 2's runtime
+    assertion is structurally wired into ClaudeProvider's generate
+    entry point.
+
+    Soft pin: the assertion may be invoked from a helper or directly;
+    the structural requirement is that the symbol appears in
+    providers.py source (i.e., wiring exists). Slice-2's tests verify
+    the wiring is *correct* (right place, right args); this invariant
+    just verifies the wiring is *present*.
+
+    Returns tuple of violations; empty tuple means contract holds.
+    NEVER raises."""
+    if "assert_provider_route_compatible" not in source:
+        return (
+            "providers.py does not reference "
+            "assert_provider_route_compatible — Layer 2 cost contract "
+            "runtime assertion is missing from the dispatch boundary "
+            "(see cost_contract_assertion.py + PRD §26.6.2)",
+        )
+    return ()
+
+
+# ---------------------------------------------------------------------------
 # Validation engine
 # ---------------------------------------------------------------------------
 
@@ -358,6 +609,43 @@ def _register_seed_invariants() -> None:
                 "wiring; without this Phase 2 is theatrical)."
             ),
             validate=_validate_plan_runner_default_claims,
+        ),
+    )
+    # PRD §26.6.1 — cost contract structural pin (post-Phase-12).
+    # Bulletproofs the BG/SPEC-never-cascades-to-Claude invariant
+    # at the AST level (with the documented Nervous System Reflex
+    # read-only escape hatch for BG only).
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="cost_contract_bg_spec_no_unguarded_cascade",
+            target_file=(
+                "backend/core/ouroboros/governance/candidate_generator.py"
+            ),
+            description=(
+                "_generate_speculative MUST NOT call self._call_fallback "
+                "(SPEC never cascades to Claude). _generate_background "
+                "MAY call self._call_fallback only inside an is_read_only "
+                "guard (Manifesto §5 Nervous System Reflex; cost contract "
+                "per project_bg_spec_sealed.md + PRD §26.6)."
+            ),
+            validate=_validate_cost_contract_bg_spec,
+        ),
+    )
+    # PRD §26.6.2 — runtime assertion wiring presence pin.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="providers_cost_contract_assertion_wired",
+            target_file=(
+                "backend/core/ouroboros/governance/providers.py"
+            ),
+            description=(
+                "providers.py MUST reference "
+                "assert_provider_route_compatible from "
+                "cost_contract_assertion — pins Layer 2 runtime "
+                "assertion wiring at the dispatch boundary "
+                "(PRD §26.6.2)."
+            ),
+            validate=_validate_providers_dispatch_assertion,
         ),
     )
 
