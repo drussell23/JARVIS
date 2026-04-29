@@ -1547,6 +1547,39 @@ class CandidateGenerator:
                     "generation (no Claude cascade)",
                     _provider_route, _block_reason,
                 )
+                # Sentinel-Pacemaker handshake (2026-04-29) —
+                # when the topology layer blocks BG/SPEC ops because
+                # the catalog is purged/empty, ask the Pacemaker to
+                # bypass its 30-min cadence sleep and probe DW now.
+                # If DW is reachable, the next refresh cycle
+                # repopulates the catalog and subsequent ops flow.
+                # Best-effort, never raises. Rate-limited at the
+                # trigger site so a block-storm doesn't thrash /models.
+                _reason_lower = (_block_reason or "").lower()
+                _is_catalog_purge = (
+                    "catalog" in _reason_lower
+                    and (
+                        "purged" in _reason_lower
+                        or "empty" in _reason_lower
+                        or "static list" in _reason_lower
+                    )
+                )
+                if _is_catalog_purge:
+                    try:
+                        from backend.core.ouroboros.governance.dw_discovery_runner import (
+                            request_force_refresh,
+                        )
+                        request_force_refresh(
+                            reason=(
+                                f"topology_block:{_provider_route}:"
+                                f"{_block_reason[:80]}"
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 — never raise
+                        logger.debug(
+                            "[CandidateGenerator] force_refresh "
+                            "request failed", exc_info=True,
+                        )
                 if _provider_route == "speculative":
                     raise RuntimeError(
                         f"speculative_deferred:blocked_by_topology:"
