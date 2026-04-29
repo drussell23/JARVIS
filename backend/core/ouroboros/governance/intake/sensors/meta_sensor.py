@@ -66,16 +66,20 @@ META_SENSOR_SCHEMA_VERSION = "meta_sensor.1"
 
 
 def meta_sensor_enabled() -> bool:
-    """``JARVIS_META_SENSOR_ENABLED`` (default ``false`` until
-    Slice B graduation; promotes to default-true after 3 clean
-    sessions per CLAUDE.md discipline).
+    """``JARVIS_META_SENSOR_ENABLED`` (default ``true`` — graduated
+    in the F2/F3/C-consumer arc 2026-04-29 alongside the soak that
+    validates the empirical loop closure).
+
+    Asymmetric env semantics — empty / whitespace = unset marker =
+    graduated default; explicit false-class strings hot-revert.
 
     When off, ``scan_once()`` short-circuits to an empty list and
     no envelopes are emitted. The detector registry remains
-    populated + queryable for operators inspecting the surface."""
+    populated + queryable for operators inspecting the surface.
+    Hot-revert: ``export JARVIS_META_SENSOR_ENABLED=false``."""
     raw = os.environ.get("JARVIS_META_SENSOR_ENABLED", "").strip().lower()
     if raw == "":
-        return False  # opt-in until graduation
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
