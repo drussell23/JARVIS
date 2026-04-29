@@ -564,6 +564,26 @@ async def _fire_terminal_postmortem(
                     "has_blocking_failures": pm.has_blocking_failures,
                 },
             )
+            # Priority D Slice D1 — best-effort SSE publish. IDE
+            # consumers see new postmortems land in real time.
+            # Master-flag-gated at the publisher level; never raises.
+            try:
+                from backend.core.ouroboros.governance.postmortem_observability import (
+                    publish_terminal_postmortem_persisted,
+                )
+                publish_terminal_postmortem_persisted(
+                    op_id=op_id,
+                    record_id=op_id,  # use op_id as the record handle
+                    terminal_phase=_phase_name,
+                    total_claims=int(pm.total_claims),
+                    has_blocking_failures=bool(pm.has_blocking_failures),
+                    reason=str(reason or ""),
+                )
+            except Exception:  # noqa: BLE001 — best-effort
+                logger.debug(
+                    "[PhaseDispatcher] postmortem SSE publish failed",
+                    exc_info=True,
+                )
         except Exception:  # noqa: BLE001 — defensive
             # Merkle persistence failed — fall back to basic persist.
             # The postmortem is still recorded, just without the DAG

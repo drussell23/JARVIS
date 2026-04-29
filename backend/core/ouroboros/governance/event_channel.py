@@ -315,6 +315,44 @@ class EventChannelServer:
                     adversarial_exc,
                 )
 
+            # Priority D Slice D1 — postmortem ledger discoverability.
+            # Mirrors the adversarial wiring pattern: dedicated
+            # IDEObservabilityRouter helper for shared rate-limit +
+            # CORS, gated on master flag, loopback-asserted.
+            postmortem_router_mounted = False
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (
+                    IDEObservabilityRouter as _IDEObsRouterPm,
+                    assert_loopback_only as _assert_loopback_postmortem,
+                )
+                from backend.core.ouroboros.governance.postmortem_observability import (  # noqa: E501
+                    postmortem_observability_enabled as _pm_enabled,
+                    register_postmortem_routes,
+                )
+                if _pm_enabled():
+                    _assert_loopback_postmortem(self._host)
+                    _pm_helper = _IDEObsRouterPm()
+                    register_postmortem_routes(
+                        app,
+                        rate_limit_check=lambda req: (
+                            _pm_helper._check_rate_limit(
+                                _pm_helper._client_key(req),
+                            )
+                        ),
+                        cors_headers=_pm_helper._cors_headers,
+                    )
+                    postmortem_router_mounted = True
+            except ValueError as pm_loopback_exc:
+                logger.warning(
+                    "[EventChannel] postmortem observability refused: %s",
+                    pm_loopback_exc,
+                )
+            except Exception as pm_exc:
+                logger.warning(
+                    "[EventChannel] postmortem observability wiring failed: %s",
+                    pm_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is

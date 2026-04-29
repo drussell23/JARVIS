@@ -213,6 +213,12 @@ EVENT_TYPE_CONFIDENCE_DROP_DETECTED = "confidence_drop_detected"
 EVENT_TYPE_SLO_BREACHED = "slo_breached"
 EVENT_TYPE_FLAG_CHANGED = "flag_changed"
 
+# Priority D Slice D1 — Postmortem ledger discoverability. Fired by
+# Option E's _fire_terminal_postmortem after a successful Merkle
+# DAG ledger write. Payload is summary-only; full record at
+# ``/observability/postmortems/{op_id}`` GET.
+EVENT_TYPE_TERMINAL_POSTMORTEM_PERSISTED = "terminal_postmortem_persisted"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -262,6 +268,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CONFIDENCE_DROP_DETECTED,      # Phase 8 Slice 2
     EVENT_TYPE_SLO_BREACHED,                  # Phase 8 Slice 2
     EVENT_TYPE_FLAG_CHANGED,                  # Phase 8 Slice 2
+    EVENT_TYPE_TERMINAL_POSTMORTEM_PERSISTED,  # Priority D Slice D1
 })
 
 
