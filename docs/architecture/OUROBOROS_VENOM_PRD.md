@@ -1,11 +1,11 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.1 (2026-04-29 — post-Phase-2-graduation + soak #3 production verification)
+**Version**: 2.2 (2026-04-29 — post-Phase-12-DW-Resilience-closure + soak #7 production verification)
 **Author**: Derek J. Russell (vision) · Claude Opus 4.7 (PRD synthesis)
 **Audience**: Operator (decision authority), JARVIS engineers, future-self (resuming after context loss)
 **Prerequisite reading**: `CLAUDE.md` (architecture), `docs/architecture/OUROBOROS.md` (battle-test breakthrough log), `docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md` (Wang RSI mathematical foundation)
-**Latest review**: §25 (v4, 2026-04-29) — supersedes §24 critical-path priorities
+**Latest review**: §26 (v5, 2026-04-29) — supersedes §25 critical-path priorities (A–F all shipped + Phase 12 DW Resilience closed)
 
 ---
 
@@ -65,7 +65,7 @@
     - [24.10 Critical Path to A-Level RSI — top 3 systemic upgrades](#2410-critical-path-to-a-level-rsi--top-3-systemic-upgrades) *(superseded by §25.5 — top 5 priorities)*
     - [24.11 In-flight alignment — Phase 12 / 12.2 maps to the critical path](#2411-in-flight-alignment--phase-12--122-maps-to-the-critical-path)
     - [24.12 What this review explicitly does NOT prescribe](#2412-what-this-review-explicitly-does-not-prescribe)
-25. [Brutal Architectural Review v4 — Post-Phase-2-Production-Verification (2026-04-29)](#25-brutal-architectural-review-v4--post-phase-2-production-verification-2026-04-29) *(latest)*
+25. [Brutal Architectural Review v4 — Post-Phase-2-Production-Verification (2026-04-29)](#25-brutal-architectural-review-v4--post-phase-2-production-verification-2026-04-29) *(superseded by §26 — Priorities A–F all closed)*
     - [25.1 What soak #3 actually proved (and didn't)](#251-what-soak-3-actually-proved-and-didnt)
     - [25.2 The Cognitive & Epistemic Delta — refined post-Phase-2](#252-the-cognitive--epistemic-delta--refined-post-phase-2)
     - [25.3 Deep Observability — Temporal surface refined](#253-deep-observability--temporal-surface-refined)
@@ -75,6 +75,16 @@
     - [25.7 Reverse Russian Doll alignment](#257-reverse-russian-doll-alignment)
     - [25.8 What this review explicitly does NOT prescribe](#258-what-this-review-explicitly-does-not-prescribe)
     - [25.9 Summary](#259-summary)
+26. [Brutal Architectural Review v5 — Post-Phase-12-DW-Resilience-Closure (2026-04-29)](#26-brutal-architectural-review-v5--post-phase-12-dw-resilience-closure-2026-04-29) *(latest)*
+    - [26.1 What soak #7 actually proved (and what §25 priorities A–F now closed)](#261-what-soak-7-actually-proved-and-what-25-priorities-af-now-closed)
+    - [26.2 Refined Cognitive & Epistemic Delta — what CC still has that O+V doesn't](#262-refined-cognitive--epistemic-delta--what-cc-still-has-that-ov-doesnt)
+    - [26.3 Refined Deep Observability — temporal reconstruction is the missing depth](#263-refined-deep-observability--temporal-reconstruction-is-the-missing-depth)
+    - [26.4 Brutal grade — current state: **B+ / B−**](#264-brutal-grade--current-state-b--b-)
+    - [26.5 Critical Path to A-Level RSI — top 3 systemic upgrades (post-Phase-12)](#265-critical-path-to-a-level-rsi--top-3-systemic-upgrades-post-phase-12)
+    - [26.6 Cost contract structural reinforcement — BG never cascades to Claude (bulletproofing)](#266-cost-contract-structural-reinforcement--bg-never-cascades-to-claude-bulletproofing)
+    - [26.7 In-flight alignment + sequencing](#267-in-flight-alignment--sequencing)
+    - [26.8 What this review explicitly does NOT prescribe](#268-what-this-review-explicitly-does-not-prescribe)
+    - [26.9 Summary — the path from B+ to A](#269-summary--the-path-from-b-to-a)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -86,33 +96,34 @@
 
 Ouroboros + Venom (O+V) is the autonomous self-development governance engine of JARVIS. It is the **proactive autonomous opposite of Claude Code (CC)** — where CC requires a human to ask, O+V should observe, hypothesize, propose, validate, and ship without prompting (with human-in-loop escalation only when context warrants it).
 
-### Where we stand (2026-04-29 — post-Phase-2-production-verification)
+### Where we stand (2026-04-29 — post-Phase-12-DW-Resilience-closure + soak #7 verification)
 
-- **Architecture**: A− — sophisticated, composable, observability-rich, financial-circuit-breaker-protected. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all compose correctly. **Order-2 governance cage shipped (Pass B closed 2026-04-26)** + **Pass C Adaptive Anti-Venom structurally complete (2026-04-26)** + **Phase 1 Determinism Substrate graduated (`memory/project_phase_1_closure.md`, 2026-04-28)** + **Phase 12.2 Physics-Aware Topology Routing closed (`memory/project_phase_12_2_closure.md`, 2026-04-28)** + **Phase 2 Closed-Loop Self-Verification graduated (`dc5f77017f`, 2026-04-29)** + **Slices 3a + 3c topology self-healing + sensor backpressure (`a641ca2da3`, 2026-04-29)** + **Option E Universal Terminal Postmortem — survivor bias closed (`85cf94810a`, 2026-04-29; Antigravity-drafted, agent-verified)**.
-- **Cognitive depth**: B − the verification loop is *structurally* live but *functionally hollow*. Soak #3 (2026-04-29) produced **120 `terminal_postmortem` records** at `.jarvis/determinism/default/decisions.jsonl` with three distinct dynamic terminal contexts captured (`postmortem`, `background_accepted:...`, `noop`) — proving the Reverse Russian Doll outer shell (Slice 1.3 → Slice 2.4 → Option E) compresses cleanly through one substrate. **But every postmortem has `total_claims=0`** because PLAN was skipped on every op (`Skipping plan: trivial_op`). The organism remembers every death without memory of any prediction. See §25 for the full review.
-- **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); 3 soaks today (2026-04-29) — soak #1 (0 ops past CLASSIFY), soak #2 (5 ops past CLASSIFY, $0.166 Claude spend, 0 postmortems), soak #3 (5 ops past CLASSIFY, 120 postmortem records harvested). Wave 3 architecturally complete (W3(7) graduated, W3(6) closed-pending-external-API-stability per operator binding 2026-04-25).
-- **RSI scaffolding**: 6 Wang modules verified (Phase 0 audit, 2026-04-25); 4 wired into live FSM. **RSI Gear 1 (Determinism)**: DONE per Phase 1 closure. **RSI Gear 2 (Bounded Curiosity)**: primitives shipped (W2(4) Curiosity, RepeatRunner Bayesian aggregator) but not yet load-bearing in dispatch. **RSI Gear 3 (Closed-Loop Memory)**: scaffolding live (Phase 2 + Option E), signal hollow until §25.5.1 Priority A (mandatory claim density) ships.
+- **Architecture**: **A** — the verification loop is now *functionally* live, not just structurally live. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all compose correctly under hostile network conditions. **Order-2 governance cage shipped (Pass B closed 2026-04-26)** + **Pass C Adaptive Anti-Venom structurally complete (2026-04-26)** + **Phase 1 Determinism Substrate graduated (`memory/project_phase_1_closure.md`, 2026-04-28)** + **Phase 12.2 Physics-Aware Topology Routing closed (`memory/project_phase_12_2_closure.md`, 2026-04-28)** + **Phase 2 Closed-Loop Self-Verification graduated (`dc5f77017f`, 2026-04-29)** + **§25 Priorities A–F all CLOSED single-day (2026-04-29)**: A (mandatory claim density), B (MetaSensor degenerate-loop alarm), C (HypothesisProbe + Venom `hypothesize` tool), D (postmortem ledger discoverability), E (shipped-code structural invariants + Order-2 promotion), F (evidence collector extension + F2/F3 capture) + **Phase 12 DW Resilience CLOSED 2026-04-29 (`memory/project_phase_12_dw_resilience_closure.md`)**: Pricing Oracle (Option α) + Sentinel-Pacemaker Handshake (Option β) + Universal Terminal Postmortem (Option E) all validated firing live in soak #7 under DW endpoint flakiness.
+- **Cognitive depth**: **B+** — the verification loop now *closes meaningfully*. Soak #7 (2026-04-29, `bt-2026-04-29-074851`) produced 8 postmortem captures + 8 default-claim batches with non-trivial claim density (claims=3 pass=1 fail=0 insuff=2 err=0) and clean idle exit. The organism now both remembers every death *and* records predictions to compare those deaths against. The remaining gap from B+ to A is a *cognitive* one (no probabilistic posture, no causality DAG, no adaptive Anti-Venom in production), not a *scaffolding* one. See §26 for the full review.
+- **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); 7 soaks 2026-04-29: soaks #1–#3 caught Phase 2 hollowness (forcing §25 Priorities A–F); soak #4 validated A-shipped; soak #5 validated A+B+C+D+E+F empirical loop closure; soak #6 surfaced Static Pricing Blindspot (forced Phase 12 DW Resilience); **soak #7 (`bt-2026-04-29-074851`) — clean idle exit, session_outcome=complete, 16 Pricing Oracle resolutions + 3 Handshake firings + 22-model boot catalog + 8 postmortems w/ non-trivial claim density + $0.0316 spend + strategic_drift=ok**. Wave 3 architecturally complete (W3(7) graduated, W3(6) closed-pending-external-API-stability per operator binding 2026-04-25).
+- **RSI scaffolding**: 6 Wang modules verified (Phase 0 audit, 2026-04-25); 4 wired into live FSM. **RSI Gear 1 (Determinism)**: DONE per Phase 1 closure. **RSI Gear 2 (Bounded Curiosity)**: HypothesisProbe primitive shipped + Venom `hypothesize` tool + plan_generator wiring (§25 Priority C) — load-bearing for trivial-op gate. **RSI Gear 3 (Closed-Loop Memory)**: functionally complete (Phase 2 + Option E + §25 Priorities A+F evidence capture) — soak #7 confirms non-trivial claim density.
 
-### Grade summary table (current vs A-level target — refreshed 2026-04-29 post-soak-3)
+### Grade summary table (current vs A-level target — refreshed 2026-04-29 post-Phase-12-closure / soak #7)
 
 Color legend: 🟢 = at target / done · 🟡 = in progress / partial · 🔴 = not at target / critical gap.
 
 | Dimension | Current | A-Level Target | Gap to close |
 |---|---|---|---|
-| **Architecture** | 🟢 A− | A | Memory core (Slice 1.3 Merkle DAG) production-verified 2026-04-29 |
-| **Cognitive depth** | 🟡 B | A | §25.5 Priority A (mandatory claim density) — every postmortem currently has `total_claims=0` |
-| **Production track record** | 🔴 C+ | A | 0 ops reached COMPLETE in any of today's three soaks; 1 verified multi-file APPLY (2026-04-15) |
-| **RSI Gear 1 — Determinism** | 🟢 A | A | Phase 1 closed 2026-04-28; soak #3 confirms Merkle DAG holds in production |
-| **RSI Gear 2 — Bounded Curiosity** | 🔴 C | A | §25.5.3 Priority C (HypothesisProbe primitive) not yet built |
-| **RSI Gear 3 — Closed-Loop Memory** | 🟡 B− | A | Scaffolding live (120 records); signal hollow (every record `total_claims=0`) — §25.5.1 Priority A blocks |
-| **Operator UX vs CC** | 🟢 A− | A | Ledger discoverability gap — `.jarvis/determinism/default/decisions.jsonl` has no `/postmortems` REPL or GET (§25.5.4 Priority D) |
-| **Self-tightening immunity** | 🟡 B | A | §25.5.2 Priority B (degenerate-loop alarm) — system did not self-detect 3 concurrent silent failures today |
-| **Sandbox safety boundary** | 🔴 C | A− | Object-graph escape vector documented (§3.6 vector 1); plus today: PLAN-skip-by-trivialization bypass (§25.5.5 Priority E) |
-| **Cross-process safety** | 🟡 B− | A | Advisory file-locking on AdaptationLedger writes (§3.6 vector 3) + Slice 1.3 ordinal-counter under L3 fan-out (§25.4) |
-| **Long-horizon semantic stability** | 🔴 C+ | A | TrajectoryAuditor still missing (§24.8.2); Antivenom is per-op not per-trajectory |
-| **Net overall grade vs "95%+ sovereign autonomous developer"** | 🔴 **B−** | A | See §25.5 critical path (5 priorities, sequenced) |
+| **Architecture** | 🟢 A | A | Phase 12 DW Resilience closed 2026-04-29 — Pricing Oracle + Handshake + Universal Postmortem all live in production under hostile DW conditions |
+| **Cognitive depth** | 🟢 B+ | A | §26.5 Priority 1 (Confidence-Aware Execution) — provider logprobs not yet captured as a routing/circuit-breaker signal |
+| **Production track record** | 🟡 B | A | 1 verified multi-file APPLY (2026-04-15) + soak #7 clean idle-exit with non-trivial postmortem signal; sustained multi-day uptime not yet measured |
+| **RSI Gear 1 — Determinism** | 🟢 A | A | Phase 1 closed 2026-04-28; soak #7 confirms Merkle DAG holds under DW endpoint flakiness |
+| **RSI Gear 2 — Bounded Curiosity** | 🟡 B | A | §25 Priority C HypothesisProbe shipped + wired to PLAN's trivial-op gate; not yet load-bearing on confidence-drop circuit-breaker (§26.5 Priority 1) |
+| **RSI Gear 3 — Closed-Loop Memory** | 🟢 A− | A | Soak #7 confirms non-trivial claim density (claims=3 pass=1 fail=0 insuff=2 err=0); Order-2 promotion of plan_runner default-claim wiring landed (§25 Priority E) |
+| **Operator UX vs CC** | 🟢 A− | A | `/postmortems` REPL + 4 GET endpoints + SSE event landed (§25 Priority D); session-spanning causal DAG view still missing (§26.5 Priority 2) |
+| **Self-tightening immunity** | 🟢 A− | A | MetaSensor graduated default-true (§25 Priority B); shipped_code_invariants seeded (§25 Priority E); per-trajectory drift detector still missing (§26.5 Priority 3) |
+| **Sandbox safety boundary** | 🟡 B | A | Object-graph escape vector documented (§3.6 vector 1); PLAN-skip-by-trivialization bypass closed (§25.5.5 → Priority E shipped); Quine-class hallucination vectors enumerated (§26.4) |
+| **Cross-process safety** | 🟡 B+ | A | Advisory file-locking on AdaptationLedger writes (§3.6 vector 3); Slice 1.3 ordinal-counter under L3 fan-out (§25.4) — addressed by §26.5 Priority 2 (causality DAG with per-worker sub-ordinals) |
+| **Long-horizon semantic stability** | 🟡 B | A | TrajectoryAuditor still missing (§24.8.2); Antivenom is per-op not per-trajectory — addressed by §26.5 Priority 3 (Adaptive Anti-Venom unblocking Pass C) |
+| **Cost contract enforcement (BG never cascades to Claude)** | 🟢 A− | A | Soak #7 validated 14 BG blocks correctly skip-and-queue'd; structural reinforcement pending (§26.6) — AST invariant + runtime assertion + Property Oracle claim |
+| **Net overall grade vs "95%+ sovereign autonomous developer"** | 🟢 **B+ / B−** | A | See §26.5 critical path (3 systemic upgrades, sequenced) |
 
-**The gap is honest, refreshed against today's evidence.** O+V has A-level architecture and A-level vision. Execution sits at B− because (a) Phase 2 is graduated default-true and doing zero verification work — every postmortem captured today has `total_claims=0`, (b) the system did not self-detect THREE concurrent silent failures during today's soaks (PLAN-skip nuking claim path, wall-clock-cap regression, Slice 3c dormant), (c) zero ops reached COMPLETE in any of today's three soaks. Today moved us from "B+ trending A- on architectural composition" (§24.9) to "B- on production behavior" (§25.4) — the demotion captures the honest gap between scaffolding and signal.
+**The gap is honest, refreshed against today's evidence.** O+V has A-level architecture and A-level vision. Execution sits at B+ on happy paths and B− on edge cases. The §25 priorities A–F closing single-day moved us from "B− on production behavior" (§25.4) to "B+ on closed-loop verification" (§26.4) — the upgrade captures the honest gap between *signal density* (now non-trivial) and *cognitive depth* (still single-threaded). The remaining edge-case fragility is enumerated in §26.4 and addressed by the three systemic upgrades in §26.5.
 
 ### Where we're going
 
@@ -2802,6 +2813,306 @@ Together, A + B + E close Phase 2's hollowness within ~1 week of focused work. P
 
 ---
 
+## 26. Brutal Architectural Review v5 — Post-Phase-12-DW-Resilience-Closure (2026-04-29)
+
+**Trigger**: operator architectural-review request 2026-04-29, immediately following the closure of the Phase 12 / 12.2 DW Resilience arc and the validation of §25 Priorities A–F all in production via soak #7 (`bt-2026-04-29-074851`).
+**Predecessor reviews**: §3.6 (v1, 2026-04-26), §3.6.6 (v2, 2026-04-27), §24 (v3, 2026-04-28), §25 (v4, 2026-04-29 — Priorities A–F).
+**Frame**: same Reverse Russian Doll constraint — Anti-Venom must scale proportionally as O+V expands the outer shell. The §25 priorities closed the *signal-density* gap; this review enumerates the *cognitive-depth* gap that remains.
+**Honesty contract**: edge cases not happy path. The system is now genuinely B+ on happy paths and genuinely B− on edge cases. No marketing.
+
+### 26.1 What soak #7 actually proved (and what §25 Priorities A–F now closed)
+
+Soak #7 (`bt-2026-04-29-074851`, 853s, idle_timeout, session_outcome=complete, $0.0316) is the first soak where the *full §25 stack* was live and exercised under hostile network conditions:
+
+| Subsystem | §25 Priority | Soak #7 evidence |
+|---|---|---|
+| Mandatory claim density | A | 8 default-claim batches captured at PLAN exits — non-trivial signal in every postmortem |
+| MetaSensor degenerate-loop alarm | B | Master flag `JARVIS_META_SENSOR_ENABLED` graduated default-true 2026-04-29 |
+| Bounded HypothesisProbe + Venom `hypothesize` tool | C | Wired to plan_generator's trivial-op gate (`probe_trivial_op_assumption` LIVE) |
+| Postmortem ledger discoverability | D | `/postmortems` REPL + 4 GET endpoints + SSE event live |
+| Plan-runner cannot silently skip claim capture | E | `meta/shipped_code_invariants.py` seed `plan_runner_default_claims_wiring` enforces at boot + APPLY |
+| Evidence collector extension + F2/F3 capture | F | 8 evidence batches stamped at PLAN entry + APPLY pre/post — used by Universal Postmortem |
+| Pricing Oracle (Option α) | Phase 12 | 16 live resolutions including soak #6 root case `Qwen/Qwen3.5-397B-A17B-FP8-dottxt → qwen_3_5_397b ($0.10/$0.40)` |
+| Sentinel-Pacemaker Handshake (Option β) | Phase 12.2 | 3 firings: `force_refresh requested ... force_refresh wake — bypassing 1800s cadence sleep` |
+| Cost contract (BG never cascades to Claude) | project_bg_spec_sealed.md | 14 BG topology blocks correctly skip-and-queue'd under DW flakiness — contract held |
+
+**Proven by soak #7**: the verification loop now closes meaningfully. Default claims are captured unconditionally (Priority E enforces structurally), evidence collectors stamp the artifacts those claims need to evaluate against (Priority F), the Universal Terminal Postmortem records pass/fail/insufficient outcomes per claim (Phase 2 + Option E), and the cost contract holds under network duress (Phase 12). Three concurrent silent-disable failures from soak #3 are all now structurally impossible.
+
+**Not yet proven**: that the system can *act* on the signal it's now collecting. Postmortems carry pass/fail per claim, but no consumer treats `claim.fail` as a circuit-breaker condition. Default claims include `must_hold` severity but the system does not yet refuse to advance an op when `must_hold_failed > 0` is observed in a sibling op. The signal is rich; the *closing of the loop into action* is the remaining gap.
+
+### 26.2 Refined Cognitive & Epistemic Delta — what CC still has that O+V doesn't
+
+CC's edge is no longer "Venom has 16 tools, CC has more" (parity), nor "CC has plan-mode" (Priority C closed that). Post-§25 closure, CC's remaining edge is **structural epistemic discipline at the *act-on-signal* boundary**:
+
+| CC paradigm | O+V state (post §25 + Phase 12) | Honest gap |
+|---|---|---|
+| **Unbounded interactive recursion** — user as infinite oracle | `ask_human` gated to NOTIFY_APPLY+; Green ops have no fallback oracle | For BG/SPEC routes (most of the autonomous surface), there is no confidence oracle. HypothesisProbe partially fills this on the trivial-op gate; nowhere else. |
+| **Speculative execution trees** — try multiple branches, pick winner | Single-thread Venom tool loop per op; L3 worktree fan-out exists (W3(6)) but is per-op-graph, not per-hypothesis | COMPLEX route is the cost-supported lane for multi-hypothesis. The infrastructure is there (`subagent_scheduler` + `worktree_manager`); the *cognitive trigger* (when to fan out hypotheses vs commit linearly) is not. |
+| **Mid-generation self-critique** — model corrects itself mid-stream | REVIEW subagent post-hoc on finished candidate (graduated 2026-04-20); no real-time critique | Provider-side stream events are captured; we don't run a critic over the rolling token buffer. |
+| **Streamed reasoning surface** — operator watches the *think*, not just the *do* | SerpentFlow + Update blocks render code-deltas; `stream_renderer.py` shows tokens; reasoning-deltas not surfaced as a first-class event class | The data is in the model output; the surface is missing. |
+| **Confidence-aware decisions** — implicit in CC via human disambiguation | DW + Claude both expose logprobs / top-k; we discard them after stream parse | The single biggest missing primitive. Confidence is the routing signal that turns Priorities A–F from a *passive* verification loop into an *active* one. |
+| **Counterfactual reasoning** — "if I do X, what breaks?" | SemanticGuardian regex/AST patterns + Iron Gate exploration floor + Property Oracle claims | All operate on *committed* state. None probe "what would happen if?" with structured reasoning. HypothesisProbe is bounded for the trivial-op gate only. |
+
+Three structural primitives close these gaps and all three leverage existing infrastructure:
+
+1. **Confidence-gated GENERATE** — capture per-token logprobs from `providers.py` (DW + Claude both expose them in stream events). Compute rolling top-1/top-2 margin. When margin drops below `JARVIS_CONFIDENCE_FLOOR` (env-tunable, default 0.05), abort the GENERATE round + route to HypothesisProbe with the partial output as evidence. **No hardcoding** — threshold lives in FlagRegistry, posture-relevant (HARDEN tightens floor, EXPLORE loosens), and AdaptationLedger (Pass C) adjusts it within bounds. **Existing files extended**: `providers.py`, `phase_capture.py`, `urgency_router.py`, `flag_registry.py`.
+
+2. **Multi-hypothesis fan-out at GENERATE (COMPLEX route only)** — when SemanticTriage returns GENERATE *and* route=COMPLEX *and* HypothesisProbe declares the trivial-op assumption falsified, dispatch N candidates in parallel L3 worktrees (Wave 3 #6 primitive). Score each via REVIEW + per-candidate test runner + Property Oracle claim evaluation. Collapse to winner + write losers to `.jarvis/hypothesis_losers.jsonl` for cross-session learning. **No hardcoding** — N derived from posture (EXPLORE → 3, HARDEN → 1, MAINTAIN → 2). **Existing files extended**: `subagent_scheduler.py`, `worktree_manager.py`, `phase_dispatcher.py`, `review_subagent.py`.
+
+3. **Pre-APPLY counterfactual probe** — before APPLY commits, dispatch HypothesisProbe with hypothesis "this change will not regress claim X, file Y, contract Z" using existing evidence collectors (Priority F). Failure → GENERATE_RETRY with structured feedback. This is the missing layer between SemanticGuardian (pattern-level) and tests (behavior-level): *intent-level* verification. **Existing files extended**: `phase_runners/slice4b_runner.py`, `verification/hypothesis_probe.py`, `verification/evidence_collectors.py`.
+
+### 26.3 Refined Deep Observability — temporal reconstruction is the missing depth
+
+§25 Priority D shipped `/postmortems` REPL + 4 GET endpoints + SSE event. That closed the *discoverability* gap. The remaining gap is *temporal reconstruction* — the ability to take any decision node and replay forward, fork sideways, or trace the full causal tree backward.
+
+What exists (validated by soak #7):
+- `EventChannelServer` `/observability/{health,tasks,...}` GETs + `/observability/stream` SSE (Gap #6 Slices 1+2)
+- `SessionRecord` + `SessionIndex` + `SessionBrowser` (Apr 21 5-slice arc, 117 tests)
+- `phase_capture.py` Merkle DAG hook (Slice 1.3, in `.jarvis/determinism/<session>/decisions.jsonl`)
+- `replay.html` per session (auto-generated by harness on shutdown)
+- Postmortem ledger (Priority D)
+- `summary.json` + `notebook` per session
+
+What's missing:
+- **Causality DAG** (not just flat event log). Today every decision/op/postmortem is a *node* but the *edges* (this caused that, this is a counterfactual of that) are implicit. We need a directed graph where every node points to its parents (signal source, posture state, prior decisions, evidence consulted) and children (downstream phase outcomes, child ops). The `phase_capture` Merkle hash is the seed; extending it to track parent-record-id and counterfactual-of-record-id makes the DAG navigable.
+- **Latent-space confidence broadcast**. Providers expose logprobs and top-k; we discard them after stream parse. Add a `model.confidence_drop` SSE event class (severity-tiered: P1 = below floor mid-stream → abort; P2 = within 20% of floor → warning; P3 = sustained low margin across multiple ops → posture nudge toward HARDEN).
+- **Pre-trip circuit-breaker events**. Breakers fire when limits *hit*. We need `breaker.approaching` events at 75% of budget so Pass C governor can react before the bang. The CostGovernor + RateLimiter both have the data; neither emits at 75%.
+- **Parallel fan-out canvas**. Wave 3 #6 SSE bridges are explicitly deferred (`memory/project_wave3_item6_scope.md`: "Known debt — log-only"). That debt is now load-bearing for time-travel debugging on multi-hypothesis fan-out (§26.2 primitive 2).
+- **Time-travel debugging UI**. Slice 1.4's `--rerun <session-id>` is text-scoped + op-scoped. There is no UI that takes a `record_id` and renders the upstream/downstream Merkle DAG with confidence-drop annotations + counterfactual-fork affordance. The IDE observability schema (`schema_version: "1.0"`) extends naturally to this.
+
+**Noise discipline** (refined from §25.3): emit on transition, not on tick. Posture observer is the gold standard (only emits on cross-hysteresis). Today's soak #7 demonstrates this scales: 16 oracle resolutions + 3 handshake firings + 14 topology blocks = 33 transition events across 853s, all individually meaningful, none noise. The bad pattern is "emit every heartbeat" — drowns observers and degrades rate-limited GETs.
+
+### 26.4 Brutal grade — current state: **B+ / B−**
+
+**Defending B+ on happy paths, B− on edge cases**:
+
+- **Happy path is now A−**: §25 Priorities A–F closed single-day; Phase 12 DW Resilience closed single-day; soak #7 produced clean idle-exit with non-trivial claim density. The verification loop *measurably* closes.
+- **Edge cases are still B−**: the cognitive layer is single-threaded relative to its potential; long-horizon drift detection is heuristic; Quine-class hallucination vectors remain (enumerated below); confidence-aware execution is absent.
+
+**Hidden race conditions identified post-§25 closure (additive to §24.6 + §25.4)**:
+
+- **Wave 2(5) PhaseRunner extraction is mid-flight**. Slice 5b (Iron Gate parity for GENERATE) still pending. Until it lands, every extracted runner threads cross-phase state via the `artifacts` dict (memory: `project_wave2_phaserunner_slice5a.md`). Every threading site is one more potential race surface.
+- **`_active_file_ops` lock with TTL stale-release** (`JARVIS_FILE_LOCK_TTL_S=300`) is heuristic. Under sensor storm, it can release a lock while a worktree subagent is still mid-generation. Fix: TTL keyed on subagent heartbeat, not wall-clock.
+- **Posture observer Lock→RLock bugfix** shipped in Slice 5 Arc A (memory: `project_slice5_arc_a.md`). That pattern (recursive callback into singleton during state read) probably exists elsewhere — FlagRegistry, SensorGovernor, maybe even pricing_oracle's `_REGISTRY_LOCK` under cache invalidation. Audit-grade-1 due.
+- **Slice 1.3 `capture_phase_decision` ordinal-counter under L3 fan-out** — per-process counter; multi-worker writes to same `<session>/decisions.jsonl` may produce out-of-order ordinals across worker boundaries. Replay determinism may not hold cross-worker. Addressed structurally by §26.5 Priority 2 (causality DAG with per-worker sub-ordinals).
+
+**Cascading state-failure vectors over long horizons (additive to §24.7)**:
+
+- **Signal coalescing window is 30s**. Under burst, two signals for the same file 31s apart spawn two ops. The cooldown ledger handles GitHub but not generic FS sensors.
+- **Strategic drift threshold is heuristic** (currently passing at 0.1 / soak #7). No formal long-horizon detector. If the manifesto drifts, no alarm.
+- **Postmortem ledger compaction is unbounded**. At 10K postmortems the SemanticIndex centroid will smear. No retention policy beyond per-session.
+- **MetaSensor (Priority B) thresholds are static**. AdaptationLedger (Pass C) should adjust them in production based on sensor-emission distributions — currently does not.
+
+**Antivenom bypass vectors most likely to land (additive to §24.8 + §25.4)**:
+
+- **Plausibly-typed dead code** — passes AST, passes pattern check, does nothing meaningful. Tests don't catch it because there are no tests for "this code reaches its postcondition." Property Oracle helps if claims are non-trivial; default claims (Priority A) are structural-shape, not behavioral-shape. **Mitigation**: §26.5 Priority 1 (confidence-aware execution) — low-confidence GENERATE rounds are exactly where dead-code emerges.
+- **Symbol-shape hallucination** — model imports `from x import Y` where `x` exists and `Y` is grammatically right but semantically wrong (uses old API surface). Iron Gate doesn't run the import. **Mitigation**: pre-APPLY counterfactual probe (§26.2 primitive 3) executes a scoped `python -c "from x import Y"` as evidence.
+- **Test-shape gaming** — model writes a test that asserts on a symbol it just defined. Default claim `test_set_hash_stable` catches *removal* but not *gaming-via-addition*. **Mitigation**: extend default-claim set (Priority A's manifest) with a `test_added_must_assert_existing_behavior` claim using AST analysis of test-target symbols.
+- **Quine-style obfuscation** — model writes a one-line lambda or `exec(compile(...))` that constructs the actual logic at runtime. AST is trivial, behavior is anything. **Mitigation**: SemanticGuardian pattern `runtime_code_construction` (new) — denies any patch introducing `exec`, `eval`, `compile`, `getattr` with dynamic argument.
+
+The honest defense for "still B+ overall": the *combination* of risk-tier floor + APPROVAL_REQUIRED on Orange + visual VERIFY + Universal Postmortem + repeat-runner + change_engine checkpoint restore means most escape paths are *visible after the fact*. RSI tolerates after-the-fact catch IF rollback is structural. We don't lose; we just learn slowly. The path to A is to make the loop *fast* — that's what §26.5 Priority 1 (confidence) gives us.
+
+### 26.5 Critical Path to A-Level RSI — top 3 systemic upgrades (post-Phase-12)
+
+§25.5 listed Priorities A–F covering signal density. Those are now ALL CLOSED. The next tier is *cognitive depth*. Three systemic upgrades, in order. Each composes; each leverages existing infrastructure; none introduces hardcoding.
+
+#### 26.5.1 Priority 1: Confidence-Aware Execution (Probabilistic Posture) [HIGHEST IMPACT]
+
+**Problem**: provider responses contain logprobs, top-k alternatives, and per-token confidence. We discard them after stream parse. As a result, every generation outcome is binary success/fail — there's no internal "I'm uncertain about this" signal. CC has the user as an external confidence oracle; O+V has nothing. This is the single biggest CC delta and the missing Order-1 cognitive primitive.
+
+**Required upgrade** — three composing surfaces:
+
+1. **Logprob capture in providers.py** — both DW (`doubleword_provider.py`) and Claude (`providers.py`) expose per-token logprobs in stream events. Capture them into `ctx.confidence_trace: List[float]` during GENERATE. Zero new dependencies; both providers already parse the stream.
+
+2. **Confidence-gated circuit-breaker mid-stream** — compute rolling top-1/top-2 margin over the last K tokens (K env-tunable, default 16). When margin drops below `JARVIS_CONFIDENCE_FLOOR` (env-tunable, default 0.05; posture-relevant — HARDEN→0.10, EXPLORE→0.02), abort the GENERATE round + route the partial output to HypothesisProbe with hypothesis "the model is in epistemic distress on this op." Successful probe → resume; falsified probe → escalate to NOTIFY_APPLY (effectively asking the operator).
+
+3. **Confidence-aware route routing** — extend `urgency_router.py` to consider confidence-trace history as a routing input. Recurring low-confidence ops in BG route → propose route demotion. Recurring high-confidence ops in COMPLEX → propose route promotion. Routes shift; cost contract is preserved (BG never cascades to Claude — see §26.6).
+
+**Why this is highest-impact**: confidence is the missing signal that turns the §25 verification loop from *passive* (records what happened) to *active* (changes what's happening). Property Oracle claims pass/fail, but only after APPLY. Confidence intervenes *during* GENERATE. It also unlocks counterfactual probes, multi-hypothesis fan-out triggers, and Pass C's MetaAdaptationGovernor reading "is the system uncertain enough that I should tighten constraints?" as a real signal.
+
+**Antivenom alignment**: confidence floor is itself an Order-2 governance object — the threshold is FlagRegistry-typed, posture-relevant, AdaptationLedger-tunable within bounds. Amending the floor crosses Pass B Slice 1's locked-true invariant.
+
+**No hardcoding**: floor lives in FlagRegistry, posture-relevant categories assigned, K-window is env-tunable, AdaptationLedger adjusts within Pass C's monotonic-tightening invariant.
+
+**Sequencing**: independent of Priority 2; can ship in parallel with it. Composes as the *signal source* for Priority 2's causal DAG (every confidence-drop is a graph node).
+
+#### 26.5.2 Priority 2: Causality DAG + Deterministic Replay [HIGH IMPACT]
+
+**Problem**: today's events are a flat stream. `phase_capture` Merkle-hashes records; `summary.json` aggregates per-op outcomes; `replay.html` renders a session linearly. None of these answer the question "given decision X, what was its causal predecessor Y, and what would have happened if at Y we'd taken path Z?" This is the missing substrate for time-travel debugging, drift detection, counterfactual reasoning, and replay-from-fork.
+
+**Required upgrade** — promote `phase_capture` from per-phase Merkle nodes to a session-spanning DAG:
+
+1. **Schema extension** — every captured record carries `parent_record_ids: List[str]` (one per dependency: signal source, posture state, prior op outcome, evidence consulted) and optional `counterfactual_of: str` (when a record was generated by HypothesisProbe as a "what if?" branch).
+
+2. **Replay command extension** — `scripts/ouroboros_battle_test.py --rerun-from <record-id>` re-executes the session starting from a specific record, with the captured entropy/clock state restored from `phase_capture`. This is the substrate for counterfactual probes (§26.2 primitive 3) and for cross-session A/B-style learning (replay last week's bug-fix attempt with this week's evidence collectors).
+
+3. **DAG navigation surface** — extend `/postmortems` REPL + IDE observability schema with a `dag` subcommand: `dag for-record <id>`, `dag fork-counterfactuals <id>`, `dag drift <session-a> <session-b>`. Same loopback-only + rate-limited contract as Slice 1 GETs.
+
+4. **Per-worker sub-ordinals** — fix Slice 1.3 ordinal-counter under L3 fan-out by namespacing ordinals as `<worker-id>:<ordinal>` so multi-worker writes to `<session>/decisions.jsonl` produce a stable total order under deterministic replay.
+
+**Why this is high-impact**: causality is the substrate that makes Priority 1's confidence signal *historically navigable* and makes Priority 3's adaptive Anti-Venom *evidence-driven instead of heuristic*. Without a DAG, every adaptation is per-op blind; with a DAG, drift detection becomes graph-isomorphism over time.
+
+**Antivenom alignment**: DAG nodes are AST-validated (`shipped_code_invariants.py` seed: "every record persisted to ledger MUST carry valid parent_record_ids"). Replay determinism is structural — captured entropy + clock state make it bit-identical. Order-2 governance: DAG schema lives in Order-2 manifest.
+
+**No hardcoding**: window-sizes, retention policies, drift-thresholds all FlagRegistry-typed and posture-relevant.
+
+**Sequencing**: ships in parallel with Priority 1 — they compose at the SSE event class level (`model.confidence_drop` events become DAG nodes with parent links to the GENERATE record they aborted).
+
+#### 26.5.3 Priority 3: Adaptive Anti-Venom (Unblock Pass C) [HIGH IMPACT, GATED]
+
+**Problem**: Iron Gate exploration floors, SemanticGuardian patterns, ExplorationLedger weights, and Risk Tier Floor are all *static* today. Pass C's MetaAdaptationGovernor (drafted 2026-04-26, currently held on Pass B Slice 1) is the structural answer. Without adaptation, the shell expansion guaranteed by O+V outpaces the constraint surface — either we tighten reactively (already too late) or preemptively-statically (RSI stalls).
+
+**Required upgrade** — unblock Pass C's MetaAdaptationGovernor with monotonic-tightening invariant:
+
+1. **Pass B Slice 1 ships** (currently held on W2(5) Slice 5b). MetaPhaseRunner + Order-2 manifest + ORDER_2_GOVERNANCE risk class + AST validator + shadow replay + locked-true amendment protocol. All defaults false initially; per-slice graduation cadence.
+
+2. **Pass C Slice 1 ships** (gated on Pass B Slice 1). AdaptationLedger primitive + 5 surfaces (SemanticGuardian patterns, IronGate floors, per-Order budgets, risk-tier ladder, ExplorationLedger weights) + MetaAdaptationGovernor. Monotonic-tightening invariant: once a constraint tightens, it cannot loosen without operator approval crossing Pass B's locked-true gate.
+
+3. **Per-trajectory drift detector** (NEW post-Pass-C-Slice-1) — rolling-window comparison of constraint distributions across sessions. When drift exceeds posture-relevant threshold, automatically tighten the affected constraint within bounds. Operator surface: SSE event `adaptation_proposed` + `/posture explain --adaptation` REPL.
+
+**Why this is high-impact**: this is the only upgrade on the critical path that makes Order-2 self-rewriting *structurally safe*. Without adaptive Anti-Venom, Order-2 is gated permanently behind operator approval per amendment. With it, Order-2 becomes *practically reachable* under bounded adaptation rates.
+
+**Antivenom alignment**: this IS the Anti-Venom adaptation. Its own adaptation rate is bounded (monotonic-tightening + operator-approval-required for loosening + 70%+ approval-rate over 30-day window per §10.3 arc-closure criterion).
+
+**No hardcoding**: every tunable lives in FlagRegistry; AdaptationLedger writes to durable Order-2 manifest; thresholds posture-relevant; amendment protocol is operator-approval-required.
+
+**Sequencing**: GATED on Pass B Slice 1 (currently held on W2(5) Slice 5b). When W2(5) closes, Pass B Slice 1 unblocks; when Pass B Slice 1 ships, Pass C Slice 1 unblocks; when Pass C Slice 1 ships, this Priority becomes the next concrete arc.
+
+### 26.6 Cost contract structural reinforcement — BG never cascades to Claude (bulletproofing)
+
+The operator's directive (2026-04-29): "make sure the Cost contract (BG never cascades to Claude) [stays bulletproof]". Soak #7 validated 14 BG topology blocks correctly skip-and-queue'd under DW endpoint flakiness. The contract held *behaviorally*. The next tier is to make it hold *structurally* — three reinforcements that cannot be weakened by a future model patch.
+
+Today the contract lives in two places:
+1. `brain_selection_policy.yaml` — config; overridable by any patch
+2. `candidate_generator.py` block-mode dispatch — code; trusts the YAML
+
+A model with the wrong patch could weaken either. Three structural reinforcements, all leveraging existing infrastructure, no hardcoding:
+
+#### 26.6.1 AST invariant (extends §25 Priority E)
+
+Extend `meta/shipped_code_invariants.py` with a new seed:
+
+```python
+INVARIANT_BG_NEVER_CASCADES_TO_CLAUDE = ShippedCodeInvariant(
+    invariant_id="bg_route_never_reaches_claude_provider",
+    description=(
+        "No code path in providers.py or candidate_generator.py "
+        "may dispatch to a Claude-tier provider when ctx.route in "
+        "('background', 'speculative'). Enforces project_bg_spec_sealed.md."
+    ),
+    target_files=["backend/core/ouroboros/governance/providers.py",
+                  "backend/core/ouroboros/governance/candidate_generator.py"],
+    ast_check_kind="reachability_proof",
+    ast_check_args={
+        "from_route": ["background", "speculative"],
+        "must_not_reach": "ClaudeProvider",
+    },
+    severity=SEVERITY_MUST_HOLD,
+    hot_revert_env="JARVIS_BG_COST_CONTRACT_INVARIANT_ENABLED",  # default true
+)
+```
+
+Validated at boot + every APPLY. Failure blocks the APPLY and emits `cost_contract_invariant_violated` SSE event.
+
+#### 26.6.2 Runtime structural assertion
+
+In `providers.py`, at the dispatch-to-provider boundary:
+
+```python
+def dispatch_provider(ctx: PipelineContext, provider: Provider) -> ...:
+    # Cost contract structural reinforcement — fail loud, not silent.
+    # See docs/architecture/OUROBOROS_VENOM_PRD.md §26.6 +
+    # memory/project_bg_spec_sealed.md
+    if ctx.route in BG_SPEC_ROUTES and provider.tier == "claude":
+        raise CostContractViolation(
+            f"BG/SPEC route attempted Claude cascade — op={ctx.op_id} "
+            f"route={ctx.route} provider={provider.name}. This is a "
+            f"structural invariant; check candidate_generator dispatch "
+            f"+ topology block-mode policy."
+        )
+    return provider.dispatch(ctx, ...)
+```
+
+`CostContractViolation` is a fatal exception class — the orchestrator catches it, terminates the op as `failure_class=cost_contract_violation`, writes a `must_hold_failed` postmortem record, and refuses further work on that op. No silent fallback.
+
+#### 26.6.3 Property Oracle claim (extends §25 Priority A default-claim manifest)
+
+Register a default claim that fires on every postmortem:
+
+```python
+@register_default_claim
+def cost_contract_bg_op_did_not_use_claude(ctx: PipelineContext) -> PropertyClaim:
+    """Every BG/SPEC op MUST have provider != claude in its phase trace."""
+    return PropertyClaim(
+        claim_id="cost.bg_op_used_claude_must_be_false",
+        property=Property.from_kind("provider_class_in_phase_trace_must_not_match"),
+        severity=SEVERITY_MUST_HOLD,
+        evidence_required={
+            "applicable_when_route_in": ["background", "speculative"],
+            "provider_class_must_not_match": "claude",
+        },
+    )
+```
+
+This makes the contract *empirically auditable per op* via the existing Property Oracle infrastructure (Phase 2). Any drift triggers Priority B's MetaSensor (rate of `cost.bg_op_used_claude_must_be_false` failures > 0 over last N → P1 alarm).
+
+**None of these duplicate existing logic. All three extend graduated primitives (§25 Priorities A + E, Phase 2 Property Oracle).** Together they make the cost contract enforced at three independent layers: AST (boot + APPLY), runtime (every dispatch), and audit (every postmortem). A future model patch would have to weaken all three simultaneously to break the contract — which is precisely what the Order-2 governance cage prevents (the AST invariant lives in the manifest).
+
+### 26.7 In-flight alignment + sequencing
+
+| Current state on main | Maps to | Status |
+|---|---|---|
+| Phase 1 Determinism Substrate (4 flags graduated) | §24.10.1 Priority 1 / RSI Gear 1 | DONE |
+| Phase 2 Closed-Loop Self-Verification (Slice 2.5 graduated) | §24.10.2 Priority 2 | DONE — Priorities A+E+F made it *functionally* complete |
+| §25 Priority A — mandatory claim density | §25.5.1 | DONE |
+| §25 Priority B — MetaSensor degenerate-loop alarm | §25.5.2 | DONE (graduated default-true) |
+| §25 Priority C — bounded HypothesisProbe + Venom `hypothesize` tool | §25.5.3 | DONE (wired to plan_generator trivial-op gate) |
+| §25 Priority D — postmortem ledger discoverability | §25.5.4 | DONE (REPL + 4 GETs + SSE) |
+| §25 Priority E — plan_runner cannot silently skip claim capture | §25.5.5 | DONE (shipped_code_invariants seed) |
+| §25 Priority F — evidence collector extension + F2/F3 capture | §25.5 (added) | DONE |
+| Phase 12 DW Resilience: Pricing Oracle (α) + Handshake (β) + Universal Postmortem (E) | Phase 12 / 12.2 | CLOSED 2026-04-29 (`memory/project_phase_12_dw_resilience_closure.md`) |
+| W2(5) PhaseRunner extraction (Slices 1–5a) | §26.4 race condition | IN-FLIGHT — Slice 5b (Iron Gate parity) pending |
+| Pass B Slice 1 (MetaPhaseRunner + Order-2 manifest) | §26.5.3 gating | HELD on W2(5) Slice 5b |
+| Pass C Slice 1 (AdaptationLedger + MetaAdaptationGovernor) | §26.5.3 | HELD on Pass B Slice 1 |
+| W3(6) parallel L3 fan-out (Slices 1–4 shipped, defaults false) | §26.2 primitive 2 substrate | INFRASTRUCTURE READY — defaults false, SSE bridges deferred |
+
+**Sequencing for the next focus** (impact-ranked):
+
+1. **Priority 1 — Confidence-Aware Execution** (§26.5.1) — ships first, independent of any in-flight arc, leverages providers.py + phase_capture + urgency_router. Highest unlock-to-effort ratio.
+2. **Priority 2 — Causality DAG** (§26.5.2) — ships in parallel with Priority 1 once the confidence event class is defined; they compose.
+3. **Cost contract structural reinforcement** (§26.6) — ships in parallel with Priority 1; small, high-confidence, leverages §25 Priority E shipped infrastructure. Low risk, immediate operator visibility.
+4. **W2(5) Slice 5b** (Iron Gate parity for GENERATE) — unblocks Pass B Slice 1.
+5. **Pass B Slice 1** (Order-2 manifest cage) — unblocks Pass C Slice 1.
+6. **Priority 3 — Adaptive Anti-Venom** (§26.5.3) — unblocks once Pass C Slice 1 ships.
+
+### 26.8 What this review explicitly does NOT prescribe
+
+- **Re-running soak #7 with `JARVIS_PRICING_ORACLE_ENABLED=false`** to "test the legacy path in production" — that's the work-around path. The structural fix is the §26.6 invariant + structural assertion + Property Oracle claim.
+- **Adding more sensors** — the 16 + MetaSensor are sufficient for current signal density. Today's gap is *cognitive depth*, not signal coverage.
+- **Adding more phase runners or subagent types** — same prohibitions as §24.12 + §25.8. The W2(5) extraction in-flight is sufficient.
+- **Building a brand-new "RSI core"** — Phase 1 + Phase 2 + §25 Priorities A–F + Phase 12 closure is the RSI core. The next three priorities (§26.5) extend it; they don't replace it.
+- **Re-litigating Phase 12** — Phase 12 / 12.2 DW Resilience is CLOSED per `memory/project_phase_12_dw_resilience_closure.md`. The 14 BG topology blocks observed in soak #7 are NOT regressions — they are the cost contract holding under DW outage.
+
+### 26.9 Summary — the path from B+ to A
+
+**Did we make significant progress today (2026-04-29)? Yes — across two distinct axes:**
+- **Signal density** (§25 Priorities A–F closed single-day): the verification loop now closes meaningfully; postmortems carry non-trivial claim density; soak #7 validated empirical loop closure.
+- **Resilience** (Phase 12 DW Resilience closed single-day): the autonomic nervous system now self-heals catalog state under hostile network conditions without operator intervention; soak #7 validated Pricing Oracle + Handshake + Universal Postmortem live in production.
+
+**What remains the gap from B+ to A: cognitive depth.** The system now collects rich signal but does not yet *act* on it during execution (only after). Three systemic upgrades close this:
+
+1. **Confidence-Aware Execution** (§26.5.1) — turns confidence into a routing signal + circuit-breaker. Single biggest CC-delta-closing primitive. Ships first.
+2. **Causality DAG + Deterministic Replay** (§26.5.2) — substrate for time-travel debugging, drift detection, counterfactual reasoning. Ships in parallel.
+3. **Adaptive Anti-Venom** (§26.5.3) — Pass C's MetaAdaptationGovernor making constraints scale proportionally as the shell expands. Gated; ships when Pass B Slice 1 + W2(5) Slice 5b clear.
+
+**Cost contract bulletproofing** (§26.6) ships in parallel with Priority 1 — three structural reinforcements (AST invariant + runtime assertion + Property Oracle claim) make BG-never-cascades-to-Claude an enforced invariant at three independent layers.
+
+**Net trajectory**: the §25 priorities + Phase 12 closure earned the right to attempt A. They did not deliver A. The next three priorities (§26.5) + cost-contract reinforcement (§26.6), in this order, are how we get there.
+
+The architecture is now A. The cognitive layer is B+. The path closes both gaps via the three priorities above. None requires hardcoding. All extend existing graduated primitives. The Reverse Russian Doll's outer shell — Anti-Venom scaling proportionally as O+V expands — is what Priority 3 structurally enables.
+
+---
+
 ## Appendix A — Glossary
 
 ### Core terms
@@ -3029,6 +3340,7 @@ When §5.4 MVP RSI conditions all met → claim Wang-grounded RSI.
 
 | Date | Version | Change | Author |
 |---|---|---|---|
+| 2026-04-29 | 2.59 | **§26 Brutal Architectural Review v5 — post-Phase-12-DW-Resilience-closure (B+/B− grade defended).** Adds §26 (latest review) covering: (26.1) what soak #7 actually proved + §25 Priorities A–F all CLOSED single-day (mandatory claim density / MetaSensor / HypothesisProbe / postmortem ledger discoverability / shipped-code structural invariants / evidence collector extension) + Phase 12 DW Resilience CLOSED single-day (Pricing Oracle α + Sentinel-Pacemaker Handshake β + Universal Terminal Postmortem E all live in production); (26.2) refined Cognitive & Epistemic Delta — what CC still has that O+V doesn't post-§25 closure (unbounded interactive recursion / speculative execution trees / mid-generation self-critique / streamed reasoning surface / **confidence-aware decisions** / counterfactual reasoning); (26.3) refined Deep Observability — temporal reconstruction is the missing depth (causality DAG / latent-space confidence broadcast / pre-trip circuit-breaker events / parallel fan-out canvas / time-travel debugging UI); (26.4) brutal grade B+/B− defense — happy path A−, edge cases B−; new race conditions enumerated (W2(5) Slice 5b in-flight / `_active_file_ops` heuristic TTL / Slice 1.3 ordinal under L3 fan-out); new Antivenom bypass vectors (plausibly-typed dead code / symbol-shape hallucination / test-shape gaming / Quine-style obfuscation); (26.5) **Critical Path to A-Level RSI — top 3 systemic upgrades**: Priority 1 Confidence-Aware Execution (Probabilistic Posture) — capture provider logprobs as routing signal + circuit-breaker; Priority 2 Causality DAG + Deterministic Replay — promote phase_capture from per-phase Merkle nodes to session-spanning DAG with parent_record_ids + counterfactual_of edges; Priority 3 Adaptive Anti-Venom (unblock Pass C) — gated on W2(5) Slice 5b + Pass B Slice 1; (26.6) **Cost contract structural reinforcement** — three structural reinforcements bulletproofing BG-never-cascades-to-Claude: AST invariant (extends §25 Priority E shipped_code_invariants seed) + runtime structural assertion (CostContractViolation fatal exception in providers.py at dispatch boundary) + Property Oracle claim (extends §25 Priority A default-claim manifest with `cost.bg_op_used_claude_must_be_false` per-op); (26.7) in-flight alignment table + impact-ranked sequencing for next focus; (26.8) explicit non-prescriptions (no soak re-run with master-off / no more sensors / no more phase runners / no brand-new RSI core); (26.9) summary — the path from B+ to A. **Updates §1 Executive Summary** ("Where we stand" refreshed to post-Phase-12-DW-Resilience-closure + soak #7 verification; grade table refreshed: Architecture A, Cognitive depth B+, RSI Gear 2 B, RSI Gear 3 A−, Self-tightening immunity A−, Cost contract enforcement A−, Net B+/B−). Updates TOC with §26 subsection links. **Marks §25 as superseded by §26 (Priorities A–F all closed).** Zero behavior change — doc-only update synthesizing today's architectural review. | Claude Opus 4.7 (post-Phase-12-DW-Resilience-closure architectural review) |
 | 2026-04-25 | 1.0 | Initial draft | Claude Opus 4.7 (synthesis from 7-day operator collaboration) |
 | 2026-04-25 | 2.0 | Added: TOC, §4 Cognitive Scaffolding deep dive, §5 RSI Convergence Framework, §8 Manifesto alignment, §10 Per-phase telemetry, §11 Per-phase testing, §18 Stakeholder map, §19 Migration & versioning. Expanded: §22 Trinity context, App A glossary, App B reference docs map, App C phase gate criteria. | Claude Opus 4.7 (per operator request: "more depth, RSI section, more references") |
 | 2026-04-25 | 2.1 | Added §1 "Roadmap Execution Status (live)" subsection — per-slice [x]/[~]/[ ] tracking. Records: Phase 0 audit complete; Phase 1 P0 build (PR #20968) + live-fire smoke + graduation pins landed; P0 master-flag flip pending 3-clean-session cadence. Update discipline noted: each closing slice updates this section in same PR. | Claude Opus 4.7 (P0 follow-on PR) |
