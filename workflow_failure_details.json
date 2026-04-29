@@ -1,0 +1,114 @@
+{
+  "workflow_name": "CodeQL Security Analysis",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25084417184",
+  "branch": "main",
+  "commit_sha": "a641ca2",
+  "run_number": 4750,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/codeql-security-analysis-run4750-20260429-004503",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: CodeQL Security Analysis (Run #4750)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 29,
+              "content": "2026-04-29T00:19:41.7779502Z ##[error]API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 1009:D77BE:1F8BE6:7DACC7:69F14E9D and timestamp 2026-04-29 00:19:41 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service) - https://docs.github.com/en/rest/using-the-rest-api/getting-started-with-the-rest-api#rate-limiting",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 82,
+              "content": "2026-04-29T00:20:19.4043990Z Successfully uploaded a SARIF file for the unsuccessful execution. Received expected \"unsuccessful execution\" processing error, and no other errors.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 84,
+              "content": "2026-04-29T00:20:19.4050898Z CodeQL job status was configuration error.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 30,
+              "content": "2026-04-29T00:19:56.1649465Z ##[warning]Failed to gather information for telemetry: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 1008:35EF7F:17F68B:5F2416:69F14EAC and timestamp 2026-04-29 00:19:56 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service) - https://docs.github.com/en/rest/using-the-rest-api/getting-started-with-the-rest-api#rate-limiting. Will skip sending status report.",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 57,
+              "content": "2026-04-29T00:20:12.5945307Z [command]/opt/hostedtoolcache/CodeQL/2.25.2/x64/codeql/codeql database export-diagnostics /home/runner/work/_temp/codeql_databases --db-cluster --format=sarif-latest --output=../codeql-failed-run.sarif --sarif-include-diagnostics -vvv --sarif-category /language:javascript-typescript",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 72,
+              "content": "2026-04-29T00:20:13.4469473Z Uploading failed SARIF file ../codeql-failed-run.sarif",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 73,
+              "content": "2026-04-29T00:20:13.4472506Z Post-processing sarif files: [\"../codeql-failed-run.sarif\"]",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 81,
+              "content": "2026-04-29T00:20:19.4042614Z Analysis upload status is failed.",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-04-29T00:20:19.6869087Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 6
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 30,
+              "content": "2026-04-29T00:19:56.1649465Z ##[warning]Failed to gather information for telemetry: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 1008:35EF7F:17F68B:5F2416:69F14EAC and timestamp 2026-04-29 00:19:56 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service) - https://docs.github.com/en/rest/using-the-rest-api/getting-started-with-the-rest-api#rate-limiting. Will skip sending status report.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-04-29T00:20:19.6869087Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 98,
+              "content": "2026-04-29T00:20:19.7180531Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: github/codeql-action/analyze@v3, github/codeql-action/init@v3. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 3
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Review test cases and ensure code changes haven't broken existing functionality"
+      ],
+      "severity": "high",
+      "category": "test_failure",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-04-29T00:45:03.123132"
+}
