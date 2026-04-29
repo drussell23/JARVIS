@@ -675,6 +675,196 @@ def _validate_confidence_route_advisor_cost_guard(
     return tuple(violations)
 
 
+# ---------------------------------------------------------------------------
+# Priority 2 Slice 6 — Causality DAG structural pins
+# ---------------------------------------------------------------------------
+
+
+def _validate_causality_dag_no_authority_imports(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 3 ``causality_dag.py`` structural pin: must NOT import
+    any forbidden authority module. Pure-data graph builder; reads
+    the JSONL ledger via stdlib only.
+
+    Returns tuple of violations; empty tuple means pin holds. NEVER
+    raises."""
+    forbidden_substrings = (
+        "orchestrator",
+        "phase_runners",
+        "candidate_generator",
+        "iron_gate",
+        "change_engine",
+        "policy",
+        "semantic_guardian",
+        "semantic_firewall",
+        "providers",
+        "doubleword_provider",
+        "urgency_router",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                for fb in forbidden_substrings:
+                    if fb in alias.name:
+                        violations.append(
+                            f"forbidden import: {alias.name}",
+                        )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            for fb in forbidden_substrings:
+                if fb in mod:
+                    violations.append(f"forbidden import: {mod}")
+    return tuple(violations)
+
+
+def _validate_causality_dag_bounded_traversal(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 3 ``subgraph()`` structural pin: the function MUST
+    accept a ``max_depth`` parameter so traversal is bounded.
+    Without this bound, a DAG with cycles or pathological depth
+    could OOM or hang the navigation surface.
+
+    AST-walks ``causality_dag.py`` for the ``subgraph`` function
+    definition and verifies it has a ``max_depth`` parameter.
+    Bytes-fallback also confirms the parameter token is present in
+    source so a refactor that renames it to ``depth`` would be
+    caught.
+
+    Returns tuple of violations; empty tuple means pin holds. NEVER
+    raises."""
+    violations: List[str] = []
+
+    if "max_depth" not in source:
+        violations.append(
+            "max_depth parameter token missing from "
+            "causality_dag source"
+        )
+
+    found_function = False
+    found_max_depth_arg = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "subgraph"
+        ):
+            found_function = True
+            for arg in (
+                list(node.args.args)
+                + list(node.args.kwonlyargs)
+            ):
+                if arg.arg == "max_depth":
+                    found_max_depth_arg = True
+                    break
+            break
+    if not found_function:
+        violations.append("subgraph function missing")
+    elif not found_max_depth_arg:
+        violations.append(
+            "subgraph function missing max_depth parameter "
+            "(bounded traversal contract broken)"
+        )
+    return tuple(violations)
+
+
+def _validate_dag_navigation_no_ctx_mutation(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 4 ``dag_navigation.py`` structural pin: MUST NOT call
+    any mutation method on a ctx-shaped object. The navigation
+    surface is read-only — no ``ctx.advance(...)`` /
+    ``ctx.with_*(...)`` / ``ctx.with_strategic_*(...)`` etc.
+    AST-walks function calls and rejects any ``ctx.advance``,
+    ``ctx.with_*``, or ``ctx.replace(...)`` invocation.
+
+    Returns tuple of violations; empty tuple means pin holds. NEVER
+    raises."""
+    forbidden_method_prefixes = ("with_", "advance", "replace")
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        # ctx.method(...) pattern
+        if not isinstance(func.value, ast.Name):
+            continue
+        if func.value.id != "ctx":
+            continue
+        method_name = func.attr
+        for prefix in forbidden_method_prefixes:
+            if (
+                method_name == prefix
+                or method_name.startswith(prefix)
+            ):
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden ctx.{method_name}() "
+                    f"call — dag_navigation must be read-only on ctx"
+                )
+                break
+    return tuple(violations)
+
+
+def _validate_dag_replay_cost_contract_preserved(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 5 + Slice 6 structural pin: the ``--rerun-from`` replay
+    path in ``scripts/ouroboros_battle_test.py`` MUST go through the
+    existing orchestrator entry point — it cannot bypass the §26.6
+    four-layer cost contract by introducing a new dispatch path.
+
+    Bytes-level check: source MUST reference both the replay
+    helper functions (``prepare_replay_from_record`` +
+    ``apply_replay_from_record_env``) AND the existing ``--rerun``
+    flag — proving the replay flow piggybacks on the orchestrator's
+    existing dispatch. Source MUST NOT contain a direct call to
+    ``ClaudeProvider`` or any provider construction (which would
+    indicate a shortcut bypass).
+
+    Returns tuple of violations; empty tuple means pin holds. NEVER
+    raises."""
+    violations: List[str] = []
+
+    if "prepare_replay_from_record" not in source:
+        violations.append(
+            "prepare_replay_from_record reference missing — "
+            "--rerun-from is not wired through the replay primitive"
+        )
+    if "apply_replay_from_record_env" not in source:
+        violations.append(
+            "apply_replay_from_record_env reference missing — "
+            "--rerun-from is not wired through the env-overlay path"
+        )
+    # The fork must require --rerun (so it goes through the existing
+    # orchestrator-dispatched replay, not a new code path).
+    if "--rerun-from" in source and "args.rerun is None" not in source:
+        violations.append(
+            "--rerun-from path may bypass --rerun's orchestrator "
+            "dispatch — required guard `if args.rerun is None` is "
+            "missing"
+        )
+    # Direct provider construction / dispatch in the replay path
+    # would be a §26.6 cost-contract bypass.
+    forbidden_provider_tokens = (
+        "ClaudeProvider(",
+        "DoublewordProvider(",
+        "from backend.core.ouroboros.governance.providers import",
+        "from backend.core.ouroboros.governance.doubleword_provider import",
+    )
+    for token in forbidden_provider_tokens:
+        if token in source:
+            violations.append(
+                f"direct provider reference detected: {token!r} — "
+                f"replay must go through orchestrator entry point, "
+                f"not bypass dispatch"
+            )
+    return tuple(violations)
+
+
 def _validate_providers_dispatch_assertion(
     tree: ast.Module, source: str,
 ) -> Tuple[str, ...]:
@@ -900,6 +1090,77 @@ def _register_seed_invariants() -> None:
                 "depth."
             ),
             validate=_validate_confidence_route_advisor_cost_guard,
+        ),
+    )
+    # PRD §26.5.2 — Priority 2 Slice 6 graduation seeds.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="causality_dag_no_authority_imports",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "causality_dag.py"
+            ),
+            description=(
+                "Slice 3 graph builder must NOT import "
+                "orchestrator / phase_runners / candidate_generator / "
+                "iron_gate / change_engine / policy / "
+                "semantic_guardian / providers / urgency_router — "
+                "pure-data primitive, structural read-only over "
+                "the ledger."
+            ),
+            validate=_validate_causality_dag_no_authority_imports,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="causality_dag_bounded_traversal",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "causality_dag.py"
+            ),
+            description=(
+                "Slice 3 subgraph() MUST accept a max_depth "
+                "parameter — bounded BFS traversal contract; without "
+                "this bound a pathological DAG could OOM or hang the "
+                "navigation surface. AST-pinned so future refactors "
+                "cannot silently drop the bound."
+            ),
+            validate=_validate_causality_dag_bounded_traversal,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="dag_navigation_no_ctx_mutation",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "dag_navigation.py"
+            ),
+            description=(
+                "Slice 4 navigation surface MUST NOT call ctx "
+                "mutation methods (ctx.advance / ctx.with_* / "
+                "ctx.replace) — read-only contract enforced at "
+                "AST-walk time. Future patches cannot silently "
+                "introduce a mutation surface via the DAG view."
+            ),
+            validate=_validate_dag_navigation_no_ctx_mutation,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="dag_replay_cost_contract_preserved",
+            target_file=(
+                "scripts/ouroboros_battle_test.py"
+            ),
+            description=(
+                "Slice 5 --rerun-from MUST go through the existing "
+                "orchestrator entry point (no shortcut bypass of the "
+                "§26.6 four-layer cost contract). Bytes-pinned: the "
+                "replay path references prepare_replay_from_record + "
+                "apply_replay_from_record_env, requires --rerun for "
+                "session identity, and contains zero direct provider "
+                "construction tokens."
+            ),
+            validate=_validate_dag_replay_cost_contract_preserved,
         ),
     )
 

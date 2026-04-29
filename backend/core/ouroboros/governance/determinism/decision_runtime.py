@@ -106,15 +106,15 @@ def ledger_enabled() -> bool:
 
 
 def causality_dag_schema_enabled() -> bool:
-    """``JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED`` (default ``false`` —
-    Priority 2 Slice 1; flips to ``true`` in Slice 6 graduation).
+    """``JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED`` (default ``true`` —
+    graduated in Priority 2 Slice 6).
 
     Master flag governing whether ``DecisionRecord``'s lineage
     fields (``parent_record_ids`` + ``counterfactual_of``) are
-    EMITTED at write time. When off, the ``record()`` path forces
-    these fields to empty/None regardless of caller-supplied input —
-    the JSONL output is byte-for-byte identical to pre-Slice-1
-    ledgers.
+    EMITTED at write time. When off (hot-revert), the ``record()``
+    path forces these fields to empty/None regardless of caller-
+    supplied input — the JSONL output is byte-for-byte identical
+    to pre-Slice-1 ledgers.
 
     The READ path (``DecisionRecord.from_dict``) is ALWAYS tolerant
     of the new fields (parses them when present, defaults when
@@ -122,52 +122,51 @@ def causality_dag_schema_enabled() -> bool:
     dataclass defaults handle backward-compat without needing to
     consult the flag.
 
-    Asymmetric env semantics — empty/whitespace = current default
-    false; explicit truthy enables; explicit falsy disables."""
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy hot-reverts."""
     raw = os.environ.get(
         "JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 1 default
+        return True  # graduated default (Slice 6 — was false in Slice 1)
     return raw in ("1", "true", "yes", "on")
 
 
 def per_worker_ordinals_enabled() -> bool:
-    """``JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED`` (default ``false``
-    — Priority 2 Slice 2; flips to ``true`` in Slice 6 graduation).
+    """``JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED`` (default ``true``
+    — graduated in Priority 2 Slice 6).
 
     Master flag governing whether the per-worker ordinal namespace
-    is computed + emitted at write time. When off, the legacy
-    ``_ordinals: Dict[(op_id, phase, kind), int]`` is the sole
-    source of truth and the new ``worker_id`` / ``sub_ordinal``
-    fields stay at sentinels (empty + -1) — the JSONL output is
-    byte-for-byte identical to pre-Slice-2 ledgers.
+    is computed + emitted at write time. When off (hot-revert), the
+    legacy ``_ordinals: Dict[(op_id, phase, kind), int]`` is the
+    sole source of truth and the new ``worker_id`` / ``sub_ordinal``
+    fields stay at sentinels (empty + -1).
 
-    When on (shadow mode): the per-worker dict is populated in
-    parallel and the new fields ARE emitted. Replay still uses the
-    legacy ordinal until the enforce sub-flag flips.
+    When on (graduated): the per-worker dict is populated in
+    parallel and the new fields ARE emitted. Replay uses the
+    per-worker namespace when the enforce sub-flag is also on.
 
-    Asymmetric env semantics — empty/whitespace = current default
-    false; explicit truthy enables; explicit falsy disables."""
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy hot-reverts."""
     raw = os.environ.get(
         "JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 2 default
+        return True  # graduated default (Slice 6 — was false in Slice 2)
     return raw in ("1", "true", "yes", "on")
 
 
 def per_worker_ordinals_enforce() -> bool:
-    """``JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE`` (default ``false``
-    — Priority 2 Slice 2; flips to ``true`` in Slice 6 graduation).
+    """``JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE`` (default ``true``
+    — graduated in Priority 2 Slice 6; was shadow-only in Slice 2).
 
     Sub-flag governing whether the per-worker namespace is
-    AUTHORITATIVE for replay. When off (shadow mode), Slice 2 is
-    purely additive — the runtime tracks both old + new ordinal
-    keys but legacy lookup paths still use the legacy key. When on
-    (graduated), replay uses ``(worker_id, op_id, phase, kind)`` as
-    the canonical lookup key. Mirrors the Slice 5 Arc B + Priority
-    1 Slice 2 shadow→enforce pattern.
+    AUTHORITATIVE for replay. When on (graduated), replay uses
+    ``(worker_id, op_id, phase, kind)`` as the canonical lookup
+    key. When off (hot-revert), Slice 2 reverts to additive shadow
+    mode — the runtime tracks both old + new ordinal keys but
+    legacy lookup paths still use the legacy key. Mirrors the
+    Priority 1 Slice 5 enforce-flip pattern.
 
     Always paired with the master flag — both must be on for the
     enforce path to engage. When master is off, this flag is
@@ -176,7 +175,7 @@ def per_worker_ordinals_enforce() -> bool:
         "JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 2 default — shadow mode
+        return True  # graduated default (Slice 6 — was shadow in Slice 2)
     return raw in ("1", "true", "yes", "on")
 
 

@@ -1186,25 +1186,84 @@ SEED_SPECS: list = [
     ),
 
     # ====================================================================
-    # Priority 2 — Causality DAG + Deterministic Replay — 7 flags
-    # Slices 3–6.  Operator directive 2026-04-29.
+    # Priority 2 — Causality DAG + Deterministic Replay — 9 flags
+    # Slices 1–6 graduated default-true 2026-04-29 (Slice 6).
+    # Cost contract preservation pinned by 4 shipped_code_invariants
+    # seeds (causality_dag_no_authority_imports, causality_dag_
+    # bounded_traversal, dag_navigation_no_ctx_mutation,
+    # dag_replay_cost_contract_preserved).
     # ====================================================================
     FlagSpec(
-        name="JARVIS_CAUSALITY_DAG_QUERY_ENABLED",
-        type=FlagType.BOOL, default=False,
+        name="JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED",
+        type=FlagType.BOOL, default=True,
         description=(
-            "Master gate for DAG construction from the JSONL "
-            "decisions ledger. When false, build_dag returns an "
-            "empty CausalityDAG. Default false until Slice 6 "
-            "graduation."
+            "Slice 1 — gates emission of DecisionRecord lineage "
+            "fields (parent_record_ids + counterfactual_of) at "
+            "write time. When off (hot-revert), record() forces "
+            "these to empty/None and the JSONL output is byte-for-"
+            "byte identical to pre-Slice-1 ledgers. The READ path "
+            "is always tolerant via dataclass defaults."
         ),
-        category=Category.EXPERIMENTAL,
+        category=Category.OBSERVABILITY,
+        source_file=(
+            "backend/core/ouroboros/governance/determinism/"
+            "decision_runtime.py"
+        ),
+        example="true",
+        since="Priority 2 Slice 6 graduation",
+    ),
+    FlagSpec(
+        name="JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 2 master — gates per-worker ordinal namespace "
+            "computation + emission. Fixes L3 fan-out determinism "
+            "(W3(6) known debt). When off, the legacy per-(op_id, "
+            "phase, kind) ordinal counter is the sole source of "
+            "truth and worker_id/sub_ordinal stay at sentinels."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/determinism/"
+            "decision_runtime.py"
+        ),
+        example="true",
+        since="Priority 2 Slice 6 graduation",
+    ),
+    FlagSpec(
+        name="JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 2 enforce sub-flag — gates whether per-worker "
+            "namespace is AUTHORITATIVE for replay. When off "
+            "(hot-revert to shadow), runtime tracks both old + new "
+            "ordinal keys but legacy lookup still uses the legacy "
+            "key. Mirrors the Priority 1 Slice 5 enforce-flip pattern."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/determinism/"
+            "decision_runtime.py"
+        ),
+        example="true",
+        since="Priority 2 Slice 6 graduation",
+    ),
+    FlagSpec(
+        name="JARVIS_CAUSALITY_DAG_QUERY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 3 master gate for DAG construction from the JSONL "
+            "decisions ledger. When false (hot-revert), build_dag "
+            "returns an empty CausalityDAG immediately — no file I/O, "
+            "no parsing. Graduated default-true 2026-04-29."
+        ),
+        category=Category.OBSERVABILITY,
         source_file=(
             "backend/core/ouroboros/governance/verification/"
             "causality_dag.py"
         ),
-        example="false",
-        since="Priority 2 Slice 3",
+        example="true",
+        since="Priority 2 Slice 6 graduation",
     ),
     FlagSpec(
         name="JARVIS_DAG_MAX_RECORDS",
@@ -1254,35 +1313,42 @@ SEED_SPECS: list = [
     ),
     FlagSpec(
         name="JARVIS_DAG_NAVIGATION_ENABLED",
-        type=FlagType.BOOL, default=False,
+        type=FlagType.BOOL, default=True,
         description=(
-            "Master gate for DAG navigation surfaces (REPL, "
-            "GET, SSE). Sub-flags control individual channels. "
-            "Default false until Slice 6 graduation."
+            "Slice 4 master — gates DAG navigation surfaces "
+            "(REPL `/postmortems dag` family, IDE GET endpoints, "
+            "SSE dag_fork_detected event). Three independent "
+            "sub-flags govern individual channels (REPL/GET/SSE) "
+            "and default 'on when master is on'. Hot-revert: "
+            "explicit false."
         ),
-        category=Category.EXPERIMENTAL,
+        category=Category.OBSERVABILITY,
         source_file=(
             "backend/core/ouroboros/governance/verification/"
             "dag_navigation.py"
         ),
-        example="false",
-        since="Priority 2 Slice 4",
+        example="true",
+        since="Priority 2 Slice 6 graduation",
     ),
     FlagSpec(
         name="JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED",
-        type=FlagType.BOOL, default=False,
+        type=FlagType.BOOL, default=True,
         description=(
-            "Gate for --rerun-from record-level fork replay. "
-            "When false, the CLI arg is accepted but returns a "
-            "structured failure. Default false until Slice 6."
+            "Slice 5 gate for --rerun-from record-level fork "
+            "replay. Cost contract preservation is structural — "
+            "the replay path goes through the existing orchestrator "
+            "entry point (no shortcut bypass of the §26.6 four-"
+            "layer defense), pinned by the dag_replay_cost_contract"
+            "_preserved shipped_code_invariants seed."
         ),
-        category=Category.EXPERIMENTAL,
+        category=Category.SAFETY,
         source_file=(
             "backend/core/ouroboros/governance/verification/"
             "replay_from_record.py"
         ),
-        example="false",
-        since="Priority 2 Slice 5",
+        example="true",
+        since="Priority 2 Slice 6 graduation",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
     ),
 ]
 

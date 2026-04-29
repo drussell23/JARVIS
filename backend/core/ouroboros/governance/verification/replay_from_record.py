@@ -74,12 +74,21 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 def replay_from_record_enabled() -> bool:
     """``JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED`` (default
-    ``false`` — Slice 5; flips ``true`` in Slice 6 graduation)."""
+    ``true`` — graduated in Priority 2 Slice 6).
+
+    Master flag governing whether ``--rerun-from <record-id>``
+    activates the record-level fork primitive. When off
+    (hot-revert), the CLI flag is structurally inert. Cost contract
+    preservation is structural — the replay path goes through the
+    existing orchestrator entry point (no shortcut bypass of the
+    §26.6 four-layer defense), pinned by the
+    ``dag_replay_cost_contract_preserved`` shipped_code_invariants
+    seed."""
     raw = os.environ.get(
         "JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated default (Slice 6 — was false in Slice 5)
     return raw in _TRUTHY
 
 

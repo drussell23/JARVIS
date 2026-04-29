@@ -87,22 +87,22 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def dag_query_enabled() -> bool:
-    """``JARVIS_CAUSALITY_DAG_QUERY_ENABLED`` (default ``false`` —
-    Priority 2 Slice 3; flips to ``true`` in Slice 6 graduation).
+    """``JARVIS_CAUSALITY_DAG_QUERY_ENABLED`` (default ``true`` —
+    graduated in Priority 2 Slice 6).
 
     Master flag governing whether ``build_dag()`` performs I/O to
-    read the ledger.  When off, ``build_dag()`` returns an empty
-    ``CausalityDAG`` immediately — no file open, no parsing.
+    read the ledger.  When off (hot-revert), ``build_dag()`` returns
+    an empty ``CausalityDAG`` immediately — no file open, no parsing.
 
     Hot-revert path: ``export JARVIS_CAUSALITY_DAG_QUERY_ENABLED=false``.
 
-    Asymmetric env semantics — empty/whitespace = current default
-    false; explicit truthy enables; explicit falsy disables."""
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy hot-reverts."""
     raw = os.environ.get(
         "JARVIS_CAUSALITY_DAG_QUERY_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 3 default
+        return True  # graduated default (Slice 6 — was false in Slice 3)
     return raw in _TRUTHY
 
 

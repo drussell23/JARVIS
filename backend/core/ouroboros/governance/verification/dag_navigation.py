@@ -52,13 +52,19 @@ _MAX_RENDER_BYTES = 16 * 1024
 
 
 def dag_navigation_enabled() -> bool:
-    """``JARVIS_DAG_NAVIGATION_ENABLED`` (default ``false`` — Slice 4;
-    flips ``true`` in Slice 6 graduation)."""
+    """``JARVIS_DAG_NAVIGATION_ENABLED`` (default ``true`` —
+    graduated in Priority 2 Slice 6).
+
+    Master flag governing whether the DAG navigation surfaces (REPL
+    `/postmortems dag` subcommands, IDE GET endpoints, SSE
+    dag_fork_detected event) are active. Three independent
+    sub-flags govern each surface; all default to "on when master
+    is on". Hot-revert: explicit false."""
     raw = os.environ.get(
         "JARVIS_DAG_NAVIGATION_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 4 default
+        return True  # graduated default (Slice 6 — was false in Slice 4)
     return raw in _TRUTHY
 
 
