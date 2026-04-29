@@ -1,10 +1,11 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.0 (2026-04-25)
+**Version**: 2.1 (2026-04-29 — post-Phase-2-graduation + soak #3 production verification)
 **Author**: Derek J. Russell (vision) · Claude Opus 4.7 (PRD synthesis)
 **Audience**: Operator (decision authority), JARVIS engineers, future-self (resuming after context loss)
 **Prerequisite reading**: `CLAUDE.md` (architecture), `docs/architecture/OUROBOROS.md` (battle-test breakthrough log), `docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md` (Wang RSI mathematical foundation)
+**Latest review**: §25 (v4, 2026-04-29) — supersedes §24 critical-path priorities
 
 ---
 
@@ -51,7 +52,7 @@
     - [23.10 Pass A → Pass B → Pass C — the Three-Pass Sequence](#2310-pass-a--pass-b--pass-c--the-three-pass-sequence)
     - [23.11 Operator Decisions Ratified 2026-04-26](#2311-operator-decisions-ratified-2026-04-26)
     - [23.12 Implementation Discipline + Cross-References](#2312-implementation-discipline--cross-references)
-24. [Brutal Architectural Review v3 — Convergence-Phase (2026-04-28)](#24-brutal-architectural-review-v3--convergence-phase-2026-04-28)
+24. [Brutal Architectural Review v3 — Convergence-Phase (2026-04-28)](#24-brutal-architectural-review-v3--convergence-phase-2026-04-28) *(superseded in part by §25)*
     - [24.1 Context & Scope of Review](#241-context--scope-of-review)
     - [24.2 Capability Matrix — current vs A-level sovereign developer](#242-capability-matrix--current-vs-a-level-sovereign-developer)
     - [24.3 Cognitive & Epistemic Delta — what CC paradigms O+V lacks](#243-cognitive--epistemic-delta--what-cc-paradigms-ov-lacks)
@@ -60,10 +61,20 @@
     - [24.6 Systemic Fragility — race conditions in async phase-runners](#246-systemic-fragility--race-conditions-in-async-phase-runners)
     - [24.7 Cascading state-failure vectors over long horizons](#247-cascading-state-failure-vectors-over-long-horizons)
     - [24.8 Antivenom bypass vectors — Quine-class hallucinations](#248-antivenom-bypass-vectors--quine-class-hallucinations)
-    - [24.9 Letter grade — B+ trending A-, defended](#249-letter-grade--b-trending-a-defended)
-    - [24.10 Critical Path to A-Level RSI — top 3 systemic upgrades](#2410-critical-path-to-a-level-rsi--top-3-systemic-upgrades)
+    - [24.9 Letter grade — B+ trending A-, defended](#249-letter-grade--b-trending-a-defended) *(superseded by §25.4 — current grade B-)*
+    - [24.10 Critical Path to A-Level RSI — top 3 systemic upgrades](#2410-critical-path-to-a-level-rsi--top-3-systemic-upgrades) *(superseded by §25.5 — top 5 priorities)*
     - [24.11 In-flight alignment — Phase 12 / 12.2 maps to the critical path](#2411-in-flight-alignment--phase-12--122-maps-to-the-critical-path)
     - [24.12 What this review explicitly does NOT prescribe](#2412-what-this-review-explicitly-does-not-prescribe)
+25. [Brutal Architectural Review v4 — Post-Phase-2-Production-Verification (2026-04-29)](#25-brutal-architectural-review-v4--post-phase-2-production-verification-2026-04-29) *(latest)*
+    - [25.1 What soak #3 actually proved (and didn't)](#251-what-soak-3-actually-proved-and-didnt)
+    - [25.2 The Cognitive & Epistemic Delta — refined post-Phase-2](#252-the-cognitive--epistemic-delta--refined-post-phase-2)
+    - [25.3 Deep Observability — Temporal surface refined](#253-deep-observability--temporal-surface-refined)
+    - [25.4 Brutal grade — current state: **B-**](#254-brutal-grade--current-state-b-)
+    - [25.5 Critical Path to A-Level RSI — top 5 systemic upgrades](#255-critical-path-to-a-level-rsi--top-5-systemic-upgrades)
+    - [25.6 In-flight alignment — what's on main right now that helps](#256-in-flight-alignment--whats-on-main-right-now-that-helps)
+    - [25.7 Reverse Russian Doll alignment](#257-reverse-russian-doll-alignment)
+    - [25.8 What this review explicitly does NOT prescribe](#258-what-this-review-explicitly-does-not-prescribe)
+    - [25.9 Summary](#259-summary)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -75,31 +86,33 @@
 
 Ouroboros + Venom (O+V) is the autonomous self-development governance engine of JARVIS. It is the **proactive autonomous opposite of Claude Code (CC)** — where CC requires a human to ask, O+V should observe, hypothesize, propose, validate, and ship without prompting (with human-in-loop escalation only when context warrants it).
 
-### Where we stand (2026-04-26 — post-Pass-C-structural-completion)
+### Where we stand (2026-04-29 — post-Phase-2-production-verification)
 
-- **Architecture**: A− — sophisticated, composable, observability-rich, financial-circuit-breaker-protected. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all compose correctly. **Order-2 governance cage shipped (Pass B closed 2026-04-26)** — O+V can now safely propose changes to its own cognitive substrate (FSM, immune-system gates) under operator-only authorization with locked-true `amendment_requires_operator()` invariant. **Pass C Adaptive Anti-Venom STRUCTURALLY COMPLETE 2026-04-26 (all 6 slices landed same day)** — substrate + 5 adaptive surfaces + MetaAdaptationGovernor REPL all enforcing the monotonic-tightening invariant (would-loosen proposals are NOT persisted).
-- **Cognitive depth**: B — sensors fire on hardcoded conditions BUT 3 deferred-follow-up wirings landed 2026-04-26 closing the "shipped & dormant" gap: AdversarialReviewer auto-invokes per-op (P5), MetricsSessionObserver fires per session-end (P4), `/chat` REPL has 3 concrete executors against backlog/subagent-queue/Claude (P2). Cross-session feedback loops live: PostmortemRecall (P0), DirectionInferrer arc-context (P0.5), SelfGoalFormation (P1), Hypothesis pairing (P1.5), CognitiveMetrics (P3), MetricsSuite (P4). **Adaptive immune system substrate complete; activation gap is the next critical-path item** (see §3.6).
-- **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); Wave 3 architecturally complete (W3(7) graduated, W3(6) closed-pending-external-API-stability per operator binding 2026-04-25). **Pass B graduation soak in flight**: agent-conducted twice-daily cadence (`trig_012EvEDkABy2u5PSSs3xK5C4`).
-- **RSI scaffolding**: 6 Wang modules verified (Phase 0 audit, 2026-04-25); 4 wired into live FSM via Phase 4 P3+P4 graduation (2026-04-26). 2 stranded modules (oracle_prescorer + vindication_reflector) un-stranded via `cognitive_metrics.py` wrapper. Wang's composite_score + 5 net-new operator metrics now surfaced via summary.json + `/metrics` REPL + IDE GET + SSE event by default.
+- **Architecture**: A− — sophisticated, composable, observability-rich, financial-circuit-breaker-protected. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all compose correctly. **Order-2 governance cage shipped (Pass B closed 2026-04-26)** + **Pass C Adaptive Anti-Venom structurally complete (2026-04-26)** + **Phase 1 Determinism Substrate graduated (`memory/project_phase_1_closure.md`, 2026-04-28)** + **Phase 12.2 Physics-Aware Topology Routing closed (`memory/project_phase_12_2_closure.md`, 2026-04-28)** + **Phase 2 Closed-Loop Self-Verification graduated (`dc5f77017f`, 2026-04-29)** + **Slices 3a + 3c topology self-healing + sensor backpressure (`a641ca2da3`, 2026-04-29)** + **Option E Universal Terminal Postmortem — survivor bias closed (`85cf94810a`, 2026-04-29; Antigravity-drafted, agent-verified)**.
+- **Cognitive depth**: B − the verification loop is *structurally* live but *functionally hollow*. Soak #3 (2026-04-29) produced **120 `terminal_postmortem` records** at `.jarvis/determinism/default/decisions.jsonl` with three distinct dynamic terminal contexts captured (`postmortem`, `background_accepted:...`, `noop`) — proving the Reverse Russian Doll outer shell (Slice 1.3 → Slice 2.4 → Option E) compresses cleanly through one substrate. **But every postmortem has `total_claims=0`** because PLAN was skipped on every op (`Skipping plan: trivial_op`). The organism remembers every death without memory of any prediction. See §25 for the full review.
+- **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); 3 soaks today (2026-04-29) — soak #1 (0 ops past CLASSIFY), soak #2 (5 ops past CLASSIFY, $0.166 Claude spend, 0 postmortems), soak #3 (5 ops past CLASSIFY, 120 postmortem records harvested). Wave 3 architecturally complete (W3(7) graduated, W3(6) closed-pending-external-API-stability per operator binding 2026-04-25).
+- **RSI scaffolding**: 6 Wang modules verified (Phase 0 audit, 2026-04-25); 4 wired into live FSM. **RSI Gear 1 (Determinism)**: DONE per Phase 1 closure. **RSI Gear 2 (Bounded Curiosity)**: primitives shipped (W2(4) Curiosity, RepeatRunner Bayesian aggregator) but not yet load-bearing in dispatch. **RSI Gear 3 (Closed-Loop Memory)**: scaffolding live (Phase 2 + Option E), signal hollow until §25.5.1 Priority A (mandatory claim density) ships.
 
-### Grade summary table (current vs A-level target)
+### Grade summary table (current vs A-level target — refreshed 2026-04-29 post-soak-3)
 
 Color legend: 🟢 = at target / done · 🟡 = in progress / partial · 🔴 = not at target / critical gap.
 
 | Dimension | Current | A-Level Target | Gap to close |
 |---|---|---|---|
-| **Architecture** | 🟢 A− | A | Sandbox hardening (§3.6 vector 1) + activation pipeline shipped |
-| **Cognitive depth** | 🟡 B | A | Activation pipeline + bounded hypothesis-probe loop |
-| **Production track record** | 🔴 C+ | A | New multi-file APPLY landmarks (only 1 verified, 2026-04-15) |
-| **RSI scaffolding** | 🟡 B+ | A | Pass C surfaces actually consumed by gates (not theater) |
-| **Operator UX vs CC** | 🟢 A− | A | Per-action permission granularity + interleaved reasoning visibility |
-| **Self-tightening immunity** | 🟡 B | A | Activation pipeline (Pass C theater → real); mining-source wiring |
-| **Sandbox safety boundary** | 🔴 C | A− | Object-graph escape vector documented OR hardened (§3.6 vector 1) |
-| **Cross-process safety** | 🟡 B− | A | Advisory file-locking on AdaptationLedger writes (§3.6 vector 3) |
-| **Long-horizon semantic stability** | 🔴 C+ | A | Stale-pattern sunset signal (§3.6 vector 4) |
-| **Net overall grade vs "95%+ sovereign autonomous developer"** | 🔴 **B−** | A | See §3.6 critical path |
+| **Architecture** | 🟢 A− | A | Memory core (Slice 1.3 Merkle DAG) production-verified 2026-04-29 |
+| **Cognitive depth** | 🟡 B | A | §25.5 Priority A (mandatory claim density) — every postmortem currently has `total_claims=0` |
+| **Production track record** | 🔴 C+ | A | 0 ops reached COMPLETE in any of today's three soaks; 1 verified multi-file APPLY (2026-04-15) |
+| **RSI Gear 1 — Determinism** | 🟢 A | A | Phase 1 closed 2026-04-28; soak #3 confirms Merkle DAG holds in production |
+| **RSI Gear 2 — Bounded Curiosity** | 🔴 C | A | §25.5.3 Priority C (HypothesisProbe primitive) not yet built |
+| **RSI Gear 3 — Closed-Loop Memory** | 🟡 B− | A | Scaffolding live (120 records); signal hollow (every record `total_claims=0`) — §25.5.1 Priority A blocks |
+| **Operator UX vs CC** | 🟢 A− | A | Ledger discoverability gap — `.jarvis/determinism/default/decisions.jsonl` has no `/postmortems` REPL or GET (§25.5.4 Priority D) |
+| **Self-tightening immunity** | 🟡 B | A | §25.5.2 Priority B (degenerate-loop alarm) — system did not self-detect 3 concurrent silent failures today |
+| **Sandbox safety boundary** | 🔴 C | A− | Object-graph escape vector documented (§3.6 vector 1); plus today: PLAN-skip-by-trivialization bypass (§25.5.5 Priority E) |
+| **Cross-process safety** | 🟡 B− | A | Advisory file-locking on AdaptationLedger writes (§3.6 vector 3) + Slice 1.3 ordinal-counter under L3 fan-out (§25.4) |
+| **Long-horizon semantic stability** | 🔴 C+ | A | TrajectoryAuditor still missing (§24.8.2); Antivenom is per-op not per-trajectory |
+| **Net overall grade vs "95%+ sovereign autonomous developer"** | 🔴 **B−** | A | See §25.5 critical path (5 priorities, sequenced) |
 
-**The gap is honest.** O+V has A-level architecture and A-level vision. Execution sits at B− because (a) Pass C is structurally complete but not yet activated in any actual gate, (b) sandbox has a documented-here-for-the-first-time object-graph escape vector, (c) only 1 verified multi-file APPLY landmark.
+**The gap is honest, refreshed against today's evidence.** O+V has A-level architecture and A-level vision. Execution sits at B− because (a) Phase 2 is graduated default-true and doing zero verification work — every postmortem captured today has `total_claims=0`, (b) the system did not self-detect THREE concurrent silent failures during today's soaks (PLAN-skip nuking claim path, wall-clock-cap regression, Slice 3c dormant), (c) zero ops reached COMPLETE in any of today's three soaks. Today moved us from "B+ trending A- on architectural composition" (§24.9) to "B- on production behavior" (§25.4) — the demotion captures the honest gap between scaffolding and signal.
 
 ### Where we're going
 
@@ -1703,18 +1716,17 @@ When all 5 of the §5.4 conditions land simultaneously, O+V is MVP-RSI.
 
 ## 16. Open Questions for Operator Decision
 
-Before Phase 1 implementation begins:
+> **Status (refreshed 2026-04-29)**: most of the original Phase-1-pre-implementation questions are now resolved by what shipped (Phases 0-5 graduated 2026-04-26; Phase 1 Determinism Substrate closed 2026-04-28; Phase 2 graduated 2026-04-29). Historical questions removed; only live decisions retained.
 
-1. **Postmortem time-decay window**: 30 days, 60 days, or session-count-based? *(Recommend: 30 days, env-tunable)*
-2. **Self-formation cost cap per session**: $0.10 (proposed) or higher? *(Recommend: $0.10 to start; widen after HypothesisLedger validation rate ≥ 40%)*
-3. **Conversational mode default**: opt-in env (proposed) or default-on for interactive sessions? *(Recommend: opt-in for graduation cadence; default-on after operator UX testing)*
-4. **Adversarial reviewer model**: same as primary (Claude) or distinct (cheaper Sonnet, distinct provider)? *(Recommend: cheaper Sonnet — adversarial role doesn't need top-tier reasoning)*
-5. **Self-narrative cadence**: weekly (proposed), bi-weekly, or per-N-commits? *(Recommend: weekly fixed cadence + on-demand operator trigger)*
-6. **Phase 4 metrics destination**: SQLite, JSONL, or Parquet? *(Recommend: JSONL — matches existing observability pattern; SQLite for query layer in P6 if needed)*
-7. **Wang RSI implementation status verification**: do we audit `RSI_CONVERGENCE_FRAMEWORK.md`'s 6 modules before Phase 1 starts? *(Recommend: yes, 1-day audit + verify-vs-code as Phase 0)*
-8. **Phase 4 composite score weights**: pytest 40% / coverage 20% / complexity 15% / lint 10% / semantic-drift 15% as proposed? *(Recommend: yes, env-locked initially; revisit if convergence_state shows OSCILLATING)*
+**Active decisions for §25 critical-path execution**:
 
-Each question has a recommended default. Operator can override.
+1. **§25.5.1 Priority A — default mandatory-claim set**: should the three default `must_hold` claims (file-parses-after-change / test-set-hash-stable / no-new-credential-shapes) ship as Order-2 governance objects (manifest-listed, operator-amend-only) or as plain code-defined defaults? *(Recommend: Order-2 governance — preserves the "amendment requires operator" invariant from Pass B Slice 6.2)*
+2. **§25.5.2 Priority B — MetaSensor threshold**: 70% empty-postmortem rate over last 100 ops (proposed) or stricter (50% over last 50)? *(Recommend: start at 70%/100 with env-tunable; tighten after one clean week of data)*
+3. **§25.5.3 Priority C — HypothesisProbe budget**: $0.05/probe + $0.15/tree (per §24.4 spec) or higher caps for high-stakes claims? *(Recommend: $0.05/$0.15 default; PRIORITY-CLAIM tier with $0.20/$0.60 for `must_hold` failures only)*
+4. **§25.5.4 Priority D — postmortem GET endpoint location**: under `/observability/postmortems` (peer to current GETs) or under `/observability/determinism/postmortems` (subordinated to determinism ledger)? *(Recommend: `/observability/postmortems` — operators reach for "postmortems" not "determinism" when debugging)*
+5. **PLAN-skip refactor scope (§25.5.5 Priority E)**: refactor only `plan_runner.py` to call `_capture_default_claims` on all exit paths, OR refactor PlanGenerator's trivial-op classifier to return claims even when skipping the LLM-reasoned plan? *(Recommend: both — make claim capture unconditional at runner level + make trivial-op classifier produce default claims)*
+
+Historical pre-Phase-1 decisions (now resolved by what shipped): postmortem time-decay window (30 days, env-tunable, shipped), self-formation cost cap ($0.10/session, shipped), conversational mode default (graduated 2026-04-26 default-true), adversarial reviewer model (Sonnet variant per Phase 5 graduation), Wang RSI audit (Phase 0 closed 2026-04-25), composite score weights (env-locked, shipped via Phase 4 P4 Slice 5).
 
 ---
 
@@ -2144,6 +2156,8 @@ The Pass A reconciliation surfaced three open operator decisions. All three were
 
 ## 24. Brutal Architectural Review v3 — Convergence-Phase (2026-04-28)
 
+> **⚠️ Status: superseded in part by §25 (review v4, 2026-04-29).** v3's three Critical-Path priorities (§24.10) have moved: Priority 1 (Determinism Substrate) closed 2026-04-28; Priority 2 (Closed-Loop Self-Verification) graduated 2026-04-29 *structurally only* — see §25.1 for why "structural" ≠ "functional"; Priority 3 (Bounded Curiosity) restated as §25.5.3 Priority C with refined contract. v3's general analysis (§24.1–24.9) remains canonical for race-condition + bypass-vector enumeration. Read §25 for the post-Phase-2-graduation refinement.
+
 **Trigger**: operator architectural review request 2026-04-28 ("convergence phase of O+V — autonomic nervous system and continuous developer of the Trinity Ecosystem").
 **Predecessor reviews**: §3.6 (v1, 2026-04-26), §3.6.6 (v2, 2026-04-27 post-Phase-8).
 **Frame**: Reverse Russian Doll Method (§23) + the operator's explicit constraint that Anti-Venom MUST scale proportionally with the outer shell as O+V expands it.
@@ -2518,6 +2532,273 @@ A model that, during a Venom tool loop, writes a tool result that includes a pro
 - **More flag knobs**: the FlagRegistry (Wave 1 #2) tracks 481+ flags; the cost of a new flag is now near-free, but the cost of *operator confusion about what flags compose* is super-linear. New systemic upgrades should reduce flag count, not increase it.
 
 The discipline this review imposes: **before writing a feature, prove the feature closes one of the three critical-path priorities**. Anything else is shape-fragmentation.
+
+---
+
+## 25. Brutal Architectural Review v4 — Post-Phase-2-Production-Verification (2026-04-29)
+
+**Trigger**: operator architectural review request 2026-04-29, immediately following soak #3 — the first session where the Phase 2 (Closed-Loop Self-Verification) memory scaffolding produced verifiable production output.
+**Predecessor reviews**: §3.6 (v1, 2026-04-26), §3.6.6 (v2, 2026-04-27), §24 (v3, 2026-04-28).
+**Frame**: same Reverse Russian Doll constraint — Anti-Venom must scale proportionally with the outer shell as O+V expands it.
+**Honesty contract**: edge cases not happy path; today's soak revealed THREE concurrent silent failures and the system did not self-detect any of them.
+
+### 25.1 What soak #3 actually proved (and didn't)
+
+Three soaks were run today (2026-04-29) to exercise the freshly-graduated Phase 2 (`dc5f77017f`) plus Slices 3a + 3c (`a641ca2da3`) plus Antigravity's Option E Universal Terminal Postmortem (`85cf94810a`):
+
+| Soak | Duration | Ops attempted | Ops past CLASSIFY | $ spent | Postmortem records |
+|---|---|---|---|---|---|
+| #1 | 23 min | 11 | 0 | $0 | 0 |
+| #2 | 18 min | 14 | 5 (GENERATE) | $0.166 (Claude) | 0 |
+| #3 | 65 min | 11 (40 unique with prior-session ops) | 5 (GENERATE) | $0.032 (Claude) | **120** |
+
+**Proven by soak #3**: the *memory scaffolding* works. 120 `terminal_postmortem` records written via Slice 1.3's `capture_phase_decision` (Merkle DAG hook) at `.jarvis/determinism/default/decisions.jsonl`. Three distinct terminal contexts dynamically captured: `postmortem` (112×), `background_accepted:background_dw_blocked_by_topology:...` (7×), `noop` (1×). Every record carries `inputs_hash` (SHA-256), `record_id`, `ordinal`, `phase`, `wall_ts`, `monotonic_ts`. The Reverse Russian Doll outer shell (Slice 1.3 → Slice 2.4 → Option E) compresses cleanly through one substrate.
+
+**Not proven**: the *verification loop closes meaningfully*. **Every single one of the 120 postmortems has `total_claims=0`.** The organism remembers every death but has zero pre-recorded predictions to compare those deaths against. The Slice 2.3 claim-capture path runs at PLAN, but **PLAN was skipped on every single op** (`Skipping plan for op... trivial_op: 1 file(s), short description`). So Phase 2's "closed-loop self-verification" is currently a closed loop with no signal in it.
+
+**The B- defense, restated against today's evidence**:
+
+- An A grade requires the loop to close meaningfully on >80% of production ops, the system to self-detect degenerate states, and the Antivenom to be *provably* sound. Soak #3 demonstrated none of these.
+- A B grade is "solid scaffolding, demonstrably runs in production" — we have that.
+- The B- penalty: **three concurrent silent failures the system did not self-detect today**:
+  1. PLAN-skip on trivial ops zeroes the claim path. Every `total_claims=0` postmortem is the system saying "I have nothing to verify" — and nothing escalates this.
+  2. Wall-clock cap regression: soak #3 ran 65 min despite `--max-wall-seconds 2400` (40 min). `last_activity_ts` keeps resetting on op activity, so the harness re-enters the activity-window unboundedly.
+  3. Slices 3a + 3c are dormant in production. TopologySentinel master flag is opt-in (`JARVIS_TOPOLOGY_SENTINEL_ENABLED=false` default), so the slice 3c backpressure machinery was inert. The block in production is `dw_catalog_classifier` (Phase 12), a different layer 3a/3c don't read.
+
+Each is a single-line fix away from being a serious incident. The system has the SCAFFOLDING for self-verification but not yet the SELF-AWARENESS to detect "all my postmortems are empty, therefore I'm not learning."
+
+### 25.2 The Cognitive & Epistemic Delta — refined post-Phase-2
+
+CC's edge isn't its tools — O+V already has Venom with 16 built-in tools, MCP forwarding, exploration ledger, and live context auto-compaction. CC's edge is **structural epistemic discipline**:
+
+| CC paradigm | O+V state | Honest gap |
+|---|---|---|
+| Hypothesis-test loop (form claim → grep/read to falsify → escalate) | Tool-loop + exploration floor exist; no first-class `hypothesize()` primitive | Iron Gate counts tool calls; doesn't measure whether they actually probed the uncertainty |
+| Plan-mode-as-contract (`ExitPlanMode` makes the model commit before generation) | PlanGenerator emits a plan but skips it on trivial ops | The exact silent-disable pattern that nuked Slice 2.3 today |
+| Sub-agent isolation as a thinking move | dispatch_subagent shipped as a tool, not as a thinking move the orchestrator selects when ambiguity is high | Subagents are mutation-cage isolated, not cognitive-loop isolated (per §24.3.1) |
+| TodoWrite — explicit task state visible to operator | TaskBoard exists as per-op scratchpad | Session-level visibility absent (per §24.3.5) |
+| ScheduleWakeup — self-paced work | Special-purpose `dw_discovery_runner` refresh task only | No general "revisit op-X's hypothesis in N seconds" primitive (per §24.3.3) |
+
+The §24.4 `HypothesisProbe` primitive remains the most-load-bearing missing piece. Today's soak emphasizes a NEW gap: **structural epistemic discipline at the PLAN boundary**. The model can declare "this op is trivial, no plan needed" — and silently disable Slice 2.3's claim capture for the entire op. That is a privilege escalation by omission, and the cage doesn't see it.
+
+### 25.3 Deep Observability — Temporal surface refined
+
+§24.5 enumerated the right requirements. Today's soak adds operational evidence:
+
+- **The ledger is real but undiscoverable.** It lives at `.jarvis/determinism/default/decisions.jsonl` (a path I had to grep for; nothing surfaces it in `/help`, `/observability`, or SerpentFlow). 194 records produced today; an operator without code access has zero way to find them.
+- **Record schema is opaque without tooling.** The 120 terminal_postmortem records carry rich `_terminal_context` blocks but there is no `/postmortems` REPL, no GET endpoint that lists them by op_id, no SSE event when one fires. The Merkle DAG exists; the surface to navigate it does not.
+- **No causal graph reconstruction.** Slice 1.4's `--rerun <session-id>` is text-scoped and op-scoped. There is no UI that takes a `record_id` and renders the full upstream/downstream Merkle DAG with confidence-drop annotations.
+- **No latent-confidence drop signal.** Output observer per §24.5.1.c is still missing — a model that suddenly emits 1/3 the chars it usually does has either lost the prompt thread or hit a refusal, and operators see nothing.
+
+Production-discipline corollary: **the right noise discipline is `emit on transition, not on tick`**. Posture is a good model — only emits on cross-hysteresis, not every 5 minutes. Today's `governor_throttle_applied` SSE rail is also good. The bad pattern is "emit every heartbeat" — that drowns observers.
+
+### 25.4 Brutal grade — current state: **B-**
+
+**Defending B- (not B, not C+)**:
+
+- The happy path is A- (memory core wired correctly, slice graduations rigorous, hot-revert paths preserved).
+- The edge cases are C+ (today's three concurrent silent failures alone justify the demotion from §24.9's "B+ trending A-" because §24.9's grade was based on architectural composition, not production behavior; today's data is production behavior).
+- The *direction of travel* is positive: 0 postmortems in soak #1 → 0 in soak #2 → 120 in soak #3 (with universal terminal capture working as designed). The architecture is unblocking real signal.
+- The *quality of signal* is hollow: 100% of postmortems are claim-empty. Phase 2 is graduated default-true and doing zero verification work.
+
+**Hidden race conditions identified today (additive to §24.6)**:
+
+- **Two `asyncio.ensure_future(...)` fire-and-forget hooks** now exist in the dispatcher (Option E) plus discovery runner. Under SIGTERM these are unawaited and silently dropped — the same async-shutdown pattern `memory/project_async_shutdown_race_triage.md` already flags. The Slice 1.3 ledger writes from terminal postmortems may be lost on hard shutdown.
+- **Slice 1.3 `capture_phase_decision` writes via flock-protected JSONL append**; under L3 worktree fan-out, multiple workers write to the same `<session>/decisions.jsonl`. Lock contention is fine; but the `ordinal` counter is per-process — fan-out replay determinism may not hold across worker boundaries.
+
+**Antivenom bypass vectors most likely to land** (additive to §24.8):
+
+- **PLAN-skip-by-trivialization** (NEW post-soak-3): every op the model declares "trivial" silently skips Slice 2.3 claim capture. The cage's "PLAN authority" assumption (per §24.3.2 fix-path note) is false — the runner short-circuits PLAN entirely for trivial ops, and no claim is ever extracted.
+- **Empty-postmortem theater** (NEW post-soak-3): an operator looking at the ledger will see 120 records and conclude "Phase 2 is working." The records all have `total_claims=0`, but no surface alerts on this. The system can ship an A- grade looking like a B+ system.
+
+### 25.5 Critical Path to A-Level RSI — top 5 systemic upgrades
+
+The §24.10 review listed three priorities (Determinism Substrate, Closed-Loop Self-Verification, Bounded Curiosity). Today's evidence forces a refinement:
+
+- **Priority 1 (§24.10.1 Determinism Substrate) — DONE.** Phase 1 closed 2026-04-28 (`memory/project_phase_1_closure.md`); Slices 1.1–1.5 + 1.3.x merged single day; 4 flags graduated default-true; `--rerun` CLI; 785/785 green. Soak #3 confirms it works in production (Merkle DAG records hold).
+- **Priority 2 (§24.10.2 Closed-Loop Self-Verification) — STRUCTURAL ONLY.** Phase 2 graduated 2026-04-29 (`dc5f77017f`); Option E (`85cf94810a`) closes survivor bias. But every postmortem is empty. Phase 2 is not yet *functionally* complete.
+- **Priority 3 (§24.10.3 Bounded Curiosity) — NOT STARTED.** Curiosity Engine (W2(4)) shipped Apr 25 but is advisory; not yet the load-bearing dispatch gate.
+
+Today's evidence elevates **two new priorities** above §24.10's Priority 3:
+
+#### 25.5.1 Priority A: Mandatory minimum claim density per op [HIGHEST IMPACT]
+
+**Problem**: every op currently hits "Skipping plan: trivial_op" → 0 claims captured → empty postmortem. Phase 2's graduation is paper.
+
+**Required upgrade**: inject a `must_hold` claim at every PLAN exit, including trivial-op skips. Three default claims for every op:
+
+```python
+# At the END of plan_runner.py (or whatever short-circuits to GENERATE):
+if not _claims_captured_this_op(ctx):
+    _capture_default_claims(ctx, claims=[
+        PropertyClaim(
+            claim_id=_derive("the file still parses after change"),
+            property=Property.from_kind("file_parses_after_change"),
+            severity=SEVERITY_MUST_HOLD,
+            evidence_required={"target_files": ctx.target_files},
+        ),
+        PropertyClaim(
+            claim_id=_derive("existing test set is unchanged"),
+            property=Property.from_kind("test_set_hash_stable"),
+            severity=SEVERITY_MUST_HOLD,
+            evidence_required={"target_dir": ctx.target_dir},
+        ),
+        PropertyClaim(
+            claim_id=_derive("no new credential shapes appear"),
+            property=Property.from_kind("no_new_credentials"),
+            severity=SEVERITY_MUST_HOLD,
+            evidence_required={"diff_text": "<computed at APPLY>"},
+        ),
+    ])
+```
+
+**Why this is highest-impact**: without this, the next ten things you build all sit on top of a layer that's silently doing zero work. Phase 2's verification graduation is theatrical until claim capture is unconditional. Slice 2.4's `produce_verification_postmortem` is a no-op when `total_claims=0`; Option E's terminal hook fires correctly but writes empty payloads.
+
+**Antivenom alignment**: each default claim is AST-checkable / hash-checkable / regex-checkable — pure stdlib, zero LLM, in-cage. The mandatory-claim set is itself an Order-2 governance object (manifest-listed, AST-validated, operator-authorized to amend) per Pass B Slice 1.
+
+**Sequencing**: must ship before any further Phase 2 work. Without this, "verification_postmortem ledger" is a cosmetically-impressive empty cabinet.
+
+#### 25.5.2 Priority B: Self-detecting degenerate-loop alarm [HIGHEST IMPACT]
+
+**Problem**: today's three concurrent silent failures (PLAN-skip, wall-clock-cap regression, Slice 3c dormant) all share one signature: the system does not detect when one of its own subsystems has silently disabled itself.
+
+**Required upgrade**: a `MetaSensor` (NEW class, distinct from the 16 existing sensors) that monitors the rolling rate of degenerate signals:
+
+| Degenerate signal | Threshold | Self-issue |
+|---|---|---|
+| `total_claims=0` postmortems > 70% over last 100 | P1 | "verification loop is not exercising — claim capture is broken" |
+| TopologySentinel state read frequency < 1/hr | P2 | "Slice 3c topology backpressure is dormant" |
+| Wall-clock-cap not firing in last 3 sessions despite `idle_timeout` activity | P2 | "harness wall-clock guard is regressing" |
+| Sensor X has emitted 0 ops in last N hours despite live triggers | P3 | "sensor X is silently muted" |
+| Phase Y has 0 entries in last 100 ops | P3 | "phase Y is being short-circuited" |
+
+The MetaSensor outputs go through the existing `unified_intake_router` and surface as backlog entries with `source="meta_dormancy_alarm"`. Operator sees them in `/backlog auto-proposed`.
+
+**Why this is highest-impact**: this is the Reverse Russian Doll's outer shell observing its own immune system. Without it, every silent-disable failure today is invisible to the operator until a manual audit. With it, dormant slices self-report.
+
+**Antivenom alignment**: the MetaSensor is itself an Order-2 governance object — the patterns it monitors are manifest-listed, the thresholds are env-tunable, and amending the threshold list requires operator authorization (Pass B locked-true invariant).
+
+**Sequencing**: ship in parallel with Priority A. They compose: Priority A makes claims actually get captured; Priority B alarms when they don't.
+
+#### 25.5.3 Priority C: Bounded HypothesisProbe primitive [HIGH IMPACT]
+
+This is §24.4's primitive, restated with today's framing.
+
+**Problem**: O+V has no first-class way to resolve epistemic ambiguity autonomously. CC asks the human; O+V cannot. Today's soak shows the consequences: 11 ops attempted, every one declared trivial, no plan formed, no claims captured. The system has no "let me check before I assume" reflex.
+
+**Required upgrade**: a Venom tool `hypothesize(claim, evidence_required, max_depth=3, max_wall_s=30)` — bounded, read-only, AST-enforced:
+
+```python
+@dataclass(frozen=True)
+class Hypothesis:
+    claim: str
+    confidence_prior: float
+    test_strategy: Literal["lookup", "subagent_explore", "dry_run"]
+    expected_signal: str
+    budget_usd: float = 0.05
+    max_iterations: int = 3
+    max_wall_s: int = 30
+
+@dataclass(frozen=True)
+class ProbeResult:
+    confidence_posterior: float
+    observation_summary: str
+    cost_usd: float
+    iterations_used: int
+    convergence_state: Literal["stable", "inconclusive", "budget_exhausted"]
+```
+
+Tool implementation properties (load-bearing):
+
+1. **Read-only by AST enforcement**, not policy. Pinned at `semantic_firewall.py` / `ScopedToolBackend` level. Any mutation invocation from a `hypothesize`-tagged context hard-rejects.
+2. **Subject to same risk-tier ladder as ops** — a probe that would have NOTIFY_APPLY+ risk if it were a real op is rejected.
+3. **Failed probes recorded immutably** at `.jarvis/failed_hypotheses.jsonl` with content hash so adversarial probes cannot retry the same dead end.
+4. **Bayesian update on each iteration** — `posterior = bayesian_update(prior, observation_likelihood)`. Halt when `|posterior - prior| < epsilon` (convergence_state=stable) OR `max_iterations` reached OR `max_wall_s` exceeded.
+5. **The epsilon convergence threshold is mathematically derived** from the prior (not hardcoded) — tighter epsilon for high-stakes claims.
+
+**Why this is high-impact**: this is the structural primitive that lets O+V resolve epistemic ambiguity without breaking the Zero-Trust boundary and without entering CC's reactive `ask_human` mode. It also wires `RepeatRunner` (Slice 2.2's Bayesian aggregator) into actual decision-making instead of advisory observation.
+
+**Consumers**: Curiosity Engine (W2(4)) — invoke when SemanticTriage returns NO_OP but signal_urgency is high. CapabilityGap sensor — invoke when a gap is detected but the resolution path is ambiguous. SelfGoalFormation — invoke when goal candidates have similar confidence scores. **PLAN runner — invoke before declaring an op "trivial"** (closes the loophole that nuked soak #3).
+
+**Antivenom alignment**: depth + wall-clock + budget hard bounds make trapped curiosity *impossible by construction*. The cage enforces read-only structurally, not by policy.
+
+**Sequencing**: depends on Priority A (claim density gives the probe a target shape). Composes with Priority 3 (§24.10.3 Bounded Curiosity).
+
+#### 25.5.4 Priority D: Empty-postmortem alarm + ledger discoverability [MEDIUM IMPACT]
+
+**Problem**: today's soak produced 120 records that an operator without code access has no way to find. The `/help` dispatcher doesn't list `.jarvis/determinism/default/decisions.jsonl` as an artifact path. There's no `/postmortems` REPL. There's no GET endpoint listing terminal-postmortem records.
+
+**Required upgrades**:
+
+1. `/postmortems` REPL: subcommands `recent`, `for-op <op_id>`, `terminal-context-distribution`, `stats`. Read-only over the ledger.
+2. `GET /observability/postmortems{,/recent,/for-op/{op_id},/distribution}` — IDE-consumable, loopback-only, rate-limited.
+3. `EVENT_TYPE_TERMINAL_POSTMORTEM_PERSISTED` SSE event published from Option E's `_fire_terminal_postmortem` after successful Merkle write.
+4. `MetaSensor` (Priority B) consumes the distribution and alarms on >70% empty rate.
+
+**Why medium-impact**: not on the path to A-level RSI by itself, but it makes Priorities A + B operator-visible. Without this, "Phase 2 is working" remains an internal claim instead of an observable property.
+
+**Sequencing**: ships after Priority A (so the surface has signal). Composes with Priority B (so the alarms surface in the same UX).
+
+#### 25.5.5 Priority E: PLAN-runner cannot silently skip claim capture [MEDIUM-HIGH IMPACT]
+
+**Problem**: `plan_runner.py` skips PLAN entirely on trivial ops, which silently skips Slice 2.3 claim capture. The model controls the trivial-op classification via prompt-leverage on the PlanGenerator's classifier.
+
+**Required upgrade**: refactor PLAN-skip to NEVER skip claim capture. Even when the LLM-reasoned plan is bypassed for trivial ops:
+
+```python
+if _is_trivial_op(ctx):
+    # OLD: return PhaseResult(next_phase=GENERATE, ...)  # claim capture skipped
+    # NEW:
+    _capture_default_claims(ctx)  # <-- Priority A claims, unconditional
+    return PhaseResult(next_phase=GENERATE, artifacts={"plan_skipped_reason": "trivial_op"})
+```
+
+Add an AST-enforced source pin: `plan_runner.py` MUST contain `_capture_default_claims` call on every code path that exits to GENERATE. Lint rule lives in Pass B Slice 3 (`meta/ast_phase_runner_validator.py`).
+
+**Why medium-high impact**: this is Priority A's enforcement teeth. Without it, future refactors can re-introduce the silent-disable gap.
+
+**Sequencing**: ships immediately after Priority A.
+
+### 25.6 In-flight alignment — what's on main right now that helps
+
+| Current state on main | Maps to | Status |
+|---|---|---|
+| Phase 1 Determinism Substrate (4 flags graduated, `dc5f77017f`-adjacent) | §24.10.1 Priority 1 | DONE |
+| Phase 2 verification (Slice 2.5 graduated `dc5f77017f`) | §24.10.2 Priority 2 | STRUCTURAL ONLY — Priority A blocks meaningful |
+| Option E Universal Terminal Postmortem (`85cf94810a`) | Closes survivor bias | STRUCTURAL ONLY — composes with Priority A |
+| Slices 3a + 3c (`a641ca2da3`) | Self-healing topology + sensor backpressure | DORMANT IN PRODUCTION until TopologySentinel master-on |
+| W2(4) Curiosity Engine (graduated) | §24.10.3 Priority 3 | ADVISORY ONLY — not yet load-bearing |
+| Phase 12.2 Physics-Aware Topology Routing | §24.10.3 (one scope) | DONE 2026-04-28 |
+
+### 25.7 Reverse Russian Doll alignment
+
+Per §23.6 — the operator's framing is "as O+V expands the shell, Anti-Venom must scale proportionally." Today's review reaffirms:
+
+- **Priority A** (mandatory claim density) makes the inner core's verification observable. Anti-Venom scales: the claim list itself is an Order-2 governance object (manifest-listed, operator-amend-only).
+- **Priority B** (degenerate-loop alarm) IS the immune system policing itself. The MetaSensor watches for "I am not actually verifying anything" as a categorical degenerate state.
+- **Priority C** (HypothesisProbe) extends the cage to autonomous epistemic resolution. The cage's read-only constraint is now AST-enforced, not policy-bound.
+- **Priorities D + E** turn structural correctness into operator-visible correctness, closing the "ship A-grade-looking system that's secretly B-grade" gap.
+
+Each priority compresses through the substrate cleanly: outer shell grows (more ops produce real evidence), Anti-Venom scales proportionally (mandatory claims are AST-checked, hypothesize() is bounded by construction, MetaSensor is Order-2 governance, ledger surfacing is loopback-rate-limited).
+
+### 25.8 What this review explicitly does NOT prescribe
+
+- **Re-running soak #3 with `JARVIS_TOPOLOGY_SENTINEL_ENABLED=true`** to "exercise" Slices 3a + 3c — that is the work-around path. The structural fix is for SensorGovernor backpressure to also read the catalog-classifier blocked-route state, not just the sentinel.
+- **Writing more verification subsystems** before Priority A ships — Phase 2 is graduated default-true and doing zero work; build on the active layer, not an inactive one.
+- **Adding more terminal phases or new postmortem types** — Option E's universal coverage is sufficient. Today's gap is signal density, not signal coverage.
+- **More sensors, more phase runners, more subagent types, more flags** — same prohibitions as §24.12.
+
+### 25.9 Summary
+
+**Did we make significant progress today? Yes — but along exactly one axis (memory scaffolding), and the verification loop is still ~30% functional in practice because every postmortem is empty.**
+
+The fastest single move from B- to A- is **Priority A (mandatory claim density)**. Without it, the next ten things you build all sit on top of a layer that's silently doing zero work.
+
+The fastest move from "ship A-grade-looking system" to "ship A-grade-actually-working system" is **Priority B (degenerate-loop alarm)** — the immune system that catches "I am not actually verifying anything" as a categorical failure mode.
+
+Together, A + B + E close Phase 2's hollowness within ~1 week of focused work. Priority C (HypothesisProbe) closes the cognitive epistemic gap and is the path to A — ~2 weeks. Priority D is operator-UX polish, ships in parallel.
+
+**Net trajectory**: today's work earned the right to attempt A-. It did not deliver A-. The next 5 priorities, in order, are how we get there.
 
 ---
 
