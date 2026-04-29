@@ -128,11 +128,18 @@ def _hash_record(payload: Dict[str, Any]) -> str:
 
 def is_enabled() -> bool:
     """Master flag — ``JARVIS_ADAPTATION_LEDGER_ENABLED`` (default
-    false until Slice 6 graduation; Slice 1's individual graduation
-    flips this default to true)."""
-    return os.environ.get(
+    ``true`` — graduated in Move 1 Pass C cadence 2026-04-29 after
+    soak ``bt-2026-04-29-212606`` proved zero crash / regression /
+    cost-contract violation under all 7 Pass C flags simultaneously).
+
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy hot-reverts."""
+    raw = os.environ.get(
         "JARVIS_ADAPTATION_LEDGER_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated default (Move 1 Pass C cadence)
+    return raw in _TRUTHY
 
 
 def ledger_path() -> Path:

@@ -147,11 +147,13 @@ def test_min_synthesized_pattern_chars_pinned():
     assert MIN_SYNTHESIZED_PATTERN_CHARS == 8
 
 
-def test_master_flag_default_false_pre_graduation(monkeypatch):
+def test_master_flag_default_true_post_graduation(monkeypatch):
+    """Graduated 2026-04-29 (Move 1 Pass C cadence) — empty/unset env
+    returns True. Asymmetric semantics: explicit falsy hot-reverts."""
     monkeypatch.delenv(
         "JARVIS_ADAPTIVE_SEMANTIC_GUARDIAN_ENABLED", raising=False,
     )
-    assert is_enabled() is False
+    assert is_enabled() is True
 
 
 def test_master_flag_truthy_variants(monkeypatch):
@@ -161,9 +163,18 @@ def test_master_flag_truthy_variants(monkeypatch):
 
 
 def test_master_flag_falsy_variants(monkeypatch):
-    for val in ("0", "false", "no", "off", "", "garbage"):
+    # Post-graduation: empty/whitespace = unset = graduated default-true.
+    # Only explicit falsy tokens hot-revert.
+    for val in ("0", "false", "no", "off", "garbage"):
         monkeypatch.setenv("JARVIS_ADAPTIVE_SEMANTIC_GUARDIAN_ENABLED", val)
         assert is_enabled() is False
+
+
+def test_master_flag_empty_string_post_graduation(monkeypatch):
+    """Asymmetric env semantics — explicit empty string is treated as
+    unset and returns the graduated default-true."""
+    monkeypatch.setenv("JARVIS_ADAPTIVE_SEMANTIC_GUARDIAN_ENABLED", "")
+    assert is_enabled() is True
 
 
 def test_postmortem_event_lite_is_frozen():

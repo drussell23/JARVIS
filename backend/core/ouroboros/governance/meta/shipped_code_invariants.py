@@ -865,6 +865,77 @@ def _validate_dag_replay_cost_contract_preserved(
     return tuple(violations)
 
 
+def _validate_adaptation_ledger_monotonic_tightening(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Pass C ``adaptation/ledger.py`` LOAD-BEARING pin: the ledger
+    MUST contain the monotonic-tightening verdict enum + validator
+    function. Without these, surface miners could propose looser
+    safety properties (regression vector). Bytes-pinned so a rename
+    or accidental removal is caught.
+
+    Returns tuple of violations; empty tuple means pin holds. NEVER
+    raises."""
+    violations: List[str] = []
+    required_tokens = (
+        "MonotonicTighteningVerdict",
+        "validate_monotonic_tightening",
+        "REJECTED_WOULD_LOOSEN",
+    )
+    for tok in required_tokens:
+        if tok not in source:
+            violations.append(
+                f"monotonic-tightening token missing: {tok}"
+            )
+    return tuple(violations)
+
+
+_ADAPTATION_FORBIDDEN_AUTHORITY_SUBSTRINGS = (
+    "orchestrator",
+    "phase_runners",
+    "candidate_generator",
+    "iron_gate",
+    "change_engine",
+    "policy",
+    "semantic_firewall",
+    "providers",
+    "doubleword_provider",
+    "urgency_router",
+)
+
+
+def _validate_adaptation_miners_no_authority_imports(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Pass C surface-miner structural pin: miners are read-only
+    proposal generators. They MUST NOT import any authority module.
+    Their write-surface is the ledger (proposal records); apply
+    happens via /adapt approve gated by operator approval.
+
+    Note: the SemanticGuardian miner intentionally references the
+    *string* token 'semantic_guardian' in its proposal kind metadata —
+    that is a data label, not an import. This validator only flags
+    actual ``Import`` / ``ImportFrom`` AST nodes.
+
+    Returns tuple of violations; empty tuple means pin holds. NEVER
+    raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                for fb in _ADAPTATION_FORBIDDEN_AUTHORITY_SUBSTRINGS:
+                    if fb in alias.name:
+                        violations.append(
+                            f"forbidden import: {alias.name}"
+                        )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            for fb in _ADAPTATION_FORBIDDEN_AUTHORITY_SUBSTRINGS:
+                if fb in mod:
+                    violations.append(f"forbidden import: {mod}")
+    return tuple(violations)
+
+
 def _validate_providers_dispatch_assertion(
     tree: ast.Module, source: str,
 ) -> Tuple[str, ...]:
@@ -1163,6 +1234,59 @@ def _register_seed_invariants() -> None:
             validate=_validate_dag_replay_cost_contract_preserved,
         ),
     )
+
+    # PRD §26.5.3 — Pass C (Move 1 graduation 2026-04-29) seeds.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="adaptation_ledger_monotonic_tightening_pin",
+            target_file=(
+                "backend/core/ouroboros/governance/adaptation/"
+                "ledger.py"
+            ),
+            description=(
+                "LOAD-BEARING — the AdaptationLedger MUST contain the "
+                "MonotonicTighteningVerdict enum + "
+                "validate_monotonic_tightening function + "
+                "REJECTED_WOULD_LOOSEN sentinel. These are the safety "
+                "spine of all 6 surface miners — without them, "
+                "adaptive proposals could weaken existing safety "
+                "properties (regression vector)."
+            ),
+            validate=_validate_adaptation_ledger_monotonic_tightening,
+        ),
+    )
+    for _miner in (
+        "semantic_guardian_miner",
+        "exploration_floor_tightener",
+        "per_order_mutation_budget",
+        "risk_tier_extender",
+        "category_weight_rebalancer",
+        "meta_governor",
+    ):
+        register_shipped_code_invariant(
+            ShippedCodeInvariant(
+                invariant_name=(
+                    f"adaptation_{_miner}_no_authority_imports"
+                ),
+                target_file=(
+                    f"backend/core/ouroboros/governance/adaptation/"
+                    f"{_miner}.py"
+                ),
+                description=(
+                    f"Pass C surface module {_miner!r} is a read-only "
+                    "proposal generator. It MUST NOT import any "
+                    "authority module (orchestrator / phase_runners / "
+                    "candidate_generator / iron_gate / change_engine "
+                    "/ policy / semantic_firewall / providers / "
+                    "doubleword_provider / urgency_router). Write-"
+                    "surface is the ledger; apply happens via "
+                    "operator-gated /adapt approve."
+                ),
+                validate=(
+                    _validate_adaptation_miners_no_authority_imports
+                ),
+            ),
+        )
 
 
 _register_seed_invariants()

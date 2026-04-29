@@ -120,10 +120,17 @@ _VALID_SUBCOMMANDS: Tuple[str, ...] = (
 
 
 def is_enabled() -> bool:
-    """Master flag — ``JARVIS_ADAPT_REPL_ENABLED`` (default false)."""
-    return os.environ.get(
+    """Master flag — ``JARVIS_ADAPT_REPL_ENABLED`` (default ``true`` —
+    graduated in Move 1 Pass C cadence 2026-04-29).
+
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy hot-reverts."""
+    raw = os.environ.get(
         "JARVIS_ADAPT_REPL_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated default (Move 1 Pass C cadence)
+    return raw in _TRUTHY
 
 
 # ---------------------------------------------------------------------------

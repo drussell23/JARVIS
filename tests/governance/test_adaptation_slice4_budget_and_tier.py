@@ -157,16 +157,25 @@ def test_4a_order_constants_pinned():
     assert ORDER_2 == 2
 
 
-def test_4a_master_flag_default_false(monkeypatch):
+def test_4a_master_flag_default_true_post_graduation(monkeypatch):
+    """Graduated 2026-04-29 (Move 1 Pass C cadence) — empty/unset env
+    returns True. Asymmetric semantics: explicit falsy hot-reverts."""
     monkeypatch.delenv(
         "JARVIS_ADAPTIVE_PER_ORDER_BUDGET_ENABLED", raising=False,
     )
-    assert budget_is_enabled() is False
+    assert budget_is_enabled() is True
 
 
 def test_4a_master_flag_truthy(monkeypatch):
     monkeypatch.setenv("JARVIS_ADAPTIVE_PER_ORDER_BUDGET_ENABLED", "1")
     assert budget_is_enabled() is True
+
+
+def test_4a_master_flag_explicit_falsy_hot_reverts(monkeypatch):
+    """Asymmetric env semantics — explicit "0" hot-reverts the
+    graduated default-true."""
+    monkeypatch.setenv("JARVIS_ADAPTIVE_PER_ORDER_BUDGET_ENABLED", "0")
+    assert budget_is_enabled() is False
 
 
 def test_4a_mutation_usage_lite_frozen():
@@ -471,16 +480,25 @@ def test_4b_max_tier_name_chars_pinned():
     assert MAX_TIER_NAME_CHARS == 64
 
 
-def test_4b_master_flag_default_false(monkeypatch):
+def test_4b_master_flag_default_true_post_graduation(monkeypatch):
+    """Graduated 2026-04-29 (Move 1 Pass C cadence) — empty/unset env
+    returns True. Asymmetric semantics: explicit falsy hot-reverts."""
     monkeypatch.delenv(
         "JARVIS_ADAPTIVE_RISK_TIER_LADDER_ENABLED", raising=False,
     )
-    assert tier_is_enabled() is False
+    assert tier_is_enabled() is True
 
 
 def test_4b_master_flag_truthy(monkeypatch):
     monkeypatch.setenv("JARVIS_ADAPTIVE_RISK_TIER_LADDER_ENABLED", "1")
     assert tier_is_enabled() is True
+
+
+def test_4b_master_flag_explicit_falsy_hot_reverts(monkeypatch):
+    """Asymmetric env semantics — explicit "0" hot-reverts the
+    graduated default-true."""
+    monkeypatch.setenv("JARVIS_ADAPTIVE_RISK_TIER_LADDER_ENABLED", "0")
+    assert tier_is_enabled() is False
 
 
 def test_4b_postmortem_event_lite_frozen():

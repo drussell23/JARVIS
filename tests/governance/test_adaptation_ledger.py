@@ -206,9 +206,11 @@ def test_master_flag_off_returns_disabled(monkeypatch, tmp_path):
     assert res.status is ProposeStatus.DISABLED
 
 
-def test_master_default_off_when_unset(monkeypatch):
+def test_master_default_true_post_graduation(monkeypatch):
+    """Graduated 2026-04-29 (Move 1 Pass C cadence) — empty/unset env
+    returns True. Asymmetric semantics: explicit falsy hot-reverts."""
     monkeypatch.delenv("JARVIS_ADAPTATION_LEDGER_ENABLED", raising=False)
-    assert is_enabled() is False
+    assert is_enabled() is True
 
 
 def test_disabled_returns_empty_for_read_methods(monkeypatch, tmp_path):

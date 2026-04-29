@@ -3,7 +3,8 @@
 Pins:
   * 12-status DispatchStatus enum + frozen DispatchResult + .ok
     helper + .to_dict shape + module constants.
-  * Master flag default-false-pre-graduation.
+  * Master flag default-true-post-graduation (Move 1 Pass C cadence
+    2026-04-29) + explicit "0" hot-revert.
   * help subcommand always works (even master-off — discoverability).
   * Substrate (ledger) master-off short-circuit: even with REPL on,
     LEDGER_DISABLED returned for read+write subcommands (help still
@@ -212,6 +213,13 @@ def test_parse_argv_unbalanced_falls_back():
 # ===========================================================================
 # C — Master flag + help bypass + LEDGER_DISABLED
 # ===========================================================================
+
+
+def test_master_default_true_post_graduation(monkeypatch):
+    """Graduated 2026-04-29 (Move 1 Pass C cadence) — empty/unset env
+    returns True. Asymmetric semantics: explicit falsy hot-reverts."""
+    monkeypatch.delenv("JARVIS_ADAPT_REPL_ENABLED", raising=False)
+    assert is_enabled() is True
 
 
 def test_master_off_blocks_subcommands_except_help(monkeypatch, tmp_path):

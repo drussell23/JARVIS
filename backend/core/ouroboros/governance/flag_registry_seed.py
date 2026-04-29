@@ -1350,6 +1350,136 @@ SEED_SPECS: list = [
         since="Priority 2 Slice 6 graduation",
         posture_relevance=_HARDEN_AND_CONSOLIDATE,
     ),
+    # ====================================================================
+    # Pass C — Adaptive Anti-Venom (Move 1 graduation 2026-04-29) — 7 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_ADAPTATION_LEDGER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the AdaptationLedger substrate — "
+            "JSONL append-only proposal store with monotonic-"
+            "tightening invariant. All 6 surface miners short-"
+            "circuit when this is off (LEDGER_DISABLED). Asymmetric "
+            "env semantics: empty/unset = graduated default-true; "
+            "explicit falsy hot-reverts."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/ledger.py"
+        ),
+        example="true",
+        since="Move 1 Pass C cadence",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_ADAPTIVE_SEMANTIC_GUARDIAN_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Surface miner — proposes new SemanticGuardian patterns "
+            "from clustered POSTMORTEM events. Monotonic-tightening: "
+            "only adds patterns, never weakens existing ones. "
+            "Operator approval required via /adapt approve."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/"
+            "semantic_guardian_miner.py"
+        ),
+        example="true",
+        since="Move 1 Pass C cadence",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_ADAPTIVE_IRON_GATE_FLOORS_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Surface miner — proposes raised Iron Gate exploration "
+            "floors per category (read_file/search_code/get_callers/"
+            "list_dir/glob_files) from clustered bypass-failure "
+            "outcomes. Floors only ratchet up, never down."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/"
+            "exploration_floor_tightener.py"
+        ),
+        example="true",
+        since="Move 1 Pass C cadence",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_ADAPTIVE_PER_ORDER_BUDGET_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Surface miner — proposes lowered per-Order mutation "
+            "budgets (Order 1 / Order 2) from underutilization "
+            "evidence. Monotonic-tightening: budgets only shrink, "
+            "never grow."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/"
+            "per_order_mutation_budget.py"
+        ),
+        example="true",
+        since="Move 1 Pass C cadence",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_ADAPTIVE_RISK_TIER_LADDER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Surface miner — proposes risk-tier ladder extensions "
+            "(new tiers between SAFE_AUTO/NOTIFY_APPLY/APPROVAL_"
+            "REQUIRED/BLOCKED) from clustered escalation evidence. "
+            "Only adds tiers, never collapses them."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/"
+            "risk_tier_extender.py"
+        ),
+        example="true",
+        since="Move 1 Pass C cadence",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_ADAPTIVE_CATEGORY_WEIGHTS_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Surface miner — proposes ExplorationLedger category "
+            "weight rebalances from clustered exploration-outcome "
+            "evidence. Operator approval gates the apply step."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/"
+            "category_weight_rebalancer.py"
+        ),
+        example="true",
+        since="Move 1 Pass C cadence",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_ADAPT_REPL_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the /adapt REPL — pending/show/"
+            "history/stats/approve/reject subcommands over the "
+            "AdaptationLedger. help always works (discoverability) "
+            "even master-off. Substrate (LEDGER) master-off short-"
+            "circuits read+write subcommands to LEDGER_DISABLED."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/"
+            "meta_governor.py"
+        ),
+        example="true",
+        since="Move 1 Pass C cadence",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
 ]
 
 

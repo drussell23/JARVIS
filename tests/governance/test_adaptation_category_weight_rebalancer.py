@@ -155,17 +155,27 @@ def test_min_weight_value_pinned():
     assert MIN_WEIGHT_VALUE == 0.01
 
 
-def test_master_flag_default_false_pre_graduation(monkeypatch):
+def test_master_flag_default_true_post_graduation(monkeypatch):
+    """Graduated 2026-04-29 (Move 1 Pass C cadence) — empty/unset env
+    returns True. Asymmetric semantics: explicit falsy hot-reverts."""
     monkeypatch.delenv(
         "JARVIS_ADAPTIVE_CATEGORY_WEIGHTS_ENABLED", raising=False,
     )
-    assert is_enabled() is False
+    assert is_enabled() is True
 
 
 def test_master_flag_truthy_variants(monkeypatch):
     for val in ("1", "true", "yes", "on"):
         monkeypatch.setenv("JARVIS_ADAPTIVE_CATEGORY_WEIGHTS_ENABLED", val)
         assert is_enabled() is True
+
+
+def test_master_flag_explicit_falsy_hot_reverts(monkeypatch):
+    """Asymmetric env semantics — explicit falsy tokens hot-revert
+    the graduated default-true."""
+    for val in ("0", "false", "no", "off"):
+        monkeypatch.setenv("JARVIS_ADAPTIVE_CATEGORY_WEIGHTS_ENABLED", val)
+        assert is_enabled() is False
 
 
 def test_category_outcome_lite_frozen():
