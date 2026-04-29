@@ -126,6 +126,19 @@ _RISK_TIER_FLOOR_NAME = os.environ.get(
 # scanning is fast (GENERAL invocation happens synchronously inside
 # dispatch_general() hot path).
 
+# §24.8.5 — Credential / secret shapes. Extracted as a named module
+# constant so the verification subsystem (Priority A — mandatory claim
+# density) can reuse the same regex set for `no_new_credential_shapes`
+# without duplicating the patterns. The single source of truth lives
+# here; both the firewall and the oracle import it.
+_CREDENTIAL_SHAPE_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}", re.UNICODE),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b", re.UNICODE),
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b", re.UNICODE),
+    re.compile(r"\bxox[bp]-[A-Za-z0-9\-]{10,}\b", re.UNICODE),
+    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----", re.UNICODE),
+)
+
 _INJECTION_PATTERNS: Tuple[re.Pattern, ...] = (
     # Role-override attempts
     re.compile(r"(?i)\b(ignore|disregard|forget)\s+(previous|prior|all|above)\s+(instruction|prompt|message|directive)", re.UNICODE),
@@ -146,15 +159,10 @@ _INJECTION_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"(?i)\bset\s+(risk.?tier|approval|gate|validation)\s+(to\s+)?(safe.?auto|none|disabled|off|skip)\b", re.UNICODE),
     re.compile(r"(?i)\b(force|always)\s+(approve|accept|pass|allow|merge|commit|apply)\b", re.UNICODE),
     re.compile(r"(?i)\bwithout\s+(human|manual|operator|approval|review|validation|verification|gate|check)\b", re.UNICODE),
-    # Credential / secret shapes (overlap with sanitize_for_log; we
-    # check here so the rejection is at dispatch time, not buried
-    # inside sanitized output).
-    re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}", re.UNICODE),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b", re.UNICODE),
-    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b", re.UNICODE),
-    re.compile(r"\bxox[bp]-[A-Za-z0-9\-]{10,}\b", re.UNICODE),
-    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----", re.UNICODE),
-)
+    # Credential / secret shapes — sourced from the canonical
+    # _CREDENTIAL_SHAPE_PATTERNS tuple above so both firewall and
+    # verification share one definition (no duplication).
+) + _CREDENTIAL_SHAPE_PATTERNS
 
 
 # ============================================================================
