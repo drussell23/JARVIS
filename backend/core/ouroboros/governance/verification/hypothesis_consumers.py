@@ -184,21 +184,21 @@ class GoalDisambiguationVerdict:
 
 def confidence_probe_integration_enabled() -> bool:
     """``JARVIS_CONFIDENCE_PROBE_INTEGRATION_ENABLED`` (default
-    ``false`` for Slice 3; flips to ``true`` in Slice 5 graduation).
+    ``true`` — graduated in Priority 1 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = current default;
-    explicit truthy enables; explicit falsy disables. Re-read at
-    call time so monkeypatch + live toggle work.
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy disables.
+    Re-read at call time so monkeypatch + live toggle work.
 
     When off, ``probe_confidence_collapse`` returns the safe
     legacy default (``RETRY_WITH_FEEDBACK`` with rendered feedback)
-    without invoking the probe — caller's pre-Slice-3 behaviour
-    stands. Hot-revert: single env knob → no probe dispatched."""
+    without invoking the probe. Hot-revert: single env knob → no
+    probe dispatched."""
     raw = os.environ.get(
         "JARVIS_CONFIDENCE_PROBE_INTEGRATION_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 3 default
+        return True  # graduated default (Slice 5 — was false in Slice 3)
     return raw in ("1", "true", "yes", "on")
 
 

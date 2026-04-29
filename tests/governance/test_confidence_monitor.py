@@ -53,19 +53,21 @@ from backend.core.ouroboros.governance.verification.confidence_monitor import (
 
 
 # ===========================================================================
-# §1 — Master flag default false
+# §1 — Master flag default true (Slice 5 graduation, was false in Slice 2)
 # ===========================================================================
 
 
-def test_master_flag_default_false(monkeypatch) -> None:
+def test_master_flag_default_true_post_graduation(monkeypatch) -> None:
     monkeypatch.delenv("JARVIS_CONFIDENCE_MONITOR_ENABLED", raising=False)
-    assert confidence_monitor_enabled() is False
+    assert confidence_monitor_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["", " ", "  ", "\t"])
-def test_master_flag_empty_default_false(monkeypatch, val) -> None:
+def test_master_flag_empty_default_true_post_graduation(
+    monkeypatch, val,
+) -> None:
     monkeypatch.setenv("JARVIS_CONFIDENCE_MONITOR_ENABLED", val)
-    assert confidence_monitor_enabled() is False
+    assert confidence_monitor_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])
@@ -81,13 +83,13 @@ def test_master_flag_falsy(monkeypatch, val) -> None:
 
 
 # ===========================================================================
-# §2 — Sub-flag default false (shadow mode)
+# §2 — Enforce sub-flag default true (Slice 5 graduation, was shadow in Slice 2)
 # ===========================================================================
 
 
-def test_enforce_subflag_default_false(monkeypatch) -> None:
+def test_enforce_subflag_default_true_post_graduation(monkeypatch) -> None:
     monkeypatch.delenv("JARVIS_CONFIDENCE_MONITOR_ENFORCE", raising=False)
-    assert confidence_monitor_enforce() is False
+    assert confidence_monitor_enforce() is True
 
 
 def test_enforce_subflag_explicit_true(monkeypatch) -> None:
@@ -96,13 +98,19 @@ def test_enforce_subflag_explicit_true(monkeypatch) -> None:
 
 
 def test_enforce_independent_of_master(monkeypatch) -> None:
-    """Master off + enforce on → still shadow effectively (provider
-    wiring guards on master). The flag function returns true; the
-    wiring orchestrates."""
+    """Master off + enforce on — flag functions are independent; the
+    wiring respects master gating. Each flag's truth value is its
+    own independent contract."""
     monkeypatch.setenv("JARVIS_CONFIDENCE_MONITOR_ENABLED", "false")
     monkeypatch.setenv("JARVIS_CONFIDENCE_MONITOR_ENFORCE", "true")
     assert confidence_monitor_enabled() is False
     assert confidence_monitor_enforce() is True
+
+
+def test_enforce_falsy_disables(monkeypatch) -> None:
+    """Hot-revert path: explicit false on enforce → shadow mode."""
+    monkeypatch.setenv("JARVIS_CONFIDENCE_MONITOR_ENFORCE", "false")
+    assert confidence_monitor_enforce() is False
 
 
 # ===========================================================================

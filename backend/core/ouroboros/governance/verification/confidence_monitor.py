@@ -104,33 +104,33 @@ CONFIDENCE_MONITOR_SCHEMA_VERSION: str = "confidence_monitor.1"
 
 
 def confidence_monitor_enabled() -> bool:
-    """``JARVIS_CONFIDENCE_MONITOR_ENABLED`` (default ``false`` for
-    Slice 2; flips to ``true`` in Slice 5 graduation).
+    """``JARVIS_CONFIDENCE_MONITOR_ENABLED`` (default ``true`` —
+    graduated in Priority 1 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = current default;
-    explicit truthy enables; explicit falsy disables. Re-read at
-    call time so monkeypatch + live toggle work."""
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy disables.
+    Re-read at call time so monkeypatch + live toggle work."""
     raw = os.environ.get(
         "JARVIS_CONFIDENCE_MONITOR_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 2 default
+        return True  # graduated default (Slice 5 — was false in Slice 2)
     return raw in ("1", "true", "yes", "on")
 
 
 def confidence_monitor_enforce() -> bool:
-    """``JARVIS_CONFIDENCE_MONITOR_ENFORCE`` (default ``false``).
+    """``JARVIS_CONFIDENCE_MONITOR_ENFORCE`` (default ``true`` —
+    graduated in Priority 1 Slice 5; was shadow-only in Slice 2).
 
-    Sub-flag governing the raise path. When off (Slice 2 default),
-    the monitor observes + tags ctx but does NOT raise
-    ``ConfidenceCollapseError``. When on (Slice 5 graduation),
-    BELOW_FLOOR triggers the raise. This is the shadow→enforce
-    pattern (Slice 5 Arc B precedent)."""
+    Sub-flag governing the raise path. When on (graduated),
+    BELOW_FLOOR mid-stream triggers ``ConfidenceCollapseError`` so
+    the GENERATE retry path engages. When off (hot-revert), the
+    monitor observes + tags ctx but does NOT raise."""
     raw = os.environ.get(
         "JARVIS_CONFIDENCE_MONITOR_ENFORCE", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 2 ships shadow-only
+        return True  # graduated default (Slice 5 — was shadow in Slice 2)
     return raw in ("1", "true", "yes", "on")
 
 

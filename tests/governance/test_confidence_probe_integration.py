@@ -103,23 +103,25 @@ def _make_probe_result(
 
 
 # ===========================================================================
-# §1 — Master flag default false
+# §1 — Master flag default true (Slice 5 graduation, was false in Slice 3)
 # ===========================================================================
 
 
-def test_integration_flag_default_false(monkeypatch) -> None:
+def test_integration_flag_default_true_post_graduation(monkeypatch) -> None:
     monkeypatch.delenv(
         "JARVIS_CONFIDENCE_PROBE_INTEGRATION_ENABLED", raising=False,
     )
-    assert confidence_probe_integration_enabled() is False
+    assert confidence_probe_integration_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["", " ", "  ", "\t"])
-def test_integration_flag_empty_default_false(monkeypatch, val) -> None:
+def test_integration_flag_empty_default_true_post_graduation(
+    monkeypatch, val,
+) -> None:
     monkeypatch.setenv(
         "JARVIS_CONFIDENCE_PROBE_INTEGRATION_ENABLED", val,
     )
-    assert confidence_probe_integration_enabled() is False
+    assert confidence_probe_integration_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])

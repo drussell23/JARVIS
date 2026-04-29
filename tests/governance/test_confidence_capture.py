@@ -44,20 +44,23 @@ from backend.core.ouroboros.governance.verification.confidence_capture import (
 
 
 # ===========================================================================
-# §1 — Master flag default false (Slice 1 ships behind the flag)
+# §1 — Master flag default true (Slice 5 graduation, was false in Slice 1)
 # ===========================================================================
 
 
-def test_master_flag_default_false(monkeypatch) -> None:
-    """Slice 1 default — flips to true in Slice 5 graduation."""
+def test_master_flag_default_true_post_graduation(monkeypatch) -> None:
+    """Slice 5 graduated default — was false in Slice 1, flipped
+    to true in Slice 5. Hot-revert: explicit false-class env value."""
     monkeypatch.delenv("JARVIS_CONFIDENCE_CAPTURE_ENABLED", raising=False)
-    assert confidence_capture_enabled() is False
+    assert confidence_capture_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["", " ", "  ", "\t"])
-def test_master_flag_empty_default_false(monkeypatch, val) -> None:
+def test_master_flag_empty_default_true_post_graduation(
+    monkeypatch, val,
+) -> None:
     monkeypatch.setenv("JARVIS_CONFIDENCE_CAPTURE_ENABLED", val)
-    assert confidence_capture_enabled() is False
+    assert confidence_capture_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])

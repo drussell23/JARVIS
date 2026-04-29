@@ -90,11 +90,11 @@ CONFIDENCE_CAPTURE_SCHEMA_VERSION: str = "confidence_capture.1"
 
 
 def confidence_capture_enabled() -> bool:
-    """``JARVIS_CONFIDENCE_CAPTURE_ENABLED`` (default ``false`` for
-    Slice 1; flips to ``true`` in Slice 5 after 3 clean soaks).
+    """``JARVIS_CONFIDENCE_CAPTURE_ENABLED`` (default ``true`` —
+    graduated in Priority 1 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
-    default; explicit truthy enables; explicit falsy disables.
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy disables.
     Re-read at call time so monkeypatch works in tests + operators
     can toggle live without re-init.
 
@@ -104,7 +104,7 @@ def confidence_capture_enabled() -> bool:
         "JARVIS_CONFIDENCE_CAPTURE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 1 default; flipped in Slice 5
+        return True  # graduated default (Slice 5 — was false in Slice 1)
     return raw in ("1", "true", "yes", "on")
 
 

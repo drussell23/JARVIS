@@ -493,6 +493,188 @@ def _validate_cost_contract_bg_spec(
     return tuple(violations)
 
 
+# ---------------------------------------------------------------------------
+# Priority 1 Slice 5 — confidence-aware execution structural pins
+# ---------------------------------------------------------------------------
+
+
+def _validate_confidence_capture_authority(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 1 capture primitive structural pin: must NOT import any
+    forbidden authority module (orchestrator/policy/iron_gate/
+    providers/etc). The capture path is structurally read-only on
+    stream events — no provider imports means no path can mutate
+    the stream / response.
+
+    Returns tuple of violations; empty tuple means pin holds. NEVER
+    raises."""
+    forbidden_substrings = (
+        "orchestrator",
+        "phase_runners",
+        "candidate_generator",
+        "iron_gate",
+        "change_engine",
+        "policy",
+        "semantic_guardian",
+        "semantic_firewall",
+        "providers",
+        "doubleword_provider",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                for fb in forbidden_substrings:
+                    if fb in alias.name:
+                        violations.append(
+                            f"forbidden import: {alias.name}",
+                        )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            for fb in forbidden_substrings:
+                if fb in mod:
+                    violations.append(f"forbidden import: {mod}")
+    return tuple(violations)
+
+
+def _validate_confidence_monitor_pure_data(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 2 monitor structural pin: must NOT do I/O — no file
+    reads/writes, no network, no subprocess. Pure-data evaluator
+    means the monitor cannot become a control-flow surface for
+    confidence-driven side effects.
+
+    Bytes-level scan for forbidden module imports (open / requests /
+    urllib / socket / subprocess) + AST scan for ``open(`` calls
+    outside the documented threading import path. NEVER raises."""
+    forbidden_module_substrings = (
+        "subprocess",
+        "socket",
+        "urllib",
+        "requests",
+        "httpx",
+        "aiohttp",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                for fb in forbidden_module_substrings:
+                    if fb == alias.name.split(".")[0]:
+                        violations.append(
+                            f"forbidden I/O module import: {alias.name}",
+                        )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            root = mod.split(".")[0]
+            for fb in forbidden_module_substrings:
+                if fb == root:
+                    violations.append(
+                        f"forbidden I/O module import: {mod}",
+                    )
+        # Block bare open() calls (file I/O)
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "open":
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: bare open() call detected — "
+                    f"monitor must be I/O-free"
+                )
+    return tuple(violations)
+
+
+def _validate_confidence_probe_consumer(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 3 probe-consumer structural pin: hypothesis_consumers.py
+    MUST contain the ``ConfidenceCollapseAction`` enum with all three
+    canonical actions (RETRY_WITH_FEEDBACK / ESCALATE_TO_OPERATOR /
+    INCONCLUSIVE) AND the ``probe_confidence_collapse`` async
+    function. Future refactors that drop any of these break the
+    Slice 3 contract.
+
+    Returns tuple of violations; empty tuple means pin holds. NEVER
+    raises."""
+    violations: List[str] = []
+    if "class ConfidenceCollapseAction" not in source:
+        violations.append(
+            "ConfidenceCollapseAction enum class missing — "
+            "Slice 3 contract broken"
+        )
+    for action in (
+        "RETRY_WITH_FEEDBACK",
+        "ESCALATE_TO_OPERATOR",
+        "INCONCLUSIVE",
+    ):
+        if action not in source:
+            violations.append(
+                f"ConfidenceCollapseAction.{action} member missing"
+            )
+    if "async def probe_confidence_collapse" not in source:
+        violations.append(
+            "probe_confidence_collapse async consumer missing"
+        )
+    return tuple(violations)
+
+
+def _validate_confidence_route_advisor_cost_guard(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 4 route-advisor structural pin: ``_propose_route_change``
+    MUST contain a ``raise CostContractViolation(...)`` statement.
+    This is the AST-pinned guard preventing any future refactor
+    from silently dropping the BG/SPEC → higher-cost escalation
+    check.
+
+    Walks the AST to find the function definition and verifies a
+    ``raise CostContractViolation(...)`` Call exists in its body.
+    Bytes-fallback also checks for the token signature.
+    NEVER raises."""
+    violations: List[str] = []
+
+    # Must reference the cost-contract symbols
+    if "CostContractViolation" not in source:
+        violations.append(
+            "CostContractViolation reference missing"
+        )
+    if "COST_GATED_ROUTES" not in source:
+        violations.append("COST_GATED_ROUTES reference missing")
+
+    # AST pin: find _propose_route_change and verify a
+    # `raise CostContractViolation(...)` exists in its body
+    found_function = False
+    found_guard = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "_propose_route_change"
+        ):
+            found_function = True
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Raise):
+                    exc = sub.exc
+                    if isinstance(exc, ast.Call) and isinstance(
+                        exc.func, ast.Name,
+                    ):
+                        if exc.func.id == "CostContractViolation":
+                            found_guard = True
+                            break
+            break
+    if not found_function:
+        violations.append(
+            "_propose_route_change function missing"
+        )
+    elif not found_guard:
+        violations.append(
+            "_propose_route_change body missing "
+            "`raise CostContractViolation(...)` guard"
+        )
+    return tuple(violations)
+
+
 def _validate_providers_dispatch_assertion(
     tree: ast.Module, source: str,
 ) -> Tuple[str, ...]:
@@ -646,6 +828,78 @@ def _register_seed_invariants() -> None:
                 "(PRD §26.6.2)."
             ),
             validate=_validate_providers_dispatch_assertion,
+        ),
+    )
+    # PRD §26.5.1 — Priority 1 Slice 5 graduation seeds.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="confidence_capture_no_authority_imports",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "confidence_capture.py"
+            ),
+            description=(
+                "Slice 1 capture primitive must NOT import "
+                "orchestrator / phase_runners / candidate_generator / "
+                "iron_gate / change_engine / policy / "
+                "semantic_guardian / semantic_firewall / providers / "
+                "doubleword_provider — pure-data primitive, structural "
+                "read-only on stream events."
+            ),
+            validate=_validate_confidence_capture_authority,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="confidence_monitor_pure_data_no_io",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "confidence_monitor.py"
+            ),
+            description=(
+                "Slice 2 monitor must NOT do I/O — no subprocess / "
+                "socket / urllib / requests / aiohttp imports, no "
+                "bare open() calls. Pure-data evaluator means the "
+                "monitor cannot become a control-flow surface for "
+                "confidence-driven side effects."
+            ),
+            validate=_validate_confidence_monitor_pure_data,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="confidence_probe_consumer_contract",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "hypothesis_consumers.py"
+            ),
+            description=(
+                "Slice 3 hypothesis_consumers.py MUST contain the "
+                "ConfidenceCollapseAction enum (RETRY_WITH_FEEDBACK / "
+                "ESCALATE_TO_OPERATOR / INCONCLUSIVE) AND the "
+                "probe_confidence_collapse async consumer — pins "
+                "the cognitive-cage contract."
+            ),
+            validate=_validate_confidence_probe_consumer,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="confidence_route_advisor_cost_contract_guard",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "confidence_route_advisor.py"
+            ),
+            description=(
+                "Slice 4 _propose_route_change MUST contain "
+                "`raise CostContractViolation(...)` in its body — "
+                "structural guard preventing BG/SPEC → STANDARD/"
+                "COMPLEX/IMMEDIATE escalation. AST-pinned so future "
+                "refactors cannot silently drop the cost contract "
+                "guard. Composes with §26.6 four-layer defense-in-"
+                "depth."
+            ),
+            validate=_validate_confidence_route_advisor_cost_guard,
         ),
     )
 

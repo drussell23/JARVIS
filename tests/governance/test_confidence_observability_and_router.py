@@ -94,19 +94,21 @@ from backend.core.ouroboros.governance.postmortem_observability import (
 # ===========================================================================
 
 
-def test_observability_flag_default_false(monkeypatch) -> None:
+def test_observability_flag_default_true_post_graduation(monkeypatch) -> None:
     monkeypatch.delenv(
         "JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED", raising=False,
     )
-    assert confidence_observability_enabled() is False
+    assert confidence_observability_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["", " ", "\t"])
-def test_observability_flag_empty_default_false(monkeypatch, val) -> None:
+def test_observability_flag_empty_default_true_post_graduation(
+    monkeypatch, val,
+) -> None:
     monkeypatch.setenv(
         "JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED", val,
     )
-    assert confidence_observability_enabled() is False
+    assert confidence_observability_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on"])
@@ -309,19 +311,21 @@ def test_observability_pure_stdlib_plus_broker_only() -> None:
 # ===========================================================================
 
 
-def test_advisor_flag_default_false(monkeypatch) -> None:
+def test_advisor_flag_default_true_post_graduation(monkeypatch) -> None:
     monkeypatch.delenv(
         "JARVIS_CONFIDENCE_ROUTE_ROUTING_ENABLED", raising=False,
     )
-    assert confidence_route_routing_enabled() is False
+    assert confidence_route_routing_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["", " ", "\t"])
-def test_advisor_flag_empty_default_false(monkeypatch, val) -> None:
+def test_advisor_flag_empty_default_true_post_graduation(
+    monkeypatch, val,
+) -> None:
     monkeypatch.setenv(
         "JARVIS_CONFIDENCE_ROUTE_ROUTING_ENABLED", val,
     )
-    assert confidence_route_routing_enabled() is False
+    assert confidence_route_routing_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on"])

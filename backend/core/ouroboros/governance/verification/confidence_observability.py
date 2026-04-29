@@ -79,12 +79,12 @@ CONFIDENCE_OBSERVABILITY_SCHEMA_VERSION: str = "confidence_observability.1"
 
 
 def confidence_observability_enabled() -> bool:
-    """``JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED`` (default ``false``
-    for Slice 4; flips to ``true`` in Slice 5 graduation).
+    """``JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED`` (default ``true`` —
+    graduated in Priority 1 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = current default;
-    explicit truthy enables; explicit falsy disables. Re-read at
-    call time so monkeypatch + live toggle work.
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy disables.
+    Re-read at call time so monkeypatch + live toggle work.
 
     Hot-revert: ``export JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED=false``
     short-circuits every publisher to a pure no-op."""
@@ -92,7 +92,7 @@ def confidence_observability_enabled() -> bool:
         "JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 4 default
+        return True  # graduated default (Slice 5 — was false in Slice 4)
     return raw in ("1", "true", "yes", "on")
 
 

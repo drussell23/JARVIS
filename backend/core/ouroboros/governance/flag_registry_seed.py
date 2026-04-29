@@ -1040,6 +1040,150 @@ SEED_SPECS: list = [
         example="200",
         since="v1.0",
     ),
+    # ====================================================================
+    # Priority 1 Confidence-Aware Execution (PRD §26.5.1) — 7 flags
+    # graduated default-true 2026-04-29 in Slice 5. The cost contract
+    # (§26.6) is enforced structurally regardless of these flags' state.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_CAPTURE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 1 master kill switch — DW provider captures "
+            "per-token logprobs into ConfidenceCapturer when on. "
+            "When off, the request body's logprobs/top_logprobs "
+            "params are NOT sent and the capturer is None."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_capture.py"
+        ),
+        example="true",
+        since="Priority 1 Slice 5 graduation",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_MONITOR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 2 master — rolling-window monitor evaluates the "
+            "captured margins against the posture-relevant floor. "
+            "When off, evaluate() always returns OK (no verdict "
+            "transitions, no SSE events, no abort)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_monitor.py"
+        ),
+        example="true",
+        since="Priority 1 Slice 5 graduation",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_MONITOR_ENFORCE",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 2 enforce sub-flag — when on AND BELOW_FLOOR is "
+            "observed, the DW stream loop raises "
+            "ConfidenceCollapseError mid-stream (caught by existing "
+            "RuntimeError handlers; orchestrator routes to GENERATE "
+            "retry). When off (hot-revert), the monitor observes + "
+            "tags ctx artifacts but does NOT raise."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_monitor.py"
+        ),
+        example="true",
+        since="Priority 1 Slice 5 graduation",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_PROBE_INTEGRATION_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 3 master — probe_confidence_collapse consumer "
+            "dispatches HypothesisProbe to map a ConfidenceCollapseError "
+            "to one of three actions (RETRY_WITH_FEEDBACK / "
+            "ESCALATE_TO_OPERATOR / INCONCLUSIVE). Three-layer flag "
+            "gating: this + JARVIS_HYPOTHESIS_CONSUMERS_ENABLED + "
+            "JARVIS_HYPOTHESIS_PROBE_ENABLED — any one off → safe "
+            "legacy default (RETRY_WITH_FEEDBACK with rendered hint)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "hypothesis_consumers.py"
+        ),
+        example="true",
+        since="Priority 1 Slice 5 graduation",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 4 master — broadcasts confidence verdicts as SSE "
+            "events (model_confidence_drop P1 / "
+            "model_confidence_approaching P2 / "
+            "model_sustained_low_confidence P3 / route_proposal). "
+            "Independent from the route advisor flag. When off, all "
+            "publish helpers return None immediately — broker is "
+            "NOT consulted."
+        ),
+        category=Category.OBSERVABILITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_observability.py"
+        ),
+        example="true",
+        since="Priority 1 Slice 5 graduation",
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_ROUTE_ROUTING_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 4 advisor master — propose_route_change emits "
+            "advisory RouteProposal events for cost-side route "
+            "demotions. Cost contract preservation: even with this "
+            "flag on, the AST-pinned guard in _propose_route_change "
+            "raises CostContractViolation on any BG/SPEC → STANDARD/"
+            "COMPLEX/IMMEDIATE attempt. §26.6 four-layer defense-in-"
+            "depth ensures the cost contract holds regardless of "
+            "this flag's state."
+        ),
+        category=Category.ROUTING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_route_advisor.py"
+        ),
+        example="true",
+        since="Priority 1 Slice 5 graduation",
+    ),
+    FlagSpec(
+        name="JARVIS_COST_CONTRACT_RUNTIME_ASSERT_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "§26.6.2 Layer 2 — runtime CostContractViolation gate at "
+            "ClaudeProvider.generate dispatch boundary. When BG/SPEC "
+            "route is dispatched to Claude AND op is not read_only, "
+            "raises CostContractViolation (fatal — orchestrator "
+            "terminates op as failure_class=cost_contract_violation). "
+            "Composes with Layer 1 (AST shipped_code_invariants seeds) "
+            "+ Layer 3 (Property Oracle claim) + Layer 4 (Slice 4 "
+            "advisor structural guard) for 4-layer defense-in-depth."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/cost_contract_assertion.py"
+        ),
+        example="true",
+        since="§26.6 + Priority 1 Slice 5 graduation",
+        posture_relevance=_ALL_POSTURES_CRITICAL,
+    ),
 ]
 
 

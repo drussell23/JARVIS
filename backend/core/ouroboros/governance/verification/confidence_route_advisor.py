@@ -120,12 +120,20 @@ _HIGHER_COST_ROUTES: frozenset = frozenset({
 
 
 def confidence_route_routing_enabled() -> bool:
-    """``JARVIS_CONFIDENCE_ROUTE_ROUTING_ENABLED`` (default ``false``
-    for Slice 4; flips to ``true`` in Slice 5 graduation).
+    """``JARVIS_CONFIDENCE_ROUTE_ROUTING_ENABLED`` (default ``true`` —
+    graduated in Priority 1 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = current default;
-    explicit truthy enables; explicit falsy disables. Re-read at
-    call time so monkeypatch + live toggle work.
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy disables.
+    Re-read at call time so monkeypatch + live toggle work.
+
+    Cost contract preservation: even with this flag on, the
+    advisor's structural guard (``_propose_route_change``) raises
+    ``CostContractViolation`` on any BG/SPEC → higher-cost
+    proposal. §26.6 four-layer defense-in-depth (AST invariant +
+    runtime CostContractViolation in providers.py + Property
+    Oracle claim + this advisor's AST-pinned guard) ensures
+    cost contract holds regardless of route-advisor state.
 
     Hot-revert: ``export JARVIS_CONFIDENCE_ROUTE_ROUTING_ENABLED=false``
     short-circuits ``propose_route_change`` to ``None`` always."""
@@ -133,7 +141,7 @@ def confidence_route_routing_enabled() -> bool:
         "JARVIS_CONFIDENCE_ROUTE_ROUTING_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 4 default
+        return True  # graduated default (Slice 5 — was false in Slice 4)
     return raw in ("1", "true", "yes", "on")
 
 
