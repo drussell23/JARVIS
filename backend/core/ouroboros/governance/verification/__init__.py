@@ -66,10 +66,19 @@ from backend.core.ouroboros.governance.verification.repeat_runner import (
     get_default_runner,
     repeat_runner_enabled,
 )
+from backend.core.ouroboros.governance.verification.default_claims import (
+    DefaultClaimSpec,
+    default_claims_enabled,
+    list_default_claim_specs,
+    register_default_claim_spec,
+    synthesize_default_claims,
+    unregister_default_claim_spec,
+)
 
 __all__ = [
     "CANONICAL_SEVERITIES",
     "ClaimOutcome",
+    "DefaultClaimSpec",
     "EvidenceCollector",
     "Property",
     "PropertyClaim",
@@ -86,18 +95,23 @@ __all__ = [
     "VerificationPostmortem",
     "capture_claims",
     "ctx_evidence_collector",
+    "default_claims_enabled",
     "filter_load_bearing",
     "get_default_oracle",
     "get_default_runner",
     "get_recorded_claims",
     "get_recorded_postmortem",
+    "list_default_claim_specs",
     "log_postmortem_summary",
     "oracle_enabled",
     "persist_postmortem",
     "postmortem_enabled",
     "produce_verification_postmortem",
     "property_capture_enabled",
+    "register_default_claim_spec",
     "register_evaluator",
     "repeat_runner_enabled",
     "synthesize_claims_from_plan",
+    "synthesize_default_claims",
+    "unregister_default_claim_spec",
 ]
