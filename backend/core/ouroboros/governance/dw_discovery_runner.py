@@ -150,6 +150,37 @@ async def run_discovery(
             f"catalog_fetch_failed:{snapshot.fetch_failure_reason}"
         )
 
+    # Step 1.4: Slice 3a — active topology recovery.
+    # The catalog GET /models *is* the lightweight reachability probe
+    # the architectural directive calls for: same auth, same session,
+    # same endpoint, zero new infrastructure. When fetch succeeds AND
+    # returns a populated model list, lift transient blocks via the
+    # sentinel's apply_health_probe_result() helper. The 30-min refresh
+    # cadence (JARVIS_DW_CATALOG_REFRESH_S) doubles as the recovery
+    # cadence — operator-tunable; not hardcoded.
+    if (
+        snapshot.fetch_failure_reason is None
+        and len(snapshot.models) > 0
+    ):
+        try:
+            from backend.core.ouroboros.governance.topology_sentinel import (
+                get_default_sentinel as _get_sent,
+                topology_active_recovery_enabled as _ar_enabled,
+            )
+            if _ar_enabled():
+                _recovered = _get_sent().apply_health_probe_result(
+                    success=True,
+                )
+                if _recovered:
+                    diagnostics.append(
+                        f"topology_active_recovery:transitions={_recovered}"
+                    )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[DiscoveryRunner] active topology recovery failed",
+                exc_info=True,
+            )
+
     # Step 1.5: Slice G — modality verification (metadata + probes)
     # Runs BEFORE classify so the ledger is populated with verdicts
     # the classifier can consult. Gated by master flag — when off,

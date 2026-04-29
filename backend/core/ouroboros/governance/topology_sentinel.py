@@ -194,6 +194,8 @@ _SENTINEL_PROPAGATED_VARS: Tuple[str, ...] = (
     # Master flag
     "JARVIS_TOPOLOGY_SENTINEL_ENABLED",
     "JARVIS_TOPOLOGY_FORCE_SEVERED",
+    # Slice 3a — active recovery from successful catalog probes
+    "JARVIS_TOPOLOGY_ACTIVE_RECOVERY_ENABLED",
     # Threshold + decay
     "JARVIS_TOPOLOGY_SEVERED_THRESHOLD_WEIGHTED",
     "JARVIS_TOPOLOGY_SUCCESS_DECAY",
@@ -286,6 +288,23 @@ def is_sentinel_enabled() -> bool:
     ``model_id`` and consumers MUST treat the verdict as advisory
     (legacy static yaml stays authoritative)."""
     return _env_bool("JARVIS_TOPOLOGY_SENTINEL_ENABLED", default=False)
+
+
+def topology_active_recovery_enabled() -> bool:
+    """Slice 3a — self-healing recovery from a successful catalog probe.
+
+    ``JARVIS_TOPOLOGY_ACTIVE_RECOVERY_ENABLED`` (default ``true``).
+    When on, ``apply_health_probe_result(success=True)`` resets every
+    ``TERMINAL_OPEN`` breaker (the catalog probe itself just proved
+    reachability — auth/modality verdicts may have been transient or
+    are stale under a new snapshot) AND calls ``record_success`` on
+    every ``HALF_OPEN`` breaker (decays the weighted streak; pushes
+    HALF_OPEN→CLOSED). Hot-revert path: ``export
+    JARVIS_TOPOLOGY_ACTIVE_RECOVERY_ENABLED=false`` returns the runner
+    to legacy "reset only on snapshot id change" behavior."""
+    return _env_bool(
+        "JARVIS_TOPOLOGY_ACTIVE_RECOVERY_ENABLED", default=True,
+    )
 
 
 def severed_threshold_weighted() -> float:
@@ -1476,6 +1495,99 @@ class TopologySentinel:
             return count
         except Exception:  # noqa: BLE001 — defensive
             return 0
+
+    def list_blocked_endpoints(self) -> Tuple[str, ...]:
+        """Slice 3c — return the model_ids currently in OPEN or
+        TERMINAL_OPEN. Stable-sorted. Used by SensorGovernor for
+        topology-aware backpressure (low-urgency sensors throttle when
+        any DW endpoint is blocked).
+
+        When the master flag is off, returns ``()`` because
+        ``get_state`` collapses every endpoint to CLOSED in that case
+        (legacy yaml authoritative). NEVER raises."""
+        if not is_sentinel_enabled():
+            return ()
+        try:
+            with self._lock:
+                blocked = [
+                    mid for mid, b in self._breakers.items()
+                    if b.state.value in ("OPEN", "TERMINAL_OPEN")
+                ]
+            return tuple(sorted(blocked))
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+
+    def apply_health_probe_result(self, *, success: bool) -> int:
+        """Slice 3a — active recovery from a lightweight catalog probe.
+
+        Called by ``dw_discovery_runner.run_discovery`` after the
+        ``GET /models`` fetch. The fetch IS the probe — when DW returns
+        a populated catalog, the endpoint is reachable, and any
+        transient block deserves a fresh chance.
+
+        On ``success=True``:
+          * Every ``TERMINAL_OPEN`` breaker is reset (auth/modality
+            verdicts that survived persistence get a fresh probe path)
+          * Every ``HALF_OPEN`` breaker has ``record_success`` called
+            on it (decays weighted streak; transitions HALF_OPEN→CLOSED
+            via the existing rate_limiter state machine)
+          * ``OPEN`` breakers are left alone — the rate_limiter's
+            time-based ``recovery_timeout_s`` (default 30s) handles
+            OPEN→HALF_OPEN auto-transition; the next live call probes
+            it and triggers HALF_OPEN→CLOSED via the existing path.
+            Forcing OPEN→CLOSED here would race the post-failure cool-
+            down and could mask a real fault.
+
+        On ``success=False``:
+          * No-op. Probe failure is a catalog-layer signal, not a
+            model-layer signal — penalising every model for a single
+            catalog timeout would double-count failures and risks a
+            cascade-storm on transient network blips.
+
+        Both master flags are honoured: when
+        ``JARVIS_TOPOLOGY_SENTINEL_ENABLED=false`` OR
+        ``JARVIS_TOPOLOGY_ACTIVE_RECOVERY_ENABLED=false``, this method
+        is a no-op returning 0.
+
+        Returns the count of breakers transitioned (TERMINAL_OPEN
+        resets + HALF_OPEN→CLOSED transitions). NEVER raises."""
+        if not success:
+            return 0
+        if not is_sentinel_enabled():
+            return 0
+        if not topology_active_recovery_enabled():
+            return 0
+        transitions = 0
+        # Step 1: TERMINAL_OPEN resets — explicit method already exists
+        try:
+            transitions += self.reset_all_terminal_breakers()
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        # Step 2: HALF_OPEN → CLOSED via record_success on each
+        try:
+            with self._lock:
+                half_open_ids = [
+                    mid for mid, b in self._breakers.items()
+                    if b.state.value == "HALF_OPEN"
+                ]
+            for mid in half_open_ids:
+                pre_state = self.get_state(mid)
+                self.report_success(mid)
+                post_state = self.get_state(mid)
+                if pre_state != post_state:
+                    transitions += 1
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[TopologySentinel] HALF_OPEN recovery failed",
+                exc_info=True,
+            )
+        if transitions:
+            logger.info(
+                "[TopologySentinel] active recovery: %d breaker(s) "
+                "transitioned after successful catalog probe",
+                transitions,
+            )
+        return transitions
 
     def force_severed(self, model_id: str, reason: str) -> None:
         """Operator override — pin the endpoint OPEN immediately."""
