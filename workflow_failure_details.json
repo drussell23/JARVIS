@@ -1,0 +1,107 @@
+{
+  "workflow_name": "Secret Scanning",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25084417152",
+  "branch": "main",
+  "commit_sha": "a641ca2",
+  "run_number": 4595,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/secret-scanning-run4595-20260429-002125",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Secret Scanning (Run #4595)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 74,
+              "content": "2026-04-29T00:17:06.8534906Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 8840:1FD6CC:11D94F:46C104:69F14E02 and timestamp 2026-04-29 00:17:06 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)]. License key validation will be enforced \ud83e\udd37.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 75,
+              "content": "2026-04-29T00:17:06.8551006Z ##[error]\ud83d\uded1 missing gitleaks license. Go grab one at gitleaks.io and store it as a GitHub Secret named GITLEAKS_LICENSE. For more info about the recent breaking update, see [here](https://github.com/gitleaks/gitleaks-action#-announcement).",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 74,
+              "content": "2026-04-29T00:17:06.8534906Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 8840:1FD6CC:11D94F:46C104:69F14E02 and timestamp 2026-04-29 00:17:06 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)]. License key validation will be enforced \ud83e\udd37.",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-04-29T00:17:07.2451722Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 74,
+              "content": "2026-04-29T00:17:06.8534906Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please include the request ID 8840:1FD6CC:11D94F:46C104:69F14E02 and timestamp 2026-04-29 00:17:06 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)]. License key validation will be enforced \ud83e\udd37.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 81,
+              "content": "2026-04-29T00:17:06.8650595Z   if-no-files-found: warn",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 86,
+              "content": "2026-04-29T00:17:07.0821652Z ##[warning]No files were found with the provided path: gitleaks-report.json. No artifacts will be uploaded.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 96,
+              "content": "2026-04-29T00:17:07.2451722Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 98,
+              "content": "2026-04-29T00:17:07.2825964Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: actions/checkout@v4, actions/upload-artifact@v4, gitleaks/gitleaks-action@v2. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 5
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 21,
+              "content": "2026-04-29T00:17:02.2263732Z  * [new branch]          seed-arc-plan-exploit-stream-timeout -> origin/seed-arc-plan-exploit-stream-timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations"
+      ],
+      "severity": "high",
+      "category": "linting_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-04-29T00:21:25.409996"
+}
