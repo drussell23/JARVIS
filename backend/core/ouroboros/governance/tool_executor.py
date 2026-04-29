@@ -970,6 +970,44 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"subagent", "read"}),
     ),
+    # Priority C — bounded HypothesisProbe Venom tool. Lets the model
+    # autonomously resolve epistemic ambiguity ("does file X exist?",
+    # "does function Y still call Z?") via a bounded read-only probe
+    # WITHOUT falling back to ask_human. AST-cage enforced read-only
+    # at the strategy level (Slice C primitive); the tool dispatch
+    # itself is gated by JARVIS_HYPOTHESIS_PROBE_ENABLED.
+    "hypothesize": ToolManifest(
+        name="hypothesize", version="1.0",
+        description=(
+            "Probe a hypothesis about the codebase autonomously. Pass "
+            "claim (the proposition), confidence_prior (0..1, your "
+            "current belief), test_strategy ('lookup' / "
+            "'subagent_explore' / 'dry_run'), and expected_signal "
+            "(format depends on strategy: 'file_exists:<path>', "
+            "'contains:<path>:<substring>', 'not_contains:<path>:"
+            "<substring>'). Returns posterior confidence + "
+            "convergence_state ('stable' / 'inconclusive' / "
+            "'budget_exhausted' / 'memorialized_dead' / etc). Use "
+            "this BEFORE making structural decisions you're "
+            "uncertain about — the probe is bounded "
+            "(max 3 iterations, $0.05/probe budget, 30s wall-clock) "
+            "and read-only by AST enforcement. Failed hypotheses "
+            "memorialize so retries on cosmetic-only variants "
+            "short-circuit."
+        ),
+        arg_schema={
+            "claim": {"type": "string"},
+            "confidence_prior": {"type": "number", "default": 0.5},
+            "test_strategy": {
+                "type": "string", "default": "lookup",
+            },
+            "expected_signal": {"type": "string"},
+            "max_iterations": {"type": "integer", "default": 3},
+            "budget_usd": {"type": "number", "default": 0.05},
+            "max_wall_s": {"type": "integer", "default": 30},
+        },
+        capabilities=frozenset({"read"}),
+    ),
 }
 
 
@@ -2921,6 +2959,7 @@ class AsyncProcessToolBackend:
                 "task_create",     # Gap #5 Slice 2 — TaskBoard-backed
                 "task_update",     # Gap #5 Slice 2
                 "task_complete",   # Gap #5 Slice 2
+                "hypothesize",     # Priority C — bounded probe primitive
             ):
                 return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
             return await self._run_sync_tool_async(
@@ -3122,6 +3161,85 @@ class AsyncProcessToolBackend:
                 return await run_task_tool(
                     call, policy_ctx, timeout, cap,
                 )
+
+            elif call.name == "hypothesize":
+                # Priority C — bounded HypothesisProbe. Routes to the
+                # Slice C primitive with the model-supplied claim +
+                # strategy + bounds. Read-only by AST enforcement at
+                # the strategy level; this handler is a thin adapter
+                # that translates ToolCall args → Hypothesis.
+                from backend.core.ouroboros.governance.verification.hypothesis_probe import (
+                    Hypothesis as _Hyp,
+                    get_default_probe as _get_probe,
+                    hypothesis_probe_enabled as _probe_enabled,
+                )
+                if not _probe_enabled():
+                    return ToolResult(
+                        tool_call=call, output="",
+                        error=(
+                            "hypothesize disabled "
+                            "(JARVIS_HYPOTHESIS_PROBE_ENABLED=false)"
+                        ),
+                        status=ToolExecStatus.POLICY_DENIED,
+                    )
+                args = call.arguments or {}
+                try:
+                    claim_text = str(args.get("claim", "") or "").strip()
+                    if not claim_text:
+                        return ToolResult(
+                            tool_call=call, output="",
+                            error="hypothesize requires non-empty claim",
+                            status=ToolExecStatus.EXEC_ERROR,
+                        )
+                    h = _Hyp(
+                        claim=claim_text,
+                        confidence_prior=float(
+                            args.get("confidence_prior", 0.5),
+                        ),
+                        test_strategy=str(
+                            args.get("test_strategy", "lookup") or "lookup",
+                        ).strip().lower(),
+                        expected_signal=str(
+                            args.get("expected_signal", "") or "",
+                        ),
+                        parent_op_id=str(policy_ctx.op_id or ""),
+                        budget_usd=float(
+                            args.get("budget_usd", -1) or -1,
+                        ),
+                        max_iterations=int(
+                            args.get("max_iterations", -1) or -1,
+                        ),
+                        max_wall_s=int(
+                            args.get("max_wall_s", -1) or -1,
+                        ),
+                    )
+                    probe_runner = _get_probe()
+                    result = await asyncio.wait_for(
+                        probe_runner.test(h), timeout=timeout,
+                    )
+                    payload = {
+                        "claim": claim_text,
+                        "confidence_prior": h.confidence_prior,
+                        "confidence_posterior": result.confidence_posterior,
+                        "convergence_state": result.convergence_state,
+                        "iterations_used": result.iterations_used,
+                        "cost_usd": result.cost_usd,
+                        "observation_summary": (
+                            result.observation_summary
+                        ),
+                        "evidence_hash": result.evidence_hash,
+                    }
+                    return ToolResult(
+                        tool_call=call,
+                        output=json.dumps(payload, indent=2)[:cap],
+                        status=ToolExecStatus.SUCCESS,
+                    )
+                except (TypeError, ValueError) as exc:
+                    return ToolResult(
+                        tool_call=call, output="",
+                        error="hypothesize bad arg: " + str(exc)[:120],
+                        status=ToolExecStatus.EXEC_ERROR,
+                    )
 
             return ToolResult(
                 tool_call=call, output=output[:cap],
