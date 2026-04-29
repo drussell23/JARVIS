@@ -1,12 +1,18 @@
 """Priority C — Consumer-facing hypothesis-probe helpers.
 
 Wraps HypothesisProbe with reasonable defaults for each consumer
-identified in PRD §25.5.3:
+identified in PRD §25.5.3 + Priority 1 Slice 3 (PRD §26.5.1):
 
-  * PLAN runner — ``probe_trivial_op_assumption`` (this slice ships
-    the live wiring into plan_generator's `_is_trivial_op` gate)
-  * Curiosity Engine — ``probe_intent_dismissal`` (scaffolded; full
-    wiring in a future slice)
+  * PLAN runner — ``probe_trivial_op_assumption`` (live wiring
+    into plan_generator's ``_is_trivial_op`` gate)
+  * **Priority 1 Slice 3 — confidence collapse**:
+    ``probe_confidence_collapse`` (this slice — live consumer
+    that maps a ``ConfidenceCollapseError`` to one of three
+    actions: RETRY_WITH_FEEDBACK / ESCALATE_TO_OPERATOR /
+    INCONCLUSIVE; live wiring into generate_runner is the
+    Slice 5 graduation flip)
+  * Curiosity Engine — ``probe_intent_dismissal`` (scaffolded;
+    full wiring in a future slice)
   * CapabilityGap sensor — ``probe_capability_gap`` (scaffolded)
   * SelfGoalFormation — ``probe_goal_disambiguation`` (scaffolded)
 
@@ -32,6 +38,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
 
@@ -86,6 +93,57 @@ class TrivialityVerdict:
     cost_usd: float
 
 
+# Priority 1 Slice 3 — confidence collapse consumer types
+# ---------------------------------------------------------------------------
+
+
+class ConfidenceCollapseAction(str, Enum):
+    """Three discrete actions a caller takes after a confidence
+    collapse, derived by ``probe_confidence_collapse``.
+
+    String-valued so the action serializes cleanly into ctx
+    artifacts + ledger records + Slice 4 SSE payloads.
+    """
+
+    RETRY_WITH_FEEDBACK = "retry_with_feedback"
+    """Probe REFUTED real distress (or low-confidence margin near
+    floor) — likely stylistic variation. Caller should retry the
+    GENERATE round with the feedback artifact threaded into the
+    next prompt to nudge the model toward higher-confidence
+    sampling."""
+
+    ESCALATE_TO_OPERATOR = "escalate_to_operator"
+    """Probe CONFIRMED real distress (very low margin under tight
+    posture, OR memorialized as a recurring collapse). Caller
+    should raise risk_tier to NOTIFY_APPLY+ so the operator can
+    intervene. Cost-contract preserved: escalation does NOT
+    cascade BG/SPEC routes to Claude (§26.6 invariants enforce)."""
+
+    INCONCLUSIVE = "inconclusive"
+    """Probe didn't decide — margin in the middle band. Caller
+    should retry with reduced thinking budget so the model has
+    less rope to spin uncertain reasoning. Slice 5 will SSE-emit
+    the inconclusive transition for operator awareness."""
+
+
+@dataclass(frozen=True)
+class ConfidenceCollapseVerdict:
+    """Result of ``probe_confidence_collapse``.
+
+    Caller branches on ``action``; remaining fields are diagnostic
+    + the rendered feedback text the caller threads into the next
+    GENERATE prompt (RETRY_WITH_FEEDBACK case) or the escalation
+    surface (ESCALATE_TO_OPERATOR case)."""
+
+    action: ConfidenceCollapseAction
+    confidence_posterior: float
+    convergence_state: str
+    observation_summary: str
+    cost_usd: float
+    feedback_text: str = ""
+    thinking_budget_reduction_factor: float = 1.0  # 1.0 = no reduction
+
+
 @dataclass(frozen=True)
 class IntentDismissalVerdict:
     """Result of ``probe_intent_dismissal``. Scaffolded for the
@@ -117,6 +175,369 @@ class GoalDisambiguationVerdict:
     confidence_posterior: float
     convergence_state: str
     observation_summary: str
+
+
+# ---------------------------------------------------------------------------
+# Priority 1 Slice 3 — confidence collapse probe consumer
+# ---------------------------------------------------------------------------
+
+
+def confidence_probe_integration_enabled() -> bool:
+    """``JARVIS_CONFIDENCE_PROBE_INTEGRATION_ENABLED`` (default
+    ``false`` for Slice 3; flips to ``true`` in Slice 5 graduation).
+
+    Asymmetric env semantics — empty/whitespace = current default;
+    explicit truthy enables; explicit falsy disables. Re-read at
+    call time so monkeypatch + live toggle work.
+
+    When off, ``probe_confidence_collapse`` returns the safe
+    legacy default (``RETRY_WITH_FEEDBACK`` with rendered feedback)
+    without invoking the probe — caller's pre-Slice-3 behaviour
+    stands. Hot-revert: single env knob → no probe dispatched."""
+    raw = os.environ.get(
+        "JARVIS_CONFIDENCE_PROBE_INTEGRATION_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return False  # Slice 3 default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _confidence_distress_ratio() -> float:
+    """``JARVIS_CONFIDENCE_COLLAPSE_DISTRESS_RATIO`` (default 0.3).
+
+    Margin/effective_floor ratio BELOW which the verdict ESCALATES
+    to NOTIFY_APPLY+. Below ``ratio × effective_floor`` is treated
+    as real epistemic distress, not stylistic variation. Floored at
+    0.0; capped at 1.0 (above 1.0 would mean "anything below floor
+    escalates" — useful but degenerate)."""
+    raw = os.environ.get(
+        "JARVIS_CONFIDENCE_COLLAPSE_DISTRESS_RATIO", "0.3",
+    )
+    try:
+        v = float(raw)
+        if v != v:  # NaN check
+            return 0.3
+        return max(0.0, min(1.0, v))
+    except (TypeError, ValueError):
+        return 0.3
+
+
+def _confidence_stylistic_ratio() -> float:
+    """``JARVIS_CONFIDENCE_COLLAPSE_STYLISTIC_RATIO`` (default 0.7).
+
+    Margin/effective_floor ratio ABOVE which the verdict is
+    RETRY_WITH_FEEDBACK (likely stylistic variation, not distress).
+    Between distress_ratio and stylistic_ratio → INCONCLUSIVE.
+    Floored at distress_ratio; capped at 1.0."""
+    raw = os.environ.get(
+        "JARVIS_CONFIDENCE_COLLAPSE_STYLISTIC_RATIO", "0.7",
+    )
+    try:
+        v = float(raw)
+        if v != v:
+            return 0.7
+        # Clamp to [distress_ratio, 1.0] to preserve banding
+        return max(_confidence_distress_ratio(), min(1.0, v))
+    except (TypeError, ValueError):
+        return 0.7
+
+
+def _confidence_inconclusive_thinking_factor() -> float:
+    """``JARVIS_CONFIDENCE_INCONCLUSIVE_THINKING_FACTOR`` (default
+    0.5). Multiplier on the next round's thinking budget when the
+    verdict is INCONCLUSIVE — 0.5 halves the budget, biasing the
+    model toward less rope to spin uncertain reasoning. Floored at
+    0.05 (5% of original) to avoid effectively disabling thinking;
+    capped at 1.0 (no reduction)."""
+    raw = os.environ.get(
+        "JARVIS_CONFIDENCE_INCONCLUSIVE_THINKING_FACTOR", "0.5",
+    )
+    try:
+        v = float(raw)
+        if v != v:
+            return 0.5
+        return max(0.05, min(1.0, v))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _render_confidence_collapse_feedback(error: Any) -> str:
+    """Render structured feedback the next GENERATE round threads
+    into its prompt. Defensive: works on any object with the
+    documented ``ConfidenceCollapseError`` attributes; falls back
+    gracefully when fields are missing. NEVER raises.
+
+    The rendered text is bounded to ~600 chars so it doesn't
+    dominate the next prompt's token budget."""
+    try:
+        op_id = str(getattr(error, "op_id", "") or "<unknown>")
+        verdict = getattr(error, "verdict", None)
+        verdict_str = (
+            str(verdict.value) if hasattr(verdict, "value")
+            else str(verdict or "<unknown>")
+        )
+        rolling = getattr(error, "rolling_margin", None)
+        rolling_str = (
+            f"{float(rolling):.4f}" if rolling is not None else "n/a"
+        )
+        floor = float(getattr(error, "floor", 0.0) or 0.0)
+        eff_floor = float(getattr(error, "effective_floor", 0.0) or 0.0)
+        posture = str(getattr(error, "posture", "") or "none")
+        obs = int(getattr(error, "observations_count", 0) or 0)
+        win = int(getattr(error, "window_size", 0) or 0)
+        provider = str(getattr(error, "provider", "") or "")
+        model_id = str(getattr(error, "model_id", "") or "")
+    except Exception:  # noqa: BLE001 — defensive
+        return (
+            "Confidence collapse detected on prior GENERATE round. "
+            "Consider tightening reasoning + reducing speculative "
+            "branches in the next attempt."
+        )
+    return (
+        "[CONFIDENCE-COLLAPSE-FEEDBACK]\n"
+        f"Prior GENERATE round op={op_id} on provider={provider!r} "
+        f"model={model_id!r} produced low rolling-mean confidence "
+        f"margin (rolling={rolling_str}, floor={floor:.4f}, "
+        f"effective_floor={eff_floor:.4f} under posture={posture}, "
+        f"obs={obs}/{win}, verdict={verdict_str}).\n"
+        "Guidance for this round:\n"
+        "  - prefer one concrete approach over enumerating "
+        "alternatives;\n"
+        "  - cite specific file paths + symbol names rather than "
+        "describing them in prose;\n"
+        "  - if uncertainty is real, emit a single ask_human "
+        "question at the appropriate boundary instead of guessing;\n"
+        "  - avoid hedging language ('maybe', 'perhaps', 'I think') "
+        "in favor of declarative statements grounded in evidence."
+    )
+
+
+def _render_confidence_collapse_escalation(error: Any) -> str:
+    """Render escalation text when the probe CONFIRMS real distress.
+    The operator-facing summary; threaded onto the NOTIFY_APPLY
+    surface. Bounded ~400 chars. NEVER raises."""
+    try:
+        op_id = str(getattr(error, "op_id", "") or "<unknown>")
+        rolling = getattr(error, "rolling_margin", None)
+        rolling_str = (
+            f"{float(rolling):.4f}" if rolling is not None else "n/a"
+        )
+        eff_floor = float(getattr(error, "effective_floor", 0.0) or 0.0)
+        posture = str(getattr(error, "posture", "") or "none")
+    except Exception:  # noqa: BLE001
+        return (
+            "Confidence collapse escalated to operator: model is "
+            "in epistemic distress on this op."
+        )
+    return (
+        "[CONFIDENCE-COLLAPSE-ESCALATION]\n"
+        f"op={op_id} margin={rolling_str} effective_floor="
+        f"{eff_floor:.4f} posture={posture}. Probe confirmed "
+        f"real distress (not stylistic variation). Escalating to "
+        f"NOTIFY_APPLY+ for operator review."
+    )
+
+
+async def probe_confidence_collapse(
+    *,
+    error: Any,
+    ctx: Optional[Any] = None,
+    prior: float = 0.5,
+    probe: Optional[HypothesisProbe] = None,
+) -> ConfidenceCollapseVerdict:
+    """Probe a confidence-collapse event and return a typed verdict.
+
+    Caller branches on ``verdict.action``:
+      * ``RETRY_WITH_FEEDBACK`` — re-run GENERATE with feedback
+        threaded into the next prompt
+      * ``ESCALATE_TO_OPERATOR`` — raise risk_tier to NOTIFY_APPLY+
+      * ``INCONCLUSIVE`` — re-run GENERATE with reduced thinking
+        budget (``thinking_budget_reduction_factor``)
+
+    Decision math (deterministic, no LLM in the cage):
+      1. Master-flag-gated at three layers — confidence integration
+         flag, hypothesis_consumers flag, hypothesis_probe flag.
+         Any one off → safe legacy default (RETRY_WITH_FEEDBACK
+         with feedback text).
+      2. Memorialization check — if the probe primitive's failed-
+         hypothesis ledger reports this collapse as already-seen,
+         escalate (recurring distress).
+      3. Hard distress signal — if margin/effective_floor < distress
+         ratio (default 0.3) → ESCALATE_TO_OPERATOR.
+      4. Stylistic variation — if margin/effective_floor > stylistic
+         ratio (default 0.7) → RETRY_WITH_FEEDBACK.
+      5. Middle band → INCONCLUSIVE with reduced thinking budget.
+
+    NEVER raises. Bounded by §25 Priority C primitive contracts:
+    depth ≤ 3, budget ≤ $0.05, wall ≤ 30s. Probe failures collapse
+    to safe defaults."""
+    legacy_default = ConfidenceCollapseVerdict(
+        action=ConfidenceCollapseAction.RETRY_WITH_FEEDBACK,
+        confidence_posterior=prior,
+        convergence_state="disabled",
+        observation_summary=(
+            "probe disabled — retry with default feedback"
+        ),
+        cost_usd=0.0,
+        feedback_text=_render_confidence_collapse_feedback(error),
+    )
+
+    if not confidence_probe_integration_enabled():
+        return legacy_default
+    if not hypothesis_consumers_enabled():
+        return legacy_default
+    if not hypothesis_probe_enabled():
+        return legacy_default
+    if error is None:
+        return legacy_default
+
+    # Build hypothesis: "this confidence collapse represents real
+    # epistemic distress (not stylistic variation)". The lookup
+    # strategy memorializes the (claim, signal, strategy) hash —
+    # if we've seen this exact collapse before, the probe returns
+    # ``memorialized_dead`` and we escalate.
+    op_id = str(getattr(error, "op_id", "") or "")
+    verdict_attr = getattr(error, "verdict", None)
+    verdict_str = (
+        str(verdict_attr.value) if hasattr(verdict_attr, "value")
+        else str(verdict_attr or "unknown")
+    )
+    expected_signal = (
+        f"file_exists:.jarvis/confidence_collapses/{op_id}.marker"
+    )
+    h = Hypothesis(
+        claim=(
+            f"confidence_collapse on op {op_id} represents real "
+            f"epistemic distress (verdict={verdict_str})"
+        ),
+        confidence_prior=prior,
+        test_strategy="lookup",
+        expected_signal=expected_signal,
+        parent_op_id=op_id,
+    )
+
+    try:
+        runner = probe or get_default_probe()
+        result = await runner.test(h)
+    except Exception:  # noqa: BLE001 — never raise out of consumer
+        logger.debug(
+            "[probe_confidence_collapse] probe.test raised — "
+            "falling back to legacy default", exc_info=True,
+        )
+        return legacy_default
+
+    return _decide_confidence_collapse_action(error, result)
+
+
+def _decide_confidence_collapse_action(
+    error: Any,
+    result: ProbeResult,
+) -> ConfidenceCollapseVerdict:
+    """Pure decision math from (error, ProbeResult) → Verdict.
+    Separated from the async dispatcher so tests can hit the
+    decision logic directly without an async probe call.
+    NEVER raises."""
+    try:
+        # 1. Memorialization check — recurring collapse on this
+        # claim hash → escalate.
+        if result.convergence_state == "memorialized_dead":
+            return ConfidenceCollapseVerdict(
+                action=ConfidenceCollapseAction.ESCALATE_TO_OPERATOR,
+                confidence_posterior=result.confidence_posterior,
+                convergence_state=result.convergence_state,
+                observation_summary=(
+                    "recurring confidence collapse — "
+                    "escalating to operator"
+                ),
+                cost_usd=result.cost_usd,
+                feedback_text=(
+                    _render_confidence_collapse_escalation(error)
+                ),
+            )
+
+        # 2/3/4. Margin-band decision math.
+        rolling = getattr(error, "rolling_margin", None)
+        eff_floor = float(getattr(error, "effective_floor", 0.0) or 0.0)
+        distress_ratio = _confidence_distress_ratio()
+        stylistic_ratio = _confidence_stylistic_ratio()
+
+        # Defensive: missing margin or zero floor → INCONCLUSIVE
+        # (we have no signal to band on).
+        if rolling is None or eff_floor <= 0.0:
+            return ConfidenceCollapseVerdict(
+                action=ConfidenceCollapseAction.INCONCLUSIVE,
+                confidence_posterior=result.confidence_posterior,
+                convergence_state=result.convergence_state,
+                observation_summary=(
+                    "insufficient margin signal — retry with "
+                    "reduced thinking budget"
+                ),
+                cost_usd=result.cost_usd,
+                thinking_budget_reduction_factor=(
+                    _confidence_inconclusive_thinking_factor()
+                ),
+            )
+
+        rolling_f = float(rolling)
+        ratio = rolling_f / eff_floor
+
+        if ratio < distress_ratio:
+            return ConfidenceCollapseVerdict(
+                action=ConfidenceCollapseAction.ESCALATE_TO_OPERATOR,
+                confidence_posterior=result.confidence_posterior,
+                convergence_state=result.convergence_state,
+                observation_summary=(
+                    f"margin/floor ratio {ratio:.3f} < distress "
+                    f"threshold {distress_ratio:.3f} — real distress"
+                ),
+                cost_usd=result.cost_usd,
+                feedback_text=(
+                    _render_confidence_collapse_escalation(error)
+                ),
+            )
+        if ratio > stylistic_ratio:
+            return ConfidenceCollapseVerdict(
+                action=ConfidenceCollapseAction.RETRY_WITH_FEEDBACK,
+                confidence_posterior=result.confidence_posterior,
+                convergence_state=result.convergence_state,
+                observation_summary=(
+                    f"margin/floor ratio {ratio:.3f} > stylistic "
+                    f"threshold {stylistic_ratio:.3f} — likely "
+                    f"stylistic variation"
+                ),
+                cost_usd=result.cost_usd,
+                feedback_text=(
+                    _render_confidence_collapse_feedback(error)
+                ),
+            )
+        # Middle band
+        return ConfidenceCollapseVerdict(
+            action=ConfidenceCollapseAction.INCONCLUSIVE,
+            confidence_posterior=result.confidence_posterior,
+            convergence_state=result.convergence_state,
+            observation_summary=(
+                f"margin/floor ratio {ratio:.3f} in band "
+                f"[{distress_ratio:.3f}, {stylistic_ratio:.3f}] — "
+                f"retry with reduced thinking budget"
+            ),
+            cost_usd=result.cost_usd,
+            thinking_budget_reduction_factor=(
+                _confidence_inconclusive_thinking_factor()
+            ),
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return ConfidenceCollapseVerdict(
+            action=ConfidenceCollapseAction.RETRY_WITH_FEEDBACK,
+            confidence_posterior=getattr(
+                result, "confidence_posterior", 0.5,
+            ),
+            convergence_state="evaluator_error",
+            observation_summary=(
+                "decision logic raised — falling back to retry"
+            ),
+            cost_usd=getattr(result, "cost_usd", 0.0),
+            feedback_text=_render_confidence_collapse_feedback(error),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -406,12 +827,16 @@ async def probe_goal_disambiguation(
 
 __all__ = [
     "CapabilityGapVerdict",
+    "ConfidenceCollapseAction",
+    "ConfidenceCollapseVerdict",
     "GoalDisambiguationVerdict",
     "HYPOTHESIS_CONSUMERS_SCHEMA_VERSION",
     "IntentDismissalVerdict",
     "TrivialityVerdict",
+    "confidence_probe_integration_enabled",
     "hypothesis_consumers_enabled",
     "probe_capability_gap",
+    "probe_confidence_collapse",
     "probe_goal_disambiguation",
     "probe_intent_dismissal",
     "probe_trivial_op_assumption",
