@@ -804,6 +804,22 @@ def main() -> None:
             "asserts each decision matches the recorded output."
         ),
     )
+    # Priority 2 Slice 5 — record-level fork replay.
+    # Distinct from --rerun (which replays a full session). --rerun-from
+    # loads the CausalityDAG, locates the target record, and forks
+    # execution from that point. New decisions carry counterfactual_of.
+    parser.add_argument(
+        "--rerun-from",
+        type=str,
+        default=None,
+        metavar="RECORD_ID",
+        help=(
+            "Fork replay from a specific decision record within the "
+            "session specified by --rerun. Requires --rerun to identify "
+            "the session. New decisions written during the forked run "
+            "carry counterfactual_of=<original-record-id>."
+        ),
+    )
     # Phase 8 surface wiring Slice 3 — multi-op timeline renderer.
     # Read-only over the decision-trace ledger; never boots the
     # battle-test stack. Default false until graduation; respects
@@ -866,6 +882,46 @@ def main() -> None:
                 f"{type(exc).__name__}: {exc}\n"
                 "  Continuing with fresh-session boot.\n"
             )
+
+    # ------------------------------------------------------------------
+    # Priority 2 Slice 5 — record-level fork replay (--rerun-from)
+    # ------------------------------------------------------------------
+    if args.rerun_from is not None:
+        if args.rerun is None:
+            print(
+                f"\n  {_RED}--rerun-from requires --rerun <session-id>{_RESET}\n"
+            )
+            sys.exit(2)
+        try:
+            from backend.core.ouroboros.governance.verification.replay_from_record import (
+                prepare_replay_from_record,
+                apply_replay_from_record_env,
+                render_replay_from_record_summary,
+            )
+            _fork_plan = prepare_replay_from_record(
+                args.rerun, args.rerun_from, mode=args.rerun_mode,
+            )
+            print(render_replay_from_record_summary(_fork_plan))
+            if _fork_plan.is_replayable:
+                apply_replay_from_record_env(
+                    _fork_plan, mode=args.rerun_mode,
+                )
+                print(
+                    f"  → forking from record {args.rerun_from} "
+                    f"in {args.rerun_mode.upper()} mode.\n"
+                )
+            else:
+                print(
+                    f"\n  {_RED}Fork setup failed: "
+                    f"{_fork_plan.failure_reason}{_RESET}\n"
+                )
+                sys.exit(2)
+        except Exception as exc:
+            print(
+                f"\n  {_RED}Fork subsystem unavailable:{_RESET} "
+                f"{type(exc).__name__}: {exc}\n"
+            )
+            sys.exit(2)
 
     # ------------------------------------------------------------------
     # Replay mode — show a previous session timeline and exit
