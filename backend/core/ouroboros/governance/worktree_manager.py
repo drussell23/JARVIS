@@ -19,12 +19,66 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Priority 2 Slice 2 — worker identity for L3 fan-out determinism
+# ---------------------------------------------------------------------------
+
+
+def worker_id_for_path(worktree_path: Optional[str] = None) -> str:
+    """Derive a stable worker identifier for use in per-worker
+    ordinal namespacing (Priority 2 Slice 2 — Causality DAG /
+    PRD §26.5.2).
+
+    Combines ``os.getpid()`` (process unique at any moment) with a
+    one-way SHA1 prefix of the worktree path (deterministic per
+    worker but never leaks the path content). Format: ``"{pid}-{
+    8-char-hash}"`` when a worktree path is supplied, or
+    ``"{pid}-base"`` when running in the shared tree.
+
+    Pure function — NEVER raises, no I/O at call time. Path hashing
+    is an in-memory SHA1 computation. Safe to call from the
+    ordinal-assignment hot path.
+
+    Used by ``decision_runtime.DecisionRuntime`` to namespace its
+    ordinal counter so concurrent multi-worker writes to a shared
+    session ledger produce a stable replayable total order under
+    the lexicographic ``(wall_ts, worker_id, sub_ordinal)`` compare.
+
+    Authority invariants (AST-pinned by tests):
+      * No imports of orchestrator / phase_runners /
+        candidate_generator / iron_gate / change_engine / policy /
+        semantic_guardian / providers / urgency_router.
+      * Pure stdlib (``hashlib`` + ``os``).
+      * NEVER raises out of any input.
+      * Path content NEVER appears in the output (only its 8-char
+        hash prefix); doesn't leak filesystem layout.
+    """
+    try:
+        pid = os.getpid()
+    except Exception:  # noqa: BLE001 — defensive
+        pid = 0
+    if not worktree_path:
+        return f"{pid}-base"
+    try:
+        path_str = str(worktree_path).strip()
+        if not path_str:
+            return f"{pid}-base"
+        path_hash = hashlib.sha1(
+            path_str.encode("utf-8", errors="replace"),
+        ).hexdigest()[:8]
+        return f"{pid}-{path_hash}"
+    except Exception:  # noqa: BLE001 — defensive
+        return f"{pid}-base"
 
 
 def _parse_worktree_porcelain(text: str) -> "list[dict[str, str]]":

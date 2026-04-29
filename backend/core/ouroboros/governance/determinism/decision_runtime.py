@@ -132,6 +132,54 @@ def causality_dag_schema_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def per_worker_ordinals_enabled() -> bool:
+    """``JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED`` (default ``false``
+    — Priority 2 Slice 2; flips to ``true`` in Slice 6 graduation).
+
+    Master flag governing whether the per-worker ordinal namespace
+    is computed + emitted at write time. When off, the legacy
+    ``_ordinals: Dict[(op_id, phase, kind), int]`` is the sole
+    source of truth and the new ``worker_id`` / ``sub_ordinal``
+    fields stay at sentinels (empty + -1) — the JSONL output is
+    byte-for-byte identical to pre-Slice-2 ledgers.
+
+    When on (shadow mode): the per-worker dict is populated in
+    parallel and the new fields ARE emitted. Replay still uses the
+    legacy ordinal until the enforce sub-flag flips.
+
+    Asymmetric env semantics — empty/whitespace = current default
+    false; explicit truthy enables; explicit falsy disables."""
+    raw = os.environ.get(
+        "JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return False  # Slice 2 default
+    return raw in ("1", "true", "yes", "on")
+
+
+def per_worker_ordinals_enforce() -> bool:
+    """``JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE`` (default ``false``
+    — Priority 2 Slice 2; flips to ``true`` in Slice 6 graduation).
+
+    Sub-flag governing whether the per-worker namespace is
+    AUTHORITATIVE for replay. When off (shadow mode), Slice 2 is
+    purely additive — the runtime tracks both old + new ordinal
+    keys but legacy lookup paths still use the legacy key. When on
+    (graduated), replay uses ``(worker_id, op_id, phase, kind)`` as
+    the canonical lookup key. Mirrors the Slice 5 Arc B + Priority
+    1 Slice 2 shadow→enforce pattern.
+
+    Always paired with the master flag — both must be on for the
+    enforce path to engage. When master is off, this flag is
+    structurally ignored at the runtime layer."""
+    raw = os.environ.get(
+        "JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE", "",
+    ).strip().lower()
+    if raw == "":
+        return False  # Slice 2 default — shadow mode
+    return raw in ("1", "true", "yes", "on")
+
+
 class LedgerMode(Enum):
     """Operating mode for the decision runtime.
 
@@ -257,6 +305,15 @@ class DecisionRecord:
     # Priority 2 Slice 1 — Causality DAG lineage (additive).
     parent_record_ids: Tuple[str, ...] = ()
     counterfactual_of: Optional[str] = None
+    # Priority 2 Slice 2 — per-worker ordinal namespace for L3
+    # fan-out determinism (additive). Empty string + sentinel -1
+    # mean "absent / pre-Slice-2 record" — preserved on read for
+    # backward-compat. Total order across workers is the
+    # lexicographic compare ``(wall_ts, worker_id, sub_ordinal)``;
+    # legacy ``ordinal`` field stays authoritative until Slice 6
+    # graduation flips JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE on.
+    worker_id: str = ""
+    sub_ordinal: int = -1
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -281,6 +338,14 @@ class DecisionRecord:
             out["parent_record_ids"] = list(self.parent_record_ids)
         if self.counterfactual_of is not None:
             out["counterfactual_of"] = str(self.counterfactual_of)
+        # Priority 2 Slice 2 — emit per-worker ordinal namespace
+        # ONLY when set. worker_id="" + sub_ordinal=-1 are sentinels
+        # for "absent / pre-Slice-2 record" — same byte-for-byte
+        # preservation as Slice 1.
+        if self.worker_id:
+            out["worker_id"] = str(self.worker_id)
+        if self.sub_ordinal >= 0:
+            out["sub_ordinal"] = int(self.sub_ordinal)
         return out
 
     @classmethod
@@ -320,6 +385,26 @@ class DecisionRecord:
                     safe_counter = s if s else None
                 except Exception:  # noqa: BLE001 — defensive
                     safe_counter = None
+            # Priority 2 Slice 2 — defensive worker namespace parse.
+            # Pre-Slice-2 records (without these keys) parse with
+            # empty string + -1 sentinels.
+            raw_worker = raw.get("worker_id")
+            safe_worker: str = ""
+            if raw_worker is not None:
+                try:
+                    s = str(raw_worker).strip()
+                    safe_worker = s
+                except Exception:  # noqa: BLE001 — defensive
+                    safe_worker = ""
+            raw_sub = raw.get("sub_ordinal")
+            safe_sub: int = -1
+            if raw_sub is not None:
+                try:
+                    safe_sub = int(raw_sub)
+                    if safe_sub < 0:
+                        safe_sub = -1
+                except (TypeError, ValueError):
+                    safe_sub = -1
             return cls(
                 record_id=str(raw["record_id"]),
                 session_id=str(raw["session_id"]),
@@ -333,6 +418,8 @@ class DecisionRecord:
                 wall_ts=float(raw["wall_ts"]),
                 parent_record_ids=safe_parents,
                 counterfactual_of=safe_counter,
+                worker_id=safe_worker,
+                sub_ordinal=safe_sub,
             )
         except (KeyError, ValueError, TypeError):
             return None
@@ -463,6 +550,7 @@ class DecisionRuntime:
         *,
         session_id: str,
         path: Optional[Path] = None,
+        worktree_path: Optional[str] = None,
     ) -> None:
         self._session_id = (str(session_id).strip() or "default")
         self._path = path  # resolved lazily so env can be patched
@@ -470,6 +558,19 @@ class DecisionRuntime:
         self._sync_lock = threading.RLock()
         # Per-(op_id, phase, kind) ordinal counters for record mode
         self._ordinals: Dict[Tuple[str, str, str], int] = {}
+        # Priority 2 Slice 2 — per-(worker_id, op_id, phase, kind)
+        # ordinal counters for the L3 fan-out determinism fix.
+        # Master-flag-gated: populated in shadow mode when
+        # JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED=true; authoritative
+        # for replay when JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE=true.
+        # Computed lazily once at first record() call to avoid
+        # importing worktree_manager during constructor (keeps the
+        # constructor pure + cage-clean).
+        self._per_worker_ordinals: Dict[
+            Tuple[str, str, str, str], int
+        ] = {}
+        self._worker_id: Optional[str] = None
+        self._worktree_path: Optional[str] = worktree_path
         # Lazy lookup index for replay/verify: keys → record
         self._index: Optional[Dict[Tuple[str, str, str, int], DecisionRecord]] = None
         self._index_loaded_from_path: Optional[Path] = None
@@ -477,6 +578,25 @@ class DecisionRuntime:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    def _resolve_worker_id(self) -> str:
+        """Lazily compute the worker_id once per runtime instance.
+
+        Imports ``worker_id_for_path`` from ``worktree_manager`` lazily
+        so the constructor stays cage-clean (no eager dependency on
+        the W3(6) primitive). Cached after first call. NEVER raises —
+        falls back to ``"unknown-worker"`` on any import / compute
+        failure so the runtime always has a stable identifier."""
+        if self._worker_id is not None:
+            return self._worker_id
+        try:
+            from backend.core.ouroboros.governance.worktree_manager import (
+                worker_id_for_path,
+            )
+            self._worker_id = worker_id_for_path(self._worktree_path)
+        except Exception:  # noqa: BLE001 — defensive
+            self._worker_id = "unknown-worker"
+        return self._worker_id
 
     def _resolved_path(self) -> Path:
         if self._path is not None:
@@ -516,9 +636,28 @@ class DecisionRuntime:
             parent_record_ids. Used by Slice 5's ``--rerun-from``."""
         try:
             ordinal_key = (op_id, phase, kind)
+            # Priority 2 Slice 2 — pre-compute master-flag state once
+            # per call so concurrent flag toggles can't produce a
+            # split-state record.
+            per_worker_master_on = per_worker_ordinals_enabled()
+            worker_id_str: str = ""
+            sub_ordinal_val: int = -1
             with self._sync_lock:
                 ordinal = self._ordinals.get(ordinal_key, 0)
                 self._ordinals[ordinal_key] = ordinal + 1
+                # Priority 2 Slice 2 — populate per-worker dict in
+                # shadow mode. Same lock window as legacy ordinal
+                # increment so the two counters stay coherent across
+                # concurrent record() calls.
+                if per_worker_master_on:
+                    worker_id_str = self._resolve_worker_id()
+                    pw_key = (worker_id_str, op_id, phase, kind)
+                    sub_ordinal_val = self._per_worker_ordinals.get(
+                        pw_key, 0,
+                    )
+                    self._per_worker_ordinals[pw_key] = (
+                        sub_ordinal_val + 1
+                    )
 
             inputs_hash = _canonical_hash(dict(inputs) if inputs else {})
             output_repr = _canonical_serialize(output)
@@ -562,6 +701,8 @@ class DecisionRuntime:
                 wall_ts=wall_ts,
                 parent_record_ids=safe_parents,
                 counterfactual_of=safe_counter,
+                worker_id=worker_id_str,
+                sub_ordinal=sub_ordinal_val,
             )
             await self._append_to_disk(record)
             # Mutate the lazy index if it was already built
