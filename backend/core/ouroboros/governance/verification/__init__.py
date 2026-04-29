@@ -92,6 +92,29 @@ from backend.core.ouroboros.governance.verification.evidence_collectors import (
     list_evidence_gatherers,
     register_evidence_gatherer,
 )
+from backend.core.ouroboros.governance.verification.evidence_capture import (
+    capture_test_files_inventory,
+    compute_unified_diff,
+    evidence_capture_enabled,
+    snapshot_target_files,
+    stamp_apply_evidence_post,
+    stamp_diff_text,
+    stamp_target_files_post,
+    stamp_target_files_pre,
+    stamp_test_files_post,
+    stamp_test_files_pre,
+)
+from backend.core.ouroboros.governance.verification.hypothesis_consumers import (
+    CapabilityGapVerdict,
+    GoalDisambiguationVerdict,
+    IntentDismissalVerdict,
+    TrivialityVerdict,
+    hypothesis_consumers_enabled,
+    probe_capability_gap,
+    probe_goal_disambiguation,
+    probe_intent_dismissal,
+    probe_trivial_op_assumption,
+)
 
 __all__ = [
     "CANONICAL_SEVERITIES",

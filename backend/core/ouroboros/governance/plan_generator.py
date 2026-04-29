@@ -371,6 +371,38 @@ class PlanGenerator:
         # explicitly asked to review a plan before any execution. ──
         forced_plan_review = _plan_review_required()
         skip_reason = "" if forced_plan_review else self._should_skip(ctx)
+        if skip_reason and skip_reason.startswith("trivial_op:"):
+            # Priority C consumer wiring — probe the trivial-op
+            # assumption before silently skipping PLAN. The legacy
+            # heuristic (1 file + short description) misclassified
+            # large-file ops as trivial in soak #3, which silently
+            # disabled Slice 2.3 claim capture for the whole op.
+            # The probe falsifies the heuristic when a target file
+            # is non-trivially sized; if REFUTED, force PLAN to run.
+            try:
+                from backend.core.ouroboros.governance.verification.hypothesis_consumers import (
+                    probe_trivial_op_assumption,
+                )
+                _verdict = await probe_trivial_op_assumption(
+                    target_files=ctx.target_files,
+                    op_id=ctx.op_id,
+                    description=ctx.description or "",
+                )
+                if not _verdict.treat_as_trivial:
+                    logger.info(
+                        "[PlanGenerator] trivial-op assumption REFUTED "
+                        "by HypothesisProbe — forcing PLAN op=%s "
+                        "post=%.3f reason=%s",
+                        ctx.op_id,
+                        _verdict.confidence_posterior,
+                        _verdict.observation_summary[:80],
+                    )
+                    skip_reason = ""  # override the skip
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[PlanGenerator] trivial-op probe failed; legacy "
+                    "heuristic stands op=%s", ctx.op_id, exc_info=True,
+                )
         if skip_reason:
             logger.info(
                 "[PlanGenerator] Skipping plan for op=%s: %s",
