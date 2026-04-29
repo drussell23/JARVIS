@@ -1091,6 +1091,39 @@ class DoublewordProvider:
                 input_tokens = 0
                 output_tokens = 0
                 _PER_CHUNK_TIMEOUT = 30.0  # seconds between SSE chunks
+
+                # Priority 1 Slice 1 — confidence capture (PRD §26.5.1).
+                # Master-flag-gated; when enabled, request OpenAI-compat
+                # per-token logprobs from the provider so the streaming
+                # parse below can capture the top-1/top-2 margin signal
+                # into ctx.artifacts["confidence_capturer"]. Capture is
+                # purely additive on the response; the request shape
+                # only changes when the flag is on (byte-for-byte
+                # preserved when off).
+                from backend.core.ouroboros.governance.verification.confidence_capture import (
+                    ConfidenceCapturer,
+                    confidence_capture_enabled,
+                    confidence_capture_top_k,
+                    extract_openai_compat_logprobs_from_chunk,
+                )
+                _confidence_capturer: Optional[ConfidenceCapturer] = None
+                if confidence_capture_enabled():
+                    body["logprobs"] = True
+                    body["top_logprobs"] = confidence_capture_top_k()
+                    _confidence_capturer = ConfidenceCapturer(
+                        provider="doubleword",
+                        model_id=str(_effective_model or ""),
+                    )
+                    # Stash on ctx.artifacts so downstream phase runners
+                    # (Slice 2 monitor) can read the trace post-stream.
+                    try:
+                        _artifacts = getattr(context, "artifacts", None)
+                        if isinstance(_artifacts, dict):
+                            _artifacts["confidence_capturer"] = (
+                                _confidence_capturer
+                            )
+                    except Exception:  # noqa: BLE001 — capture must
+                        pass        # never break the stream loop
                 # Phase 12.2 Slice C — TTFT measurement window opens
                 # the moment we issue the request and closes on first
                 # non-empty content chunk. monotonic() is jump-proof
@@ -1140,6 +1173,26 @@ class DoublewordProvider:
                             chunk = json.loads(data_str)
                             delta = chunk.get("choices", [{}])[0].get("delta", {})
                             token = delta.get("content", "")
+                            # Priority 1 Slice 1 — pure logprob capture.
+                            # Reads chunk["choices"][0]["logprobs"]["content"]
+                            # if present and feeds each entry to the
+                            # capturer. Master-flag-gated upstream;
+                            # when off, _confidence_capturer is None.
+                            # NEVER raises into the SSE loop.
+                            if _confidence_capturer is not None:
+                                try:
+                                    for _t, _lp, _top in (
+                                        extract_openai_compat_logprobs_from_chunk(
+                                            chunk,
+                                        )
+                                    ):
+                                        _confidence_capturer.append(
+                                            token=_t,
+                                            logprob=_lp,
+                                            top_logprobs=_top,
+                                        )
+                                except Exception:  # noqa: BLE001
+                                    pass
                             if token:
                                 content += token
                                 self._last_chunk_at = time.monotonic()
