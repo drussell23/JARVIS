@@ -258,6 +258,233 @@ class PostmortemDistribution:
         }
 
 
+# Priority 1 Slice 4 — confidence-margin distribution
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConfidencePostmortemDistribution:
+    """Aggregate over a window of postmortems' optional
+    ``confidence_trace_summary`` annotations (Slice 1
+    ConfidenceSummary.to_dict() shape).
+
+    Fields are ``Optional[float]`` because rows without confidence
+    annotations contribute zero. ``records_with_confidence`` reports
+    how many rows had any signal (0 → no signal collected yet)."""
+
+    total_rows: int = 0
+    records_with_confidence: int = 0
+    captured_token_total: int = 0
+    truncated_capture_count: int = 0
+    mean_top1_logprob_avg: Optional[float] = None
+    mean_top1_top2_margin_avg: Optional[float] = None
+    min_top1_top2_margin_observed: Optional[float] = None
+    max_top1_top2_margin_observed: Optional[float] = None
+    provider_histogram: Dict[str, int] = field(default_factory=dict)
+    model_histogram: Dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_rows": self.total_rows,
+            "records_with_confidence": self.records_with_confidence,
+            "captured_token_total": self.captured_token_total,
+            "truncated_capture_count": self.truncated_capture_count,
+            "mean_top1_logprob_avg": (
+                round(self.mean_top1_logprob_avg, 4)
+                if self.mean_top1_logprob_avg is not None else None
+            ),
+            "mean_top1_top2_margin_avg": (
+                round(self.mean_top1_top2_margin_avg, 4)
+                if self.mean_top1_top2_margin_avg is not None else None
+            ),
+            "min_top1_top2_margin_observed": (
+                round(self.min_top1_top2_margin_observed, 4)
+                if self.min_top1_top2_margin_observed is not None else None
+            ),
+            "max_top1_top2_margin_observed": (
+                round(self.max_top1_top2_margin_observed, 4)
+                if self.max_top1_top2_margin_observed is not None else None
+            ),
+            "provider_histogram": dict(self.provider_histogram),
+            "model_histogram": dict(self.model_histogram),
+        }
+
+
+def compute_confidence_distribution(
+    rows: List[Dict[str, Any]],
+) -> ConfidencePostmortemDistribution:
+    """Aggregate confidence-trace summaries from postmortem rows.
+
+    Looks under ``row["postmortem"]["confidence_trace_summary"]``
+    AND ``row["confidence_trace_summary"]`` (Slice 5+ may write
+    either shape; tolerates both). Defensively skips malformed
+    entries; NEVER raises."""
+    total = 0
+    with_conf = 0
+    token_total = 0
+    truncated_count = 0
+    margin_sum = 0.0
+    margin_count = 0
+    top1_logprob_sum = 0.0
+    top1_logprob_count = 0
+    min_margin: Optional[float] = None
+    max_margin: Optional[float] = None
+    provider_hist: Dict[str, int] = {}
+    model_hist: Dict[str, int] = {}
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        total += 1
+        # Tolerate both summary locations
+        summary = None
+        pm = r.get("postmortem") or {}
+        if isinstance(pm, dict):
+            summary = pm.get("confidence_trace_summary")
+        if not isinstance(summary, dict):
+            summary = r.get("confidence_trace_summary")
+        if not isinstance(summary, dict):
+            continue
+        with_conf += 1
+        try:
+            token_total += int(summary.get("token_count") or 0)
+        except (TypeError, ValueError):
+            pass
+        if bool(summary.get("capture_truncated", False)):
+            truncated_count += 1
+        provider = str(summary.get("provider") or "")
+        if provider:
+            provider_hist[provider] = provider_hist.get(provider, 0) + 1
+        model_id = str(summary.get("model_id") or "")
+        if model_id:
+            model_hist[model_id] = model_hist.get(model_id, 0) + 1
+        try:
+            mean_margin = summary.get("mean_top1_top2_margin")
+            if mean_margin is not None:
+                m = float(mean_margin)
+                if m == m:  # NaN check
+                    margin_sum += m
+                    margin_count += 1
+        except (TypeError, ValueError):
+            pass
+        try:
+            mean_t1 = summary.get("mean_top1_logprob")
+            if mean_t1 is not None:
+                v = float(mean_t1)
+                if v == v:
+                    top1_logprob_sum += v
+                    top1_logprob_count += 1
+        except (TypeError, ValueError):
+            pass
+        try:
+            min_m = summary.get("min_top1_top2_margin")
+            if min_m is not None:
+                mv = float(min_m)
+                if mv == mv:
+                    min_margin = (
+                        mv if min_margin is None else min(min_margin, mv)
+                    )
+        except (TypeError, ValueError):
+            pass
+        try:
+            max_m = summary.get("max_top1_top2_margin")
+            if max_m is not None:
+                xv = float(max_m)
+                if xv == xv:
+                    max_margin = (
+                        xv if max_margin is None else max(max_margin, xv)
+                    )
+        except (TypeError, ValueError):
+            pass
+
+    return ConfidencePostmortemDistribution(
+        total_rows=total,
+        records_with_confidence=with_conf,
+        captured_token_total=token_total,
+        truncated_capture_count=truncated_count,
+        mean_top1_logprob_avg=(
+            top1_logprob_sum / top1_logprob_count
+            if top1_logprob_count > 0 else None
+        ),
+        mean_top1_top2_margin_avg=(
+            margin_sum / margin_count if margin_count > 0 else None
+        ),
+        min_top1_top2_margin_observed=min_margin,
+        max_top1_top2_margin_observed=max_margin,
+        provider_histogram=provider_hist,
+        model_histogram=model_hist,
+    )
+
+
+def render_confidence_distribution(
+    dist: ConfidencePostmortemDistribution,
+) -> str:
+    """Render a human-readable summary of the confidence distribution.
+    NEVER raises."""
+    try:
+        if dist.records_with_confidence == 0:
+            return _ascii_clip(
+                f"[postmortems confidence-distribution]\n"
+                f"  total rows scanned: {dist.total_rows}\n"
+                f"  records with confidence summary: 0\n"
+                f"  (no signal yet — Slice 5+ wires "
+                f"confidence_trace_summary into postmortem records)"
+            )
+        lines = [
+            "[postmortems confidence-distribution]",
+            f"  total rows: {dist.total_rows}",
+            f"  with confidence: {dist.records_with_confidence} "
+            f"({dist.records_with_confidence / max(1, dist.total_rows) * 100:.1f}%)",
+            f"  total tokens captured: {dist.captured_token_total}",
+            f"  truncated captures: {dist.truncated_capture_count}",
+        ]
+        if dist.mean_top1_logprob_avg is not None:
+            lines.append(
+                f"  mean top1 logprob (avg over rows): "
+                f"{dist.mean_top1_logprob_avg:.4f}"
+            )
+        if dist.mean_top1_top2_margin_avg is not None:
+            lines.append(
+                f"  mean top1/top2 margin (avg over rows): "
+                f"{dist.mean_top1_top2_margin_avg:.4f}"
+            )
+        if dist.min_top1_top2_margin_observed is not None:
+            lines.append(
+                f"  min margin observed: "
+                f"{dist.min_top1_top2_margin_observed:.4f}"
+            )
+        if dist.max_top1_top2_margin_observed is not None:
+            lines.append(
+                f"  max margin observed: "
+                f"{dist.max_top1_top2_margin_observed:.4f}"
+            )
+        if dist.provider_histogram:
+            top_provs = sorted(
+                dist.provider_histogram.items(),
+                key=lambda kv: -kv[1],
+            )[:5]
+            lines.append(
+                "  providers: " + ", ".join(
+                    f"{p}={c}" for p, c in top_provs
+                ),
+            )
+        if dist.model_histogram:
+            top_models = sorted(
+                dist.model_histogram.items(),
+                key=lambda kv: -kv[1],
+            )[:5]
+            lines.append(
+                "  models: " + ", ".join(
+                    f"{m}={c}" for m, c in top_models
+                ),
+            )
+        return _ascii_clip("\n".join(lines))
+    except Exception:  # noqa: BLE001 — defensive
+        return _ascii_clip(
+            "[postmortems confidence-distribution] (render error)"
+        )
+
+
 def compute_distribution(
     rows: List[Dict[str, Any]],
 ) -> PostmortemDistribution:
@@ -351,6 +578,8 @@ def render_help() -> str:
         "  /postmortems distribution          terminal_phase + reason "
         "histogram + empty-claim rate",
         "  /postmortems stats                 alias for distribution",
+        "  /postmortems confidence-distribution  confidence-margin "
+        "summary aggregation (Slice 4)",
         "  /postmortems help                  this listing",
     ]))
 
