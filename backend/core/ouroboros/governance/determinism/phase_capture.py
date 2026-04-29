@@ -257,6 +257,8 @@ async def capture_phase_decision(
     compute: Callable[[], Any],
     extra_inputs: Optional[Mapping[str, Any]] = None,
     output_adapter: Optional[OutputAdapter] = None,
+    parent_record_ids: Optional[Any] = None,
+    counterfactual_of: Optional[str] = None,
 ) -> Any:
     """Phase-runner-shaped wrapper around Slice 1.2's ``decide(...)``.
 
@@ -325,6 +327,8 @@ async def capture_phase_decision(
     serialized = await decide(
         op_id=op_id, phase=phase, kind=kind,
         inputs=inputs, compute=_adapted_compute,
+        parent_record_ids=parent_record_ids,
+        counterfactual_of=counterfactual_of,
     )
 
     # Apply the deserialize step so the caller gets back the original

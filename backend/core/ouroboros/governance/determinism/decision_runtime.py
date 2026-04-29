@@ -72,8 +72,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import (
-    Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping,
-    Optional, Tuple,
+    Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List,
+    Mapping, Optional, Tuple,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,33 @@ def ledger_enabled() -> bool:
     ).strip().lower()
     if raw == "":
         return True  # graduated default
+    return raw in ("1", "true", "yes", "on")
+
+
+def causality_dag_schema_enabled() -> bool:
+    """``JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED`` (default ``false`` —
+    Priority 2 Slice 1; flips to ``true`` in Slice 6 graduation).
+
+    Master flag governing whether ``DecisionRecord``'s lineage
+    fields (``parent_record_ids`` + ``counterfactual_of``) are
+    EMITTED at write time. When off, the ``record()`` path forces
+    these fields to empty/None regardless of caller-supplied input —
+    the JSONL output is byte-for-byte identical to pre-Slice-1
+    ledgers.
+
+    The READ path (``DecisionRecord.from_dict``) is ALWAYS tolerant
+    of the new fields (parses them when present, defaults when
+    absent) regardless of this flag. Tolerance is structural — the
+    dataclass defaults handle backward-compat without needing to
+    consult the flag.
+
+    Asymmetric env semantics — empty/whitespace = current default
+    false; explicit truthy enables; explicit falsy disables."""
+    raw = os.environ.get(
+        "JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return False  # Slice 1 default
     return raw in ("1", "true", "yes", "on")
 
 
@@ -193,7 +220,29 @@ class DecisionRecord:
     Lookup keys: (session_id, op_id, phase, kind, ordinal). Two
     decisions with the same keys are duplicates — REPLAY returns
     the FIRST match; ordinal disambiguates repeated calls within
-    the same op+phase+kind tuple."""
+    the same op+phase+kind tuple.
+
+    Priority 2 Slice 1 (Causality DAG, PRD §26.5.2) extensions —
+    OPTIONAL, additive backward-compat:
+      * ``parent_record_ids`` — explicit causal predecessors (this
+        record's inputs were derived from these prior records).
+        Empty tuple = leaf / no recorded ancestors. Slice 3's
+        ``causality_dag.build_dag`` walks these to construct the
+        session-spanning graph.
+      * ``counterfactual_of`` — when set, marks this record as a
+        "what if?" branch from the named record_id (typically a
+        HypothesisProbe verdict that didn't materialize on the
+        live path). Slice 5's ``--rerun-from`` uses this to
+        differentiate counterfactual replays from live records.
+
+    SCHEMA_VERSION stays ``decision_record.1`` because the new
+    fields are strictly additive on the JSON shape — old records
+    written without these fields parse cleanly via ``from_dict``
+    (defaults applied), and new records written with these fields
+    are read by old code as if they didn't exist (the writer
+    omits the keys when empty/None to minimize bytes + preserve
+    byte-for-byte equality with pre-Slice-1 ledgers under master-
+    off mode)."""
     record_id: str
     session_id: str
     op_id: str
@@ -205,9 +254,12 @@ class DecisionRecord:
     monotonic_ts: float
     wall_ts: float
     schema_version: str = SCHEMA_VERSION
+    # Priority 2 Slice 1 — Causality DAG lineage (additive).
+    parent_record_ids: Tuple[str, ...] = ()
+    counterfactual_of: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "record_id": self.record_id,
             "session_id": self.session_id,
             "op_id": self.op_id,
@@ -220,16 +272,54 @@ class DecisionRecord:
             "wall_ts": self.wall_ts,
             "schema_version": self.schema_version,
         }
+        # Priority 2 Slice 1 — emit lineage fields ONLY when set.
+        # Empty tuple + None → keys absent, byte-for-byte equality
+        # with pre-Slice-1 ledger writes preserved when caller
+        # didn't supply lineage. Old readers ignore unknown keys
+        # and old writers don't emit them.
+        if self.parent_record_ids:
+            out["parent_record_ids"] = list(self.parent_record_ids)
+        if self.counterfactual_of is not None:
+            out["counterfactual_of"] = str(self.counterfactual_of)
+        return out
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> Optional["DecisionRecord"]:
         """Parse from a JSONL row. NEVER raises — returns None on
-        unparseable input."""
+        unparseable input.
+
+        Priority 2 Slice 1: ``parent_record_ids`` and
+        ``counterfactual_of`` are optional + defensively coerced.
+        Pre-Slice-1 records (without these keys) parse with empty
+        tuple + None defaults."""
         try:
             if not isinstance(raw, Mapping):
                 return None
             if raw.get("schema_version") != SCHEMA_VERSION:
                 return None
+            # Priority 2 Slice 1 — defensive lineage parse.
+            # Non-iterable parents → empty tuple; non-string
+            # elements silently skipped; non-string counterfactual
+            # → None. Read path is structurally tolerant.
+            raw_parents = raw.get("parent_record_ids")
+            safe_parents: Tuple[str, ...] = ()
+            if raw_parents is not None:
+                try:
+                    safe_parents = tuple(
+                        str(p) for p in raw_parents
+                        if isinstance(p, (str, int, float))
+                        and str(p).strip() != ""
+                    )
+                except TypeError:
+                    safe_parents = ()
+            raw_counter = raw.get("counterfactual_of")
+            safe_counter: Optional[str] = None
+            if raw_counter is not None:
+                try:
+                    s = str(raw_counter).strip()
+                    safe_counter = s if s else None
+                except Exception:  # noqa: BLE001 — defensive
+                    safe_counter = None
             return cls(
                 record_id=str(raw["record_id"]),
                 session_id=str(raw["session_id"]),
@@ -241,6 +331,8 @@ class DecisionRecord:
                 output_repr=str(raw["output_repr"]),
                 monotonic_ts=float(raw["monotonic_ts"]),
                 wall_ts=float(raw["wall_ts"]),
+                parent_record_ids=safe_parents,
+                counterfactual_of=safe_counter,
             )
         except (KeyError, ValueError, TypeError):
             return None
@@ -403,11 +495,25 @@ class DecisionRuntime:
         kind: str,
         inputs: Mapping[str, Any],
         output: Any,
+        parent_record_ids: Optional[Iterable[Any]] = None,
+        counterfactual_of: Optional[str] = None,
     ) -> Optional[DecisionRecord]:
         """Append a record. Returns the record on success, None on
         disk fault (in which case the caller's compute() output is
         still valid — only the ledger entry was dropped). NEVER
-        raises."""
+        raises.
+
+        Priority 2 Slice 1 (Causality DAG, PRD §26.5.2):
+          * ``parent_record_ids`` — explicit causal predecessors.
+            Coerced defensively (non-iterable → empty; non-string
+            elements skipped). Master-flag-gated: when
+            ``JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED=false``, this
+            kwarg is FORCED to empty regardless of caller — the
+            JSONL output stays byte-for-byte identical to
+            pre-Slice-1 writes.
+          * ``counterfactual_of`` — when set, marks this record as
+            a "what if?" branch. Same master-flag gating as
+            parent_record_ids. Used by Slice 5's ``--rerun-from``."""
         try:
             ordinal_key = (op_id, phase, kind)
             with self._sync_lock:
@@ -417,6 +523,30 @@ class DecisionRuntime:
             inputs_hash = _canonical_hash(dict(inputs) if inputs else {})
             output_repr = _canonical_serialize(output)
             monotonic_ts, wall_ts = _capture_clock_now()
+            # Priority 2 Slice 1 — defensive lineage coercion +
+            # master-flag-gated suppression. When the schema flag is
+            # off, the new fields are forced to empty/None regardless
+            # of caller — preserves byte-for-byte ledger compatibility
+            # with pre-Slice-1 writes.
+            safe_parents: Tuple[str, ...] = ()
+            safe_counter: Optional[str] = None
+            if causality_dag_schema_enabled():
+                if parent_record_ids is not None:
+                    try:
+                        safe_parents = tuple(
+                            str(p).strip() for p in parent_record_ids
+                            if isinstance(p, (str, int, float))
+                            and str(p).strip() != ""
+                        )
+                    except TypeError:
+                        safe_parents = ()
+                if counterfactual_of is not None:
+                    try:
+                        s = str(counterfactual_of).strip()
+                        safe_counter = s if s else None
+                    except Exception:  # noqa: BLE001 — defensive
+                        safe_counter = None
+
             record = DecisionRecord(
                 record_id=_next_record_id(
                     self._session_id, op_id, ordinal,
@@ -430,6 +560,8 @@ class DecisionRuntime:
                 output_repr=output_repr,
                 monotonic_ts=monotonic_ts,
                 wall_ts=wall_ts,
+                parent_record_ids=safe_parents,
+                counterfactual_of=safe_counter,
             )
             await self._append_to_disk(record)
             # Mutate the lazy index if it was already built
@@ -600,9 +732,19 @@ async def decide(
     compute: Callable[[], Awaitable[Any]],
     runtime: Optional[DecisionRuntime] = None,
     ordinal: Optional[int] = None,
+    parent_record_ids: Optional[Iterable[Any]] = None,
+    counterfactual_of: Optional[str] = None,
 ) -> Any:
     """The integration surface. Wraps a decision in record/replay/
     verify semantics based on session mode.
+
+    Priority 2 Slice 1 — optional ``parent_record_ids`` +
+    ``counterfactual_of`` kwargs threaded to ``runtime.record()``.
+    Master-flag-gated by ``JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED``;
+    when off, the kwargs are forced to empty/None at the runtime
+    layer regardless of caller. PASSTHROUGH and REPLAY paths don't
+    invoke ``record()`` so the kwargs have no effect there — only
+    RECORD-mode appends are affected.
 
     Behavior by mode:
       * **PASSTHROUGH** — ``await compute()``, no recording, no
@@ -667,6 +809,8 @@ async def decide(
         await runtime.record(
             op_id=op_id, phase=phase, kind=kind,
             inputs=inputs, output=live,
+            parent_record_ids=parent_record_ids,
+            counterfactual_of=counterfactual_of,
         )
         return live
 
@@ -705,6 +849,8 @@ async def decide(
     await runtime.record(
         op_id=op_id, phase=phase, kind=kind,
         inputs=inputs, output=live,
+        parent_record_ids=parent_record_ids,
+        counterfactual_of=counterfactual_of,
     )
     return live
 
