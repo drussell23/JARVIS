@@ -85,12 +85,20 @@ from backend.core.ouroboros.governance.verification.hypothesis_probe import (
     list_test_strategies,
     register_test_strategy,
 )
+from backend.core.ouroboros.governance.verification.evidence_collectors import (
+    EvidenceGatherer,
+    dispatch_evidence_gather,
+    evidence_collectors_enabled,
+    list_evidence_gatherers,
+    register_evidence_gatherer,
+)
 
 __all__ = [
     "CANONICAL_SEVERITIES",
     "ClaimOutcome",
     "DefaultClaimSpec",
     "EvidenceCollector",
+    "EvidenceGatherer",
     "Property",
     "PropertyClaim",
     "PropertyEvaluator",
@@ -107,6 +115,8 @@ __all__ = [
     "capture_claims",
     "ctx_evidence_collector",
     "default_claims_enabled",
+    "dispatch_evidence_gather",
+    "evidence_collectors_enabled",
     "Hypothesis",
     "HypothesisProbe",
     "ProbeResult",
@@ -119,6 +129,7 @@ __all__ = [
     "get_recorded_claims",
     "get_recorded_postmortem",
     "list_default_claim_specs",
+    "list_evidence_gatherers",
     "list_recent_postmortems",
     "list_test_strategies",
     "log_postmortem_summary",
@@ -129,6 +140,7 @@ __all__ = [
     "property_capture_enabled",
     "register_default_claim_spec",
     "register_evaluator",
+    "register_evidence_gatherer",
     "register_test_strategy",
     "repeat_runner_enabled",
     "synthesize_claims_from_plan",
