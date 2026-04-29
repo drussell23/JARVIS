@@ -580,6 +580,8 @@ def render_help() -> str:
         "  /postmortems stats                 alias for distribution",
         "  /postmortems confidence-distribution  confidence-margin "
         "summary aggregation (Slice 4)",
+        "  /postmortems dag <sub> [args]      causality DAG navigation "
+        "(Slice 4) — try 'dag' for sub-help",
         "  /postmortems help                  this listing",
     ]))
 
@@ -822,6 +824,24 @@ def dispatch_postmortems_command(
         return PostmortemReplResult(
             status=PostmortemReplStatus.OK,
             rendered_text=render_confidence_distribution(dist),
+        )
+    if sub == "dag":
+        # Priority 2 Slice 4 — Causality DAG navigation.
+        # Delegates to dag_navigation.dispatch_dag_command with the
+        # remaining argv. Master-flag gating happens inside the
+        # delegate so the REPL surfaces the correct disabled message.
+        try:
+            from backend.core.ouroboros.governance.verification.dag_navigation import (
+                dispatch_dag_command,
+            )
+            text = dispatch_dag_command(
+                argv[1:], session_id=session_id,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            text = "[dag] import/dispatch error"
+        return PostmortemReplResult(
+            status=PostmortemReplStatus.OK,
+            rendered_text=_ascii_clip(text),
         )
     return PostmortemReplResult(
         status=PostmortemReplStatus.UNKNOWN_SUBCOMMAND,

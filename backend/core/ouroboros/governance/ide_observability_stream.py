@@ -235,6 +235,12 @@ EVENT_TYPE_FLAG_CHANGED = "flag_changed"
 # ``/observability/postmortems/{op_id}`` GET.
 EVENT_TYPE_TERMINAL_POSTMORTEM_PERSISTED = "terminal_postmortem_persisted"
 
+# Priority 2 Slice 4 — Causality DAG fork detection. Fired by
+# dag_navigation.publish_dag_fork_event when a counterfactual
+# branch is detected during DAG construction or navigation.
+# Payload: {record_id, counterfactual_id, session_id, wall_ts}.
+EVENT_TYPE_DAG_FORK_DETECTED = "dag_fork_detected"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -285,6 +291,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SLO_BREACHED,                  # Phase 8 Slice 2
     EVENT_TYPE_FLAG_CHANGED,                  # Phase 8 Slice 2
     EVENT_TYPE_TERMINAL_POSTMORTEM_PERSISTED,  # Priority D Slice D1
+    EVENT_TYPE_DAG_FORK_DETECTED,             # Priority 2 Slice 4
 })
 
 
