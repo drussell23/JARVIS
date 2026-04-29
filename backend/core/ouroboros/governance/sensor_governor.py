@@ -161,6 +161,30 @@ def emergency_postmortem_threshold() -> float:
     return min(1.0, raw)
 
 
+def topology_backpressure_enabled() -> bool:
+    """Slice 3c — TopologySentinel-aware throttle for low-urgency
+    sensors. ``JARVIS_TOPOLOGY_BACKPRESSURE_ENABLED`` (default
+    ``true``). When on, a SensorGovernor whose injected
+    ``topology_state_fn`` reports any DW endpoint blocked applies an
+    additional multiplier to the weighted cap of BACKGROUND and
+    SPECULATIVE urgency requests. IMMEDIATE/STANDARD/COMPLEX caps
+    are untouched (those routes can fall back to Claude). Hot-revert:
+    ``export JARVIS_TOPOLOGY_BACKPRESSURE_ENABLED=false`` returns the
+    cap math to posture × urgency × brake (the pre-3c formula)."""
+    return _env_bool("JARVIS_TOPOLOGY_BACKPRESSURE_ENABLED", True)
+
+
+def topology_backpressure_mult() -> float:
+    """Multiplier applied to BG/SPEC weighted caps when topology is
+    blocked. Default 0.2 = throttle to 20% of the unblocked cap.
+    ``JARVIS_TOPOLOGY_BACKPRESSURE_MULT``. Floor at 0.0 (full halt
+    is allowed); ceiling at 1.0 (no-op upper bound)."""
+    raw = _env_float(
+        "JARVIS_TOPOLOGY_BACKPRESSURE_MULT", 0.2, minimum=0.0,
+    )
+    return min(1.0, raw)
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary
 # ---------------------------------------------------------------------------
@@ -235,6 +259,13 @@ class BudgetDecision:
     emergency_brake: bool = False
     global_cap: int = 0
     global_count: int = 0
+    # Slice 3c — set when topology-backpressure factor was applied to
+    # this sensor's weighted_cap (DW blocked + urgency in BG/SPEC).
+    # Independent of `allowed` — the cap may still leave headroom even
+    # under backpressure; the field is purely observability so SSE
+    # consumers can distinguish "throttled by topology" from "throttled
+    # by capacity".
+    topology_blocked: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -249,6 +280,7 @@ class BudgetDecision:
             "emergency_brake": self.emergency_brake,
             "global_cap": self.global_cap,
             "global_count": self.global_count,
+            "topology_blocked": self.topology_blocked,
         }
 
 
@@ -293,6 +325,24 @@ def _default_signal_bundle_fn() -> Optional[Any]:
         return None
 
 
+def _default_topology_state_fn() -> Tuple[str, ...]:
+    """Slice 3c — default reader for the TopologySentinel singleton.
+
+    Returns the tuple of model_ids currently OPEN/TERMINAL_OPEN. When
+    the sentinel module isn't importable (Slice 1 isolation) OR the
+    sentinel master flag is off, returns ``()`` so backpressure is a
+    no-op and the cap math collapses to the pre-3c formula. NEVER
+    raises — backpressure is advisory; sentinel outage must not break
+    the governor."""
+    try:
+        from backend.core.ouroboros.governance.topology_sentinel import (
+            get_default_sentinel,
+        )
+        return get_default_sentinel().list_blocked_endpoints()
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 # ---------------------------------------------------------------------------
 # SensorGovernor
 # ---------------------------------------------------------------------------
@@ -319,6 +369,9 @@ class SensorGovernor:
         *,
         posture_fn: Optional[Callable[[], Optional[str]]] = None,
         signal_bundle_fn: Optional[Callable[[], Optional[Any]]] = None,
+        topology_state_fn: Optional[
+            Callable[[], Tuple[str, ...]]
+        ] = None,
     ) -> None:
         self._specs: Dict[str, SensorBudgetSpec] = {}
         # Per-sensor deques of emission timestamps (monotonic seconds)
@@ -329,6 +382,11 @@ class SensorGovernor:
         self._decisions: Deque[BudgetDecision] = deque(maxlen=512)
         self._posture_fn = posture_fn or _default_posture_fn
         self._signal_bundle_fn = signal_bundle_fn or _default_signal_bundle_fn
+        # Slice 3c — TopologySentinel-aware backpressure. Returns the
+        # tuple of blocked model_ids; truthy → throttle BG/SPEC caps.
+        self._topology_state_fn = (
+            topology_state_fn or _default_topology_state_fn
+        )
         self._lock = threading.Lock()
 
     # -- registration -------------------------------------------------------
@@ -387,17 +445,45 @@ class SensorGovernor:
         return (cost_burn >= emergency_cost_threshold()
                 or pm_rate >= emergency_postmortem_threshold())
 
+    def _topology_blocking(self, urgency: Urgency) -> bool:
+        """Slice 3c — predicate for "should the topology factor apply
+        to this request?". Returns True iff:
+          * the master flag is on, AND
+          * urgency is BACKGROUND or SPECULATIVE (high-urgency routes
+            cascade to Claude and must not throttle on DW health), AND
+          * the injected ``topology_state_fn`` reports any blocked
+            endpoint.
+
+        The state-fn callable is permitted to raise — we swallow and
+        return False so a sentinel outage never breaks the governor.
+        """
+        if not topology_backpressure_enabled():
+            return False
+        if urgency not in (Urgency.BACKGROUND, Urgency.SPECULATIVE):
+            return False
+        try:
+            blocked = self._topology_state_fn()
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(blocked)
+
     def _weighted_cap(
         self,
         spec: SensorBudgetSpec,
         urgency: Urgency,
         posture: Optional[str],
         brake: bool,
+        topology_blocked: bool = False,
     ) -> int:
         base = spec.base_cap_per_hour
         posture_mult = spec.weight_for_posture(posture)
         urgency_mult = spec.urgency_mult(urgency)
         cap = base * posture_mult * urgency_mult
+        # Slice 3c — topology backpressure factor applied BEFORE the
+        # emergency brake so the two compose (DW blocked + cost-burn
+        # high → 0.2 × 0.2 = 0.04× throttle on BG/SPEC).
+        if topology_blocked:
+            cap *= topology_backpressure_mult()
         if brake:
             cap *= emergency_reduction_pct()
         # Floor at 1 so brake + low-weight sensor isn't fully zeroed
@@ -443,7 +529,11 @@ class SensorGovernor:
             self._evict_expired(now)
 
             brake = self._emergency_brake_active()
-            weighted_cap = self._weighted_cap(spec, urgency, posture, brake)
+            topology_blocked = self._topology_blocking(urgency)
+            weighted_cap = self._weighted_cap(
+                spec, urgency, posture, brake,
+                topology_blocked=topology_blocked,
+            )
             current = len(self._per_sensor.get(sensor_name, ()))
             remaining = max(0, weighted_cap - current)
 
@@ -453,6 +543,12 @@ class SensorGovernor:
                 gcap = max(1, int(gcap * emergency_reduction_pct()))
             gremaining = max(0, gcap - gcount)
 
+            # Slice 3c — when the cap was reduced by topology AND the
+            # reduction is what exhausted the per-sensor budget, stamp
+            # a more specific reason_code so SSE/REPL consumers can
+            # distinguish "throttled by DW health" from "throttled by
+            # capacity". reason_code is otherwise unchanged when the
+            # topology factor wasn't load-bearing.
             if gremaining <= 0:
                 decision = BudgetDecision(
                     allowed=False, sensor_name=sensor_name, urgency=urgency,
@@ -460,14 +556,21 @@ class SensorGovernor:
                     current_count=current, remaining=remaining,
                     reason_code="governor.global_cap_exhausted",
                     emergency_brake=brake, global_cap=gcap, global_count=gcount,
+                    topology_blocked=topology_blocked,
                 )
             elif remaining <= 0:
+                _reason = (
+                    "governor.topology_backpressure"
+                    if topology_blocked
+                    else "governor.sensor_cap_exhausted"
+                )
                 decision = BudgetDecision(
                     allowed=False, sensor_name=sensor_name, urgency=urgency,
                     posture=posture, weighted_cap=weighted_cap,
                     current_count=current, remaining=remaining,
-                    reason_code="governor.sensor_cap_exhausted",
+                    reason_code=_reason,
                     emergency_brake=brake, global_cap=gcap, global_count=gcount,
+                    topology_blocked=topology_blocked,
                 )
             else:
                 decision = BudgetDecision(
@@ -476,6 +579,7 @@ class SensorGovernor:
                     current_count=current, remaining=remaining,
                     reason_code="governor.ok",
                     emergency_brake=brake, global_cap=gcap, global_count=gcount,
+                    topology_blocked=topology_blocked,
                 )
 
             self._decisions.append(decision)
