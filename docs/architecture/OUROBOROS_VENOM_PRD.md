@@ -99,9 +99,9 @@ Ouroboros + Venom (O+V) is the autonomous self-development governance engine of 
 ### Where we stand (2026-04-29 — post-Phase-12-DW-Resilience-closure + soak #7 verification)
 
 - **Architecture**: **A** — the verification loop is now *functionally* live, not just structurally live. The 11-phase FSM + 16 sensors + cost-governor + Iron Gate + risk-tier ladder all compose correctly under hostile network conditions. **Order-2 governance cage shipped (Pass B closed 2026-04-26)** + **Pass C Adaptive Anti-Venom structurally complete (2026-04-26)** + **Phase 1 Determinism Substrate graduated (`memory/project_phase_1_closure.md`, 2026-04-28)** + **Phase 12.2 Physics-Aware Topology Routing closed (`memory/project_phase_12_2_closure.md`, 2026-04-28)** + **Phase 2 Closed-Loop Self-Verification graduated (`dc5f77017f`, 2026-04-29)** + **§25 Priorities A–F all CLOSED single-day (2026-04-29)**: A (mandatory claim density), B (MetaSensor degenerate-loop alarm), C (HypothesisProbe + Venom `hypothesize` tool), D (postmortem ledger discoverability), E (shipped-code structural invariants + Order-2 promotion), F (evidence collector extension + F2/F3 capture) + **Phase 12 DW Resilience CLOSED 2026-04-29 (`memory/project_phase_12_dw_resilience_closure.md`)**: Pricing Oracle (Option α) + Sentinel-Pacemaker Handshake (Option β) + Universal Terminal Postmortem (Option E) all validated firing live in soak #7 under DW endpoint flakiness.
-- **Cognitive depth**: **B+** — the verification loop now *closes meaningfully*. Soak #7 (2026-04-29, `bt-2026-04-29-074851`) produced 8 postmortem captures + 8 default-claim batches with non-trivial claim density (claims=3 pass=1 fail=0 insuff=2 err=0) and clean idle exit. The organism now both remembers every death *and* records predictions to compare those deaths against. The remaining gap from B+ to A is a *cognitive* one (no probabilistic posture, no causality DAG, no adaptive Anti-Venom in production), not a *scaffolding* one. See §26 for the full review.
+- **Cognitive depth**: **A−** — Priority 1 (Confidence-Aware Execution, CLOSED 2026-04-29) wired confidence as a routing/circuit-breaker signal + HypothesisProbe consumer. Priority 2 (Causality DAG, CLOSED 2026-04-29) shipped session-spanning navigable graph + replay-from-record + L3 fan-out determinism fix. The verification loop now closes *meaningfully* AND has structural memory of its own causal history. The remaining gap to full A is Priority 3 (Adaptive Anti-Venom, gated on W2(5) Slice 5b → Pass B Slice 1 → Pass C Slice 1). See §26 for the full review.
 - **Production track record**: 1 verified end-to-end multi-file APPLY (Sessions Q-S, 2026-04-15); 7 soaks 2026-04-29: soaks #1–#3 caught Phase 2 hollowness (forcing §25 Priorities A–F); soak #4 validated A-shipped; soak #5 validated A+B+C+D+E+F empirical loop closure; soak #6 surfaced Static Pricing Blindspot (forced Phase 12 DW Resilience); **soak #7 (`bt-2026-04-29-074851`) — clean idle exit, session_outcome=complete, 16 Pricing Oracle resolutions + 3 Handshake firings + 22-model boot catalog + 8 postmortems w/ non-trivial claim density + $0.0316 spend + strategic_drift=ok**. Wave 3 architecturally complete (W3(7) graduated, W3(6) closed-pending-external-API-stability per operator binding 2026-04-25).
-- **RSI scaffolding**: 6 Wang modules verified (Phase 0 audit, 2026-04-25); 4 wired into live FSM. **RSI Gear 1 (Determinism)**: DONE per Phase 1 closure. **RSI Gear 2 (Bounded Curiosity)**: HypothesisProbe primitive shipped + Venom `hypothesize` tool + plan_generator wiring (§25 Priority C) — load-bearing for trivial-op gate. **RSI Gear 3 (Closed-Loop Memory)**: functionally complete (Phase 2 + Option E + §25 Priorities A+F evidence capture) — soak #7 confirms non-trivial claim density.
+- **RSI scaffolding**: 6 Wang modules verified (Phase 0 audit, 2026-04-25); 4 wired into live FSM. **RSI Gear 1 (Determinism)**: DONE per Phase 1 closure. **RSI Gear 2 (Bounded Curiosity)**: HypothesisProbe primitive shipped + Venom `hypothesize` tool + plan_generator wiring (§25 Priority C) + Priority 1 Slice 3 wired probe consumer for confidence-collapse → 3-action verdict (CLOSED 2026-04-29). **RSI Gear 3 (Closed-Loop Memory)**: functionally complete (Phase 2 + Option E + §25 Priorities A+F evidence capture) — soak #7 confirms non-trivial claim density. **NEW: Causality DAG substrate (§26.5.2 Priority 2 CLOSED 2026-04-29)**: session-spanning navigable graph + replay-from-record + per-worker sub-ordinals fix L3 fan-out determinism — substrate for Pass C drift detection ready.
 
 ### Grade summary table (current vs A-level target — refreshed 2026-04-29 post-Phase-12-closure / soak #7)
 
@@ -110,15 +110,15 @@ Color legend: 🟢 = at target / done · 🟡 = in progress / partial · 🔴 = 
 | Dimension | Current | A-Level Target | Gap to close |
 |---|---|---|---|
 | **Architecture** | 🟢 A | A | Phase 12 DW Resilience closed 2026-04-29 — Pricing Oracle + Handshake + Universal Postmortem all live in production under hostile DW conditions |
-| **Cognitive depth** | 🟢 B+ | A | §26.5 Priority 1 (Confidence-Aware Execution) — provider logprobs not yet captured as a routing/circuit-breaker signal |
+| **Cognitive depth** | 🟢 A− | A | §26.5 Priority 1 (Confidence-Aware Execution) ✅ CLOSED 2026-04-29 + §26.5.2 Priority 2 (Causality DAG) ✅ CLOSED 2026-04-29 — only §26.5.3 Priority 3 (Adaptive Anti-Venom, gated on W2(5) Slice 5b → Pass B Slice 1 → Pass C Slice 1) remains for full A |
 | **Production track record** | 🟡 B | A | 1 verified multi-file APPLY (2026-04-15) + soak #7 clean idle-exit with non-trivial postmortem signal; sustained multi-day uptime not yet measured |
 | **RSI Gear 1 — Determinism** | 🟢 A | A | Phase 1 closed 2026-04-28; soak #7 confirms Merkle DAG holds under DW endpoint flakiness |
-| **RSI Gear 2 — Bounded Curiosity** | 🟡 B | A | §25 Priority C HypothesisProbe shipped + wired to PLAN's trivial-op gate; not yet load-bearing on confidence-drop circuit-breaker (§26.5 Priority 1) |
+| **RSI Gear 2 — Bounded Curiosity** | 🟢 A− | A | §25 Priority C HypothesisProbe shipped + Priority 1 Slice 3 wires probe consumer for confidence-collapse → 3-action verdict (RETRY/ESCALATE/INCONCLUSIVE); §26.5.1 Priority 1 CLOSED 2026-04-29 |
 | **RSI Gear 3 — Closed-Loop Memory** | 🟢 A− | A | Soak #7 confirms non-trivial claim density (claims=3 pass=1 fail=0 insuff=2 err=0); Order-2 promotion of plan_runner default-claim wiring landed (§25 Priority E) |
-| **Operator UX vs CC** | 🟢 A− | A | `/postmortems` REPL + 4 GET endpoints + SSE event landed (§25 Priority D); session-spanning causal DAG view still missing (§26.5 Priority 2) |
+| **Operator UX vs CC** | 🟢 A | A | `/postmortems` REPL + 4 GET endpoints + SSE event landed (§25 Priority D); session-spanning causal DAG navigation surface CLOSED 2026-04-29 (§26.5.2 Priority 2 — `/postmortems dag` family + 2 IDE GETs + `dag_fork_detected` SSE) |
 | **Self-tightening immunity** | 🟢 A− | A | MetaSensor graduated default-true (§25 Priority B); shipped_code_invariants seeded (§25 Priority E); per-trajectory drift detector still missing (§26.5 Priority 3) |
 | **Sandbox safety boundary** | 🟡 B | A | Object-graph escape vector documented (§3.6 vector 1); PLAN-skip-by-trivialization bypass closed (§25.5.5 → Priority E shipped); Quine-class hallucination vectors enumerated (§26.4) |
-| **Cross-process safety** | 🟡 B+ | A | Advisory file-locking on AdaptationLedger writes (§3.6 vector 3); Slice 1.3 ordinal-counter under L3 fan-out (§25.4) — addressed by §26.5 Priority 2 (causality DAG with per-worker sub-ordinals) |
+| **Cross-process safety** | 🟢 A− | A | Slice 1.3 ordinal-counter L3 fan-out bug CLOSED 2026-04-29 by Priority 2 Slice 2 — `(worker_id, op_id, phase, kind)` composite namespace + `worker_id_for_path()` pure-stdlib helper. Advisory file-locking on AdaptationLedger writes (§3.6 vector 3) still pending — gated on Pass C unblock |
 | **Long-horizon semantic stability** | 🟡 B | A | TrajectoryAuditor still missing (§24.8.2); Antivenom is per-op not per-trajectory — addressed by §26.5 Priority 3 (Adaptive Anti-Venom unblocking Pass C) |
 | **Cost contract enforcement (BG never cascades to Claude)** | 🟢 A− | A | Soak #7 validated 14 BG blocks correctly skip-and-queue'd; structural reinforcement pending (§26.6) — AST invariant + runtime assertion + Property Oracle claim |
 | **Net overall grade vs "95%+ sovereign autonomous developer"** | 🟢 **B+ / B−** | A | See §26.5 critical path (3 systemic upgrades, sequenced) |
@@ -2936,27 +2936,39 @@ The honest defense for "still B+ overall": the *combination* of risk-tier floor 
 
 **Sequencing**: independent of Priority 2; can ship in parallel with it. Composes as the *signal source* for Priority 2's causal DAG (every confidence-drop is a graph node).
 
-#### 26.5.2 Priority 2: Causality DAG + Deterministic Replay [HIGH IMPACT]
+#### 26.5.2 Priority 2: Causality DAG + Deterministic Replay [HIGH IMPACT] ✅ CLOSED 2026-04-29
 
-**Problem**: today's events are a flat stream. `phase_capture` Merkle-hashes records; `summary.json` aggregates per-op outcomes; `replay.html` renders a session linearly. None of these answer the question "given decision X, what was its causal predecessor Y, and what would have happened if at Y we'd taken path Z?" This is the missing substrate for time-travel debugging, drift detection, counterfactual reasoning, and replay-from-fork.
+**Status**: 6-slice arc graduated single-day 2026-04-29 (post-finishing-pass `2c0f642735`). Full closure record in `memory/project_priority_2_causality_dag_closure.md`. All 6 master flags graduated default-true; 4 new shipped_code_invariants seeds (now 11 total); 9 FlagRegistry seeds; 655/655 regression green; §26.6 four-layer cost contract preservation pinned by AST invariant + verified at runtime under DAG/replay state.
 
-**Required upgrade** — promote `phase_capture` from per-phase Merkle nodes to a session-spanning DAG:
+**Original problem statement (now resolved)**: today's events were a flat stream. `phase_capture` Merkle-hashed records; `summary.json` aggregated per-op outcomes; `replay.html` rendered a session linearly. None of these answered the question "given decision X, what was its causal predecessor Y, and what would have happened if at Y we'd taken path Z?" — the missing substrate for time-travel debugging, drift detection, counterfactual reasoning, and replay-from-fork.
 
-1. **Schema extension** — every captured record carries `parent_record_ids: List[str]` (one per dependency: signal source, posture state, prior op outcome, evidence consulted) and optional `counterfactual_of: str` (when a record was generated by HypothesisProbe as a "what if?" branch).
+**What shipped**:
 
-2. **Replay command extension** — `scripts/ouroboros_battle_test.py --rerun-from <record-id>` re-executes the session starting from a specific record, with the captured entropy/clock state restored from `phase_capture`. This is the substrate for counterfactual probes (§26.2 primitive 3) and for cross-session A/B-style learning (replay last week's bug-fix attempt with this week's evidence collectors).
+1. **Schema extension (Slice 1)** — every captured record carries optional `parent_record_ids: Tuple[str,...]` and `counterfactual_of: Optional[str]`. `SCHEMA_VERSION` unchanged (additive backward-compat); pre-Slice-1 records parse cleanly with empty defaults. Master-flag-gated emission via `JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED` (graduated default-true).
 
-3. **DAG navigation surface** — extend `/postmortems` REPL + IDE observability schema with a `dag` subcommand: `dag for-record <id>`, `dag fork-counterfactuals <id>`, `dag drift <session-a> <session-b>`. Same loopback-only + rate-limited contract as Slice 1 GETs.
+2. **Per-worker sub-ordinals (Slice 2)** — fixes the L3 fan-out determinism bug (W3(6) known debt) by namespacing ordinals as `(worker_id, op_id, phase, kind)`. `worker_id_for_path()` in `worktree_manager.py` is pure (AST-pinned no I/O); shadow→enforce two-flag pattern. Both flags graduated default-true.
 
-4. **Per-worker sub-ordinals** — fix Slice 1.3 ordinal-counter under L3 fan-out by namespacing ordinals as `<worker-id>:<ordinal>` so multi-worker writes to `<session>/decisions.jsonl` produce a stable total order under deterministic replay.
+3. **DAG construction primitive (Slice 3)** — new `verification/causality_dag.py`; bounded BFS, cycle detection, topo sort, counterfactual branch detection; FlagRegistry-typed bounds (`JARVIS_DAG_MAX_RECORDS=100K`, `JARVIS_DAG_MAX_DEPTH=8`, `JARVIS_DAG_DRIFT_NODE_DELTA_THRESHOLD=0.25`).
 
-**Why this is high-impact**: causality is the substrate that makes Priority 1's confidence signal *historically navigable* and makes Priority 3's adaptive Anti-Venom *evidence-driven instead of heuristic*. Without a DAG, every adaptation is per-op blind; with a DAG, drift detection becomes graph-isomorphism over time.
+4. **Navigation surface (Slice 4)** — `/postmortems dag` REPL family (`for-record` / `fork-counterfactuals` / `drift` / `stats`) + `GET /observability/dag/{session_id}` + `GET /observability/dag/record/{id}` + `EVENT_TYPE_DAG_FORK_DETECTED` SSE event. Three independent sub-flags govern REPL/GET/SSE channels.
 
-**Antivenom alignment**: DAG nodes are AST-validated (`shipped_code_invariants.py` seed: "every record persisted to ledger MUST carry valid parent_record_ids"). Replay determinism is structural — captured entropy + clock state make it bit-identical. Order-2 governance: DAG schema lives in Order-2 manifest.
+5. **Replay-from-record (Slice 5)** — `--rerun-from <record-id>` extends the existing `--rerun` CLI flag. The replay path is **purely env-overlay** (sets `JARVIS_CAUSALITY_FORK_FROM_RECORD_ID` + `JARVIS_CAUSALITY_FORK_COUNTERFACTUAL_OF`); the orchestrator's existing `--rerun` path is what dispatches. **Cost contract preservation is structural** — pinned by the `dag_replay_cost_contract_preserved` shipped_code_invariants seed which verifies `scripts/ouroboros_battle_test.py` references the replay primitive functions, requires `--rerun` for session identity, and contains zero direct provider construction tokens.
 
-**No hardcoding**: window-sizes, retention policies, drift-thresholds all FlagRegistry-typed and posture-relevant.
+6. **Graduation flip (Slice 6)** — 6 master flags flipped default false → true; 4 new shipped_code_invariants seeds (`causality_dag_no_authority_imports`, `causality_dag_bounded_traversal`, `dag_navigation_no_ctx_mutation`, `dag_replay_cost_contract_preserved`); 9 FlagRegistry seeds; 30 §-numbered graduation pins.
 
-**Sequencing**: ships in parallel with Priority 1 — they compose at the SSE event class level (`model.confidence_drop` events become DAG nodes with parent links to the GENERATE record they aborted).
+**Antivenom alignment** (verified post-finishing-pass): the §26.6 four-layer cost-contract defense holds under all DAG / replay states. Tests in `test_causality_dag_replay_from_record.py` + `test_causality_dag_graduation.py` prove:
+  * Layer 4 advisor structural guard fires on synthetic BG → STANDARD/COMPLEX/IMMEDIATE escalation regardless of replay-mode env
+  * Layer 2 runtime CostContractViolation gate fires under all DAG/replay state
+  * `apply_replay_from_record_env()` sets ONLY documented overlay env vars (no provider-routing flags)
+  * `replay_from_record.py` is import-isolated from any provider module (AST-walked + invariant-pinned)
+
+**Composition with shipped infrastructure**:
+  * Confidence-drop SSE events (Priority 1 Slice 4) → DAG nodes via `parent_record_ids`
+  * HypothesisProbe verdicts (Priority 1 Slice 3) → counterfactual fork branches via `counterfactual_of`
+  * `cluster_kind` heuristic detects "confidence_collapse_cluster" when ≥3 confidence_drop nodes share a recent ancestor
+  * `dag drift <session-a> <session-b>` is now the per-trajectory drift substrate Pass C will mine
+
+**Pass C unlock dependency**: Priority 3 (Adaptive Anti-Venom, §26.5.3) is now unblocked from the *substrate* side — Slice 4's `dag drift` provides the per-trajectory drift signal Pass C MetaAdaptationGovernor needs, and Slice 5's counterfactual replay produces evidence Pass C will mine for adaptation rules. Priority 3 remains gated on the *governance* side (W2(5) Slice 5b → Pass B Slice 1 → Pass C Slice 1).
 
 #### 26.5.3 Priority 3: Adaptive Anti-Venom (Unblock Pass C) [HIGH IMPACT, GATED]
 
