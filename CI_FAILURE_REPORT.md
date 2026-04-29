@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: Secret Scanning
-- **Run Number**: #4595
-- **Branch**: `main`
-- **Commit**: `a641ca2da3062be9cb57ef36bee1e42ca2c1f581`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #50664
+- **Branch**: `fix/ci/secret-scanning-run4595-20260429-002125`
+- **Commit**: `1351c448a25545d49e98230bd8773d6d92f82400`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-29T00:15:55Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25084417152)
+- **Timestamp**: 2026-04-29T00:22:12Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25084599558)
 
 ## Failure Overview
 
@@ -17,23 +17,23 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Scan for Secrets with Gitleaks | linting_error | high | 31s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
-### 1. Scan for Secrets with Gitleaks
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Linting Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-29T00:16:39Z
-**Completed**: 2026-04-29T00:17:10Z
-**Duration**: 31 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25084417152/job/73496597800)
+**Started**: 2026-04-29T00:22:15Z
+**Completed**: 2026-04-29T00:22:19Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25084599558/job/73497183350)
 
 #### Failed Steps
 
-- **Step 3**: Run Gitleaks
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
@@ -42,30 +42,23 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 74: `2026-04-29T00:17:06.8534906Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate`
-    - Line 75: `2026-04-29T00:17:06.8551006Z ##[error]🛑 missing gitleaks license. Go grab one at gitleaks.io and sto`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 74: `2026-04-29T00:17:06.8534906Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate`
-    - Line 96: `2026-04-29T00:17:07.2451722Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 30: `2026-04-29T00:22:17.2219231Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-04-29T00:22:17.7113580Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Secr`
 
 - Pattern: `WARN|Warning|warning`
-  - Occurrences: 5
+  - Occurrences: 1
   - Sample matches:
-    - Line 74: `2026-04-29T00:17:06.8534906Z ##[warning]Get user [drussell23] failed with error [HttpError: API rate`
-    - Line 81: `2026-04-29T00:17:06.8650595Z   if-no-files-found: warn`
-    - Line 86: `2026-04-29T00:17:07.0821652Z ##[warning]No files were found with the provided path: gitleaks-report.`
+    - Line 58: `2026-04-29T00:22:17.7451897Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
   - Sample matches:
-    - Line 21: `2026-04-29T00:17:02.2263732Z  * [new branch]          seed-arc-plan-exploit-stream-timeout -> origin`
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
 1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -85,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-04-29T00:21:25.409748*
+📊 *Report generated on 2026-04-29T00:23:50.340924*
 🤖 *JARVIS CI/CD Auto-PR Manager*
