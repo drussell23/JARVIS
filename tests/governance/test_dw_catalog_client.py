@@ -133,8 +133,16 @@ def test_model_card_requires_id() -> None:
     assert ModelCard.from_api_dict({"id": None}) is None
 
 
-def test_model_card_minimal_id_only() -> None:
-    """Just ``id`` produces a card; param count parsed from id."""
+def test_model_card_minimal_id_only(monkeypatch) -> None:
+    """Just ``id`` produces a card; param count parsed from id.
+
+    Pricing is intentionally blank from the API. Under Option α the
+    Pricing Oracle fills the missing pricing for known families — this
+    test pins the LEGACY (master-off) behavior so the catalog parser's
+    "no API pricing → both None" path stays covered. The Oracle hit
+    case is pinned in test_dw_catalog_client_pricing_oracle_hook.py.
+    """
+    monkeypatch.setenv("JARVIS_PRICING_ORACLE_ENABLED", "false")
     card = ModelCard.from_api_dict({"id": "Qwen/Qwen3.5-397B-A17B"})
     assert card is not None
     assert card.model_id == "Qwen/Qwen3.5-397B-A17B"
