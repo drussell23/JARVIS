@@ -86,6 +86,111 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
+# ---------------------------------------------------------------------------
+# Priority A Slice A3 — Mandatory claim density at every PLAN exit
+# ---------------------------------------------------------------------------
+#
+# Per PRD §25.5.1: every PLAN exit (success path AND every failure
+# terminal) MUST capture default must_hold claims so post-APPLY
+# verification has signal to evaluate. The pre-A3 wiring captured
+# claims ONLY on the success path AND ONLY when _plan_result was
+# non-skipped — which silently zeroed claim coverage for the entire
+# trivial-op population (every op in soak #3).
+#
+# This helper is the single chokepoint: every `return PhaseResult(...)`
+# that exits PLAN is preceded by `await _capture_default_claims_at_plan_exit`.
+# The helper is master-flag-gated at the synthesizer level
+# (JARVIS_DEFAULT_CLAIMS_ENABLED → Slice A2's `default_claims_enabled`),
+# so when off it is a pure no-op without runner-side branches.
+
+
+async def _capture_default_claims_at_plan_exit(
+    ctx: Any, *, exit_reason: str,
+) -> int:
+    """Synthesize + persist the default must_hold claims for this op.
+
+    Walks the default-claim registry (verification.default_claims),
+    applies per-spec filters (file_pattern + posture), persists each
+    surviving claim via Slice 2.3's ``capture_claims`` (which routes
+    through Slice 1.3's Merkle DAG ledger).
+
+    NEVER raises. Best-effort — capture failures are logged at DEBUG
+    and counted as zero. Master flag ``JARVIS_DEFAULT_CLAIMS_ENABLED``
+    governs whether the synthesizer materializes anything; when off,
+    this returns 0 without touching the ledger.
+
+    Posture is read best-effort via the posture_observer singleton.
+    Unavailable / not-yet-initialized → ``None``, which means any
+    posture-filtered specs are skipped on this exit.
+
+    Returns the count of default claims successfully persisted.
+    """
+    try:
+        from backend.core.ouroboros.governance.verification.default_claims import (
+            synthesize_default_claims,
+        )
+        from backend.core.ouroboros.governance.verification.property_capture import (
+            capture_claims,
+        )
+    except Exception:  # noqa: BLE001 — verification package missing
+        logger.debug(
+            "[PLANRunner] verification module unavailable at exit_reason=%s",
+            exit_reason, exc_info=True,
+        )
+        return 0
+    # Best-effort posture read — never raise into the runner path.
+    posture: Optional[str] = None
+    try:
+        from backend.core.ouroboros.governance.posture_observer import (
+            get_default_store,
+        )
+        reading = get_default_store().load_current()
+        if reading is not None:
+            posture = reading.posture.value
+    except Exception:  # noqa: BLE001
+        posture = None
+    op_id = str(getattr(ctx, "op_id", "") or "")
+    if not op_id:
+        return 0
+    target_files = tuple(getattr(ctx, "target_files", ()) or ())
+    try:
+        claims = synthesize_default_claims(
+            op_id=op_id,
+            target_files=target_files,
+            posture=posture,
+        )
+    except Exception:  # noqa: BLE001 — defensive (synthesizer should
+        # itself never raise; this is belt-and-suspenders)
+        logger.debug(
+            "[PLANRunner] synthesize_default_claims raised at "
+            "exit_reason=%s op=%s",
+            exit_reason, op_id, exc_info=True,
+        )
+        return 0
+    if not claims:
+        return 0
+    try:
+        captured = await capture_claims(
+            op_id=op_id, claims=claims, ctx=ctx,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[PLANRunner] capture_claims raised at exit_reason=%s op=%s",
+            exit_reason, op_id, exc_info=True,
+        )
+        return 0
+    if captured:
+        # §8 observability — one structured INFO line per exit so
+        # operators can audit "did the loop close?" via grep without
+        # reading the determinism ledger.
+        logger.info(
+            "[PLANRunner] default_claims_captured count=%d "
+            "exit_reason=%s op=%s",
+            captured, exit_reason, op_id,
+        )
+    return captured
+
+
 class PLANRunner(PhaseRunner):
     """Verbatim transcription of orchestrator.py PLAN block (~2259-3012)."""
 
@@ -206,6 +311,9 @@ class PLANRunner(PhaseRunner):
                     "detail": _skip_reason,
                 },
             )
+            await _capture_default_claims_at_plan_exit(
+                ctx, exit_reason="plan_required_unavailable",
+            )
             return PhaseResult(
                 next_ctx=ctx, next_phase=None, status="fail",
                 reason="plan_required_unavailable",
@@ -280,6 +388,10 @@ class PLANRunner(PhaseRunner):
                             "reason": "plan_review_unavailable",
                             "detail": "approval_provider_missing",
                         },
+                    )
+                    await _capture_default_claims_at_plan_exit(
+                        ctx,
+                        exit_reason="plan_review_unavailable:provider_missing",
                     )
                     return PhaseResult(
                         next_ctx=ctx, next_phase=None, status="fail",
@@ -394,6 +506,10 @@ class PLANRunner(PhaseRunner):
                                 "detail": str(_gate_exc)[:200],
                             },
                         )
+                        await _capture_default_claims_at_plan_exit(
+                            ctx,
+                            exit_reason="plan_review_unavailable:gate_infra",
+                        )
                         return PhaseResult(
                             next_ctx=ctx, next_phase=None, status="fail",
                             reason="plan_review_unavailable",
@@ -488,6 +604,9 @@ class PLANRunner(PhaseRunner):
                             f"Reconsider strategy before retry.",
                             op_id=ctx.op_id,
                         )
+                        await _capture_default_claims_at_plan_exit(
+                            ctx, exit_reason="plan_rejected",
+                        )
                         return PhaseResult(
                             next_ctx=ctx, next_phase=None, status="fail",
                             reason="plan_rejected",
@@ -514,6 +633,9 @@ class PLANRunner(PhaseRunner):
                                 ctx,
                                 OperationState.FAILED,
                                 {"reason": "plan_approval_expired"},
+                            )
+                            await _capture_default_claims_at_plan_exit(
+                                ctx, exit_reason="plan_approval_expired",
                             )
                             return PhaseResult(
                                 next_ctx=ctx, next_phase=None, status="fail",
@@ -856,6 +978,9 @@ class PLANRunner(PhaseRunner):
         if orch._is_cancel_requested(ctx.op_id):
             ctx = ctx.advance(OperationPhase.CANCELLED, terminal_reason_code="user_cancelled")
             await orch._record_ledger(ctx, OperationState.FAILED, {"reason": "user_cancelled"})
+            await _capture_default_claims_at_plan_exit(
+                ctx, exit_reason="user_cancelled",
+            )
             return PhaseResult(
                 next_ctx=ctx, next_phase=None, status="fail",
                 reason="user_cancelled",
@@ -898,6 +1023,16 @@ class PLANRunner(PhaseRunner):
                 "plan still applies",
                 exc_info=True,
             )
+
+        # Priority A Slice A3 — default must_hold claims fire on the
+        # success path too, additive to whatever synthesize_claims_-
+        # from_plan produced above. Trivial-op skips silently captured
+        # zero claims pre-A3; this guarantees verification_postmortem
+        # records have signal even when the LLM-reasoned plan is
+        # absent.
+        await _capture_default_claims_at_plan_exit(
+            ctx, exit_reason="planned",
+        )
 
         return PhaseResult(
             next_ctx=ctx,
