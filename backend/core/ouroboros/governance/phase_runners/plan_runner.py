@@ -216,6 +216,24 @@ class PLANRunner(PhaseRunner):
             _plan_review_required,
         )
 
+        # Priority F3 — stamp test_files_pre at PLAN entry. Captures
+        # the existing test inventory BEFORE any change-engine work
+        # so the test_set_hash_stable claim (Priority A) can compute
+        # a real pre-vs-post delta at evaluation time. Best-effort,
+        # never raises. Master-flag-gated at the helper level.
+        try:
+            from backend.core.ouroboros.governance.verification.evidence_capture import (
+                stamp_test_files_pre,
+            )
+            stamp_test_files_pre(
+                ctx, target_dir=str(orch._config.project_root),
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[PLANRunner] stamp_test_files_pre failed",
+                exc_info=True,
+            )
+
         # ---- VERBATIM transcription of orchestrator.py 2263-3012 ----
         if _serpent:
             _serpent.update_phase("PLAN")

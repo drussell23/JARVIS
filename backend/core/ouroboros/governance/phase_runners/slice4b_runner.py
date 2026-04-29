@@ -577,6 +577,21 @@ class Slice4bRunner(PhaseRunner):
         else:
             change_request = orch._build_change_request(ctx, best_candidate)
             _t_apply = time.monotonic()
+            # Priority F2 — snapshot target_files content BEFORE the
+            # change_engine writes anything. This pre-state is the
+            # other half of the diff_text computation that fires
+            # on success; without it diff is empty and no_new_-
+            # credential_shapes evaluates to INSUFFICIENT.
+            try:
+                from backend.core.ouroboros.governance.verification.evidence_capture import (
+                    stamp_target_files_pre,
+                )
+                stamp_target_files_pre(ctx)
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[Slice4b] stamp_target_files_pre failed",
+                    exc_info=True,
+                )
             try:
                 change_result = await orch._stack.change_engine.execute(change_request)
             except Exception as exc:
@@ -623,6 +638,35 @@ class Slice4bRunner(PhaseRunner):
                 next_ctx=ctx, next_phase=None, status="fail",
                 reason="change_engine_failed",
                 artifacts={"t_apply": _t_apply},
+            )
+
+        # Priority F2 — APPLY succeeded; capture full post-state
+        # evidence so the F1 gatherers find rich pre-stamped data
+        # instead of falling back to self-gather. Stamps:
+        #   * ctx.target_files_post  (file_parses_after_change)
+        #   * ctx.test_files_post    (test_set_hash_stable)
+        #   * ctx.diff_text          (no_new_credential_shapes)
+        # Best-effort, never raises.
+        try:
+            from backend.core.ouroboros.governance.verification.evidence_capture import (
+                stamp_apply_evidence_post,
+            )
+            _stamp_diag = stamp_apply_evidence_post(
+                ctx, target_dir=str(orch._config.project_root),
+            )
+            logger.info(
+                "[Slice4b] apply_evidence_stamped op=%s "
+                "target_files_post=%d test_files_post=%d "
+                "diff_text_bytes=%d",
+                ctx.op_id,
+                _stamp_diag.get("target_files_post", 0),
+                _stamp_diag.get("test_files_post", 0),
+                _stamp_diag.get("diff_text_bytes", 0),
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[Slice4b] stamp_apply_evidence_post failed",
+                exc_info=True,
             )
 
         # ==================== Phase 7.5: INFRASTRUCTURE ====================
