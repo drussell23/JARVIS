@@ -683,8 +683,216 @@ def _eval_set_subset(
     )
 
 
+# ---------------------------------------------------------------------------
+# Default-claim evaluators (Priority A — mandatory claim density)
+# ---------------------------------------------------------------------------
+#
+# These three evaluators back the default claims that EVERY op captures
+# at PLAN exit. They are intentionally:
+#   - Pure stdlib (ast / hashlib / re) — zero LLM, zero network
+#   - Deterministic — same evidence → same verdict (replay-stable)
+#   - Defensive — never raise; missing evidence → INSUFFICIENT_EVIDENCE
+#
+# Per PRD §25.5.1 — without these, every verification_postmortem record
+# has total_claims=0 and Phase 2 is theatrical.
+
+
+def _eval_file_parses_after_change(
+    prop: Property, evidence: Mapping[str, Any],
+) -> PropertyVerdict:
+    """Verify each file in ``target_files_post`` is syntactically
+    valid Python after APPLY. Pure-stdlib AST parse — no execution,
+    no import side-effects.
+
+    Required evidence keys:
+      * ``target_files_post`` — sequence of {path, content} mappings
+        captured post-APPLY. Each entry must carry the file's actual
+        on-disk content (caller reads it). Non-Python files (extension
+        not ``.py``) are silently skipped (no false-fail on YAML/JSON).
+
+    Verdict:
+      * PASSED iff every Python file in ``target_files_post`` parses
+        cleanly via ``ast.parse``.
+      * FAILED with the first SyntaxError (line + offset) on any
+        parse failure.
+      * INSUFFICIENT_EVIDENCE if the key is missing or not iterable."""
+    try:
+        files = list(evidence["target_files_post"])
+    except (KeyError, TypeError) as exc:
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.INSUFFICIENT_EVIDENCE,
+            confidence=0.0,
+            reason=f"missing/non-iterable target_files_post: {exc}",
+        )
+    import ast as _ast
+    parsed_count = 0
+    for entry in files:
+        try:
+            path = str(entry.get("path", "") or "")
+            content = entry.get("content", "")
+        except AttributeError:
+            continue  # malformed entry — skip silently
+        if not path or not isinstance(content, (str, bytes)):
+            continue
+        # Slice A1: only Python files are subject to AST parse.
+        # Other text files (YAML / JSON / Markdown) bypass cleanly.
+        if not path.endswith(".py"):
+            continue
+        text = (
+            content.decode("utf-8", errors="replace")
+            if isinstance(content, bytes) else content
+        )
+        try:
+            _ast.parse(text, filename=path)
+            parsed_count += 1
+        except SyntaxError as exc:
+            return PropertyVerdict(
+                property_name=prop.name, kind=prop.kind,
+                verdict=VerdictKind.FAILED,
+                confidence=1.0,
+                reason=(
+                    f"SyntaxError in {path}:{exc.lineno or 0}:"
+                    f"{exc.offset or 0}: {(exc.msg or '')[:120]}"
+                ),
+            )
+    return PropertyVerdict(
+        property_name=prop.name, kind=prop.kind,
+        verdict=VerdictKind.PASSED,
+        confidence=1.0,
+        reason=f"parsed_ok={parsed_count}",
+    )
+
+
+def _eval_test_set_hash_stable(
+    prop: Property, evidence: Mapping[str, Any],
+) -> PropertyVerdict:
+    """Verify the test-file inventory is unchanged across the op.
+
+    The op shouldn't silently delete or rename existing test files.
+    Adding new tests is fine (the post-set is a superset of the pre-
+    set). Removing tests fails the claim — operators must explicitly
+    re-classify the op as test-touching to do so.
+
+    Required evidence keys:
+      * ``test_files_pre`` — sequence of test file paths captured
+        before APPLY (sorted, normalized).
+      * ``test_files_post`` — sequence of test file paths post-APPLY.
+
+    Verdict:
+      * PASSED iff every entry in pre is present in post (additions OK,
+        deletions/renames flagged).
+      * FAILED with the first missing path (truncated to 5).
+      * INSUFFICIENT_EVIDENCE if either key is missing."""
+    try:
+        pre = list(evidence["test_files_pre"])
+        post = set(evidence["test_files_post"])
+    except (KeyError, TypeError) as exc:
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.INSUFFICIENT_EVIDENCE,
+            confidence=0.0,
+            reason=f"missing/non-iterable test_files_pre/post: {exc}",
+        )
+    missing = [p for p in pre if p not in post]
+    if missing:
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.FAILED,
+            confidence=1.0,
+            reason=(
+                f"removed {len(missing)} test file(s); first 5: "
+                f"{sorted(str(p) for p in missing)[:5]}"
+            ),
+        )
+    # Hash both sets and report the digest pair so replay can verify
+    # the same observation produced the same verdict.
+    import hashlib as _hashlib
+    pre_digest = _hashlib.sha256(
+        ("\n".join(sorted(str(p) for p in pre))).encode("utf-8"),
+    ).hexdigest()[:16]
+    post_digest = _hashlib.sha256(
+        ("\n".join(sorted(str(p) for p in post))).encode("utf-8"),
+    ).hexdigest()[:16]
+    return PropertyVerdict(
+        property_name=prop.name, kind=prop.kind,
+        verdict=VerdictKind.PASSED,
+        confidence=1.0,
+        reason=f"pre_sha={pre_digest} post_sha={post_digest} additions={max(0, len(post) - len(pre))}",
+    )
+
+
+def _eval_no_new_credential_shapes(
+    prop: Property, evidence: Mapping[str, Any],
+) -> PropertyVerdict:
+    """Verify the diff text does NOT introduce any credential-shape
+    secret. Reuses the canonical ``_CREDENTIAL_SHAPE_PATTERNS`` tuple
+    from ``semantic_firewall.py`` — single source of truth.
+
+    Required evidence keys:
+      * ``diff_text`` — the unified diff (or full new-file content)
+        produced by APPLY. Empty string is acceptable (no diff = no
+        credentials added).
+
+    Verdict:
+      * PASSED iff none of the 5 credential regexes match.
+      * FAILED with the first matching pattern's name (truncated
+        match preview, no actual secret echoed back to logs).
+      * INSUFFICIENT_EVIDENCE if the key is missing."""
+    if "diff_text" not in evidence:
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.INSUFFICIENT_EVIDENCE,
+            confidence=0.0,
+            reason="missing key: diff_text",
+        )
+    diff_text = evidence.get("diff_text") or ""
+    if not isinstance(diff_text, (str, bytes)):
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.INSUFFICIENT_EVIDENCE,
+            confidence=0.0,
+            reason=f"diff_text is not str/bytes: {type(diff_text).__name__}",
+        )
+    if isinstance(diff_text, bytes):
+        diff_text = diff_text.decode("utf-8", errors="replace")
+    # Late import — semantic_firewall pulls in heavier deps; keep
+    # property_oracle lightweight at module load.
+    try:
+        from backend.core.ouroboros.governance.semantic_firewall import (
+            _CREDENTIAL_SHAPE_PATTERNS,
+        )
+    except ImportError as exc:
+        return PropertyVerdict(
+            property_name=prop.name, kind=prop.kind,
+            verdict=VerdictKind.EVALUATOR_ERROR,
+            confidence=0.0,
+            reason=f"semantic_firewall unavailable: {exc}",
+        )
+    for pattern in _CREDENTIAL_SHAPE_PATTERNS:
+        match = pattern.search(diff_text)
+        if match is not None:
+            # Do NOT echo the matched secret back. Report the pattern
+            # source (its source string) and the match offset only.
+            return PropertyVerdict(
+                property_name=prop.name, kind=prop.kind,
+                verdict=VerdictKind.FAILED,
+                confidence=1.0,
+                reason=(
+                    f"credential shape detected at offset "
+                    f"{match.start()}; pattern={pattern.pattern[:48]!r}"
+                ),
+            )
+    return PropertyVerdict(
+        property_name=prop.name, kind=prop.kind,
+        verdict=VerdictKind.PASSED,
+        confidence=1.0,
+        reason=f"no credential shapes in {len(diff_text)} chars",
+    )
+
+
 def _register_seed_evaluators() -> None:
-    """Module-load: register the six seed evaluators. Idempotent —
+    """Module-load: register the seed evaluators. Idempotent —
     re-registering the same callable is a silent no-op."""
     register_evaluator(
         kind="test_passes", evaluate=_eval_test_passes,
@@ -711,6 +919,31 @@ def _register_seed_evaluators() -> None:
     register_evaluator(
         kind="set_subset", evaluate=_eval_set_subset,
         description="Verify actual ⊆ allowed (allowlist check).",
+    )
+    # Priority A — Mandatory Claim Density evaluators (Slice A1).
+    register_evaluator(
+        kind="file_parses_after_change",
+        evaluate=_eval_file_parses_after_change,
+        description=(
+            "Verify every Python file in target_files_post parses "
+            "cleanly via ast.parse (default must_hold claim)."
+        ),
+    )
+    register_evaluator(
+        kind="test_set_hash_stable",
+        evaluate=_eval_test_set_hash_stable,
+        description=(
+            "Verify the existing test file inventory is preserved "
+            "across the op (additions OK; deletions flagged)."
+        ),
+    )
+    register_evaluator(
+        kind="no_new_credential_shapes",
+        evaluate=_eval_no_new_credential_shapes,
+        description=(
+            "Verify the diff_text contains no credential/secret "
+            "regex shape (5 canonical patterns from semantic_firewall)."
+        ),
     )
 
 
