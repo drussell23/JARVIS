@@ -73,9 +73,17 @@ def fresh_registry():
 # ===========================================================================
 
 
-def test_master_flag_default_false(monkeypatch) -> None:
+def test_master_flag_default_true(monkeypatch) -> None:
+    """Priority B graduated 2026-04-29 — env unset → default-true."""
     monkeypatch.delenv("JARVIS_META_SENSOR_ENABLED", raising=False)
-    assert meta_sensor_enabled() is False
+    assert meta_sensor_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["", " ", "  ", "\t"])
+def test_master_flag_empty_reads_default_true(monkeypatch, val) -> None:
+    """Asymmetric env semantics — empty/whitespace is the unset marker."""
+    monkeypatch.setenv("JARVIS_META_SENSOR_ENABLED", val)
+    assert meta_sensor_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on"])
@@ -85,9 +93,10 @@ def test_master_flag_truthy(monkeypatch, val) -> None:
 
 
 @pytest.mark.parametrize(
-    "val", ["", " ", "0", "false", "no", "off", "garbage"],
+    "val", ["0", "false", "no", "off", "garbage"],
 )
 def test_master_flag_falsy(monkeypatch, val) -> None:
+    """Hot-revert path — explicit false-class strings disable post-graduation."""
     monkeypatch.setenv("JARVIS_META_SENSOR_ENABLED", val)
     assert meta_sensor_enabled() is False
 
