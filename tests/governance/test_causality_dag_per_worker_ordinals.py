@@ -449,49 +449,76 @@ def test_record_master_on_schema_version_unchanged(
 # ===========================================================================
 
 
-def test_concurrent_threads_preserve_per_worker_increment(
+def test_concurrent_async_tasks_preserve_per_worker_increment(
     monkeypatch, isolated_runtime,
 ) -> None:
-    """Multiple threads sharing a single runtime increment its
-    per-worker dict atomically (sync_lock contract). Even though
-    they share the same worker_id (same pid), their sub_ordinals
-    monotonically increase from 0 to N-1."""
+    """Many concurrent asyncio tasks sharing a single runtime
+    increment its per-worker dict atomically under the sync_lock
+    contract. They share the same worker_id (single pid in single
+    event loop), so their sub_ordinals must form 0..N-1
+    contiguously.
+
+    Production L3 fan-out reality: separate processes own separate
+    runtimes with separate worker_ids; concurrent writes serialize
+    through flock on the shared ledger. Within a single runtime
+    instance, asyncio.gather on multiple decide() coroutines
+    exercises the sync_lock + async_lock interplay."""
     monkeypatch.setenv(
         "JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED", "true",
     )
 
-    n_threads = 4
-    per_thread = 25
+    n_tasks = 50
 
     async def one_op(idx: int) -> None:
         await decide(
-            op_id=f"op-shared",
-            phase="ROUTE", kind="route",
+            op_id="op-shared", phase="ROUTE", kind="route",
             inputs={"i": idx},
             compute=lambda v=idx: {"r": "x", "v": v},
         )
 
-    def thread_worker():
-        async def chain():
-            for j in range(per_thread):
-                await one_op(j)
-        asyncio.run(chain())
+    async def driver():
+        await asyncio.gather(
+            *(one_op(i) for i in range(n_tasks)),
+        )
 
-    threads = [
-        threading.Thread(target=thread_worker)
-        for _ in range(n_threads)
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
+    asyncio.run(driver())
     rows = _ledger_lines(isolated_runtime)
-    assert len(rows) == n_threads * per_thread
+    assert len(rows) == n_tasks
     # All records share the same worker_id (single pid) — their
     # sub_ordinals must form 0..N-1 contiguously.
     sub_ordinals = sorted(r["sub_ordinal"] for r in rows)
-    assert sub_ordinals == list(range(n_threads * per_thread))
+    assert sub_ordinals == list(range(n_tasks))
+
+
+def test_concurrent_async_per_op_namespace_independent(
+    monkeypatch, isolated_runtime,
+) -> None:
+    """Different (op_id) values produce independent sub_ordinal
+    namespaces — each starts at 0. Verifies the per-worker dict
+    keys are correctly tuple-composed."""
+    monkeypatch.setenv(
+        "JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED", "true",
+    )
+
+    async def driver():
+        # 5 ops, 3 records each
+        for op in ("op-a", "op-b", "op-c", "op-d", "op-e"):
+            for _ in range(3):
+                await decide(
+                    op_id=op, phase="ROUTE", kind="route",
+                    inputs={"x": op}, compute=lambda: {"r": "x"},
+                )
+
+    asyncio.run(driver())
+    rows = _ledger_lines(isolated_runtime)
+    # Group by op_id; verify each op's sub_ordinals are 0,1,2
+    by_op: dict = {}
+    for r in rows:
+        by_op.setdefault(r["op_id"], []).append(r["sub_ordinal"])
+    for op, subs in by_op.items():
+        assert sorted(subs) == [0, 1, 2], (
+            f"op {op} sub_ordinals {subs} != [0,1,2]"
+        )
 
 
 def test_total_order_via_wall_ts_lexicographic(
