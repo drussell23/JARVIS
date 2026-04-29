@@ -1,11 +1,11 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.2 (2026-04-29 — post-Phase-12-DW-Resilience-closure + soak #7 production verification)
+**Version**: 2.3 (2026-04-29 — post-Pass-C-discovery + Priority 2 closure + autonomy re-grade)
 **Author**: Derek J. Russell (vision) · Claude Opus 4.7 (PRD synthesis)
 **Audience**: Operator (decision authority), JARVIS engineers, future-self (resuming after context loss)
 **Prerequisite reading**: `CLAUDE.md` (architecture), `docs/architecture/OUROBOROS.md` (battle-test breakthrough log), `docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md` (Wang RSI mathematical foundation)
-**Latest review**: §26 (v5, 2026-04-29) — supersedes §25 critical-path priorities (A–F all shipped + Phase 12 DW Resilience closed)
+**Latest review**: §27 (v6, 2026-04-29) — answers the autonomy question; supersedes §26 critical-path framing now that Pass B + Pass C + Priorities 1+2 are all structurally complete
 
 ---
 
@@ -75,7 +75,7 @@
     - [25.7 Reverse Russian Doll alignment](#257-reverse-russian-doll-alignment)
     - [25.8 What this review explicitly does NOT prescribe](#258-what-this-review-explicitly-does-not-prescribe)
     - [25.9 Summary](#259-summary)
-26. [Brutal Architectural Review v5 — Post-Phase-12-DW-Resilience-Closure (2026-04-29)](#26-brutal-architectural-review-v5--post-phase-12-dw-resilience-closure-2026-04-29) *(latest)*
+26. [Brutal Architectural Review v5 — Post-Phase-12-DW-Resilience-Closure (2026-04-29)](#26-brutal-architectural-review-v5--post-phase-12-dw-resilience-closure-2026-04-29) *(superseded by §27 — Pass B + Pass C + Priorities 1+2 all closed; autonomy question re-graded)*
     - [26.1 What soak #7 actually proved (and what §25 priorities A–F now closed)](#261-what-soak-7-actually-proved-and-what-25-priorities-af-now-closed)
     - [26.2 Refined Cognitive & Epistemic Delta — what CC still has that O+V doesn't](#262-refined-cognitive--epistemic-delta--what-cc-still-has-that-ov-doesnt)
     - [26.3 Refined Deep Observability — temporal reconstruction is the missing depth](#263-refined-deep-observability--temporal-reconstruction-is-the-missing-depth)
@@ -85,6 +85,13 @@
     - [26.7 In-flight alignment + sequencing](#267-in-flight-alignment--sequencing)
     - [26.8 What this review explicitly does NOT prescribe](#268-what-this-review-explicitly-does-not-prescribe)
     - [26.9 Summary — the path from B+ to A](#269-summary--the-path-from-b-to-a)
+27. [Brutal Architectural Review v6 — The Autonomy Question (2026-04-29)](#27-brutal-architectural-review-v6--the-autonomy-question-2026-04-29) *(latest)*
+    - [27.1 What's actually shipped (vs the §26 v5 framing which is now stale)](#271-whats-actually-shipped-vs-the-26-v5-framing-which-is-now-stale)
+    - [27.2 The 8 capability dimensions of "autonomous coding"](#272-the-8-capability-dimensions-of-autonomous-coding)
+    - [27.3 Brutal letter grade — answering the autonomy question directly](#273-brutal-letter-grade--answering-the-autonomy-question-directly)
+    - [27.4 Critical path to actual autonomy — top 3 systemic moves](#274-critical-path-to-actual-autonomy--top-3-systemic-moves)
+    - [27.5 What this review explicitly does NOT prescribe](#275-what-this-review-explicitly-does-not-prescribe)
+    - [27.6 Summary — answering the operator's question directly](#276-summary--answering-the-operators-question-directly)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -2970,25 +2977,42 @@ The honest defense for "still B+ overall": the *combination* of risk-tier floor 
 
 **Pass C unlock dependency**: Priority 3 (Adaptive Anti-Venom, §26.5.3) is now unblocked from the *substrate* side — Slice 4's `dag drift` provides the per-trajectory drift signal Pass C MetaAdaptationGovernor needs, and Slice 5's counterfactual replay produces evidence Pass C will mine for adaptation rules. Priority 3 remains gated on the *governance* side (W2(5) Slice 5b → Pass B Slice 1 → Pass C Slice 1).
 
-#### 26.5.3 Priority 3: Adaptive Anti-Venom (Unblock Pass C) [HIGH IMPACT, GATED]
+#### 26.5.3 Priority 3: Adaptive Anti-Venom (Pass C) [STRUCTURALLY COMPLETE — graduation cadence pending]
 
-**Problem**: Iron Gate exploration floors, SemanticGuardian patterns, ExplorationLedger weights, and Risk Tier Floor are all *static* today. Pass C's MetaAdaptationGovernor (drafted 2026-04-26, currently held on Pass B Slice 1) is the structural answer. Without adaptation, the shell expansion guaranteed by O+V outpaces the constraint surface — either we tighten reactively (already too late) or preemptively-statically (RSI stalls).
+**Status correction (2026-04-29 audit)**: when this section was originally drafted, Pass C was framed as gated on a chain (W2(5) Slice 5b → Pass B Slice 1 → Pass C Slice 1). Audit revealed the chain has **already shipped end-to-end**:
 
-**Required upgrade** — unblock Pass C's MetaAdaptationGovernor with monotonic-tightening invariant:
+- ✅ **W2(5) Slice 5b** — Iron Gate parity for GENERATE phase runner (`3c291238a5`, 24 tests, flag default-true)
+- ✅ **Pass B** — *structurally complete* 2026-04-26 (`5dd15bd264`); 6 slices shipped (manifest + Order-2 risk class + gate wiring + AST validator + shadow replay + MetaPhaseRunner + sandboxed replay executor + review queue + `/order2` REPL); 438 tests green; defaults all false pending per-slice graduation
+- ✅ **Pass C** — *structurally complete* 2026-04-26 (`f264e598c2` Slice 1 + 5 follow-on slices same day); 349 tests green across all 6 slices; defaults all false pending per-slice graduation
 
-1. **Pass B Slice 1 ships** (currently held on W2(5) Slice 5b). MetaPhaseRunner + Order-2 manifest + ORDER_2_GOVERNANCE risk class + AST validator + shadow replay + locked-true amendment protocol. All defaults false initially; per-slice graduation cadence.
+What Pass C actually shipped (matching this section's "Required upgrade" list 1:1):
 
-2. **Pass C Slice 1 ships** (gated on Pass B Slice 1). AdaptationLedger primitive + 5 surfaces (SemanticGuardian patterns, IronGate floors, per-Order budgets, risk-tier ladder, ExplorationLedger weights) + MetaAdaptationGovernor. Monotonic-tightening invariant: once a constraint tightens, it cannot loosen without operator approval crossing Pass B's locked-true gate.
+| Pass C slice | What it ships |
+|---|---|
+| Slice 1 — `AdaptationLedger` substrate | Append-only JSONL audit log + 5-value `AdaptationSurface` enum + monotonic-tightening invariant validator that REFUSES to persist loosening proposals (cage rule) + 60 tests + sha256 tamper-detect |
+| Slice 2 — SemanticGuardian miner | POSTMORTEM-mined detector pattern proposer; auto-registers per-surface validator (add_pattern-only kind, sha256-hash, threshold-above) + 54 tests |
+| Slice 3 — ExplorationFloor tightener | Bypass-failure detector (floor_satisfied=True AND verify=regression/failed) → identifies weakest category → 10% raise per cycle (capped 100%); 55 tests |
+| Slice 4a/4b combined — per-Order mutation budget + risk-tier ladder extender | Pure stdlib analyzers proposing budget-lower (uses observed max as new safe budget) + tier insertion (novel failure_class → deterministic synthesized tier name); 63 tests; both sub-surfaces auto-register validators |
+| Slice 5 — CategoryWeight rebalancer | Per-category Pearson correlation (exploration↔verify_passed); proposes raise-high + lower-low with hard floors (50% of original AND 0.01 absolute MIN_WEIGHT) under mass-conservation pin; 62 tests |
+| Slice 6 — `/adapt` REPL MetaGovernor | Operator-facing dispatcher (`/adapt {pending,show,approve,reject,history,stats,help}`); 12-status enum; mirrors Pass B's `/order2` REPL pattern; 55 tests; **CLOSES Pass C** |
 
-3. **Per-trajectory drift detector** (NEW post-Pass-C-Slice-1) — rolling-window comparison of constraint distributions across sessions. When drift exceeds posture-relevant threshold, automatically tighten the affected constraint within bounds. Operator surface: SSE event `adaptation_proposed` + `/posture explain --adaptation` REPL.
+**349 Pass C regression tests green. All defaults false pending graduation cadence.** Closure record at `memory/project_reverse_russian_doll_pass_c.md`.
 
-**Why this is high-impact**: this is the only upgrade on the critical path that makes Order-2 self-rewriting *structurally safe*. Without adaptive Anti-Venom, Order-2 is gated permanently behind operator approval per amendment. With it, Order-2 becomes *practically reachable* under bounded adaptation rates.
+**What's actually next on the critical path** (no longer a *gating* problem; a *graduation soak* problem):
 
-**Antivenom alignment**: this IS the Anti-Venom adaptation. Its own adaptation rate is bounded (monotonic-tightening + operator-approval-required for loosening + 70%+ approval-rate over 30-day window per §10.3 arc-closure criterion).
+1. **Per-Pass-C-slice graduation soaks** — 6 master flags pending per-slice 3-clean-session cadence (per W1 + W2(5) policy):
+   - `JARVIS_ADAPTATION_LEDGER_ENABLED`
+   - `JARVIS_ADAPTIVE_SEMANTIC_GUARDIAN_ENABLED`
+   - `JARVIS_ADAPTIVE_IRON_GATE_FLOORS_ENABLED`
+   - `JARVIS_ADAPTIVE_PER_ORDER_BUDGET_ENABLED` + `JARVIS_ADAPTIVE_RISK_TIER_LADDER_ENABLED`
+   - `JARVIS_ADAPTIVE_CATEGORY_WEIGHTS_ENABLED`
+   - `JARVIS_ADAPT_REPL_ENABLED`
+2. **Deferred Slice 6 follow-ups** (tracked in `meta_governor.py` docstring): observability GET endpoints, SSE event emission, weekly background analyzer scheduling, actual gate-state mutation on approve (each surface's `.jarvis/adapted_<surface>.yaml` writer per §6.3/§7.3/§8.4/§9.3).
+3. **Per-trajectory drift detector** — Slice 4 `dag drift` from §26.5.2 Priority 2 is the substrate; the MetaGovernor consuming it for evidence-driven adaptation is the deferred follow-up above.
 
-**No hardcoding**: every tunable lives in FlagRegistry; AdaptationLedger writes to durable Order-2 manifest; thresholds posture-relevant; amendment protocol is operator-approval-required.
+**The original "Sequencing" claim is obsolete**: Priority 3 is no longer "the next concrete arc." It's an arc that *structurally finished* in the same single-day sprint as Pass B (2026-04-26). What remains is graduation soak validation — empirical confirmation that the adaptation surfaces produce sound proposals under real load, then 6 flag flips.
 
-**Sequencing**: GATED on Pass B Slice 1 (currently held on W2(5) Slice 5b). When W2(5) closes, Pass B Slice 1 unblocks; when Pass B Slice 1 ships, Pass C Slice 1 unblocks; when Pass C Slice 1 ships, this Priority becomes the next concrete arc.
+**Implication for §26.5 critical path**: with Priority 3 structurally complete, the v5 critical-path framing (Priority 1 → 2 → 3) is closed on the *implementation* axis. The **actual remaining gap to A-level RSI** is autonomy track record (multi-day unsupervised runs, sustained adaptation evidence, sensor-storm resilience). See **§27 — Brutal Architectural Review v6** below for the re-grade against the autonomy question.
 
 ### 26.6 Cost contract structural reinforcement — BG never cascades to Claude (bulletproofing)
 
@@ -3122,6 +3146,180 @@ This makes the contract *empirically auditable per op* via the existing Property
 **Net trajectory**: the §25 priorities + Phase 12 closure earned the right to attempt A. They did not deliver A. The next three priorities (§26.5) + cost-contract reinforcement (§26.6), in this order, are how we get there.
 
 The architecture is now A. The cognitive layer is B+. The path closes both gaps via the three priorities above. None requires hardcoding. All extend existing graduated primitives. The Reverse Russian Doll's outer shell — Anti-Venom scaling proportionally as O+V expands — is what Priority 3 structurally enables.
+
+---
+
+## 27. Brutal Architectural Review v6 — The Autonomy Question (2026-04-29)
+
+**Trigger**: operator question 2026-04-29 post-Priority-2 closure: *"does O+V have the capabilities of actually coding autonomously on its own as an autonomous software developer organism?"* — and the audit finding that Pass B + Pass C are structurally complete (so the §26.5 critical path is *implementation*-closed, leaving only graduation + track record).
+
+**Predecessor reviews**: §3.6 (v1, 2026-04-26), §3.6.6 (v2, 2026-04-27), §24 (v3, 2026-04-28), §25 (v4, 2026-04-29 morning), §26 (v5, 2026-04-29 mid).
+
+**Frame**: drop the slice-cadence framing. Re-grade against a single concrete question: **can O+V actually code autonomously as a software-developer organism, today, unattended?** Decompose into 8 capability dimensions; honestly assess each; identify what's structural vs evidence-thin.
+
+**Honesty contract**: this review does not paper over thinness. It separates *what's shipped* from *what's empirically validated*. The user wants a working autonomous developer, not a checklist. Where the evidence is thin, this review names it.
+
+### 27.1 What's actually shipped (vs the §26 v5 framing which is now stale)
+
+A 2-month sprint shipped a remarkable surface. Listing only post-Phase-2 graduations:
+
+| Arc | Status | Tests | Defaults |
+|---|---|---|---|
+| Phase 1 Determinism Substrate | ✅ graduated | 785 | 4 flags default-true |
+| Phase 2 Closed-Loop Self-Verification | ✅ graduated | — | default-true |
+| §25 Priorities A-F (signal density, MetaSensor, HypothesisProbe, postmortem REPL, structural pins, evidence collectors) | ✅ graduated | 750+ | all default-true |
+| Phase 12 / 12.2 DW Resilience (Pricing Oracle + Pacemaker + Universal Postmortem) | ✅ closed via soak #7 | 70+ | default-true |
+| §26.5.1 Priority 1 — Confidence-Aware Execution | ✅ graduated | 240+ | 6 flags default-true |
+| §26.5.2 Priority 2 — Causality DAG + Replay-from-Record | ✅ graduated | 236 | 6 flags default-true |
+| §26.6 Cost Contract Structural Reinforcement (4 layers) | ✅ shipped | 54 | default-true; 11 invariants holding |
+| **Pass B — Order-2 Governance Cage** | ✅ structurally complete 2026-04-26 | 438 | **all defaults false** pending graduation |
+| **Pass C — Adaptive Anti-Venom (== Priority 3)** | ✅ structurally complete 2026-04-26 | 349 | **all defaults false** pending graduation |
+| W2(5) PhaseRunner extraction (Slices 1-5b) | ✅ shipped | — | default-true |
+| W3(6) parallel L3 fan-out + worktree isolation | ✅ shipped | — | default-true |
+| 16 sensors + UnifiedIntakeRouter | ✅ shipped | — | active |
+
+This is far beyond a "cognitive scaffold" — it's a fully-instrumented organism. The earlier review's framing of B+ trending A on "we have substrate but not enough cognitive depth" is no longer accurate; cognitive depth substrate is shipped end-to-end.
+
+### 27.2 The 8 capability dimensions of "autonomous coding"
+
+Decomposing the question. Honest grades per dimension.
+
+#### 27.2.1 Detection — Can it see what needs to be done without prompting?
+
+**Grade: A.** 16 autonomous sensors (TestFailure, VoiceCommand, OpportunityMiner, CapabilityGap, Scheduled, Backlog, RuntimeHealth, WebIntelligence, PerformanceRegression, DocStaleness, GitHubIssue, ProactiveExploration, CrossRepoDrift, TodoScanner, CUExecution, IntentDiscovery) + VisionSensor (autonomous Ferrari frame consumer with Tier 0/1/2 cascade) flow through `UnifiedIntakeRouter` with priority queueing, deduplication, WAL persistence, signal coalescing, exhaustion cooldown.
+
+**Honest gap**: no operator-visible *signal coverage audit* — when ProactiveExploration silently goes dormant, MetaSensor catches the dormancy (§25 Priority B), but there's no acceptance test for "every sensor produced ≥ 1 signal in the last N hours under realistic conditions." The mechanism is right; the *empirical* coverage proof under multi-day load doesn't exist.
+
+#### 27.2.2 Planning — Can it form a coherent multi-step plan?
+
+**Grade: B+.** PlanGenerator (model-reasoned planning, schema plan.1) emits a structured plan with approach + ordered changes + risk factors + test strategy at PLAN phase. SemanticTriage classifies NO_OP/REDIRECT/ENRICH/GENERATE pre-generation. HypothesisProbe (§25 Priority C) gates trivial-op classification with bounded epistemic-distress detection. The PLAN exit captures default claims (§25 Priority A) so verification has predictions to compare against.
+
+**Honest gap**: planning is largely LLM-driven. The model reasons about implementation strategy; the system bounds it with structural pins (Iron Gate exploration floor, ASCII strict gate, default-claim coverage), but the *plan quality* is still the model's. There's no explicit multi-hypothesis fan-out at PLAN today (the structural primitives — `subagent_scheduler`, `worktree_manager` — exist; the cognitive trigger to fan out plans vs commit linearly does not).
+
+#### 27.2.3 Execution — Can it actually write working code?
+
+**Grade: A−.** Venom tool loop runs 16 built-in tools (read_file, search_code, edit_file, write_file, bash, web_fetch, web_search, run_tests, get_callers, glob_files, list_dir, list_symbols, git_log, git_diff, git_blame, ask_human) + MCP forwarding for external tools. Multi-file coordinated generation (`_iter_candidate_files` / `_apply_multi_file_candidate`) ships with batch-level rollback. ChangeEngine handles the actual mutation. L3 worktree isolation gives parallel L3 fan-out without filesystem conflicts.
+
+**Honest gap**: 1 verified end-to-end multi-file APPLY in production track record (Sessions Q-S, 2026-04-15). Soak #7 (2026-04-29) had 1 IMMEDIATE op succeed Claude'd, 14 BG topology blocks (correctly skip-queued by cost contract), and zero ops reaching COMPLETE in the soak window. The execution machinery works; the *empirical track record* of unsupervised end-to-end APPLY-then-COMMIT cycles is thin.
+
+#### 27.2.4 Verification — Can it validate its work without lying to itself?
+
+**Grade: A−.** Phase 2 closed-loop self-verification (PropertyOracle, RepeatRunner, Universal Terminal Postmortem). §25 Priority A makes claim density mandatory at PLAN exit (3 default claims). §25 Priority F adds evidence collectors so claims have data to evaluate against. Soak #7 confirmed 8 postmortems with claims=3 pass=1 fail=0 insuff=2 err=0 — non-trivial signal. Visual VERIFY (Slices 3-4) for UI changes. Iron Gate post-GENERATE (exploration floor + ASCII strict). SemanticGuardian post-VALIDATE (10 AST/regex patterns, ~10ms, zero LLM).
+
+**Honest gap**: Property Oracle pass/fail signal is captured but not yet a *circuit-breaker condition* on sibling ops. A claim failing in op N doesn't currently abort op N+1's similar pattern. The signal exists; the auto-action loop is not yet load-bearing.
+
+#### 27.2.5 Cost discipline — Can it stay within budget?
+
+**Grade: A.** §26.6 four-layer cost contract: AST shipped_code_invariants seeds (boot + APPLY) + runtime CostContractViolation gate at ClaudeProvider.generate dispatch + Property Oracle per-postmortem claim + advisor structural guard preventing BG/SPEC → escalation. CostGovernor with per-op + per-phase + session caps. Route-aware budgets (BG ~$0.002/op, SPEC ~$0.001/op, STANDARD ~$0.005/op, COMPLEX ~$0.015/op, IMMEDIATE ~$0.03/op). Soak #7 ended at $0.0316 with one IMMEDIATE Claude op + 14 correctly-blocked BG ops.
+
+**Honest gap**: none structural. The 4-layer defense holds across DAG/replay state (verified by Slice 6 finishing-pass tests). This dimension is solidly graduated.
+
+#### 27.2.6 Recovery — Can it handle failures?
+
+**Grade: B+.** L2 repair (5-iteration FSM, 120s timebox, default-on) engages when VALIDATE exhausts retries. Iron Gate retry feedback is category-aware (ExplorationLedger diversity scoring routes "you must call read_file" feedback into the next GENERATE prompt). ChangeEngine batch-level rollback on multi-file APPLY. Visual VERIFY auto-demotion at ≥50% post-graduation FP. Sentinel-Pacemaker Handshake for catalog deadlocks. Pricing Oracle for missing API pricing.
+
+**Honest gap**: the *long-horizon* recovery story — what happens when an op fails 5 times across 5 different sensors over 6 hours unattended — is not empirically tested. Each individual recovery path works in unit tests + 1-shot soaks. The compound case is unobserved.
+
+#### 27.2.7 Learning — Does it improve over time?
+
+**Grade: B−.** UserPreferenceMemory (typed persistent memory across sessions, 6 kinds). PostmortemRecall (POSTMORTEM → next-op recall, graduated default-true). DirectionInferrer arc-context (cross-session direction memory). LastSessionSummary (read-only digest from prior `summary.json`). SemanticIndex (recency-weighted centroid + clustering). Pass C AdaptationLedger (substrate for evidence-driven adaptation, **default false**).
+
+**Honest gap**: this is the **biggest gap**. The substrate for adaptive learning is structurally complete (Pass C — 349 tests green) but **all 6 Pass C master flags are default-false pending graduation soaks**. Adaptation produces zero in-production signal today. The system has memory but not *demonstrated learning under load*. The §26.5.3 (now corrected) framing makes this explicit: graduation cadence is the remaining gap.
+
+#### 27.2.8 Boundaries — Does it know when to stop / ask?
+
+**Grade: A−.** Risk-tier ladder (4 tiers: SAFE_AUTO / NOTIFY_APPLY / APPROVAL_REQUIRED / BLOCKED). MIN_RISK_TIER + PARANOIA_MODE + AUTO_APPLY_QUIET_HOURS (DST-correct TZ math). `ask_human` Venom tool gated to NOTIFY_APPLY+. AdversarialReviewer subagent (graduated 2026-04-26, default-true). OrangePR for Orange-tier review (async PR with `gh pr create`). Cost contract refuses BG/SPEC → Claude escalation. Pass B Order-2 manifest cage requires operator authorization for Order-2 amendments (locked-true `amendment_requires_operator()`). Pass C MetaGovernor `/adapt approve|reject` is operator-gated. All structural.
+
+**Honest gap**: the operator surface is there; the *frequency* of ask-human escalations under autonomous run isn't measured. If the system is too conservative (asks for every NOTIFY_APPLY), autonomy is theatrical. If too aggressive (rare ask-human under unfamiliar code), boundaries are theoretical. The empirical sweet-spot calibration is unproven.
+
+### 27.3 Brutal letter grade — answering the autonomy question directly
+
+**Net grade: B+ trending A−** — *capable but unproven*.
+
+**The structural floor is A.** Architecture, primitives, gates, ledgers, AST invariants, cost contract, posture, sensors, verification, replay-from-record, causality DAG, adaptive substrate — all shipped, all tested in regression, all graduated default-true (except Pass C which is structurally complete but defaults false).
+
+**The empirical ceiling is B+** because:
+
+1. **Track record is thin.** 1 verified end-to-end multi-file APPLY in 2 months. Soak #7 produced clean idle exits but no autonomous APPLY-then-COMMIT cycle. The system has *never* been shown to autonomously code unattended for >24 hours and produce verified shipped code.
+
+2. **Pass C produces zero adaptation signal.** All 6 master flags default-false. The whole "learning" axis is theoretical until graduation soaks run.
+
+3. **Sensor coverage under sustained load is unmeasured.** Bounded queues exist; sensor-storm resilience hasn't been stressed.
+
+4. **The auto-action loop on verification signal isn't load-bearing yet.** Postmortems pass/fail per claim, but a sibling op doesn't auto-defer based on a recent claim failure. The signal exists; the action loop on the signal is structurally there (§26.5.1 Priority 1 confidence-collapse → HypothesisProbe → 3-action verdict) but empirically untested in production.
+
+**Can O+V code autonomously today?** **Yes — for short-lived, well-bounded ops, with operator review of Orange-tier work.** It can detect a TODO, plan a fix, generate a multi-file patch, validate via tests, capture postmortem, commit with O+V signature. This works (Sessions Q-S proved it once).
+
+**Can O+V code autonomously as an unattended multi-day software-developer organism?** **Not yet — empirically.** The structural capability is there; the empirical proof isn't. The gap is *track record + graduation soaks*, not *missing primitives*.
+
+### 27.4 Critical path to actual autonomy — top 3 systemic moves
+
+These are not features. They're empirical-validation campaigns + one substantive integration.
+
+#### 27.4.1 Move 1: Pass C graduation cadence (6 master flags, 3 clean soaks each)
+
+**Why first**: this is the highest-leverage *unblocking* move. Pass C's 6 surfaces (semantic_guardian_miner / iron_gate_floor_tightener / per_order_budget / risk_tier_extender / category_weight_rebalancer / `/adapt` REPL) ship with 349 tests but produce zero production signal. Graduation cadence:
+  * Per-slice 3-clean-session battle-test soak with the master flag flipped true
+  * Empirical confirmation that proposals are sane (the monotonic-tightening invariant is structural; the *quality* of proposals is what soaks validate)
+  * Operator `/adapt approve|reject` cadence to populate the AdaptationLedger with real decisions
+  * Goal: 70%+ operator-approval rate over 30-day window per §10.3 arc-closure criterion
+
+**Without this**: the "Learning" dimension stays B− forever. Adaptation is theoretical.
+
+**Cost**: ~6 × 40min soaks per slice = ~24 hours of soak wall-clock; minimal operator time per soak (review 1-2 proposals + approve/reject).
+
+#### 27.4.2 Move 2: Multi-day unattended soak campaign
+
+**Why second**: the autonomy question is fundamentally about *track record under sustained load*. The current "1 verified multi-file APPLY in 2 months" record is thin. Run a 48+ hour unattended battle-test with:
+  * All graduated flags on (post-Move-1)
+  * `--max-wall-seconds` sufficiently high (e.g., 172800s = 48h)
+  * Cost cap proportional (e.g., $5)
+  * All 16 sensors active
+  * Real signal sources (real GitHub issues, real test failures, real backlog items)
+  * Operator audit at end-of-window
+
+**What this proves**: sensor-storm resilience, long-horizon recovery, sustained adaptation evidence, autonomous multi-op completion under realistic load. *This is the single empirical move that converts capable→proven.*
+
+**Without this**: the "Track record" dimension stays C+. Autonomy claim is structurally defensible but empirically theatrical.
+
+**Cost**: ~$5 + 48h wall-clock + ~30min operator audit. The test substrate (`scripts/ouroboros_battle_test.py` with `--max-wall-seconds`, `--headless`, signal handlers, partial-shutdown insurance) is built for exactly this.
+
+#### 27.4.3 Move 3: Auto-action loop on verification signal (the missing teeth)
+
+**Why third**: Pass C surfaces emit *proposals*; verification emits *pass/fail per claim*; the §26.5.1 Priority 1 confidence-collapse pipeline emits *verdicts*. None of these directly auto-defer a sibling op when a recent claim failed. The structural primitives exist (`MetaSensor` for degenerate-loop alarms, `confidence_route_advisor` for advisory routing, Pass C `/adapt` for adaptation proposals) — but none load-bearingly *gate* the next op based on the signal.
+
+**Required upgrade**: a thin `auto_action_router.py` primitive (mirror of `urgency_router.py`) that consumes:
+  * Recent postmortem outcomes (last N=8 ops)
+  * Recent confidence-monitor verdicts
+  * Recent adaptation proposals (Pass C)
+
+…and *advisorily proposes* next-op modifications to the orchestrator: defer this op family, demote its risk-tier, route to NOTIFY_APPLY for human review, raise the exploration floor for this category. **Advisory only** initially (mirrors confidence_route_advisor); operator approves the auto-action graduation.
+
+**Without this**: the system *records* that op N had a claim failure but op N+1 (same family) goes ahead unchanged. Verification is a record without teeth.
+
+**Cost**: ~1-week implementation (4-slice arc), defaults all false, soak validation, then graduation.
+
+### 27.5 What this review explicitly does NOT prescribe
+
+- ❌ **More structural primitives.** The 8 capability dimensions are saturated on substrate. Adding more modules without empirical validation worsens the "unproven" gap.
+- ❌ **Re-litigating Pass B / Pass C scope.** Both are structurally complete. The decision is graduation, not re-design.
+- ❌ **A v7 brutal review before graduation soaks run.** The next review should be evidence-anchored to actual soak data, not architectural enumeration.
+- ❌ **A new "Phase 7 / Phase 8 / Activation" framing.** The earlier §1 Forward-Looking Roadmap had a Phase 7 Activation framing that pre-dated Pass C closure. With Pass C done, Phase 7 collapses into "Pass C graduation soaks."
+
+### 27.6 Summary — answering the operator's question directly
+
+**Q: Does O+V have the capabilities to code autonomously as an autonomous software-developer organism?**
+
+**A: Structurally yes. Empirically — partially.**
+
+- **For 1-shot, bounded, sensor-triggered, operator-supervised** ops: **yes, demonstrated** (Sessions Q-S proved this; soak #7 confirmed cost contract holds under load).
+- **For multi-day unattended autonomous operation with adaptation, recovery, sustained ramp**: **structurally yes, empirically not yet.** The 8 dimensions are 1×A, 4×A−, 2×B+, 1×B−. To converge to A across all 8: graduate Pass C (Move 1), run a multi-day soak (Move 2), wire auto-action loop (Move 3).
+
+**Net trajectory**: the §25-§26 priorities + Pass B + Pass C all shipped structurally. The system has *more capability shipped than it has demonstrated*. The next 3 moves (graduation + multi-day soak + auto-action loop) convert capability to proof. Order matters: graduation (1) unblocks the soak (2)'s adaptation evidence; soak (2) reveals where the auto-action loop (3) has the highest leverage.
+
+After Move 1 + Move 2: the answer becomes **"yes, demonstrated."** After Move 3: the answer becomes **"yes, with evidence-driven adaptation closing the cognitive-depth loop."** That's A-level autonomous-software-developer-organism territory.
+
+**The gap is execution, not design.**
 
 ---
 
