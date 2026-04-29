@@ -1184,6 +1184,106 @@ SEED_SPECS: list = [
         since="§26.6 + Priority 1 Slice 5 graduation",
         posture_relevance=_ALL_POSTURES_CRITICAL,
     ),
+
+    # ====================================================================
+    # Priority 2 — Causality DAG + Deterministic Replay — 7 flags
+    # Slices 3–6.  Operator directive 2026-04-29.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CAUSALITY_DAG_QUERY_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master gate for DAG construction from the JSONL "
+            "decisions ledger. When false, build_dag returns an "
+            "empty CausalityDAG. Default false until Slice 6 "
+            "graduation."
+        ),
+        category=Category.EXPERIMENTAL,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "causality_dag.py"
+        ),
+        example="false",
+        since="Priority 2 Slice 3",
+    ),
+    FlagSpec(
+        name="JARVIS_DAG_MAX_RECORDS",
+        type=FlagType.INT, default=100_000,
+        description=(
+            "Hard cap on records loaded from the JSONL ledger "
+            "during build_dag. Prevents unbounded memory on "
+            "very large sessions."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "causality_dag.py"
+        ),
+        example="100000",
+        since="Priority 2 Slice 3",
+    ),
+    FlagSpec(
+        name="JARVIS_DAG_MAX_DEPTH",
+        type=FlagType.INT, default=8,
+        description=(
+            "Maximum BFS depth for subgraph extraction. "
+            "Prevents unbounded traversal on deep causal chains."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "causality_dag.py"
+        ),
+        example="8",
+        since="Priority 2 Slice 3",
+    ),
+    FlagSpec(
+        name="JARVIS_DAG_DRIFT_NODE_DELTA_THRESHOLD",
+        type=FlagType.FLOAT, default=0.25,
+        description=(
+            "Node-set delta ratio above which drift is flagged "
+            "between two DAGs. 0.25 = 25%% difference."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "causality_dag.py"
+        ),
+        example="0.25",
+        since="Priority 2 Slice 3",
+    ),
+    FlagSpec(
+        name="JARVIS_DAG_NAVIGATION_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master gate for DAG navigation surfaces (REPL, "
+            "GET, SSE). Sub-flags control individual channels. "
+            "Default false until Slice 6 graduation."
+        ),
+        category=Category.EXPERIMENTAL,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "dag_navigation.py"
+        ),
+        example="false",
+        since="Priority 2 Slice 4",
+    ),
+    FlagSpec(
+        name="JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Gate for --rerun-from record-level fork replay. "
+            "When false, the CLI arg is accepted but returns a "
+            "structured failure. Default false until Slice 6."
+        ),
+        category=Category.EXPERIMENTAL,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "replay_from_record.py"
+        ),
+        example="false",
+        since="Priority 2 Slice 5",
+    ),
 ]
 
 
