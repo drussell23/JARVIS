@@ -1106,7 +1106,22 @@ class DoublewordProvider:
                     confidence_capture_top_k,
                     extract_openai_compat_logprobs_from_chunk,
                 )
+                # Priority 1 Slice 2 — confidence monitor + circuit-breaker.
+                # When ENABLED, the monitor consumes the per-token margin
+                # signal alongside the capturer and produces a verdict;
+                # ENFORCE sub-flag governs whether BELOW_FLOOR raises
+                # ConfidenceCollapseError mid-stream. Slice 2 ships
+                # SHADOW only — both flags default false; ENFORCE flips
+                # in Slice 5 graduation.
+                from backend.core.ouroboros.governance.verification.confidence_monitor import (
+                    ConfidenceMonitor,
+                    ConfidenceVerdict,
+                    confidence_monitor_enabled,
+                    confidence_monitor_enforce,
+                )
                 _confidence_capturer: Optional[ConfidenceCapturer] = None
+                _confidence_monitor: Optional[ConfidenceMonitor] = None
+                _monitor_enforce_active: bool = False
                 if confidence_capture_enabled():
                     body["logprobs"] = True
                     body["top_logprobs"] = confidence_capture_top_k()
@@ -1114,6 +1129,20 @@ class DoublewordProvider:
                         provider="doubleword",
                         model_id=str(_effective_model or ""),
                     )
+                    # Slice 2 monitor wakes only when its own master flag
+                    # is on. Capture without monitor remains valid (Slice 1
+                    # observation-only mode for ledger/replay use).
+                    if confidence_monitor_enabled():
+                        _confidence_monitor = ConfidenceMonitor(
+                            provider="doubleword",
+                            model_id=str(_effective_model or ""),
+                            op_id=str(
+                                getattr(context, "op_id", "") or "",
+                            ),
+                        )
+                        _monitor_enforce_active = (
+                            confidence_monitor_enforce()
+                        )
                     # Stash on ctx.artifacts so downstream phase runners
                     # (Slice 2 monitor) can read the trace post-stream.
                     try:
@@ -1122,6 +1151,10 @@ class DoublewordProvider:
                             _artifacts["confidence_capturer"] = (
                                 _confidence_capturer
                             )
+                            if _confidence_monitor is not None:
+                                _artifacts["confidence_monitor"] = (
+                                    _confidence_monitor
+                                )
                     except Exception:  # noqa: BLE001 — capture must
                         pass        # never break the stream loop
                 # Phase 12.2 Slice C — TTFT measurement window opens
@@ -1173,12 +1206,17 @@ class DoublewordProvider:
                             chunk = json.loads(data_str)
                             delta = chunk.get("choices", [{}])[0].get("delta", {})
                             token = delta.get("content", "")
-                            # Priority 1 Slice 1 — pure logprob capture.
-                            # Reads chunk["choices"][0]["logprobs"]["content"]
-                            # if present and feeds each entry to the
-                            # capturer. Master-flag-gated upstream;
-                            # when off, _confidence_capturer is None.
-                            # NEVER raises into the SSE loop.
+                            # Priority 1 Slice 1 + Slice 2 — capture +
+                            # monitor. Reads chunk's logprobs structure;
+                            # feeds capturer (always when capture enabled)
+                            # and monitor (when monitor enabled). Master-
+                            # flag-gated upstream; when off, both are None.
+                            # NEVER raises into the SSE loop EXCEPT for
+                            # the explicit ConfidenceCollapseError path
+                            # under ENFORCE — which propagates as a
+                            # structured RuntimeError that the caller
+                            # already handles via "background_dw_error" /
+                            # GENERATE_RETRY routing.
                             if _confidence_capturer is not None:
                                 try:
                                     for _t, _lp, _top in (
@@ -1191,8 +1229,125 @@ class DoublewordProvider:
                                             logprob=_lp,
                                             top_logprobs=_top,
                                         )
+                                        # Slice 2 monitor: feed the
+                                        # top-1/top-2 margin if there
+                                        # are at least 2 alternatives.
+                                        if _confidence_monitor is not None:
+                                            try:
+                                                if (
+                                                    isinstance(_top, list)
+                                                    and len(_top) >= 2
+                                                ):
+                                                    _entry0 = _top[0]
+                                                    _entry1 = _top[1]
+                                                    _lp0 = (
+                                                        _entry0.get(
+                                                            "logprob"
+                                                        ) if isinstance(
+                                                            _entry0, dict
+                                                        ) else None
+                                                    )
+                                                    _lp1 = (
+                                                        _entry1.get(
+                                                            "logprob"
+                                                        ) if isinstance(
+                                                            _entry1, dict
+                                                        ) else None
+                                                    )
+                                                    if (
+                                                        _lp0 is not None
+                                                        and _lp1 is not None
+                                                    ):
+                                                        _confidence_monitor.observe(
+                                                            float(_lp0)
+                                                            - float(_lp1)
+                                                        )
+                                            except Exception:  # noqa: BLE001
+                                                pass
                                 except Exception:  # noqa: BLE001
                                     pass
+
+                                # Slice 2 mid-stream verdict check. Cheap
+                                # (O(K)). Slice 5 graduation flips ENFORCE
+                                # on; until then, the verdict is observed
+                                # but never aborts. SHADOW mode tags
+                                # ctx.artifacts only; ENFORCE mode raises
+                                # ConfidenceCollapseError.
+                                if _confidence_monitor is not None:
+                                    try:
+                                        _posture: Optional[str] = None
+                                        try:
+                                            _posture = (
+                                                getattr(
+                                                    context,
+                                                    "current_posture", None,
+                                                )
+                                                or getattr(
+                                                    context,
+                                                    "posture", None,
+                                                )
+                                            )
+                                        except Exception:  # noqa: BLE001
+                                            _posture = None
+                                        _verdict = (
+                                            _confidence_monitor.evaluate(
+                                                posture=(
+                                                    str(_posture)
+                                                    if _posture else None
+                                                ),
+                                            )
+                                        )
+                                        if _verdict != ConfidenceVerdict.OK:
+                                            try:
+                                                _arts = getattr(
+                                                    context,
+                                                    "artifacts", None,
+                                                )
+                                                if isinstance(
+                                                    _arts, dict,
+                                                ):
+                                                    _arts[
+                                                        "confidence_verdict"
+                                                    ] = _verdict.value
+                                                    _arts[
+                                                        "confidence_margin"
+                                                    ] = (
+                                                        _confidence_monitor
+                                                        .current_margin()
+                                                    )
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                            if (
+                                                _monitor_enforce_active
+                                                and _verdict
+                                                == ConfidenceVerdict.BELOW_FLOOR
+                                            ):
+                                                raise (
+                                                    _confidence_monitor
+                                                    .to_collapse_error(
+                                                        verdict=_verdict,
+                                                        posture=(
+                                                            str(_posture)
+                                                            if _posture
+                                                            else None
+                                                        ),
+                                                    )
+                                                )
+                                    except (
+                                        Exception
+                                    ) as _conf_exc:  # noqa: BLE001
+                                        # Re-raise ConfidenceCollapseError
+                                        # so caller's retry path engages.
+                                        # Other exceptions from the verdict
+                                        # path are swallowed defensively.
+                                        from backend.core.ouroboros.governance.verification.confidence_monitor import (
+                                            ConfidenceCollapseError,
+                                        )
+                                        if isinstance(
+                                            _conf_exc,
+                                            ConfidenceCollapseError,
+                                        ):
+                                            raise
                             if token:
                                 content += token
                                 self._last_chunk_at = time.monotonic()
