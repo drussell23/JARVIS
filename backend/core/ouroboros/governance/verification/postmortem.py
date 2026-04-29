@@ -684,6 +684,72 @@ def _ledger_path_for_session(session_id: Optional[str] = None) -> Path:
     return Path(base) / sid / "decisions.jsonl"
 
 
+def list_recent_postmortems(
+    *,
+    limit: int = 100,
+    session_id: Optional[str] = None,
+    include_kinds: Optional[Tuple[str, ...]] = None,
+) -> Tuple[VerificationPostmortem, ...]:
+    """Read the most recent N recorded postmortems from the per-session
+    JSONL ledger, newest-last. NEVER raises.
+
+    By default, returns BOTH ``verification_postmortem`` records
+    (Slice 2.4, COMPLETE-phase happy path) AND ``terminal_postmortem``
+    records (Option E, every non-COMPLETE termination). Callers can
+    narrow via ``include_kinds`` if needed.
+
+    Used by the MetaSensor (Priority B) to detect degenerate signals
+    like high empty-claim rate. NEVER raises — file-read failures /
+    JSON-decode errors / unparseable rows are silently skipped.
+
+    Returns the LAST ``limit`` matching records in insertion order.
+    """
+    safe_limit = max(1, int(limit))
+    if include_kinds is None:
+        include_kinds = (
+            "verification_postmortem", "terminal_postmortem",
+        )
+    safe_kinds = tuple(str(k) for k in include_kinds)
+    path = _ledger_path_for_session(session_id)
+    if not path.exists():
+        return ()
+    pms: List[VerificationPostmortem] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, Mapping):
+                    continue
+                if record.get("kind") not in safe_kinds:
+                    continue
+                output_repr = record.get("output_repr", "")
+                if not isinstance(output_repr, str):
+                    continue
+                try:
+                    pm_dict = json.loads(output_repr)
+                except json.JSONDecodeError:
+                    continue
+                pm = VerificationPostmortem.from_dict(pm_dict)
+                if pm is not None:
+                    pms.append(pm)
+    except OSError as exc:
+        logger.debug(
+            "[verification.postmortem] list_recent read failed at "
+            "%s: %s", path, exc,
+        )
+        return ()
+    # Return last `safe_limit` records (newest-last).
+    if len(pms) > safe_limit:
+        return tuple(pms[-safe_limit:])
+    return tuple(pms)
+
+
 def get_recorded_postmortem(
     *,
     op_id: str,
@@ -826,6 +892,7 @@ __all__ = [
     "VerificationPostmortem",
     "ctx_evidence_collector",
     "get_recorded_postmortem",
+    "list_recent_postmortems",
     "log_postmortem_summary",
     "persist_postmortem",
     "postmortem_enabled",
