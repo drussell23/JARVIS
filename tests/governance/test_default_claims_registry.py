@@ -142,7 +142,11 @@ def test_spec_to_dict_round_trip() -> None:
 def test_three_seed_specs_registered_at_module_load(fresh_registry) -> None:
     specs = list_default_claim_specs()
     kinds = sorted(s.claim_kind for s in specs)
+    # Original 3 Priority A seeds + the §26.6.3 cost contract claim
+    # added post-Phase-12. Test name is historical; coverage is now
+    # "all current seed specs registered at module load."
     assert kinds == [
+        "cost_contract_bg_op_did_not_use_claude",
         "file_parses_after_change",
         "no_new_credential_shapes",
         "test_set_hash_stable",
@@ -211,8 +215,8 @@ def test_reset_clears_and_reseeds(fresh_registry) -> None:
     assert any(s.claim_kind == "extra" for s in list_default_claim_specs())
     reset_registry_for_tests()
     assert all(s.claim_kind != "extra" for s in list_default_claim_specs())
-    # Seeds re-registered
-    assert len(list_default_claim_specs()) == 3
+    # Seeds re-registered (3 Priority A + 1 §26.6.3 cost contract)
+    assert len(list_default_claim_specs()) == 4
 
 
 # ===========================================================================
@@ -318,9 +322,13 @@ def test_synthesize_happy_path_returns_three_claims(
     claims = synthesize_default_claims(
         op_id="op-1", target_files=["a.py"],
     )
-    assert len(claims) == 3
+    # Original 3 Priority A claims + §26.6.3 cost contract claim
+    # (which applies unconditionally to all ops). Test name is
+    # historical.
+    assert len(claims) == 4
     kinds = sorted(c.property.kind for c in claims)
     assert kinds == [
+        "cost_contract_bg_op_did_not_use_claude",
         "file_parses_after_change",
         "no_new_credential_shapes",
         "test_set_hash_stable",
@@ -496,7 +504,8 @@ def test_synthesized_claims_persist_via_capture_claims(
     claims = synthesize_default_claims(
         op_id="op-e2e", target_files=["a.py"],
     )
-    assert len(claims) == 3
+    # 3 Priority A + 1 §26.6.3 cost contract claim
+    assert len(claims) == 4
 
     async def _run():
         from backend.core.ouroboros.governance.verification import (
@@ -511,10 +520,11 @@ def test_synthesized_claims_persist_via_capture_claims(
         return captured, recovered
 
     captured, recovered = asyncio.run(_run())
-    assert captured == 3
-    assert len(recovered) == 3
+    assert captured == 4
+    assert len(recovered) == 4
     kinds = sorted(c.property.kind for c in recovered)
     assert kinds == [
+        "cost_contract_bg_op_did_not_use_claude",
         "file_parses_after_change",
         "no_new_credential_shapes",
         "test_set_hash_stable",
