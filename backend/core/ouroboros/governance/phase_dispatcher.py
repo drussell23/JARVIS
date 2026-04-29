@@ -78,6 +78,7 @@ is pure routing — runners still own their own authority domains.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -452,6 +453,142 @@ def build_default_registry() -> PhaseRunnerRegistry:
 
 
 # ---------------------------------------------------------------------------
+# Universal Terminal Postmortem (Option E)
+# ---------------------------------------------------------------------------
+
+
+_TERMINAL_POSTMORTEM_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _terminal_postmortem_enabled() -> bool:
+    """``JARVIS_TERMINAL_POSTMORTEM_ENABLED`` (default ``true``).
+
+    Independent kill switch for the universal terminal postmortem hook.
+    When off, the dispatcher exits without firing postmortems for
+    non-COMPLETE terminations. Hot-revert path: ``export
+    JARVIS_TERMINAL_POSTMORTEM_ENABLED=false``."""
+    raw = os.environ.get(
+        "JARVIS_TERMINAL_POSTMORTEM_ENABLED", "true",
+    ).strip().lower()
+    return raw in _TERMINAL_POSTMORTEM_TRUTHY
+
+
+async def _fire_terminal_postmortem(
+    *,
+    ctx: Any,
+    terminal_phase: "OperationPhase",
+    status: str,
+    reason: Optional[str],
+) -> None:
+    """Universal terminal postmortem — async, never blocks, never raises.
+
+    Fires for EVERY op termination EXCEPT COMPLETE (which has its own
+    postmortem wiring in COMPLETERunner). Dynamically captures the
+    terminal context:
+
+      * ``terminal_phase`` — which phase killed the op
+      * ``status`` — "fail" / "ok" / "skip" from PhaseResult
+      * ``reason`` — the runner's reason string (e.g.,
+        ``"background_accepted"``, ``"is_noop"``,
+        ``"validate_failed"``, ``"gate_blocked"``)
+
+    Produces a VerificationPostmortem and persists it via
+    ``capture_phase_decision`` so the record is Merkle-linked to
+    the op's decision chain (Slice 1.3 DAG edge).
+
+    Authority invariant: NEVER imports orchestrator / candidate_generator.
+    NEVER raises out of the public surface."""
+    try:
+        if not _terminal_postmortem_enabled():
+            return
+
+        op_id = getattr(ctx, "op_id", None)
+        if not op_id:
+            return
+
+        # Produce the postmortem (walks recorded claims + evaluates)
+        from backend.core.ouroboros.governance.verification.postmortem import (
+            log_postmortem_summary,
+            persist_postmortem,
+            postmortem_enabled,
+            produce_verification_postmortem,
+        )
+        if not postmortem_enabled():
+            return
+
+        pm = await produce_verification_postmortem(
+            op_id=op_id, ctx=ctx,
+        )
+
+        log_postmortem_summary(pm)
+
+        # Persist via capture_phase_decision for Merkle DAG linkage.
+        # We use phase=terminal_phase.name and kind="terminal_postmortem"
+        # so the record hashes into the op's decision chain at the
+        # correct phase vertex.
+        try:
+            from backend.core.ouroboros.governance.determinism.phase_capture import (
+                capture_phase_decision,
+            )
+            _phase_name = (
+                terminal_phase.name
+                if hasattr(terminal_phase, "name")
+                else str(terminal_phase)
+            )
+
+            pm_dict = pm.to_dict()
+            # Enrich with terminal context — the dynamic signal that
+            # distinguishes this from a COMPLETE postmortem.
+            pm_dict["_terminal_context"] = {
+                "terminal_phase": _phase_name,
+                "status": str(status),
+                "reason": str(reason) if reason else None,
+                "is_success": status == "ok",
+            }
+
+            async def _emit() -> Any:
+                return pm_dict
+
+            await capture_phase_decision(
+                op_id=op_id,
+                phase=_phase_name,
+                kind="terminal_postmortem",
+                ctx=ctx,
+                compute=_emit,
+                extra_inputs={
+                    "terminal_phase": _phase_name,
+                    "status": str(status),
+                    "reason": str(reason) if reason else None,
+                    "total_claims": pm.total_claims,
+                    "must_hold_failed": pm.must_hold_failed,
+                    "has_blocking_failures": pm.has_blocking_failures,
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            # Merkle persistence failed — fall back to basic persist.
+            # The postmortem is still recorded, just without the DAG
+            # edge. Better than losing the lesson entirely.
+            await persist_postmortem(pm=pm, op_id=op_id, ctx=ctx)
+
+        if pm.has_blocking_failures:
+            logger.warning(
+                "[PhaseDispatcher] terminal postmortem reports blocking "
+                "failures: op=%s phase=%s reason=%s must_hold_failed=%d/%d",
+                op_id[:16] if op_id else "?",
+                terminal_phase.name if hasattr(terminal_phase, "name") else "?",
+                reason or "?",
+                pm.must_hold_failed, pm.must_hold_count,
+            )
+
+    except Exception:  # noqa: BLE001 — NEVER raises, NEVER blocks
+        logger.debug(
+            "[PhaseDispatcher] terminal postmortem failed — "
+            "op closure unaffected",
+            exc_info=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher — the main event
 # ---------------------------------------------------------------------------
 
@@ -587,6 +724,19 @@ async def dispatch_pipeline(
                 "exiting loop",
                 dispatch_phase.name,
             )
+            # Option E: universal terminal postmortem for unregistered
+            # terminal phases (CANCELLED / EXPIRED / POSTMORTEM).
+            # These exits have no runner PhaseResult, so status/reason
+            # are inferred from the phase itself.
+            if dispatch_phase != OperationPhase.COMPLETE:
+                asyncio.ensure_future(
+                    _fire_terminal_postmortem(
+                        ctx=ctx,
+                        terminal_phase=dispatch_phase,
+                        status="fail",
+                        reason=dispatch_phase.name.lower(),
+                    )
+                )
             return ctx
 
         try:
@@ -721,6 +871,20 @@ async def dispatch_pipeline(
                 "(status=%s reason=%r) — terminal",
                 result.status, result.reason,
             )
+            # Option E: universal terminal postmortem. Fire for
+            # every non-COMPLETE termination so the organism learns
+            # from every death, not just its successes.
+            # COMPLETE is skipped: COMPLETERunner already fires its
+            # own postmortem (lines 164-200 of complete_runner.py).
+            if dispatch_phase != OperationPhase.COMPLETE:
+                asyncio.ensure_future(
+                    _fire_terminal_postmortem(
+                        ctx=result.next_ctx,
+                        terminal_phase=dispatch_phase,
+                        status=result.status,
+                        reason=result.reason,
+                    )
+                )
             return result.next_ctx
 
         ctx = result.next_ctx
