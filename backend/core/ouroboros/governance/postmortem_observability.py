@@ -579,6 +579,21 @@ def dispatch_postmortems_command(
             status=PostmortemReplStatus.OK,
             rendered_text=render_distribution(dist),
         )
+    if sub == "confidence-distribution":
+        # Priority 1 Slice 4 — confidence-margin distribution view.
+        # Reads confidence summary annotations from postmortem rows
+        # (Slice 1's ConfidenceSummary.to_dict() shape, expected
+        # under pm["confidence_trace_summary"] when Slice 5+ wires
+        # the side-channel annotation). Defensive: empty/missing
+        # data renders a "no signal yet" message.
+        rows = _read_postmortem_rows(
+            ledger_path, session_id=session_id,
+        )
+        dist = compute_confidence_distribution(rows)
+        return PostmortemReplResult(
+            status=PostmortemReplStatus.OK,
+            rendered_text=render_confidence_distribution(dist),
+        )
     return PostmortemReplResult(
         status=PostmortemReplStatus.UNKNOWN_SUBCOMMAND,
         rendered_text=render_help(),

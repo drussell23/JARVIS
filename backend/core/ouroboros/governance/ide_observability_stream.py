@@ -133,6 +133,22 @@ EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
 EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 
+# Priority 1 Slice 4 — confidence-aware execution event vocabulary
+# (PRD §26.5.1). Severity-tiered: P1 = breaker fired (above-floor abort),
+# P2 = approaching floor (early warning), P3 = sustained low-confidence
+# trend across N ops (posture nudge candidate). Slice 4 ships the
+# vocabulary + publish helpers; producer wiring lives in DW provider's
+# verdict-emission site and is master-flag-gated by
+# JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED.
+EVENT_TYPE_MODEL_CONFIDENCE_DROP = "model_confidence_drop"
+EVENT_TYPE_MODEL_CONFIDENCE_APPROACHING = "model_confidence_approaching"
+EVENT_TYPE_MODEL_SUSTAINED_LOW_CONFIDENCE = "model_sustained_low_confidence"
+# Confidence-aware route advisor (Slice 4) — ADVISORY ONLY.
+# Cost contract preservation: this event NEVER signals BG/SPEC →
+# STANDARD/COMPLEX/IMMEDIATE escalation. The advisor's AST-pinned
+# guard + §26.6 runtime CostContractViolation enforce structurally.
+EVENT_TYPE_ROUTE_PROPOSAL = "route_proposal"
+
 # Slice 5 Arc B — L3 fan-out decision (allow / clamp / disabled / probe_fail).
 # Fires on every gate consultation from subagent_scheduler, not just clamps,
 # so operator has full §8 trail. Scheduler call rate is bounded.
