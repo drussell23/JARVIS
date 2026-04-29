@@ -170,12 +170,22 @@ class DormancyFinding:
     evidence:
         Raw signal data (sample size, threshold, observed value).
         Persisted in the envelope's evidence dict for audit.
+    target_files:
+        Investigation entry-points for the operator — the source
+        file(s) to inspect when this alarm fires. Each detector
+        populates this with the relevant code path (e.g., the
+        empty-postmortem detector points at plan_runner.py because
+        that's where Priority A wiring lives). The IntentEnvelope
+        contract requires non-empty target_files for non-vision
+        sources; the MetaSensor falls back to a sentinel marker
+        when a detector omits this field.
     """
 
     detector_kind: str
     severity: str
     summary: str
     evidence: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+    target_files: Tuple[str, ...] = ()
     schema_version: str = META_SENSOR_SCHEMA_VERSION
 
     def evidence_dict(self) -> Dict[str, Any]:
@@ -349,6 +359,13 @@ def _evaluate_empty_postmortem_rate() -> Optional[DormancyFinding]:
                 "specs registered."
             )),
         ),
+        # Operator's investigation entry-points — Priority A wiring +
+        # registry are the two files that, if regressed, produce this
+        # signal.
+        target_files=(
+            "backend/core/ouroboros/governance/phase_runners/plan_runner.py",
+            "backend/core/ouroboros/governance/verification/default_claims.py",
+        ),
     )
 
 
@@ -476,10 +493,17 @@ class MetaSensor:
                 from backend.core.ouroboros.governance.intake.intent_envelope import (
                     make_envelope,
                 )
+                # Detector specifies target_files (the operator's
+                # investigation entry-points). Falls back to a sentinel
+                # marker when a detector omits the field — the
+                # IntentEnvelope contract requires non-empty.
+                tgt = finding.target_files or (
+                    f"<meta_dormancy:{finding.detector_kind}>",
+                )
                 envelope = make_envelope(
                     source="meta_dormancy_alarm",
                     description=finding.summary,
-                    target_files=(),
+                    target_files=tgt,
                     repo=self._repo,
                     confidence=1.0,  # deterministic — same ledger → same finding
                     urgency=urgency,

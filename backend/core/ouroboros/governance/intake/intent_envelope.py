@@ -39,6 +39,12 @@ _VALID_SOURCES = frozenset({
     "performance_regression",
     "cross_repo_drift",
     "security_advisory",
+    # Priority B Slice B1 — MetaSensor (degenerate-loop dormancy
+    # alarm). Self-issues emitted when O+V's own subsystems silently
+    # disable themselves (e.g., empty-postmortem rate > 70%). Stays
+    # distinct from runtime_health because the signal is about the
+    # cognition-layer, not the OS/runtime-layer.
+    "meta_dormancy_alarm",
     "web_intelligence",
     # P1 Slice 3 (2026-04-26) — SelfGoalFormationEngine proposals reach
     # the intake via BacklogSensor's second-source ledger reader. The
