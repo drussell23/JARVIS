@@ -422,27 +422,60 @@ async def ctx_evidence_collector(
     claim: PropertyClaim, ctx: Any,
 ) -> Mapping[str, Any]:
     """Default evidence collector. Pulls common signals from
-    OperationContext for the four canonical claim kinds.
+    OperationContext for the canonical claim kinds.
 
-    Returns empty mapping for unknown kinds — Oracle will return
-    INSUFFICIENT_EVIDENCE. NEVER raises.
+    Priority F (2026-04-29): now dispatches FIRST through the
+    ``evidence_collectors`` registry (Priority A claim kinds plus
+    operator-registered extensions), then falls back to the legacy
+    hardcoded paths for the original Slice 2.4 kinds (``test_passes``
+    / ``key_present``). Returns empty mapping for unknown kinds —
+    Oracle returns INSUFFICIENT_EVIDENCE. NEVER raises.
 
     The mapping per claim kind:
 
-      * ``test_passes`` — ctx.validation_passed → exit_code (0 or 1)
-        (assumes a passing op had its test_strategy.tests_to_pass
-        actually exercised)
-      * ``key_present`` — ctx.validation_passed AND op didn't fail
-        → present=True (best-effort signal that no regression
-        materialized)
-      * ``string_matches`` — empty (signature inspection requires
-        live AST parsing — operators wire richer collectors)
-      * ``set_subset`` — empty (custom claim — operator-specific)
-      * Unknown kind — empty
+      Priority A (via registry):
+        * ``file_parses_after_change`` — target_files_post (pre-
+          stamped by APPLY) or self-gathered from disk
+        * ``test_set_hash_stable`` — test_files_pre + test_files_post
+        * ``no_new_credential_shapes`` — diff_text (pre-stamped)
+      Slice 2.4 legacy:
+        * ``test_passes`` — ctx.validation_passed → exit_code (0 or 1)
+        * ``key_present`` — ctx.validation_passed → present
+        * Unknown kind — empty
     """
     kind = claim.property.kind if claim and claim.property else ""
 
     try:
+        # Priority F — dispatch via registry. When the registry
+        # returns a non-empty mapping, we trust it as authoritative
+        # and skip the legacy hardcoded paths (the registry's
+        # gatherers are typed; legacy paths are best-effort).
+        try:
+            from backend.core.ouroboros.governance.verification.evidence_collectors import (
+                dispatch_evidence_gather,
+                is_kind_registered,
+            )
+            if is_kind_registered(kind):
+                gathered = await dispatch_evidence_gather(claim, ctx)
+                if gathered:
+                    return gathered
+                # Registry returned empty — let legacy paths try
+                # only if the kind ISN'T in the Priority A set
+                # (those have honest INSUFFICIENT_EVIDENCE semantics
+                # we don't want to mask with a false-positive legacy
+                # signal).
+                priority_a_kinds = {
+                    "file_parses_after_change",
+                    "test_set_hash_stable",
+                    "no_new_credential_shapes",
+                }
+                if kind in priority_a_kinds:
+                    return {}
+        except Exception:  # noqa: BLE001 — defensive
+            # Registry import / dispatch failed — fall through to
+            # legacy hardcoded paths.
+            pass
+
         if kind == "test_passes":
             # If validation_passed is True on ctx, we treat that as
             # exit_code=0 for any test_passes claim. This is a
