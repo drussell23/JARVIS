@@ -979,6 +979,16 @@ class FailbackStateMachine:
         if _is_content_failure(exc):
             return FailureMode.CONTENT_FAILURE
 
+        # Stream Rupture Breaker: the typed exception carries a
+        # provider_stream_rupture:... message. Classify as TRANSIENT_TRANSPORT
+        # so the FSM uses the short 5s/30s recovery profile and cascades
+        # to Tier 1 immediately.
+        from backend.core.ouroboros.governance.stream_rupture import (
+            StreamRuptureError,
+        )
+        if isinstance(exc, StreamRuptureError):
+            return FailureMode.TRANSIENT_TRANSPORT
+
         chain = _walk_exception_chain(exc)
 
         # First pass: any layer that names a known transient transport class

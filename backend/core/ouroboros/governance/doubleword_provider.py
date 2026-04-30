@@ -28,6 +28,11 @@ from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
 )
+from backend.core.ouroboros.governance.stream_rupture import (
+    StreamRuptureError,
+    stream_inter_chunk_timeout_s as _stream_inter_chunk_timeout_s,
+    stream_rupture_timeout_s as _stream_rupture_timeout_s,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1185,15 +1190,38 @@ class DoublewordProvider:
                             model_id=_effective_model,
                         )
 
+                    # Two-Phase Stream Rupture Breaker.
+                    # Phase 1 (TTFT): generous timeout for first token.
+                    # Phase 2 (Inter-Chunk): tight timeout once streaming.
+                    _rupture_ttft = _stream_rupture_timeout_s()
+                    _rupture_ic = _stream_inter_chunk_timeout_s()
+                    _chunk_phase_timeout = _rupture_ttft  # Phase 1
+                    _sse_has_tokens = False
                     # Parse SSE stream with per-chunk timeout to detect stalled streams
                     while True:
                         try:
                             line = await asyncio.wait_for(
-                                resp.content.readline(), timeout=_PER_CHUNK_TIMEOUT,
+                                resp.content.readline(), timeout=_chunk_phase_timeout,
                             )
                         except asyncio.TimeoutError:
-                            logger.warning("[DoublewordProvider] SSE stream stalled (no data for %.0fs)", _PER_CHUNK_TIMEOUT)
-                            break
+                            _rupt_elapsed = time.monotonic() - _ttft_request_start_monotonic
+                            _rupt_phase = "ttft" if not _sse_has_tokens else "inter_chunk"
+                            logger.error(
+                                "[DoublewordProvider] STREAM RUPTURE "
+                                "(phase=%s): no chunk for %.0fs "
+                                "(elapsed=%.1fs, bytes=%d)",
+                                _rupt_phase,
+                                _chunk_phase_timeout,
+                                _rupt_elapsed,
+                                len(content),
+                            )
+                            raise StreamRuptureError(
+                                provider="doubleword",
+                                elapsed_s=_rupt_elapsed,
+                                bytes_received=len(content),
+                                rupture_timeout_s=_chunk_phase_timeout,
+                                phase=_rupt_phase,
+                            )
                         if not line:
                             break
                         line_str = line.decode("utf-8", errors="replace").strip()
@@ -1351,6 +1379,12 @@ class DoublewordProvider:
                             if token:
                                 content += token
                                 self._last_chunk_at = time.monotonic()
+                                # Stream Rupture Breaker: Phase 2 step-down.
+                                # Once first token arrives, tighten the
+                                # watchdog to inter-chunk timeout.
+                                if not _sse_has_tokens:
+                                    _sse_has_tokens = True
+                                    _chunk_phase_timeout = _rupture_ic
                                 # Phase 12.2 Slice C — record TTFT once
                                 # per request on first non-empty content
                                 # chunk. NEVER raises into the SSE loop:

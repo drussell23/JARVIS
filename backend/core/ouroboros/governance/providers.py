@@ -34,6 +34,11 @@ from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
 )
+from backend.core.ouroboros.governance.stream_rupture import (
+    StreamRuptureError,
+    stream_inter_chunk_timeout_s as _stream_inter_chunk_timeout_s,
+    stream_rupture_timeout_s as _stream_rupture_timeout_s,
+)
 
 try:
     from backend.core.prime_client import TaskProfile as _TaskProfile
@@ -5897,10 +5902,53 @@ class ClaudeProvider:
                     if _thinking_param is not None:
                         _stream_kwargs["thinking"] = _thinking_param
                     async with _current_client.messages.stream(**_stream_kwargs) as stream:
-                        async for text in stream.text_stream:
+                        # Two-Phase Stream Rupture Breaker.
+                        # Phase 1 (TTFT): generous 120s for first token
+                        #   (deep-thinking models pause 30-60s).
+                        # Phase 2 (Inter-Chunk): tight 30s once tokens flow.
+                        _rupture_ttft = _stream_rupture_timeout_s()
+                        _rupture_ic = _stream_inter_chunk_timeout_s()
+                        _chunk_timeout = _rupture_ttft  # Phase 1
+                        _chunk_iter = stream.text_stream.__aiter__()
+                        while True:
+                            try:
+                                text = await asyncio.wait_for(
+                                    _chunk_iter.__anext__(),
+                                    timeout=_chunk_timeout,
+                                )
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                _rupt_elapsed = time.monotonic() - _call_start
+                                _rupt_phase = (
+                                    "ttft" if _stream_first_token_at[0] is None
+                                    else "inter_chunk"
+                                )
+                                logger.error(
+                                    "[ClaudeProvider] STREAM RUPTURE "
+                                    "(phase=%s): no chunk for %.0fs "
+                                    "(elapsed=%.1fs, bytes=%d, "
+                                    "tool_round=%s, thinking=%s)",
+                                    _rupt_phase,
+                                    _chunk_timeout,
+                                    _rupt_elapsed,
+                                    len(raw_content),
+                                    "yes" if _is_tool_round else "no",
+                                    "on" if _thinking_param is not None else "off",
+                                )
+                                raise StreamRuptureError(
+                                    provider="claude-api",
+                                    elapsed_s=_rupt_elapsed,
+                                    bytes_received=len(raw_content),
+                                    rupture_timeout_s=_chunk_timeout,
+                                    phase=_rupt_phase,
+                                )
+                            # Token received — process it.
                             if _stream_first_token_at[0] is None:
                                 _stream_first_token_at[0] = time.monotonic()
                                 _first_token_ms[0] = (_stream_first_token_at[0] - _call_start) * 1000.0
+                                # Phase 2: step down to tight inter-chunk timeout.
+                                _chunk_timeout = _rupture_ic
                             raw_content += text
                             try:
                                 _stream_callback(text)
@@ -6018,6 +6066,12 @@ class ClaudeProvider:
                     # exception it produced so the existing fallback
                     # paths (prefill-retry, backoff, etc.) still fire.
                     await _stream_task
+                except StreamRuptureError:
+                    # Stream Rupture Breaker fired — propagate directly.
+                    # The message carries provider_stream_rupture:... which
+                    # the FSM classifies as TRANSIENT_TRANSPORT and the
+                    # Universal Terminal Postmortem captures as-is.
+                    raise
                 except (asyncio.TimeoutError, asyncio.CancelledError) as _te:
                     # Catch BOTH timeout and cancellation so we always get
                     # diagnostic data. Outer candidate_generator wait_for
