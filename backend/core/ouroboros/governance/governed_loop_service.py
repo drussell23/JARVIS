@@ -1086,6 +1086,41 @@ class GovernedLoopService:
                 )
                 logger.debug("[GovernedLoop] Preemption FSM executor initialized")
 
+            # Phase-Aware Heartbeats (Move 2 v4): register a stream-tick
+            # callback that providers can pulse during long GENERATE
+            # streams to keep the harness ActivityMonitor's freshness
+            # signal accurate. Lookup is O(1) on the in-memory dict;
+            # we update last_activity_at_utc *only* — never the
+            # phase-transition timestamp, since no phase actually
+            # advanced. Best-effort: failures (missing op, etc.) are
+            # swallowed so a misbehaving provider can't kill generation.
+            try:
+                from backend.core.ouroboros.governance.providers import (
+                    set_stream_activity_callback,
+                )
+
+                def _on_stream_tick(op_id: str) -> None:
+                    if not op_id:
+                        return
+                    ctx = self._fsm_contexts.get(op_id)
+                    if ctx is None:
+                        return
+                    try:
+                        ctx.last_activity_at_utc = datetime.now(timezone.utc)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                set_stream_activity_callback(_on_stream_tick)
+                logger.info(
+                    "[GovernedLoop] Stream-tick activity hook registered "
+                    "(Phase-Aware Heartbeats live)"
+                )
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "[GovernedLoop] Failed to register stream-tick hook: %s",
+                    _exc,
+                )
+
             # Fetch and cache VM capability contract
             if self._prime_client is not None:
                 try:

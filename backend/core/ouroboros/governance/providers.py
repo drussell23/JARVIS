@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -46,6 +46,57 @@ except ImportError:
     _TaskProfile = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("Ouroboros.Providers")
+
+
+# ---------------------------------------------------------------------------
+# Stream-tick activity hook — Phase-Aware Heartbeats (Move 2 v4)
+# ---------------------------------------------------------------------------
+# A long GENERATE phase that's actively streaming tokens used to look stale
+# to the harness ActivityMonitor (which only watched ``last_transition_at_utc``
+# on the FSM context). Move 2 soaks v1/v2/v3 idle-out'd at 1-2h because no
+# new phase transition fired during multi-minute Claude generations even
+# though tokens were flowing.
+#
+# Fix: providers call ``_emit_stream_activity(op_id)`` on every Nth chunk
+# (default 8) during streaming. The hook is registered by GovernedLoopService
+# at ``start()`` and points at a function that updates the matching FSM
+# context's ``last_activity_at_utc``. ``ActivityMonitor`` reads
+# ``max(last_transition_at_utc, last_activity_at_utc)`` so a producing
+# stream stays "fresh" for as long as it's actually producing.
+#
+# Module-level hook (not contextvar) keeps providers independent of GLS:
+# providers import nothing from governance; GLS registers a callback.
+# When unset, the call is a cheap no-op.
+_stream_activity_callback: Optional[Callable[[str], None]] = None
+_STREAM_ACTIVITY_CHUNK_INTERVAL = int(
+    os.environ.get("JARVIS_STREAM_ACTIVITY_CHUNK_INTERVAL", "8")
+)
+
+
+def set_stream_activity_callback(
+    fn: Optional[Callable[[str], None]],
+) -> None:
+    """Register (or clear) the stream-tick activity hook.
+
+    Called once at GLS start. Idempotent. ``None`` clears the hook for
+    test isolation. Never raises — registration must not fail boot."""
+    global _stream_activity_callback
+    _stream_activity_callback = fn
+
+
+def _emit_stream_activity(op_id: str) -> None:
+    """Pulse the activity hook for ``op_id``. No-op when unregistered.
+
+    Best-effort: the hook is throttled at the call site (every Nth chunk)
+    AND failures are swallowed here so a misbehaving consumer cannot kill
+    a generation. Stream-tick is observability, never authority."""
+    cb = _stream_activity_callback
+    if cb is None or not op_id:
+        return
+    try:
+        cb(op_id)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -5937,6 +5988,10 @@ class ClaudeProvider:
                 output_tokens = 0
                 _cached_input = 0
                 _stream_first_token_at: List[Optional[float]] = [None]
+                # Closure-captured op_id for stream-tick activity hook.
+                # Move 2 v4 Phase-Aware Heartbeats: read once here so the
+                # nested _do_stream can pulse the harness ActivityMonitor.
+                _stream_op_id = str(getattr(context, "op_id", "") or "")
 
                 async def _do_stream() -> None:
                     nonlocal raw_content, input_tokens, output_tokens, _cached_input
@@ -5966,6 +6021,10 @@ class ClaudeProvider:
                         _rupture_ic = _stream_inter_chunk_timeout_s()
                         _chunk_timeout = _rupture_ttft  # Phase 1
                         _chunk_iter = stream.text_stream.__aiter__()
+                        # Phase-Aware Heartbeat counter — every Nth chunk
+                        # pulses the harness ActivityMonitor so long
+                        # GENERATEs stay observably fresh.
+                        _stream_chunk_count = 0
                         while True:
                             try:
                                 text = await asyncio.wait_for(
@@ -6005,7 +6064,22 @@ class ClaudeProvider:
                                 _first_token_ms[0] = (_stream_first_token_at[0] - _call_start) * 1000.0
                                 # Phase 2: step down to tight inter-chunk timeout.
                                 _chunk_timeout = _rupture_ic
+                                # First token also pulses activity so the
+                                # transition from "waiting for TTFT" to
+                                # "actively producing" is observable.
+                                _emit_stream_activity(_stream_op_id)
                             raw_content += text
+                            _stream_chunk_count += 1
+                            # Phase-Aware Heartbeat — every Nth chunk pulse
+                            # the activity hook so a 10-min generation that
+                            # doesn't transition phase still looks fresh to
+                            # ActivityMonitor. Cheap (no I/O), throttled.
+                            if (
+                                _STREAM_ACTIVITY_CHUNK_INTERVAL > 0
+                                and _stream_chunk_count
+                                % _STREAM_ACTIVITY_CHUNK_INTERVAL == 0
+                            ):
+                                _emit_stream_activity(_stream_op_id)
                             try:
                                 _stream_callback(text)
                             except Exception:

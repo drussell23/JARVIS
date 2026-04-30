@@ -1197,6 +1197,11 @@ class DoublewordProvider:
                     _rupture_ic = _stream_inter_chunk_timeout_s()
                     _chunk_phase_timeout = _rupture_ttft  # Phase 1
                     _sse_has_tokens = False
+                    # Phase-Aware Heartbeat — pulse the harness
+                    # ActivityMonitor every Nth content chunk so a long
+                    # DW stream stays observably fresh (Move 2 v4).
+                    _stream_op_id = str(getattr(context, "op_id", "") or "")
+                    _stream_chunk_count = 0
                     # Parse SSE stream with per-chunk timeout to detect stalled streams
                     while True:
                         try:
@@ -1385,6 +1390,30 @@ class DoublewordProvider:
                                 if not _sse_has_tokens:
                                     _sse_has_tokens = True
                                     _chunk_phase_timeout = _rupture_ic
+                                    # Phase-Aware Heartbeat: pulse activity
+                                    # on first token (TTFT → producing).
+                                    try:
+                                        from backend.core.ouroboros.governance.providers import (
+                                            _emit_stream_activity as _activity_pulse,
+                                        )
+                                        _activity_pulse(_stream_op_id)
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                _stream_chunk_count += 1
+                                # Phase-Aware Heartbeat — every Nth content
+                                # chunk pulses ActivityMonitor so a long DW
+                                # stream stays fresh between phase transitions.
+                                if (
+                                    _stream_chunk_count > 0
+                                    and _stream_chunk_count % 8 == 0
+                                ):
+                                    try:
+                                        from backend.core.ouroboros.governance.providers import (
+                                            _emit_stream_activity as _activity_pulse,
+                                        )
+                                        _activity_pulse(_stream_op_id)
+                                    except Exception:  # noqa: BLE001
+                                        pass
                                 # Phase 12.2 Slice C — record TTFT once
                                 # per request on first non-empty content
                                 # chunk. NEVER raises into the SSE loop:

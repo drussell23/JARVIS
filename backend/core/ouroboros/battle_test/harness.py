@@ -3392,12 +3392,24 @@ class BattleTestHarness:
                             continue
 
                         last_transition = getattr(fsm_ctx, "last_transition_at_utc", None)
-                        if last_transition is None:
+                        # Phase-Aware Heartbeats (Move 2 v4): a long GENERATE
+                        # that's actively streaming tokens updates
+                        # ``last_activity_at_utc`` between phase transitions.
+                        # Take the max so a producing stream is observably
+                        # fresh and not mis-classified stale.
+                        last_activity = getattr(fsm_ctx, "last_activity_at_utc", None)
+                        if last_transition is None and last_activity is None:
                             progressing_count += 1
                             _stale_since.pop(dedupe_key, None)
                             continue
+                        if last_transition is None:
+                            freshness_ts = last_activity
+                        elif last_activity is None:
+                            freshness_ts = last_transition
+                        else:
+                            freshness_ts = max(last_transition, last_activity)
 
-                        elapsed_s = (now - last_transition).total_seconds()
+                        elapsed_s = (now - freshness_ts).total_seconds()
 
                         if elapsed_s < self._OP_STALE_THRESHOLD_S:
                             # Op is progressing normally

@@ -500,6 +500,11 @@ class PreemptionFsmExecutor(FsmExecutor):
         ctx.state = decision.to_state
         ctx.retry_index = decision.retry_index
         ctx.last_transition_at_utc = ti.now_utc
+        # Phase transitions are also activity — bump the activity stamp so
+        # ActivityMonitor sees a freshness signal even for ops that aren't
+        # streaming. Stream-tick handlers will further update this between
+        # transitions during long GENERATE streams.
+        ctx.last_activity_at_utc = ti.now_utc
         ctx.last_reason_code = decision.reason_code
 
         if (

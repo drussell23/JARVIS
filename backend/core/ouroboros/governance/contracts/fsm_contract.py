@@ -93,6 +93,14 @@ class LoopRuntimeContext:
     first_suspend_at_utc: Optional[datetime] = None
     last_transition_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_reason_code: Optional[ReasonCode] = None
+    # Mid-flight activity timestamp — updated when an op is making progress
+    # WITHOUT a phase transition (e.g. streaming tokens during GENERATE).
+    # The ActivityMonitor uses ``max(last_transition_at_utc,
+    # last_activity_at_utc)`` as the freshness signal so a long-running
+    # GENERATE that's actively producing tokens is not mis-classified as
+    # stale. Phase transitions implicitly bump this too (any progress is
+    # progress). Defaults to construction time so a brand-new ctx is fresh.
+    last_activity_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class Ledger(Protocol):
