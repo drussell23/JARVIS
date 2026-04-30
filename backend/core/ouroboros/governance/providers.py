@@ -4392,6 +4392,43 @@ _CLAUDE_HTTP_READ_TIMEOUT_THINKING_S = float(
 _CLAUDE_HTTP_READ_TIMEOUT_DEFAULT_S = float(
     os.environ.get("JARVIS_CLAUDE_HTTP_READ_TIMEOUT_DEFAULT_S", "120.0")
 )
+# ---------------------------------------------------------------------------
+# Transport Resilience Layer — explicit ``httpx.Limits``
+# ---------------------------------------------------------------------------
+# The Anthropic SDK ships with httpx defaults of ``max_connections=1000`` and
+# ``max_keepalive_connections=100`` — appropriate for a high-throughput
+# server, but pathological for a constrained sustained-load workload like
+# JARVIS, which holds 3-5 concurrent BG/IMMEDIATE workers and runs for hours.
+# Under such load the default pool accumulates stale keepalive connections
+# whose underlying TCP/TLS state has been quietly torn down by an upstream
+# load balancer or NAT box; the next reuse attempt surfaces as
+# ``APITimeoutError(chain=ConnectTimeout->TimeoutError)`` or
+# ``ReadError(chain=ClosedResourceError->SSLWantReadError)`` — the failure
+# pattern observed in soak ``bt-2026-04-30-021210`` (Move 2 v2, 17 ops / 0
+# completions / 1h idle-out under healthy api.anthropic.com).
+#
+# Tight, explicit caps prevent stale-pool accumulation:
+#   * ``max_connections`` — total in-flight + idle ceiling. 10 covers our
+#     concurrent worker peak with margin; collisions surface as ``PoolTimeout``
+#     in <pool_timeout> seconds rather than masquerading as connect timeouts.
+#   * ``max_keepalive_connections`` — idle pool ceiling. Keep low so stale
+#     connections cannot accumulate; force a fresh handshake on cold paths.
+#   * ``keepalive_expiry`` — how long an idle keepalive lives before being
+#     proactively closed. 30s matches the operator directive's spirit:
+#     dead connections die fast, before the next request reuses them.
+#
+# All three are env-overridable for emergency tuning; defaults are calibrated
+# for our observed workload, not arbitrary.
+_CLAUDE_HTTP_MAX_CONNECTIONS = int(
+    os.environ.get("JARVIS_CLAUDE_HTTP_MAX_CONNECTIONS", "10")
+)
+_CLAUDE_HTTP_MAX_KEEPALIVE = int(
+    os.environ.get("JARVIS_CLAUDE_HTTP_MAX_KEEPALIVE", "5")
+)
+_CLAUDE_HTTP_KEEPALIVE_EXPIRY_S = float(
+    os.environ.get("JARVIS_CLAUDE_HTTP_KEEPALIVE_EXPIRY_S", "30.0")
+)
+
 # Exponential backoff retry — 2s, 4s, 8s between attempts.
 _CLAUDE_RETRY_MAX_ATTEMPTS = int(
     os.environ.get("JARVIS_CLAUDE_RETRY_MAX_ATTEMPTS", "3")
@@ -4979,9 +5016,24 @@ class ClaudeProvider:
                 write=_CLAUDE_HTTP_WRITE_TIMEOUT_S,
                 pool=_CLAUDE_HTTP_POOL_TIMEOUT_S,
             )
+            # Transport Resilience Layer — explicit Limits + segmented
+            # Timeout. Constructing our own ``httpx.AsyncClient`` and passing
+            # it to the SDK as ``http_client=`` ensures the pool caps land
+            # on the actual transport, not just on a wrapper. Stale
+            # keepalives die fast (30s); pool stays bounded (10/5) so dead
+            # connections can't masquerade as connect timeouts under load.
+            _http_limits = httpx.Limits(
+                max_connections=_CLAUDE_HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=_CLAUDE_HTTP_MAX_KEEPALIVE,
+                keepalive_expiry=_CLAUDE_HTTP_KEEPALIVE_EXPIRY_S,
+            )
+            _http_client = httpx.AsyncClient(
+                timeout=_http_timeout,
+                limits=_http_limits,
+            )
             self._client = anthropic.AsyncAnthropic(
                 api_key=self._api_key,
-                timeout=_http_timeout,
+                http_client=_http_client,
                 # SDK-level retries hide signal and consume our timebox
                 # silently. We do our own visible retry in _call_with_backoff.
                 max_retries=0,
@@ -4989,12 +5041,16 @@ class ClaudeProvider:
             logger.info(
                 "[ClaudeProvider] anthropic client initialized "
                 "(connect=%.0fs read=%.0fs write=%.0fs pool=%.0fs thinking=%s "
+                "max_conn=%d max_keepalive=%d keepalive_exp=%.0fs "
                 "generation=%d)",
                 _CLAUDE_HTTP_CONNECT_TIMEOUT_S,
                 _read_timeout,
                 _CLAUDE_HTTP_WRITE_TIMEOUT_S,
                 _CLAUDE_HTTP_POOL_TIMEOUT_S,
                 "on" if self._extended_thinking else "off",
+                _CLAUDE_HTTP_MAX_CONNECTIONS,
+                _CLAUDE_HTTP_MAX_KEEPALIVE,
+                _CLAUDE_HTTP_KEEPALIVE_EXPIRY_S,
                 self._client_generation,
             )
         return self._client
