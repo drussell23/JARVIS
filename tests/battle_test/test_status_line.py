@@ -2,7 +2,8 @@
 
 Covers the format contract + env gates + data-source sampling for the
 Priority 2B UX fix. Uses ``render_plain()`` for exact-string assertions
-(ANSI-free) and ``render_prompt_toolkit()`` for HTML markup assertions.
+(ANSI-free). The ``render_prompt_toolkit()`` HTML path was retired
+in UI Slice 3 (2026-04-30) along with the persistent bottom_toolbar.
 
 Mandates verified:
   • Env kill switch (``JARVIS_UI_STATUS_LINE_ENABLED``)
@@ -31,7 +32,6 @@ import pytest
 from backend.core.ouroboros.battle_test.status_line import (
     StatusLineBuilder,
     StatusSnapshot,
-    _format_html,
     _format_plain,
     compact_mode_enabled,
     get_status_line_builder,
@@ -215,32 +215,11 @@ def test_warn_marker_on_both_when_both_hot():
     assert line.count("⚠") == 2
 
 
-def test_html_color_tokens_match_gradient(monkeypatch):
-    """HTML render must use ansigreen/ansiyellow/ansired per gradient."""
-    # 20% — green
-    snap_green = StatusSnapshot(
-        cost_spent_usd=0.10, cost_budget_usd=0.50,
-        idle_elapsed_s=100, idle_timeout_s=1000,
-    )
-    html = _format_html(snap_green, compact=False)
-    assert "<ansigreen>" in html
-    assert "<ansired>" not in html
-
-    # 70% — yellow
-    snap_warn = StatusSnapshot(
-        cost_spent_usd=0.35, cost_budget_usd=0.50,
-        idle_elapsed_s=100, idle_timeout_s=1000,
-    )
-    html = _format_html(snap_warn, compact=False)
-    assert "<ansiyellow>" in html
-
-    # 95% — red
-    snap_hot = StatusSnapshot(
-        cost_spent_usd=0.475, cost_budget_usd=0.50,
-        idle_elapsed_s=100, idle_timeout_s=1000,
-    )
-    html = _format_html(snap_hot, compact=False)
-    assert "<ansired>" in html
+# NOTE: ``test_html_color_tokens_match_gradient`` was retired in UI
+# Slice 3 (2026-04-30) along with ``_format_html`` and the
+# ``render_prompt_toolkit`` rendering path. The gradient logic itself
+# (``_level_for_fraction``) is still exercised by the warn-marker
+# tests above, which assert on the plain-format ⚠ glyph emission.
 
 
 def test_warn_threshold_env_override_moves_the_line(monkeypatch):
@@ -471,17 +450,14 @@ def test_builder_route_and_provider_pulled_from_primary_ctx():
 def test_render_returns_empty_when_kill_switch_off(monkeypatch):
     monkeypatch.setenv("JARVIS_UI_STATUS_LINE_ENABLED", "0")
     builder = StatusLineBuilder()
-    assert builder.render_prompt_toolkit() == ""
     assert builder.render_plain() == ""
 
 
-def test_render_prompt_toolkit_html_non_empty_when_enabled():
+def test_render_plain_non_empty_when_enabled():
     builder = StatusLineBuilder()
-    html = builder.render_prompt_toolkit()
-    assert html  # non-empty
-    assert "Phase:" in html
-    # HTML markup present.
-    assert "<b>" in html or "<ansicyan>" in html
+    plain = builder.render_plain()
+    assert plain  # non-empty
+    assert "Phase:" in plain
 
 
 def test_render_never_raises_even_with_broken_refs():
@@ -500,14 +476,12 @@ def test_render_never_raises_even_with_broken_refs():
         cost_tracker=broken, idle_watchdog=broken,
         governed_loop_service=broken,
     )
-    # Must not raise on either rendering path.
+    # Must not raise on the plain rendering path.
     plain = builder.render_plain()
-    html = builder.render_prompt_toolkit()
-    # Graceful degradation: both should return strings (possibly a
-    # minimal "IDLE" line, not empty-string — the builder catches at
-    # the sample layer, not the whole render).
+    # Graceful degradation: returns string (possibly minimal "IDLE"
+    # line, not empty-string — builder catches at the sample layer,
+    # not the whole render).
     assert isinstance(plain, str)
-    assert isinstance(html, str)
 
 
 # ---------------------------------------------------------------------------
@@ -515,44 +489,37 @@ def test_render_never_raises_even_with_broken_refs():
 # ---------------------------------------------------------------------------
 
 
-def test_serpent_flow_delegates_to_status_line_builder():
-    """Static guard: SerpentFlow's bottom_toolbar must invoke
-    ``get_status_line_builder``. If a future refactor deletes the
-    delegation, the glanceable line silently regresses to the legacy
-    verbose toolbar."""
+def test_serpent_flow_no_bottom_toolbar():
+    """UI Slice 3 (2026-04-30) inverted contract: SerpentFlow MUST NOT
+    construct its REPL with a persistent bottom_toolbar. The flowing
+    CLI surfaces state on-demand via ``/status`` (Slice 5) and inline
+    via op-completion receipts (Slice 6) — no fixed terminal regions.
+    This guard prevents a future regression that re-introduces the
+    persistent toolbar (which would re-create the duplicate paradigm
+    we just removed)."""
     path = (
         Path(__file__).resolve().parent.parent.parent
         / "backend" / "core" / "ouroboros" / "battle_test" / "serpent_flow.py"
     )
     src = path.read_text(encoding="utf-8")
-    assert "get_status_line_builder" in src, (
-        "SerpentFlow no longer references get_status_line_builder — "
-        "the glanceable status line will silently regress to the "
-        "legacy verbose toolbar."
-    )
-    tree = ast.parse(src)
-    called = any(
-        isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        and n.func.id == "get_status_line_builder"
-        for n in ast.walk(tree)
-    )
-    assert called
+    # ``bottom_toolbar=`` as a keyword argument MUST be absent. Token
+    # may appear in comments / docstrings explaining the retirement;
+    # we check only for the actual kwarg pattern.
+    assert "bottom_toolbar=_toolbar" not in src
+    assert "bottom_toolbar=lambda" not in src
 
 
-def test_serpent_flow_uses_refresh_interval():
-    """Static guard: PromptSession must be constructed with
-    ``refresh_interval=`` so the toolbar ticks during execution,
-    not only on keystrokes."""
+def test_serpent_flow_no_refresh_interval():
+    """UI Slice 3 inverted contract: no fixed refresh cadence. The
+    flowing CLI doesn't tick a fixed UI region — events emit when
+    they happen (op heartbeats, completion receipts, REPL prompts)."""
     path = (
         Path(__file__).resolve().parent.parent.parent
         / "backend" / "core" / "ouroboros" / "battle_test" / "serpent_flow.py"
     )
     src = path.read_text(encoding="utf-8")
-    assert "refresh_interval=" in src, (
-        "PromptSession is no longer passed refresh_interval — the "
-        "toolbar will revert to keystroke-driven redraws and appear "
-        "frozen during long GENERATE / L2 phases."
-    )
+    # The kwarg must be absent from any PromptSession construction.
+    assert "refresh_interval=" not in src
 
 
 def test_harness_registers_status_line_builder():

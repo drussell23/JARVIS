@@ -1,11 +1,15 @@
 """Serpent Flow — Ouroboros Flowing CLI with Organism Personality.
 
-Layout Architecture (4-zone vertical stack):
+Layout Architecture (post UI Slice 3, 2026-04-30):
 
-  Zone 0: Boot Banner — compact Rich Panel, scrolls away after boot
+  Zone 0: Boot Banner — printed once at startup, scrolls away inline
   Zone 1: Event Stream — op-scoped blocks with box-drawing borders
-  Zone 2: REPL Input — fixed bottom via prompt_toolkit.prompt_async()
-  Zone 3: Status Bar — persistent toolbar via prompt_toolkit.bottom_toolbar
+  Zone 2: REPL Input — prompt_toolkit.prompt_async, no fixed positioning
+
+  (Zone 3 — persistent bottom_toolbar — retired in UI Slice 3.
+  State is surfaced on-demand via /status /cost /posture REPL
+  commands and via inline op-completion receipt lines. No fixed
+  terminal regions; matches Claude Code's flowing UX.)
 
 Op blocks use box-drawing characters for visual hierarchy::
 
@@ -3103,7 +3107,16 @@ class SerpentREPL:
             self._task = None
 
     async def _loop(self) -> None:
-        """Async REPL loop with persistent bottom toolbar."""
+        """Async REPL loop — flowing CLI, no fixed UI panels.
+
+        UI Slice 3 (2026-04-30): the persistent bottom_toolbar (Zone 3)
+        is retired. State is now surfaced via on-demand REPL commands
+        (``/status``, ``/cost``, ``/posture`` — Slice 5) and via inline
+        op-completion receipt lines (Slice 6) instead of a refreshing
+        toolbar. ``prompt_toolkit`` is retained for input editing only;
+        no bottom_toolbar, no refresh_interval, no fixed terminal
+        regions. Matches Claude Code's flowing terminal UX.
+        """
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.formatted_text import HTML
@@ -3115,65 +3128,8 @@ class SerpentREPL:
             )
             return
 
-        # ── Zone 3: Status bar via bottom_toolbar ──
-        # The toolbar callable is invoked on every prompt redraw,
-        # giving us a live-updating status line at the terminal bottom.
-        #
-        # Priority 2B: delegates to ``StatusLineBuilder`` when registered
-        # (Phase · Cost · Idle · Op · [route·provider] — glanceable,
-        # scannable, colour-graded). Falls back to the legacy verbose
-        # layout when the builder is absent (headless harness, tests)
-        # or when JARVIS_UI_STATUS_LINE_ENABLED=0. ``refresh_interval``
-        # on PromptSession ticks the toolbar every 500ms (env-tunable
-        # via JARVIS_UI_STATUS_LINE_REFRESH_MS) so the line updates
-        # smoothly through execution phases, not just on keystrokes.
-        def _toolbar():
-            # Try the glanceable builder first.
-            try:
-                from backend.core.ouroboros.battle_test.status_line import (
-                    get_status_line_builder,
-                )
-                _builder = get_status_line_builder()
-                if _builder is not None:
-                    _html_str = _builder.render_prompt_toolkit()
-                    if _html_str:
-                        return HTML(_html_str)
-            except Exception:
-                # Any failure in the glanceable path is non-fatal —
-                # fall through to the legacy layout below.
-                pass
-
-            f = self._flow
-            elapsed = time.time() - f._started_at
-            m, s = int(elapsed // 60), int(elapsed % 60)
-            active = len(f._active_ops)
-
-            active_str = f"{active} active" if active else "idle"
-            plan_str = "🗺 plan │ " if f._plan_review_mode else ""
-            route_str = f"🧭 {f._route_cost_toolbar_summary()} │ " if f._route_costs else ""
-            return HTML(
-                f" <b>🐍</b> │ "
-                f"<style fg='ansigreen'>✅ {f._completed}</style>  "
-                f"<style fg='ansired'>💀 {f._failed}</style> │ "
-                f"💰 ${f._cost_total:.3f}/${f._cost_cap:.2f} │ "
-                f"📡 {f._sensors_active} sensors │ "
-                f"{active_str} │ "
-                f"{plan_str}"
-                f"{route_str}"
-                f"⏱ {m}m {s:02d}s"
-            )
-
-        # Refresh cadence from the status-line env (default 500ms).
-        try:
-            from backend.core.ouroboros.battle_test.status_line import (
-                refresh_interval_s as _status_refresh_s,
-            )
-            _refresh = _status_refresh_s()
-        except Exception:
-            _refresh = 0.5
-        self._session = PromptSession(
-            bottom_toolbar=_toolbar, refresh_interval=_refresh,
-        )
+        # No bottom_toolbar, no refresh_interval — pure flowing CLI.
+        self._session = PromptSession()
 
         with patch_stdout(raw=True):
             while self._running:

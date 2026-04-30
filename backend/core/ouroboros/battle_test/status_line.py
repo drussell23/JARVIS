@@ -201,25 +201,6 @@ class StatusLineBuilder:
             provider=provider,
         )
 
-    def render_prompt_toolkit(self) -> str:
-        """Render for the prompt_toolkit ``bottom_toolbar`` callable.
-
-        Returns an HTML string with prompt_toolkit's inline style tags.
-        Empty string when the master kill-switch is off — the caller
-        should fall back to its legacy toolbar content in that case.
-        """
-        if not status_line_enabled():
-            return ""
-        try:
-            snap = self.snapshot()
-            return _format_html(snap, compact=compact_mode_enabled())
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "[StatusLine] render failed; empty line returned",
-                exc_info=True,
-            )
-            return ""
-
     def render_plain(self) -> str:
         """Plain ANSI-free rendering for logs / unit tests."""
         if not status_line_enabled():
@@ -460,10 +441,6 @@ def _level_for_fraction(fraction: float) -> str:
     return "ok"
 
 
-# Color tokens keyed by level, per render backend.
-_HTML_COLORS = {"ok": "ansigreen", "warn": "ansiyellow", "hot": "ansired"}
-
-
 def _short_op_id(op_id: str) -> str:
     if not op_id:
         return ""
@@ -542,52 +519,13 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
     return " · ".join(parts)
 
 
-def _format_html(snap: StatusSnapshot, *, compact: bool) -> str:
-    """prompt_toolkit HTML rendering with color gradient."""
-    from html import escape
-
-    cost_fr = _cost_fraction(snap.cost_spent_usd, snap.cost_budget_usd)
-    idle_fr = _idle_fraction(snap.idle_elapsed_s, snap.idle_timeout_s)
-    cost_color = _HTML_COLORS[_level_for_fraction(cost_fr)]
-    idle_color = _HTML_COLORS[_level_for_fraction(idle_fr)]
-
-    parts: List[str] = []
-
-    phase_txt = escape(_format_phase(snap))
-    parts.append(f"<b>Phase:</b> <ansicyan>{phase_txt}</ansicyan>")
-
-    cost_inner = (
-        f"${snap.cost_spent_usd:.2f} / ${snap.cost_budget_usd:.2f}"
-    )
-    if cost_fr >= (warn_threshold_pct() / 100.0):
-        cost_inner += " ⚠"
-    parts.append(
-        f"<b>Cost:</b> <{cost_color}>{escape(cost_inner)}</{cost_color}>"
-    )
-
-    idle_inner = (
-        f"{int(snap.idle_elapsed_s)}s / {int(snap.idle_timeout_s)}s"
-    )
-    if idle_fr >= (warn_threshold_pct() / 100.0):
-        idle_inner += " ⚠"
-    parts.append(
-        f"<b>Idle:</b> <{idle_color}>{escape(idle_inner)}</{idle_color}>"
-    )
-
-    if not compact and snap.primary_op_id:
-        op_inner = escape(_short_op_id(snap.primary_op_id))
-        if snap.extra_op_count > 0:
-            op_inner += f" (+{snap.extra_op_count})"
-        parts.append(
-            f"<b>Op:</b> <ansimagenta>{op_inner}</ansimagenta>"
-        )
-
-    if not compact:
-        badge = _format_badge(snap.route, snap.provider)
-        if badge:
-            parts.append(f"<ansiblue>{escape(badge)}</ansiblue>")
-
-    return " <ansiwhite>·</ansiwhite> ".join(parts)
+# NOTE: ``_format_html`` (prompt_toolkit HTML rendering for the legacy
+# bottom_toolbar) was retired in UI Slice 3 (2026-04-30) along with the
+# ``render_prompt_toolkit`` method. The plain text formatter above is
+# the sole renderer; consumers (Slice 5 ``/status`` REPL command,
+# Slice 6 op-completion receipts) format inline with Rich markup at
+# their own emission seam — keeping status_line.py free of any
+# specific terminal-rendering library beyond stdlib.
 
 
 # ---------------------------------------------------------------------------

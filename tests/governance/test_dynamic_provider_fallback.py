@@ -119,10 +119,16 @@ def test_fsm_should_attempt_primary_after_failure_returns_false():
 def test_fsm_attempt_primary_returns_true_after_eta_elapses(monkeypatch):
     """After a TRANSIENT_TRANSPORT failure (5s base ETA), once the
     recovery ETA has elapsed, ``should_attempt_primary`` returns True
-    again — the dynamic-fallback short-circuit naturally lifts. We
-    don't actually wait 5s; we monkeypatch ``time.monotonic`` to
-    advance past the ETA."""
-    import time as _time
+    again — the dynamic-fallback short-circuit naturally lifts.
+
+    Determinism: we explicitly disable full-jitter so ``recovery_eta``
+    returns a stable value across the two calls in this test (one to
+    capture the threshold, one inside ``should_attempt_primary``).
+    Without this, the random jitter on the second call can land just
+    past the patched clock and false-fail the assertion. Issue
+    diagnosed during UI Slice 3 (2026-04-30) — this test was
+    intermittently failing in suite runs."""
+    monkeypatch.setenv("JARVIS_TOPOLOGY_FULL_JITTER_ENABLED", "0")
     from backend.core.ouroboros.governance.candidate_generator import (
         FailbackStateMachine, FailureMode,
     )
