@@ -1,12 +1,12 @@
-"""REPL command handlers + dashboard renderers for the VisionSensor.
+"""REPL command handlers + status renderers for the VisionSensor.
 
 Task 21 of the VisionSensor + Visual VERIFY arc. Provides the
 operator-facing surface that SerpentFlow wires up as slash commands
-and the LiveDashboard wires up as a status line. Keeping these as
-pure functions (sensor injected) means:
+and as inline status output. Keeping these as pure functions
+(sensor injected) means:
 
-* the 1900-line SerpentFlow and 1233-line LiveDashboard modules need
-  no new imports other than the five tiny handlers exposed here,
+* the SerpentFlow flowing CLI needs no new imports other than the
+  five tiny handlers exposed here,
 * every branch is exercisable in isolation without booting the full
   battle-test harness,
 * the TTY-only `/vision boost` gate is an injectable probe so CI can
@@ -247,7 +247,7 @@ def handle_vision_boost(
 
 
 # ---------------------------------------------------------------------------
-# Dashboard status line — single-line render for LiveDashboard
+# Vision status line — single-line render for inline SerpentFlow output
 # ---------------------------------------------------------------------------
 
 

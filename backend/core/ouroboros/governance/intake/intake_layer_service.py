@@ -796,7 +796,7 @@ class IntakeLayerService:
                 self._sensors.append(_vision_sensor)
                 self._vision_sensor = _vision_sensor
                 # Publish the sensor to the process-global registry so
-                # SerpentFlow REPL handlers + LiveDashboard status line
+                # SerpentFlow REPL handlers + inline status renderers
                 # can reach it without threading the intake-layer object
                 # through every call site.
                 try:

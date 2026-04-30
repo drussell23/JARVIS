@@ -371,7 +371,7 @@ def test_status_line_boost_token_present_when_active(tmp_path):
 
 def test_status_line_fits_single_line(tmp_path):
     """Regression guard: the status line contains no newlines —
-    LiveDashboard renders it in a single Rich cell."""
+    SerpentFlow renders it inline as a single line."""
     sensor = _make_sensor(tmp_path)
     sensor._pause(reason=PAUSE_REASON_FP_BUDGET, duration_s=None)
     sensor.enable_boost(60.0)

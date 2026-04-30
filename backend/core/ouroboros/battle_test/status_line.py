@@ -1,16 +1,18 @@
-"""Glanceable one-line operator status for the Ouroboros battle-test TUI.
+"""Glanceable one-line operator status for the Ouroboros battle-test CLI.
 
-Closes UX Priority 2B: the LiveDashboard is verbose; operators want a
-scannable one-liner pinned at the bottom of the terminal. Target format
-(example, rendered with Rich/prompt_toolkit markup):
+Closes UX Priority 2B: operators want a scannable one-liner of current
+state. Target format (example):
 
     Phase: L2 Repair 2/8 · Cost: $0.22 / $0.50 · Idle: 847s / 2400s
     · Op: 019d9368 [complex·claude]
 
-This module owns the data aggregation + format contract. SerpentFlow's
-existing ``bottom_toolbar`` callable delegates to
-``StatusLineBuilder.render_prompt_toolkit()``, so the status line stays
-pinned (thanks to ``patch_stdout``) across REPL idle AND execution.
+This module owns the data aggregation + format contract. The flowing
+SerpentFlow CLI consumes it via the ``/status`` REPL command and via
+event-driven receipt lines on op completion (UI Slices 5-6, 2026-04-30).
+The legacy ``render_prompt_toolkit()`` path that fed a persistent
+bottom toolbar is retired as of UI Slice 3 — see
+``memory/project_move_2_closure.md`` for context on why fixed UI panels
+were removed in favor of a pure flowing CLI.
 
 Architectural mandates (matching stream_renderer / diff_preview):
 

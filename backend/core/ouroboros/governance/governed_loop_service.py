@@ -3914,10 +3914,9 @@ class GovernedLoopService:
         #   - LogTransport       → debug.log (always)
         #   - SerpentTransport   → renders a proactive_alert Panel in the
         #                          flowing CLI (battle-test sessions)
-        #   - DashboardTransport → LiveDashboard event feed (if wired)
         #
-        # We do NOT import SerpentFlow/LiveDashboard here — they are owned
-        # by the battle-test harness and may not exist in production. The
+        # We do NOT import SerpentFlow here — it is owned by the
+        # battle-test harness and may not exist in production. The
         # CommProtocol indirection keeps this layer clean.
         #
         # A single hibernation "cycle" shares one op_id across enter/wake so

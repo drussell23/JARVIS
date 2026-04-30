@@ -548,8 +548,7 @@ class CritiqueEngine:
     def stats(self) -> Dict[str, Any]:
         """Snapshot of cumulative critique telemetry.
 
-        Consumers: SerpentFlow /status, battle-test final summary,
-        LiveDashboard critique panel.
+        Consumers: SerpentFlow /status, battle-test final summary.
         """
         return {
             "total_critiques": self._total_critiques,

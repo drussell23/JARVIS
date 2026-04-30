@@ -29,14 +29,14 @@ _ENABLED = os.environ.get(
     "JARVIS_OUROBOROS_ANIMATION", "true"
 ).lower() in ("true", "1", "yes")
 
-# When LiveDashboard is active, the serpent is redundant — the dashboard
-# already shows phase + elapsed per operation.  The serpent's raw stderr
-# writes fight with Rich Live's in-place rendering, causing visual stutter.
+# Suppression hook retained for callers that want to silence the
+# serpent animation in non-interactive contexts (CI, headless soaks).
+# Historically called by the now-retired LiveDashboard at boot.
 _SUPPRESSED = False
 
 
 def suppress() -> None:
-    """Suppress the serpent animation (called by LiveDashboard on boot)."""
+    """Suppress the serpent animation. Used by non-interactive callers."""
     global _SUPPRESSED
     _SUPPRESSED = True
 
