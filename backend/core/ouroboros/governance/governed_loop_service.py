@@ -3774,7 +3774,47 @@ class GovernedLoopService:
             from backend.core.ouroboros.governance.background_agent_pool import (
                 BackgroundAgentPool,
             )
-            self._bg_pool = BackgroundAgentPool(orchestrator=self._orchestrator)
+
+            # Move 2 v5 — Unified Observability hooks. BG ops register
+            # into the same ``_active_ops`` set foreground ops use, AND
+            # get a minimal LoopRuntimeContext in ``_fsm_contexts`` so the
+            # harness ActivityMonitor's staleness check + Phase-Aware
+            # Heartbeats apply to them too. The op_id passed here is the
+            # *context*'s op_id — the same one used by everything
+            # downstream (FSM, telemetry, ledgers).
+            def _bg_register_active(op_id: str) -> None:
+                if not op_id:
+                    return
+                self._active_ops.add(op_id)
+                # Create a minimal FSM context if one doesn't already
+                # exist — gives the staleness check something to read,
+                # and the stream-tick activity hook a target for
+                # last_activity_at_utc updates.
+                if op_id not in self._fsm_contexts:
+                    self._fsm_contexts[op_id] = LoopRuntimeContext(
+                        op_id=op_id,
+                    )
+                logger.debug(
+                    "[GovernedLoop] BG op registered into _active_ops: %s",
+                    op_id,
+                )
+
+            def _bg_unregister_active(op_id: str) -> None:
+                if not op_id:
+                    return
+                self._active_ops.discard(op_id)
+                self._fsm_contexts.pop(op_id, None)
+                logger.debug(
+                    "[GovernedLoop] BG op unregistered from "
+                    "_active_ops: %s",
+                    op_id,
+                )
+
+            self._bg_pool = BackgroundAgentPool(
+                orchestrator=self._orchestrator,
+                on_op_active_register=_bg_register_active,
+                on_op_active_unregister=_bg_unregister_active,
+            )
             await self._bg_pool.start()
             logger.info(
                 "[GLS] BackgroundAgentPool started (pool_size=%d, queue_size=%d)",

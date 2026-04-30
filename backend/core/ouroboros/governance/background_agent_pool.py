@@ -53,7 +53,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.orchestrator import GovernedOrchestrator
@@ -189,8 +189,19 @@ class BackgroundAgentPool:
         orchestrator: GovernedOrchestrator,
         pool_size: Optional[int] = None,
         queue_size: Optional[int] = None,
+        on_op_active_register: Optional[Callable[[str], None]] = None,
+        on_op_active_unregister: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._orchestrator = orchestrator
+        # Move 2 v5 — Unified Observability. The harness ActivityMonitor
+        # tracks ``GovernedLoopService._active_ops``; the original BG path
+        # bypassed that tracker, so ops streaming tokens for minutes were
+        # invisible to the staleness check and the idle watchdog fired
+        # prematurely. The hooks let GLS register/unregister BG ops in
+        # the same central registry foreground ops live in. Both default
+        # to no-ops so older callers (tests) don't break.
+        self._on_op_active_register = on_op_active_register
+        self._on_op_active_unregister = on_op_active_unregister
         self._pool_size: int = (
             pool_size if pool_size is not None
             else _read_env_int("JARVIS_BG_POOL_SIZE", 3)
@@ -600,6 +611,27 @@ class BackgroundAgentPool:
                     op.goal[:80],
                 )
 
+                # Move 2 v5 — Unified Observability: register this BG op
+                # into the central active-op tracker so the harness
+                # ActivityMonitor sees it during staleness checks. The
+                # underlying op_id used by the orchestrator is the
+                # context's op_id (not the pool-internal slot id).
+                _ctx_op_id = str(getattr(op.context, "op_id", "") or "")
+                _registered_ctx_op_id: Optional[str] = None
+                if (
+                    self._on_op_active_register is not None
+                    and _ctx_op_id
+                ):
+                    try:
+                        self._on_op_active_register(_ctx_op_id)
+                        _registered_ctx_op_id = _ctx_op_id
+                    except Exception as _exc:  # noqa: BLE001
+                        logger.warning(
+                            "Worker %d: on_op_active_register failed for "
+                            "%s: %s",
+                            worker_id, _ctx_op_id, _exc,
+                        )
+
                 try:
                     # Phase 1 Step 3C: § 4 bind contract dispatch. Read
                     # the live orchestrator from the process-wide bind
@@ -763,6 +795,27 @@ class BackgroundAgentPool:
                     op.completed_at = time.monotonic()
                     op.task = None
                     self._queue.task_done()
+                    # Move 2 v5 — Unified Observability cleanup. Always
+                    # unregister, even on cancellation / failure / rupture
+                    # so no dangling state accumulates in the central
+                    # tracker. Symmetric with the register call above:
+                    # we only unregister an op_id we successfully
+                    # registered. Best-effort: a failing unregister
+                    # cannot leak the worker.
+                    if (
+                        _registered_ctx_op_id is not None
+                        and self._on_op_active_unregister is not None
+                    ):
+                        try:
+                            self._on_op_active_unregister(
+                                _registered_ctx_op_id,
+                            )
+                        except Exception as _exc:  # noqa: BLE001
+                            logger.warning(
+                                "Worker %d: on_op_active_unregister "
+                                "failed for %s: %s",
+                                worker_id, _registered_ctx_op_id, _exc,
+                            )
 
         except asyncio.CancelledError:
             logger.debug("Worker %d shutting down (cancelled)", worker_id)
