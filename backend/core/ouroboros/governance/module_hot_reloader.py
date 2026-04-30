@@ -95,7 +95,10 @@ DEFAULT_QUARANTINE: FrozenSet[str] = frozenset({
     "backend.core.ouroboros.governance._governance_state",
     "backend.core.ouroboros.battle_test.harness",
     "backend.core.ouroboros.battle_test.serpent_flow",
-    "backend.core.ouroboros.battle_test.live_dashboard",
+    # NOTE: ``backend.core.ouroboros.battle_test.live_dashboard`` retired
+    # 2026-04-30 (UI Slice 1 of REPL unification). The flowing CLI is now
+    # the sole presentation surface — Rich Live TUI was duplicate
+    # presentation-layer code. Slice 2 deletes the module file itself.
 })
 
 # Probe symbols: a known-stable public attribute per safe module. After
