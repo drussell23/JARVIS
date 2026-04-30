@@ -3165,10 +3165,16 @@ class SerpentREPL:
                         )
                         self._running = False
                         break
-                    if line == "status":
+                    if line in ("status", "/status"):
                         self._print_status()
                         continue
-                    if line == "help":
+                    if line in ("cost", "/cost"):
+                        self._print_cost()
+                        continue
+                    if line in ("posture", "/posture"):
+                        self._print_posture()
+                        continue
+                    if line in ("help", "/help"):
                         self._print_help()
                         continue
                     if line.startswith("cancel "):
@@ -3334,28 +3340,57 @@ class SerpentREPL:
                     break
 
     def _print_status(self) -> None:
-        """Print detailed organism status."""
+        """Print detailed organism status as inline scrollable output.
+
+        UI Slice 5 (2026-04-30): retired the Rich ``Panel`` wrapper —
+        same content, but emitted as plain inline lines so the status
+        scrolls naturally with the event stream. Operators get a
+        snapshot they can scroll back to instead of a fixed-region
+        re-render. Composes the existing ``status_line.py`` data
+        layer when available; otherwise falls back to the cached
+        SerpentFlow counters.
+        """
         f = self._flow
         elapsed = time.time() - f._started_at
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
 
-        lines = [
-            f"[bold]Session[/bold]     {f._session_id}",
-            f"[bold]Uptime[/bold]      {mins}m {secs:02d}s",
-            f"[bold]Evolved[/bold]     [green]{f._completed}[/green]",
-            f"[bold]Shed[/bold]        [red]{f._failed}[/red]",
-            f"[bold]Cost[/bold]        ${f._cost_total:.4f} / ${f._cost_cap:.2f}",
-            f"[bold]Active Ops[/bold]  {len(f._active_ops)}",
-            f"[bold]Sensors[/bold]     {f._sensors_active}",
-            f"[bold]Lessons[/bold]     {len(f._session_lessons)}",
-            (
-                f"[bold]Plan Review[/bold] "
-                f"{'[green]ON[/green]' if f._plan_review_mode else '[dim]OFF[/dim]'}"
-            ),
-        ]
+        f.console.print()
+        f.console.print(
+            f"[cyan]🐍 Organism Status[/cyan]"
+            f"  [dim]({mins}m {secs:02d}s elapsed)[/dim]"
+        )
+        # Compact one-liner from the preserved status_line.py data layer
+        # when registered; surfaces phase / cost / idle / op id / route.
+        try:
+            from backend.core.ouroboros.battle_test.status_line import (
+                get_status_line_builder,
+            )
+            _builder = get_status_line_builder()
+            if _builder is not None:
+                _line = _builder.render_plain()
+                if _line:
+                    f.console.print(f"  [dim]{_line}[/dim]")
+        except Exception:
+            pass
+        f.console.print(
+            f"  [bold]Session[/bold]      {f._session_id}"
+        )
+        f.console.print(
+            f"  [bold]Evolved[/bold]      [green]{f._completed}[/green]"
+            f"  [dim]│[/dim]  [bold]Shed[/bold] [red]{f._failed}[/red]"
+            f"  [dim]│[/dim]  [bold]Active[/bold] {len(f._active_ops)}"
+            f"  [dim]│[/dim]  [bold]Sensors[/bold] {f._sensors_active}"
+        )
+        f.console.print(
+            f"  [bold]Cost[/bold]         ${f._cost_total:.4f}"
+            f" / ${f._cost_cap:.2f}"
+            f"  [dim]│[/dim]  [bold]Lessons[/bold] {len(f._session_lessons)}"
+            f"  [dim]│[/dim]  [bold]Plan Review[/bold] "
+            f"{'[green]ON[/green]' if f._plan_review_mode else '[dim]OFF[/dim]'}"
+        )
         if f._route_costs:
-            lines.append("[bold]Route Spend[/bold]")
+            f.console.print(f"  [bold]Route Spend[/bold]")
             for route, stats in sorted(
                 f._route_costs.items(),
                 key=lambda item: item[1].get("total", 0.0),
@@ -3363,26 +3398,136 @@ class SerpentREPL:
             ):
                 label = _ROUTE_SHORT.get(route, route[:3].upper())
                 spark = _sparkline(list(stats.get("samples", [])))
-                lines.append(
-                    f"  {label}  ${stats.get('total', 0.0):.4f}  "
+                f.console.print(
+                    f"    {label}  ${stats.get('total', 0.0):.4f}  "
                     f"{len(stats.get('ops', set()))} op  {spark}"
                 )
-        panel = Panel(
-            "\n".join(lines),
-            title="[cyan]🐍 Organism Status[/cyan]",
-            border_style="cyan",
-            width=min(f.console.width, 64),
-            padding=(0, 2),
-        )
         f.console.print()
-        f.console.print(panel)
+
+    def _print_cost(self) -> None:
+        """Inline cost breakdown — UI Slice 5 ``/cost`` REPL command.
+
+        Pulls cost data from the SerpentFlow's tracked counters and
+        the route-cost rollup (already maintained by the existing
+        op-completion path). No fixed UI panels — output scrolls
+        with the event stream.
+        """
+        f = self._flow
+        spent = f._cost_total
+        cap = f._cost_cap
+        pct = (spent / cap * 100.0) if cap > 0 else 0.0
+
+        f.console.print()
+        f.console.print(
+            f"[bold yellow]💰 Cost[/bold yellow]  "
+            f"${spent:.4f} / ${cap:.2f}  "
+            f"[dim]({pct:.1f}%)[/dim]"
+        )
+        if not f._route_costs:
+            f.console.print(
+                "  [dim]No route-level cost samples yet.[/dim]"
+            )
+        else:
+            f.console.print(f"  [bold]Per-route[/bold]")
+            for route, stats in sorted(
+                f._route_costs.items(),
+                key=lambda item: item[1].get("total", 0.0),
+                reverse=True,
+            ):
+                label = _ROUTE_SHORT.get(route, route[:3].upper())
+                total = stats.get("total", 0.0)
+                op_count = len(stats.get("ops", set()))
+                spark = _sparkline(list(stats.get("samples", [])))
+                f.console.print(
+                    f"    {label:<6s} ${total:.4f}  "
+                    f"{op_count} op  {spark}"
+                )
+        f.console.print()
+
+    def _print_posture(self) -> None:
+        """Inline posture snapshot — UI Slice 5 ``/posture`` REPL.
+
+        Reads from the persistent ``PostureStore`` (singleton)
+        populated by the always-on ``PostureObserver``. When the
+        observer hasn't run yet (cold boot) or the store is empty,
+        emits a clear "no reading yet" line rather than a panel-shaped
+        placeholder.
+        """
+        f = self._flow
+        f.console.print()
+        try:
+            from backend.core.ouroboros.governance.posture_observer import (
+                get_default_store,
+            )
+            store = get_default_store()
+            reading = store.load_current()
+        except Exception as _exc:
+            f.console.print(
+                f"[dim]🧭 Posture surface unavailable: {type(_exc).__name__}[/dim]"
+            )
+            f.console.print()
+            return
+
+        if reading is None:
+            f.console.print(
+                "[bold blue]🧭 Posture[/bold blue]  "
+                "[dim]no reading yet — observer hasn't completed first cycle[/dim]"
+            )
+            f.console.print()
+            return
+
+        # PostureReading attribute names: posture, confidence,
+        # signals, set_at_unix, source. We surface the operator-
+        # relevant subset; defensive against schema drift.
+        _posture = getattr(reading, "posture", None)
+        _conf = getattr(reading, "confidence", None)
+        _set_at = getattr(reading, "set_at_unix", None)
+        _signals = getattr(reading, "signals", None)
+        _source = getattr(reading, "source", None)
+
+        _posture_str = (
+            _posture.value if hasattr(_posture, "value")
+            else str(_posture or "?")
+        )
+        _conf_str = (
+            f"{_conf:.2f}" if isinstance(_conf, (int, float))
+            else "?"
+        )
+        f.console.print(
+            f"[bold blue]🧭 Posture[/bold blue]  "
+            f"[bold]{_posture_str}[/bold]  "
+            f"[dim]conf={_conf_str}[/dim]"
+        )
+        if _source:
+            f.console.print(
+                f"  [bold]Source[/bold]   {_source}"
+            )
+        if _set_at:
+            try:
+                _age_s = max(0.0, time.time() - float(_set_at))
+                _ago = (
+                    f"{int(_age_s)}s ago" if _age_s < 90
+                    else f"{int(_age_s/60)}m ago" if _age_s < 5400
+                    else f"{int(_age_s/3600)}h ago"
+                )
+                f.console.print(f"  [bold]Set[/bold]      {_ago}")
+            except Exception:
+                pass
+        if isinstance(_signals, dict) and _signals:
+            # Surface up to 3 signal items inline.
+            sig_items = list(_signals.items())[:3]
+            sig_str = "  ".join(
+                f"[dim]{k}={v}[/dim]" for k, v in sig_items
+            )
+            f.console.print(f"  [bold]Signals[/bold]  {sig_str}")
         f.console.print()
 
     def _print_help(self) -> None:
         """Print available REPL commands."""
         lines = [
-            f"  [{_C['dim']}]status[/{_C['dim']}]            organism status panel",
-            f"  [{_C['dim']}]cost[/{_C['dim']}]              cost breakdown",
+            f"  [{_C['dim']}]/status[/{_C['dim']}]           organism status snapshot",
+            f"  [{_C['dim']}]/cost[/{_C['dim']}]             cost breakdown by route",
+            f"  [{_C['dim']}]/posture[/{_C['dim']}]          current strategic posture",
             f"  [{_C['dim']}]/lessons[/{_C['dim']}]          show session lesson buffer",
             f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]       cancel an in-flight operation",
             f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]      set risk ceiling",
