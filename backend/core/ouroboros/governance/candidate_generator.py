@@ -3019,6 +3019,52 @@ class CandidateGenerator:
         is Claude (more expensive, but the cost contract guard at
         ClaudeProvider boundary still rejects BG/SPEC).
         """
+        # Move 2 v7 — Circuit Breaker pre-call gate. The Claude provider's
+        # internal _call_with_backoff retry loop absorbs transport failures
+        # within its 3-attempt window. The FSM only sees failures that
+        # bubble through this dispatcher, missing exhaustions consumed by
+        # the provider's internal retries (e.g. PLAN-phase calls). The
+        # cross-cutting breaker sits at the provider boundary and trips
+        # on consecutive transport-exhaustion events regardless of which
+        # dispatch path triggered them. When OPEN, route directly to
+        # fallback. The breaker only gates calls when the primary is the
+        # Claude/Anthropic tier — it does not block DW/Tier-0 traffic.
+        try:
+            _is_claude_primary = (
+                self._tier0 is None or self._primary is not self._tier0
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            _is_claude_primary = True
+        if _is_claude_primary:
+            try:
+                from backend.core.ouroboros.governance.claude_circuit_breaker import (
+                    get_claude_circuit_breaker,
+                    is_enabled as _breaker_enabled,
+                    CircuitState,
+                )
+                if _breaker_enabled():
+                    _breaker = get_claude_circuit_breaker()
+                    if not _breaker.should_allow_request():
+                        _snap = _breaker.snapshot()
+                        logger.warning(
+                            "[CandidateGenerator] Circuit breaker OPEN — "
+                            "routing %s op to fallback (state=%s, "
+                            "consecutive_transport_failures=%d, "
+                            "total_trips=%d)",
+                            getattr(context, "provider_route", "?"),
+                            _snap["state"],
+                            _snap["consecutive_transport_failures"],
+                            _snap["total_trips"],
+                        )
+                        return await self._call_fallback(context, deadline)
+            except Exception as _exc:  # noqa: BLE001
+                # Breaker failure must never block dispatch — treat as
+                # CLOSED and fall through to normal flow.
+                logger.debug(
+                    "[CandidateGenerator] Circuit breaker check failed "
+                    "(treating as CLOSED): %s", _exc,
+                )
+
         # Dynamic fallback: skip a primary in active backoff.
         if not self.fsm.should_attempt_primary():
             _eta_s = max(0.0, self.fsm.recovery_eta() - time.monotonic())

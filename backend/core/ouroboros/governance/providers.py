@@ -5327,6 +5327,19 @@ class ClaudeProvider:
                     remaining_ms=_remaining_ms_now(),
                     exc_class=None, outcome="success",
                 )
+                # Move 2 v7 — Circuit Breaker. A successful Claude call
+                # is the recovery signal: clear consecutive-transport
+                # failures and (if HALF_OPEN probing) re-close the
+                # breaker.
+                try:
+                    from backend.core.ouroboros.governance.claude_circuit_breaker import (
+                        get_claude_circuit_breaker,
+                        is_enabled as _breaker_enabled,
+                    )
+                    if _breaker_enabled():
+                        get_claude_circuit_breaker().record_success()
+                except Exception:  # noqa: BLE001
+                    pass
                 return result
             except BaseException as exc:  # noqa: BLE001 — we rethrow below
                 # Bare class name is used for set-membership lookups against
@@ -5427,6 +5440,25 @@ class ClaudeProvider:
                             if _remaining_s() is not None else "∞"
                         ),
                     )
+                    # Move 2 v7 — Circuit Breaker. Retry exhaustion on a
+                    # transport-class error is a strong signal that
+                    # Claude's transport layer is sustainedly sick. Trip
+                    # the breaker so future calls route around Claude
+                    # without paying for another full retry cascade.
+                    try:
+                        from backend.core.ouroboros.governance.claude_circuit_breaker import (
+                            get_claude_circuit_breaker,
+                            is_enabled as _breaker_enabled,
+                            is_transport_class_exception,
+                        )
+                        if _breaker_enabled() and is_transport_class_exception(exc):
+                            get_claude_circuit_breaker().record_transport_exhaustion(
+                                exc_class_display,
+                            )
+                    except Exception:  # noqa: BLE001
+                        # Breaker observability must never propagate
+                        # failure into the call path.
+                        pass
                     if _CLAUDE_RECYCLE_ON_EXHAUST:
                         self._recycle_client(
                             reason=f"retry_exhausted:{label}:{exc_class_display}"
@@ -5486,6 +5518,21 @@ class ClaudeProvider:
                             label, exc_class_display, rem_post,
                             self._client_generation,
                         )
+                        # Move 2 v7 — Circuit Breaker. Budget-starved
+                        # exhaustion on transport classes still counts
+                        # as a sustained-failure signal.
+                        try:
+                            from backend.core.ouroboros.governance.claude_circuit_breaker import (
+                                get_claude_circuit_breaker,
+                                is_enabled as _breaker_enabled,
+                                is_transport_class_exception,
+                            )
+                            if _breaker_enabled() and is_transport_class_exception(exc):
+                                get_claude_circuit_breaker().record_transport_exhaustion(
+                                    exc_class_display,
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
                         if _CLAUDE_RECYCLE_ON_EXHAUST:
                             self._recycle_client(
                                 reason=f"budget_starved:{label}:{exc_class_display}"
