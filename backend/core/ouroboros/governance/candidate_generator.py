@@ -3002,7 +3002,39 @@ class CandidateGenerator:
         Note: In Python 3.9, ``CancelledError`` is a ``BaseException`` (not
         ``Exception``), so we must catch it explicitly to handle
         ``asyncio.wait_for`` cancellation of the primary call.
+
+        Move 2 v6 — Dynamic Provider Fallback. Before paying for a
+        primary call we know is statistically likely to fail, consult
+        the FSM. If it has classified the primary as in active backoff
+        (consecutive transport failures + recovery ETA hasn't elapsed),
+        route directly to fallback. The FSM bookkeeping already exists
+        (``record_primary_failure`` + ``recovery_eta``); we just need to
+        actually consult it at this critical dispatch site. Without
+        this, repeated Claude transport failures used to keep retrying
+        Claude — and the resulting cascade left ``_active_ops`` empty
+        for an hour, idling the soak even after the v5 fixes.
+
+        Cost-safe: dynamic fallback for IMMEDIATE/COMPLEX is Claude →
+        DW (~30× cheaper). For STANDARD where DW is primary, fallback
+        is Claude (more expensive, but the cost contract guard at
+        ClaudeProvider boundary still rejects BG/SPEC).
         """
+        # Dynamic fallback: skip a primary in active backoff.
+        if not self.fsm.should_attempt_primary():
+            _eta_s = max(0.0, self.fsm.recovery_eta() - time.monotonic())
+            logger.warning(
+                "[CandidateGenerator] Dynamic fallback engaged — primary "
+                "in %s backoff (consecutive_failures=%d, "
+                "recovery_eta=+%.0fs) — routing %s op to fallback "
+                "without re-attempting primary",
+                self.fsm._failure_mode.name
+                if self.fsm._failure_mode is not None else "UNKNOWN",
+                self.fsm._consecutive_failures,
+                _eta_s,
+                getattr(context, "provider_route", "?"),
+            )
+            return await self._call_fallback(context, deadline)
+
         try:
             result = await self._call_primary(context, deadline)
             # Primary succeeded — record recovery if we were in a failure state
