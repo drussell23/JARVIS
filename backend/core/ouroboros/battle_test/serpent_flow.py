@@ -404,59 +404,75 @@ class SerpentFlow:
         n_sensors: int = 0,
         log_path: str = "",
     ) -> None:
-        """Render the compact boot banner as a Rich Panel.
+        """Print the boot banner as inline scrollable output.
+
+        UI Slice 4 (2026-04-30): retired the Rich ``Panel`` wrapper in
+        favor of plain inline lines so the banner scrolls away
+        naturally with the rest of the event stream — matching Claude
+        Code's flowing UX. No fixed terminal regions, no panel
+        borders, no width clamping.
 
         Parameters
         ----------
         layers:
-            List of ``(icon, name, is_on, detail)`` tuples for the 6-layer
-            organism status display.
+            List of ``(icon, name, is_on, detail)`` tuples for the
+            6-layer organism status display.
         n_sensors:
             Number of active intake sensors.
         log_path:
-            Path to the debug log file (shown in banner footer).
+            Path to the debug log file (shown at the bottom).
         """
-        _on = "[bright_green]ON[/bright_green] "
+        _on = "[bright_green]ON[/bright_green]"
         _off = "[dim]OFF[/dim]"
 
-        lines: List[str] = []
-
-        # Identity block
-        lines.append(f"[bold]Session[/bold]    [dim]{self._session_id}[/dim]")
-        lines.append(f"[bold]Branch[/bold]     [dim]{self._branch_name or 'N/A'}[/dim]")
-        lines.append(
-            f"[bold]Budget[/bold]     ${self._cost_cap:.2f}  [dim]│[/dim]  "
-            f"Idle {self._idle_timeout_s:.0f}s"
+        # Header — single bright line, no border.
+        self.console.print()
+        self.console.print(
+            "[bold cyan]🐍 OUROBOROS + VENOM[/bold cyan]"
+            "  [dim]│[/dim]  "
+            "[dim]The Self-Developing Organism[/dim]"
         )
-        if self._plan_review_mode:
-            lines.append("[bold]Mode[/bold]       Governed + plan review before execute")
-        else:
-            lines.append("[bold]Mode[/bold]       Governed (SAFE_AUTO auto-apply)")
-        lines.append("")
 
-        # Layer status
-        lines.append("[bold]── 6-Layer Organism ─────────────────────────[/bold]")
+        # Identity block — flat lines, no panel.
+        self.console.print(
+            f"  [bold]Session[/bold]  [dim]{self._session_id}[/dim]"
+        )
+        self.console.print(
+            f"  [bold]Branch[/bold]   [dim]{self._branch_name or 'N/A'}[/dim]"
+        )
+        self.console.print(
+            f"  [bold]Budget[/bold]   ${self._cost_cap:.2f}"
+            f"  [dim]│[/dim]  Idle {self._idle_timeout_s:.0f}s"
+        )
+        _mode = (
+            "Governed + plan review before execute"
+            if self._plan_review_mode
+            else "Governed (SAFE_AUTO auto-apply)"
+        )
+        self.console.print(f"  [bold]Mode[/bold]     {_mode}")
+
+        # Layer status — single header line + one line per layer.
+        self.console.print()
+        self.console.print(
+            "[bold]── 6-Layer Organism ──[/bold]"
+        )
         for icon, name, is_on, detail in layers:
             status = _on if is_on else _off
-            lines.append(f"  {icon}  {name:<24s} {status} [dim]{detail}[/dim]")
+            self.console.print(
+                f"  {icon}  {name:<24s} {status}  [dim]{detail}[/dim]"
+            )
 
-        # Footer
-        lines.append("")
-        sensor_str = f" [dim]│[/dim] {n_sensors} sensors" if n_sensors else ""
-        lines.append(f"[bright_green]🔋 Organism alive[/bright_green]{sensor_str} [dim]│[/dim] Ctrl+C to stop")
-        if log_path:
-            lines.append(f"[dim]📝 {log_path}[/dim]")
-
-        panel = Panel(
-            "\n".join(lines),
-            title="[bold cyan]🐍 O U R O B O R O S  +  V E N O M[/bold cyan]",
-            subtitle="[bold cyan]The Self-Developing Organism[/bold cyan]",
-            border_style="bold cyan",
-            width=min(self.console.width, 72),
-            padding=(1, 2),
-        )
+        # Footer line.
         self.console.print()
-        self.console.print(panel)
+        sensor_str = (
+            f"  [dim]│[/dim]  {n_sensors} sensors" if n_sensors else ""
+        )
+        self.console.print(
+            f"[bright_green]🔋 Organism alive[/bright_green]{sensor_str}"
+            f"  [dim]│[/dim]  Ctrl+C to stop"
+        )
+        if log_path:
+            self.console.print(f"[dim]📝 {log_path}[/dim]")
         self.console.print()
 
     # ══════════════════════════════════════════════════════════
