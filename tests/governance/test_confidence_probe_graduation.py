@@ -280,11 +280,14 @@ class TestShippedCodeInvariantPins:
             f"Move 5 pins fire violations: {relevant}"
         )
 
-    def test_total_invariant_count_at_23(self):
-        # 20 (post-Move-4) + 3 (Move 5 Slice 5) = 23
+    def test_total_invariant_count_at_least_23(self):
+        # Move 5 added 3 pins (post-Move-4 baseline 20 → 23).
+        # Move 6 added 5 more (28). Future moves may add more —
+        # this pin asserts the floor (Move-5 contribution stays
+        # registered) without being brittle to growth.
         count = len(list_shipped_code_invariants())
-        assert count == 23, (
-            f"expected 23 shipped_code_invariants post-Move-5; "
+        assert count >= 23, (
+            f"expected ≥23 shipped_code_invariants post-Move-5; "
             f"got {count}"
         )
 

@@ -127,8 +127,15 @@ QUORUM_ELIGIBLE_TIERS: frozenset = frozenset({
 
 
 def quorum_gate_enabled() -> bool:
-    """``JARVIS_QUORUM_GATE_ENABLED`` (default ``false`` until
-    Slice 5 graduation).
+    """``JARVIS_QUORUM_GATE_ENABLED`` (default ``true`` post Slice 5
+    graduation 2026-05-01).
+
+    Sub-gate for the orchestrator hook. When this is true AND the
+    master ``JARVIS_GENERATIVE_QUORUM_ENABLED`` is also true, the
+    runner fires K rolls on APPROVAL_REQUIRED+ ops on non-cost-
+    gated routes. Operators may set this false to disable Quorum
+    invocation while keeping the master on (e.g., emergency
+    revert without full disable).
 
     Asymmetric env semantics — empty/whitespace = unset = current
     default; explicit ``0``/``false``/``no``/``off`` evaluates
@@ -138,7 +145,7 @@ def quorum_gate_enabled() -> bool:
         "JARVIS_QUORUM_GATE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated 2026-05-01 (Move 6 Slice 5)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -432,6 +439,7 @@ async def invoke_quorum_for_op(
     cost_estimate_per_roll_usd: float = 0.0,
     master_override: Optional[bool] = None,
     gate_override: Optional[bool] = None,
+    op_id: str = "",
 ) -> QuorumGateResult:
     """Combine gate check + Slice 3 runner + action mapping.
     Orchestrator-facing entry point. NEVER raises.
@@ -473,6 +481,7 @@ async def invoke_quorum_for_op(
                 cost_estimate_per_roll_usd
             ),
             enabled_override=True,
+            op_id=op_id,
         )
 
         action = map_consensus_to_action(run_result.verdict)

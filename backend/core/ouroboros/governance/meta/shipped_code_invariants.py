@@ -1142,6 +1142,155 @@ def _validate_confidence_probe_cap_structure(
     return tuple(violations)
 
 
+# ---------------------------------------------------------------------------
+# Move 6 — Generative Quorum AST pins (4 invariants)
+# ---------------------------------------------------------------------------
+
+
+def _validate_generative_quorum_no_authority_imports(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """Move 6 Slice 5 — Quorum primitive + runner + gate must NOT
+    import orchestrator-tier modules. Pure structural primitives.
+
+    NEVER raises."""
+    forbidden = (
+        "orchestrator", "iron_gate", "policy", "change_engine",
+        "candidate_generator", "providers", "doubleword_provider",
+        "urgency_router", "auto_action_router",
+        "subagent_scheduler", "tool_executor", "phase_runners",
+        "semantic_guardian", "semantic_firewall", "risk_engine",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        module = (
+            node.module if isinstance(node, ast.ImportFrom)
+            else (node.names[0].name if node.names else "")
+        )
+        module = module or ""
+        for f in forbidden:
+            if f in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden authority import "
+                    f"contains {f!r}: {module}"
+                )
+    return tuple(violations)
+
+
+def _validate_ast_canonical_pure_stdlib(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """Move 6 Slice 5 — ast_canonical signature module must be
+    stdlib-only (no governance imports). Critical because the
+    signature compute is a load-bearing trust boundary: any
+    governance dep widens the attack surface.
+
+    Also AST-pins the no-exec/eval/compile contract — signature
+    compute MUST never execute candidate code.
+
+    NEVER raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if (
+                "backend." in module
+                or "governance" in module
+            ):
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: ast_canonical must be "
+                    f"stdlib-only — found {module!r}"
+                )
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in ("exec", "eval", "compile"):
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: ast_canonical MUST NOT "
+                        f"execute candidate code — found "
+                        f"{node.func.id}() call"
+                    )
+    return tuple(violations)
+
+
+def _validate_quorum_gate_consumes_cost_gated_routes(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """Move 6 Slice 5 — STRUCTURAL §26.6 cost-contract guard. The
+    gate MUST reference ``COST_GATED_ROUTES`` symbol from
+    ``cost_contract_assertion``. Catches a refactor that drops
+    the cost guard structurally BEFORE shipping.
+
+    Bytes-pinned for the symbol name + import-from line; AST-
+    pinned for the importfrom node. NEVER raises."""
+    violations: List[str] = []
+    if "COST_GATED_ROUTES" not in source:
+        violations.append(
+            "gate dropped its reference to "
+            "COST_GATED_ROUTES — the structural §26.6 cost-"
+            "contract guard is gone"
+        )
+    found_import = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if (
+                node.module
+                == "backend.core.ouroboros.governance."
+                "cost_contract_assertion"
+            ):
+                for alias in node.names:
+                    if alias.name == "COST_GATED_ROUTES":
+                        found_import = True
+                        break
+    if not found_import:
+        violations.append(
+            "gate must import COST_GATED_ROUTES via importfrom "
+            "from cost_contract_assertion (single source of "
+            "truth)"
+        )
+    return tuple(violations)
+
+
+def _validate_quorum_cap_structure_pinned(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """Move 6 Slice 5 — Quorum K + agreement-threshold env knobs
+    MUST use ``min(ceiling, max(floor, value))`` clamps. Catches
+    refactor that loosens caps (e.g., letting K=10 through).
+
+    Bytes-pinned for floor/ceiling constants + the clamp pattern.
+    NEVER raises."""
+    violations: List[str] = []
+    required_constants = (
+        "_K_FLOOR",
+        "_K_CEILING",
+        "_AGREEMENT_THRESHOLD_FLOOR",
+    )
+    for const in required_constants:
+        if const not in source:
+            violations.append(
+                f"cap-structure constant missing: {const}"
+            )
+    required_helpers = (
+        "def quorum_k",
+        "def agreement_threshold",
+    )
+    for helper in required_helpers:
+        if helper not in source:
+            violations.append(
+                f"cap helper missing: {helper}"
+            )
+    if "min(" not in source or "max(" not in source:
+        violations.append(
+            "cap helpers must use min()/max() clamp pattern"
+        )
+    return tuple(violations)
+
+
 def _validate_invariant_drift_auditor_no_disk_writes(
     tree: ast.Module, source: str,
 ) -> Tuple[str, ...]:
@@ -1631,6 +1780,107 @@ def _register_seed_invariants() -> None:
                 "the pure-compute primitive."
             ),
             validate=_validate_invariant_drift_auditor_no_disk_writes,
+        ),
+    )
+    # Move 6 Slice 5 — Generative Quorum graduation pins.
+    # Closes §28.5.2 v9 brutal review's two undefended Antivenom
+    # bypass vectors (Test-shape gaming + Quine-class hallucination)
+    # via independent-roll consensus. These pins protect the
+    # structural primitives from refactor drift.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "generative_quorum_no_authority_imports_primitive"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "generative_quorum.py"
+            ),
+            description=(
+                "Slice 1 Quorum primitive must NOT import "
+                "orchestrator / phase_runners / iron_gate / "
+                "change_engine / policy / candidate_generator / "
+                "providers / doubleword_provider / "
+                "urgency_router / auto_action_router / "
+                "subagent_scheduler / tool_executor / "
+                "semantic_guardian / semantic_firewall / "
+                "risk_engine — pure-data primitive."
+            ),
+            validate=_validate_generative_quorum_no_authority_imports,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "generative_quorum_runner_no_authority_imports"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "generative_quorum_runner.py"
+            ),
+            description=(
+                "Slice 3 K-way parallel runner must NOT import "
+                "orchestrator-tier modules — transport-agnostic "
+                "primitive. Lazy ide_observability_stream import "
+                "for SSE is allowed (load-bearing best-effort)."
+            ),
+            validate=_validate_generative_quorum_no_authority_imports,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="ast_canonical_pure_stdlib",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "ast_canonical.py"
+            ),
+            description=(
+                "Slice 2 AST-normalized signature compute MUST be "
+                "stdlib-only — no governance imports. Critical "
+                "safety: also AST-pinned no-exec/eval/compile so "
+                "the canonicalizer NEVER executes candidate code "
+                "(only ast.parses it). Trust boundary."
+            ),
+            validate=_validate_ast_canonical_pure_stdlib,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "quorum_gate_consumes_cost_gated_routes"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "generative_quorum_gate.py"
+            ),
+            description=(
+                "STRUCTURAL §26.6 cost-contract guard: Slice 4 "
+                "gate MUST import COST_GATED_ROUTES from "
+                "cost_contract_assertion AND reference it in its "
+                "decision tree. Catches a refactor that drops "
+                "the BG/SPEC cost-gate structurally BEFORE "
+                "shipping."
+            ),
+            validate=(
+                _validate_quorum_gate_consumes_cost_gated_routes
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="quorum_cap_structure_pinned",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "generative_quorum.py"
+            ),
+            description=(
+                "K + agreement-threshold env knobs MUST use "
+                "min(ceiling, max(floor, value)) clamps with "
+                "named floor/ceiling constants. Catches refactor "
+                "that loosens caps (e.g., K=10 through, "
+                "threshold=1 single-roll consensus)."
+            ),
+            validate=_validate_quorum_cap_structure_pinned,
         ),
     )
 

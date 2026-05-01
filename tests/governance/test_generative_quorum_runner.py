@@ -705,12 +705,14 @@ class TestAuthorityInvariants:
                     )
 
     def test_governance_imports_in_allowlist(self, runner_source):
-        """Slice 3 may import ONLY Slice 1 + Slice 2 from
-        governance. No other governance module."""
+        """Slice 3 may import Slice 1 + Slice 2 + (Slice 5 lazy)
+        ide_observability_stream from governance. No other module."""
         tree = ast.parse(runner_source)
         allowed = {
             "backend.core.ouroboros.governance.verification.generative_quorum",
             "backend.core.ouroboros.governance.verification.ast_canonical",
+            # Slice 5 — lazy SSE publisher import
+            "backend.core.ouroboros.governance.ide_observability_stream",
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):

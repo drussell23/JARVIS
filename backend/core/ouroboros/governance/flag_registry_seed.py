@@ -1733,6 +1733,116 @@ SEED_SPECS: list = [
         example="templates",
         since="Move 5 Slice 5",
     ),
+
+    # ====================================================================
+    # Generative Quorum (Move 6) — 6 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_GENERATIVE_QUORUM_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master kill switch for K-way Generative Quorum. "
+            "Default false post Slice 5 graduation — operators "
+            "explicitly opt in because Quorum incurs K× generation "
+            "cost per APPROVAL_REQUIRED+ op. When false, the gate "
+            "short-circuits to FALL_THROUGH_SINGLE on every op (no "
+            "behavior change from pre-Move-6 baseline)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "generative_quorum.py"
+        ),
+        example="false",
+        since="Move 6 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_QUORUM_GATE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the orchestrator hook. When master is "
+            "true AND this is true, the gate fires Quorum on "
+            "APPROVAL_REQUIRED+ ops on non-cost-gated routes. "
+            "Operators may set false to disable invocation while "
+            "keeping master on (emergency revert)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "generative_quorum_gate.py"
+        ),
+        example="true",
+        since="Move 6 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_QUORUM_K",
+        type=FlagType.INT, default=3,
+        description=(
+            "Number of candidate rolls per quorum. Cap structure: "
+            "min(5, max(2, value)) — single-roll defeats consensus; "
+            "ceiling 5 caps cost amplification."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "generative_quorum.py"
+        ),
+        example="3",
+        since="Move 6 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_QUORUM_AGREEMENT_THRESHOLD",
+        type=FlagType.INT, default=2,
+        description=(
+            "Minimum cluster size required to declare "
+            "MAJORITY_CONSENSUS. Floor 2 because single-roll "
+            "agreement is meaningless — consensus requires at "
+            "least two rolls to align."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "generative_quorum.py"
+        ),
+        example="2",
+        since="Move 6 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_AST_CANONICAL_NORMALIZE_LITERALS",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "AST signature normalization for Quorum convergence. "
+            "When true (default), literal values (ints/strs/etc) "
+            "are replaced with type tags before hashing — Quine-"
+            "class invariance. When false, strict literal equality."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "ast_canonical.py"
+        ),
+        example="true",
+        since="Move 6 Slice 2",
+    ),
+    FlagSpec(
+        name="JARVIS_AST_CANONICAL_STRIP_DOCSTRINGS",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "When true, docstrings are stripped from the AST "
+            "before hashing. Default false — conservative because "
+            "docstring text might be semantically load-bearing. "
+            "Enable when models produce different phrasings for "
+            "same logic."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "ast_canonical.py"
+        ),
+        example="false",
+        since="Move 6 Slice 2",
+    ),
 ]
 
 

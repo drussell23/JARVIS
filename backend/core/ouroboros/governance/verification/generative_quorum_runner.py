@@ -91,6 +91,83 @@ GENERATIVE_QUORUM_RUNNER_SCHEMA_VERSION: str = (
 
 
 # ---------------------------------------------------------------------------
+# Slice 5 — SSE event vocabulary + publisher
+# ---------------------------------------------------------------------------
+
+
+EVENT_TYPE_QUORUM_OUTCOME: str = "generative_quorum_outcome"
+"""SSE event fired on every non-DISABLED Quorum run completion.
+Mirrors Move 4 / Move 5 lazy-import + best-effort discipline:
+broker-missing / publish-error all return ``None`` silently.
+NEVER raises. Master-flag-gated by ``quorum_enabled()`` —
+DISABLED outcomes are not published (zero noise when master off)."""
+
+
+def publish_quorum_outcome(
+    *,
+    outcome: str,
+    op_id: str,
+    detail: str,
+    agreement_count: int,
+    distinct_count: int,
+    total_rolls: int,
+    failed_count: int,
+    elapsed_seconds: float,
+    canonical_signature: Optional[str] = None,
+) -> Optional[str]:
+    """Fire ``EVENT_TYPE_QUORUM_OUTCOME`` SSE event for a Quorum
+    run. Lazy ``ide_observability_stream`` import + best-effort
+    publish + never-raise contract.
+
+    Returns broker frame_id on publish, ``None`` on
+    suppression/failure (master-off / DISABLED / broker-missing /
+    publish-error)."""
+    if not quorum_enabled():
+        return None
+    # DISABLED outcomes are silent (zero SSE noise when off)
+    if str(outcome or "").strip().lower() == "disabled":
+        return None
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            get_default_broker,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        broker = get_default_broker()
+        # Bound canonical_signature length so SSE payload doesn't
+        # blow up on pathological inputs (sha256 hex is 64 chars
+        # so this is essentially a defensive guard).
+        bounded_sig = (
+            canonical_signature[:128]
+            if isinstance(canonical_signature, str) else None
+        )
+        return broker.publish(
+            event_type=EVENT_TYPE_QUORUM_OUTCOME,
+            op_id=str(op_id or ""),
+            payload={
+                "schema_version": (
+                    GENERATIVE_QUORUM_RUNNER_SCHEMA_VERSION
+                ),
+                "outcome": str(outcome or ""),
+                "op_id": str(op_id or ""),
+                "detail": str(detail or "")[:200],
+                "agreement_count": int(agreement_count),
+                "distinct_count": int(distinct_count),
+                "total_rolls": int(total_rolls),
+                "failed_count": int(failed_count),
+                "elapsed_seconds": float(elapsed_seconds),
+                "canonical_signature": bounded_sig,
+            },
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[QuorumRunner] SSE publish swallowed", exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Roll-generator typing
 # ---------------------------------------------------------------------------
 
@@ -255,6 +332,7 @@ async def run_quorum(
     seed_base: int = 0,
     cost_estimate_per_roll_usd: float = 0.0,
     enabled_override: Optional[bool] = None,
+    op_id: str = "",
 ) -> QuorumRunResult:
     """Fire K candidate rolls in parallel and compute consensus.
     NEVER raises. Master-flag-off short-circuits to DISABLED with
@@ -354,11 +432,28 @@ async def run_quorum(
         # Step 5: consensus
         verdict = compute_consensus(rolls, threshold=threshold)
 
+        elapsed = time.monotonic() - start
+
+        # Step 6 (Slice 5) — fire SSE event on every non-DISABLED
+        # run completion. Best-effort; never raises. Master-off
+        # short-circuits inside publish_quorum_outcome.
+        publish_quorum_outcome(
+            outcome=verdict.outcome.value,
+            op_id=op_id,
+            detail=verdict.detail,
+            agreement_count=verdict.agreement_count,
+            distinct_count=verdict.distinct_count,
+            total_rolls=verdict.total_rolls,
+            failed_count=len(failed),
+            elapsed_seconds=elapsed,
+            canonical_signature=verdict.canonical_signature,
+        )
+
         return QuorumRunResult(
             verdict=verdict,
             rolls=tuple(rolls),
             failed_roll_ids=tuple(failed),
-            elapsed_seconds=time.monotonic() - start,
+            elapsed_seconds=elapsed,
         )
     except asyncio.CancelledError:
         # Surface cancellation — caller is shutting down
@@ -389,9 +484,11 @@ async def run_quorum(
 
 
 __all__ = [
+    "EVENT_TYPE_QUORUM_OUTCOME",
     "GENERATIVE_QUORUM_RUNNER_SCHEMA_VERSION",
     "QuorumRunResult",
     "RollGenerator",
     "RollOutput",
+    "publish_quorum_outcome",
     "run_quorum",
 ]

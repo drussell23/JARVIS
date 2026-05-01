@@ -102,9 +102,12 @@ def make_verdict(outcome: ConsensusOutcome) -> ConsensusVerdict:
 
 
 class TestQuorumGateEnabledKnob:
-    def test_default_is_false(self):
+    def test_default_is_true_post_graduation(self):
+        """Slice 5 graduated 2026-05-01 — sub-gate now defaults
+        true. Master flag (``JARVIS_GENERATIVE_QUORUM_ENABLED``)
+        remains operator-controlled (default false)."""
         os.environ.pop("JARVIS_QUORUM_GATE_ENABLED", None)
-        assert quorum_gate_enabled() is False
+        assert quorum_gate_enabled() is True
 
     def test_explicit_true(self):
         with mock.patch.dict(
@@ -127,10 +130,11 @@ class TestQuorumGateEnabledKnob:
             assert quorum_gate_enabled() is False
 
     def test_whitespace_treated_as_unset(self):
+        # Whitespace = unset = current default = True post Slice 5
         with mock.patch.dict(
             os.environ, {"JARVIS_QUORUM_GATE_ENABLED": "   "},
         ):
-            assert quorum_gate_enabled() is False
+            assert quorum_gate_enabled() is True
 
 
 # ---------------------------------------------------------------------------
