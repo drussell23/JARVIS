@@ -1292,6 +1292,176 @@ def _validate_quorum_cap_structure_pinned(
 
 
 # ---------------------------------------------------------------------------
+# Priority #2 — PostmortemRecall AST pins (4 invariants)
+# ---------------------------------------------------------------------------
+
+
+def _validate_postmortem_recall_pure_stdlib(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Slice 1 PostmortemRecord primitive MUST be pure-stdlib —
+    strongest authority invariant. Zero governance imports.
+    No exec/eval/compile (canonical safety pin). No async
+    (Slices 1-4 are sync; Slice 5 wraps via to_thread).
+
+    NEVER raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if "backend." in module or "governance" in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: postmortem_recall must be "
+                    f"pure-stdlib — found {module!r}"
+                )
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in ("exec", "eval", "compile"):
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: postmortem_recall MUST "
+                        f"NOT execute candidate code — found "
+                        f"{node.func.id}() call"
+                    )
+        if isinstance(node, ast.AsyncFunctionDef):
+            lineno = getattr(node, "lineno", "?")
+            violations.append(
+                f"line {lineno}: Slice 1 primitive must remain "
+                f"sync — found async function {node.name!r}"
+            )
+    return tuple(violations)
+
+
+def _validate_postmortem_recall_index_uses_flock(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """STRUCTURAL cross-process safety pin + zero-duplication
+    via reuse contract. Slice 2 index store MUST reference:
+      * ``flock_append_line`` + ``flock_critical_section``
+        (Tier 1 #3 cross-process safety)
+      * ``_sanitize_field`` (load-bearing safety helper reuse
+        from last_session_summary)
+      * ``_parse_summary`` (canonical summary.json parser reuse)
+
+    NEVER raises."""
+    violations: List[str] = []
+    required_symbols = (
+        ("flock_append_line", "audit log cross-process safety"),
+        ("flock_critical_section", "ring-buffer cross-process safety"),
+        ("_sanitize_field", "zero-duplication safety helper reuse"),
+        ("_parse_summary", "canonical summary.json parser reuse"),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"index store dropped {symbol!r} reference — "
+                f"{reason} guard is gone"
+            )
+    return tuple(violations)
+
+
+def _validate_postmortem_recall_injector_authority_free(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Slice 3 CONTEXT_EXPANSION injector MUST NOT import
+    orchestrator-tier modules. READ-ONLY contract over the
+    index. MUST reference ``_sanitize_field`` (canonical safety
+    helper reuse) + ``recall_postmortems`` (Slice 1 reuse) +
+    ``read_index`` (Slice 2 reuse).
+
+    NEVER raises."""
+    forbidden = (
+        "orchestrator", "iron_gate", "policy", "change_engine",
+        "candidate_generator", "providers",
+        "doubleword_provider", "urgency_router",
+        "auto_action_router", "subagent_scheduler",
+        "tool_executor", "phase_runners", "semantic_guardian",
+        "semantic_firewall", "risk_engine",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        module = (
+            node.module if isinstance(node, ast.ImportFrom)
+            else (node.names[0].name if node.names else "")
+        )
+        module = module or ""
+        for f in forbidden:
+            if f in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden authority "
+                    f"import {f!r}: {module}"
+                )
+    required_symbols = (
+        ("_sanitize_field", "canonical safety helper reuse"),
+        ("recall_postmortems", "Slice 1 reuse"),
+        ("read_index", "Slice 2 reuse"),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"injector dropped {symbol!r} — {reason} gone"
+            )
+    return tuple(violations)
+
+
+def _validate_postmortem_recall_consumer_uses_adaptation_ledger(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """STRUCTURAL Phase C universal-cage-rule integration pin.
+    Slice 4 consumer MUST import
+    ``MonotonicTighteningVerdict`` from ``adaptation.ledger``
+    AND reference the symbol + ``read_coherence_advisories``
+    (canonical reader reuse from Priority #1 Slice 4) +
+    ``INJECT_POSTMORTEM_RECALL_HINT`` (filter target — catches
+    refactor that drops the action filter).
+
+    NEVER raises."""
+    violations: List[str] = []
+    required_symbols = (
+        (
+            "MonotonicTighteningVerdict",
+            "Phase C cage rule integration",
+        ),
+        (
+            "read_coherence_advisories",
+            "Priority #1 canonical reader reuse",
+        ),
+        (
+            "INJECT_POSTMORTEM_RECALL_HINT",
+            "filter target",
+        ),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"consumer dropped {symbol!r} — {reason} gone"
+            )
+    # Verify importfrom shape for MonotonicTighteningVerdict
+    found_import = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if (
+                node.module
+                == "backend.core.ouroboros.governance"
+                ".adaptation.ledger"
+            ):
+                for alias in node.names:
+                    if alias.name == "MonotonicTighteningVerdict":
+                        found_import = True
+                        break
+    if not found_import:
+        violations.append(
+            "consumer must import MonotonicTighteningVerdict "
+            "via importfrom from adaptation.ledger"
+        )
+    return tuple(violations)
+
+
+# ---------------------------------------------------------------------------
 # Priority #1 — Coherence Auditor AST pins (4 invariants)
 # ---------------------------------------------------------------------------
 
@@ -2156,6 +2326,98 @@ def _register_seed_invariants() -> None:
             ),
             validate=(
                 _validate_coherence_action_bridge_uses_adaptation_ledger
+            ),
+        ),
+    )
+    # Priority #2 Slice 5 — PostmortemRecall graduation pins.
+    # Closes the recurrence-prevention loop: detection (Move 4 +
+    # Priority #1) translates to actual prevention. These 4 pins
+    # protect the structural primitives from refactor drift.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="postmortem_recall_pure_stdlib",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "postmortem_recall.py"
+            ),
+            description=(
+                "Slice 1 PostmortemRecord primitive MUST be "
+                "PURE-STDLIB — strongest authority invariant. "
+                "Zero governance imports. No exec/eval/compile "
+                "(canonical safety pin). No async (Slices 1-4 "
+                "are sync; Slice 5 wraps via to_thread). Mirrors "
+                "Priority #1 Slice 1's discipline."
+            ),
+            validate=_validate_postmortem_recall_pure_stdlib,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "postmortem_recall_index_uses_flock"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "postmortem_recall_index.py"
+            ),
+            description=(
+                "STRUCTURAL cross-process safety + zero-"
+                "duplication via reuse contract. Slice 2 index "
+                "store MUST reference flock_append_line + "
+                "flock_critical_section (Tier 1 #3) AND "
+                "_sanitize_field + _parse_summary "
+                "(LastSessionSummary canonical helpers). Catches "
+                "refactor that drops cross-process safety or "
+                "duplicates the canonical safety helpers."
+            ),
+            validate=(
+                _validate_postmortem_recall_index_uses_flock
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "postmortem_recall_injector_authority_free"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "postmortem_recall_injector.py"
+            ),
+            description=(
+                "Slice 3 CONTEXT_EXPANSION injector MUST NOT "
+                "import orchestrator-tier modules. MUST "
+                "reference _sanitize_field + recall_postmortems "
+                "+ read_index (the 3 zero-duplication reuse "
+                "contracts). Robust degradation: no orchestrator "
+                "coupling means no GENERATE-pipeline raise path."
+            ),
+            validate=(
+                _validate_postmortem_recall_injector_authority_free
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "postmortem_recall_consumer_uses_adaptation_ledger"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "postmortem_recall_consumer.py"
+            ),
+            description=(
+                "STRUCTURAL Phase C universal-cage-rule "
+                "integration: Slice 4 consumer MUST import "
+                "MonotonicTighteningVerdict via importfrom from "
+                "adaptation.ledger AND reference "
+                "read_coherence_advisories (canonical reader "
+                "reuse) AND INJECT_POSTMORTEM_RECALL_HINT "
+                "(filter target). Catches refactor that bypasses "
+                "Phase C vocabulary OR drops the action filter."
+            ),
+            validate=(
+                _validate_postmortem_recall_consumer_uses_adaptation_ledger
             ),
         ),
     )

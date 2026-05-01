@@ -121,22 +121,83 @@ POSTMORTEM_RECALL_INJECTOR_SCHEMA_VERSION: str = (
 
 
 # ---------------------------------------------------------------------------
+# Slice 5 — SSE event vocabulary + publisher
+# ---------------------------------------------------------------------------
+
+
+EVENT_TYPE_POSTMORTEM_RECALL_INJECTED: str = (
+    "postmortem_recall_injected"
+)
+"""SSE event fired on every successful (non-empty) injection.
+Operators consume via the IDE stream. Master-flag-gated by
+``postmortem_recall_enabled()``; broker-missing / publish-error
+all return None silently. NEVER raises. Mirrors Move 4/5/6/
+Priority#1 lazy-import + best-effort discipline."""
+
+
+def publish_postmortem_recall_injection(
+    *,
+    op_id: str = "",
+    section_chars: int = 0,
+    record_count: int = 0,
+    max_relevance: str = "",
+) -> Optional[str]:
+    """Fire ``EVENT_TYPE_POSTMORTEM_RECALL_INJECTED`` SSE event.
+    Lazy ``ide_observability_stream`` import + best-effort
+    publish + never-raise contract.
+
+    Returns broker frame_id on publish, ``None`` on suppression
+    /failure (master-off / broker-missing / publish-error)."""
+    if not postmortem_recall_enabled():
+        return None
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            get_default_broker,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        broker = get_default_broker()
+        return broker.publish(
+            event_type=EVENT_TYPE_POSTMORTEM_RECALL_INJECTED,
+            op_id=str(op_id or ""),
+            payload={
+                "schema_version": (
+                    POSTMORTEM_RECALL_INJECTOR_SCHEMA_VERSION
+                ),
+                "op_id": str(op_id or ""),
+                "section_chars": int(section_chars),
+                "record_count": int(record_count),
+                "max_relevance": str(max_relevance or ""),
+            },
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[PostmortemInjector] SSE publish swallowed",
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Sub-gate flag
 # ---------------------------------------------------------------------------
 
 
 def postmortem_injection_enabled() -> bool:
     """``JARVIS_POSTMORTEM_INJECTION_ENABLED`` (default
-    ``false`` until Slice 5 graduation).
+    ``true`` post Slice 5 graduation 2026-05-01).
 
     Sub-gate for the CONTEXT_EXPANSION injection. Master flag
     (``JARVIS_POSTMORTEM_RECALL_ENABLED``) must also be true for
-    the section to actually render."""
+    the section to actually render. Operators may set false to
+    disable the injection while keeping the underlying index
+    fresh."""
     raw = os.environ.get(
         "JARVIS_POSTMORTEM_INJECTION_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated 2026-05-01 (Priority #2 Slice 5)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -525,13 +586,29 @@ def render_postmortem_recall_section(
             int(max_chars) if max_chars is not None
             else max_prompt_chars()
         )
-        return _render_section(
+        section = _render_section(
             records_with_relevance,
             total_index_size=verdict.total_index_size,
             max_age_days=max_age,
             char_budget=char_budget,
             now_ts=now_ts,
         )
+
+        # Step 7 (Slice 5) — fire SSE event on successful
+        # injection. Best-effort; never raises. Empty section
+        # = silenced.
+        if section:
+            try:
+                publish_postmortem_recall_injection(
+                    op_id="",
+                    section_chars=len(section),
+                    record_count=len(records_with_relevance),
+                    max_relevance=verdict.max_relevance.value,
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+
+        return section
     except Exception as exc:  # noqa: BLE001 — last-resort defensive
         logger.debug(
             "[PostmortemInjector] render_section raised: %s",
@@ -586,10 +663,12 @@ def compose_for_op_context(
 
 
 __all__ = [
+    "EVENT_TYPE_POSTMORTEM_RECALL_INJECTED",
     "POSTMORTEM_RECALL_INJECTOR_SCHEMA_VERSION",
     "compose_for_op_context",
     "max_chars_per_record",
     "max_prompt_chars",
     "postmortem_injection_enabled",
+    "publish_postmortem_recall_injection",
     "render_postmortem_recall_section",
 ]

@@ -137,8 +137,24 @@ POSTMORTEM_RECALL_SCHEMA_VERSION: str = "postmortem_recall.1"
 
 
 def postmortem_recall_enabled() -> bool:
-    """``JARVIS_POSTMORTEM_RECALL_ENABLED`` (default ``false``
-    until Slice 5 graduation).
+    """``JARVIS_POSTMORTEM_RECALL_ENABLED`` (default ``true``
+    post Slice 5 graduation 2026-05-01).
+
+    Master kill switch for the cross-session PostmortemRecall arc.
+    When false, the entire 4-slice pipeline reverts in lockstep:
+      * recall_postmortems returns DISABLED
+      * record_postmortem / rebuild_index → FAILED
+      * render_postmortem_recall_section → ""
+      * get_active_recurrence_boosts → empty mapping
+
+    Cost-correctness: graduating default-true is appropriate
+    because PostmortemRecall is read-only over existing artifacts
+    (.ouroboros/sessions/*/summary.json + Priority #1's
+    .jarvis/coherence_advisory.jsonl), runs at CONTEXT_EXPANSION
+    (per-op pre-generation, NOT per-LLM-call), and produces ONLY
+    advisory output (operator approval still required for any
+    actual flag flip downstream). Zero LLM calls. Zero additional
+    generation amplification.
 
     Asymmetric env semantics — empty/whitespace = unset = current
     default; explicit ``0``/``false``/``no``/``off`` evaluates
@@ -148,7 +164,7 @@ def postmortem_recall_enabled() -> bool:
         "JARVIS_POSTMORTEM_RECALL_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated 2026-05-01 (Priority #2 Slice 5)
     return raw in ("1", "true", "yes", "on")
 
 

@@ -167,7 +167,7 @@ POSTMORTEM_RECALL_CONSUMER_SCHEMA_VERSION: str = (
 
 def postmortem_recurrence_boost_enabled() -> bool:
     """``JARVIS_POSTMORTEM_RECURRENCE_BOOST_ENABLED`` (default
-    ``false`` until Slice 5 graduation).
+    ``true`` post Slice 5 graduation 2026-05-01).
 
     Sub-gate for the recurrence consumer. When false,
     ``get_active_recurrence_boosts`` returns empty mapping and
@@ -178,7 +178,7 @@ def postmortem_recurrence_boost_enabled() -> bool:
         "JARVIS_POSTMORTEM_RECURRENCE_BOOST_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated 2026-05-01 (Priority #2 Slice 5)
     return raw in ("1", "true", "yes", "on")
 
 

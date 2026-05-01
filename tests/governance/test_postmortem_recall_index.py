@@ -128,9 +128,9 @@ def _make_synthetic_session(
 
 
 class TestSubGateFlag:
-    def test_default_is_false(self):
+    def test_default_is_true_post_graduation(self):
         os.environ.pop("JARVIS_POSTMORTEM_INDEX_ENABLED", None)
-        assert postmortem_index_enabled() is False
+        assert postmortem_index_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on", "TRUE"],
@@ -419,12 +419,17 @@ class TestSessionParser:
 
 class TestRebuild:
     def test_disabled_returns_failed(self, tmp_base):
-        os.environ.pop("JARVIS_POSTMORTEM_INDEX_ENABLED", None)
-        target = tmp_base / "idx.jsonl"
-        r = rebuild_index_from_sessions(
-            project_root=tmp_base, target_path=target,
-        )
-        assert r.outcome is IndexOutcome.FAILED
+        # Default-true post graduation; explicit false to
+        # exercise the disabled-rebuild path
+        with mock.patch.dict(
+            os.environ,
+            {"JARVIS_POSTMORTEM_INDEX_ENABLED": "false"},
+        ):
+            target = tmp_base / "idx.jsonl"
+            r = rebuild_index_from_sessions(
+                project_root=tmp_base, target_path=target,
+            )
+            assert r.outcome is IndexOutcome.FAILED
 
     def test_enabled_built_outcome(self, tmp_base):
         ts = time.time()
@@ -532,14 +537,17 @@ class TestRebuild:
 
 class TestRecordPostmortem:
     def test_disabled_returns_failed(self, tmp_base):
-        os.environ.pop("JARVIS_POSTMORTEM_INDEX_ENABLED", None)
-        target = tmp_base / "inc.jsonl"
-        r = PostmortemRecord(
-            op_id="o1", session_id="s1",
-            failure_class="test", timestamp=time.time(),
-        )
-        out = record_postmortem(r, target_path=target)
-        assert out is IndexOutcome.FAILED
+        with mock.patch.dict(
+            os.environ,
+            {"JARVIS_POSTMORTEM_INDEX_ENABLED": "false"},
+        ):
+            target = tmp_base / "inc.jsonl"
+            r = PostmortemRecord(
+                op_id="o1", session_id="s1",
+                failure_class="test", timestamp=time.time(),
+            )
+            out = record_postmortem(r, target_path=target)
+            assert out is IndexOutcome.FAILED
 
     def test_enabled_appends(self, tmp_base):
         target = tmp_base / "inc.jsonl"

@@ -102,9 +102,11 @@ def _make_record(
 
 
 class TestMasterFlag:
-    def test_default_is_false(self):
+    def test_default_is_true_post_graduation(self):
+        # Slice 5 graduated 2026-05-01 — master default-true
+        # because PostmortemRecall is read-only (zero LLM cost).
         os.environ.pop("JARVIS_POSTMORTEM_RECALL_ENABLED", None)
-        assert postmortem_recall_enabled() is False
+        assert postmortem_recall_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on", "TRUE", "Yes"],
@@ -128,11 +130,12 @@ class TestMasterFlag:
 
     @pytest.mark.parametrize("v", ["", "   ", "\t\n"])
     def test_whitespace_treated_as_unset(self, v):
+        # Whitespace = unset = current default = True post-Slice-5
         with mock.patch.dict(
             os.environ,
             {"JARVIS_POSTMORTEM_RECALL_ENABLED": v},
         ):
-            assert postmortem_recall_enabled() is False
+            assert postmortem_recall_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -649,10 +652,15 @@ class TestRecallPostmortems:
         assert v.outcome is RecallOutcome.DISABLED
 
     def test_master_off_returns_disabled(self):
-        os.environ.pop("JARVIS_POSTMORTEM_RECALL_ENABLED", None)
-        r = _make_record()
-        v = recall_postmortems([r], RecallTarget())
-        assert v.outcome is RecallOutcome.DISABLED
+        # Default-true post graduation; explicit false to
+        # exercise master-off path
+        with mock.patch.dict(
+            os.environ,
+            {"JARVIS_POSTMORTEM_RECALL_ENABLED": "false"},
+        ):
+            r = _make_record()
+            v = recall_postmortems([r], RecallTarget())
+            assert v.outcome is RecallOutcome.DISABLED
 
     def test_empty_records_returns_empty_index(self):
         v = recall_postmortems(

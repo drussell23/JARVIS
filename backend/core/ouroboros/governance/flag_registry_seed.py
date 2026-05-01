@@ -1990,6 +1990,120 @@ SEED_SPECS: list = [
         example="0.8",
         since="Priority #1 Slice 5",
     ),
+
+    # ====================================================================
+    # PostmortemRecall (Priority #2) — 6 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_POSTMORTEM_RECALL_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for cross-session "
+            "PostmortemRecall. When false, the entire 4-slice "
+            "pipeline reverts in lockstep (recall → DISABLED, "
+            "index writes → FAILED, injector → empty string, "
+            "boost → empty). Graduated default-true post-Slice-5 "
+            "because PostmortemRecall is read-only over existing "
+            "artifacts (zero LLM cost, runs at CONTEXT_EXPANSION "
+            "not per-LLM-call, advisory-only output). Operator "
+            "approval still required for any actual flag flip "
+            "downstream via MetaAdaptationGovernor."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "postmortem_recall.py"
+        ),
+        example="true",
+        since="Priority #2 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_POSTMORTEM_INDEX_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the cross-session index store. "
+            "Controls whether rebuild_index_from_sessions and "
+            "record_postmortem actually write."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "postmortem_recall_index.py"
+        ),
+        example="true",
+        since="Priority #2 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_POSTMORTEM_INJECTION_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the CONTEXT_EXPANSION injection. When "
+            "false, render_postmortem_recall_section returns "
+            "empty string (load-bearing robust degradation: "
+            "GENERATE pipeline NEVER affected by recall failure)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "postmortem_recall_injector.py"
+        ),
+        example="true",
+        since="Priority #2 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_POSTMORTEM_RECURRENCE_BOOST_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the recurrence consumer (activates "
+            "Priority #1 Slice 4's INJECT_POSTMORTEM_RECALL_HINT "
+            "advisory). When detected, extends recall budget "
+            "for the next-N-ops on the matched failure_class — "
+            "biases the model toward prior remediation patterns "
+            "and away from the recurring failure mode."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "postmortem_recall_consumer.py"
+        ),
+        example="true",
+        since="Priority #2 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_POSTMORTEM_RECALL_TOP_K",
+        type=FlagType.INT, default=3,
+        description=(
+            "Default top-K records returned per recall. Cap "
+            "structure: min(10, max(1, value)). Slice 4's "
+            "recurrence boost can extend up to "
+            "JARVIS_POSTMORTEM_RECALL_TOP_K_CEILING."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "postmortem_recall.py"
+        ),
+        example="3",
+        since="Priority #2 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_POSTMORTEM_RECALL_MAX_AGE_DAYS",
+        type=FlagType.INT, default=30,
+        description=(
+            "Records older than this age (computed at recall "
+            "time vs timestamp field) are excluded from results. "
+            "Cap structure: min(365, max(1, value)). Stale "
+            "postmortems shouldn't bias new ops indefinitely."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "postmortem_recall.py"
+        ),
+        example="30",
+        since="Priority #2 Slice 5",
+    ),
 ]
 
 

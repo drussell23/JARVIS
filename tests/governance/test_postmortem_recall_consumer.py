@@ -117,11 +117,11 @@ def _make_recurrence_advisory(
 
 
 class TestSubGateFlag:
-    def test_default_is_false(self):
+    def test_default_is_true_post_graduation(self):
         os.environ.pop(
             "JARVIS_POSTMORTEM_RECURRENCE_BOOST_ENABLED", None,
         )
-        assert postmortem_recurrence_boost_enabled() is False
+        assert postmortem_recurrence_boost_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on"],

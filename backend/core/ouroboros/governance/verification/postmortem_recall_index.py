@@ -129,17 +129,18 @@ POSTMORTEM_RECALL_INDEX_SCHEMA_VERSION: str = (
 
 
 def postmortem_index_enabled() -> bool:
-    """``JARVIS_POSTMORTEM_INDEX_ENABLED`` (default ``false``
-    until Slice 5 graduation).
+    """``JARVIS_POSTMORTEM_INDEX_ENABLED`` (default ``true``
+    post Slice 5 graduation 2026-05-01).
 
     Sub-gate for the cross-session index store. Master flag
     (``JARVIS_POSTMORTEM_RECALL_ENABLED``) must also be true for
-    rebuild + record to actually write."""
+    rebuild + record to actually write. Operators may set false
+    to disable index writes while keeping master on."""
     raw = os.environ.get(
         "JARVIS_POSTMORTEM_INDEX_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated 2026-05-01 (Priority #2 Slice 5)
     return raw in ("1", "true", "yes", "on")
 
 
