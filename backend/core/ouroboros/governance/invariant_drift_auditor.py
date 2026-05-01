@@ -358,16 +358,15 @@ def _exploration_complexity_buckets() -> Tuple[str, ...]:
 
     NEVER raises."""
     try:
-        from backend.core.ouroboros.governance import exploration_engine
+        from backend.core.ouroboros.governance.exploration_engine import (  # noqa: E501
+            _DEFAULT_FLOORS,
+        )
     except Exception:  # noqa: BLE001 — defensive
         return ()
     try:
-        floors_map = getattr(
-            exploration_engine, "_DEFAULT_FLOORS", None,
-        )
-        if not isinstance(floors_map, Mapping):
+        if not isinstance(_DEFAULT_FLOORS, Mapping):
             return ()
-        return tuple(sorted(str(k) for k in floors_map.keys()))
+        return tuple(sorted(str(k) for k in _DEFAULT_FLOORS.keys()))
     except Exception:  # noqa: BLE001 — defensive
         return ()
 
