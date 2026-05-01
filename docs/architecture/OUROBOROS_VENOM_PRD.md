@@ -1,11 +1,11 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.6 (2026-04-30 — Move 3 auto_action_router CLOSED; 4-slice arc shipped same-day; verification→action loop closes; Self-tightening immunity A−→A; master flag graduated default-true in shadow mode; ENFORCE locked off until separate later authorization)
+**Version**: 2.7 (2026-04-30 — **Move 4 InvariantDriftAuditor CLOSED**; 5-slice arc shipped same-day; semantic-drift detection primitive + boot-anchored baseline + posture-aware async observer + auto_action_router bridge + graduation; closes the *temporal* gap left by Move 3 — Reverse Russian Doll Order 2 trajectory now has its load-bearing safety property; **§28 Brutal Architectural Review v9 (file:line-grounded)** added — post-Move-4 deep dive identifies 3 immediate-priority operational fixes (confidence drop SSE producer wiring + PostureObserver task-death detection + cross-process flock on ledgers) that produce A-grade leverage with bug-fix-grade effort; structural ceiling A, empirical floor B+, trending A−)
 **Author**: Derek J. Russell (vision) · Claude Opus 4.7 (PRD synthesis)
 **Audience**: Operator (decision authority), JARVIS engineers, future-self (resuming after context loss)
 **Prerequisite reading**: `CLAUDE.md` (architecture), `docs/architecture/OUROBOROS.md` (battle-test breakthrough log), `docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md` (Wang RSI mathematical foundation)
-**Latest review**: §27 (v6, 2026-04-29) — answers the autonomy question; supersedes §26 critical-path framing now that Pass B + Pass C + Priorities 1+2 are all structurally complete
+**Latest review**: **§28 (v9, 2026-04-30, file:line-grounded)** — post-Move-4 deep dive verifying claims with parallel exploration agents; supersedes §27 in priority enumeration. Earlier reviews retained for historical narrative.
 
 ---
 
@@ -358,21 +358,22 @@ The "lowest-numbered `[ ]` row" heuristic (above) still applies *within* a phase
 
 ## 2. Vision Statement
 
-> *"O+V is proactive and not reactive. Its job is to explore the codebase like CC does and develop the JARVIS repo on its own without any human intervention (only if necessary, based on context and severity). It should also understand the direction I'm going and the goal I'm trying to achieve on its own. I want O+V to have the most advanced intelligent capabilities possible — and to be the proactive autonomous version of CC."*
+> *"O+V is the proactive autonomous opposite of Claude Code (CC). Where CC is a highly optimized but fundamentally reactive CLI tool dependent on human invocation, O+V operates as a sovereign computing organism. Its mandate is continuous, asynchronous operation under bounded compute — observing, hypothesizing, proposing, validating, and shipping the JARVIS Trinity Ecosystem (Body / Mind / Soul) without human prompting except when context and severity demand operator approval. It leverages a Curiosity Primitive to autonomously roam the ecosystem, detect capability gaps via Shannon entropy, infer unstated strategic posture, and generate connective tissue between JARVIS (Body) and J-Prime (Mind). All generation (Venom) is structurally subject to Antivenom — a Zero-Trust epistemological boundary enforced by the Iron Gate, SemanticGuardian (AST validation), shipped_code_invariants pins, ExplorationLedger diversity floors, Pass C adaptive monotonic-tightening, the Move 3 auto-action proposal ledger, and the Move 4 invariant-drift auditor — ensuring mathematical safety against catastrophic mutations. Per the Reverse Russian Doll RSI architecture: the inner core (O+V) carves an exponentially larger, smarter shell around itself; the immune system (Antivenom) scales proportionally so the expanding outer doll never collapses, hallucinates, or crushes the core."*
 >
-> — Derek J. Russell, operator binding
+> — Derek J. Russell, operator binding *(refreshed 2026-04-30 post-Move-4)*
 
 ### Operationalized as success criteria
 
 The vision delivers when:
 
-1. **Self-initiating** — O+V begins useful work without human prompting (✅ delivered: 16 sensors + 9 self-formed-goal entries via Phase 2 SelfGoalFormation)
-2. **Codebase exploration parity with CC** — same depth of read/search/reason as CC's tool loop (✅ partial→strong: Iron Gate enforces hygiene-first AND ExplorationLedger enforces diversity-floor across 5 categories AND Phase 5 AdversarialReviewer auto-injects findings every non-SAFE_AUTO GENERATE; Pass C Slice 3 will auto-tighten the floors based on bypass-failure observations)
-3. **Repo development without intervention** — multi-file changes ship end-to-end autonomously (⚠️ proven once Sessions Q-S; broader cadence pending Pass B per-slice graduation soak underway)
-4. **Human-in-loop only when severity demands** — risk-tier ladder + curiosity ask_human + Phase 3 inline approval UX (✅ delivered) + Phase 7 plan approval (✅ delivered) + Pass B `/order2 amend` operator-only authorization for Order-2 governance changes (✅ delivered)
+1. **Self-initiating** — O+V begins useful work without human prompting (✅ delivered: 17 sensors incl. VisionSensor + 9 self-formed-goal entries via Phase 2 SelfGoalFormation + Curiosity Engine widening ask_human under EXPLORE/CONSOLIDATE postures)
+2. **Codebase exploration parity with CC** — same depth of read/search/reason as CC's tool loop (✅ partial→strong: Iron Gate enforces hygiene-first AND ExplorationLedger enforces diversity-floor across 5 categories AND Phase 5 AdversarialReviewer auto-injects findings every non-SAFE_AUTO GENERATE; Pass C floors auto-tighten based on bypass-failure observations)
+3. **Repo development without intervention** — multi-file changes ship end-to-end autonomously (⚠️ proven once Sessions Q-S; broader cadence gated on ENFORCE-mode graduation which is itself gated on Move 3+4 shadow-mode evidence accumulation)
+4. **Human-in-loop only when severity demands** — risk-tier ladder + curiosity ask_human + Phase 3 inline approval UX (✅ delivered) + Phase 7 plan approval (✅ delivered) + Pass B `/order2 amend` operator-only authorization for Order-2 governance changes (✅ delivered) + Move 3 ROUTE_TO_NOTIFY_APPLY proposal mechanism (✅ delivered)
 5. **Understands operator direction + goal** — without being told (✅ delivered: DirectionInferrer + arc-context + 100-commit git momentum + ConversationBridge + UserPreferenceMemory + LastSessionSummary all wired into CONTEXT_EXPANSION; intent-classifier routes natural-language `/chat` turns into structured actions)
-6. **A-level execution** — sustained quality + reliability + learning (✅ scaffolding complete: Wang composite_score + 5 operator metrics now surfaced; Pass C Adaptive Anti-Venom in flight to close the "static cage" gap; soak-cadence-driven graduation discipline proven)
-7. **Self-tightening immune system** *(NEW success criterion, added 2026-04-26)* — gates grow stricter as the shell expands, never looser via the adaptive surface (🚀 Pass C Slices 1-4 landed: AdaptationLedger substrate + 4 surfaces all enforcing the monotonic-tightening invariant. Slices 5-6 pending. Loosening operations strictly require Pass B `/order2 amend` operator authorization.)
+6. **A-level execution** — sustained quality + reliability + learning (🟡 scaffolding complete + structural ceiling A: Wang composite_score + 5 operator metrics surfaced; Pass C Adaptive Anti-Venom graduated 2026-04-30; Move 3 auto-action loop graduated; Move 4 invariant-drift auditor graduated; **execution at A− post-Move-4 trending A — gated on §28 v9 immediate-priority operational fixes + ENFORCE-mode soak evidence**)
+7. **Self-tightening immune system** *(success criterion added 2026-04-26)* — gates grow stricter as the shell expands, never looser via the adaptive surface (✅ Pass C all 6 slices graduated 2026-04-30: AdaptationLedger substrate + 5 mining surfaces + MetaGovernor + `/adapt` REPL all enforcing monotonic-tightening invariant. Loosening operations strictly require Pass B `/order2 amend` operator authorization.)
+8. **Self-validating immune system over time** *(NEW success criterion, added 2026-04-30 post-Move-4)* — architectural promises captured at boot; continuously re-validated against the baseline; semantic drift surfaces through the unified operator-review ledger before it accumulates into silent regression (✅ Move 4 graduated 2026-04-30: InvariantDriftAuditor + posture-aware async observer + auto_action_router bridge + 8 FlagRegistry seeds + 2 shipped_code_invariants AST pins. The Reverse Russian Doll Order 2 trajectory now has its load-bearing safety property — the constraint scales with the shell.)
 
 ---
 
