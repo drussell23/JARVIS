@@ -1330,6 +1330,48 @@ class DoublewordProvider:
                                                 ),
                                             )
                                         )
+                                        # Tier 1 #1 — fire SSE on
+                                        # verdict state transitions.
+                                        # Best-effort, defensive,
+                                        # never raises. Master-flag-
+                                        # gated by
+                                        # JARVIS_CONFIDENCE_SSE_PRODUCER_ENABLED.
+                                        try:
+                                            from backend.core.ouroboros.governance.verification.confidence_sse_producer import (  # noqa: E501
+                                                observe_streaming_verdict,
+                                            )
+                                            _snap = (
+                                                _confidence_monitor
+                                                .snapshot()
+                                            )
+                                            observe_streaming_verdict(
+                                                op_id=getattr(
+                                                    context,
+                                                    "op_id", "",
+                                                ),
+                                                verdict=_verdict,
+                                                rolling_margin=(
+                                                    _snap.rolling_margin
+                                                ),
+                                                window_size=(
+                                                    _snap.window_size
+                                                ),
+                                                observations_count=(
+                                                    _snap.observations_count
+                                                ),
+                                                posture=(
+                                                    str(_posture)
+                                                    if _posture
+                                                    else None
+                                                ),
+                                                provider="doubleword",
+                                                model_id=getattr(
+                                                    _confidence_monitor,
+                                                    "model_id", "",
+                                                ),
+                                            )
+                                        except Exception:  # noqa: BLE001
+                                            pass
                                         if _verdict != ConfidenceVerdict.OK:
                                             try:
                                                 _arts = getattr(
