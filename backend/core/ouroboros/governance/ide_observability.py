@@ -256,6 +256,23 @@ class IDEObservabilityRouter:
             "/observability/curiosity/{question_id}",
             self._handle_curiosity_detail,
         )
+        # Priority #3 Slice 5b — Counterfactual Replay surface.
+        app.router.add_get(
+            "/observability/replay/health",
+            self._handle_replay_health,
+        )
+        app.router.add_get(
+            "/observability/replay/baseline",
+            self._handle_replay_baseline,
+        )
+        app.router.add_get(
+            "/observability/replay/verdicts",
+            self._handle_replay_verdicts,
+        )
+        app.router.add_get(
+            "/observability/replay/history",
+            self._handle_replay_history,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -1433,4 +1450,186 @@ class IDEObservabilityRouter:
         return self._error_response(
             request, 404, "ide_observability.curiosity_not_found",
         )
+
+    # --- Priority #3 Slice 5b — Counterfactual Replay surface ----------------
+
+    @staticmethod
+    def _replay_master_enabled() -> bool:
+        """Surface inherits Slice 1's master flag — disabled
+        master → 403 ``replay.disabled`` regardless of any sub-
+        gate state."""
+        try:
+            from backend.core.ouroboros.governance.verification.counterfactual_replay import (
+                counterfactual_replay_enabled,
+            )
+        except ImportError:
+            return False
+        return counterfactual_replay_enabled()
+
+    def _replay_parse_limit(
+        self, request: "web.Request", default: int = 50,
+    ) -> Optional[int]:
+        """Parse ``?limit=N`` query param. Returns int or None on
+        malformed input (caller emits 400)."""
+        raw = request.query.get("limit")
+        if raw is None:
+            return default
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return None
+        # Same upper bound as Slice 4's read_replay_history caller cap.
+        return max(1, min(200, n))
+
+    async def _handle_replay_health(self, request: "web.Request") -> Any:
+        """GET /observability/replay/health — surface liveness +
+        flag bundle.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "enabled": true,
+              "engine_enabled": true,
+              "comparator_enabled": true,
+              "observer_enabled": true,
+              "history_path": ".jarvis/replay_history/replay.jsonl",
+              "history_count": 42
+            }
+
+        Returns 403 ``replay.disabled`` when master flag is off
+        (port-scanner discipline — no signal about the surface
+        being available)."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._replay_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.replay_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.counterfactual_replay_engine import (
+                replay_engine_enabled,
+            )
+            from backend.core.ouroboros.governance.verification.counterfactual_replay_comparator import (
+                comparator_enabled,
+            )
+            from backend.core.ouroboros.governance.verification.counterfactual_replay_observer import (
+                read_replay_history,
+                replay_history_path,
+                replay_observer_enabled,
+            )
+            history = read_replay_history()
+            return self._json_response(
+                request, 200,
+                {
+                    "enabled": True,
+                    "engine_enabled": bool(replay_engine_enabled()),
+                    "comparator_enabled": bool(comparator_enabled()),
+                    "observer_enabled": bool(replay_observer_enabled()),
+                    "history_path": str(replay_history_path()),
+                    "history_count": len(history),
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] replay_health failed", exc_info=True,
+            )
+            return self._error_response(
+                request, 500, "ide_observability.replay_health_error",
+            )
+
+    async def _handle_replay_baseline(self, request: "web.Request") -> Any:
+        """GET /observability/replay/baseline — current
+        ComparisonReport over the recent history.
+
+        Shape mirrors ``ComparisonReport.to_dict()`` (outcome +
+        stats + tightening + detail)."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._replay_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.replay_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.counterfactual_replay_observer import (
+                compare_recent_history,
+            )
+            report = compare_recent_history()
+            return self._json_response(request, 200, report.to_dict())
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] replay_baseline failed", exc_info=True,
+            )
+            return self._error_response(
+                request, 500, "ide_observability.replay_baseline_error",
+            )
+
+    async def _handle_replay_verdicts(
+        self, request: "web.Request",
+    ) -> Any:
+        """GET /observability/replay/verdicts?limit=N — last N
+        StampedVerdicts from the JSONL ring buffer (default 50,
+        clamped [1, 200]).
+
+        Each entry is the StampedVerdict.to_dict() shape (verdict
+        + tightening + cluster_kind + schema_version)."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._replay_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.replay_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        limit = self._replay_parse_limit(request, default=50)
+        if limit is None:
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.counterfactual_replay_observer import (
+                read_replay_history,
+            )
+            history = read_replay_history(limit=limit)
+            return self._json_response(
+                request, 200,
+                {
+                    "verdicts": [sv.to_dict() for sv in history],
+                    "count": len(history),
+                    "limit": limit,
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] replay_verdicts failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.replay_verdicts_error",
+            )
+
+    async def _handle_replay_history(
+        self, request: "web.Request",
+    ) -> Any:
+        """GET /observability/replay/history?limit=N — alias for
+        verdicts under the conventional /history naming. Same
+        bounded projection + same shape."""
+        return await self._handle_replay_verdicts(request)
 
