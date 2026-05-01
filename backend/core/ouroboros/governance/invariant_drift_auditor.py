@@ -189,6 +189,27 @@ class ExplorationFloorPin:
             "required_categories": list(self.required_categories),
         }
 
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, Any],
+    ) -> Optional["ExplorationFloorPin"]:
+        """Reconstruct from a ``to_dict`` payload. Returns ``None`` on
+        any malformed shape — defensive contract for cross-session
+        load paths. NEVER raises."""
+        try:
+            return cls(
+                complexity=str(payload["complexity"]),
+                min_score=float(payload["min_score"]),
+                min_categories=int(payload["min_categories"]),
+                required_categories=tuple(
+                    str(c) for c in (
+                        payload.get("required_categories") or ()
+                    )
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
 
 @dataclass(frozen=True)
 class InvariantSnapshot:
@@ -234,6 +255,71 @@ class InvariantSnapshot:
             "schema_version": self.schema_version,
         }
 
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, Any],
+    ) -> Optional["InvariantSnapshot"]:
+        """Reconstruct from a ``to_dict`` payload. Returns ``None`` on
+        schema mismatch OR any malformed field — caller treats as
+        "no baseline" and re-captures. Mirrors PostureStore's
+        ``reading_from_json`` discipline. NEVER raises."""
+        try:
+            schema = payload.get("schema_version")
+            if schema != INVARIANT_DRIFT_AUDITOR_SCHEMA_VERSION:
+                logger.warning(
+                    "[InvariantDriftAuditor] schema mismatch: got "
+                    "%r, want %r; treating as no-baseline",
+                    schema, INVARIANT_DRIFT_AUDITOR_SCHEMA_VERSION,
+                )
+                return None
+            pins_raw = payload.get("exploration_floor_pins") or ()
+            pins: List[ExplorationFloorPin] = []
+            for raw in pins_raw:
+                if not isinstance(raw, Mapping):
+                    return None
+                pin = ExplorationFloorPin.from_dict(raw)
+                if pin is None:
+                    return None
+                pins.append(pin)
+            posture_conf_raw = payload.get("posture_confidence")
+            posture_conf = (
+                float(posture_conf_raw)
+                if posture_conf_raw is not None else None
+            )
+            posture_value_raw = payload.get("posture_value")
+            posture_value = (
+                str(posture_value_raw)
+                if posture_value_raw is not None else None
+            )
+            return cls(
+                snapshot_id=str(payload["snapshot_id"]),
+                captured_at_utc=float(payload["captured_at_utc"]),
+                shipped_invariant_names=tuple(
+                    str(n) for n in (
+                        payload.get("shipped_invariant_names") or ()
+                    )
+                ),
+                shipped_violation_signature=str(
+                    payload.get("shipped_violation_signature", "")
+                ),
+                shipped_violation_count=int(
+                    payload.get("shipped_violation_count", 0)
+                ),
+                flag_registry_hash=str(
+                    payload.get("flag_registry_hash", "")
+                ),
+                flag_count=int(payload.get("flag_count", 0)),
+                exploration_floor_pins=tuple(pins),
+                posture_value=posture_value,
+                posture_confidence=posture_conf,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[InvariantDriftAuditor] malformed snapshot "
+                "payload: %s", exc,
+            )
+            return None
+
 
 @dataclass(frozen=True)
 class InvariantDriftRecord:
@@ -258,6 +344,28 @@ class InvariantDriftRecord:
             "affected_keys": list(self.affected_keys),
             "schema_version": self.schema_version,
         }
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, Any],
+    ) -> Optional["InvariantDriftRecord"]:
+        """Reconstruct from a ``to_dict`` payload. Returns ``None`` on
+        unknown enum value OR malformed shape. NEVER raises."""
+        try:
+            kind = DriftKind(payload["drift_kind"])
+            severity = DriftSeverity(payload["severity"])
+            return cls(
+                drift_kind=kind,
+                severity=severity,
+                detail=str(payload.get("detail", "")),
+                affected_keys=tuple(
+                    str(k) for k in (
+                        payload.get("affected_keys") or ()
+                    )
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
 
 # ---------------------------------------------------------------------------
