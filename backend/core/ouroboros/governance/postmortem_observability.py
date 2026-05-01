@@ -1080,7 +1080,7 @@ def publish_terminal_postmortem_persisted(
         return None
     try:
         broker = get_default_broker()
-        return broker.publish(
+        result = broker.publish(
             event_type=EVENT_TYPE_TERMINAL_POSTMORTEM_PERSISTED,
             op_id=str(op_id),
             payload={
@@ -1098,7 +1098,34 @@ def publish_terminal_postmortem_persisted(
         logger.debug(
             "[PostmortemObservability] publish failed", exc_info=True,
         )
-        return None
+        result = None
+
+    # Move 3 Slice 3 — auto-action observer hook. After the
+    # broker publish completes (succeed or fail), notify the
+    # post-postmortem observer so the auto-action router can run
+    # its decision tree against the freshly-persisted ledger
+    # state. Best-effort — observer failures are swallowed at the
+    # observer side; this layer just guards the import in case
+    # the auto_action_router module isn't installed (pure tests
+    # of postmortem_observability without the router stack).
+    try:
+        from backend.core.ouroboros.governance.auto_action_router import (
+            get_post_postmortem_observer,
+        )
+        observer = get_post_postmortem_observer()
+        observer.on_terminal_postmortem_persisted(
+            op_id=str(op_id),
+            terminal_phase=str(terminal_phase),
+            has_blocking_failures=bool(has_blocking_failures),
+        )
+    except Exception:  # noqa: BLE001 — observer hook MUST NOT
+        # propagate errors into the publish path.
+        logger.debug(
+            "[PostmortemObservability] auto-action observer hook "
+            "swallowed exception", exc_info=True,
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------

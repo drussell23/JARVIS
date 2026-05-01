@@ -66,11 +66,16 @@ Authority invariants (AST-pinned by tests)
 """
 from __future__ import annotations
 
+import collections
 import enum
+import json
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Optional, Protocol, Sequence, Tuple
 
 from backend.core.ouroboros.governance.cost_contract_assertion import (
     COST_GATED_ROUTES,
@@ -747,22 +752,27 @@ def recent_confidence_verdicts(
 ) -> Tuple[RecentConfidenceVerdict, ...]:
     """Read recent confidence-monitor verdicts.
 
-    Slice 2 stub: the confidence-monitor publishes verdict events
-    via ``verification.confidence_observability`` to the SSE broker
-    but there is currently no persistent ledger of verdicts to read
-    after the fact. Slice 3 wires a process-local ring buffer at the
-    confidence_monitor's publish seam so downstream consumers can
-    poll without re-running the monitor.
+    Slice 3 (2026-04-30): wired against the process-local
+    ``_VerdictRingBuffer`` populated by
+    ``record_confidence_verdict`` at the confidence_observability
+    publish seam. No persistent ledger — verdicts are
+    inherently per-session signals (next session boots with a
+    fresh window). The buffer is bounded at
+    ``_VERDICT_BUFFER_MAXLEN`` (32 by default; env-tunable for
+    future expansion) so memory is O(1) regardless of session
+    length.
 
-    Until Slice 3 ships the ring buffer, this reader returns an
-    empty tuple. The dispatcher's decision tree handles
+    The dispatcher's decision tree handles
     ``len(recent_verdicts) == 0`` cleanly — no signal → no action.
 
     NEVER raises.
     """
-    # Intentional empty-tuple stub — see docstring.
-    _ = limit  # parameter retained for API stability across slices
-    return ()
+    safe_limit = (
+        _safe_int(limit, default=auto_action_history_k())
+        if limit is not None
+        else auto_action_history_k()
+    )
+    return _verdict_buffer.snapshot(limit=safe_limit)
 
 
 def recent_adaptation_proposals(
@@ -870,11 +880,534 @@ def gather_context(
     )
 
 
+# ---------------------------------------------------------------------------
+# Move 3 Slice 3 — confidence-verdict ring buffer
+# ---------------------------------------------------------------------------
+
+
+def _verdict_buffer_maxlen() -> int:
+    """``JARVIS_AUTO_ACTION_VERDICT_BUFFER_MAXLEN`` (default 32,
+    floor 8). Bounded ring buffer for in-flight confidence verdicts
+    so memory stays O(1) regardless of session length.
+
+    NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_AUTO_ACTION_VERDICT_BUFFER_MAXLEN", "",
+    ).strip()
+    if not raw:
+        return 32
+    try:
+        return max(8, int(raw))
+    except (TypeError, ValueError):
+        return 32
+
+
+class _VerdictRingBuffer:
+    """Thread-safe bounded ring buffer for confidence-monitor
+    verdicts.
+
+    Producer: ``record_confidence_verdict`` (called by
+    ``confidence_observability.publish_*_event``).
+    Consumer: ``recent_confidence_verdicts`` (called by
+    ``gather_context``).
+
+    Bounded by ``_verdict_buffer_maxlen()`` — drop-oldest semantics
+    via ``collections.deque(maxlen=...)``. Snapshot returns a tuple
+    of frozen ``RecentConfidenceVerdict`` so consumers can iterate
+    without holding the lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._deque: collections.deque = collections.deque(
+            maxlen=_verdict_buffer_maxlen(),
+        )
+
+    def append(self, verdict: RecentConfidenceVerdict) -> None:
+        """Append a verdict. Drop-oldest when at maxlen.
+
+        NEVER raises — input validation done at the call site."""
+        if not isinstance(verdict, RecentConfidenceVerdict):
+            return
+        with self._lock:
+            self._deque.append(verdict)
+
+    def snapshot(
+        self, *, limit: Optional[int] = None,
+    ) -> Tuple[RecentConfidenceVerdict, ...]:
+        """Return up to ``limit`` most-recent verdicts (newest-last).
+
+        Always returns a fresh tuple — caller can iterate without
+        any lock concern."""
+        with self._lock:
+            items = tuple(self._deque)
+        if limit is None or limit <= 0 or limit >= len(items):
+            return items
+        return items[-limit:]
+
+    def clear(self) -> None:
+        """Drop all buffered verdicts. Test hook + boot reset."""
+        with self._lock:
+            self._deque.clear()
+
+    def reset_maxlen(self) -> None:
+        """Re-read the env knob and rebuild the deque with the new
+        maxlen. Drops any in-flight items. Test hook for env-knob
+        changes."""
+        with self._lock:
+            self._deque = collections.deque(
+                maxlen=_verdict_buffer_maxlen(),
+            )
+
+
+# Module-level singleton — single producer/consumer flow.
+_verdict_buffer: _VerdictRingBuffer = _VerdictRingBuffer()
+
+
+def record_confidence_verdict(
+    *,
+    op_id: str,
+    verdict: str,
+    rolling_margin: float = 0.0,
+) -> None:
+    """Producer-side hook for the verdict ring buffer.
+
+    Called by ``confidence_observability.publish_*_event`` after
+    each verdict publish. Always best-effort — input validation +
+    swallow-failure semantics so a misbehaving caller cannot
+    derail the publish path.
+
+    Verdict strings expected (case-insensitive):
+      * ``ok`` / ``approaching_floor`` / ``below_floor`` —
+        ``ConfidenceVerdict`` enum values
+      * Or the higher-level dispatcher verdicts:
+        ``RETRY`` / ``ESCALATE`` / ``INCONCLUSIVE``
+
+    The router's decision tree (``_escalate_rate``) accepts the
+    upper-case dispatcher form; lower-case enum values are
+    promoted via mapping below.
+    """
+    if not isinstance(op_id, str) or not op_id:
+        return
+    raw = (verdict or "").strip()
+    if not raw:
+        return
+    upper = raw.upper()
+    # Map ConfidenceVerdict enum values to dispatcher verdicts.
+    # below_floor is the strongest signal -> ESCALATE.
+    # approaching_floor is the early warning -> RETRY.
+    # ok is the happy path -> RETRY (no escalation, but a verdict
+    # was emitted, so it's still in the rolling window).
+    if upper == "BELOW_FLOOR":
+        upper = "ESCALATE"
+    elif upper == "APPROACHING_FLOOR":
+        upper = "RETRY"
+    elif upper == "OK":
+        upper = "RETRY"
+    margin = _safe_float(rolling_margin, default=0.0)
+    _verdict_buffer.append(
+        RecentConfidenceVerdict(
+            op_id=op_id,
+            verdict=upper,
+            rolling_margin=margin,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Move 3 Slice 3 — advisory proposal ledger
+# ---------------------------------------------------------------------------
+
+
+_LEDGER_FILENAME = "auto_action_proposals.jsonl"
+
+
+def _ledger_path() -> Path:
+    """Resolve the on-disk path for the advisory proposal ledger.
+
+    Default ``.jarvis/auto_action_proposals.jsonl`` under the
+    repo root. Env override
+    ``JARVIS_AUTO_ACTION_LEDGER_PATH`` for tests + custom layouts.
+    """
+    explicit = os.environ.get(
+        "JARVIS_AUTO_ACTION_LEDGER_PATH", "",
+    ).strip()
+    if explicit:
+        return Path(explicit)
+    repo_root = Path(os.environ.get("JARVIS_REPO_PATH", ".")).resolve()
+    return repo_root / ".jarvis" / _LEDGER_FILENAME
+
+
+def _action_to_jsonl_record(action: AdvisoryAction) -> str:
+    """Serialize an AdvisoryAction to a single JSONL row.
+
+    Schema captures the full advisory record + timestamps for
+    correlation with the operator review surface (Slice 4
+    ``/auto-action`` REPL command). NEVER raises — fields are
+    coerced to strings/numbers."""
+    record = {
+        "schema_version": action.schema_version,
+        "recorded_at_unix": time.time(),
+        "action_type": action.action_type.value,
+        "reason_code": str(action.reason_code or ""),
+        "evidence": str(action.evidence or ""),
+        "target_op_family": str(action.target_op_family or ""),
+        "target_category": str(action.target_category or ""),
+        "proposed_risk_tier": str(action.proposed_risk_tier or ""),
+        "rolling_failure_rate": _safe_float(
+            action.rolling_failure_rate, default=0.0,
+        ),
+        "rolling_escalate_rate": _safe_float(
+            action.rolling_escalate_rate, default=0.0,
+        ),
+        "history_size": _safe_int(action.history_size, default=0),
+        "posture": str(action.posture or ""),
+        "op_id": str(action.op_id or ""),
+    }
+    return json.dumps(record, separators=(",", ":"))
+
+
+class AutoActionProposalLedger:
+    """Append-only JSONL ledger for advisory action proposals.
+
+    Mirror of ``adaptation.ledger.AdaptationLedger`` (simpler — no
+    state-machine, no monotonic-tightening verdict, just append +
+    read_recent for the operator review surface). Threading-safe
+    via process-local lock; cross-process atomicity comes from
+    line-oriented append semantics on POSIX append-mode writes.
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self._path = path if path is not None else _ledger_path()
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def append(self, action: AdvisoryAction) -> bool:
+        """Append a proposal as a JSONL row. Returns True on
+        success, False on any failure (parent missing, disk full,
+        etc.) — NEVER raises. NO_ACTION proposals are skipped to
+        keep the ledger focused on operator-relevant signal."""
+        if action.action_type is AdvisoryActionType.NO_ACTION:
+            return False
+        line = _action_to_jsonl_record(action)
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        try:
+            with self._lock:
+                with self._path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+                    fh.write("\n")
+            return True
+        except OSError as exc:
+            logger.debug(
+                "[auto_action_router] ledger append failed at %s: %s",
+                self._path, exc,
+            )
+            return False
+
+    def read_recent(
+        self, limit: int = 100,
+    ) -> Tuple[dict, ...]:
+        """Read the last ``limit`` proposals as raw dict records,
+        newest-last. Used by Slice 4's operator surfaces.
+        NEVER raises."""
+        safe_limit = max(1, int(limit))
+        if not self._path.exists():
+            return ()
+        try:
+            with self._lock:
+                with self._path.open("r", encoding="utf-8") as fh:
+                    rows = []
+                    for raw_line in fh:
+                        raw_line = raw_line.strip()
+                        if not raw_line:
+                            continue
+                        try:
+                            rows.append(json.loads(raw_line))
+                        except json.JSONDecodeError:
+                            continue
+        except OSError:
+            return ()
+        if len(rows) > safe_limit:
+            rows = rows[-safe_limit:]
+        return tuple(rows)
+
+
+# Module-level singleton with lazy path resolution.
+_ledger_singleton: Optional[AutoActionProposalLedger] = None
+_ledger_singleton_lock = threading.Lock()
+
+
+def get_default_ledger() -> AutoActionProposalLedger:
+    """Process-wide singleton. Path is resolved lazily so env
+    overrides at test time take effect without module reload."""
+    global _ledger_singleton
+    if _ledger_singleton is None:
+        with _ledger_singleton_lock:
+            if _ledger_singleton is None:
+                _ledger_singleton = AutoActionProposalLedger()
+    return _ledger_singleton
+
+
+def reset_default_ledger_for_tests() -> None:
+    """Drop the singleton so a fresh path is resolved on next
+    access. Test isolation hook."""
+    global _ledger_singleton
+    with _ledger_singleton_lock:
+        _ledger_singleton = None
+
+
+# ---------------------------------------------------------------------------
+# Move 3 Slice 3 — Post-postmortem observer (mirrors OpsDigestObserver)
+# ---------------------------------------------------------------------------
+
+
+class PostPostmortemObserver(Protocol):
+    """Stable contract for the post-postmortem hook.
+
+    Called by ``postmortem_observability`` after a terminal
+    postmortem record persists. The observer is the integration
+    point where the auto-action router runs its decision tree
+    against the freshly-updated signal surfaces.
+
+    All methods are best-effort fire-and-forget. Implementations
+    MUST NOT raise; callers wrap in try/except defensively."""
+
+    def on_terminal_postmortem_persisted(
+        self,
+        *,
+        op_id: str,
+        terminal_phase: str,
+        has_blocking_failures: bool,
+    ) -> None:
+        """A terminal postmortem record has been persisted to the
+        JSONL ledger. The observer can now read recent ledger state
+        and emit advisory output without racing the producer."""
+
+
+class _NoopPostPostmortemObserver:
+    """Default observer — silently drops every call. Used when no
+    auto-action router has registered (cold boot, master flag off,
+    test isolation)."""
+
+    def on_terminal_postmortem_persisted(
+        self,
+        *,
+        op_id: str,
+        terminal_phase: str,
+        has_blocking_failures: bool,
+    ) -> None:
+        return
+
+
+_POSTMORTEM_OBSERVER_LOCK = threading.Lock()
+_POSTMORTEM_OBSERVER: PostPostmortemObserver = _NoopPostPostmortemObserver()
+
+
+def register_post_postmortem_observer(
+    observer: Optional[PostPostmortemObserver],
+) -> None:
+    """Install (or clear) the process-global post-postmortem
+    observer. Passing None restores the default no-op observer."""
+    global _POSTMORTEM_OBSERVER
+    with _POSTMORTEM_OBSERVER_LOCK:
+        _POSTMORTEM_OBSERVER = (
+            observer if observer is not None
+            else _NoopPostPostmortemObserver()
+        )
+
+
+def get_post_postmortem_observer() -> PostPostmortemObserver:
+    """Return the currently-registered observer (never None)."""
+    with _POSTMORTEM_OBSERVER_LOCK:
+        return _POSTMORTEM_OBSERVER
+
+
+def reset_post_postmortem_observer() -> None:
+    """Restore the default no-op observer. Test hook."""
+    register_post_postmortem_observer(None)
+
+
+# ---------------------------------------------------------------------------
+# Move 3 Slice 3 — Concrete observer that runs the dispatcher
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CtxEnrichment:
+    """Per-op context the observer needs to enrich the dispatcher
+    input. Provided by the orchestrator at hook-registration time
+    via ``register_op_context``. Sliced 3 keeps this deliberately
+    minimal — Slice 4 may extend it as the dispatcher's decision
+    tree grows."""
+
+    op_family: str = ""
+    risk_tier: str = ""
+    route: str = ""
+    posture: str = ""
+    failed_category: str = ""
+
+
+class AutoActionShadowObserver:
+    """Concrete post-postmortem observer for shadow-mode operation.
+
+    On each terminal-postmortem-persisted event:
+      1. Pulls the freshly-updated signal surfaces via
+         ``gather_context`` (no duplicated state-gathering).
+      2. Enriches the ``current_*`` fields from
+         ``_pending_ctx_enrichments[op_id]`` if registered by the
+         orchestrator hook (otherwise empty).
+      3. Runs ``propose_advisory_action`` against the master flag.
+      4. Persists the resulting advisory action to the ledger
+         (NO_ACTION skipped).
+
+    ENFORCE flag is NEVER consulted here — the observer is
+    advisory-only by construction. The mutation boundary lives at
+    the orchestrator hook seam (Slice 4+), not in the observer.
+    """
+
+    def __init__(
+        self,
+        *,
+        ledger: Optional[AutoActionProposalLedger] = None,
+        ctx_lookup: Optional[Callable[[str], _CtxEnrichment]] = None,
+    ) -> None:
+        self._ledger = ledger if ledger is not None else get_default_ledger()
+        self._ctx_lookup = ctx_lookup or (lambda _op_id: _CtxEnrichment())
+
+    def on_terminal_postmortem_persisted(
+        self,
+        *,
+        op_id: str,
+        terminal_phase: str,
+        has_blocking_failures: bool,
+    ) -> None:
+        """Observer entry point. NEVER raises."""
+        if not auto_action_router_enabled():
+            return
+        try:
+            enrichment = self._ctx_lookup(op_id) or _CtxEnrichment()
+            ctx = gather_context(
+                current_op_family=enrichment.op_family,
+                current_risk_tier=enrichment.risk_tier,
+                current_route=enrichment.route,
+                posture=enrichment.posture,
+            )
+            action = propose_advisory_action(ctx)
+            # Stamp the op_id onto the proposal post-hoc so the
+            # ledger row carries the trigger correlation.
+            from dataclasses import replace
+            stamped = replace(action, op_id=op_id)
+            self._ledger.append(stamped)
+        except CostContractViolation:
+            # Cost-contract violation is fatal-by-design: re-raise.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[auto_action_router] shadow observer swallowed "
+                "exception for op_id=%s: %s", op_id, exc,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Move 3 Slice 3 — Per-op ctx enrichment registry
+# ---------------------------------------------------------------------------
+#
+# Orchestrator hook seam: at op-start the orchestrator registers the
+# op's identity (family, risk_tier, route, posture); at op-terminal the
+# postmortem observer looks it up. Bounded LRU prevents unbounded
+# growth across long sessions.
+
+_CTX_ENRICHMENT_LOCK = threading.Lock()
+_CTX_ENRICHMENTS: "collections.OrderedDict[str, _CtxEnrichment]" = (
+    collections.OrderedDict()
+)
+_CTX_ENRICHMENT_MAXLEN = 256
+
+
+def register_op_context(
+    op_id: str,
+    *,
+    op_family: str = "",
+    risk_tier: str = "",
+    route: str = "",
+    posture: str = "",
+    failed_category: str = "",
+) -> None:
+    """Orchestrator hook — register ctx fields the observer needs.
+
+    Called at op-start (or whenever any of these fields are
+    finalized) so the post-postmortem observer can enrich the
+    dispatcher input from this registry rather than reaching into
+    the orchestrator's internal state. Bounded LRU; older entries
+    drop on overflow."""
+    if not isinstance(op_id, str) or not op_id:
+        return
+    with _CTX_ENRICHMENT_LOCK:
+        _CTX_ENRICHMENTS[op_id] = _CtxEnrichment(
+            op_family=str(op_family or ""),
+            risk_tier=str(risk_tier or ""),
+            route=str(route or ""),
+            posture=str(posture or ""),
+            failed_category=str(failed_category or ""),
+        )
+        # LRU eviction.
+        while len(_CTX_ENRICHMENTS) > _CTX_ENRICHMENT_MAXLEN:
+            _CTX_ENRICHMENTS.popitem(last=False)
+
+
+def lookup_op_context(op_id: str) -> _CtxEnrichment:
+    """Observer-side lookup. Returns empty enrichment when no
+    registration exists for ``op_id`` — the dispatcher's decision
+    tree handles empty fields cleanly."""
+    if not isinstance(op_id, str) or not op_id:
+        return _CtxEnrichment()
+    with _CTX_ENRICHMENT_LOCK:
+        return _CTX_ENRICHMENTS.get(op_id, _CtxEnrichment())
+
+
+def clear_op_context_registry() -> None:
+    """Drop all registrations. Boot reset + test isolation hook."""
+    with _CTX_ENRICHMENT_LOCK:
+        _CTX_ENRICHMENTS.clear()
+
+
+# ---------------------------------------------------------------------------
+# Move 3 Slice 3 — Boot wiring helper
+# ---------------------------------------------------------------------------
+
+
+def install_shadow_observer(
+    *,
+    ctx_lookup: Optional[Callable[[str], _CtxEnrichment]] = None,
+) -> None:
+    """Idempotent install of the shadow-mode observer.
+
+    Called by ``governed_loop_service.start()`` after the harness
+    boots. When the master flag is off, this is still a no-op at
+    runtime (the observer's first action is a master-flag check),
+    so it is safe to call regardless. The default ``ctx_lookup``
+    falls through to the in-process registry."""
+    register_post_postmortem_observer(
+        AutoActionShadowObserver(
+            ctx_lookup=ctx_lookup or lookup_op_context,
+        )
+    )
+
+
 __all__ = [
     "AUTO_ACTION_ROUTER_SCHEMA_VERSION",
     "AdvisoryAction",
     "AdvisoryActionType",
     "AutoActionContext",
+    "AutoActionProposalLedger",
+    "AutoActionShadowObserver",
+    "PostPostmortemObserver",
     "RecentAdaptationProposal",
     "RecentConfidenceVerdict",
     "RecentOpOutcome",
@@ -883,9 +1416,19 @@ __all__ = [
     "auto_action_failure_rate_trip",
     "auto_action_history_k",
     "auto_action_router_enabled",
+    "clear_op_context_registry",
     "gather_context",
+    "get_default_ledger",
+    "get_post_postmortem_observer",
+    "install_shadow_observer",
+    "lookup_op_context",
     "propose_advisory_action",
     "recent_adaptation_proposals",
     "recent_confidence_verdicts",
     "recent_postmortem_outcomes",
+    "record_confidence_verdict",
+    "register_op_context",
+    "register_post_postmortem_observer",
+    "reset_default_ledger_for_tests",
+    "reset_post_postmortem_observer",
 ]

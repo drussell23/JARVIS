@@ -182,6 +182,35 @@ def _build_confidence_payload(
 # ---------------------------------------------------------------------------
 
 
+def _record_verdict_for_auto_action_router(
+    *, op_id: Any, verdict_str: str, rolling_margin: Any = None,
+) -> None:
+    """Move 3 Slice 3 — bridge to ``auto_action_router``'s
+    process-local verdict ring buffer.
+
+    Called from each per-op verdict publish site (P1 drop, P2
+    approaching). Best-effort — any failure (module not installed,
+    buffer full, malformed input) is swallowed at the auto-action
+    router side. This wrapper just guards the import for tests
+    that exercise confidence_observability without the router."""
+    if not isinstance(op_id, str) or not op_id:
+        return
+    try:
+        from backend.core.ouroboros.governance.auto_action_router import (
+            record_confidence_verdict,
+        )
+        record_confidence_verdict(
+            op_id=op_id,
+            verdict=verdict_str,
+            rolling_margin=_safe_float(rolling_margin) or 0.0,
+        )
+    except Exception:  # noqa: BLE001 — bridge MUST NOT propagate.
+        logger.debug(
+            "[ConfidenceObservability] auto_action_router bridge "
+            "swallowed exception", exc_info=True,
+        )
+
+
 def publish_confidence_drop_event(
     *,
     verdict: Any = None,
@@ -221,6 +250,14 @@ def publish_confidence_drop_event(
         )
         payload["severity"] = "P1"
         del severity  # unused; severity is structurally fixed at P1
+        # Move 3 Slice 3 — feed the auto-action router's verdict
+        # ring buffer. P1 = BELOW_FLOOR → ESCALATE in the
+        # router's vocabulary.
+        _record_verdict_for_auto_action_router(
+            op_id=op_id,
+            verdict_str="BELOW_FLOOR",
+            rolling_margin=rolling_margin,
+        )
         return get_default_broker().publish(
             EVENT_TYPE_MODEL_CONFIDENCE_DROP,
             _safe_str(provider, default="confidence_monitor"),
@@ -277,6 +314,14 @@ def publish_confidence_approaching_event(
             model_id=model_id,
         )
         payload["severity"] = "P2"
+        # Move 3 Slice 3 — feed the auto-action router's verdict
+        # ring buffer. P2 = APPROACHING_FLOOR → RETRY in the
+        # router's vocabulary (early warning, not yet escalating).
+        _record_verdict_for_auto_action_router(
+            op_id=op_id,
+            verdict_str="APPROACHING_FLOOR",
+            rolling_margin=rolling_margin,
+        )
         return get_default_broker().publish(
             EVENT_TYPE_MODEL_CONFIDENCE_APPROACHING,
             _safe_str(provider, default="confidence_monitor"),

@@ -26,6 +26,26 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_router_state():
+    """Clear the Slice 3 verdict ring buffer + ledger singleton
+    before every test in this module so prior-test state doesn't
+    leak into the Slice 2 reader assertions (the verdict reader
+    pulls from the in-process buffer, which other tests in this
+    suite may populate)."""
+    from backend.core.ouroboros.governance.auto_action_router import (
+        _verdict_buffer, reset_default_ledger_for_tests,
+        clear_op_context_registry,
+    )
+    _verdict_buffer.clear()
+    reset_default_ledger_for_tests()
+    clear_op_context_registry()
+    yield
+    _verdict_buffer.clear()
+    reset_default_ledger_for_tests()
+    clear_op_context_registry()
+
+
 # -----------------------------------------------------------------------
 # § A — Public API surface
 # -----------------------------------------------------------------------
@@ -349,8 +369,12 @@ def test_gather_context_never_raises_on_reader_failure():
     """All three readers return () on failure; gather_context still
     produces a valid AutoActionContext."""
     from backend.core.ouroboros.governance.auto_action_router import (
-        gather_context, AutoActionContext,
+        gather_context, AutoActionContext, _verdict_buffer,
     )
+    # Clear the Slice 3 ring buffer so prior-test state doesn't
+    # bleed into this assertion (the verdict reader pulls from
+    # the in-process buffer, which other tests may have populated).
+    _verdict_buffer.clear()
     with patch(
         "backend.core.ouroboros.governance.verification.postmortem"
         ".list_recent_postmortems",
