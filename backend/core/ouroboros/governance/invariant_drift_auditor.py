@@ -1,10 +1,17 @@
-"""Move 4 Slice 1 — TrajectoryAuditor primitive (PRD §27.4.4).
+"""Move 4 Slice 1 — InvariantDriftAuditor primitive (PRD §27.4.4).
 
 The load-bearing safety property for the Reverse Russian Doll Order 2
 trajectory: as the organism adapts (Pass C surface miners propose
 tightenings, Move 3 advisory router proposes deferrals, operators
 approve patches), the *architectural invariants* the system was born
 with must not silently regress.
+
+Companion to ``observability/trajectory_auditor.py`` — that module
+tracks **physical** codebase trajectory (LOC, complexity, public-API
+count). This module tracks **semantic** invariant drift (shipped-code
+pins, flag defaults, exploration floors, posture). Orthogonal
+concerns; both feed into the same operator situational-awareness
+loop.
 
 Move 3 (auto_action_router) closed the verification → action loop
 operationally. Move 4 closes it *temporally* — the organism takes a
@@ -27,7 +34,7 @@ Slice 1 ships the **primitive only**:
       4. ``posture_store`` current-reading — informational drift
          (postures legitimately move; this is a watchword surface).
 
-  * ``TrajectoryDriftRecord`` — one diff between two snapshots, with
+  * ``InvariantDriftRecord`` — one diff between two snapshots, with
     severity classification (CRITICAL / WARNING / INFO).
 
   * Pure ``compare_snapshots(a, b)`` engine — deterministic, total,
@@ -67,7 +74,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     Any,
     Dict,
@@ -80,7 +87,7 @@ from typing import (
 logger = logging.getLogger(__name__)
 
 
-TRAJECTORY_AUDITOR_SCHEMA_VERSION: str = "trajectory_auditor.1"
+INVARIANT_DRIFT_AUDITOR_SCHEMA_VERSION: str = "invariant_drift_auditor.1"
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +97,8 @@ TRAJECTORY_AUDITOR_SCHEMA_VERSION: str = "trajectory_auditor.1"
 # ---------------------------------------------------------------------------
 
 
-def trajectory_auditor_enabled() -> bool:
-    """``JARVIS_TRAJECTORY_AUDITOR_ENABLED`` (default ``false`` —
+def invariant_drift_auditor_enabled() -> bool:
+    """``JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED`` (default ``false`` —
     primitive ships dormant; Slices 2-5 add producers/consumers; Slice
     5 graduates this default to ``true``).
 
@@ -101,7 +108,7 @@ def trajectory_auditor_enabled() -> bool:
     entry so flips hot-revert.
     """
     raw = os.environ.get(
-        "JARVIS_TRAJECTORY_AUDITOR_ENABLED", "",
+        "JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED", "",
     ).strip().lower()
     if raw == "":
         return False  # default-false until Slice 5 graduation
@@ -208,7 +215,7 @@ class InvariantSnapshot:
     posture_value: Optional[str]
     posture_confidence: Optional[float]
 
-    schema_version: str = TRAJECTORY_AUDITOR_SCHEMA_VERSION
+    schema_version: str = INVARIANT_DRIFT_AUDITOR_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -229,7 +236,7 @@ class InvariantSnapshot:
 
 
 @dataclass(frozen=True)
-class TrajectoryDriftRecord:
+class InvariantDriftRecord:
     """One drift between two snapshots. Frozen so it can be safely
     propagated through the auto_action_router signal bridge (Slice 4)
     without aliasing concerns."""
@@ -241,7 +248,7 @@ class TrajectoryDriftRecord:
     # render either ``detail`` or these fields. Frozen tuples to keep
     # the dataclass hashable.
     affected_keys: Tuple[str, ...] = ()
-    schema_version: str = TRAJECTORY_AUDITOR_SCHEMA_VERSION
+    schema_version: str = INVARIANT_DRIFT_AUDITOR_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -484,14 +491,14 @@ def capture_snapshot(
 
 def _compare_shipped_invariants(
     a: InvariantSnapshot, b: InvariantSnapshot,
-) -> List[TrajectoryDriftRecord]:
-    out: List[TrajectoryDriftRecord] = []
+) -> List[InvariantDriftRecord]:
+    out: List[InvariantDriftRecord] = []
     a_names = set(a.shipped_invariant_names)
     b_names = set(b.shipped_invariant_names)
     removed = sorted(a_names - b_names)
     if removed:
         out.append(
-            TrajectoryDriftRecord(
+            InvariantDriftRecord(
                 drift_kind=DriftKind.SHIPPED_INVARIANT_REMOVED,
                 severity=DriftSeverity.CRITICAL,
                 detail=(
@@ -504,7 +511,7 @@ def _compare_shipped_invariants(
         )
     if a.shipped_violation_count == 0 and b.shipped_violation_count > 0:
         out.append(
-            TrajectoryDriftRecord(
+            InvariantDriftRecord(
                 drift_kind=DriftKind.SHIPPED_VIOLATION_INTRODUCED,
                 severity=DriftSeverity.CRITICAL,
                 detail=(
@@ -523,7 +530,7 @@ def _compare_shipped_invariants(
         != b.shipped_violation_signature
     ):
         out.append(
-            TrajectoryDriftRecord(
+            InvariantDriftRecord(
                 drift_kind=(
                     DriftKind.SHIPPED_VIOLATION_SIGNATURE_CHANGED
                 ),
@@ -541,15 +548,15 @@ def _compare_shipped_invariants(
 
 def _compare_flag_registry(
     a: InvariantSnapshot, b: InvariantSnapshot,
-) -> List[TrajectoryDriftRecord]:
-    out: List[TrajectoryDriftRecord] = []
+) -> List[InvariantDriftRecord]:
+    out: List[InvariantDriftRecord] = []
     if (
         a.flag_registry_hash
         and b.flag_registry_hash
         and a.flag_registry_hash != b.flag_registry_hash
     ):
         out.append(
-            TrajectoryDriftRecord(
+            InvariantDriftRecord(
                 drift_kind=DriftKind.FLAG_REGISTRY_HASH_CHANGED,
                 severity=DriftSeverity.WARNING,
                 detail=(
@@ -561,7 +568,7 @@ def _compare_flag_registry(
         )
     if b.flag_count < a.flag_count:
         out.append(
-            TrajectoryDriftRecord(
+            InvariantDriftRecord(
                 drift_kind=DriftKind.FLAG_REGISTRY_COUNT_DECREASED,
                 severity=DriftSeverity.CRITICAL,
                 detail=(
@@ -576,8 +583,8 @@ def _compare_flag_registry(
 
 def _compare_exploration_floors(
     a: InvariantSnapshot, b: InvariantSnapshot,
-) -> List[TrajectoryDriftRecord]:
-    out: List[TrajectoryDriftRecord] = []
+) -> List[InvariantDriftRecord]:
+    out: List[InvariantDriftRecord] = []
     a_by_complexity: Dict[str, ExplorationFloorPin] = {
         p.complexity: p for p in a.exploration_floor_pins
     }
@@ -589,7 +596,7 @@ def _compare_exploration_floors(
     )
     if removed_buckets:
         out.append(
-            TrajectoryDriftRecord(
+            InvariantDriftRecord(
                 drift_kind=DriftKind.EXPLORATION_BUCKET_REMOVED,
                 severity=DriftSeverity.CRITICAL,
                 detail=(
@@ -604,7 +611,7 @@ def _compare_exploration_floors(
         pin_b = b_by_complexity[complexity]
         if pin_b.min_score < pin_a.min_score:
             out.append(
-                TrajectoryDriftRecord(
+                InvariantDriftRecord(
                     drift_kind=DriftKind.EXPLORATION_FLOOR_LOWERED,
                     severity=DriftSeverity.CRITICAL,
                     detail=(
@@ -617,7 +624,7 @@ def _compare_exploration_floors(
             )
         if pin_b.min_categories < pin_a.min_categories:
             out.append(
-                TrajectoryDriftRecord(
+                InvariantDriftRecord(
                     drift_kind=DriftKind.EXPLORATION_FLOOR_LOWERED,
                     severity=DriftSeverity.CRITICAL,
                     detail=(
@@ -633,7 +640,7 @@ def _compare_exploration_floors(
         dropped = sorted(a_req - b_req)
         if dropped:
             out.append(
-                TrajectoryDriftRecord(
+                InvariantDriftRecord(
                     drift_kind=(
                         DriftKind.EXPLORATION_REQUIRED_CATEGORY_DROPPED
                     ),
@@ -650,13 +657,13 @@ def _compare_exploration_floors(
 
 def _compare_posture(
     a: InvariantSnapshot, b: InvariantSnapshot,
-) -> List[TrajectoryDriftRecord]:
+) -> List[InvariantDriftRecord]:
     if a.posture_value is None or b.posture_value is None:
         return []
     if a.posture_value == b.posture_value:
         return []
     return [
-        TrajectoryDriftRecord(
+        InvariantDriftRecord(
             drift_kind=DriftKind.POSTURE_DRIFT,
             severity=DriftSeverity.INFO,
             detail=(
@@ -672,7 +679,7 @@ def _compare_posture(
 def compare_snapshots(
     baseline: InvariantSnapshot,
     current: InvariantSnapshot,
-) -> Tuple[TrajectoryDriftRecord, ...]:
+) -> Tuple[InvariantDriftRecord, ...]:
     """Pure, deterministic, total comparison. Returns drift records
     found going from ``baseline`` -> ``current``. Empty tuple == no
     drift detected.
@@ -691,33 +698,33 @@ def compare_snapshots(
         current, InvariantSnapshot,
     ):
         return ()
-    out: List[TrajectoryDriftRecord] = []
+    out: List[InvariantDriftRecord] = []
     try:
         out.extend(_compare_shipped_invariants(baseline, current))
     except Exception:  # noqa: BLE001 — defensive
         logger.debug(
-            "[TrajectoryAuditor] shipped-invariant compare raised",
+            "[InvariantDriftAuditor] shipped-invariant compare raised",
             exc_info=True,
         )
     try:
         out.extend(_compare_flag_registry(baseline, current))
     except Exception:  # noqa: BLE001 — defensive
         logger.debug(
-            "[TrajectoryAuditor] flag-registry compare raised",
+            "[InvariantDriftAuditor] flag-registry compare raised",
             exc_info=True,
         )
     try:
         out.extend(_compare_exploration_floors(baseline, current))
     except Exception:  # noqa: BLE001 — defensive
         logger.debug(
-            "[TrajectoryAuditor] exploration-floor compare raised",
+            "[InvariantDriftAuditor] exploration-floor compare raised",
             exc_info=True,
         )
     try:
         out.extend(_compare_posture(baseline, current))
     except Exception:  # noqa: BLE001 — defensive
         logger.debug(
-            "[TrajectoryAuditor] posture compare raised",
+            "[InvariantDriftAuditor] posture compare raised",
             exc_info=True,
         )
     return tuple(out)
@@ -730,10 +737,10 @@ def compare_snapshots(
 
 
 def filter_by_severity(
-    records: Tuple[TrajectoryDriftRecord, ...],
+    records: Tuple[InvariantDriftRecord, ...],
     *,
     minimum: DriftSeverity = DriftSeverity.WARNING,
-) -> Tuple[TrajectoryDriftRecord, ...]:
+) -> Tuple[InvariantDriftRecord, ...]:
     """Return only records whose severity is at-or-above ``minimum``.
     CRITICAL > WARNING > INFO. NEVER raises."""
     order = {
@@ -749,7 +756,7 @@ def filter_by_severity(
 
 
 def has_critical_drift(
-    records: Tuple[TrajectoryDriftRecord, ...],
+    records: Tuple[InvariantDriftRecord, ...],
 ) -> bool:
     """True iff any record is CRITICAL. NEVER raises."""
     return any(r.severity is DriftSeverity.CRITICAL for r in records)
@@ -764,12 +771,12 @@ __all__ = [
     "DriftKind",
     "DriftSeverity",
     "ExplorationFloorPin",
+    "INVARIANT_DRIFT_AUDITOR_SCHEMA_VERSION",
+    "InvariantDriftRecord",
     "InvariantSnapshot",
-    "TRAJECTORY_AUDITOR_SCHEMA_VERSION",
-    "TrajectoryDriftRecord",
     "capture_snapshot",
     "compare_snapshots",
     "filter_by_severity",
     "has_critical_drift",
-    "trajectory_auditor_enabled",
+    "invariant_drift_auditor_enabled",
 ]
