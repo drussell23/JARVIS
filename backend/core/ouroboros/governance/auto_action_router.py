@@ -70,7 +70,7 @@ import enum
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 from backend.core.ouroboros.governance.cost_contract_assertion import (
     COST_GATED_ROUTES,
@@ -606,6 +606,270 @@ def propose_advisory_action(
     )
 
 
+# ---------------------------------------------------------------------------
+# Move 3 Slice 2 — signal source readers
+# ---------------------------------------------------------------------------
+#
+# Three read-only helpers that consume EXISTING ledger surfaces and produce
+# the input dataclasses Slice 1 defined. Per operator binding ("do not
+# duplicate state-gathering"), every reader either:
+#   (a) wraps a public reader on an existing ledger and maps the result
+#       into the input dataclass, OR
+#   (b) returns an empty tuple with an explicit TODO when no persistent
+#       surface exists yet. Slice 3 wires the producer side for case (b)
+#       at the orchestrator hook seam.
+#
+# Best-effort everywhere — readers NEVER raise. A missing ledger / parse
+# failure / module-not-importable returns an empty tuple. Defensive
+# composition: callers chain these into ``AutoActionContext`` without
+# branch-on-error.
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+        if v != v:  # NaN
+            return default
+        return v
+    except (TypeError, ValueError):
+        return default
+
+
+def recent_postmortem_outcomes(
+    *,
+    limit: Optional[int] = None,
+    session_id: Optional[str] = None,
+) -> Tuple[RecentOpOutcome, ...]:
+    """Read the most recent postmortems and project them into
+    ``RecentOpOutcome`` records.
+
+    Wraps ``verification.postmortem.list_recent_postmortems`` —
+    no duplicated state-gathering. Maps each ``VerificationPostmortem``:
+
+      * ``op_id``, ``elapsed_s = completed_unix - started_unix``
+      * ``success = (total_failed == 0 AND not has_blocking_failures
+        AND error_count == 0)``
+      * ``failure_phase`` — derived from kind: ``"VERIFY"`` for
+        ``verification_postmortem``, ``"TERMINAL"`` for
+        ``terminal_postmortem``, empty when success.
+      * ``op_family``, ``risk_tier``, ``failed_category`` left empty —
+        these are populated at the orchestrator hook seam in Slice 3
+        from ``ctx.task_complexity`` / ``ctx.risk_tier`` /
+        ``ctx.failed_exploration_category``. The reader returns the
+        bare projection; the caller enriches.
+
+    Newest-last (matches ``list_recent_postmortems`` ordering).
+
+    Parameters
+    ----------
+    limit:
+        Number of records to fetch. Defaults to
+        ``auto_action_history_k()`` so the reader is in lockstep with
+        the dispatcher's window.
+    session_id:
+        Optional session override; defaults to the ambient session
+        per the postmortem ledger's path resolution.
+
+    NEVER raises."""
+    safe_limit = (
+        _safe_int(limit, default=auto_action_history_k())
+        if limit is not None
+        else auto_action_history_k()
+    )
+    if safe_limit <= 0:
+        return ()
+    try:
+        from backend.core.ouroboros.governance.verification.postmortem import (
+            list_recent_postmortems,
+        )
+    except Exception:  # noqa: BLE001
+        return ()
+    try:
+        records = list_recent_postmortems(
+            limit=safe_limit, session_id=session_id,
+        )
+    except Exception:  # noqa: BLE001
+        return ()
+
+    outcomes: list = []
+    for pm in records:
+        try:
+            failed = (
+                _safe_int(getattr(pm, "must_hold_failed", 0))
+                + _safe_int(getattr(pm, "should_hold_failed", 0))
+                + _safe_int(getattr(pm, "ideal_failed", 0))
+            )
+            err = _safe_int(getattr(pm, "error_count", 0))
+            blocking = bool(getattr(pm, "has_blocking_failures", False))
+            success = (failed == 0) and (err == 0) and (not blocking)
+            failure_phase: Optional[str] = None
+            if not success:
+                # Best-effort: distinguish VERIFY-phase failures from
+                # TERMINAL postmortems. We don't have direct access to
+                # the kind field on the dataclass, so default to
+                # "VERIFY" when there are claim failures and "TERMINAL"
+                # when only error_count is non-zero.
+                failure_phase = (
+                    "VERIFY" if failed > 0 or blocking
+                    else "TERMINAL"
+                )
+            started = _safe_float(getattr(pm, "started_unix", 0.0))
+            completed = _safe_float(getattr(pm, "completed_unix", 0.0))
+            elapsed = max(0.0, completed - started)
+            outcomes.append(
+                RecentOpOutcome(
+                    op_id=str(getattr(pm, "op_id", "") or ""),
+                    op_family="",  # populated by Slice 3 hook
+                    success=success,
+                    risk_tier="",  # populated by Slice 3 hook
+                    failure_phase=failure_phase,
+                    failure_reason=None,
+                    failed_category=None,  # populated by Slice 3 hook
+                    cost_usd=0.0,
+                    elapsed_s=elapsed,
+                )
+            )
+        except Exception:  # noqa: BLE001 — defensive: skip malformed
+            continue
+    return tuple(outcomes)
+
+
+def recent_confidence_verdicts(
+    *,
+    limit: Optional[int] = None,
+) -> Tuple[RecentConfidenceVerdict, ...]:
+    """Read recent confidence-monitor verdicts.
+
+    Slice 2 stub: the confidence-monitor publishes verdict events
+    via ``verification.confidence_observability`` to the SSE broker
+    but there is currently no persistent ledger of verdicts to read
+    after the fact. Slice 3 wires a process-local ring buffer at the
+    confidence_monitor's publish seam so downstream consumers can
+    poll without re-running the monitor.
+
+    Until Slice 3 ships the ring buffer, this reader returns an
+    empty tuple. The dispatcher's decision tree handles
+    ``len(recent_verdicts) == 0`` cleanly — no signal → no action.
+
+    NEVER raises.
+    """
+    # Intentional empty-tuple stub — see docstring.
+    _ = limit  # parameter retained for API stability across slices
+    return ()
+
+
+def recent_adaptation_proposals(
+    *,
+    limit: Optional[int] = None,
+) -> Tuple[RecentAdaptationProposal, ...]:
+    """Read the most recent Pass C adaptation proposals + their
+    operator decisions.
+
+    Wraps ``adaptation.ledger.get_default_ledger().history(limit=N)``
+    — no duplicated state-gathering. Maps each ``AdaptationProposal``:
+
+      * ``proposal_id`` — direct
+      * ``surface`` — the AdaptationSurface enum value (string)
+      * ``operator_outcome`` — derived from the proposal's
+        ``operator_decision``: ``"approved"`` /  ``"rejected"`` /
+        ``"pending"``.
+
+    Newest-first per ``ledger.history`` ordering.
+
+    NEVER raises."""
+    safe_limit = (
+        _safe_int(limit, default=auto_action_history_k())
+        if limit is not None
+        else auto_action_history_k()
+    )
+    if safe_limit <= 0:
+        return ()
+    try:
+        from backend.core.ouroboros.governance.adaptation.ledger import (
+            get_default_ledger,
+        )
+    except Exception:  # noqa: BLE001
+        return ()
+    try:
+        ledger = get_default_ledger()
+        records = ledger.history(limit=safe_limit)
+    except Exception:  # noqa: BLE001
+        return ()
+
+    out: list = []
+    for proposal in records:
+        try:
+            surface = getattr(proposal, "surface", None)
+            surface_str = (
+                surface.value if hasattr(surface, "value")
+                else str(surface or "")
+            )
+            decision = getattr(proposal, "operator_decision", None)
+            decision_str = (
+                decision.value if hasattr(decision, "value")
+                else str(decision or "pending")
+            ).strip().lower()
+            # Normalize to the 3-value vocabulary documented on
+            # RecentAdaptationProposal.operator_outcome.
+            if decision_str in ("approved", "applied"):
+                outcome = "approved"
+            elif decision_str in ("rejected", "denied"):
+                outcome = "rejected"
+            else:
+                outcome = "pending"
+            out.append(
+                RecentAdaptationProposal(
+                    proposal_id=str(
+                        getattr(proposal, "proposal_id", "") or "",
+                    ),
+                    surface=surface_str,
+                    operator_outcome=outcome,
+                )
+            )
+        except Exception:  # noqa: BLE001 — defensive: skip malformed
+            continue
+    return tuple(out)
+
+
+def gather_context(
+    *,
+    current_op_family: str = "",
+    current_risk_tier: str = "",
+    current_route: str = "",
+    posture: str = "",
+    session_id: Optional[str] = None,
+) -> AutoActionContext:
+    """One-shot helper that runs all three readers + assembles an
+    ``AutoActionContext``.
+
+    Convenience for Slice 3's orchestrator-hook caller: instead of
+    invoking each reader independently and zipping the result, the
+    hook can call ``gather_context(...)`` once. The ``current_*``
+    fields ride the ctx and parameterize the dispatcher's targeting
+    decisions (op family failure rate, risk-tier-specific demote vs
+    defer, etc.).
+
+    NEVER raises — each reader independently swallows failure."""
+    return AutoActionContext(
+        recent_outcomes=recent_postmortem_outcomes(
+            session_id=session_id,
+        ),
+        recent_verdicts=recent_confidence_verdicts(),
+        recent_proposals=recent_adaptation_proposals(),
+        current_op_family=current_op_family,
+        current_risk_tier=current_risk_tier,
+        current_route=current_route,
+        posture=posture,
+    )
+
+
 __all__ = [
     "AUTO_ACTION_ROUTER_SCHEMA_VERSION",
     "AdvisoryAction",
@@ -619,5 +883,9 @@ __all__ = [
     "auto_action_failure_rate_trip",
     "auto_action_history_k",
     "auto_action_router_enabled",
+    "gather_context",
     "propose_advisory_action",
+    "recent_adaptation_proposals",
+    "recent_confidence_verdicts",
+    "recent_postmortem_outcomes",
 ]
