@@ -3373,6 +3373,191 @@ After Move 1 + Move 2: the answer becomes **"yes, demonstrated."** After Move 3:
 
 ---
 
+## 28. Brutal Architectural Review v9 — Post-Move-4 Deep Dive (2026-04-30)
+
+> Operator-driven 2026-04-30 review with explicit instruction to verify all claims against the actual codebase via parallel exploration agents. v9 supersedes v8 (which was unverified) on every claim where evidence diverged. **Letter grade adjusts down from v8's "A− trending A" to "A− structural ceiling, B+ empirical floor, trending A−"** — honest reflection of file:line audit.
+
+### 28.1 What this review actually verified (vs prior reviews)
+
+Prior brutal reviews (v3-v8) operated from architectural memory + summary files. **v9 dispatched 4 parallel exploration agents with FILE:LINE evidence requirements** covering: cognitive surfaces, observability + Causality DAG, Antivenom defense + bypass vectors, and async concurrency surfaces. Several v8 claims were over-generous; several v8 gaps closed. The PRD reflects the audited reality.
+
+### 28.2 Delta since v7 (what shipped between v7 and v9)
+
+- **Priority 1 confidence-aware execution** (5 slices) — `confidence_capture.py` + `confidence_monitor.py` + `hypothesis_consumers.py` (3-action enum: `RETRY_WITH_FEEDBACK`/`ESCALATE_TO_OPERATOR`/`INCONCLUSIVE`) + `confidence_route_advisor.py` with cost-contract guard.
+- **Priority 2 Causality DAG** (6 slices) — `verification/causality_dag.py:513` + `verification/dag_navigation.py:296-363` + `observability/decision_trace_ledger.py`. Session-spanning navigable graph with bounded BFS subgraph (max_depth env-tunable). DAG REPL via `/postmortems dag` subcommands.
+- **Move 1 Pass C graduation** — 7 master flags graduated; surface miners propose tightenings; monotonic-tightening verdict prevents safety-property weakening.
+- **Move 2 24h burn-in** — empirical ceiling proven at 1h28m, bounded by Anthropic API physics, not O+V substrate.
+- **Move 3 auto_action_router** — verification → action loop closed operationally (per-postmortem `AdvisoryAction` proposals, 5-value `AdvisoryActionType` enum, ledger + SSE + `/auto-action` REPL + GET endpoints).
+- **Move 4 InvariantDriftAuditor** — verification → action loop closed temporally (boot-anchored baseline + continuous re-validation via posture-aware async observer + auto_action_router fan-in + 4 GET routes + observer SSE event + 8 FlagRegistry seeds + 2 AST pins).
+
+### 28.3 Cognitive & Epistemic Delta — file:line evidence
+
+**What shipped (verified):**
+- `confidence_capture.py:92-108` — graduated default-on, captures per-token logprobs.
+- `confidence_monitor.py:225-234, 317-325` — three-state enum, per-GENERATE-round instance.
+- `hypothesis_consumers.py:100-127` — exactly 3 `ConfidenceCollapseAction` values.
+- `confidence_route_advisor.py:277-292` — `CostContractViolation` raise on BG/SPEC → STANDARD/COMPLEX/IMMEDIATE.
+
+**Hard gaps verified absent (not assumed):**
+
+1. **Anthropic-routed ops have ZERO confidence signal.** `confidence_capture.py:14-20` explicit comment: "NOTHING from Claude provider." DoubleWord-only logprob harvest. **Half the provider cascade flies blind on epistemic uncertainty.**
+2. **No inner reasoning between tool rounds.** `tool_executor.py:200-1000` audit confirmed sequential request→response→request only. CC's Extended Thinking has no analog.
+3. **No parallel speculative hypothesis branches.** Sequential only; no K-concurrent candidate generation.
+4. **Hypothesis probe loop is REACTIVE not PROACTIVE.** `hypothesis_consumers.py:341-429` `probe_confidence_collapse` only fires AFTER provider-side collapse. The Curiosity engine adaptation module is SCAFFOLDED but **default-off** — auto-probe + auto-bridge both opt-in.
+5. **GENERAL subagent body is a STUB.** `agentic_general_subagent.py:39` returns `NOT_IMPLEMENTED`. The Semantic Firewall + mutation cage exist; the LLM driver does not. **CLAUDE.md's "Phase B Slice 1b graduated" claim is misleading** — the cage graduated, the executor didn't.
+6. **`classify_clarify.py` is not autonomous.** Default OFF, single boundary question, requires human answer (line 13-16: "operator answer enriches ctx.description").
+
+### 28.4 Deep Observability — file:line evidence
+
+**What shipped (verified):**
+- `verification/causality_dag.py:513` — `build_dag(session_id)` session-spanning traversal.
+- `verification/causality_dag.py:253` — `subgraph(record_id, max_depth)` bounded BFS, default 8 (`max_depth_knob()` line 150, env `JARVIS_DAG_MAX_DEPTH`).
+- `verification/dag_navigation.py:296-363` — DAG REPL via `dispatch_dag_command()`: `dag for-record <id>`, `dag fork-counterfactuals <id>`, `dag drift <session-a> <session-b>`, `dag stats`.
+- `ide_observability_stream.py:105-242` — **57 SSE event types defined** (verified via grep).
+- `ide_observability.py:188-257` + Slice 5 additions = **24 GET endpoints under `/observability/*`** (20 pre-Slice 5 + 4 invariant-drift).
+- `phase_cost.py:51-69` — 17 canonical phases tracked.
+
+**Hard gaps verified absent:**
+
+1. **`EVENT_TYPE_MODEL_CONFIDENCE_DROP` vocabulary defined, PRODUCERS NOT WIRED.** `ide_observability_stream.py:142-144` explicit comment: "Slice 4 ships the vocabulary + publish helpers; producer wiring lives in DW provider's verdict-emission site and is master-flag-gated by `JARVIS_CONFIDENCE_OBSERVABILITY_ENABLED`." Search confirmed: NO producer in `providers.py`, NO producer in `event_channel.py`. **The dictionary exists; nothing speaks the language.** This is the single biggest delta vs CC.
+2. **`--rerun-from` is NOT in `scripts/ouroboros_battle_test.py`.** The closure memo `project_priority_2_causality_dag_closure.md` references "replay-from-record (--rerun-from)" — it's wrong. Battle-test harness has `--rerun` only. Replay logic lives in `governance/meta/replay_executor.py` (not surfaced to harness). **The DAG is currently observability-only; time-travel state reconstruction is not operator-accessible.**
+3. **No `/replay` or `/rerun` REPL command for state reconstruction.** `serpent_flow.py` has `/postmortems dag for-record <id>` (read-only render) but no command that takes a node_id and reconstructs ctx state to fork from.
+4. **Parallel fan-out only emits graph-level state.** `subagent_scheduler.py:911-930` `_emit_graph_event()` payload has `ready_units / running_units / completed_units / failed_units / cancelled_units` — per-graph state. No per-L3-worker-pool sub-graph snapshot.
+5. **Posture singleton has subtle correctness issue.** `posture_observer.py:716` uses `RLock` (correct). BUT `posture_store.py:165` uses non-reentrant `Lock`. If any code path calls `load_current()` then triggers `write_current()` within the same control flow holding the outer lock → **deadlock**. No current consumers do this; the asymmetric lock pattern is a sharp edge waiting to bite.
+
+### 28.5 Brutal Grade & Systemic Fragility — file:line evidence
+
+#### 28.5.1 Race conditions (concrete, not abstract)
+
+**CRITICAL — silent observer death cascade (`posture_observer.py:558-572`):**
+
+`_run_forever`: exception in `run_one_cycle()` is caught at line 565, increments `_cycles_failed`, logs once, **continues silent retry every 300s indefinitely**. No alarm callback, no fail-loud signal to orchestrator. Downstream consumers (sensor_governor, invariant_drift_observer's posture_reader, ide_observability_stream) call `get_default_observer()` and read **stale `_store` state** — they have no way to detect the task is dead-but-still-listed-as-running. **Compound risk:** combined with disk-full (which makes `write_current()` swallow at `posture_store.py:326-328`), posture freezes at last-good reading; sensor_governor applies its weight against frozen posture; routing decisions made on stale state for hours/days. **This is the worst silent-degradation path in the system.**
+
+**Cross-process ledger append corruption (`auto_action_router.py:1110-1113` + `adaptation/ledger.py`):**
+
+Both use `path.open("a")` with `threading.Lock()`. POSIX append-mode is line-atomic **within a single process** but **NOT across processes**. Two `ouroboros_battle_test.py` processes writing the same `.jsonl` concurrently can interleave partial writes. `ApprovalStore` uses `fcntl.flock` correctly elsewhere; the action ledgers don't. **Concrete data-loss path on multi-process runs.**
+
+**Cross-process baseline write race (`invariant_drift_store.py:317-329`):**
+
+Slice 2's atomic write is correct *within a process* (tempfile + `os.replace`) but two processes calling `install_boot_snapshot()` simultaneously produce duplicate audit records and a possible read-of-half-written-baseline-then-write-fresh sequence. No CAS, no flock. Move 4 ships with this race undefended.
+
+**Phase extraction state — half-migrated:**
+
+W2(5) extraction status (verified via `orchestrator.py:117-260`): **8 phases extracted by default-on flags** (COMPLETE, ROUTE, CTX, PLAN, GENERATE, VALIDATE, GATE, SLICE4B). **4 phases NOT extracted**: CLASSIFY, APPROVE, APPLY, VERIFY (no env flags found). `best_candidate` threading via artifacts in extracted phases vs direct mutation in non-extracted phases — torn-read risk during flag flips mid-op.
+
+#### 28.5.2 Antivenom bypass vectors — exhaustive verification
+
+| # | Vector | Defense status | Evidence |
+|---|--------|---------------|----------|
+| 1 | Plausibly-typed dead code | **Partial** — only `architectural` tier requires CALL_GRAPH | `exploration_engine.py:414-430` — only `architectural` floors include `required_categories={CALL_GRAPH, HISTORY}`. `complex` tier (line 400-413) does NOT. Most ops fall to `complex`. **Wider gap than v8 implied.** |
+| 2 | Symbol-shape hallucination | **Partial** — 20 pins covering ~1% of load-bearing surface | `shipped_code_invariants.py` count via `list_shipped_code_invariants()` = 20. Asymptote: every load-bearing public API needs one. |
+| 3 | Multi-file coordinated bypass | **Partial — atomic batch rollback OK, no cross-file composition validation** | `orchestrator.py:9321-9471` validates per-file independently + atomic rollback. **No cross-file dependency check** — file A's call site update + file B's symbol rename validated independently, not as a graph. |
+| 4 | Test-shape gaming | **ABSENT — confirmed by exhaustive search** | Zero invariants pin "test exercises mock without SUT." No structural classifier flags vacuous tests. |
+| 5 | Quine-class hallucination | **ABSENT — confirmed by exhaustive search** | No check rejects a patch that adds a new `shipped_code_invariant` registration alongside the patch it validates. Registry is post-hoc; Quine-class gen with self-validating invariant is structurally accepted. |
+
+**SemanticGuardian count is 11 not 10** (`semantic_guardian.py:975-1002`) — `dynamic_import_chain` (hard-fail) was added but CLAUDE.md isn't updated. 6 hard-fail + 5 soft-fail.
+
+#### 28.5.3 Letter grade — adjusted from v8 with hard evidence
+
+**Structural ceiling: A. Empirical floor: B+. Trending A− (was A in v8).**
+
+Honest down-adjustment because:
+1. Confidence drop SSE producers **not wired** despite vocabulary defined — CC's biggest single UX-equivalence gap is wider than v8 implied.
+2. PostureObserver silent-death cascade is concrete operational fragility, not abstract.
+3. Cross-process ledger races are concrete data-loss paths.
+4. GENERAL subagent body is STUB — Phase B "graduation" was the cage, not the cognition.
+5. `--rerun-from` claim in memory was wrong — time-travel state reconstruction is NOT operator-accessible.
+6. Test-shape gaming + Quine bypass confirmed undefended via exhaustive search.
+
+**What would push to A:**
+- (a) Move 5 Hypothesis Probe Loop ships
+- (b) Confidence drop SSE producers wired
+- (c) PostureObserver task-death detection wired
+- (d) Quine bypass pin lands
+- (e) ENFORCE-mode shadow soak produces 1 verified APPLY+COMMIT
+
+All 5 → A. Three of 5 → A−. Two → stays B+.
+
+**What would push to A+:**
+All five above PLUS Move 6 Generative Quorum + Move 7 Cross-op Semantic Budget.
+
+### 28.6 Critical Path to A-Level RSI — sequenced systemic upgrades
+
+#### 28.6.1 Immediate priorities (highest-leverage, bug-fix-grade effort, A-grade impact)
+
+These are the **highest-ROI work items** — 1-2 days each, no exotic cognitive architecture, close concrete operational fragility:
+
+| Rank | Priority | Effort | Files | Closes |
+|------|----------|--------|-------|--------|
+| 🔴 **#1** | **Confidence drop SSE producer wiring** | 2-3 days | `providers.py` (DW streaming hook) + `confidence_monitor.py` bridge | Lowest-effort highest-impact. Vocabulary already defined (`ide_observability_stream.py:142-144`). Producer needs to fire `EVENT_TYPE_MODEL_CONFIDENCE_DROP` whenever monitor's `BELOW_FLOOR` verdict triggers, throttled by env-tunable rate limit (mirror Move 4's drift-signature dedup ring). Operators get CC-equivalent token-rate visibility. |
+| 🔴 **#2** | **PostureObserver task-death detection** | 3-5 days | `posture_observer.py:558-572` + downstream consumers | Add heartbeat counter to `_cycles_ok`; if `time.time() - last_cycle_ok > 3 × observer_interval_s()`, flip "task degraded" flag visible to consumers. SensorGovernor + InvariantDriftObserver should treat stale posture as `MAINTAIN` (safe default) rather than reading frozen state. **Closes worst silent-degradation cascade.** |
+| 🔴 **#3** | **Cross-process flock on ledgers** | 1-2 days | `auto_action_router.py:1110` + `adaptation/ledger.py` append paths | Wrap append paths in `fcntl.flock` (UNIX) / `msvcrt.locking` (Windows). Mirror existing `ApprovalStore` pattern. Closes concrete data-loss race during multi-process runs. |
+
+**Total effort: ~1-2 weeks for all three. Expected impact: B+ empirical floor → A− empirical floor.**
+
+#### 28.6.2 Strategic moves (sequenced)
+
+**🟡 Move 5 — Hypothesis Probe Loop.** Solves epistemic-ambiguity-without-`ask_human`. Plugs into existing `confidence_monitor` + `hypothesis_consumers` pipeline as a 4th `ConfidenceCollapseAction` outcome (`PROBE_ENVIRONMENT`). Bounded probe via read-only tool allowlist (`read_file` / `search_code` / `get_callers` / `git_blame` / `list_symbols`), K=3 rounds, 30s wall-clock, 1× cost-tier of current op, AST-pinned cap structure. **5-slice arc, 1-2 weeks.**
+
+**🟡 Move 6 — Generative Quorum.** K=3 parallel candidates with AST-normalized signature consensus. Substrate exists (L3 worktrees + `subagent_scheduler.py`). Kills Quine-class + symbol-shape hallucination in one architectural move. Gated to APPROVAL_REQUIRED+ tier (cost-tier 3× generate). **5-slice arc.**
+
+**🟡 Move 7 — Cross-op Semantic Budget.** Rolling embedding of "what the codebase semantically does" via existing `SemanticIndex`. Cumulative-drift threshold over rolling window of N ops triggers ESCALATE → operator review of trajectory. Move 4 catches *architectural promise* drift; Move 7 catches *semantic meaning* drift. **Together they bound drift in both axes mathematically — that's the foundation for stable RSI.**
+
+#### 28.6.3 Backlog (parallel-executable when capacity allows)
+
+**🟢 Move 8 — GENERAL subagent LLM driver.** Phase B Slice 1b finishing pass. Currently `agentic_general_subagent.py:39` returns `NOT_IMPLEMENTED`. Wire the LLM executor inside the existing Semantic Firewall + mutation cage. **3-slice arc.**
+
+**🟢 Move 9 — Test-shape gaming defense.** Static classifier flagging tests where the assertion target is structurally a mock (not the system-under-test). AST-walkable: assertion target is `MagicMock()` / `Mock()` / patched-import → flag. **2-slice arc.**
+
+**🟢 Move 10 — Slice 5b /invariant REPL command.** Inline drift signal rendering in `serpent_flow.py`. Operator surface for Move 4's full functionality. Currently GET endpoints + SSE work; REPL would tighten the operator workflow. **1-slice arc.**
+
+### 28.7 What's next — operator binding (refreshed 2026-04-30)
+
+**The 3 immediate priorities (28.6.1) are the next focus area.** They produce A-grade leverage with bug-fix-grade effort. Rationale:
+- Confidence drop SSE wiring closes the biggest CC-parity gap with the lowest engineering effort.
+- PostureObserver task-death detection closes the most-dangerous silent-degradation cascade.
+- Cross-process flock closes a concrete data-loss path.
+
+After all three: structural ceiling stays A; empirical floor lifts to A−. Then Move 5 (Hypothesis Probe Loop) as the next strategic move.
+
+**Skip multi-day soak retry** — Anthropic API physics ceiling proven; no architectural ROI.
+**Skip ENFORCE-mode graduation** — gated on Move 3+4 shadow-mode evidence accumulation (≥30 actionable proposals in the ledger before considering).
+
+### 28.8 UX delta vs CC — what's missing
+
+Three nice-to-haves with clear ROI based on file:line audit:
+
+1. **Inline confidence drop banner.** Once Priority #1 SSE producer wires, render in flowing CLI: `[~] confidence drop @ token 247: top1=0.42 top2=0.38 → monitor floor breached`. Numeric confidence visibility CC doesn't have.
+2. **`/dag` REPL surface.** `dispatch_dag_command()` exists at `dag_navigation.py:296` but bound to `/postmortems dag` subcommand. Promote to top-level `/dag for-record <id>` / `/dag fork-counterfactuals <id>` / `/dag drift <s1> <s2>` for operator discoverability. Time-travel debugging becomes a first-class verb.
+3. **Inline drift signal rendering** (Move 4 Slice 5b). SerpentFlow renders between op completions: `⚠ drift detected: invariant_drift_bridge_uses_propose_action → /invariant-drift overview`. Concrete and worth doing.
+
+### 28.9 Reverse Russian Doll alignment after Move 4
+
+Acknowledged: O+V (innermost doll) expanded the shell with Move 1+2+3+4. Anti-Venom (immune system) scaled proportionally:
+- Pin count: 13 → **20** (+54%)
+- SemanticGuardian patterns: 10 → **11**
+- SSE event vocabulary: ~10 → **57**
+- GET endpoints: ~16 → **24**
+- Async observers: 1 (PostureObserver) → **3** (+ SensorGovernor + InvariantDriftObserver)
+
+But two specific failure modes within the constraint shell are now load-bearing and undefended:
+- **Test-shape gaming** (no AST pin can catch — needs semantic understanding of test intent)
+- **Quine-class hallucination** (no check rejects op adding self-validating invariant)
+
+**Move 6 Generative Quorum kills both** in one architectural move.
+
+### 28.10 Summary — answering the operator's question directly
+
+> *"What level is O+V currently at compared to CC? What letter grade would you give? Does it have potential to become A-level execution from A-level vision?"*
+
+**Current state**: A-level vision, A-level structural foundation, A− execution on cognitive tasks, B+ execution on edge cases. Move 4 closed the temporal gap that bounded the system to "operationally closed loop" — drift is now detected continuously and routed through the unified operator-review surface. **The system has a load-bearing safety property that competitors don't have.**
+
+**Path to A**: 3 immediate operational fixes (1-2 weeks total) + Move 5 Hypothesis Loop. **Path to A+**: above + Move 6 + Move 7. **The vision is A-level; the execution is currently A− trending A.**
+
+**The path is not exotic — three operational bug fixes plus the Hypothesis Loop.**
+
+---
+
 ## Appendix A — Glossary
 
 ### Core terms
@@ -3600,6 +3785,7 @@ When §5.4 MVP RSI conditions all met → claim Wang-grounded RSI.
 
 | Date | Version | Change | Author |
 |---|---|---|---|
+| 2026-04-30 | 2.7 | **§28 Brutal Architectural Review v9 — file:line-grounded post-Move-4 deep dive.** Operator-driven 2026-04-30 review with explicit instruction to verify all claims against the actual codebase via parallel exploration agents (4 dispatched: cognitive surfaces / observability + Causality DAG / Antivenom defense + bypass vectors / async concurrency surfaces). v9 supersedes v8 on every claim where evidence diverged. Letter grade adjusts down from v8's "A− trending A" to **"A− structural ceiling, B+ empirical floor, trending A−"** — honest reflection of file:line audit. Updates: §1 version line bumped to 2.7 with Move 4 closure marker + v9 latest-review pointer; §2 Vision Statement refreshed with operator-binding rewrite (proactive autonomous opposite of CC + Reverse Russian Doll convergence framing) + new 8th success criterion ("Self-validating immune system over time" — Move 4 graduated 2026-04-30); new §28 (10 sub-sections) covering: (28.1) what v9 verified vs prior reviews; (28.2) delta since v7 (Priority 1 + Priority 2 + Move 1+2+3+4 all closed); (28.3) cognitive & epistemic delta with file:line evidence (Anthropic-routed ops have ZERO confidence signal — `confidence_capture.py:14-20`; no inner reasoning between tool rounds; no parallel speculative branches; hypothesis probe loop is REACTIVE not PROACTIVE; GENERAL subagent body is STUB at `agentic_general_subagent.py:39`; classify_clarify is NOT autonomous); (28.4) deep observability with file:line evidence (Causality DAG shipped at `verification/causality_dag.py:513`; 57 SSE event types + 24 GET endpoints; **`EVENT_TYPE_MODEL_CONFIDENCE_DROP` vocabulary defined but PRODUCERS NOT WIRED** — `ide_observability_stream.py:142-144`; **`--rerun-from` is NOT in `scripts/ouroboros_battle_test.py`** — closure memo was wrong; no `/replay` REPL; `posture_store.py:165` uses non-reentrant Lock vs RLock asymmetry); (28.5) brutal grade with file:line evidence — race conditions concrete: CRITICAL silent observer death cascade at `posture_observer.py:558-572`, cross-process ledger append corruption at `auto_action_router.py:1110-1113`, cross-process baseline write race at `invariant_drift_store.py:317-329`, half-migrated phase extraction (8 extracted, 4 NOT: CLASSIFY/APPROVE/APPLY/VERIFY); 5 Antivenom bypass vectors exhaustively verified — Test-shape gaming + Quine-class hallucination both **CONFIRMED ABSENT** via grep + AST audit; SemanticGuardian count is 11 not 10 (`semantic_guardian.py:975-1002` — `dynamic_import_chain` was added but CLAUDE.md isn't updated); 20 shipped_code_invariants pins (post-Move 4); only `architectural` tier requires CALL_GRAPH (wider gap than v8 implied); (28.6) **Critical Path to A-Level RSI** — 28.6.1 immediate priorities (highest-leverage, bug-fix-grade effort): #1 Confidence drop SSE producer wiring (2-3 days), #2 PostureObserver task-death detection (3-5 days), #3 Cross-process flock on ledgers (1-2 days) — total 1-2 weeks for all three; expected impact B+ → A− empirical floor; 28.6.2 strategic moves sequenced (Move 5 Hypothesis Probe Loop / Move 6 Generative Quorum / Move 7 Cross-op Semantic Budget); 28.6.3 backlog (Move 8 GENERAL subagent LLM driver / Move 9 Test-shape gaming defense / Move 10 Slice 5b /invariant REPL); (28.7) operator binding refreshed — 3 immediate priorities are next focus area, skip multi-day soak retry, skip ENFORCE-mode graduation; (28.8) UX delta vs CC (3 nice-to-haves: inline confidence drop banner / promote `/dag` REPL to top-level / Slice 5b inline drift signal rendering); (28.9) Reverse Russian Doll alignment after Move 4 — pin count 13→20 (+54%), SSE vocab ~10→57, GET endpoints ~16→24, async observers 1→3 — but Test-shape gaming + Quine-class hallucination remain undefended (Move 6 kills both); (28.10) summary answering operator's question directly: A-level vision + A-level structural foundation + A− execution on cognitive tasks + B+ on edge cases; path to A is 3 immediate fixes + Move 5; path to A+ is above + Move 6 + Move 7. Zero behavior change — doc-only update synthesizing today's verified review. **Move 4 InvariantDriftAuditor closure documented in `memory/project_move_4_closure.md`** — 5-slice arc, 285 new regression tests, 415/415 combined green, ~5,500 net new lines. | Claude Opus 4.7 (post-Move-4 file:line-grounded brutal review v9) |
 | 2026-04-29 | 2.59 | **§26 Brutal Architectural Review v5 — post-Phase-12-DW-Resilience-closure (B+/B− grade defended).** Adds §26 (latest review) covering: (26.1) what soak #7 actually proved + §25 Priorities A–F all CLOSED single-day (mandatory claim density / MetaSensor / HypothesisProbe / postmortem ledger discoverability / shipped-code structural invariants / evidence collector extension) + Phase 12 DW Resilience CLOSED single-day (Pricing Oracle α + Sentinel-Pacemaker Handshake β + Universal Terminal Postmortem E all live in production); (26.2) refined Cognitive & Epistemic Delta — what CC still has that O+V doesn't post-§25 closure (unbounded interactive recursion / speculative execution trees / mid-generation self-critique / streamed reasoning surface / **confidence-aware decisions** / counterfactual reasoning); (26.3) refined Deep Observability — temporal reconstruction is the missing depth (causality DAG / latent-space confidence broadcast / pre-trip circuit-breaker events / parallel fan-out canvas / time-travel debugging UI); (26.4) brutal grade B+/B− defense — happy path A−, edge cases B−; new race conditions enumerated (W2(5) Slice 5b in-flight / `_active_file_ops` heuristic TTL / Slice 1.3 ordinal under L3 fan-out); new Antivenom bypass vectors (plausibly-typed dead code / symbol-shape hallucination / test-shape gaming / Quine-style obfuscation); (26.5) **Critical Path to A-Level RSI — top 3 systemic upgrades**: Priority 1 Confidence-Aware Execution (Probabilistic Posture) — capture provider logprobs as routing signal + circuit-breaker; Priority 2 Causality DAG + Deterministic Replay — promote phase_capture from per-phase Merkle nodes to session-spanning DAG with parent_record_ids + counterfactual_of edges; Priority 3 Adaptive Anti-Venom (unblock Pass C) — gated on W2(5) Slice 5b + Pass B Slice 1; (26.6) **Cost contract structural reinforcement** — three structural reinforcements bulletproofing BG-never-cascades-to-Claude: AST invariant (extends §25 Priority E shipped_code_invariants seed) + runtime structural assertion (CostContractViolation fatal exception in providers.py at dispatch boundary) + Property Oracle claim (extends §25 Priority A default-claim manifest with `cost.bg_op_used_claude_must_be_false` per-op); (26.7) in-flight alignment table + impact-ranked sequencing for next focus; (26.8) explicit non-prescriptions (no soak re-run with master-off / no more sensors / no more phase runners / no brand-new RSI core); (26.9) summary — the path from B+ to A. **Updates §1 Executive Summary** ("Where we stand" refreshed to post-Phase-12-DW-Resilience-closure + soak #7 verification; grade table refreshed: Architecture A, Cognitive depth B+, RSI Gear 2 B, RSI Gear 3 A−, Self-tightening immunity A−, Cost contract enforcement A−, Net B+/B−). Updates TOC with §26 subsection links. **Marks §25 as superseded by §26 (Priorities A–F all closed).** Zero behavior change — doc-only update synthesizing today's architectural review. | Claude Opus 4.7 (post-Phase-12-DW-Resilience-closure architectural review) |
 | 2026-04-25 | 1.0 | Initial draft | Claude Opus 4.7 (synthesis from 7-day operator collaboration) |
 | 2026-04-25 | 2.0 | Added: TOC, §4 Cognitive Scaffolding deep dive, §5 RSI Convergence Framework, §8 Manifesto alignment, §10 Per-phase telemetry, §11 Per-phase testing, §18 Stakeholder map, §19 Migration & versioning. Expanded: §22 Trinity context, App A glossary, App B reference docs map, App C phase gate criteria. | Claude Opus 4.7 (per operator request: "more depth, RSI section, more references") |
