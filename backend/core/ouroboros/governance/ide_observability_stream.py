@@ -241,6 +241,28 @@ EVENT_TYPE_TERMINAL_POSTMORTEM_PERSISTED = "terminal_postmortem_persisted"
 # Payload: {record_id, counterfactual_id, session_id, wall_ts}.
 EVENT_TYPE_DAG_FORK_DETECTED = "dag_fork_detected"
 
+# Priority #3 Slice 4 — Counterfactual Replay observability. Two
+# event types fire from counterfactual_replay_observer:
+#   * COMPLETE — per-verdict SSE: one event per recorded replay
+#     (after engine produces a ReplayVerdict). Payload: {session_id,
+#     swap_phase, swap_kind, outcome, verdict, recurrence_evidence,
+#     tightening, cluster_kind, schema_version}.
+#   * BASELINE_UPDATED — per-aggregation SSE: fires when the
+#     periodic observer recomputes the recurrence-reduction-pct
+#     baseline and the ComparisonOutcome changed (or every Nth
+#     pass for liveness). Payload: {outcome, total_replays,
+#     actionable_count, recurrence_reduction_pct, regression_rate,
+#     postmortems_prevented, baseline_quality, tightening,
+#     schema_version}.
+# Both are PURE OBSERVABILITY — no authority surface. Cost-contract
+# preserved by construction (observer reads cached artifacts only).
+EVENT_TYPE_COUNTERFACTUAL_REPLAY_COMPLETE = (
+    "counterfactual_replay_complete"
+)
+EVENT_TYPE_COUNTERFACTUAL_BASELINE_UPDATED = (
+    "counterfactual_baseline_updated"
+)
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -292,6 +314,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_FLAG_CHANGED,                  # Phase 8 Slice 2
     EVENT_TYPE_TERMINAL_POSTMORTEM_PERSISTED,  # Priority D Slice D1
     EVENT_TYPE_DAG_FORK_DETECTED,             # Priority 2 Slice 4
+    EVENT_TYPE_COUNTERFACTUAL_REPLAY_COMPLETE,   # Priority #3 Slice 4
+    EVENT_TYPE_COUNTERFACTUAL_BASELINE_UPDATED,  # Priority #3 Slice 4
 })
 
 

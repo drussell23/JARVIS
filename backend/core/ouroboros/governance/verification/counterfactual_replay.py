@@ -577,6 +577,69 @@ class ReplayVerdict:
             "schema_version": self.schema_version,
         }
 
+    @classmethod
+    def from_dict(
+        cls, raw: Mapping[str, Any],
+    ) -> Optional["ReplayVerdict"]:
+        """Reconstruct from a JSON-shaped mapping. NEVER raises —
+        returns None on schema-mismatch / missing required fields.
+
+        Pairs with ``to_dict`` for round-trip persistence (Slice 4's
+        history store + IDE GET endpoints). Tolerates schema drift:
+        missing optional fields default; ReplayOutcome /
+        BranchVerdict are looked up case-insensitively against
+        their value vocabularies."""
+        try:
+            if not isinstance(raw, Mapping):
+                return None
+            if (
+                raw.get("schema_version")
+                != COUNTERFACTUAL_REPLAY_SCHEMA_VERSION
+            ):
+                return None
+            outcome_raw = raw.get("outcome")
+            verdict_raw = raw.get("verdict")
+            if not isinstance(outcome_raw, str):
+                return None
+            if not isinstance(verdict_raw, str):
+                return None
+            try:
+                outcome = ReplayOutcome(outcome_raw)
+            except ValueError:
+                return None
+            try:
+                verdict = BranchVerdict(verdict_raw)
+            except ValueError:
+                return None
+
+            target = None
+            target_raw = raw.get("target")
+            if isinstance(target_raw, Mapping):
+                target = ReplayTarget.from_dict(target_raw)
+
+            original = None
+            original_raw = raw.get("original_branch")
+            if isinstance(original_raw, Mapping):
+                original = BranchSnapshot.from_dict(original_raw)
+
+            counterfactual = None
+            cf_raw = raw.get("counterfactual_branch")
+            if isinstance(cf_raw, Mapping):
+                counterfactual = BranchSnapshot.from_dict(cf_raw)
+
+            return cls(
+                outcome=outcome,
+                target=target,
+                original_branch=original,
+                counterfactual_branch=counterfactual,
+                verdict=verdict,
+                divergence_phase=str(raw.get("divergence_phase", "")),
+                divergence_reason=str(raw.get("divergence_reason", "")),
+                detail=str(raw.get("detail", "")),
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Internal: stable verdict-fingerprint hash (for Slice 4 dedup)
