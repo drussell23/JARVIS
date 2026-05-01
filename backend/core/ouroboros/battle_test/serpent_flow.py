@@ -544,6 +544,96 @@ class SerpentFlow:
             highlight=False,
         )
 
+    def _read_current_posture_token(self) -> str:
+        """Best-effort read of the current posture for receipt lines.
+
+        Returns a short uppercase token (EXPLORE / CONSOLIDATE /
+        HARDEN / MAINTAIN) or empty string when unavailable. Never
+        raises — receipt emission must not depend on the posture
+        observer being live."""
+        try:
+            from backend.core.ouroboros.governance.posture_observer import (
+                get_default_store,
+            )
+            reading = get_default_store().load_current()
+            if reading is None:
+                return ""
+            posture = getattr(reading, "posture", None)
+            if posture is None:
+                return ""
+            return (
+                posture.value.upper() if hasattr(posture, "value")
+                else str(posture).upper()
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _emit_op_receipt(
+        self,
+        op_id: str,
+        *,
+        kind: str,  # "success" | "failure"
+        cost_usd: float,
+        elapsed_s: float,
+        failure_reason: str = "",
+        failure_phase: str = "",
+    ) -> None:
+        """Emit a single inline op-completion receipt line.
+
+        UI Slice 6 (2026-04-30): grep-friendly summary line emitted
+        whenever an op reaches a terminal state. Format:
+
+            [✓] op-a7f3 · cost $0.0042 · posture EXPLORE · 22.3s
+            [✗] op-b8d2 · cost $0.0010 · posture HARDEN  · 15.7s · failed at GENERATE
+
+        Single line, ` · ` separators (grep-friendly — no
+        box-drawing glyphs), plain ANSI styling. Posture is read
+        best-effort from the existing observer surface; absent when
+        the observer hasn't run yet.
+
+        Parameters
+        ----------
+        op_id:
+            Full op id; the receipt shows the short form via
+            ``_short_id``.
+        kind:
+            ``"success"`` or ``"failure"`` — drives the glyph and
+            color.
+        cost_usd:
+            Per-op cost in USD; rendered with 4 decimals.
+        elapsed_s:
+            Wall-clock duration of the op.
+        failure_reason / failure_phase:
+            Used only for ``kind="failure"``; surface the reason
+            and the phase that emitted the failure.
+        """
+        short = _short_id(op_id)
+        glyph = "✓" if kind == "success" else "✗"
+        glyph_color = _C["life"] if kind == "success" else _C["death"]
+        posture_tok = self._read_current_posture_token()
+        posture_seg = (
+            f" [{_C['dim']}]·[/{_C['dim']}] posture {posture_tok}"
+            if posture_tok else ""
+        )
+        cost_seg = f" [{_C['dim']}]·[/{_C['dim']}] cost ${cost_usd:.4f}"
+        time_seg = (
+            f" [{_C['dim']}]·[/{_C['dim']}] {elapsed_s:.1f}s"
+        )
+        tail_seg = ""
+        if kind == "failure" and failure_reason:
+            _phase = (
+                f" at {failure_phase}" if failure_phase else ""
+            )
+            tail_seg = (
+                f" [{_C['dim']}]·[/{_C['dim']}] "
+                f"[{_C['death']}]failed{_phase}: {failure_reason[:60]}[/{_C['death']}]"
+            )
+        self.console.print(
+            f"  [{glyph_color}][{glyph}][/{glyph_color}] "
+            f"op-{short}{cost_seg}{posture_seg}{time_seg}{tail_seg}",
+            highlight=False,
+        )
+
     def _close_op_block(self, op_id: str) -> None:
         """Print the bottom border of an op block with running stats."""
         self._active_ops.discard(op_id)
@@ -1644,6 +1734,15 @@ class SerpentFlow:
         self._op_rationales.pop(op_id, None)
         self._close_op_block(op_id)
 
+        # UI Slice 6 — grep-friendly inline receipt right after the
+        # block close. Single line, ` · ` separators, plain ANSI.
+        self._emit_op_receipt(
+            op_id,
+            kind="success",
+            cost_usd=cost_usd,
+            elapsed_s=elapsed,
+        )
+
     def op_failed(self, op_id: str, reason: str, phase: str = "") -> None:
         """The organism shed a failed change."""
         self._stop_status()
@@ -1670,6 +1769,16 @@ class SerpentFlow:
 
         # Close the op block
         self._close_op_block(op_id)
+
+        # UI Slice 6 — grep-friendly inline failure receipt.
+        self._emit_op_receipt(
+            op_id,
+            kind="failure",
+            cost_usd=0.0,
+            elapsed_s=elapsed,
+            failure_reason=reason,
+            failure_phase=phase,
+        )
 
     def op_noop(self, op_id: str, reason: str = "") -> None:
         """Triage NO_OP — operation was unnecessary."""
