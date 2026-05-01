@@ -129,9 +129,9 @@ class _RaisingCollector:
 
 
 class TestSubGateFlag:
-    def test_default_is_false(self):
+    def test_default_is_true_post_graduation(self):
         os.environ.pop("JARVIS_COHERENCE_OBSERVER_ENABLED", None)
-        assert observer_enabled() is False
+        assert observer_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on", "TRUE"],
@@ -155,11 +155,12 @@ class TestSubGateFlag:
 
     @pytest.mark.parametrize("v", ["", "   ", "\t\n"])
     def test_whitespace(self, v):
+        # Whitespace = unset = default = True post-graduation
         with mock.patch.dict(
             os.environ,
             {"JARVIS_COHERENCE_OBSERVER_ENABLED": v},
         ):
-            assert observer_enabled() is False
+            assert observer_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -705,10 +706,15 @@ class TestSSEPublisher:
 
 class TestLifecycle:
     def test_start_master_off_no_op(self, tmp_base):
-        os.environ.pop("JARVIS_COHERENCE_AUDITOR_ENABLED", None)
-        obs = CoherenceObserver(base_dir=tmp_base)
-        obs.start()
-        assert obs.is_running() is False
+        # Master default-true post graduation; explicit false to
+        # exercise the master-off-no-op path
+        with mock.patch.dict(
+            os.environ,
+            {"JARVIS_COHERENCE_AUDITOR_ENABLED": "false"},
+        ):
+            obs = CoherenceObserver(base_dir=tmp_base)
+            obs.start()
+            assert obs.is_running() is False
 
     def test_start_sub_gate_off_no_op(self, tmp_base):
         with mock.patch.dict(

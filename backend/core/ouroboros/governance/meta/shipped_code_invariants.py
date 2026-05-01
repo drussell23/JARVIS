@@ -1291,6 +1291,193 @@ def _validate_quorum_cap_structure_pinned(
     return tuple(violations)
 
 
+# ---------------------------------------------------------------------------
+# Priority #1 — Coherence Auditor AST pins (4 invariants)
+# ---------------------------------------------------------------------------
+
+
+def _validate_coherence_auditor_pure_stdlib(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Slice 1 primitive MUST be pure-stdlib. NO governance
+    imports of any kind — strongest authority invariant. Any
+    ``backend.*`` or ``governance`` import is a violation.
+
+    Also AST-pinned no-exec/eval/compile (mirrors Move 6 Slice 2's
+    critical safety pin — auditor compares fingerprints, never
+    executes shipped code) and no async (Slice 3 introduces
+    async; Slice 1 stays sync).
+
+    NEVER raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if "backend." in module or "governance" in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: coherence_auditor must be "
+                    f"pure-stdlib — found {module!r}"
+                )
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in ("exec", "eval", "compile"):
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: coherence_auditor MUST "
+                        f"NOT execute candidate code — found "
+                        f"{node.func.id}() call"
+                    )
+        if isinstance(node, ast.AsyncFunctionDef):
+            lineno = getattr(node, "lineno", "?")
+            violations.append(
+                f"line {lineno}: Slice 1 primitive must remain "
+                f"sync — found async function {node.name!r}"
+            )
+    return tuple(violations)
+
+
+def _validate_coherence_observer_no_authority(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Slice 3 observer MUST NOT import orchestrator-tier modules.
+    Allowed governance imports: Slice 1 (coherence_auditor),
+    Slice 2 (coherence_window_store), posture_observer (read-
+    only), posture_health (Tier 1 #2 lazy), and
+    ide_observability_stream (lazy SSE). NEVER raises."""
+    forbidden = (
+        "orchestrator", "iron_gate", "policy", "change_engine",
+        "candidate_generator", "providers",
+        "doubleword_provider", "urgency_router",
+        "auto_action_router", "subagent_scheduler",
+        "tool_executor", "phase_runners", "semantic_guardian",
+        "semantic_firewall", "risk_engine",
+    )
+    allowed_governance = {
+        (
+            "backend.core.ouroboros.governance.verification."
+            "coherence_auditor"
+        ),
+        (
+            "backend.core.ouroboros.governance.verification."
+            "coherence_window_store"
+        ),
+        "backend.core.ouroboros.governance.posture_observer",
+        "backend.core.ouroboros.governance.posture_health",
+        (
+            "backend.core.ouroboros.governance."
+            "ide_observability_stream"
+        ),
+    }
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        module = (
+            node.module if isinstance(node, ast.ImportFrom)
+            else (node.names[0].name if node.names else "")
+        )
+        module = module or ""
+        for f in forbidden:
+            if f in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden authority "
+                    f"import contains {f!r}: {module}"
+                )
+        if isinstance(node, ast.ImportFrom):
+            if (
+                module
+                and "governance" in module
+                and module not in allowed_governance
+            ):
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: governance import outside "
+                    f"observer allowlist: {module}"
+                )
+    return tuple(violations)
+
+
+def _validate_coherence_window_store_uses_flock(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """STRUCTURAL cross-process safety pin. Slice 2 store MUST
+    reference both ``flock_append_line`` (audit log) AND
+    ``flock_critical_section`` (signature ring buffer) from
+    ``cross_process_jsonl``. Catches a refactor that drops cross-
+    process safety on either persistence path. NEVER raises."""
+    violations: List[str] = []
+    if "flock_append_line" not in source:
+        violations.append(
+            "store dropped flock_append_line reference — audit "
+            "log cross-process safety guard is gone"
+        )
+    if "flock_critical_section" not in source:
+        violations.append(
+            "store dropped flock_critical_section reference — "
+            "signature ring buffer cross-process safety guard is "
+            "gone"
+        )
+    # Verify the importfrom shape exists too
+    found_import = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if (
+                node.module
+                == "backend.core.ouroboros.governance."
+                "cross_process_jsonl"
+            ):
+                found_import = True
+                break
+    if not found_import:
+        violations.append(
+            "store must import from cross_process_jsonl via "
+            "importfrom"
+        )
+    return tuple(violations)
+
+
+def _validate_coherence_action_bridge_uses_adaptation_ledger(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """STRUCTURAL universal-cage-rule integration pin. Slice 4
+    bridge MUST import ``MonotonicTighteningVerdict`` from
+    ``adaptation.ledger`` AND reference the symbol in code.
+    Catches a refactor that drops the Phase C monotonic-
+    tightening vocabulary integration. NEVER raises."""
+    violations: List[str] = []
+    if "MonotonicTighteningVerdict" not in source:
+        violations.append(
+            "bridge dropped MonotonicTighteningVerdict — Phase "
+            "C universal cage rule integration is gone"
+        )
+    found_import = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if (
+                node.module
+                == "backend.core.ouroboros.governance."
+                "adaptation.ledger"
+            ):
+                for alias in node.names:
+                    if alias.name == "MonotonicTighteningVerdict":
+                        found_import = True
+                        break
+    if not found_import:
+        violations.append(
+            "bridge must import MonotonicTighteningVerdict via "
+            "importfrom from adaptation.ledger"
+        )
+    # Also verify flock_append_line for the advisory persistence
+    if "flock_append_line" not in source:
+        violations.append(
+            "bridge dropped flock_append_line — advisory "
+            "persistence cross-process safety is gone"
+        )
+    return tuple(violations)
+
+
 def _validate_invariant_drift_auditor_no_disk_writes(
     tree: ast.Module, source: str,
 ) -> Tuple[str, ...]:
@@ -1881,6 +2068,95 @@ def _register_seed_invariants() -> None:
                 "threshold=1 single-roll consensus)."
             ),
             validate=_validate_quorum_cap_structure_pinned,
+        ),
+    )
+    # Priority #1 Slice 5 — Coherence Auditor graduation pins.
+    # Closes the gestalt-rotation blind spot identified in §28.7
+    # brutal review: behavioral drift detection complementing
+    # Move 4's structural drift via the same observer / store /
+    # bridge architectural mirror. These pins protect the
+    # structural primitives from refactor drift.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "coherence_auditor_no_authority_imports_primitive"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "coherence_auditor.py"
+            ),
+            description=(
+                "Slice 1 Coherence Auditor primitive MUST be "
+                "PURE-STDLIB — strongest authority invariant. "
+                "Zero governance imports of any kind, zero "
+                "exec/eval/compile (mirrors Move 6 Slice 2 "
+                "ast_canonical's safety pin), no async (Slice 3 "
+                "introduces async). Slice 3 observer feeds Slice "
+                "1 pre-aggregated WindowData; the primitive "
+                "stays decoupled from collection."
+            ),
+            validate=_validate_coherence_auditor_pure_stdlib,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "coherence_observer_no_authority_imports"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "coherence_observer.py"
+            ),
+            description=(
+                "Slice 3 async observer MUST NOT import "
+                "orchestrator-tier modules. Allowed governance "
+                "imports: Slice 1 (coherence_auditor), Slice 2 "
+                "(coherence_window_store), posture_observer "
+                "(read-only), posture_health (Tier 1 #2 lazy), "
+                "ide_observability_stream (lazy SSE)."
+            ),
+            validate=_validate_coherence_observer_no_authority,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="coherence_window_store_uses_flock",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "coherence_window_store.py"
+            ),
+            description=(
+                "STRUCTURAL cross-process safety: Slice 2 store "
+                "MUST reference flock_append_line (audit log) "
+                "AND flock_critical_section (ring buffer). "
+                "Catches refactor that drops cross-process "
+                "safety on either persistence path."
+            ),
+            validate=_validate_coherence_window_store_uses_flock,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "coherence_action_bridge_consumes_adaptation_ledger"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "coherence_action_bridge.py"
+            ),
+            description=(
+                "STRUCTURAL Phase C universal-cage-rule "
+                "integration: Slice 4 bridge MUST import "
+                "MonotonicTighteningVerdict from "
+                "adaptation.ledger AND reference the symbol in "
+                "code AND use flock_append_line for advisory "
+                "persistence. Catches refactor that bypasses "
+                "the universal cage rule or drops cross-process "
+                "safety on the advisory log."
+            ),
+            validate=(
+                _validate_coherence_action_bridge_uses_adaptation_ledger
+            ),
         ),
     )
 

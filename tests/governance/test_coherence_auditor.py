@@ -105,9 +105,13 @@ def _coherent_signature(*, p99: int = 5) -> BehavioralSignature:
 
 
 class TestMasterFlag:
-    def test_default_is_false(self):
+    def test_default_is_true_post_graduation(self):
+        # Slice 5 graduated 2026-05-01 — auditor default-true
+        # because read-only over existing artifacts (zero LLM
+        # cost). Operator approval via advisory ledger is still
+        # required for any actual flag flip downstream.
         os.environ.pop("JARVIS_COHERENCE_AUDITOR_ENABLED", None)
-        assert coherence_auditor_enabled() is False
+        assert coherence_auditor_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on", "TRUE", "Yes"],
@@ -131,11 +135,12 @@ class TestMasterFlag:
 
     @pytest.mark.parametrize("v", ["", "   ", "\t\n"])
     def test_whitespace_treated_as_unset(self, v):
+        # Whitespace = unset = current default = True post-Slice-5
         with mock.patch.dict(
             os.environ,
             {"JARVIS_COHERENCE_AUDITOR_ENABLED": v},
         ):
-            assert coherence_auditor_enabled() is False
+            assert coherence_auditor_enabled() is True
 
 
 # ---------------------------------------------------------------------------

@@ -1843,6 +1843,153 @@ SEED_SPECS: list = [
         example="false",
         since="Move 6 Slice 2",
     ),
+
+    # ====================================================================
+    # Coherence Auditor (Priority #1) — 8 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_COHERENCE_AUDITOR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the Long-Horizon Semantic "
+            "Coherence Auditor. When false, all 4 slices revert "
+            "in lockstep (drift compute → DISABLED, observer "
+            "won't start, bridge returns empty). Graduated "
+            "default-true post-Slice-5 because auditor is read-"
+            "only over existing artifacts (zero LLM cost, zero "
+            "K× generation amplification, periodic schedule)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "coherence_auditor.py"
+        ),
+        example="true",
+        since="Priority #1 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_COHERENCE_OBSERVER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the periodic async observer task. When "
+            "master is true AND this is true, the observer "
+            "spawns and runs at posture-aware cadence. Operators "
+            "may set false to disable the schedule while keeping "
+            "primitive APIs callable for on-demand audits."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "coherence_observer.py"
+        ),
+        example="true",
+        since="Priority #1 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the auto_action_router bridge. "
+            "Controls whether drift verdicts produce advisory "
+            "records under the monotonic-tightening contract "
+            "(no auto-flag-flip path; operator approval still "
+            "required)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "coherence_action_bridge.py"
+        ),
+        example="true",
+        since="Priority #1 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_COHERENCE_WINDOW_HOURS",
+        type=FlagType.INT, default=168,
+        description=(
+            "Bounded coherence window length in hours. Default "
+            "168 = 7 days. Cap structure: min(720, max(24, "
+            "value)) — ceiling 30 days; floor 24h prevents "
+            "degenerate single-cycle comparison."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "coherence_window_store.py"
+        ),
+        example="168",
+        since="Priority #1 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_COHERENCE_MAX_SIGNATURES",
+        type=FlagType.INT, default=200,
+        description=(
+            "Bounded ring buffer cap. Read-trim-atomic-write "
+            "evicts oldest when count exceeds. Cap structure: "
+            "min(5000, max(10, value))."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "coherence_window_store.py"
+        ),
+        example="200",
+        since="Priority #1 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_COHERENCE_CADENCE_HOURS_DEFAULT",
+        type=FlagType.FLOAT, default=6.0,
+        description=(
+            "Observer cadence in EXPLORE/CONSOLIDATE/None "
+            "postures. HARDEN tightens to 3h via "
+            "JARVIS_COHERENCE_CADENCE_HOURS_HARDEN; MAINTAIN "
+            "relaxes to 12h."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "coherence_observer.py"
+        ),
+        example="6.0",
+        since="Priority #1 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_COHERENCE_HALFLIFE_DAYS",
+        type=FlagType.FLOAT, default=14.0,
+        description=(
+            "Recency-weight halflife for distribution "
+            "aggregation. Mirrors SemanticIndex's 14d default "
+            "(formula parity pinned by test). Older ops/postures "
+            "decay at this halflife within the window."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "coherence_auditor.py"
+        ),
+        example="14.0",
+        since="Priority #1 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_COHERENCE_TIGHTEN_FACTOR",
+        type=FlagType.FLOAT, default=0.8,
+        description=(
+            "Default tightening proposer multiplier for numeric "
+            "drift kinds. proposed = current × factor (smaller-"
+            "is-tighter). 0.8 = 20% reduction. Cap structure: "
+            "min(0.95, max(0.5, value)) — floor prevents "
+            "catastrophic tightening; ceiling ensures proposals "
+            "are minimally tighter."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "coherence_action_bridge.py"
+        ),
+        example="0.8",
+        since="Priority #1 Slice 5",
+    ),
 ]
 
 

@@ -115,11 +115,11 @@ def _make_verdict(*, findings=None, outcome=None):
 
 
 class TestSubGateFlag:
-    def test_default_is_false(self):
+    def test_default_is_true_post_graduation(self):
         os.environ.pop(
             "JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED", None,
         )
-        assert coherence_action_bridge_enabled() is False
+        assert coherence_action_bridge_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on", "TRUE"],
@@ -431,12 +431,15 @@ class TestDefaultProposer:
 
 class TestBridgePropose:
     def test_disabled_returns_empty(self):
-        os.environ.pop(
-            "JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED", None,
-        )
-        v = _make_verdict()
-        out = propose_coherence_action(v)
-        assert out == tuple()
+        # Bridge default-true post graduation; explicit false to
+        # exercise the disabled-no-op path
+        with mock.patch.dict(
+            os.environ,
+            {"JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED": "false"},
+        ):
+            v = _make_verdict()
+            out = propose_coherence_action(v)
+            assert out == tuple()
 
     def test_coherent_verdict_returns_empty(self):
         v = BehavioralDriftVerdict(
@@ -618,21 +621,30 @@ class TestPersistence:
     def test_record_disabled_returns_disabled(
         self, tmp_path_advisory,
     ):
-        os.environ.pop(
-            "JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED", None,
-        )
-        adv = CoherenceAdvisory(
-            advisory_id="a" * 16, drift_signature="sig",
-            drift_kind=BehavioralDriftKind.BEHAVIORAL_ROUTE_DRIFT,
-            action=CoherenceAdvisoryAction.TIGHTEN_RISK_BUDGET,
-            severity=DriftSeverity.HIGH, detail="x",
-            recorded_at_ts=time.time(),
-            tightening_status=TighteningProposalStatus.PASSED,
-        )
-        out = record_coherence_advisory(
-            adv, path=tmp_path_advisory,
-        )
-        assert out is RecordOutcome.DISABLED
+        # Default-true post graduation; explicit false to
+        # exercise the disabled-record path
+        with mock.patch.dict(
+            os.environ,
+            {"JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED": "false"},
+        ):
+            adv = CoherenceAdvisory(
+                advisory_id="a" * 16, drift_signature="sig",
+                drift_kind=(
+                    BehavioralDriftKind.BEHAVIORAL_ROUTE_DRIFT
+                ),
+                action=(
+                    CoherenceAdvisoryAction.TIGHTEN_RISK_BUDGET
+                ),
+                severity=DriftSeverity.HIGH, detail="x",
+                recorded_at_ts=time.time(),
+                tightening_status=(
+                    TighteningProposalStatus.PASSED
+                ),
+            )
+            out = record_coherence_advisory(
+                adv, path=tmp_path_advisory,
+            )
+            assert out is RecordOutcome.DISABLED
 
     def test_record_enabled_returns_recorded(
         self, tmp_path_advisory,

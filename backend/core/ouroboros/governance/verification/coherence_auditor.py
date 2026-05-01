@@ -130,8 +130,24 @@ COHERENCE_AUDITOR_SCHEMA_VERSION: str = "coherence_auditor.1"
 
 
 def coherence_auditor_enabled() -> bool:
-    """``JARVIS_COHERENCE_AUDITOR_ENABLED`` (default ``false``
-    until Slice 5 graduation).
+    """``JARVIS_COHERENCE_AUDITOR_ENABLED`` (default ``true``
+    post Slice 5 graduation 2026-05-01).
+
+    Master kill switch for the Long-Horizon Semantic Coherence
+    Auditor arc. When false, the entire 4-slice pipeline reverts
+    in lockstep:
+      * compute_behavioral_drift returns DISABLED outcome
+      * publish_behavioral_drift returns None silently
+      * propose_coherence_action returns empty tuple
+      * CoherenceObserver.start() is no-op
+
+    Cost-correctness: graduating default-true is appropriate
+    because the auditor is read-only over existing artifacts
+    (phase_capture / posture_history / summary.json / shipped
+    modules), runs on a periodic schedule (not per-op), and
+    produces ONLY advisory output. Zero LLM calls, zero K×
+    generation amplification. Operator approval via the
+    advisory ledger is still required for any actual flag flip.
 
     Asymmetric env semantics — empty/whitespace = unset = current
     default; explicit ``0``/``false``/``no``/``off`` evaluates
@@ -141,7 +157,7 @@ def coherence_auditor_enabled() -> bool:
         "JARVIS_COHERENCE_AUDITOR_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated 2026-05-01 (Priority #1 Slice 5)
     return raw in ("1", "true", "yes", "on")
 
 

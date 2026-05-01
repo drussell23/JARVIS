@@ -139,15 +139,22 @@ COHERENCE_ACTION_BRIDGE_SCHEMA_VERSION: str = (
 
 
 def coherence_action_bridge_enabled() -> bool:
-    """``JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED`` (default false
-    until Slice 5). Master flag
+    """``JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED`` (default ``true``
+    post Slice 5 graduation 2026-05-01).
+
+    Sub-gate for the bridge that converts BehavioralDriftVerdict →
+    CoherenceAdvisory records. Advisories are written to
+    ``.jarvis/coherence_advisory.jsonl`` for operator review;
+    NO automatic flag flips occur — operator approval via the
+    future ``/coherence`` REPL is the only path from advisory to
+    actual state mutation. Master flag
     (``JARVIS_COHERENCE_AUDITOR_ENABLED``) must also be true for
     advisories to fire. Asymmetric env semantics."""
     raw = os.environ.get(
         "JARVIS_COHERENCE_ACTION_BRIDGE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated 2026-05-01 (Priority #1 Slice 5)
     return raw in ("1", "true", "yes", "on")
 
 

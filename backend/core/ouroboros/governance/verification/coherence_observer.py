@@ -136,17 +136,20 @@ COHERENCE_OBSERVER_SCHEMA_VERSION: str = "coherence_observer.1"
 
 
 def observer_enabled() -> bool:
-    """``JARVIS_COHERENCE_OBSERVER_ENABLED`` (default ``false``
-    until Slice 5 graduation).
+    """``JARVIS_COHERENCE_OBSERVER_ENABLED`` (default ``true``
+    post Slice 5 graduation 2026-05-01).
 
-    Sub-gate for the periodic auditor. Master flag
-    (``JARVIS_COHERENCE_AUDITOR_ENABLED``) must also be true.
+    Sub-gate for the periodic observer task. Master flag
+    (``JARVIS_COHERENCE_AUDITOR_ENABLED``) must also be true for
+    the observer to actually start. Operators may set this false
+    to disable the periodic auditor while keeping the primitive
+    APIs callable (e.g., on-demand audits without the schedule).
     Asymmetric env semantics."""
     raw = os.environ.get(
         "JARVIS_COHERENCE_OBSERVER_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated 2026-05-01 (Priority #1 Slice 5)
     return raw in ("1", "true", "yes", "on")
 
 
