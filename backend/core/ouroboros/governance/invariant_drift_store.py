@@ -380,7 +380,11 @@ class InvariantDriftStore:
     def append_history(self, snap: InvariantSnapshot) -> None:
         """Append to the ring buffer, trim to ``history_size`` from
         the front. Mirrors ``PostureStore.append_history`` exactly.
-        NEVER raises."""
+        NEVER raises.
+
+        Tier 1 #3 — wraps the read-trim-atomic-write block in
+        cross-process flock so concurrent processes cannot race the
+        ring-buffer mutation (last-writer-wins → lost entries)."""
         try:
             line = json.dumps(
                 snap.to_dict(), separators=(",", ":"),
@@ -391,35 +395,60 @@ class InvariantDriftStore:
                 "%s", exc,
             )
             return
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_critical_section,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            flock_critical_section = None  # type: ignore[assignment]
         with self._lock:
             try:
                 self.history_path.parent.mkdir(
                     parents=True, exist_ok=True,
                 )
-                lines: List[str] = []
-                if self.history_path.exists():
-                    try:
-                        lines = [
-                            ln for ln in
-                            self.history_path.read_text(
-                                encoding="utf-8",
-                            ).splitlines()
-                            if ln.strip()
-                        ]
-                    except OSError:
-                        lines = []
-                lines.append(line)
-                if len(lines) > self._history_size:
-                    lines = lines[-self._history_size:]
-                self._atomic_write(
-                    self.history_path,
-                    "\n".join(lines) + "\n",
-                )
-            except Exception as exc:  # noqa: BLE001 — defensive
+            except OSError as exc:
                 logger.warning(
-                    "[InvariantDriftStore] history append failed: "
+                    "[InvariantDriftStore] history mkdir failed: "
                     "%s", exc,
                 )
+                return
+            # Cross-process critical section over read-trim-write.
+            # If lock acquire fails, fall through to in-process-
+            # only behavior (defensive — single-process correctness
+            # preserved by the threading.Lock above).
+            if flock_critical_section is not None:
+                ctx = flock_critical_section(self.history_path)
+            else:
+                from contextlib import nullcontext
+                ctx = nullcontext(True)
+            with ctx as acquired:  # type: ignore[arg-type]
+                _ = acquired  # we proceed regardless; in-proc lock
+                              # already serializes within process
+                try:
+                    lines: List[str] = []
+                    if self.history_path.exists():
+                        try:
+                            lines = [
+                                ln for ln in
+                                self.history_path.read_text(
+                                    encoding="utf-8",
+                                ).splitlines()
+                                if ln.strip()
+                            ]
+                        except OSError:
+                            lines = []
+                    lines.append(line)
+                    if len(lines) > self._history_size:
+                        lines = lines[-self._history_size:]
+                    self._atomic_write(
+                        self.history_path,
+                        "\n".join(lines) + "\n",
+                    )
+                except Exception as exc:  # noqa: BLE001 — defensive
+                    logger.warning(
+                        "[InvariantDriftStore] history append "
+                        "failed: %s", exc,
+                    )
 
     def load_history(
         self, *, limit: Optional[int] = None,
@@ -457,7 +486,11 @@ class InvariantDriftStore:
     # ---- audit (immutable §8) -------------------------------------------
 
     def append_audit(self, record: BaselineAuditRecord) -> None:
-        """Append-only audit log. NEVER raises."""
+        """Append-only audit log. NEVER raises.
+
+        Tier 1 #3 — uses cross-process flock helper so multiple
+        processes cannot interleave partial writes into the §8
+        immutable audit trail."""
         try:
             line = json.dumps(
                 record.to_dict(), separators=(",", ":"),
@@ -468,16 +501,20 @@ class InvariantDriftStore:
                 exc,
             )
             return
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_append_line,
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.warning(
+                "[InvariantDriftStore] audit cross-process helper "
+                "import failed: %s", exc,
+            )
+            return
         with self._lock:
             try:
-                self.audit_path.parent.mkdir(
-                    parents=True, exist_ok=True,
-                )
-                with self.audit_path.open(
-                    "a", encoding="utf-8",
-                ) as fh:
-                    fh.write(line + "\n")
-            except OSError as exc:
+                flock_append_line(self.audit_path, line)
+            except Exception as exc:  # noqa: BLE001 — defensive
                 logger.warning(
                     "[InvariantDriftStore] audit append failed: %s",
                     exc,

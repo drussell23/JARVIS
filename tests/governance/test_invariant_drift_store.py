@@ -779,6 +779,12 @@ class TestAuthorityInvariants:
         path = _module_path()
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
+        # Allowed: invariant_drift_auditor (Slice 2's snapshot type)
+        # + cross_process_jsonl (Tier 1 #3 cross-process flock helper).
+        allowed = (
+            "invariant_drift_auditor",
+            "cross_process_jsonl",
+        )
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 mod = node.module or ""
@@ -786,8 +792,8 @@ class TestAuthorityInvariants:
                     "backend.core.ouroboros.governance",
                 ):
                     continue
-                # The ONLY allowed governance import is the auditor.
-                assert "invariant_drift_auditor" in mod, (
+                ok = any(sub in mod for sub in allowed)
+                assert ok, (
                     f"invariant_drift_store imports unexpected "
                     f"governance module: {mod}"
                 )

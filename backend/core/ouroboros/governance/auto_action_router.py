@@ -1098,21 +1098,20 @@ class AutoActionProposalLedger:
         """Append a proposal as a JSONL row. Returns True on
         success, False on any failure (parent missing, disk full,
         etc.) — NEVER raises. NO_ACTION proposals are skipped to
-        keep the ledger focused on operator-relevant signal."""
+        keep the ledger focused on operator-relevant signal.
+
+        Tier 1 #3 — uses cross-process flock helper so multiple
+        processes (e.g., concurrent battle-test runs) cannot
+        interleave partial writes."""
         if action.action_type is AdvisoryActionType.NO_ACTION:
             return False
         line = _action_to_jsonl_record(action)
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            return False
-        try:
-            with self._lock:
-                with self._path.open("a", encoding="utf-8") as fh:
-                    fh.write(line)
-                    fh.write("\n")
-            return True
-        except OSError as exc:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_append_line,
+            )
+            return flock_append_line(self._path, line)
+        except Exception as exc:  # noqa: BLE001 — defensive
             logger.debug(
                 "[auto_action_router] ledger append failed at %s: %s",
                 self._path, exc,
