@@ -412,6 +412,32 @@ class ConfidenceMonitor:
         except Exception:  # noqa: BLE001 — defensive
             return None
 
+    def reset_window(self) -> int:
+        """Clear the rolling-margin window. Returns the number of
+        observations dropped. NEVER raises.
+
+        **Move 5 Slice 4** entry point: when a confidence-aware
+        probe loop CONVERGES on an autonomous answer
+        (``ProbeOutcome.CONVERGED``), the caller invokes this to
+        clear the rolling window so the next ``evaluate()`` call
+        returns ``OK`` regardless of the prior low-confidence
+        signal. This is the structural mechanism that makes
+        ``PROBE_ENVIRONMENT`` → ``RETRY_WITH_FEEDBACK`` produce a
+        clean retry without re-firing the collapse on the next
+        observation.
+
+        Master-flag respected: if ``confidence_monitor_enabled()``
+        is off, this is a no-op (returns 0)."""
+        if not confidence_monitor_enabled():
+            return 0
+        try:
+            with self._lock:
+                dropped = len(self._window)
+                self._window.clear()
+                return dropped
+        except Exception:  # noqa: BLE001 — defensive
+            return 0
+
     def snapshot(self) -> MonitorSnapshot:
         """Frozen point-in-time view of monitor state. Useful for
         ledger persistence, SSE payloads (Slice 4), heartbeat

@@ -98,11 +98,18 @@ class TrivialityVerdict:
 
 
 class ConfidenceCollapseAction(str, Enum):
-    """Three discrete actions a caller takes after a confidence
-    collapse, derived by ``probe_confidence_collapse``.
+    """Discrete actions a caller takes after a confidence collapse.
+    Derived by ``probe_confidence_collapse`` (3 base actions) +
+    ``execute_probe_environment`` (Move 5 Slice 4 — adds
+    ``PROBE_ENVIRONMENT`` as the 4th value).
 
     String-valued so the action serializes cleanly into ctx
-    artifacts + ledger records + Slice 4 SSE payloads.
+    artifacts + ledger records + SSE payloads.
+
+    Backward-compat invariant (Move 5 Slice 4): consumers that
+    switch on action MUST tolerate the 4th value as a string
+    passthrough (verified — auto_action_router uses
+    ``verdict.value``; observability publishers use ``_safe_str``).
     """
 
     RETRY_WITH_FEEDBACK = "retry_with_feedback"
@@ -122,8 +129,18 @@ class ConfidenceCollapseAction(str, Enum):
     INCONCLUSIVE = "inconclusive"
     """Probe didn't decide — margin in the middle band. Caller
     should retry with reduced thinking budget so the model has
-    less rope to spin uncertain reasoning. Slice 5 will SSE-emit
-    the inconclusive transition for operator awareness."""
+    less rope to spin uncertain reasoning. SSE-emit the
+    inconclusive transition for operator awareness."""
+
+    PROBE_ENVIRONMENT = "probe_environment"
+    """**Move 5 Slice 4** — transient action signaling the caller
+    should run ``execute_probe_environment`` (autonomous probe
+    loop) before deciding the final action. After the probe
+    completes, ``execute_probe_environment`` returns one of the 3
+    base actions above (RETRY/ESCALATE/INCONCLUSIVE) — never
+    PROBE_ENVIRONMENT itself. PROBE_ENVIRONMENT is therefore the
+    *trigger* state, not a terminal one. Master-flag-gated by
+    ``JARVIS_CONFIDENCE_PROBE_BRIDGE_ENABLED``."""
 
 
 @dataclass(frozen=True)
