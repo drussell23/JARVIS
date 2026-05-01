@@ -3400,6 +3400,18 @@ class SerpentREPL:
                     if line in ("posture", "/posture"):
                         self._print_posture()
                         continue
+                    if line == "auto-action" or line == "/auto-action":
+                        self._print_auto_action()
+                        continue
+                    if (
+                        line.startswith("auto-action ")
+                        or line.startswith("/auto-action ")
+                    ):
+                        # Subcommand routing: "auto-action stats",
+                        # "auto-action <op_id>"
+                        rest = line.split(None, 1)[1].strip()
+                        self._print_auto_action(arg=rest)
+                        continue
                     if line in ("help", "/help"):
                         self._print_help()
                         continue
@@ -3748,12 +3760,136 @@ class SerpentREPL:
             f.console.print(f"  [bold]Signals[/bold]  {sig_str}")
         f.console.print()
 
+    def _print_auto_action(self, *, arg: str = "") -> None:
+        """Inline auto-action proposal surface — Move 3 Slice 4
+        ``/auto-action`` REPL command.
+
+        Subcommands (delimited by single space):
+          * ``/auto-action``         — recent proposals (last 10)
+          * ``/auto-action stats``   — aggregate counts by action type
+          * ``/auto-action <op_id>`` — proposals tagged with that op_id
+
+        Reads from the existing
+        ``auto_action_router.AutoActionProposalLedger`` — no
+        duplicated state-gathering. Output is inline + scrollable
+        (no Rich Panel) per the UI Slice 5/6 conventions.
+        """
+        f = self._flow
+        f.console.print()
+        try:
+            from backend.core.ouroboros.governance.auto_action_router import (
+                get_default_ledger, proposal_stats,
+            )
+            ledger = get_default_ledger()
+            rows = ledger.read_recent(limit=200)
+        except Exception as _exc:  # noqa: BLE001
+            f.console.print(
+                f"[dim]🎯 Auto-action surface unavailable: "
+                f"{type(_exc).__name__}[/dim]"
+            )
+            f.console.print()
+            return
+
+        # ── Subcommand: stats ──
+        sub = (arg or "").strip().lower()
+        if sub == "stats":
+            stats = proposal_stats(rows)
+            f.console.print(
+                f"[bold magenta]🎯 Auto-Action Stats[/bold magenta]"
+                f"  [dim]({stats.get('total', 0)} proposals "
+                f"in last {len(rows)} ledger rows)[/dim]"
+            )
+            by_type = stats.get("by_action_type", {}) or {}
+            if not by_type:
+                f.console.print(
+                    "  [dim]No actionable proposals on the ledger yet.[/dim]"
+                )
+            else:
+                f.console.print(f"  [bold]By action type[/bold]")
+                for atype, count in sorted(
+                    by_type.items(), key=lambda kv: kv[1], reverse=True,
+                ):
+                    f.console.print(f"    {atype:<28s} {count}")
+            by_family = stats.get("by_op_family", {}) or {}
+            if by_family:
+                f.console.print(f"  [bold]By op family[/bold]")
+                for fam, count in sorted(
+                    by_family.items(), key=lambda kv: kv[1], reverse=True,
+                ):
+                    f.console.print(f"    {fam:<28s} {count}")
+            by_category = stats.get("by_category", {}) or {}
+            if by_category:
+                f.console.print(f"  [bold]By exploration category[/bold]")
+                for cat, count in sorted(
+                    by_category.items(), key=lambda kv: kv[1],
+                    reverse=True,
+                ):
+                    f.console.print(f"    {cat:<28s} {count}")
+            f.console.print()
+            return
+
+        # ── Subcommand: <op_id> filter ──
+        if sub:
+            filtered = [
+                r for r in rows
+                if isinstance(r, dict) and sub in str(r.get("op_id", ""))
+            ]
+            f.console.print(
+                f"[bold magenta]🎯 Auto-Action proposals[/bold magenta]"
+                f"  [dim]op-id ~ {sub!r}: {len(filtered)} matches[/dim]"
+            )
+            if not filtered:
+                f.console.print(
+                    "  [dim]No matching proposals on the ledger.[/dim]"
+                )
+            else:
+                for r in filtered[-10:]:
+                    self._print_auto_action_row(r)
+            f.console.print()
+            return
+
+        # ── Default: recent N ──
+        recent = rows[-10:] if len(rows) > 10 else list(rows)
+        f.console.print(
+            f"[bold magenta]🎯 Auto-Action proposals[/bold magenta]"
+            f"  [dim](last {len(recent)} of {len(rows)} on ledger)[/dim]"
+        )
+        if not recent:
+            f.console.print(
+                "  [dim]No advisory proposals yet — observer is "
+                "shadow-mode and emits only when signal trips trigger.[/dim]"
+            )
+        else:
+            for r in recent:
+                self._print_auto_action_row(r)
+        f.console.print()
+
+    def _print_auto_action_row(self, row: Dict[str, Any]) -> None:
+        """Format one ledger row as a compact inline line."""
+        f = self._flow
+        atype = row.get("action_type", "?")
+        op_id = str(row.get("op_id", ""))[:12]
+        evidence = str(row.get("evidence", ""))[:80]
+        family = row.get("target_op_family", "")
+        category = row.get("target_category", "")
+        target_seg = ""
+        if family:
+            target_seg += f" family={family}"
+        if category:
+            target_seg += f" category={category}"
+        f.console.print(
+            f"  [{_C['neural']}]{atype:<26s}[/{_C['neural']}] "
+            f"[dim]op-{op_id}[/dim]{target_seg}"
+        )
+        f.console.print(f"      [dim]{evidence}[/dim]")
+
     def _print_help(self) -> None:
         """Print available REPL commands."""
         lines = [
             f"  [{_C['dim']}]/status[/{_C['dim']}]           organism status snapshot",
             f"  [{_C['dim']}]/cost[/{_C['dim']}]             cost breakdown by route",
             f"  [{_C['dim']}]/posture[/{_C['dim']}]          current strategic posture",
+            f"  [{_C['dim']}]/auto-action[/{_C['dim']}]      recent advisory proposals (stats|<op_id>)",
             f"  [{_C['dim']}]/lessons[/{_C['dim']}]          show session lesson buffer",
             f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]       cancel an in-flight operation",
             f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]      set risk ceiling",

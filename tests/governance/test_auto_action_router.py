@@ -109,13 +109,23 @@ def test_input_dataclasses_are_frozen():
 # -----------------------------------------------------------------------
 
 
-def test_master_flag_default_false_pre_graduation(monkeypatch):
-    """Slice 1 default: master flag off. Graduates to true in
-    Slice 4 after a clean shadow soak."""
+def test_master_flag_default_true_post_graduation(monkeypatch):
+    """Move 3 Slice 4 (2026-04-30) graduated this flag from false
+    → true. Asymmetric env semantics — empty/whitespace = unset =
+    graduated default-true; explicit falsy hot-reverts."""
     monkeypatch.delenv("JARVIS_AUTO_ACTION_ROUTER_ENABLED", raising=False)
     import backend.core.ouroboros.governance.auto_action_router as m
     importlib.reload(m)
-    assert m.auto_action_router_enabled() is False
+    assert m.auto_action_router_enabled() is True
+
+
+def test_master_flag_explicit_empty_string_post_graduation(monkeypatch):
+    """Asymmetric env semantics — explicit empty string is treated
+    as unset and returns the graduated default-true."""
+    monkeypatch.setenv("JARVIS_AUTO_ACTION_ROUTER_ENABLED", "")
+    import backend.core.ouroboros.governance.auto_action_router as m
+    importlib.reload(m)
+    assert m.auto_action_router_enabled() is True
 
 
 def test_master_flag_explicit_truthy(monkeypatch):
@@ -202,7 +212,9 @@ def _ctx(**kwargs):
 
 
 def test_master_off_returns_no_action(monkeypatch):
-    monkeypatch.delenv("JARVIS_AUTO_ACTION_ROUTER_ENABLED", raising=False)
+    """Post-graduation: env-unset = default-on, so testing the
+    master-off path requires explicit JARVIS_AUTO_ACTION_ROUTER_ENABLED=0."""
+    monkeypatch.setenv("JARVIS_AUTO_ACTION_ROUTER_ENABLED", "0")
     from backend.core.ouroboros.governance.auto_action_router import (
         propose_advisory_action, AdvisoryActionType,
     )

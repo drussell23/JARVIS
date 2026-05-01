@@ -1,7 +1,7 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.5 (2026-04-30 — Move 2 24h burn-in structurally closed; 6 architectural layers shipped; Track Record B→B+, Recovery B+→A−, Operator UX A→A+)
+**Version**: 2.6 (2026-04-30 — Move 3 auto_action_router CLOSED; 4-slice arc shipped same-day; verification→action loop closes; Self-tightening immunity A−→A; master flag graduated default-true in shadow mode; ENFORCE locked off until separate later authorization)
 **Author**: Derek J. Russell (vision) · Claude Opus 4.7 (PRD synthesis)
 **Audience**: Operator (decision authority), JARVIS engineers, future-self (resuming after context loss)
 **Prerequisite reading**: `CLAUDE.md` (architecture), `docs/architecture/OUROBOROS.md` (battle-test breakthrough log), `docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md` (Wang RSI mathematical foundation)
@@ -123,7 +123,7 @@ Color legend: 🟢 = at target / done · 🟡 = in progress / partial · 🔴 = 
 | **RSI Gear 2 — Bounded Curiosity** | 🟢 A− | A | §25 Priority C HypothesisProbe shipped + Priority 1 Slice 3 wires probe consumer for confidence-collapse → 3-action verdict (RETRY/ESCALATE/INCONCLUSIVE); §26.5.1 Priority 1 CLOSED 2026-04-29 |
 | **RSI Gear 3 — Closed-Loop Memory** | 🟢 A− | A | Soak #7 confirms non-trivial claim density (claims=3 pass=1 fail=0 insuff=2 err=0); Order-2 promotion of plan_runner default-claim wiring landed (§25 Priority E) |
 | **Operator UX vs CC** | 🟢 A | A | `/postmortems` REPL + 4 GET endpoints + SSE event landed (§25 Priority D); session-spanning causal DAG navigation surface CLOSED 2026-04-29 (§26.5.2 Priority 2 — `/postmortems dag` family + 2 IDE GETs + `dag_fork_detected` SSE) |
-| **Self-tightening immunity** | 🟢 A− | A | MetaSensor graduated default-true (§25 Priority B); shipped_code_invariants seeded (§25 Priority E); per-trajectory drift detector still missing (§26.5 Priority 3) |
+| **Self-tightening immunity** | 🟢 A | A | MetaSensor graduated default-true (§25 Priority B); shipped_code_invariants seeded (§25 Priority E); §26.5 Priority 3 Pass C graduated 2026-04-30; **Move 3 `auto_action_router` CLOSED 2026-04-30** — verification→action loop closes via 5-value AdvisoryActionType (`memory/project_move_3_closure.md`). Mutation boundary (`JARVIS_AUTO_ACTION_ENFORCE`) locked off; advisory-only shadow mode active. |
 | **Sandbox safety boundary** | 🟡 B | A | Object-graph escape vector documented (§3.6 vector 1); PLAN-skip-by-trivialization bypass closed (§25.5.5 → Priority E shipped); Quine-class hallucination vectors enumerated (§26.4) |
 | **Cross-process safety** | 🟢 A− | A | Slice 1.3 ordinal-counter L3 fan-out bug CLOSED 2026-04-29 by Priority 2 Slice 2 — `(worker_id, op_id, phase, kind)` composite namespace + `worker_id_for_path()` pure-stdlib helper. Advisory file-locking on AdaptationLedger writes (§3.6 vector 3) still pending — gated on Pass C unblock |
 | **Long-horizon semantic stability** | 🟡 B | A | TrajectoryAuditor still missing (§24.8.2); Antivenom is per-op not per-trajectory — addressed by §26.5 Priority 3 (Adaptive Anti-Venom unblocking Pass C) |
@@ -3322,20 +3322,31 @@ These are not features. They're empirical-validation campaigns + one substantive
 2. **Move 3** (`auto_action_router.py`, §27.4.3) — closes the verification → action loop gap.
 3. **Real-environment burn-in retry** — re-run when Anthropic shows multi-hour stable window externally; same parameters, no code changes.
 
-#### 27.4.3 Move 3: Auto-action loop on verification signal (the missing teeth)
+#### 27.4.3 Move 3: Auto-action loop on verification signal — ✅ CLOSED 2026-04-30
 
-**Why third**: Pass C surfaces emit *proposals*; verification emits *pass/fail per claim*; the §26.5.1 Priority 1 confidence-collapse pipeline emits *verdicts*. None of these directly auto-defer a sibling op when a recent claim failed. The structural primitives exist (`MetaSensor` for degenerate-loop alarms, `confidence_route_advisor` for advisory routing, Pass C `/adapt` for adaptation proposals) — but none load-bearingly *gate* the next op based on the signal.
+**Outcome**: 4-slice arc shipped same-day. Advisory router live in shadow mode — produces operator-reviewable proposals on every terminal postmortem. Mutation boundary (`JARVIS_AUTO_ACTION_ENFORCE`) stays locked off until separate later authorization.
 
-**Required upgrade**: a thin `auto_action_router.py` primitive (mirror of `urgency_router.py`) that consumes:
-  * Recent postmortem outcomes (last N=8 ops)
-  * Recent confidence-monitor verdicts
-  * Recent adaptation proposals (Pass C)
+**The 4 slices:**
 
-…and *advisorily proposes* next-op modifications to the orchestrator: defer this op family, demote its risk-tier, route to NOTIFY_APPLY for human review, raise the exploration floor for this category. **Advisory only** initially (mirrors confidence_route_advisor); operator approves the auto-action graduation.
+1. **Primitive** (`18a90afe0c`, 25 tests) — new `auto_action_router.py` (~470 lines, stdlib-only + cost_contract_assertion). 5-value `AdvisoryActionType` enum (NO_ACTION as explicit happy-path return per J.A.R.M.A.T.R.I.X. binding). Frozen input dataclasses (`RecentOpOutcome` / `RecentConfidenceVerdict` / `RecentAdaptationProposal` / `AutoActionContext`). Frozen `AdvisoryAction` output. Public `propose_advisory_action()` dispatcher always returns `AdvisoryAction`, never None. Decision precedence: master-off → ESCALATE verdicts → family failure rate (DEMOTE for SAFE_AUTO / DEFER otherwise) → failed category (RAISE_FLOOR) → NO_ACTION. Cost-contract structural guard — AST-pinned.
 
-**Without this**: the system *records* that op N had a claim failure but op N+1 (same family) goes ahead unchanged. Verification is a record without teeth.
+2. **Signal readers** (`1a806a10ba`, 18 tests) — `recent_postmortem_outcomes()` wraps `verification.postmortem.list_recent_postmortems`; `recent_adaptation_proposals()` wraps `adaptation.ledger.get_default_ledger().history()`; `recent_confidence_verdicts()` was an empty stub for Slice 3 to fill. `gather_context()` composes all three readers + caller-supplied `current_*` fields. Per operator binding "do not duplicate state-gathering" — every reader wraps an existing public ledger API.
 
-**Cost**: ~1-week implementation (4-slice arc), defaults all false, soak validation, then graduation.
+3. **Shadow integration** (`1e2e46afbd`, 31 tests) — `_VerdictRingBuffer` (thread-safe drop-oldest deque) closes Slice 2's stub; `record_confidence_verdict()` producer entry. `AutoActionProposalLedger` (append-only JSONL at `.jarvis/auto_action_proposals.jsonl`). `PostPostmortemObserver` Protocol mirroring `OpsDigestObserver` pattern. `AutoActionShadowObserver` concrete observer runs `gather_context` → `propose_advisory_action` → `ledger.append`. Per-op ctx enrichment registry (LRU 256). Two surgical producer wirings: `postmortem_observability.publish_terminal_postmortem_persisted` calls observer; `confidence_observability` records verdicts at P1/P2 publish sites (BELOW_FLOOR/APPROACHING_FLOOR).
+
+4. **Operator surfaces + graduation** (this commit, 23 tests) — `EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED` SSE event, `publish_auto_action_proposal_emitted()` helper called by shadow observer on actionable proposals (NO_ACTION skipped). `register_auto_action_routes(app)` mounts `GET /observability/auto-action[/stats]` (master-flag-gated per request, returns 503 when disabled). `proposal_stats()` aggregator over ledger rows. SerpentREPL `/auto-action` command with subcommands (`stats`, `<op_id>` filter). `event_channel.py` boot wiring registers routes + installs shadow observer. **Master flag `JARVIS_AUTO_ACTION_ROUTER_ENABLED` GRADUATED default false → true.** ENFORCE flag stays locked off.
+
+**Combined: 4 commits, 97 new regression tests, ~2,600 net new lines (module + tests + integrations + docs).**
+
+**Cost contract preservation** (load-bearing across all 4 slices): `_propose_action` raises `CostContractViolation` if `current_route in {background, speculative}` AND `proposed_risk_tier in {approval_required, blocked}`. AST-pinned. None of the 5 current action types directly carry a route field, so naturally satisfied — but encoded structurally to future-proof against later additions.
+
+**Authority invariants** (AST-pinned by tests): no orchestrator / phase_runners / candidate_generator / iron_gate / change_engine / policy / semantic_guardian / semantic_firewall / providers / doubleword_provider / urgency_router imports. Pure stdlib + `cost_contract_assertion` + `aiohttp.web` (Slice 4 routes).
+
+**Closure record**: `memory/project_move_3_closure.md`.
+
+**Mutation boundary still locked**: `JARVIS_AUTO_ACTION_ENFORCE` remains default-false per operator binding. Separate later arc graduates enforce mode after operator review of shadow ledger evidence.
+
+**Net trajectory**: §27 grade table — Self-tightening immunity dimension lifts toward A. Verification → action loop now closes; remaining gap to full A is the enforce-mode mutation boundary, gated on shadow-mode soak evidence.
 
 ### 27.5 What this review explicitly does NOT prescribe
 

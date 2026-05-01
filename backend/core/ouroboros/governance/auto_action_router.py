@@ -124,11 +124,11 @@ _RISK_LADDER: Tuple[str, ...] = (
 
 
 def auto_action_router_enabled() -> bool:
-    """``JARVIS_AUTO_ACTION_ROUTER_ENABLED`` (default ``false`` in
-    Slice 1; graduated to ``true`` in Slice 4 after shadow soak).
+    """``JARVIS_AUTO_ACTION_ROUTER_ENABLED`` (default ``true`` —
+    GRADUATED in Move 3 Slice 4, 2026-04-30).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
-    default; explicit truthy enables; explicit falsy disables.
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default-true; explicit truthy enables; explicit falsy disables.
     Re-read at call time so monkeypatch + live toggle work.
 
     Cost contract preservation: even with this flag on, the
@@ -137,6 +137,15 @@ def auto_action_router_enabled() -> bool:
     proposal. §26.6 four-layer defense-in-depth ensures cost
     contract holds regardless of router state.
 
+    Slice 4 graduation rationale: shadow-mode (Slice 3) verified
+    the observer + ledger + verdict-buffer wiring is best-effort
+    and never propagates failures into the publish path. Master-on
+    triggers the dispatcher's decision tree on every terminal
+    postmortem, but ``JARVIS_AUTO_ACTION_ENFORCE`` stays locked
+    off — the system is producing advisory ledger rows for
+    operator review, NOT modifying ctx. The mutation boundary is
+    a separate later authorization.
+
     Hot-revert: ``export JARVIS_AUTO_ACTION_ROUTER_ENABLED=false``
     short-circuits ``propose_advisory_action`` to NO_ACTION
     always."""
@@ -144,7 +153,7 @@ def auto_action_router_enabled() -> bool:
         "JARVIS_AUTO_ACTION_ROUTER_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 1 default — graduated true in Slice 4
+        return True  # graduated default (Move 3 Slice 4 cadence)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -1303,7 +1312,14 @@ class AutoActionShadowObserver:
             # ledger row carries the trigger correlation.
             from dataclasses import replace
             stamped = replace(action, op_id=op_id)
-            self._ledger.append(stamped)
+            appended = self._ledger.append(stamped)
+            # Slice 4 — SSE event for actionable proposals.
+            # ledger.append already filters NO_ACTION; we publish
+            # only when a row was actually written so operator
+            # consumers see a 1:1 relationship between SSE events
+            # and ledger rows.
+            if appended:
+                publish_auto_action_proposal_emitted(stamped)
         except CostContractViolation:
             # Cost-contract violation is fatal-by-design: re-raise.
             raise
@@ -1400,6 +1416,245 @@ def install_shadow_observer(
     )
 
 
+# ---------------------------------------------------------------------------
+# Move 3 Slice 4 — SSE event + observability routes + REPL surface
+# ---------------------------------------------------------------------------
+
+
+EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED: str = "auto_action_proposal_emitted"
+
+
+def publish_auto_action_proposal_emitted(action: AdvisoryAction) -> Optional[str]:
+    """Fire the ``auto_action_proposal_emitted`` SSE event after the
+    shadow observer persists an actionable proposal.
+
+    Best-effort — broker-missing / publish-error / observability-disabled
+    all return None silently. NEVER raises.
+
+    Operator surfaces consume this via the IDE stream; the
+    ``GET /observability/auto-action`` GET endpoints serve the
+    ledger directly for backfill/replay scenarios."""
+    if action.action_type is AdvisoryActionType.NO_ACTION:
+        return None  # NO_ACTION never warrants a publish
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (
+            get_default_broker,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        broker = get_default_broker()
+        return broker.publish(
+            event_type=EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED,
+            op_id=str(action.op_id or ""),
+            payload={
+                "schema_version": action.schema_version,
+                "wall_ts": time.time(),
+                "op_id": str(action.op_id or ""),
+                "action_type": action.action_type.value,
+                "reason_code": str(action.reason_code or ""),
+                "evidence": str(action.evidence or "")[:200],
+                "target_op_family": str(action.target_op_family or ""),
+                "target_category": str(action.target_category or ""),
+                "proposed_risk_tier": str(action.proposed_risk_tier or ""),
+                "rolling_failure_rate": _safe_float(
+                    action.rolling_failure_rate, default=0.0,
+                ),
+                "rolling_escalate_rate": _safe_float(
+                    action.rolling_escalate_rate, default=0.0,
+                ),
+                "history_size": _safe_int(action.history_size, default=0),
+                "posture": str(action.posture or ""),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[auto_action_router] SSE publish swallowed exception",
+            exc_info=True,
+        )
+        return None
+
+
+def proposal_stats(rows: Sequence[dict]) -> dict:
+    """Aggregate ledger rows into a stats summary.
+
+    Used by the ``/auto-action stats`` REPL subcommand and the
+    ``GET /observability/auto-action/stats`` endpoint. Pure function
+    over the dict shape produced by ``AutoActionProposalLedger.read_recent``.
+
+    Returns a dict with:
+      * ``total`` — total row count
+      * ``by_action_type`` — dict keyed by action_type value, count
+      * ``by_op_family`` — dict keyed by target_op_family (skips empty)
+      * ``by_category`` — dict keyed by target_category (skips empty)
+
+    NEVER raises."""
+    from collections import Counter
+    by_type: Counter = Counter()
+    by_family: Counter = Counter()
+    by_category: Counter = Counter()
+    total = 0
+    for row in rows or ():
+        if not isinstance(row, dict):
+            continue
+        total += 1
+        atype = str(row.get("action_type", ""))
+        if atype:
+            by_type[atype] += 1
+        fam = str(row.get("target_op_family", ""))
+        if fam:
+            by_family[fam] += 1
+        cat = str(row.get("target_category", ""))
+        if cat:
+            by_category[cat] += 1
+    return {
+        "total": total,
+        "by_action_type": dict(by_type),
+        "by_op_family": dict(by_family),
+        "by_category": dict(by_category),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Move 3 Slice 4 — observability route handler
+# ---------------------------------------------------------------------------
+
+
+_OBSERVABILITY_DEFAULT_LIMIT: int = 100
+_OBSERVABILITY_MAX_LIMIT: int = 500
+
+
+def _json_response(payload: dict, *, status: int = 200) -> Any:
+    """Build a Cache-Control: no-store JSON aiohttp Response.
+
+    Lazy import of aiohttp.web — keeps the auto_action_router module
+    importable in environments that don't have aiohttp installed
+    (CI tests without the web stack)."""
+    from aiohttp import web
+    return web.json_response(
+        payload,
+        status=status,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _parse_limit(query: Any) -> int:
+    """Parse + clamp the ``limit`` query param. Defaults to 100,
+    capped at 500."""
+    raw = (query or {}).get("limit", "")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _OBSERVABILITY_DEFAULT_LIMIT
+    return max(1, min(_OBSERVABILITY_MAX_LIMIT, v))
+
+
+class _AutoActionRoutesHandler:
+    """aiohttp route handler for the ``/observability/auto-action``
+    family. Mirror of ``_PostmortemRoutesHandler`` shape."""
+
+    def __init__(
+        self,
+        *,
+        ledger: Optional[AutoActionProposalLedger] = None,
+        rate_limit_check: Optional[Callable[[Any], bool]] = None,
+        cors_headers: Optional[Callable[[Any], Any]] = None,
+    ) -> None:
+        self._ledger = ledger or get_default_ledger()
+        self._rate_limit_check = rate_limit_check
+        self._cors_headers = cors_headers
+
+    def _gate(self, request: Any) -> Optional[Any]:
+        """Run the master-flag + rate-limit gate. Returns a
+        Response when the request should be rejected, None when
+        the handler should proceed."""
+        if not auto_action_router_enabled():
+            return _json_response(
+                {
+                    "error": "disabled",
+                    "schema_version": AUTO_ACTION_ROUTER_SCHEMA_VERSION,
+                },
+                status=503,
+            )
+        if self._rate_limit_check is not None:
+            try:
+                if not self._rate_limit_check(request):
+                    return _json_response(
+                        {"error": "rate_limited"},
+                        status=429,
+                    )
+            except Exception:  # noqa: BLE001
+                pass  # rate-limit failure is non-fatal
+        return None
+
+    async def handle_recent(self, request: Any) -> Any:
+        """``GET /observability/auto-action`` — most recent N
+        advisory proposals. Default 100, capped at 500."""
+        gated = self._gate(request)
+        if gated is not None:
+            return gated
+        limit = _parse_limit(getattr(request, "query", {}))
+        try:
+            rows = self._ledger.read_recent(limit=limit)
+        except Exception:  # noqa: BLE001
+            rows = ()
+        return _json_response(
+            {
+                "schema_version": AUTO_ACTION_ROUTER_SCHEMA_VERSION,
+                "limit": limit,
+                "count": len(rows),
+                "rows": list(rows),
+            }
+        )
+
+    async def handle_stats(self, request: Any) -> Any:
+        """``GET /observability/auto-action/stats`` — aggregate
+        counts (by_action_type, by_op_family, by_category) over the
+        most recent N rows."""
+        gated = self._gate(request)
+        if gated is not None:
+            return gated
+        limit = _parse_limit(getattr(request, "query", {}))
+        try:
+            rows = self._ledger.read_recent(limit=limit)
+            stats = proposal_stats(rows)
+        except Exception:  # noqa: BLE001
+            stats = proposal_stats(())
+        stats["schema_version"] = AUTO_ACTION_ROUTER_SCHEMA_VERSION
+        stats["limit"] = limit
+        return _json_response(stats)
+
+
+def register_auto_action_routes(
+    app: Any,
+    *,
+    ledger: Optional[AutoActionProposalLedger] = None,
+    rate_limit_check: Optional[Callable[[Any], bool]] = None,
+    cors_headers: Optional[Callable[[Any], Any]] = None,
+) -> None:
+    """Mount the auto-action GET routes on a caller-supplied
+    aiohttp Application. Mirrors ``register_postmortem_routes``.
+
+    Routes:
+      * ``GET /observability/auto-action``         — recent proposals
+      * ``GET /observability/auto-action/stats``   — aggregate stats
+
+    Master flag check is done in the handler (per-request),
+    so the route mounting itself is safe to call regardless of
+    flag state (allows live toggle without re-mounting)."""
+    handler = _AutoActionRoutesHandler(
+        ledger=ledger,
+        rate_limit_check=rate_limit_check,
+        cors_headers=cors_headers,
+    )
+    app.router.add_get(
+        "/observability/auto-action", handler.handle_recent,
+    )
+    app.router.add_get(
+        "/observability/auto-action/stats", handler.handle_stats,
+    )
+
+
 __all__ = [
     "AUTO_ACTION_ROUTER_SCHEMA_VERSION",
     "AdvisoryAction",
@@ -1407,6 +1662,7 @@ __all__ = [
     "AutoActionContext",
     "AutoActionProposalLedger",
     "AutoActionShadowObserver",
+    "EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED",
     "PostPostmortemObserver",
     "RecentAdaptationProposal",
     "RecentConfidenceVerdict",
@@ -1422,11 +1678,14 @@ __all__ = [
     "get_post_postmortem_observer",
     "install_shadow_observer",
     "lookup_op_context",
+    "proposal_stats",
     "propose_advisory_action",
+    "publish_auto_action_proposal_emitted",
     "recent_adaptation_proposals",
     "recent_confidence_verdicts",
     "recent_postmortem_outcomes",
     "record_confidence_verdict",
+    "register_auto_action_routes",
     "register_op_context",
     "register_post_postmortem_observer",
     "reset_default_ledger_for_tests",

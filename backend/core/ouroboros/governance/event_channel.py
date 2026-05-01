@@ -353,6 +353,47 @@ class EventChannelServer:
                     pm_exc,
                 )
 
+            # Move 3 Slice 4 — auto-action router observability
+            # routes. Loopback + rate-limit + CORS via the shared
+            # IDEObservabilityRouter helper; gated on the master
+            # flag check inside the auto-action handler (per-request).
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (
+                    IDEObservabilityRouter as _IDEObsRouterAA,
+                    assert_loopback_only as _assert_loopback_aa,
+                )
+                from backend.core.ouroboros.governance.auto_action_router import (
+                    auto_action_router_enabled as _aa_enabled,
+                    register_auto_action_routes,
+                    install_shadow_observer,
+                )
+                if _aa_enabled():
+                    _assert_loopback_aa(self._host)
+                    _aa_helper = _IDEObsRouterAA()
+                    register_auto_action_routes(
+                        app,
+                        rate_limit_check=lambda req: (
+                            _aa_helper._check_rate_limit(
+                                _aa_helper._client_key(req),
+                            )
+                        ),
+                        cors_headers=_aa_helper._cors_headers,
+                    )
+                    # Boot the shadow observer alongside the routes
+                    # so the producer + consumer surfaces come up
+                    # together. Idempotent — safe to re-call.
+                    install_shadow_observer()
+            except ValueError as aa_loopback_exc:
+                logger.warning(
+                    "[EventChannel] auto-action observability "
+                    "refused: %s", aa_loopback_exc,
+                )
+            except Exception as aa_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] auto-action observability "
+                    "wiring failed: %s", aa_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is

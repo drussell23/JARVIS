@@ -397,7 +397,9 @@ def test_gather_context_never_raises_on_reader_failure():
 
 
 def test_end_to_end_pipeline_master_off_returns_no_action(monkeypatch):
-    monkeypatch.delenv("JARVIS_AUTO_ACTION_ROUTER_ENABLED", raising=False)
+    """Post-graduation: env-unset = default-on, so testing the
+    master-off path requires explicit JARVIS_AUTO_ACTION_ROUTER_ENABLED=0."""
+    monkeypatch.setenv("JARVIS_AUTO_ACTION_ROUTER_ENABLED", "0")
     from backend.core.ouroboros.governance.auto_action_router import (
         gather_context, propose_advisory_action, AdvisoryActionType,
     )
