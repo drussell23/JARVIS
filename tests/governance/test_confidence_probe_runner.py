@@ -488,6 +488,8 @@ class TestAuthorityInvariants:
             "confidence_probe_bridge",
             "confidence_probe_generator",
             "readonly_evidence_prober",
+            # Slice 5 — SSE publisher
+            "ide_observability_stream",
         )
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
@@ -533,10 +535,14 @@ class TestAuthorityInvariants:
                 )
 
     def test_public_api_exported(self):
+        # Slice 5 added EVENT_TYPE_PROBE_OUTCOME +
+        # publish_probe_outcome for the SSE event surface.
         expected = {
             "CONFIDENCE_PROBE_RUNNER_SCHEMA_VERSION",
+            "EVENT_TYPE_PROBE_OUTCOME",
             "get_default_resolver",
             "probe_wall_clock_s",
+            "publish_probe_outcome",
             "run_probe_loop",
         }
         assert set(runner_mod.__all__) == expected

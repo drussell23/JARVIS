@@ -119,18 +119,18 @@ _MAX_TOOL_ROUNDS_CEILING: int = 10
 
 
 def bridge_enabled() -> bool:
-    """``JARVIS_CONFIDENCE_PROBE_BRIDGE_ENABLED`` (default ``false``
-    until Slice 5 graduation).
+    """``JARVIS_CONFIDENCE_PROBE_BRIDGE_ENABLED`` (**graduated
+    2026-05-01 Slice 5 — default ``true``**).
 
     Asymmetric env semantics: empty/whitespace = unset = current
-    default; explicit ``0`` / ``false`` / ``no`` / ``off`` evaluates
-    false; explicit truthy values evaluate true. Re-read on every
-    call so flips hot-revert without restart."""
+    default (post-graduation = ``true``); explicit ``0`` /
+    ``false`` / ``no`` / ``off`` hot-reverts. Re-read on every
+    call so flips take effect without restart."""
     raw = os.environ.get(
         "JARVIS_CONFIDENCE_PROBE_BRIDGE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated default — Slice 5
     return raw in ("1", "true", "yes", "on")
 
 

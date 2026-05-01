@@ -47,17 +47,25 @@ from backend.core.ouroboros.governance.verification.confidence_probe_bridge impo
 
 
 class TestEnvKnobs:
-    def test_bridge_enabled_default_false(self, monkeypatch):
+    def test_bridge_enabled_default_true_post_graduation(
+        self, monkeypatch,
+    ):
         monkeypatch.delenv(
             "JARVIS_CONFIDENCE_PROBE_BRIDGE_ENABLED", raising=False,
         )
-        assert bridge_enabled() is False
+        # Slice 5 graduation flipped this default.
+        assert bridge_enabled() is True
 
     @pytest.mark.parametrize(
         "value,expected",
-        [("", False), ("0", False), ("false", False), ("no", False),
-         ("garbage", False), ("1", True), ("true", True),
-         ("YES", True), ("on", True)],
+        [
+            # Post-graduation: empty = unset = default true
+            ("", True),
+            ("0", False), ("false", False), ("no", False),
+            ("garbage", False),
+            ("1", True), ("true", True), ("YES", True),
+            ("on", True),
+        ],
     )
     def test_bridge_enabled_env_matrix(
         self, monkeypatch, value, expected,

@@ -1622,6 +1622,117 @@ SEED_SPECS: list = [
         since="Move 4 Slice 5",
         posture_relevance=_ALL_POSTURES_CRITICAL,
     ),
+    # ====================================================================
+    # ConfidenceProbeBridge (Move 5 Slice 5 graduation) — 6 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_PROBE_BRIDGE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the Move 5 Confidence-Aware "
+            "Autonomous Probe Loop. Graduated 2026-05-01. When "
+            "false, probe_environment_executor falls through to "
+            "RETRY_WITH_FEEDBACK safe legacy default; runner is "
+            "never invoked. Asymmetric env semantics — empty/unset "
+            "= post-graduation default true; explicit `0`/`false` "
+            "hot-reverts."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_probe_bridge.py"
+        ),
+        example="true",
+        since="Move 5 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_READONLY_EVIDENCE_PROBER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the read-only EvidenceProber. When false, "
+            "ReadonlyEvidenceProber.resolve returns empty answer "
+            "(zero cost); convergence detector classifies as "
+            "DIVERGED at budget. Master must also be on."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "readonly_evidence_prober.py"
+        ),
+        example="true",
+        since="Move 5 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_PROBE_MAX_QUESTIONS",
+        type=FlagType.INT, default=3,
+        description=(
+            "Number of probe questions to generate per ambiguity. "
+            "Cap structure: min(ceiling=5, max(floor=2, value)) so "
+            "operators cannot loosen below structural floor or "
+            "exceed ceiling."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_probe_bridge.py"
+        ),
+        example="3",
+        since="Move 5 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_PROBE_CONVERGENCE_QUORUM",
+        type=FlagType.INT, default=2,
+        description=(
+            "Number of agreeing answers required to declare "
+            "CONVERGED. Floor 2 (single agreement is meaningless). "
+            "When K-1 of K probes agree on canonical answer, "
+            "confidence elevated, op proceeds."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_probe_bridge.py"
+        ),
+        example="2",
+        since="Move 5 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_PROBE_WALL_CLOCK_S",
+        type=FlagType.FLOAT, default=30.0,
+        description=(
+            "Wall-clock cap for the entire probe loop. Cap "
+            "structure: min(120, max(5, value)). Composes with "
+            "Phase 7.6's per-probe timeout (each question's tool "
+            "rounds inherit their own bound). Hits → cancel "
+            "pending, return current verdict."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_probe_runner.py"
+        ),
+        example="30",
+        since="Move 5 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_PROBE_GENERATOR_MODE",
+        type=FlagType.STR, default="templates",
+        description=(
+            "Question generation mode: `templates` (deterministic, "
+            "$0 cost — Slice 5 default) or `llm` (auxiliary-model "
+            "synthesis — currently falls through to templates with "
+            "logged warning; reserved for post-graduation slice)."
+        ),
+        category=Category.ROUTING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_probe_generator.py"
+        ),
+        example="templates",
+        since="Move 5 Slice 5",
+    ),
 ]
 
 

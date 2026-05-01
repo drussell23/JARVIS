@@ -94,6 +94,76 @@ CONFIDENCE_PROBE_RUNNER_SCHEMA_VERSION: str = (
 
 
 # ---------------------------------------------------------------------------
+# Slice 5 — SSE event vocabulary + publisher
+# ---------------------------------------------------------------------------
+
+
+EVENT_TYPE_PROBE_OUTCOME: str = "confidence_probe_outcome"
+"""SSE event fired on every non-DISABLED probe loop completion.
+Operators consume via the IDE stream. Master-flag-gated by
+``bridge_enabled()``; broker-missing / publish-error all return
+None silently. NEVER raises."""
+
+
+def publish_probe_outcome(
+    *,
+    outcome: str,
+    op_id: str,
+    detail: str,
+    agreement_count: int,
+    distinct_count: int,
+    total_answers: int,
+    canonical_answer: Optional[str] = None,
+) -> Optional[str]:
+    """Fire ``EVENT_TYPE_PROBE_OUTCOME`` SSE event for a probe loop
+    completion. Mirrors Move 4's ``publish_invariant_drift_detected``
+    discipline: lazy ``ide_observability_stream`` import +
+    best-effort publish + never-raise contract.
+
+    Returns broker frame_id on publish, ``None`` on
+    suppression/failure."""
+    if not bridge_enabled():
+        return None
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            get_default_broker,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        broker = get_default_broker()
+        # Bound canonical_answer length so SSE payload doesn't
+        # blow up on pathological probe outputs
+        bounded_canonical = (
+            canonical_answer[:200] + "..."
+            if canonical_answer and len(canonical_answer) > 200
+            else canonical_answer
+        )
+        return broker.publish(
+            event_type=EVENT_TYPE_PROBE_OUTCOME,
+            op_id=str(op_id or ""),
+            payload={
+                "schema_version": (
+                    CONFIDENCE_PROBE_RUNNER_SCHEMA_VERSION
+                ),
+                "outcome": str(outcome or ""),
+                "op_id": str(op_id or ""),
+                "detail": str(detail or "")[:200],
+                "agreement_count": int(agreement_count),
+                "distinct_count": int(distinct_count),
+                "total_answers": int(total_answers),
+                "canonical_answer": bounded_canonical,
+            },
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[ConfidenceProbeRunner] SSE publish swallowed",
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Env knobs — wall-clock cap unique to runner; others inherited from Slice 1
 # ---------------------------------------------------------------------------
 
@@ -177,6 +247,30 @@ async def _cancel_pending(
         pass
 
 
+def _verdict_with_publish(
+    verdict: ConvergenceVerdict, op_id: str,
+) -> ConvergenceVerdict:
+    """Slice 5 — fire SSE event on every non-DISABLED probe loop
+    completion. Best-effort; never raises. Returns the verdict
+    unchanged so callers can ``return _verdict_with_publish(...)``
+    inline."""
+    if verdict.outcome is ProbeOutcome.DISABLED:
+        return verdict
+    try:
+        publish_probe_outcome(
+            outcome=verdict.outcome.value,
+            op_id=op_id,
+            detail=verdict.detail,
+            agreement_count=verdict.agreement_count,
+            distinct_count=verdict.distinct_count,
+            total_answers=verdict.total_answers,
+            canonical_answer=verdict.canonical_answer,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+    return verdict
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -232,18 +326,25 @@ async def run_probe_loop(
 
     # Step 2: defensive type check
     if not isinstance(ambiguity_context, AmbiguityContext):
-        return ConvergenceVerdict(
-            outcome=ProbeOutcome.FAILED,
-            agreement_count=0,
-            distinct_count=0,
-            total_answers=0,
-            canonical_answer=None,
-            canonical_fingerprint=None,
-            detail=(
-                "ambiguity_context not an AmbiguityContext "
-                "instance"
+        return _verdict_with_publish(
+            ConvergenceVerdict(
+                outcome=ProbeOutcome.FAILED,
+                agreement_count=0,
+                distinct_count=0,
+                total_answers=0,
+                canonical_answer=None,
+                canonical_fingerprint=None,
+                detail=(
+                    "ambiguity_context not an AmbiguityContext "
+                    "instance"
+                ),
             ),
+            "",
         )
+
+    op_id_for_sse: str = str(
+        ambiguity_context.op_id or "",
+    )
 
     try:
         # Step 3: generate questions
@@ -258,16 +359,19 @@ async def run_probe_loop(
             max_questions_override=effective_max,
         )
         if not questions:
-            return ConvergenceVerdict(
-                outcome=ProbeOutcome.EXHAUSTED,
-                agreement_count=0,
-                distinct_count=0,
-                total_answers=0,
-                canonical_answer=None,
-                canonical_fingerprint=None,
-                detail=(
-                    "no probe questions generated for context"
+            return _verdict_with_publish(
+                ConvergenceVerdict(
+                    outcome=ProbeOutcome.EXHAUSTED,
+                    agreement_count=0,
+                    distinct_count=0,
+                    total_answers=0,
+                    canonical_answer=None,
+                    canonical_fingerprint=None,
+                    detail=(
+                        "no probe questions generated for context"
+                    ),
                 ),
+                op_id_for_sse,
             )
 
         # Step 4: spawn K probe tasks
@@ -309,7 +413,9 @@ async def run_probe_loop(
                 if verdict.is_actionable():
                     # Early-stop: cancel pending tasks
                     await _cancel_pending(tasks)
-                    return verdict
+                    return _verdict_with_publish(
+                        verdict, op_id_for_sse,
+                    )
         except asyncio.TimeoutError:
             # Step 7: wall-clock timeout — cancel + return current
             logger.debug(
@@ -328,26 +434,33 @@ async def run_probe_loop(
             # vs EXHAUSTED-with-budget; we keep the outcome and
             # annotate detail).
             if current.outcome is ProbeOutcome.EXHAUSTED:
-                return ConvergenceVerdict(
-                    outcome=ProbeOutcome.EXHAUSTED,
-                    agreement_count=current.agreement_count,
-                    distinct_count=current.distinct_count,
-                    total_answers=current.total_answers,
-                    canonical_answer=None,
-                    canonical_fingerprint=None,
-                    detail=(
-                        f"wall-clock timeout after {deadline_s:.1f}s "
-                        f"with {current.total_answers}/"
-                        f"{len(questions)} answers"
+                return _verdict_with_publish(
+                    ConvergenceVerdict(
+                        outcome=ProbeOutcome.EXHAUSTED,
+                        agreement_count=current.agreement_count,
+                        distinct_count=current.distinct_count,
+                        total_answers=current.total_answers,
+                        canonical_answer=None,
+                        canonical_fingerprint=None,
+                        detail=(
+                            f"wall-clock timeout after "
+                            f"{deadline_s:.1f}s with "
+                            f"{current.total_answers}/"
+                            f"{len(questions)} answers"
+                        ),
                     ),
+                    op_id_for_sse,
                 )
-            return current
+            return _verdict_with_publish(current, op_id_for_sse)
 
         # Step 6: all K completed without early-stop → final verdict
-        return compute_convergence(
-            answers,
-            quorum=effective_quorum,
-            max_probes=len(questions),
+        return _verdict_with_publish(
+            compute_convergence(
+                answers,
+                quorum=effective_quorum,
+                max_probes=len(questions),
+            ),
+            op_id_for_sse,
         )
     except asyncio.CancelledError:
         raise
@@ -356,14 +469,17 @@ async def run_probe_loop(
             "[ConfidenceProbeRunner] run_probe_loop raised: %s",
             exc,
         )
-        return ConvergenceVerdict(
-            outcome=ProbeOutcome.FAILED,
-            agreement_count=0,
-            distinct_count=0,
-            total_answers=0,
-            canonical_answer=None,
-            canonical_fingerprint=None,
-            detail=f"runner raised: {exc!r}",
+        return _verdict_with_publish(
+            ConvergenceVerdict(
+                outcome=ProbeOutcome.FAILED,
+                agreement_count=0,
+                distinct_count=0,
+                total_answers=0,
+                canonical_answer=None,
+                canonical_fingerprint=None,
+                detail=f"runner raised: {exc!r}",
+            ),
+            op_id_for_sse,
         )
 
 
@@ -413,7 +529,9 @@ class _NullQuestionResolver:
 
 __all__ = [
     "CONFIDENCE_PROBE_RUNNER_SCHEMA_VERSION",
+    "EVENT_TYPE_PROBE_OUTCOME",
     "get_default_resolver",
     "probe_wall_clock_s",
+    "publish_probe_outcome",
     "run_probe_loop",
 ]

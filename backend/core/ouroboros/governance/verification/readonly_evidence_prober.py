@@ -170,15 +170,17 @@ def is_tool_allowlisted(tool_name: str) -> bool:
 
 
 def prober_enabled() -> bool:
-    """``JARVIS_READONLY_EVIDENCE_PROBER_ENABLED`` (default ``false``
-    until Slice 5 graduation). Asymmetric env semantics: empty/
-    whitespace = unset = current default; explicit truthy/falsy
-    overrides at call time."""
+    """``JARVIS_READONLY_EVIDENCE_PROBER_ENABLED`` (**graduated
+    2026-05-01 Slice 5 — default ``true``**).
+
+    Asymmetric env semantics: empty/whitespace = unset = current
+    default (post-graduation = ``true``); explicit ``0`` /
+    ``false`` / ``no`` / ``off`` hot-reverts."""
     raw = os.environ.get(
         "JARVIS_READONLY_EVIDENCE_PROBER_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated default — Slice 5
     return raw in ("1", "true", "yes", "on")
 
 

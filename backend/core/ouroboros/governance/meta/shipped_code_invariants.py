@@ -1014,6 +1014,134 @@ def _validate_invariant_drift_bridge_uses_propose_action(
     return tuple(violations)
 
 
+def _validate_confidence_probe_no_mutation_tools(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Move 5 Slice 5 — bridge module MUST NOT reference mutation
+    tool names in code. AST-walk Name + Attribute nodes; docstring
+    strings allowed (they describe what's forbidden).
+
+    NEVER raises. Returns tuple of violations; empty = pin holds."""
+    forbidden = (
+        "edit_file", "write_file", "delete_file",
+        "run_tests", "bash",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id in forbidden:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden mutation tool "
+                    f"name {node.id!r} as Name reference"
+                )
+        elif isinstance(node, ast.Attribute):
+            if node.attr in forbidden:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden mutation tool "
+                    f"name {node.attr!r} as Attribute reference"
+                )
+    return tuple(violations)
+
+
+_EXPECTED_READONLY_TOOLS: Tuple[str, ...] = (
+    "git_blame", "git_diff", "git_log",
+    "glob_files", "get_callers",
+    "list_dir", "list_symbols",
+    "read_file", "search_code",
+)
+
+
+def _validate_readonly_evidence_prober_allowlist(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Move 5 Slice 5 — READONLY_TOOL_ALLOWLIST MUST be a
+    frozenset module-level constant containing only the canonical
+    9 read-only tools. AST-walks Assign nodes for the constant +
+    bytes-pin verifies each tool name string literal is present.
+
+    NEVER raises."""
+    violations: List[str] = []
+    # Bytes-pin: every expected tool must appear as a literal in
+    # the source (in the frozenset construction)
+    for tool in _EXPECTED_READONLY_TOOLS:
+        if f'"{tool}"' not in source and f"'{tool}'" not in source:
+            violations.append(
+                f"expected read-only tool {tool!r} missing from "
+                f"READONLY_TOOL_ALLOWLIST literal"
+            )
+    # Module-level constant exists?
+    if "READONLY_TOOL_ALLOWLIST" not in source:
+        violations.append(
+            "READONLY_TOOL_ALLOWLIST constant missing — "
+            "move 5 read-only allowlist contract broken"
+        )
+    if "frozenset(" not in source:
+        violations.append(
+            "READONLY_TOOL_ALLOWLIST must be a frozenset (immutable)"
+        )
+    # Mutation-tool defense in depth: forbidden names must NOT
+    # appear in the source at all (constant or otherwise)
+    forbidden_mutations = (
+        "edit_file", "write_file", "delete_file",
+        "run_tests",
+    )
+    for forbid in forbidden_mutations:
+        if (
+            f'"{forbid}"' in source
+            or f"'{forbid}'" in source
+        ):
+            violations.append(
+                f"forbidden mutation tool {forbid!r} appears as "
+                f"string literal in prober module — must not be "
+                f"in allowlist or referenced anywhere"
+            )
+    return tuple(violations)
+
+
+def _validate_confidence_probe_cap_structure(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Move 5 Slice 5 — env-knob helpers (max_questions,
+    max_tool_rounds_per_question) MUST use ``min(ceiling, max(floor,
+    value))`` clamps in source. Catches refactor that loosens caps.
+
+    Bytes-pinned for the clamp pattern + presence of cap-helper
+    functions. NEVER raises."""
+    violations: List[str] = []
+    required_helpers = (
+        "def max_questions",
+        "def convergence_quorum",
+        "def max_tool_rounds_per_question",
+    )
+    for helper in required_helpers:
+        if helper not in source:
+            violations.append(
+                f"cap helper missing: {helper}"
+            )
+    # The clamp pattern must appear at least once (catches refactor
+    # that drops min/max compose)
+    if "min(" not in source or "max(" not in source:
+        violations.append(
+            "cap helpers must use min()/max() clamp pattern"
+        )
+    # Bytes-pin the floor/ceiling constants exist
+    required_constants = (
+        "_MAX_QUESTIONS_FLOOR",
+        "_MAX_QUESTIONS_CEILING",
+        "_CONVERGENCE_QUORUM_FLOOR",
+        "_MAX_TOOL_ROUNDS_FLOOR",
+        "_MAX_TOOL_ROUNDS_CEILING",
+    )
+    for const in required_constants:
+        if const not in source:
+            violations.append(
+                f"cap-structure constant missing: {const}"
+            )
+    return tuple(violations)
+
+
 def _validate_invariant_drift_auditor_no_disk_writes(
     tree: ast.Module, source: str,
 ) -> Tuple[str, ...]:
@@ -1379,6 +1507,81 @@ def _register_seed_invariants() -> None:
                 ),
             ),
         )
+
+    # Move 5 Slice 5 — Confidence-Aware Probe Loop pins.
+    # Three structural pins protect the bounded-probe contract:
+    # (1) bridge module never references mutation tool names in
+    # code (only docstring mentions allowed);
+    # (2) prober's READONLY_TOOL_ALLOWLIST contains only known
+    # read-only tools (no mutation tools sneak in);
+    # (3) cap structure uses min/max clamps in source so
+    # refactors cannot silently loosen K=max_questions /
+    # convergence_quorum / max_tool_rounds_per_question.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "confidence_probe_bridge_no_mutation_tools"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "confidence_probe_bridge.py"
+            ),
+            description=(
+                "Move 5 Slice 1 bridge module MUST NOT reference "
+                "mutation tool names (edit_file / write_file / "
+                "delete_file / run_tests / bash) in code. AST-walk "
+                "Name + Attribute nodes; docstring string literals "
+                "allowed (they describe what's forbidden)."
+            ),
+            validate=(
+                _validate_confidence_probe_no_mutation_tools
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "readonly_evidence_prober_allowlist_pinned"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "readonly_evidence_prober.py"
+            ),
+            description=(
+                "Move 5 Slice 2 READONLY_TOOL_ALLOWLIST MUST be a "
+                "frozenset constant at module scope containing "
+                "only known read-only tools. AST-walks the Assign "
+                "node, verifies it's a frozenset call with literal "
+                "string args, all in the canonical 9-tool set "
+                "{read_file, search_code, get_callers, glob_files, "
+                "list_dir, list_symbols, git_blame, git_log, "
+                "git_diff}. No mutation tools."
+            ),
+            validate=(
+                _validate_readonly_evidence_prober_allowlist
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "confidence_probe_cap_structure_pinned"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "confidence_probe_bridge.py"
+            ),
+            description=(
+                "Move 5 cap-structure pin: max_questions and "
+                "max_tool_rounds_per_question MUST use "
+                "`min(ceiling, max(floor, value))` clamps in "
+                "source. Catches refactors that loosen caps "
+                "below structural floor or exceed structural "
+                "ceiling. Bytes-pinned for cap helper presence."
+            ),
+            validate=_validate_confidence_probe_cap_structure,
+        ),
+    )
 
     # Move 4 Slice 5 — InvariantDriftAuditor pin.
     # The bridge MUST consume `_propose_action` (not construct
