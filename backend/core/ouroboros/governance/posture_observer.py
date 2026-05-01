@@ -506,11 +506,58 @@ class PostureObserver:
         self._cycles_failed = 0
         self._cycles_skipped_hysteresis = 0
         self._last_change_at: Optional[float] = None
+        # Tier 1 #2 — task-death detection heartbeats. Updated on
+        # every cycle so consumers can detect a dead/hung observer
+        # task before reading frozen state. Posture health module
+        # (posture_health.py) consumes these.
+        self._last_cycle_attempt_at_unix: Optional[float] = None
+        self._last_cycle_ok_at_unix: Optional[float] = None
+        self._consecutive_cycle_failures: int = 0
 
     # ---- lifecycle --------------------------------------------------------
 
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    # ---- Tier 1 #2 — task-death detection -------------------------------
+
+    def task_health_snapshot(self) -> Dict[str, Any]:
+        """Read-only snapshot of observer task health for the
+        ``posture_health`` module's classifier. Returns the four
+        heartbeat fields + lifecycle predicates. NEVER raises.
+
+        Consumers should NOT classify health themselves — the
+        classifier in ``posture_health.evaluate_observer_health``
+        owns the policy (DEGRADED threshold, env knobs, sentinel
+        handling). This method just exposes the raw signals."""
+        try:
+            return {
+                "is_running": self.is_running(),
+                "task_done": (
+                    self._task is not None and self._task.done()
+                ),
+                "task_started": self._task is not None,
+                "last_cycle_attempt_at_unix": (
+                    self._last_cycle_attempt_at_unix
+                ),
+                "last_cycle_ok_at_unix": self._last_cycle_ok_at_unix,
+                "consecutive_cycle_failures": (
+                    self._consecutive_cycle_failures
+                ),
+                "cycles_ok": self._cycles_ok,
+                "cycles_failed": self._cycles_failed,
+            }
+        except Exception:  # noqa: BLE001 — defensive
+            return {
+                "is_running": False,
+                "task_done": False,
+                "task_started": False,
+                "last_cycle_attempt_at_unix": None,
+                "last_cycle_ok_at_unix": None,
+                "consecutive_cycle_failures": 0,
+                "cycles_ok": 0,
+                "cycles_failed": 0,
+            }
 
     def start(self) -> None:
         if not _inferrer_enabled():
@@ -558,12 +605,22 @@ class PostureObserver:
     async def _run_forever(self) -> None:
         interval = observer_interval_s()
         while not self._stop_event.is_set():
+            # Tier 1 #2 — record cycle attempt before run for hung-
+            # cycle detection (run_one_cycle has no internal timeout
+            # so it could block indefinitely on a stuck collector).
+            self._last_cycle_attempt_at_unix = time.time()
             try:
                 await self.run_one_cycle()
+                # Tier 1 #2 — successful cycle resets the failure
+                # counter and updates the OK heartbeat. Consumers
+                # use last_cycle_ok_at_unix to detect DEGRADED state.
+                self._last_cycle_ok_at_unix = time.time()
+                self._consecutive_cycle_failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self._cycles_failed += 1
+                self._consecutive_cycle_failures += 1
                 logger.exception("[PostureObserver] cycle_failed")
             # Sleep-or-stop
             try:

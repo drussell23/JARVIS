@@ -736,6 +736,7 @@ _ALLOWED_GOVERNANCE_SUBSTRINGS = (
     "invariant_drift_auditor",
     "invariant_drift_store",
     "posture_observer",  # for cadence multiplier
+    "posture_health",  # Tier 1 #2 safe-read wrapper
     "ide_observability_stream",  # Slice 5 SSE event publish
 )
 

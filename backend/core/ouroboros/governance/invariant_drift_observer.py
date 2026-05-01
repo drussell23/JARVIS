@@ -387,28 +387,43 @@ class InvariantDriftObserver:
 
     @staticmethod
     def _default_posture_reader() -> Optional[str]:
-        """Read current posture string from PostureStore. NEVER raises;
-        returns ``None`` if posture is unread/unavailable."""
+        """Read current posture string via the Tier 1 #2 safe
+        wrapper. When the PostureObserver task is degraded (hung /
+        failing / dead), ``safe_load_posture_value`` returns
+        ``None`` and the cadence multiplier defaults to 1.0
+        (equivalent to MAINTAIN posture — safe default). NEVER
+        raises; returns ``None`` if posture is unread / unavailable
+        / observer-degraded.
+
+        Falls back to direct store read when the posture_health
+        master flag is off (revert path: byte-equivalent to
+        pre-Tier-1 behavior)."""
         try:
             from backend.core.ouroboros.governance.posture_observer import (  # noqa: E501
+                get_default_observer as _get_posture_observer,
                 get_default_store as _get_posture_store,
+                observer_interval_s as _posture_interval_s,
+            )
+            from backend.core.ouroboros.governance.posture_health import (  # noqa: E501
+                safe_load_posture_value,
             )
         except Exception:  # noqa: BLE001 — defensive
             return None
         try:
             store = _get_posture_store()
-            reading = store.load_current()
-        except Exception:  # noqa: BLE001 — defensive
-            return None
-        if reading is None:
-            return None
-        try:
-            posture_attr = getattr(reading, "posture", None)
-            value = (
-                getattr(posture_attr, "value", None)
-                if posture_attr is not None else None
+            try:
+                observer = _get_posture_observer()
+            except Exception:  # noqa: BLE001 — defensive
+                observer = None
+            try:
+                interval = _posture_interval_s()
+            except Exception:  # noqa: BLE001 — defensive
+                interval = None
+            return safe_load_posture_value(
+                observer=observer,
+                store=store,
+                interval_s=interval,
             )
-            return str(value) if value is not None else None
         except Exception:  # noqa: BLE001 — defensive
             return None
 
