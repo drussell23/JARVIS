@@ -40,8 +40,66 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
+from rich.spinner import SPINNERS
 from rich.status import Status
 from rich.syntax import Syntax
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UI Slice 8 — Ouroboros snake-eating-tail spinner
+# ═══════════════════════════════════════════════════════════════════════════
+# The organism's identity glyph as the spinner: a snake closing in on its
+# own tail, biting (◯), then opening up again. Cycles forever while the
+# spinner is active. Registered into Rich's SPINNERS registry at module
+# import so callers can pass ``spinner="ouroboros"`` to ``rich.Status`` and
+# ``rich.Spinner`` exactly the same way they'd pass any built-in name.
+#
+# Env-gated: ``JARVIS_UI_OUROBOROS_SPINNER`` (default ``true``). When
+# disabled, falls through to Rich's built-in ``"dots"`` spinner via the
+# ``_active_spinner_name()`` helper. Hot-revert: ``export
+# JARVIS_UI_OUROBOROS_SPINNER=false`` returns to dots immediately for the
+# next ``Status(...)`` constructed.
+#
+# Frame design: 11 frames at 100ms each = 1.1s cycle. The closing-distance
+# convention (5→0 dots) reads as "head approaching tail," the bite frame
+# (🐍◯) is the moment of self-consumption, then the cycle re-opens. No
+# multi-line frames — single-line ephemeral inline spinner only.
+_OUROBOROS_SPINNER_NAME = "ouroboros"
+
+if _OUROBOROS_SPINNER_NAME not in SPINNERS:
+    SPINNERS[_OUROBOROS_SPINNER_NAME] = {
+        "interval": 100,
+        "frames": [
+            "🐍·····○",
+            "🐍····○",
+            "🐍···○",
+            "🐍··○",
+            "🐍·○",
+            "🐍◯",       # bite — eating own tail
+            "🐍·○",       # cycle resumes
+            "🐍··○",
+            "🐍···○",
+            "🐍····○",
+            "🐍·····○",
+        ],
+    }
+
+
+def _active_spinner_name() -> str:
+    """Resolve the active spinner glyph at call time.
+
+    Returns ``"ouroboros"`` (the snake-eating-tail glyph) when the
+    env knob ``JARVIS_UI_OUROBOROS_SPINNER`` is unset or truthy
+    (graduated default-on); ``"dots"`` (Rich built-in) when explicitly
+    disabled. Re-read on every call so operators can flip live."""
+    raw = os.environ.get(
+        "JARVIS_UI_OUROBOROS_SPINNER", "",
+    ).strip().lower()
+    if raw == "":
+        return _OUROBOROS_SPINNER_NAME  # default-on
+    if raw in ("1", "true", "yes", "on"):
+        return _OUROBOROS_SPINNER_NAME
+    return "dots"
 
 # ══════════════════════════════════════════════════════════════
 # Color palette (organism theme)
@@ -730,15 +788,26 @@ class SerpentFlow:
     # Execution masking (rich.Status spinners)
     # ══════════════════════════════════════════════════════════
 
-    def _start_status(self, message: str, spinner: str = "dots") -> None:
+    def _start_status(
+        self, message: str, spinner: Optional[str] = None,
+    ) -> None:
         """Begin an async execution spinner.
 
-        The spinner renders inline and vanishes when ``_stop_status`` is
-        called, leaving only the final artifact printed by the caller.
+        The spinner renders inline and vanishes when ``_stop_status``
+        is called, leaving only the final artifact printed by the
+        caller.
+
+        UI Slice 8: when ``spinner`` is None the active glyph is
+        resolved at call time via ``_active_spinner_name()`` —
+        defaults to the Ouroboros snake-eating-tail glyph; falls
+        back to Rich ``"dots"`` when ``JARVIS_UI_OUROBOROS_SPINNER=false``.
         """
         self._stop_status()
+        _spinner_name = (
+            spinner if spinner is not None else _active_spinner_name()
+        )
         self._active_status = self.console.status(
-            message, spinner=spinner, spinner_style=_C["neural"],
+            message, spinner=_spinner_name, spinner_style=_C["neural"],
         )
         self._active_status.start()
 
@@ -802,7 +871,7 @@ class SerpentFlow:
         self._stop_status()
         self._active_status = self.console.status(
             self._streaming_spinner_label(),
-            spinner="dots",
+            spinner=_active_spinner_name(),
             spinner_style=_C["neural"],
         )
         try:
@@ -1174,7 +1243,7 @@ class SerpentFlow:
 
         self._start_status(
             f"{prefix}{icon} T{round_index + 1} {tool_name}{summary}",
-            spinner="dots",
+            spinner=_active_spinner_name(),
         )
 
     def op_tool_call(
@@ -1271,7 +1340,7 @@ class SerpentFlow:
         prefix = "  │  " if op_id in self._active_ops else "  "
         self._start_status(
             f"{prefix}🛡️ immune check │ running tests…",
-            spinner="dots",
+            spinner=_active_spinner_name(),
         )
 
     def op_validation(
@@ -1329,7 +1398,7 @@ class SerpentFlow:
         prefix = "  │  " if op_id in self._active_ops else "  "
         self._start_status(
             f"{prefix}⏺ Verify({files_str})",
-            spinner="dots",
+            spinner=_active_spinner_name(),
         )
 
     def op_verify_result(
