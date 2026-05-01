@@ -129,17 +129,23 @@ class _RaisingEmitter(InvariantDriftSignalEmitter):
 
 
 class TestEnvKnobs:
-    def test_observer_enabled_default_false(self, monkeypatch):
+    def test_observer_enabled_default_true_post_graduation(
+        self, monkeypatch,
+    ):
         monkeypatch.delenv(
             "JARVIS_INVARIANT_DRIFT_OBSERVER_ENABLED",
             raising=False,
         )
-        assert observer_enabled() is False
+        # Slice 5 graduation flipped this default.
+        assert observer_enabled() is True
 
     @pytest.mark.parametrize(
         "value,expected",
         [("1", True), ("true", True), ("YES", True), ("on", True),
-         ("0", False), ("false", False), ("no", False), ("", False),
+         ("0", False), ("false", False), ("no", False),
+         # Empty = unset = post-graduation default true
+         ("", True),
+         # Garbage falls to revert
          ("garbage", False)],
     )
     def test_observer_enabled_env(self, monkeypatch, value, expected):
@@ -730,6 +736,7 @@ _ALLOWED_GOVERNANCE_SUBSTRINGS = (
     "invariant_drift_auditor",
     "invariant_drift_store",
     "posture_observer",  # for cadence multiplier
+    "ide_observability_stream",  # Slice 5 SSE event publish
 )
 
 
@@ -789,7 +796,11 @@ class TestAuthorityInvariants:
                 )
 
     def test_public_api_exported(self):
+        # Slice 5 added EVENT_TYPE_INVARIANT_DRIFT_DETECTED +
+        # publish_invariant_drift_detected for the observability
+        # SSE event surface.
         expected_exports = {
+            "EVENT_TYPE_INVARIANT_DRIFT_DETECTED",
             "InvariantDriftObserver",
             "InvariantDriftSignalEmitter",
             "ObserverTickResult",
@@ -800,6 +811,7 @@ class TestAuthorityInvariants:
             "get_signal_emitter",
             "observer_enabled",
             "posture_multipliers",
+            "publish_invariant_drift_detected",
             "register_signal_emitter",
             "reset_default_observer",
             "reset_signal_emitter",

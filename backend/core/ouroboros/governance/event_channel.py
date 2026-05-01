@@ -394,6 +394,86 @@ class EventChannelServer:
                     "wiring failed: %s", aa_exc,
                 )
 
+            # Move 4 Slice 5 — InvariantDriftAuditor boot wiring.
+            # Mirrors the auto_action_router block above: master-
+            # flag-gated, loopback-asserted, rate-limited, CORS-
+            # aware. Mounts read-only GETs alongside boot-snapshot
+            # capture + observer task + auto-action bridge install
+            # so producer + consumer surfaces come up together.
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+                    IDEObservabilityRouter as _IDEObsRouterID,
+                    assert_loopback_only as _assert_loopback_id,
+                )
+                from backend.core.ouroboros.governance.invariant_drift_auditor import (  # noqa: E501
+                    invariant_drift_auditor_enabled as _id_enabled,
+                )
+                from backend.core.ouroboros.governance.invariant_drift_observability import (  # noqa: E501
+                    register_invariant_drift_routes,
+                )
+                from backend.core.ouroboros.governance.invariant_drift_store import (  # noqa: E501
+                    install_boot_snapshot,
+                )
+                from backend.core.ouroboros.governance.invariant_drift_observer import (  # noqa: E501
+                    get_default_observer as _id_get_observer,
+                    observer_enabled as _id_observer_enabled,
+                )
+                from backend.core.ouroboros.governance.invariant_drift_auto_action_bridge import (  # noqa: E501
+                    bridge_enabled as _id_bridge_enabled,
+                    install_auto_action_bridge as _id_install_bridge,
+                )
+                if _id_enabled():
+                    _assert_loopback_id(self._host)
+                    _id_helper = _IDEObsRouterID()
+                    register_invariant_drift_routes(
+                        app,
+                        rate_limit_check=lambda req: (
+                            _id_helper._check_rate_limit(
+                                _id_helper._client_key(req),
+                            )
+                        ),
+                        cors_headers=_id_helper._cors_headers,
+                    )
+                    # Boot snapshot — best-effort, idempotent
+                    try:
+                        install_boot_snapshot()
+                    except Exception as boot_exc:  # noqa: BLE001
+                        logger.warning(
+                            "[EventChannel] invariant-drift boot "
+                            "snapshot failed: %s", boot_exc,
+                        )
+                    # Bridge install — must precede observer.start()
+                    # so the observer's first emit lands in the
+                    # auto-action ledger.
+                    if _id_bridge_enabled():
+                        try:
+                            _id_install_bridge()
+                        except Exception as br_exc:  # noqa: BLE001
+                            logger.warning(
+                                "[EventChannel] invariant-drift "
+                                "bridge install failed: %s", br_exc,
+                            )
+                    # Observer task — fires the periodic re-
+                    # validation cycle. Idempotent on double-start.
+                    if _id_observer_enabled():
+                        try:
+                            _id_get_observer().start()
+                        except Exception as ob_exc:  # noqa: BLE001
+                            logger.warning(
+                                "[EventChannel] invariant-drift "
+                                "observer start failed: %s", ob_exc,
+                            )
+            except ValueError as id_loopback_exc:
+                logger.warning(
+                    "[EventChannel] invariant-drift observability "
+                    "refused: %s", id_loopback_exc,
+                )
+            except Exception as id_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] invariant-drift observability "
+                    "wiring failed: %s", id_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is

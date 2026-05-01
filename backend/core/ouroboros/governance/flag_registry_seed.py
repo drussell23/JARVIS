@@ -1480,6 +1480,148 @@ SEED_SPECS: list = [
         since="Move 1 Pass C cadence",
         posture_relevance=_HARDEN_AND_CONSOLIDATE,
     ),
+    # ====================================================================
+    # InvariantDriftAuditor (Move 4 Slice 5 graduation) — 8 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the InvariantDriftAuditor arc. "
+            "Graduated 2026-04-30. When false, capture / boot "
+            "snapshot / observer / bridge / GET routes all revert "
+            "in lockstep. Asymmetric env semantics — empty/unset = "
+            "post-graduation default true; explicit `0`/`false` "
+            "hot-reverts."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "invariant_drift_auditor.py"
+        ),
+        example="true",
+        since="Move 4 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_INVARIANT_DRIFT_OBSERVER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the periodic re-validation observer. "
+            "Master must also be on. When false, no observer task "
+            "spawns; boot snapshot still happens and GET routes "
+            "still serve baseline+history. Allows operators to "
+            "disable continuous monitoring without losing the "
+            "temporal anchor."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "invariant_drift_observer.py"
+        ),
+        example="true",
+        since="Move 4 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_INVARIANT_DRIFT_AUTO_ACTION_BRIDGE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the auto_action_router bridge. When "
+            "false, drift signals still emit SSE events and append "
+            "to history but do NOT translate into AdvisoryAction "
+            "proposals in the auto-action ledger. Allows operators "
+            "to silence ledger pollution while keeping observability."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "invariant_drift_auto_action_bridge.py"
+        ),
+        example="true",
+        since="Move 4 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_INVARIANT_DRIFT_OBSERVER_INTERVAL_S",
+        type=FlagType.FLOAT, default=600.0,
+        description=(
+            "Base observer cadence in seconds. Floor 30s. Composes "
+            "with posture multiplier × vigilance factor × failure "
+            "backoff to compute the actual sleep between cycles."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "invariant_drift_observer.py"
+        ),
+        example="300",
+        since="Move 4 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_INVARIANT_DRIFT_OBSERVER_VIGILANCE_TICKS",
+        type=FlagType.INT, default=3,
+        description=(
+            "Number of subsequent cycles to maintain tightened "
+            "cadence after detecting drift. Floor 1."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "invariant_drift_observer.py"
+        ),
+        example="3",
+        since="Move 4 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_INVARIANT_DRIFT_OBSERVER_VIGILANCE_FACTOR",
+        type=FlagType.FLOAT, default=0.5,
+        description=(
+            "Cadence multiplier during vigilance window. 0.5 halves "
+            "interval (doubles frequency). Range (0.05, 1.0]."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "invariant_drift_observer.py"
+        ),
+        example="0.5",
+        since="Move 4 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_INVARIANT_DRIFT_OBSERVER_DEDUP_WINDOW",
+        type=FlagType.INT, default=5,
+        description=(
+            "Number of recent drift signatures kept in the dedup "
+            "ring. Same signature in N consecutive cycles emits "
+            "ONE signal. Floor 1."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "invariant_drift_observer.py"
+        ),
+        example="5",
+        since="Move 4 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_INVARIANT_DRIFT_POSTURE_MULTIPLIERS",
+        type=FlagType.JSON, default="",
+        description=(
+            "Optional JSON map: posture string → cadence multiplier. "
+            "HARDEN tightens (default 0.5), EXPLORE loosens (1.5), "
+            "etc. Missing keys fall back to defaults. Malformed "
+            "JSON ignored silently."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "invariant_drift_observer.py"
+        ),
+        example='{"HARDEN": 0.25, "EXPLORE": 2.0}',
+        since="Move 4 Slice 5",
+        posture_relevance=_ALL_POSTURES_CRITICAL,
+    ),
 ]
 
 

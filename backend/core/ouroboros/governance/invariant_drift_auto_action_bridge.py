@@ -99,14 +99,17 @@ _BRIDGE_ROUTE: str = "drift_bridge"
 
 
 def bridge_enabled() -> bool:
-    """``JARVIS_INVARIANT_DRIFT_AUTO_ACTION_BRIDGE_ENABLED`` (default
-    ``false``). Asymmetric env semantics — empty/whitespace = unset =
-    current default; explicit truthy/falsy overrides."""
+    """``JARVIS_INVARIANT_DRIFT_AUTO_ACTION_BRIDGE_ENABLED``
+    (**graduated 2026-04-30 Slice 5 — default ``true``**).
+
+    Asymmetric env semantics — empty/whitespace = unset = current
+    default (post-graduation = ``true``); explicit ``0`` / ``false``
+    / ``no`` / ``off`` hot-reverts."""
     raw = os.environ.get(
         "JARVIS_INVARIANT_DRIFT_AUTO_ACTION_BRIDGE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated default — Slice 5
     return raw in ("1", "true", "yes", "on")
 
 

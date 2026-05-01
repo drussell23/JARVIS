@@ -127,18 +127,24 @@ def _make_snapshot(
 
 
 class TestMasterFlag:
-    def test_default_false_when_unset(self, monkeypatch):
+    def test_default_true_post_graduation_when_unset(
+        self, monkeypatch,
+    ):
         monkeypatch.delenv(
             "JARVIS_INVARIANT_DRIFT_AUTO_ACTION_BRIDGE_ENABLED",
             raising=False,
         )
-        assert bridge_enabled() is False
+        # Slice 5 graduation flipped this default.
+        assert bridge_enabled() is True
 
     @pytest.mark.parametrize(
         "value,expected",
         [("1", True), ("true", True), ("YES", True), ("on", True),
          ("0", False), ("false", False), ("no", False),
-         ("", False), ("garbage", False)],
+         # Empty = unset = post-graduation default true
+         ("", True),
+         # Garbage falls to revert
+         ("garbage", False)],
     )
     def test_env_matrix(self, monkeypatch, value, expected):
         monkeypatch.setenv(

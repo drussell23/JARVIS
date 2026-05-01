@@ -107,15 +107,17 @@ _DEDUP_WINDOW_FLOOR = 1
 
 
 def observer_enabled() -> bool:
-    """``JARVIS_INVARIANT_DRIFT_OBSERVER_ENABLED`` (default ``false``).
+    """``JARVIS_INVARIANT_DRIFT_OBSERVER_ENABLED`` (**graduated
+    2026-04-30 Slice 5 — default ``true``**).
 
-    Asymmetric semantics: empty/whitespace = unset = current default;
-    explicit truthy/falsy overrides at call time."""
+    Asymmetric semantics: empty/whitespace = unset = current default
+    (post-graduation = ``true``); explicit ``0`` / ``false`` / ``no``
+    / ``off`` hot-reverts."""
     raw = os.environ.get(
         "JARVIS_INVARIANT_DRIFT_OBSERVER_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated default — Slice 5
     return raw in ("1", "true", "yes", "on")
 
 
@@ -575,6 +577,18 @@ class InvariantDriftObserver:
                 failure_reason=None,
             )
 
+        # Slice 5 — observability SSE for ALL novel drift (not just
+        # actionable). Best-effort, lazy-imported broker; never
+        # propagates. Operators see INFO-severity drift here even
+        # though the bridge skips it as NO_ACTION.
+        try:
+            publish_invariant_drift_detected(current, drift_records)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[InvariantDriftObserver] SSE publish swallowed: %s",
+                exc,
+            )
+
         # Emit (defensive — emitter raise must NEVER propagate)
         try:
             self._emitter().emit(current, drift_records)
@@ -662,6 +676,86 @@ def _drift_signature(
 
 
 # ---------------------------------------------------------------------------
+# SSE event — Slice 5 graduation observability surface
+# ---------------------------------------------------------------------------
+
+
+EVENT_TYPE_INVARIANT_DRIFT_DETECTED: str = (
+    "invariant_drift_detected"
+)
+
+
+def publish_invariant_drift_detected(
+    snapshot: InvariantSnapshot,
+    drift_records: Tuple[InvariantDriftRecord, ...],
+) -> Optional[str]:
+    """Fire the ``invariant_drift_detected`` SSE event for a novel
+    drift cycle. Best-effort: broker-missing / publish-error /
+    observability-disabled all return ``None`` silently. NEVER
+    raises.
+
+    Mirrors ``publish_auto_action_proposal_emitted`` exactly —
+    lazy ``ide_observability_stream`` import so the observer
+    module doesn't gain a hard dependency on the SSE infrastructure.
+
+    Fires for ALL novel drift (including INFO-severity), giving
+    operators visibility into posture moves and other informational
+    transitions that the auto-action bridge skips as NO_ACTION."""
+    if not drift_records:
+        return None
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            get_default_broker,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    # Build payload: severity histogram, drift kinds, top-affected
+    # keys; bounded so SSE payload + downstream renderers don't
+    # blow up on pathological drift bundles.
+    try:
+        severity_counts: Dict[str, int] = {}
+        kind_counts: Dict[str, int] = {}
+        affected: list = []
+        for r in drift_records:
+            sev = getattr(r.severity, "value", str(r.severity))
+            kind = getattr(
+                r.drift_kind, "value", str(r.drift_kind),
+            )
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+            for k in (r.affected_keys or ()):
+                if k not in affected:
+                    affected.append(str(k))
+        affected = affected[:16]  # bounded
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        broker = get_default_broker()
+        return broker.publish(
+            event_type=EVENT_TYPE_INVARIANT_DRIFT_DETECTED,
+            op_id=str(snapshot.snapshot_id or ""),
+            payload={
+                "schema_version": snapshot.schema_version,
+                "snapshot_id": str(snapshot.snapshot_id or ""),
+                "captured_at_utc": float(
+                    snapshot.captured_at_utc,
+                ),
+                "drift_count": len(drift_records),
+                "severity_counts": severity_counts,
+                "kind_counts": kind_counts,
+                "affected_keys": affected,
+                "posture": str(snapshot.posture_value or ""),
+            },
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[InvariantDriftObserver] SSE publish swallowed",
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Default observer singleton (mirrors Slice 2's get_default_store)
 # ---------------------------------------------------------------------------
 
@@ -699,6 +793,7 @@ def reset_default_observer() -> None:
 
 
 __all__ = [
+    "EVENT_TYPE_INVARIANT_DRIFT_DETECTED",
     "InvariantDriftObserver",
     "InvariantDriftSignalEmitter",
     "ObserverTickResult",
@@ -709,6 +804,7 @@ __all__ = [
     "get_signal_emitter",
     "observer_enabled",
     "posture_multipliers",
+    "publish_invariant_drift_detected",
     "register_signal_emitter",
     "reset_default_observer",
     "reset_signal_emitter",

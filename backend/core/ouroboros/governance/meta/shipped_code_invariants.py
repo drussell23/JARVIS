@@ -966,6 +966,98 @@ def _validate_providers_dispatch_assertion(
 
 
 # ---------------------------------------------------------------------------
+# Move 4 Slice 5 — InvariantDriftAuditor structural pins
+# ---------------------------------------------------------------------------
+
+
+def _validate_invariant_drift_bridge_uses_propose_action(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """The InvariantDriftAutoActionBridge MUST consume
+    ``_propose_action`` from auto_action_router so the §26.6 cost-
+    contract structural guard is inherited.
+
+    Two-part check:
+      1. Source MUST reference the symbol ``_propose_action`` —
+         pinned by bytes scan so a renamed import is caught.
+      2. Source MUST NOT directly construct ``AdvisoryAction(...)``
+         in any code position (only the imported reference is OK,
+         which is an ast.Name, not an ast.Call).
+
+    The combined pin: bridge uses the helper, doesn't bypass it.
+
+    Returns tuple of violation strings; empty tuple means pin holds.
+    NEVER raises."""
+    violations: List[str] = []
+    # Part 1 — must reference _propose_action.
+    if "_propose_action" not in source:
+        violations.append(
+            "_propose_action reference missing — bridge must "
+            "consume the auto_action_router cost-contract helper"
+        )
+    # Part 2 — must NOT have ``AdvisoryAction(...)`` Call nodes
+    # anywhere in the bridge module. Importing the type is fine
+    # (ast.Name); only ast.Call where func is the AdvisoryAction
+    # name counts as direct construction.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "AdvisoryAction":
+            lineno = getattr(node, "lineno", "?")
+            violations.append(
+                f"line {lineno}: direct AdvisoryAction(...) "
+                f"construction — bridge MUST consume "
+                f"_propose_action so the §26.6 cost-contract "
+                f"structural guard is inherited"
+            )
+    return tuple(violations)
+
+
+def _validate_invariant_drift_auditor_no_disk_writes(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """The InvariantDriftAuditor primitive (Slice 1) is read-only
+    over live process state. Disk writes belong to the store
+    module (Slice 2).
+
+    Bytes-pinned for these tokens (any presence is a violation):
+      ``.write_text(``, ``.write_bytes(``, ``os.replace(``,
+      ``NamedTemporaryFile``.
+
+    AST-pinned for ``open(...)`` calls (any presence is a
+    violation).
+
+    Returns tuple of violations; empty tuple means pin holds.
+    NEVER raises."""
+    violations: List[str] = []
+    forbidden_tokens = (
+        ".write_text(",
+        ".write_bytes(",
+        "os.replace(",
+        "NamedTemporaryFile",
+    )
+    for tok in forbidden_tokens:
+        if tok in source:
+            violations.append(
+                f"forbidden disk-write token: {tok!r}"
+            )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "open":
+            lineno = getattr(node, "lineno", "?")
+            violations.append(
+                f"line {lineno}: bare open() call — "
+                f"InvariantDriftAuditor primitive must remain "
+                f"read-only; disk writes belong to "
+                f"invariant_drift_store"
+            )
+    return tuple(violations)
+
+
+# ---------------------------------------------------------------------------
 # Validation engine
 # ---------------------------------------------------------------------------
 
@@ -1287,6 +1379,57 @@ def _register_seed_invariants() -> None:
                 ),
             ),
         )
+
+    # Move 4 Slice 5 — InvariantDriftAuditor pin.
+    # The bridge MUST consume `_propose_action` (not construct
+    # AdvisoryAction directly) so the §26.6 cost-contract structural
+    # guard is inherited. Pinned here so a future refactor that
+    # bypasses the guard is caught at boot validation.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "invariant_drift_bridge_uses_propose_action"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "invariant_drift_auto_action_bridge.py"
+            ),
+            description=(
+                "InvariantDriftAutoActionBridge MUST consume "
+                "auto_action_router._propose_action so the §26.6 "
+                "cost-contract structural guard is inherited. "
+                "Direct AdvisoryAction(...) construction in the "
+                "bridge would bypass the guard — this pin catches "
+                "any future refactor that does so."
+            ),
+            validate=(
+                _validate_invariant_drift_bridge_uses_propose_action
+            ),
+        ),
+    )
+    # The auditor module MUST stay disk-write-free — Slice 1's
+    # disk-write contract (no open/.write_text/.write_bytes/
+    # os.replace/NamedTemporaryFile in the auditor module). Disk
+    # writes belong to the store module.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "invariant_drift_auditor_no_disk_writes"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "invariant_drift_auditor.py"
+            ),
+            description=(
+                "The InvariantDriftAuditor primitive (Slice 1) is "
+                "read-only over live process state. Disk writes "
+                "belong to the store module (Slice 2). Pinned here "
+                "to prevent future refactors from sneaking I/O into "
+                "the pure-compute primitive."
+            ),
+            validate=_validate_invariant_drift_auditor_no_disk_writes,
+        ),
+    )
 
 
 _register_seed_invariants()

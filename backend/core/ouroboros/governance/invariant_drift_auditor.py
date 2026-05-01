@@ -98,20 +98,20 @@ INVARIANT_DRIFT_AUDITOR_SCHEMA_VERSION: str = "invariant_drift_auditor.1"
 
 
 def invariant_drift_auditor_enabled() -> bool:
-    """``JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED`` (default ``false`` —
-    primitive ships dormant; Slices 2-5 add producers/consumers; Slice
-    5 graduates this default to ``true``).
+    """``JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED`` (**graduated 2026-04-30
+    Slice 5 — default ``true``**).
 
     Asymmetric semantics mirror the ``shipped_code_invariants``
-    pattern: empty/whitespace = unset = *current* default; explicit
-    truthy/falsy overrides at call time. Re-read on every public-API
-    entry so flips hot-revert.
+    pattern: empty/whitespace = unset = *current* default
+    (post-graduation = ``true``); explicit ``0`` / ``false`` /
+    ``no`` / ``off`` hot-reverts. Re-read on every public-API
+    entry so flips take effect without restart.
     """
     raw = os.environ.get(
         "JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated default — Slice 5
     return raw in ("1", "true", "yes", "on")
 
 

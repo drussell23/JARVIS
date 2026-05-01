@@ -179,7 +179,8 @@ class TestMasterFlag:
     @pytest.mark.parametrize(
         "value,expected",
         [
-            ("", False),  # default-false until Slice 5 graduation
+            # Slice 5 graduation: empty/whitespace = default true
+            ("", True),
             ("0", False),
             ("false", False),
             ("FALSE", False),
@@ -200,25 +201,31 @@ class TestMasterFlag:
         )
         assert invariant_drift_auditor_enabled() is expected
 
-    def test_unset_env_returns_default_false(self, monkeypatch):
+    def test_unset_env_returns_default_true_post_graduation(
+        self, monkeypatch,
+    ):
         monkeypatch.delenv(
             "JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED",
             raising=False,
         )
-        assert invariant_drift_auditor_enabled() is False
+        # Slice 5 graduation flipped this default.
+        assert invariant_drift_auditor_enabled() is True
 
-    def test_whitespace_only_treated_as_unset(self, monkeypatch):
+    def test_whitespace_only_treated_as_unset_post_graduation(
+        self, monkeypatch,
+    ):
         monkeypatch.setenv(
             "JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED", "   ",
         )
-        assert invariant_drift_auditor_enabled() is False
+        # Whitespace = unset = post-graduation default true.
+        assert invariant_drift_auditor_enabled() is True
 
-    def test_garbage_value_falls_to_default(self, monkeypatch):
+    def test_garbage_value_falls_to_revert(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_INVARIANT_DRIFT_AUDITOR_ENABLED", "banana",
         )
         # Garbage is not a recognized truthy token — falls through
-        # to false.
+        # to false (hot-revert path).
         assert invariant_drift_auditor_enabled() is False
 
 
