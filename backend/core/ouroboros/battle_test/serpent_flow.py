@@ -373,10 +373,17 @@ class SerpentFlow:
         # Execution masking (rich.Status)
         self._active_status: Optional[Status] = None
 
-        # Live syntax-highlighted streaming (rich.Live + rich.Syntax)
+        # Streaming state — UI Slice 7 (2026-04-30) replaced the
+        # Rich Live(Syntax) fixed region with an ephemeral spinner
+        # that ticks per token. ``self._live`` retained as None for
+        # any incidental consumer that may inspect it; new state
+        # tracks token count + provider so the spinner label and the
+        # final receipt line can compose without a re-aggregation.
         self._live: Optional[Live] = None
         self._stream_buffer: str = ""
         self._stream_language: str = "json"
+        self._stream_token_count: int = 0
+        self._stream_provider: str = ""
 
         # Operator-visible token streaming (Priority 2 UX fix — tokens
         # on the glass in real-time during GENERATE). Owns its own
@@ -751,76 +758,117 @@ class SerpentFlow:
     def show_streaming_start(
         self, provider: str, op_id: str = "", language: str = "",
     ) -> None:
-        """Begin synthesis — header + open Live Syntax panel.
+        """Begin synthesis — emit a header line + start an ephemeral
+        spinner.
 
-        P3.2: Uses Rich.Syntax for real-time syntax highlighting
-        during DW SSE token streaming, matching CC's highlighting UX.
+        UI Slice 7 (2026-04-30): retired the Rich ``Live(Syntax)``
+        persistent region in favor of a CC-style ephemeral spinner
+        that shows progress (provider + token count) and resolves to
+        a single ``[✓] Generated N tokens`` receipt when streaming
+        ends. The actual generated code surfaces later via the
+        existing ⏺ Update / ``show_diff`` path — operators see WHAT
+        was generated as a clean diff block, not as a fixed-region
+        token stream.
+
+        Token tallies + provider remain visible during streaming via
+        the spinner label so the operator can see the system is
+        productive without the fixed-region cost.
         """
         self._streaming_active = True
         self._stream_buffer = ""
-
-        # Detect language from target files if available
-        if not language:
-            language = "json"  # Model output is JSON by default
-
-        self._stream_language = language
+        self._stream_token_count = 0
+        # Language retained for downstream consumers (not used by the
+        # ephemeral spinner) — keeps API stable for potential future
+        # syntax-highlighted diff rendering.
+        self._stream_language = language or "json"
+        # Cache the provider so show_streaming_end can include it in
+        # the resolution receipt.
+        self._stream_provider = provider or ""
 
         prov = _prov(provider) if provider else ""
-        via_str = f" via [{_C['provider']}]{prov}[/{_C['provider']}]" if prov else ""
+        via_str = (
+            f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
+            if prov else ""
+        )
         self._op_line(
             op_id,
-            f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}] {via_str}",
+            f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}]{via_str}",
         )
 
-        # Open Live Syntax rendering.  transient=False keeps output
-        # in terminal history after the stream ends.
-        self._live = Live(
-            Syntax("", language, theme="monokai", word_wrap=True),
-            console=self.console,
-            transient=False,
-            refresh_per_second=8,
+        # Ephemeral inline spinner — CC-style. Replaces the prior
+        # Live(Syntax) fixed region. ``rich.Status`` is the existing
+        # ephemeral primitive: appears, animates, vanishes when
+        # ``stop()`` is called.
+        self._stop_status()
+        self._active_status = self.console.status(
+            self._streaming_spinner_label(),
+            spinner="dots",
+            spinner_style=_C["neural"],
         )
-        self._live.start()
+        try:
+            self._active_status.start()
+        except Exception:
+            self._active_status = None
+
+    def _streaming_spinner_label(self) -> str:
+        """Compose the ephemeral spinner label (refreshed on each
+        token tick)."""
+        prov = _prov(self._stream_provider) if self._stream_provider else ""
+        prov_seg = (
+            f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
+            if prov else ""
+        )
+        return (
+            f"[{_C['neural']}]Streaming[/{_C['neural']}] "
+            f"{self._stream_token_count} tokens{prov_seg}"
+        )
 
     def show_streaming_token(self, token: str) -> None:
-        """Append a token and re-render the Syntax panel in-place.
+        """Append a token to the running buffer + tick the spinner.
 
-        P3.2: Syntax highlighting on every update — Rich.Syntax lexes
-        the accumulated buffer, giving real-time code coloring as
-        tokens arrive from the SSE stream.
+        UI Slice 7: tokens still aggregate into ``self._stream_buffer``
+        for any downstream consumer that wants the full text (the
+        existing ⏺ Update / show_diff path renders the resolved code).
+        The visible feedback during streaming is the ephemeral
+        spinner with a live token count — no fixed terminal region.
         """
         if not token:
             return
         self._stream_buffer += token
-        if self._live is not None:
+        self._stream_token_count += 1
+        if self._active_status is not None:
             try:
-                lang = getattr(self, "_stream_language", "json")
-                self._live.update(
-                    Syntax(
-                        self._stream_buffer, lang,
-                        theme="monokai", word_wrap=True,
-                    )
+                self._active_status.update(
+                    self._streaming_spinner_label(),
                 )
             except Exception:
                 pass
 
     def show_streaming_end(self) -> None:
-        """Finalize the Live Syntax region."""
-        if self._live is not None:
-            try:
-                if self._stream_buffer:
-                    lang = getattr(self, "_stream_language", "json")
-                    self._live.update(
-                        Syntax(
-                            self._stream_buffer, lang,
-                            theme="monokai", word_wrap=True,
-                        )
-                    )
-                self._live.stop()
-            except Exception:
-                pass
-            self._live = None
+        """Finalize the ephemeral stream — vanish the spinner and
+        emit a single inline receipt line.
+
+        Format: ``[✓] Generated N tokens via Claude``.
+        """
+        token_count = self._stream_token_count
+        prov = _prov(self._stream_provider) if self._stream_provider else ""
+        # Stop the spinner first so the receipt line writes cleanly
+        # below.
+        self._stop_status()
+        if token_count > 0:
+            via_seg = (
+                f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
+                if prov else ""
+            )
+            self.console.print(
+                f"  [{_C['life']}][✓][/{_C['life']}] "
+                f"Generated {token_count} tokens{via_seg}",
+                highlight=False,
+            )
+        # Reset state for the next synthesis cycle.
         self._stream_buffer = ""
+        self._stream_token_count = 0
+        self._stream_provider = ""
         self._stream_language = "json"
         self._streaming_active = False
 
