@@ -111,11 +111,14 @@ def _make_target() -> ReplayTarget:
 
 
 class TestMasterFlag:
-    def test_default_is_false(self):
+    def test_default_is_true_post_graduation(self):
+        """Slice 5 graduation flipped the master default to True
+        (2026-05-02). Hot-revert path remains via explicit
+        falsy env value."""
         os.environ.pop(
             "JARVIS_COUNTERFACTUAL_REPLAY_ENABLED", None,
         )
-        assert counterfactual_replay_enabled() is False
+        assert counterfactual_replay_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on", "TRUE"],
@@ -139,11 +142,12 @@ class TestMasterFlag:
 
     @pytest.mark.parametrize("v", ["", "   ", "\t\n"])
     def test_whitespace_treated_as_unset(self, v):
+        """Empty/whitespace = unset = graduated default-true."""
         with mock.patch.dict(
             os.environ,
             {"JARVIS_COUNTERFACTUAL_REPLAY_ENABLED": v},
         ):
-            assert counterfactual_replay_enabled() is False
+            assert counterfactual_replay_enabled() is True
 
 
 # ---------------------------------------------------------------------------

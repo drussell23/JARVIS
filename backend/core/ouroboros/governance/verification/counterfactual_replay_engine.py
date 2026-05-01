@@ -172,11 +172,11 @@ def replay_engine_enabled() -> bool:
     Asymmetric env semantics — empty/whitespace = unset = current
     default; explicit truthy/falsy overrides at call time.
 
-    Default ``false`` until Slice 5 graduation. Independent from
-    Slice 1's ``JARVIS_COUNTERFACTUAL_REPLAY_ENABLED`` so operators
-    can keep the schema (Slice 1 enums + dataclasses) live in
-    serialization paths while disabling the engine's loader for a
-    cost-cap rollback.
+    Default ``true`` — graduated 2026-05-02 in Priority #3 Slice 5.
+    Independent from Slice 1's master so operators can keep the
+    schema live in serialization paths while disabling the engine's
+    loader for a cost-cap rollback (hot-revert via ``export
+    JARVIS_REPLAY_ENGINE_ENABLED=false``).
 
     Both flags must be ``true`` for ``run_counterfactual_replay`` to
     actually load + project; if either is off the engine returns
@@ -185,7 +185,7 @@ def replay_engine_enabled() -> bool:
         "JARVIS_REPLAY_ENGINE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-off until Slice 5 graduation
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 

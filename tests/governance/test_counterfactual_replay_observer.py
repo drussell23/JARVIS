@@ -151,13 +151,16 @@ def _isolated_observer(monkeypatch, tmp_path):
 
 class TestObserverEnabledFlag:
 
-    def test_default_off(self, monkeypatch):
+    def test_default_on_post_graduation(self, monkeypatch):
+        """Slice 5 graduation flipped observer sub-gate to True
+        (2026-05-02)."""
         monkeypatch.delenv("JARVIS_REPLAY_OBSERVER_ENABLED", raising=False)
-        assert replay_observer_enabled() is False
+        assert replay_observer_enabled() is True
 
     def test_empty_treated_as_unset(self, monkeypatch):
+        """Empty = unset = graduated default-true."""
         monkeypatch.setenv("JARVIS_REPLAY_OBSERVER_ENABLED", "")
-        assert replay_observer_enabled() is False
+        assert replay_observer_enabled() is True
 
     @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "ON"])
     def test_truthy_variants(self, monkeypatch, val):

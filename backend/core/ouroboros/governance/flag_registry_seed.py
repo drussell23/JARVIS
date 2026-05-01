@@ -2104,6 +2104,130 @@ SEED_SPECS: list = [
         example="30",
         since="Priority #2 Slice 5",
     ),
+
+    # ====================================================================
+    # Counterfactual Replay (Priority #3) — 6 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_COUNTERFACTUAL_REPLAY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the 4-slice Counterfactual "
+            "Replay pipeline. When false, every public path "
+            "short-circuits in lockstep (engine → DISABLED, "
+            "comparator → DISABLED, observer → DISABLED). "
+            "Graduated default-true post-Slice-5 (2026-05-02) "
+            "because replay is read-only over cached artifacts "
+            "(zero LLM cost by AST-pinned construction; every "
+            "verdict stamps MonotonicTighteningVerdict.PASSED — "
+            "observational not prescriptive). Operator approval "
+            "still required for any downstream flag-flip proposal "
+            "via MetaAdaptationGovernor."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "counterfactual_replay.py"
+        ),
+        example="true",
+        since="Priority #3 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_REPLAY_ENGINE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 2 engine's loader path. When "
+            "false, run_counterfactual_replay returns DISABLED "
+            "with zero I/O — the Slice 1 schema stays live in "
+            "serialization paths, but no engine activity. Hot-"
+            "revert knob for cost-cap rollback without breaking "
+            "the rest of the stack."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "counterfactual_replay_engine.py"
+        ),
+        example="true",
+        since="Priority #3 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_REPLAY_COMPARATOR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 3 aggregator. When false, "
+            "compare_replay_history returns DISABLED. The "
+            "stamping logic (MonotonicTighteningVerdict.PASSED) "
+            "remains structurally accessible via stamp_verdict "
+            "for callers that want per-verdict stamping without "
+            "aggregation."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "counterfactual_replay_comparator.py"
+        ),
+        example="true",
+        since="Priority #3 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_REPLAY_OBSERVER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 4 history store + SSE event "
+            "publisher + periodic ReplayObserver. When false, "
+            "record_replay_verdict returns DISABLED, no JSONL "
+            "writes, no SSE events. Operators rolling back to a "
+            "no-persistence stance flip this without affecting "
+            "engine/comparator behavior."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "counterfactual_replay_observer.py"
+        ),
+        example="true",
+        since="Priority #3 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_REPLAY_PREVENTION_THRESHOLD_PCT",
+        type=FlagType.FLOAT, default=50.0,
+        description=(
+            "Minimum recurrence-reduction-pct (over actionable "
+            "verdicts) for ComparisonOutcome.ESTABLISHED. Default "
+            "50.0%. Cap structure: max(0.0, min(100.0, value)). "
+            "Operators tighten upward (e.g., 75.0) to demand "
+            "stronger empirical evidence before claiming the "
+            "policy under test prevents recurrence."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "counterfactual_replay_comparator.py"
+        ),
+        example="50.0",
+        since="Priority #3 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_REPLAY_HISTORY_MAX_RECORDS",
+        type=FlagType.INT, default=1000,
+        description=(
+            "Bounded ring-buffer cap for the JSONL history store. "
+            "Default 1000 records, clamped [10, 100000]. Rotation "
+            "truncates to this size after each append (same "
+            "discipline as InvariantDriftStore). Larger caps "
+            "support longer-baseline empirical claims at the cost "
+            "of more disk + slower full-history reads."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "counterfactual_replay_observer.py"
+        ),
+        example="1000",
+        since="Priority #3 Slice 5",
+    ),
 ]
 
 

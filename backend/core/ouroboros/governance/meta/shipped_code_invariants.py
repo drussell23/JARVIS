@@ -1292,6 +1292,204 @@ def _validate_quorum_cap_structure_pinned(
 
 
 # ---------------------------------------------------------------------------
+# Priority #3 — Counterfactual Replay AST pins (4 invariants)
+# ---------------------------------------------------------------------------
+
+
+def _validate_counterfactual_replay_pure_stdlib(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Slice 1 ``counterfactual_replay`` primitive MUST be pure-stdlib
+    — strongest authority invariant. Replay is observational not
+    prescriptive; the primitive must NEVER reach into governance
+    modules. Zero governance imports, zero exec/eval/compile, zero
+    async (Slice 2's engine wraps via ``asyncio.to_thread``).
+
+    NEVER raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if "backend." in module or "governance" in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: counterfactual_replay primitive "
+                    f"must be pure-stdlib — found {module!r}"
+                )
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in ("exec", "eval", "compile"):
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: counterfactual_replay MUST "
+                        f"NOT execute candidate code — found "
+                        f"{node.func.id}() call"
+                    )
+        if isinstance(node, ast.AsyncFunctionDef):
+            lineno = getattr(node, "lineno", "?")
+            violations.append(
+                f"line {lineno}: Slice 1 primitive must remain sync "
+                f"— found async function {node.name!r}"
+            )
+    return tuple(violations)
+
+
+# Cost-contract banned imports — replay engine + comparator + observer
+# all forbid orchestrator-tier coupling so the cost contract is
+# preserved by AST-pinned construction (no path through these modules
+# can invoke a generation provider).
+_REPLAY_BANNED_IMPORT_SUBSTRINGS: Tuple[str, ...] = (
+    ".providers", "doubleword_provider", "urgency_router",
+    "candidate_generator", "orchestrator", "tool_executor",
+    "phase_runner", "iron_gate", "change_engine",
+    "auto_action_router", "subagent_scheduler",
+    "semantic_guardian", "semantic_firewall", "risk_engine",
+)
+
+
+def _validate_counterfactual_replay_engine_cost_contract(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 2 engine MUST preserve the §26.6 cost contract by
+    construction: zero LLM cost on the replay path. Pinned via
+    AST-level absence of every orchestrator-tier import + presence
+    of the canonical reuse contracts (causality_dag.build_dag,
+    last_session_summary, decision_runtime.DecisionRecord).
+
+    The COST_CONTRACT_PRESERVED_BY_CONSTRUCTION constant must be
+    defined (structural marker for operators).
+
+    NEVER raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                for banned in _REPLAY_BANNED_IMPORT_SUBSTRINGS:
+                    if banned in alias.name:
+                        lineno = getattr(node, "lineno", "?")
+                        violations.append(
+                            f"line {lineno}: replay engine MUST NOT "
+                            f"import {alias.name!r} — cost contract "
+                            f"violation"
+                        )
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for banned in _REPLAY_BANNED_IMPORT_SUBSTRINGS:
+                if banned in module:
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: replay engine MUST NOT "
+                        f"import from {module!r} — cost contract "
+                        f"violation"
+                    )
+
+    # Positive reuse contracts — engine must reuse existing infra,
+    # not duplicate it.
+    required_symbols = (
+        ("causality_dag", "Priority 2 Slice 3 reuse"),
+        ("last_session_summary", "Phase 1 reuse"),
+        ("DecisionRecord", "Phase 1 Slice 1.2 reuse"),
+        ("COST_CONTRACT_PRESERVED_BY_CONSTRUCTION",
+         "structural marker constant"),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"replay engine dropped {symbol!r} — {reason} gone"
+            )
+    return tuple(violations)
+
+
+def _validate_counterfactual_replay_comparator_authority(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 3 comparator MUST be PURE-DATA aggregator: no
+    orchestrator-tier imports, no async, no exec/eval/compile.
+    MUST reuse Slice 1's closed-taxonomy enums (BranchVerdict,
+    ReplayOutcome, ReplayVerdict). MUST resolve PASSED via
+    ``adaptation.ledger.MonotonicTighteningVerdict`` (Phase C
+    cross-stack vocabulary integration).
+
+    NEVER raises."""
+    violations: List[str] = []
+    # Banned authority imports.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for banned in _REPLAY_BANNED_IMPORT_SUBSTRINGS:
+                if banned in module:
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: comparator MUST NOT import "
+                        f"from {module!r} — authority violation"
+                    )
+        if isinstance(node, ast.AsyncFunctionDef):
+            lineno = getattr(node, "lineno", "?")
+            violations.append(
+                f"line {lineno}: Slice 3 comparator must remain "
+                f"sync — found async function {node.name!r}"
+            )
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in ("exec", "eval", "compile"):
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: comparator MUST NOT execute "
+                    f"candidate code — found {node.func.id}() call"
+                )
+
+    # Positive reuse contracts.
+    required_symbols = (
+        ("BranchVerdict", "Slice 1 closed-taxonomy reuse"),
+        ("ReplayOutcome", "Slice 1 closed-taxonomy reuse"),
+        ("ReplayVerdict", "Slice 1 schema reuse"),
+        ("MonotonicTighteningVerdict",
+         "Phase C cross-stack vocabulary"),
+        ("adaptation.ledger",
+         "Phase C cage rule integration"),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"comparator dropped {symbol!r} — {reason} gone"
+            )
+    return tuple(violations)
+
+
+def _validate_counterfactual_replay_observer_uses_flock(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Slice 4 observer MUST use Tier 1 #3 cross-process flock for
+    the JSONL ring buffer (zero-duplication contract — same
+    discipline as InvariantDriftStore + Coherence window store +
+    PostmortemRecall index). MUST reuse Slice 3's
+    ``compare_replay_history`` + ``stamp_verdict`` (no
+    re-aggregation, no re-stamping). MUST reuse the
+    ``ide_observability_stream`` broker (Gap #6 reuse) AND the
+    2 new event-type constants registered in Slice 4.
+
+    NEVER raises."""
+    violations: List[str] = []
+    required_symbols = (
+        ("flock_append_line", "Tier 1 #3 cross-process safety"),
+        ("flock_critical_section", "Tier 1 #3 ring-buffer safety"),
+        ("cross_process_jsonl", "Tier 1 #3 module reuse"),
+        ("compare_replay_history", "Slice 3 aggregator reuse"),
+        ("stamp_verdict", "Slice 3 stamp reuse"),
+        ("ide_observability_stream", "Gap #6 broker reuse"),
+        ("EVENT_TYPE_COUNTERFACTUAL_REPLAY_COMPLETE",
+         "per-verdict SSE event vocabulary"),
+        ("EVENT_TYPE_COUNTERFACTUAL_BASELINE_UPDATED",
+         "per-aggregation SSE event vocabulary"),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"observer dropped {symbol!r} — {reason} gone"
+            )
+    return tuple(violations)
+
+
+# ---------------------------------------------------------------------------
 # Priority #2 — PostmortemRecall AST pins (4 invariants)
 # ---------------------------------------------------------------------------
 
@@ -2418,6 +2616,107 @@ def _register_seed_invariants() -> None:
             ),
             validate=(
                 _validate_postmortem_recall_consumer_uses_adaptation_ledger
+            ),
+        ),
+    )
+    # Priority #3 Slice 5 — Counterfactual Replay graduation pins.
+    # Closes the policy-evaluation gap (prevention → empirical
+    # measurement of effectiveness). These 4 pins protect the
+    # structural primitives from refactor drift across the 4-slice
+    # pipeline (primitive → engine → comparator → observer).
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="counterfactual_replay_pure_stdlib",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "counterfactual_replay.py"
+            ),
+            description=(
+                "Slice 1 counterfactual_replay primitive MUST be "
+                "PURE-STDLIB — strongest authority invariant. Zero "
+                "governance imports. No exec/eval/compile (canonical "
+                "safety pin). No async (Slice 2's engine wraps via "
+                "asyncio.to_thread). Mirrors Priority #1/#2 Slice 1 "
+                "discipline — observational, not prescriptive."
+            ),
+            validate=_validate_counterfactual_replay_pure_stdlib,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "counterfactual_replay_engine_cost_contract"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "counterfactual_replay_engine.py"
+            ),
+            description=(
+                "STRUCTURAL §26.6 cost-contract preservation: "
+                "Slice 2 engine MUST NOT import any orchestrator-"
+                "tier module (providers / doubleword / "
+                "urgency_router / candidate_generator / "
+                "orchestrator / tool_executor / phase_runner / "
+                "iron_gate / change_engine / auto_action_router / "
+                "subagent_scheduler / semantic_guardian / "
+                "semantic_firewall / risk_engine). MUST reuse "
+                "causality_dag.build_dag + last_session_summary + "
+                "DecisionRecord (no JSONL re-implementation). MUST "
+                "define COST_CONTRACT_PRESERVED_BY_CONSTRUCTION. "
+                "Replay's zero-LLM-cost guarantee is structural."
+            ),
+            validate=(
+                _validate_counterfactual_replay_engine_cost_contract
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "counterfactual_replay_comparator_authority"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "counterfactual_replay_comparator.py"
+            ),
+            description=(
+                "Slice 3 comparator MUST be PURE-DATA aggregator: "
+                "no orchestrator-tier imports, no async (Slice 4 "
+                "wraps via to_thread), no exec/eval/compile. MUST "
+                "reuse Slice 1 closed-taxonomy enums (BranchVerdict, "
+                "ReplayOutcome, ReplayVerdict). MUST resolve PASSED "
+                "via adaptation.ledger.MonotonicTighteningVerdict "
+                "for Phase C cross-stack vocabulary integration. "
+                "Catches refactor that breaks zero-duplication or "
+                "drops the canonical PASSED stamping."
+            ),
+            validate=(
+                _validate_counterfactual_replay_comparator_authority
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "counterfactual_replay_observer_uses_flock"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "counterfactual_replay_observer.py"
+            ),
+            description=(
+                "STRUCTURAL Tier 1 #3 cross-process safety + Slice "
+                "3 reuse + Gap #6 broker reuse: Slice 4 observer "
+                "MUST reference flock_append_line + "
+                "flock_critical_section AND compare_replay_history "
+                "+ stamp_verdict (zero re-aggregation/re-stamping) "
+                "AND ide_observability_stream + the 2 new event "
+                "vocabulary constants. Catches refactor that drops "
+                "cross-process safety OR re-implements the "
+                "comparator OR forgets to wire the SSE broker."
+            ),
+            validate=(
+                _validate_counterfactual_replay_observer_uses_flock
             ),
         ),
     )

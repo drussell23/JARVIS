@@ -244,17 +244,20 @@ def _reset_engine_state():
 
 class TestEngineEnabledFlag:
 
-    def test_default_off(self, monkeypatch):
+    def test_default_on_post_graduation(self, monkeypatch):
+        """Slice 5 graduation flipped engine sub-gate to True
+        (2026-05-02)."""
         monkeypatch.delenv("JARVIS_REPLAY_ENGINE_ENABLED", raising=False)
-        assert replay_engine_enabled() is False
+        assert replay_engine_enabled() is True
 
     def test_empty_string_treated_as_unset(self, monkeypatch):
+        """Empty = unset = graduated default-true."""
         monkeypatch.setenv("JARVIS_REPLAY_ENGINE_ENABLED", "")
-        assert replay_engine_enabled() is False
+        assert replay_engine_enabled() is True
 
     def test_whitespace_treated_as_unset(self, monkeypatch):
         monkeypatch.setenv("JARVIS_REPLAY_ENGINE_ENABLED", "   ")
-        assert replay_engine_enabled() is False
+        assert replay_engine_enabled() is True
 
     @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "ON"])
     def test_truthy_variants(self, monkeypatch, val):
