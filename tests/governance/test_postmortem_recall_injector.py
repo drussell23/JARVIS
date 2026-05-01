@@ -663,12 +663,15 @@ class TestAuthorityInvariants:
         """Slice 3 may import:
           * Slice 1 (postmortem_recall)
           * Slice 2 (postmortem_recall_index)
-          * last_session_summary (_sanitize_field)"""
+          * last_session_summary (_sanitize_field)
+          * Slice 5 — lazy SSE publisher import"""
         tree = ast.parse(source)
         allowed = {
             "backend.core.ouroboros.governance.last_session_summary",
             "backend.core.ouroboros.governance.verification.postmortem_recall",
             "backend.core.ouroboros.governance.verification.postmortem_recall_index",
+            # Slice 5 — lazy SSE publisher import
+            "backend.core.ouroboros.governance.ide_observability_stream",
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
