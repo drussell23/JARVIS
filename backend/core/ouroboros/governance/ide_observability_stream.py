@@ -86,6 +86,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Tuple,
     TYPE_CHECKING,
 )
 
@@ -179,6 +180,15 @@ EVENT_TYPE_SESSION_BOOKMARKED = "session_bookmarked"
 EVENT_TYPE_SESSION_UNBOOKMARKED = "session_unbookmarked"
 EVENT_TYPE_SESSION_PINNED = "session_pinned"
 EVENT_TYPE_SESSION_UNPINNED = "session_unpinned"
+
+# PlanFalsificationDetector Slice 5 — structural plan-step falsification
+# verdict (advisory). Fired by the orchestrator bridge after every
+# bridge_to_replan() call so observability sees both REPLAN_TRIGGERED
+# (preempts legacy DynamicRePlanner) and the silent paths (no
+# falsification, insufficient evidence, disabled, failed). Read-only;
+# no authority surface.
+EVENT_TYPE_PLAN_FALSIFICATION_VERDICT = "plan_falsification_verdict"
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -1406,6 +1416,58 @@ def publish_flag_registered_event(
         )
     except Exception:  # noqa: BLE001
         logger.debug("[Stream] publish_flag_registered_event exception", exc_info=True)
+        return None
+
+
+def publish_plan_falsification_verdict(
+    *,
+    op_id: str,
+    outcome: str,
+    falsified_step_index: Optional[int] = None,
+    falsifying_evidence_kinds: Tuple[str, ...] = (),
+    contradicting_detail: str = "",
+    total_hypotheses: int = 0,
+    total_evidence: int = 0,
+    monotonic_tightening_verdict: str = "",
+    prompt_injected: bool = False,
+) -> Optional[str]:
+    """Best-effort publisher for plan_falsification_verdict frames.
+
+    Returns the event_id on success, None when stream is disabled
+    / broker missing / publish raised. Never raises. Fired by the
+    orchestrator bridge on every bridge_to_replan() call so
+    operators see both REPLAN_TRIGGERED (preempts the legacy
+    DynamicRePlanner regex backstop) and silent paths
+    (NO_FALSIFICATION / INSUFFICIENT_EVIDENCE / DISABLED / FAILED).
+
+    Read-only payload — no authority surface."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_PLAN_FALSIFICATION_VERDICT, op_id,
+            {
+                "outcome": str(outcome),
+                "falsified_step_index": falsified_step_index,
+                "falsifying_evidence_kinds": list(
+                    falsifying_evidence_kinds
+                ),
+                "contradicting_detail": str(
+                    contradicting_detail or "",
+                )[:500],
+                "total_hypotheses": int(total_hypotheses),
+                "total_evidence": int(total_evidence),
+                "monotonic_tightening_verdict": str(
+                    monotonic_tightening_verdict or "",
+                ),
+                "prompt_injected": bool(prompt_injected),
+            },
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.debug(
+            "[Stream] publish_plan_falsification_verdict exception",
+            exc_info=True,
+        )
         return None
 
 

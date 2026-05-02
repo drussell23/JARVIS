@@ -905,3 +905,46 @@ Rules:
                         "model output may have ordering errors"
                     )
                     break
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned FlagRegistry seed for the new Slice 3 sub-flag
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    """Register the Slice 3 hypothesis-emit sub-flag. Auto-discovered.
+    Returns count."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[PlanGenerator] register_flags degraded: %s", exc,
+        )
+        return 0
+    spec = FlagSpec(
+        name="JARVIS_PLAN_HYPOTHESIS_EMIT_ENABLED",
+        type=FlagType.BOOL, default=True,
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/plan_generator.py"
+        ),
+        example="JARVIS_PLAN_HYPOTHESIS_EMIT_ENABLED=true",
+        description=(
+            "Sub-flag for plan.1 schema's expected_outcome field. "
+            "Independent of JARVIS_PLAN_FALSIFICATION_ENABLED so "
+            "operators can toggle hypothesis emission and detection "
+            "independently. Default true post Slice 5 graduation."
+        ),
+    )
+    try:
+        registry.register(spec)
+        return 1
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[PlanGenerator] register_flags spec %s skipped: %s",
+            spec.name, exc,
+        )
+        return 0

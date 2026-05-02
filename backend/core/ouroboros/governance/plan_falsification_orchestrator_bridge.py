@@ -386,6 +386,7 @@ async def bridge_to_replan(
     project_root: Optional[Path] = None,
     enabled: Optional[bool] = None,
     inject_prompt: Optional[bool] = None,
+    op_id: str = "",
 ) -> Tuple[FalsificationVerdict, str]:
     """Run the structural detector against the current plan +
     upstream validation evidence; return (verdict, prompt_block).
@@ -441,11 +442,35 @@ async def bridge_to_replan(
         inject_prompt if inject_prompt is not None
         else prompt_inject_enabled()
     )
-    if not inject:
-        return (verdict, "")
-    feedback = render_falsification_feedback(
-        verdict, plan_hypotheses=plan_hypotheses,
-    )
+    feedback = ""
+    if inject:
+        feedback = render_falsification_feedback(
+            verdict, plan_hypotheses=plan_hypotheses,
+        )
+    # Best-effort SSE publish (Slice 5 graduation). Never blocks
+    # bridge return on stream failures.
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            publish_plan_falsification_verdict,
+        )
+        publish_plan_falsification_verdict(
+            op_id=op_id or "unknown",
+            outcome=verdict.outcome.value,
+            falsified_step_index=verdict.falsified_step_index,
+            falsifying_evidence_kinds=verdict.falsifying_evidence_kinds,
+            contradicting_detail=verdict.contradicting_detail,
+            total_hypotheses=verdict.total_hypotheses,
+            total_evidence=verdict.total_evidence,
+            monotonic_tightening_verdict=(
+                verdict.monotonic_tightening_verdict
+            ),
+            prompt_injected=bool(feedback),
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.debug(
+            "[PlanFalsificationBridge] SSE publish degraded: %s",
+            exc,
+        )
     return (verdict, feedback)
 
 
@@ -456,5 +481,211 @@ __all__ = [
     "build_evidence_from_validation",
     "extract_hypotheses_from_plan_json",
     "prompt_inject_enabled",
+    "register_flags",
+    "register_shipped_invariants",
     "render_falsification_feedback",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    """Module-owned :class:`FlagRegistry` registration for the
+    bridge's 3 sub-flags. Auto-discovered. Returns count."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[PlanFalsificationBridge] register_flags degraded: %s",
+            exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/"
+        "plan_falsification_orchestrator_bridge.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_PLAN_FALSIFICATION_BRIDGE_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=(
+                "JARVIS_PLAN_FALSIFICATION_BRIDGE_ENABLED=true"
+            ),
+            description=(
+                "Wire-up sub-flag for the orchestrator bridge. "
+                "Composes with the Slice 1 master flag. When off, "
+                "the orchestrator skips the structural detector "
+                "and falls through to the legacy DynamicRePlanner "
+                "regex backstop. Graduated default-true 2026-05-02."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_PLAN_FALSIFICATION_PROMPT_INJECT_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=(
+                "JARVIS_PLAN_FALSIFICATION_PROMPT_INJECT_ENABLED=true"
+            ),
+            description=(
+                "Shadow-mode toggle: when off, the detector still "
+                "runs (verdict surfaces in observability) but no "
+                "prompt injection. Operators flip to false to "
+                "compare structural verdicts against model "
+                "behavior without pre-empting the legacy path."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_PLAN_FALSIFICATION_FEEDBACK_MAX_CHARS",
+            type=FlagType.INT, default=1500,
+            category=Category.CAPACITY,
+            source_file=target,
+            example=(
+                "JARVIS_PLAN_FALSIFICATION_FEEDBACK_MAX_CHARS=2200"
+            ),
+            description=(
+                "Truncation cap for the structural feedback block "
+                "injected into the GENERATE_RETRY prompt. Floor "
+                "200, ceiling 4000."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[PlanFalsificationBridge] register_flags spec %s "
+                "skipped: %s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Slice 4 invariants: authority allowlist (Slice 1 + Slice 2
+    only) + bridge_to_replan async + render output ASCII-only."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    _ALLOWED = {
+        "plan_falsification",
+        "plan_falsification_detector",
+    }
+    _FORBIDDEN = {
+        "orchestrator", "phase_runner", "iron_gate",
+        "change_engine", "candidate_generator", "providers",
+        "doubleword_provider", "urgency_router",
+        "auto_action_router", "subagent_scheduler",
+        "tool_executor", "semantic_guardian",
+        "semantic_firewall", "risk_engine",
+    }
+
+    def _validate(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        violations: list = []
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." not in module and "governance" not in module:
+                    continue
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                tail = module.rsplit(".", 1)[-1]
+                if tail in _FORBIDDEN:
+                    violations.append(
+                        f"line {lineno}: forbidden module {module!r}"
+                    )
+                elif tail not in _ALLOWED:
+                    violations.append(
+                        f"line {lineno}: unexpected governance "
+                        f"import {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 4 MUST NOT {node.func.id}()"
+                        )
+        # bridge_to_replan must be async.
+        async_seen = {
+            n.name for n in _ast.walk(tree)
+            if isinstance(n, _ast.AsyncFunctionDef)
+        }
+        if "bridge_to_replan" not in async_seen:
+            violations.append(
+                "missing async def bridge_to_replan"
+            )
+        # Renderer output must be ASCII-only at the source level
+        # — flag any non-ASCII string-literal that ships into the
+        # rendered prompt block. We constrain to the lines list
+        # inside render_falsification_feedback to avoid pinning
+        # docstrings.
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef) and (
+                node.name == "render_falsification_feedback"
+            ):
+                for sub in _ast.walk(node):
+                    if isinstance(sub, _ast.Constant) and isinstance(
+                        sub.value, str,
+                    ):
+                        try:
+                            sub.value.encode("ascii")
+                        except UnicodeEncodeError:
+                            violations.append(
+                                f"line {getattr(sub, 'lineno', '?')}: "
+                                f"render_falsification_feedback "
+                                f"emits non-ASCII literal"
+                            )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/"
+        "plan_falsification_orchestrator_bridge.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="plan_falsification_bridge_authority",
+            target_file=target,
+            description=(
+                "Slice 4 bridge authority: imports only "
+                "plan_falsification (Slice 1) + "
+                "plan_falsification_detector (Slice 2); "
+                "bridge_to_replan stays async; render output is "
+                "ASCII-only (Iron Gate strict-ASCII compatible); "
+                "no exec/eval/compile."
+            ),
+            validate=_validate,
+        ),
+    ]

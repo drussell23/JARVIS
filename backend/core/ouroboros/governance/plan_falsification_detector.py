@@ -387,4 +387,162 @@ __all__ = [
     "PLAN_FALSIFICATION_DETECTOR_SCHEMA_VERSION",
     "detect_falsification",
     "filesystem_probe_enabled",
+    "register_flags",
+    "register_shipped_invariants",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    """Module-owned :class:`FlagRegistry` registration for the
+    Slice 2 sub-flag. Discovered automatically. Returns count."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[PlanFalsificationDetector] register_flags degraded: %s",
+            exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/"
+        "plan_falsification_detector.py"
+    )
+    spec = FlagSpec(
+        name="JARVIS_PLAN_FALSIFICATION_FS_PROBE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        category=Category.SAFETY,
+        source_file=target,
+        example="JARVIS_PLAN_FALSIFICATION_FS_PROBE_ENABLED=true",
+        description=(
+            "Per-probe sub-flag for the FILE_MISSING filesystem "
+            "probe. Independent of master "
+            "JARVIS_PLAN_FALSIFICATION_ENABLED. Operators flip "
+            "false to suppress probes on slow NFS while keeping "
+            "upstream-classified evidence flowing."
+        ),
+    )
+    try:
+        registry.register(spec)
+        return 1
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[PlanFalsificationDetector] register_flags spec %s "
+            "skipped: %s", spec.name, exc,
+        )
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Slice 2 invariant: authority allowlist (only Slice 1
+    governance import permitted) + detector-async / helpers-sync
+    layout + no exec/eval/compile."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    _ALLOWED = {"plan_falsification"}
+    _FORBIDDEN = {
+        "orchestrator", "phase_runner", "iron_gate",
+        "change_engine", "candidate_generator", "providers",
+        "doubleword_provider", "urgency_router",
+        "auto_action_router", "subagent_scheduler",
+        "tool_executor", "semantic_guardian",
+        "semantic_firewall", "risk_engine",
+    }
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." not in module and "governance" not in module:
+                    continue
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                tail = module.rsplit(".", 1)[-1]
+                if tail in _FORBIDDEN:
+                    violations.append(
+                        f"line {lineno}: forbidden module {module!r}"
+                    )
+                elif tail not in _ALLOWED:
+                    violations.append(
+                        f"line {lineno}: unexpected governance "
+                        f"import {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 2 MUST NOT {node.func.id}()"
+                        )
+        # detect_falsification must be async; helpers must be sync.
+        sync_required = {
+            "_resolve_probe_path", "_probe_one_file",
+            "_run_filesystem_probe", "filesystem_probe_enabled",
+        }
+        async_required = {"detect_falsification"}
+        async_seen: set = set()
+        sync_seen: set = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AsyncFunctionDef):
+                async_seen.add(node.name)
+                if node.name in sync_required:
+                    violations.append(
+                        f"{node.name!r} must be sync but is async "
+                        f"def at line {getattr(node, 'lineno', '?')}"
+                    )
+            elif isinstance(node, _ast.FunctionDef):
+                sync_seen.add(node.name)
+        for required in async_required:
+            if required not in async_seen:
+                violations.append(
+                    f"missing async def {required!r}"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="plan_falsification_detector_authority",
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "plan_falsification_detector.py"
+            ),
+            description=(
+                "Slice 2 detector authority: imports only "
+                "plan_falsification (Slice 1); detect_falsification "
+                "is async + filesystem helpers stay sync; no "
+                "exec/eval/compile."
+            ),
+            validate=_validate,
+        ),
+    ]
