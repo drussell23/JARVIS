@@ -162,6 +162,15 @@ class DriftKind(str, enum.Enum):
     )
     EXPLORATION_BUCKET_REMOVED = "exploration_bucket_removed"
     POSTURE_DRIFT = "posture_drift"
+    # Cascading state vector fix (2026-05-01): long-horizon semantic
+    # gradient drift. Individual per-op changes may each pass all
+    # discrete checks (SemanticGuardian + Iron Gate + Quorum), but
+    # cumulative small shifts between snapshot points can regress an
+    # invariant surface by 100% with zero alarms. This kind is
+    # emitted by the observer's gradient tracker, NOT by the
+    # compare_snapshots() primitive (which remains a pure binary
+    # comparison between two snapshots).
+    GRADIENT_DRIFT_DETECTED = "gradient_drift_detected"
 
 
 # ---------------------------------------------------------------------------

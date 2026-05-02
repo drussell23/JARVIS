@@ -124,6 +124,40 @@ def lock_timeout_s() -> float:
         return _DEFAULT_LOCK_TIMEOUT_S
 
 
+# --- Stale lock age knob (cascading state vector fix 2026-05-01) ---
+
+_DEFAULT_STALE_LOCK_AGE_S: float = 300.0  # 5 minutes
+_STALE_LOCK_AGE_FLOOR_S: float = 10.0
+_STALE_LOCK_AGE_CEILING_S: float = 86400.0  # 24 hours
+
+
+def stale_lock_age_s() -> float:
+    """``JARVIS_STALE_LOCK_AGE_S`` (default 300s = 5 min, floor 10s,
+    ceiling 86400s = 24h).
+
+    When a ``.lock`` file's mtime is older than this threshold at
+    the time of a successful flock acquire, a structured WARNING log
+    is emitted: ``[CrossProcessJSONL] stale_lock_detected``.
+
+    The log signal lets operators detect "something was SIGKILL'd
+    mid-critical-section" and investigate the corresponding data
+    file for possible corruption (partial write). The lock mechanism
+    itself is functionally correct — the kernel releases flock on
+    process death — so this is purely diagnostic. NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_STALE_LOCK_AGE_S", "",
+    ).strip()
+    if not raw:
+        return _DEFAULT_STALE_LOCK_AGE_S
+    try:
+        val = float(raw)
+        return max(_STALE_LOCK_AGE_FLOOR_S, min(
+            _STALE_LOCK_AGE_CEILING_S, val,
+        ))
+    except (TypeError, ValueError):
+        return _DEFAULT_STALE_LOCK_AGE_S
+
+
 # ---------------------------------------------------------------------------
 # In-process lock map — keyed by lock-file absolute path
 # ---------------------------------------------------------------------------
@@ -218,6 +252,17 @@ def _acquire_cross_process_lock(
         backoff = 0.005
         max_backoff = 0.25
         acquired = False
+        # Cascading state vector fix (2026-05-01): stat lock file
+        # mtime BEFORE acquiring the flock. If the file pre-existed
+        # with a stale mtime, a prior process may have been SIGKILL'd
+        # mid-critical-section. The lock is functionally correct
+        # (kernel released it), but the data file may be corrupt.
+        lock_mtime_before: float = 0.0
+        try:
+            st = os.fstat(lock_fd)
+            lock_mtime_before = st.st_mtime
+        except OSError:
+            pass
         try:
             while True:
                 try:
@@ -250,6 +295,29 @@ def _acquire_cross_process_lock(
             if not acquired:
                 yield False
                 return
+
+            # Stale lock detection: if the file existed before we
+            # opened it AND its mtime is older than the staleness
+            # threshold, log a structured WARNING. The data file
+            # associated with this lock may have been left in a
+            # partially-written state.
+            if lock_mtime_before > 0:
+                age = time.time() - lock_mtime_before
+                threshold = stale_lock_age_s()
+                if age > threshold:
+                    logger.warning(
+                        "[CrossProcessJSONL] stale_lock_detected "
+                        "path=%s age_s=%.1f threshold_s=%.1f",
+                        lock_path, age, threshold,
+                    )
+
+            # Update mtime so the next acquirer can distinguish
+            # "file from a clean session" (mtime recent) from
+            # "file from a SIGKILL'd process" (mtime stale).
+            try:
+                os.utime(lock_fd)
+            except OSError:
+                pass  # best-effort; not critical
 
             yield True
         finally:
@@ -417,4 +485,5 @@ __all__ = [
     "flock_append_lines",
     "flock_critical_section",
     "lock_timeout_s",
+    "stale_lock_age_s",
 ]

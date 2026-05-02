@@ -334,6 +334,11 @@ _INFRA_FAILURE_CLASSES: FrozenSet[str] = frozenset({
     "battery_low",
     "git_lock_contention",
     "async_shutdown_race",
+    # Cascading state vector fix (2026-05-01): worktree isolation
+    # failures are now a distinct failure_class from generic "infra"
+    # so the retry budget can distinguish them. But for graduation
+    # aggregate statistics, they're still infrastructure-category.
+    "worktree_isolation",
 })
 
 _MIGRATION_STOP_REASONS: FrozenSet[str] = frozenset({

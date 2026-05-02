@@ -111,7 +111,13 @@ class GenerationSubagentExecutor:
                         attempt_count=1,
                         started_at_ns=started_at_ns,
                         finished_at_ns=time.monotonic_ns(),
-                        failure_class="infra",
+                        # Cascading state vector fix (2026-05-01):
+                        # worktree isolation failures use a distinct
+                        # failure_class so the retry budget and episodic
+                        # memory can distinguish them from validation
+                        # infra failures. Previously both used "infra",
+                        # causing flapping classification.
+                        failure_class="worktree_isolation",
                         error=f"worktree_create_failed:{type(wt_exc).__name__}:{wt_exc}",
                         causal_parent_id=causal_parent_id,
                     )

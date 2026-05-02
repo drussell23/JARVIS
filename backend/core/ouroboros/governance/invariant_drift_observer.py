@@ -68,11 +68,15 @@ from typing import (
     Callable,
     Deque,
     Dict,
+    List,
     Optional,
+    Set,
     Tuple,
 )
 
 from backend.core.ouroboros.governance.invariant_drift_auditor import (
+    DriftKind,
+    DriftSeverity,
     InvariantDriftRecord,
     InvariantSnapshot,
     capture_snapshot,
@@ -197,6 +201,48 @@ def dedup_window() -> int:
         _DEFAULT_DEDUP_WINDOW,
         minimum=_DEDUP_WINDOW_FLOOR,
     )
+
+
+# --- Gradient drift env knobs (cascading state vector fix 2026-05-01) ---
+
+_DEFAULT_GRADIENT_WINDOW = 10
+_GRADIENT_WINDOW_FLOOR = 3
+_GRADIENT_WINDOW_CEILING = 100
+_DEFAULT_GRADIENT_THRESHOLD = 3
+_GRADIENT_THRESHOLD_FLOOR = 2
+_GRADIENT_THRESHOLD_CEILING = 50
+
+
+def gradient_window() -> int:
+    """``JARVIS_INVARIANT_DRIFT_GRADIENT_WINDOW`` (default 10,
+    floor 3, ceiling 100).
+
+    Number of recent history snapshots the gradient tracker examines.
+    Larger windows catch slower drift but increase memory/CPU cost
+    on each cycle. NEVER raises."""
+    raw = _env_int(
+        "JARVIS_INVARIANT_DRIFT_GRADIENT_WINDOW",
+        _DEFAULT_GRADIENT_WINDOW,
+        minimum=_GRADIENT_WINDOW_FLOOR,
+    )
+    return min(_GRADIENT_WINDOW_CEILING, raw)
+
+
+def gradient_threshold() -> int:
+    """``JARVIS_INVARIANT_DRIFT_GRADIENT_THRESHOLD`` (default 3,
+    floor 2, ceiling 50).
+
+    Number of distinct hash values in the gradient window that
+    triggers a GRADIENT_DRIFT_DETECTED alarm. A stable surface has
+    1 distinct hash; 2 means one change (normal). 3+ means the
+    surface is shifting frequently — potential creeping regression.
+    NEVER raises."""
+    raw = _env_int(
+        "JARVIS_INVARIANT_DRIFT_GRADIENT_THRESHOLD",
+        _DEFAULT_GRADIENT_THRESHOLD,
+        minimum=_GRADIENT_THRESHOLD_FLOOR,
+    )
+    return min(_GRADIENT_THRESHOLD_CEILING, raw)
 
 
 # Default posture multipliers — operator-overridable, not magic.
@@ -449,6 +495,108 @@ class InvariantDriftObserver:
         # Floor — never zero, never below the configured minimum
         return max(_INTERVAL_FLOOR_S, base)
 
+    # ---- gradient drift (cascading state vector fix 2026-05-01) --------
+
+    def _compute_gradient_drift(self) -> List[InvariantDriftRecord]:
+        """Detect cumulative long-horizon drift across the history window.
+
+        Reads the last ``gradient_window()`` snapshots from the store
+        and counts distinct hash/signature values for each invariant
+        surface. When the count exceeds ``gradient_threshold()``, the
+        surface is shifting frequently between snapshot points —
+        potential creeping regression that passes every individual
+        discrete check.
+
+        Tracked surfaces:
+          * **Flag registry hash** — distinct ``flag_registry_hash``
+            values. Stable = 1; 2 = one change; 3+ = churning.
+          * **Shipped violation signature** — distinct
+            ``shipped_violation_signature`` values.
+          * **Exploration floor fingerprint** — distinct composite
+            hashes of ``(min_score, min_categories)`` per complexity
+            bucket.
+
+        NEVER raises — any exception returns empty list."""
+        try:
+            window = gradient_window()
+            threshold = gradient_threshold()
+            history = self._store.load_history(limit=window)
+            if len(history) < threshold:
+                # Not enough data points to compute a meaningful
+                # gradient — need at least `threshold` snapshots.
+                return []
+
+            records: List[InvariantDriftRecord] = []
+
+            # Surface 1: flag registry hash churn
+            flag_hashes: Set[str] = set()
+            for snap in history:
+                if snap.flag_registry_hash:
+                    flag_hashes.add(snap.flag_registry_hash)
+            if len(flag_hashes) >= threshold:
+                records.append(InvariantDriftRecord(
+                    drift_kind=DriftKind.GRADIENT_DRIFT_DETECTED,
+                    severity=DriftSeverity.WARNING,
+                    detail=(
+                        f"flag_registry gradient drift: "
+                        f"{len(flag_hashes)} distinct hashes "
+                        f"in last {len(history)} snapshots "
+                        f"(threshold={threshold})"
+                    ),
+                    affected_keys=("flag_registry_hash",),
+                ))
+
+            # Surface 2: shipped violation signature churn
+            vio_sigs: Set[str] = set()
+            for snap in history:
+                if snap.shipped_violation_signature:
+                    vio_sigs.add(snap.shipped_violation_signature)
+            if len(vio_sigs) >= threshold:
+                records.append(InvariantDriftRecord(
+                    drift_kind=DriftKind.GRADIENT_DRIFT_DETECTED,
+                    severity=DriftSeverity.WARNING,
+                    detail=(
+                        f"shipped_violation gradient drift: "
+                        f"{len(vio_sigs)} distinct signatures "
+                        f"in last {len(history)} snapshots "
+                        f"(threshold={threshold})"
+                    ),
+                    affected_keys=("shipped_violation_signature",),
+                ))
+
+            # Surface 3: exploration floor fingerprint churn
+            # Compute a composite fingerprint per snapshot from all
+            # floor pins' (complexity, min_score, min_categories).
+            floor_fingerprints: Set[str] = set()
+            for snap in history:
+                if snap.exploration_floor_pins:
+                    parts = sorted(
+                        f"{p.complexity}:{p.min_score:.4f}:"
+                        f"{p.min_categories}"
+                        for p in snap.exploration_floor_pins
+                    )
+                    floor_fingerprints.add("|".join(parts))
+            if len(floor_fingerprints) >= threshold:
+                records.append(InvariantDriftRecord(
+                    drift_kind=DriftKind.GRADIENT_DRIFT_DETECTED,
+                    severity=DriftSeverity.WARNING,
+                    detail=(
+                        f"exploration_floor gradient drift: "
+                        f"{len(floor_fingerprints)} distinct "
+                        f"fingerprints in last {len(history)} "
+                        f"snapshots (threshold={threshold})"
+                    ),
+                    affected_keys=("exploration_floor_pins",),
+                ))
+
+            return records
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[InvariantDriftObserver] gradient drift compute "
+                "failed: %s", exc,
+            )
+            return []
+
     # ---- lifecycle --------------------------------------------------------
 
     def is_running(self) -> bool:
@@ -563,6 +711,14 @@ class InvariantDriftObserver:
 
         # 4. Compare
         drift_records = compare_snapshots(baseline, current)
+
+        # 4b. Gradient drift — cascading state vector fix (2026-05-01).
+        # Even if compare_snapshots found no drift between baseline
+        # and current, the history may reveal cumulative shifts.
+        gradient_records = self._compute_gradient_drift()
+        if gradient_records:
+            drift_records = tuple(list(drift_records) + gradient_records)
+
         if not drift_records:
             with self._lock:
                 self._cycles_ok += 1

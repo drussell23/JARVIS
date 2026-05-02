@@ -81,7 +81,8 @@ async def test_execute_fails_hard_when_worktree_create_raises(tmp_path: Path) ->
 
     Verifies:
       1. result.status == FAILED
-      2. failure_class == "infra"
+      2. failure_class == "worktree_isolation" (cascading state vector fix:
+         decoupled from generic "infra" to prevent retry flapping)
       3. error carries "worktree_create_failed:" marker with the original
          exception type
       4. generator.generate() was never called (the shared tree was never
@@ -107,7 +108,7 @@ async def test_execute_fails_hard_when_worktree_create_raises(tmp_path: Path) ->
     result = await executor.execute(graph, unit)
 
     assert result.status is WorkUnitState.FAILED
-    assert result.failure_class == "infra"
+    assert result.failure_class == "worktree_isolation"
     assert result.error is not None
     assert result.error.startswith("worktree_create_failed:"), (
         f"expected worktree_create_failed: marker, got: {result.error}"
