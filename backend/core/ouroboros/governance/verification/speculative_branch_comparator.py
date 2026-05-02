@@ -123,10 +123,11 @@ def comparator_enabled() -> bool:
     Asymmetric env semantics — empty/whitespace = unset = current
     default; explicit truthy/falsy overrides at call time.
 
-    Default ``false`` until Slice 5 graduation. Independent from
-    Slice 1's master so operators can keep the schema live while
-    disabling aggregation for a cost-cap rollback or empirical-
-    question re-validation.
+    Default ``true`` — graduated 2026-05-02 in Priority #4 Slice 5.
+    Independent from Slice 1's master so operators can keep the
+    schema live while disabling aggregation for a cost-cap rollback
+    or empirical-question re-validation (hot-revert via ``export
+    JARVIS_SBT_COMPARATOR_ENABLED=false``).
 
     Both flags must be ``true`` for ``compare_tree_history`` to
     actually aggregate; if either is off the comparator returns
@@ -135,7 +136,7 @@ def comparator_enabled() -> bool:
         "JARVIS_SBT_COMPARATOR_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-off until Slice 5 graduation
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 

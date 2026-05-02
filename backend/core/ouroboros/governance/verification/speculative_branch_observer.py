@@ -153,14 +153,20 @@ def sbt_observer_enabled() -> bool:
     Asymmetric env semantics — empty/whitespace = unset = current
     default; explicit truthy/falsy overrides at call time.
 
-    Default ``false`` until Slice 5 graduation. Both flags must be
-    ``true`` for the observer to actually record + emit; if either
-    is off the public surface short-circuits to no-op."""
+    Default ``true`` — graduated 2026-05-02 in Priority #4 Slice 5.
+    Independent from Slice 1's master so operators can keep schemas
+    live while disabling persistence + streaming for a cost-cap
+    rollback (hot-revert via ``export
+    JARVIS_SBT_OBSERVER_ENABLED=false``).
+
+    Both flags must be ``true`` for the observer to actually record
+    + emit; if either is off the public surface short-circuits to
+    no-op."""
     raw = os.environ.get(
         "JARVIS_SBT_OBSERVER_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 

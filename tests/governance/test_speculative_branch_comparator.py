@@ -131,13 +131,16 @@ def _engine_on(monkeypatch):
 
 class TestComparatorEnabledFlag:
 
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
+        """Slice 5 graduation flipped comparator sub-gate to True
+        (2026-05-02)."""
         monkeypatch.delenv("JARVIS_SBT_COMPARATOR_ENABLED", raising=False)
-        assert comparator_enabled() is False
+        assert comparator_enabled() is True
 
     def test_empty_treated_as_unset(self, monkeypatch):
+        """Empty = unset = graduated default-true."""
         monkeypatch.setenv("JARVIS_SBT_COMPARATOR_ENABLED", "")
-        assert comparator_enabled() is False
+        assert comparator_enabled() is True
 
     @pytest.mark.parametrize("v", ["1", "true", "TRUE", "yes", "on"])
     def test_truthy(self, monkeypatch, v):

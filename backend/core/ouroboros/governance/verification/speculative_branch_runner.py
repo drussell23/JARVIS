@@ -151,10 +151,11 @@ def sbt_runner_enabled() -> bool:
     Asymmetric env semantics — empty/whitespace = unset = current
     default; explicit truthy/falsy overrides at call time.
 
-    Default ``false`` until Slice 5 graduation. Independent from
-    Slice 1's ``JARVIS_SBT_ENABLED`` so operators can keep the schema
-    live in serialization paths while disabling the runner's loader
-    for a cost-cap rollback.
+    Default ``true`` — graduated 2026-05-02 in Priority #4 Slice 5.
+    Independent from Slice 1's master so operators can keep the
+    schema live while disabling the runner's loader for a cost-cap
+    rollback (hot-revert via ``export
+    JARVIS_SBT_RUNNER_ENABLED=false``).
 
     Both flags must be ``true`` for ``run_speculative_tree`` to
     actually fire branches; if either is off the runner returns
@@ -163,7 +164,7 @@ def sbt_runner_enabled() -> bool:
         "JARVIS_SBT_RUNNER_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-off until Slice 5 graduation
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 

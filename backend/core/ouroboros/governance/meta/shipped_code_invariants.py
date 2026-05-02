@@ -1292,6 +1292,212 @@ def _validate_quorum_cap_structure_pinned(
 
 
 # ---------------------------------------------------------------------------
+# Priority #4 — Speculative Branch Tree AST pins (4 invariants)
+# ---------------------------------------------------------------------------
+
+
+def _validate_speculative_branch_pure_stdlib(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Slice 1 ``speculative_branch`` primitive MUST be pure-stdlib —
+    strongest authority invariant. SBT is observational not
+    prescriptive; the primitive must NEVER reach into governance
+    modules. Zero governance imports, zero exec/eval/compile, zero
+    async (Slice 2's runner wraps via ``asyncio.gather``).
+
+    NEVER raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if "backend." in module or "governance" in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: speculative_branch primitive "
+                    f"must be pure-stdlib — found {module!r}"
+                )
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in ("exec", "eval", "compile"):
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: speculative_branch MUST NOT "
+                        f"execute candidate code — found "
+                        f"{node.func.id}() call"
+                    )
+        if isinstance(node, ast.AsyncFunctionDef):
+            lineno = getattr(node, "lineno", "?")
+            violations.append(
+                f"line {lineno}: Slice 1 primitive must remain sync "
+                f"— found async function {node.name!r}"
+            )
+    return tuple(violations)
+
+
+# Cost-contract banned imports — SBT runner + comparator + observer
+# all forbid orchestrator-tier coupling so the cost contract is
+# preserved by AST-pinned construction (no path through these modules
+# can invoke a generation provider — the only LLM costs are inside
+# the per-branch tool execution path, bounded structurally by
+# max_depth × max_breadth).
+_SBT_BANNED_IMPORT_SUBSTRINGS: Tuple[str, ...] = (
+    ".providers", "doubleword_provider", "urgency_router",
+    "candidate_generator", "orchestrator", "tool_executor",
+    "phase_runner", "iron_gate", "change_engine",
+    "auto_action_router", "subagent_scheduler",
+    "semantic_guardian", "semantic_firewall", "risk_engine",
+)
+
+
+def _validate_speculative_branch_runner_cost_contract(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 2 runner MUST preserve the §26.6 cost contract by
+    construction: only LLM costs are inside the per-branch tool
+    execution path (bounded by max_depth × max_breadth × per-tool
+    budget). Pinned via AST-level absence of every orchestrator-tier
+    import + presence of canonical reuse contracts:
+
+      * Slice 1 primitives (compute_tree_verdict + compute_tree_outcome
+        — convergence logic delegated, not duplicated)
+      * Move 5's READONLY_TOOL_ALLOWLIST + is_tool_allowlisted from
+        readonly_evidence_prober (defense-in-depth tool filtering;
+        no re-implementation of the 9-tool frozenset)
+
+    The COST_CONTRACT_PRESERVED_BY_CONSTRUCTION constant must be
+    defined (structural marker for operators).
+
+    NEVER raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                for banned in _SBT_BANNED_IMPORT_SUBSTRINGS:
+                    if banned in alias.name:
+                        lineno = getattr(node, "lineno", "?")
+                        violations.append(
+                            f"line {lineno}: SBT runner MUST NOT "
+                            f"import {alias.name!r} — cost contract "
+                            f"violation"
+                        )
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for banned in _SBT_BANNED_IMPORT_SUBSTRINGS:
+                if banned in module:
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: SBT runner MUST NOT "
+                        f"import from {module!r} — cost contract "
+                        f"violation"
+                    )
+
+    # Positive reuse contracts.
+    required_symbols = (
+        ("compute_tree_verdict", "Slice 1 convergence reuse"),
+        ("compute_tree_outcome", "Slice 1 outcome reuse"),
+        ("READONLY_TOOL_ALLOWLIST", "Move 5 frozenset reuse"),
+        ("is_tool_allowlisted", "Move 5 helper reuse"),
+        ("readonly_evidence_prober", "Move 5 module reuse"),
+        ("COST_CONTRACT_PRESERVED_BY_CONSTRUCTION",
+         "structural marker constant"),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"SBT runner dropped {symbol!r} — {reason} gone"
+            )
+    return tuple(violations)
+
+
+def _validate_speculative_branch_comparator_authority(
+    tree: ast.Module, source: str,
+) -> Tuple[str, ...]:
+    """Slice 3 comparator MUST be PURE-DATA aggregator: no
+    orchestrator-tier imports, no async, no exec/eval/compile.
+    MUST reuse Slice 1's closed-taxonomy enums (TreeVerdict +
+    TreeVerdictResult). MUST resolve PASSED via
+    ``adaptation.ledger.MonotonicTighteningVerdict`` (Phase C
+    cross-stack vocabulary integration — 5th module after Move 6 +
+    Priority #1/#2/#3).
+
+    NEVER raises."""
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for banned in _SBT_BANNED_IMPORT_SUBSTRINGS:
+                if banned in module:
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: SBT comparator MUST NOT "
+                        f"import from {module!r} — authority violation"
+                    )
+        if isinstance(node, ast.AsyncFunctionDef):
+            lineno = getattr(node, "lineno", "?")
+            violations.append(
+                f"line {lineno}: Slice 3 comparator must remain sync "
+                f"— found async function {node.name!r}"
+            )
+        if isinstance(node, ast.Call) and isinstance(
+            node.func, ast.Name,
+        ):
+            if node.func.id in ("exec", "eval", "compile"):
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: SBT comparator MUST NOT execute "
+                    f"candidate code — found {node.func.id}() call"
+                )
+
+    required_symbols = (
+        ("TreeVerdict", "Slice 1 closed-taxonomy reuse"),
+        ("TreeVerdictResult", "Slice 1 schema reuse"),
+        ("MonotonicTighteningVerdict",
+         "Phase C cross-stack vocabulary"),
+        ("adaptation.ledger",
+         "Phase C cage rule integration"),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"SBT comparator dropped {symbol!r} — {reason} gone"
+            )
+    return tuple(violations)
+
+
+def _validate_speculative_branch_observer_uses_flock(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Slice 4 observer MUST use Tier 1 #3 cross-process flock for
+    the JSONL ring buffer (zero-duplication contract — same discipline
+    as InvariantDriftStore + Coherence + PostmortemRecall + Priority
+    #3 observer). MUST reuse Slice 3's ``compare_tree_history`` +
+    ``stamp_tree_verdict``. MUST reuse the
+    ``ide_observability_stream`` broker (Gap #6 reuse) AND the 2 new
+    SBT event-type constants registered in Slice 4.
+
+    NEVER raises."""
+    violations: List[str] = []
+    required_symbols = (
+        ("flock_append_line", "Tier 1 #3 cross-process safety"),
+        ("flock_critical_section", "Tier 1 #3 ring-buffer safety"),
+        ("cross_process_jsonl", "Tier 1 #3 module reuse"),
+        ("compare_tree_history", "Slice 3 aggregator reuse"),
+        ("stamp_tree_verdict", "Slice 3 stamp reuse"),
+        ("ide_observability_stream", "Gap #6 broker reuse"),
+        ("EVENT_TYPE_SBT_TREE_COMPLETE",
+         "per-tree SSE event vocabulary"),
+        ("EVENT_TYPE_SBT_BASELINE_UPDATED",
+         "per-aggregation SSE event vocabulary"),
+    )
+    for symbol, reason in required_symbols:
+        if symbol not in source:
+            violations.append(
+                f"SBT observer dropped {symbol!r} — {reason} gone"
+            )
+    return tuple(violations)
+
+
+# ---------------------------------------------------------------------------
 # Priority #3 — Counterfactual Replay AST pins (4 invariants)
 # ---------------------------------------------------------------------------
 
@@ -2717,6 +2923,111 @@ def _register_seed_invariants() -> None:
             ),
             validate=(
                 _validate_counterfactual_replay_observer_uses_flock
+            ),
+        ),
+    )
+    # Priority #4 Slice 5 — Speculative Branch Tree graduation pins.
+    # Closes the cognitive gap (CC's interleaved-thinking + plan-
+    # mode-replan + speculative-branching) via Antivenom-aligned
+    # tree topology. These 4 pins protect the structural primitives
+    # from refactor drift across the 4-slice pipeline.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name="speculative_branch_pure_stdlib",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "speculative_branch.py"
+            ),
+            description=(
+                "Slice 1 speculative_branch primitive MUST be "
+                "PURE-STDLIB — strongest authority invariant. Zero "
+                "governance imports. No exec/eval/compile (canonical "
+                "safety pin). No async (Slice 2's runner wraps via "
+                "asyncio.gather). Mirrors Priority #1/#2/#3 Slice 1 "
+                "discipline — observational, not prescriptive."
+            ),
+            validate=_validate_speculative_branch_pure_stdlib,
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "speculative_branch_runner_cost_contract"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "speculative_branch_runner.py"
+            ),
+            description=(
+                "STRUCTURAL §26.6 cost-contract preservation: Slice "
+                "2 runner MUST NOT import any orchestrator-tier "
+                "module (providers / doubleword / urgency_router / "
+                "candidate_generator / orchestrator / tool_executor "
+                "/ phase_runner / iron_gate / change_engine / "
+                "auto_action_router / subagent_scheduler / "
+                "semantic_guardian / semantic_firewall / "
+                "risk_engine). MUST reuse Slice 1 primitives "
+                "(compute_tree_verdict + compute_tree_outcome) AND "
+                "Move 5's READONLY_TOOL_ALLOWLIST + "
+                "is_tool_allowlisted (defense-in-depth tool "
+                "filtering — no re-implementation of the 9-tool "
+                "frozenset). MUST define "
+                "COST_CONTRACT_PRESERVED_BY_CONSTRUCTION."
+            ),
+            validate=(
+                _validate_speculative_branch_runner_cost_contract
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "speculative_branch_comparator_authority"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "speculative_branch_comparator.py"
+            ),
+            description=(
+                "Slice 3 comparator MUST be PURE-DATA aggregator: "
+                "no orchestrator-tier imports, no async (Slice 4 "
+                "wraps via to_thread), no exec/eval/compile. MUST "
+                "reuse Slice 1 closed-taxonomy enums (TreeVerdict "
+                "+ TreeVerdictResult). MUST resolve PASSED via "
+                "adaptation.ledger.MonotonicTighteningVerdict for "
+                "Phase C cross-stack vocabulary integration (5th "
+                "module after Move 6 + Priority #1/#2/#3). Catches "
+                "refactor that breaks zero-duplication or drops "
+                "the canonical PASSED stamping."
+            ),
+            validate=(
+                _validate_speculative_branch_comparator_authority
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "speculative_branch_observer_uses_flock"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "speculative_branch_observer.py"
+            ),
+            description=(
+                "STRUCTURAL Tier 1 #3 cross-process safety + Slice "
+                "3 reuse + Gap #6 broker reuse: Slice 4 observer "
+                "MUST reference flock_append_line + "
+                "flock_critical_section AND compare_tree_history + "
+                "stamp_tree_verdict (zero re-aggregation/re-"
+                "stamping) AND ide_observability_stream + the 2 "
+                "new SBT event vocabulary constants. Catches "
+                "refactor that drops cross-process safety OR re-"
+                "implements the comparator OR forgets to wire the "
+                "SSE broker."
+            ),
+            validate=(
+                _validate_speculative_branch_observer_uses_flock
             ),
         ),
     )

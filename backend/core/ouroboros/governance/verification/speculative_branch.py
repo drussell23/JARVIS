@@ -111,16 +111,23 @@ SBT_SCHEMA_VERSION: str = "speculative_branch.1"
 
 
 def sbt_enabled() -> bool:
-    """``JARVIS_SBT_ENABLED`` (default ``false`` until Slice 5
-    graduation).
+    """``JARVIS_SBT_ENABLED`` (default ``true`` — graduated 2026-05-02
+    in Priority #4 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
+    Asymmetric env semantics — empty/whitespace = unset = graduated
     default; explicit ``0``/``false``/``no``/``off`` evaluates false;
     explicit truthy values evaluate true. Re-read on every call so
-    flips hot-revert without restart."""
+    flips hot-revert without restart.
+
+    Graduated default-true matches Priority #1/#2/#3 discipline
+    because SBT is read-only over typed evidence (AST-pinned
+    construction; observational not prescriptive — every verdict
+    stamps MonotonicTighteningVerdict.PASSED). Operator approval
+    still required for any downstream flag-flip proposal via
+    MetaAdaptationGovernor."""
     raw = os.environ.get("JARVIS_SBT_ENABLED", "").strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 

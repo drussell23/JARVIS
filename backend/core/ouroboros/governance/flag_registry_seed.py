@@ -2228,6 +2228,132 @@ SEED_SPECS: list = [
         example="1000",
         since="Priority #3 Slice 5",
     ),
+
+    # ====================================================================
+    # Speculative Branch Tree (Priority #4) — 6 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_SBT_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the 4-slice Speculative Branch "
+            "Tree pipeline. When false, every public path "
+            "short-circuits in lockstep (runner → FAILED, "
+            "comparator → DISABLED, observer → DISABLED). "
+            "Graduated default-true post-Slice-5 (2026-05-02) "
+            "because SBT is read-only over typed evidence by "
+            "AST-pinned construction (every verdict stamps "
+            "MonotonicTighteningVerdict.PASSED — observational not "
+            "prescriptive). Closes CC's interleaved-thinking + "
+            "plan-mode-replan + speculative-branching cognitive "
+            "paradigm via Antivenom-aligned tree topology."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "speculative_branch.py"
+        ),
+        example="true",
+        since="Priority #4 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_SBT_RUNNER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 2 async tree executor. When "
+            "false, run_speculative_tree returns FAILED with zero "
+            "I/O — the Slice 1 schema stays live in serialization "
+            "paths, but no branch execution. Hot-revert knob for "
+            "cost-cap rollback without breaking the rest of the "
+            "stack."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "speculative_branch_runner.py"
+        ),
+        example="true",
+        since="Priority #4 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_SBT_COMPARATOR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 3 effectiveness aggregator. "
+            "When false, compare_tree_history returns DISABLED. "
+            "The stamping logic (MonotonicTighteningVerdict.PASSED) "
+            "remains structurally accessible via stamp_tree_verdict "
+            "for callers that want per-verdict stamping without "
+            "aggregation."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "speculative_branch_comparator.py"
+        ),
+        example="true",
+        since="Priority #4 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_SBT_OBSERVER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 4 history store + SSE event "
+            "publisher + periodic SBTObserver. When false, "
+            "record_tree_verdict returns DISABLED, no JSONL "
+            "writes, no SSE events. Operators rolling back to a "
+            "no-persistence stance flip this without affecting "
+            "runner/comparator behavior."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "speculative_branch_observer.py"
+        ),
+        example="true",
+        since="Priority #4 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_SBT_RESOLUTION_THRESHOLD_PCT",
+        type=FlagType.FLOAT, default=50.0,
+        description=(
+            "Minimum ambiguity-resolution-pct (CONVERGED / "
+            "actionable_total) for "
+            "EffectivenessOutcome.ESTABLISHED. Default 50.0%. "
+            "Cap structure: max(0.0, min(100.0, value)). Operators "
+            "tighten upward (e.g., 75.0) to demand stronger "
+            "empirical evidence before claiming SBT resolves "
+            "ambiguity effectively."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "speculative_branch_comparator.py"
+        ),
+        example="50.0",
+        since="Priority #4 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_SBT_HISTORY_MAX_RECORDS",
+        type=FlagType.INT, default=1000,
+        description=(
+            "Bounded ring-buffer cap for the SBT JSONL history "
+            "store. Default 1000 records, clamped [10, 100000]. "
+            "Rotation truncates after each append (same discipline "
+            "as InvariantDriftStore + Priority #3 Slice 4 "
+            "observer). Larger caps support longer-baseline "
+            "empirical claims at the cost of more disk + slower "
+            "full-history reads."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "speculative_branch_observer.py"
+        ),
+        example="1000",
+        since="Priority #4 Slice 5",
+    ),
 ]
 
 
