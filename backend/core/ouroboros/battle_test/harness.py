@@ -244,8 +244,54 @@ class BattleTestHarness:
             _set_active_harness(self)
             from backend.core.ouroboros.battle_test.termination_hook_registry import (  # noqa: E501
                 discover_and_register_default as _disc_term,
+                get_default_registry as _term_default_registry,
             )
             _disc_term()
+            # Slice 4 — wire the registry's dispatch-listener
+            # channel to the IDE SSE broker so consumers can
+            # subscribe to ``termination_hook_dispatched`` events.
+            # Best-effort: a missing broker (cold IDE-stream
+            # subsystem) degrades to a noop listener — never
+            # blocks termination-hook firing. The listener is
+            # registered ONCE at boot; the registry's listener
+            # list is shared across dispatches.
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                    EVENT_TYPE_TERMINATION_HOOK_DISPATCHED,
+                    get_default_broker,
+                )
+
+                def _publish_termination_event(payload: dict) -> None:
+                    try:
+                        if payload.get("event_type") != (
+                            "termination_hook_dispatched"
+                        ):
+                            return
+                        broker = get_default_broker()
+                        if broker is None:
+                            return
+                        dr = payload.get("dispatch_result", {})
+                        broker.publish(
+                            event_type=(
+                                EVENT_TYPE_TERMINATION_HOOK_DISPATCHED
+                            ),
+                            op_id=str(dr.get("cause", "") or ""),
+                            payload=dr,
+                        )
+                    except Exception:  # noqa: BLE001 — defensive
+                        # Listener exception is already swallowed
+                        # by the registry's _fire_dispatch, but
+                        # belt-and-suspender it here too.
+                        pass
+
+                _term_default_registry().on_transition(
+                    _publish_termination_event,
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[Harness] termination-SSE bridge "
+                    "degraded: %s", exc,
+                )
         except Exception as exc:  # noqa: BLE001 — defensive
             logger.debug(
                 "[Harness] termination-hook wire-up degraded: %s",

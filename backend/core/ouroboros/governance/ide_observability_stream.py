@@ -376,6 +376,16 @@ EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED = "worktree_unit_state_changed"
 # /adapt show <proposal_id>.
 EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED = "closure_loop_proposal_emitted"
 
+# TerminationHookRegistry Slice 4 — fires when the registry
+# dispatches a phase. Carries the phase + cause + outcome
+# histogram + per-hook records so IDE consumers can render a
+# "session terminating" notification with what hooks fired
+# (the partial-summary-writer adapter's outcome is the most
+# operationally relevant signal). Most consumers will see this
+# event at session end (PRE_SHUTDOWN_EVENT_SET dispatch fires
+# from signal handlers / wall-clock watchdog).
+EVENT_TYPE_TERMINATION_HOOK_DISPATCHED = "termination_hook_dispatched"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -440,6 +450,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_WORKTREE_TOPOLOGY_UPDATED,         # Gap #3 Slice 3
     EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED,       # Gap #3 Slice 3
     EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED,     # Q4 P#2 Slice 4
+    EVENT_TYPE_TERMINATION_HOOK_DISPATCHED,       # TermHook Slice 4
 })
 
 

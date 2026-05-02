@@ -2632,6 +2632,7 @@ _logger = _logging.getLogger(__name__)
 _FLAG_PROVIDER_PACKAGES: tuple = (
     "backend.core.ouroboros.governance",  # top-level (semantic_firewall, etc.)
     "backend.core.ouroboros.governance.verification",  # SBT/CIGW/Replay/etc.
+    "backend.core.ouroboros.battle_test",  # TerminationHookRegistry Slice 4
 )
 
 

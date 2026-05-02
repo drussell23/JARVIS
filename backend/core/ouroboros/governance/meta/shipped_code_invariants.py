@@ -3461,6 +3461,7 @@ def _register_seed_invariants() -> None:
 _INVARIANT_PROVIDER_PACKAGES: Tuple[str, ...] = (
     "backend.core.ouroboros.governance",  # top-level (semantic_firewall, etc.)
     "backend.core.ouroboros.governance.verification",  # SBT/CIGW/etc.
+    "backend.core.ouroboros.battle_test",  # TerminationHookRegistry Slice 4
 )
 
 

@@ -349,6 +349,14 @@ class IDEObservabilityRouter:
             "/observability/closure-loop/stats",
             self._handle_closure_loop_stats,
         )
+        # TerminationHookRegistry Slice 4 — bounded read-only
+        # projection of registered hooks per phase + registry
+        # config + master-flag state. Master-flag-off → 403
+        # (port-scanner discipline).
+        app.router.add_get(
+            "/observability/termination-hooks",
+            self._handle_termination_hooks,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -2071,6 +2079,121 @@ class IDEObservabilityRouter:
             return self._error_response(
                 request, 500,
                 "ide_observability.closure_loop_stats_error",
+            )
+
+    # ----------------------------------------------------------------------
+    # TerminationHookRegistry Slice 4 — observability surface
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _termination_hooks_master_enabled() -> bool:
+        """Master flag for the termination-hook subsystem.
+        Default-true (graduated). 403 ``termination_hooks_disabled``
+        when off — port-scanner discipline + operator's instant-
+        rollback path."""
+        try:
+            from backend.core.ouroboros.battle_test.termination_hook_registry import (  # noqa: E501
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
+    async def _handle_termination_hooks(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/termination-hooks`` — bounded
+        read-only projection of the TerminationHookRegistry.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "enabled": true,
+              "registry_config": {
+                "max_per_phase": 16,
+                "per_hook_timeout_s": 5.0,
+                "phase_budgets_s": {
+                  "pre_shutdown_event_set": 10.0,
+                  "post_async_cleanup": 10.0,
+                  "pre_hard_exit": 2.0
+                }
+              },
+              "hooks_by_phase": {
+                "pre_shutdown_event_set": [
+                  {
+                    "name": "partial_summary_writer",
+                    "phase": "pre_shutdown_event_set",
+                    "priority": 10,
+                    "timeout_s": 5.0,
+                    ...
+                  },
+                  ...
+                ],
+                ...
+              },
+              "total_count": 1
+            }
+
+        Returns 403 ``termination_hooks_disabled`` when master flag
+        off (port-scanner discipline). NEVER raises — defensive
+        fall-through to 500 on any internal error."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._termination_hooks_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.termination_hooks_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.battle_test.termination_hook import (  # noqa: E501
+                TerminationPhase,
+            )
+            from backend.core.ouroboros.battle_test.termination_hook_registry import (  # noqa: E501
+                get_default_registry,
+                max_hooks_per_phase,
+                per_hook_timeout_s,
+                phase_budget_s,
+            )
+            registry = get_default_registry()
+            hooks_by_phase: Dict[str, list] = {}
+            for phase in TerminationPhase:
+                bucket = registry.for_phase(phase)
+                hooks_by_phase[phase.value] = [
+                    r.to_projection() for r in bucket
+                ]
+            return self._json_response(
+                request, 200,
+                {
+                    "enabled": True,
+                    "registry_config": {
+                        "max_per_phase": max_hooks_per_phase(),
+                        "per_hook_timeout_s": (
+                            per_hook_timeout_s()
+                        ),
+                        "phase_budgets_s": {
+                            phase.value: phase_budget_s(phase)
+                            for phase in TerminationPhase
+                        },
+                    },
+                    "hooks_by_phase": hooks_by_phase,
+                    "total_count": registry.total_count(),
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] termination_hooks failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.termination_hooks_error",
             )
 
     # ----------------------------------------------------------------------

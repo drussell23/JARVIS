@@ -120,6 +120,35 @@ def _env_int_clamped(
         return default
 
 
+def master_enabled() -> bool:
+    """Master kill switch — ``JARVIS_TERMINATION_HOOKS_ENABLED``
+    (default TRUE post Slice 4 graduation).
+
+    Operator emergency escape hatch: when off, :meth:`dispatch`
+    returns a clean empty result without invoking any hook.
+    Hot-revertable — re-read on every dispatch call. Atomic at
+    the dispatch boundary, so a flip mid-session takes effect
+    immediately for the next termination event.
+
+    Default-true rationale: termination hooks are SAFETY
+    infrastructure (the partial-summary writer is the entire
+    reason this arc exists). Default-false would mean operator
+    must explicitly opt in to having shutdown summaries land —
+    inverting the safety bias. Operators who need to disable
+    can flip ``=false`` for instant rollback.
+
+    Asymmetric env semantics: empty/whitespace = unset =
+    graduated default true; explicit ``0`` / ``false`` / ``no`` /
+    ``off`` evaluates false; explicit truthy values evaluate
+    true."""
+    raw = os.environ.get(
+        "JARVIS_TERMINATION_HOOKS_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated 2026-05-02
+    return raw in ("1", "true", "yes", "on")
+
+
 def max_hooks_per_phase() -> int:
     """``JARVIS_TERMINATION_HOOK_MAX_PER_PHASE`` — capacity per
     phase. Default 16, clamped [1, 256]. Defends against
@@ -642,6 +671,24 @@ class TerminationHookRegistry:
         Verifiable by AST pin (no asyncio import in this file).
 
         NEVER raises."""
+        # Slice 4 master flag — re-read on every call so flips
+        # take effect immediately. Default true (graduated).
+        # When off, return a structurally valid empty result so
+        # callers can branch on records == () without changing
+        # their error-handling shape.
+        if not master_enabled():
+            logger.debug(
+                "[TerminationHookRegistry] master flag off — "
+                "skipping dispatch phase=%s cause=%s",
+                phase, cause,
+            )
+            return TerminationDispatchResult(
+                phase=phase,
+                cause=cause,
+                records=(),
+                total_duration_ms=0.0,
+                budget_exhausted=False,
+            )
         try:
             ctx = TerminationHookContext(
                 cause=cause,
@@ -861,6 +908,454 @@ def discover_and_register_default() -> int:
         return 0
 
 
+# ---------------------------------------------------------------------------
+# Slice 4 graduation — module-owned shipped_code_invariants + FlagRegistry
+# seeds. Discovered automatically via the
+# _INVARIANT_PROVIDER_PACKAGES + _FLAG_PROVIDER_PACKAGES contracts
+# (Slice 4 extends both lists to include `battle_test`).
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code invariants. Returns the list so
+    the centralized seed loader can register them at boot. NEVER
+    raises (returns ``[]`` on import failure — graduation soak
+    path is fail-open per the established convention).
+
+    Seven invariants pin the termination-hook arc's
+    correctness-critical surfaces:
+
+      1. ``termination_cause_vocabulary`` — the 8-value
+         :class:`TerminationCause` taxonomy is frozen against
+         silent expansion (Slice 1 vocabulary).
+      2. ``termination_phase_vocabulary`` — the 3-value
+         :class:`TerminationPhase` taxonomy frozen.
+      3. ``hook_outcome_vocabulary`` — the 4-value
+         :class:`HookOutcome` taxonomy frozen.
+      4. ``harness_wall_clock_dispatch_present`` — the harness
+         ``_monitor_wall_clock`` body MUST contain the
+         ``dispatch(`` call. THIS IS THE BUG-FIX REGRESSION PIN
+         — if a future refactor accidentally removes the
+         dispatch call, the wall-cap path silently regresses to
+         pre-Slice-3 behavior (no summary.json on disk after
+         os._exit(75)).
+      5. ``harness_signal_handler_dispatch_present`` — the
+         ``_handle_shutdown_signal`` body MUST contain the
+         dispatch call. Pristine-equivalency regression pin.
+      6. ``default_adapter_writer_present`` — the adapter module
+         MUST expose ``partial_summary_writer_hook`` (the only
+         hook the registry installs by default).
+      7. ``default_adapter_no_asyncio`` — the adapter module
+         MUST NOT import asyncio. Sync-first contract pin
+         (mirrors the AST-test pin from Slice 2; promoted to
+         shipped invariant so it's enforced in production
+         graduation soaks too).
+    """
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    import ast as _ast
+
+    def _validate_enum_vocabulary(
+        tree, source, *, class_name: str, required: set,
+    ) -> tuple:
+        violations = []
+        seen = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and (
+                node.name == class_name
+            ):
+                for stmt in node.body:
+                    if isinstance(stmt, _ast.Assign):
+                        for target in stmt.targets:
+                            if isinstance(target, _ast.Name):
+                                seen.add(target.id)
+        missing = required - seen
+        if missing:
+            violations.append(
+                f"{class_name} lost values: {sorted(missing)} — "
+                "the closed taxonomy is frozen by Slice 4 "
+                "graduation"
+            )
+        unexpected = seen - required - {"_generate_next_value_"}
+        if unexpected:
+            violations.append(
+                f"{class_name} gained unpinned values: "
+                f"{sorted(unexpected)} — update the AST pin AND "
+                "the test suite when widening the vocabulary"
+            )
+        return tuple(violations)
+
+    def _validate_termination_cause_vocab(tree, source) -> tuple:
+        return _validate_enum_vocabulary(
+            tree, source,
+            class_name="TerminationCause",
+            required={
+                "WALL_CLOCK_CAP", "SIGTERM", "SIGINT", "SIGHUP",
+                "IDLE_TIMEOUT", "BUDGET_EXCEEDED",
+                "NORMAL_EXIT", "UNKNOWN",
+            },
+        )
+
+    def _validate_termination_phase_vocab(tree, source) -> tuple:
+        return _validate_enum_vocabulary(
+            tree, source,
+            class_name="TerminationPhase",
+            required={
+                "PRE_SHUTDOWN_EVENT_SET",
+                "POST_ASYNC_CLEANUP",
+                "PRE_HARD_EXIT",
+            },
+        )
+
+    def _validate_hook_outcome_vocab(tree, source) -> tuple:
+        return _validate_enum_vocabulary(
+            tree, source,
+            class_name="HookOutcome",
+            required={"OK", "FAILED", "TIMED_OUT", "SKIPPED"},
+        )
+
+    def _validate_function_contains_dispatch(
+        tree, source, *, function_name: str,
+    ) -> tuple:
+        """Locate ``function_name`` as a method body and assert
+        its source contains ``.dispatch(`` — the registry's
+        dispatch surface invocation. Catches a future refactor
+        that removes the bug-fix wiring."""
+        violations = []
+        for node in _ast.walk(tree):
+            if isinstance(
+                node,
+                (_ast.FunctionDef, _ast.AsyncFunctionDef),
+            ) and node.name == function_name:
+                # Render the function body as text + check for
+                # the dispatch invocation pattern.
+                try:
+                    body_src = _ast.unparse(node)
+                except AttributeError:
+                    # ast.unparse is Python 3.9+; older
+                    # interpreters get the original source slice.
+                    body_src = source
+                if ".dispatch(" not in body_src:
+                    violations.append(
+                        f"{function_name} body MUST contain "
+                        ".dispatch( call — Slice 3 wired the "
+                        "termination-hook registry here; "
+                        "removal regresses the wall-cap "
+                        "summary.json bug fix"
+                    )
+                return tuple(violations)
+        violations.append(
+            f"{function_name} not found in module — refactor "
+            "renamed/removed the function the bug fix lives in"
+        )
+        return tuple(violations)
+
+    def _validate_wall_clock_dispatch(tree, source) -> tuple:
+        return _validate_function_contains_dispatch(
+            tree, source, function_name="_monitor_wall_clock",
+        )
+
+    def _validate_signal_handler_dispatch(tree, source) -> tuple:
+        return _validate_function_contains_dispatch(
+            tree, source, function_name="_handle_shutdown_signal",
+        )
+
+    def _validate_adapter_hook_present(tree, source) -> tuple:
+        violations = []
+        if "partial_summary_writer_hook" not in source:
+            violations.append(
+                "default-adapter module dropped "
+                "partial_summary_writer_hook — the entire "
+                "Slice 3 migration target is missing"
+            )
+        if "PARTIAL_SUMMARY_WRITER_HOOK_NAME" not in source:
+            violations.append(
+                "default-adapter module dropped "
+                "PARTIAL_SUMMARY_WRITER_HOOK_NAME constant — "
+                "Slice 4 GET-route consumer can't pin the name"
+            )
+        return tuple(violations)
+
+    def _validate_adapter_no_asyncio(tree, source) -> tuple:
+        violations = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom) and node.module:
+                if "asyncio" in node.module.split("."):
+                    violations.append(
+                        f"forbidden asyncio import in adapter: "
+                        f"{node.module} — sync-first contract "
+                        "REQUIRES no asyncio entanglement"
+                    )
+            elif isinstance(node, _ast.Import):
+                for alias in node.names:
+                    if "asyncio" in alias.name.split("."):
+                        violations.append(
+                            f"forbidden asyncio import in "
+                            f"adapter: {alias.name}"
+                        )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="termination_cause_vocabulary",
+            target_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook.py"
+            ),
+            description=(
+                "TerminationCause's 8-value closed taxonomy is "
+                "frozen. Adding a 9th value silently breaks the "
+                "_CAUSE_TO_SESSION_OUTCOME mapping in the "
+                "default adapter (which has explicit coverage "
+                "for all 8); update both atomically."
+            ),
+            validate=_validate_termination_cause_vocab,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="termination_phase_vocabulary",
+            target_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook.py"
+            ),
+            description=(
+                "TerminationPhase's 3-value closed taxonomy is "
+                "frozen. Adding a 4th value requires extending "
+                "the harness wire-up + dispatch budgets."
+            ),
+            validate=_validate_termination_phase_vocab,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="hook_outcome_vocabulary",
+            target_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook.py"
+            ),
+            description=(
+                "HookOutcome's 4-value closed taxonomy is "
+                "frozen. SKIPPED is reserved for budget "
+                "exhaustion; disabled-via-check is silent "
+                "omission. Slice 3 §H byte-equivalency "
+                "depends on this."
+            ),
+            validate=_validate_hook_outcome_vocab,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "harness_wall_clock_dispatch_present"
+            ),
+            target_file=(
+                "backend/core/ouroboros/battle_test/harness.py"
+            ),
+            description=(
+                "THE BUG-FIX REGRESSION PIN. _monitor_wall_clock "
+                "MUST contain a .dispatch( call to the "
+                "termination-hook registry. Slice 3 added this "
+                "to fix the bt-2026-05-02-203805 reproduction "
+                "(no summary.json after wall-cap → os._exit(75)). "
+                "If a refactor removes this, the wall-cap path "
+                "silently regresses."
+            ),
+            validate=_validate_wall_clock_dispatch,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "harness_signal_handler_dispatch_present"
+            ),
+            target_file=(
+                "backend/core/ouroboros/battle_test/harness.py"
+            ),
+            description=(
+                "Pristine-equivalency regression pin. "
+                "_handle_shutdown_signal MUST contain a "
+                ".dispatch( call to the termination-hook "
+                "registry. Slice 3 migrated the direct "
+                "_atexit_fallback_write call here; removal "
+                "would un-migrate one half of the symmetric "
+                "shutdown discipline."
+            ),
+            validate=_validate_signal_handler_dispatch,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="default_adapter_hook_present",
+            target_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook_default_adapters.py"
+            ),
+            description=(
+                "Default-adapter module MUST expose "
+                "partial_summary_writer_hook + "
+                "PARTIAL_SUMMARY_WRITER_HOOK_NAME constant. "
+                "These are the entire Slice 3 migration target; "
+                "removal eliminates the partial-summary write "
+                "from every termination path."
+            ),
+            validate=_validate_adapter_hook_present,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="default_adapter_no_asyncio",
+            target_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook_default_adapters.py"
+            ),
+            description=(
+                "Sync-first contract: default-adapter module "
+                "MUST NOT import asyncio. The adapter runs "
+                "from contexts where the asyncio loop may be "
+                "wedged (signal handlers, wall-clock watchdog "
+                "tasks); any asyncio entanglement breaks the "
+                "PRE_SHUTDOWN_EVENT_SET phase's threading-only "
+                "execution guarantee."
+            ),
+            validate=_validate_adapter_no_asyncio,
+        ),
+    ]
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration. Mirrors the
+    discovery contract used by Q4 P#2 closure-loop modules and
+    Move 6 Quorum — the seed loader walks
+    ``_FLAG_PROVIDER_PACKAGES`` (Slice 4 extends to include
+    ``battle_test``) and invokes once at boot. Adding a new flag
+    requires zero edits to the seed file. Returns count of
+    FlagSpecs registered. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_TERMINATION_HOOKS_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for the TerminationHookRegistry. "
+                "Default TRUE post Slice 4 graduation — termination "
+                "hooks are SAFETY infrastructure (the partial-"
+                "summary writer is the entire reason this arc "
+                "exists). Operators flip ``=false`` for instant "
+                "rollback when a misbehaving hook is interfering "
+                "with shutdown. Re-read on every dispatch — flips "
+                "take effect immediately for the next termination "
+                "event without restart."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook_registry.py"
+            ),
+            example="true",
+            since=(
+                "TerminationHookRegistry Slice 4 (2026-05-02)"
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_TERMINATION_HOOK_TIMEOUT_S",
+            type=FlagType.FLOAT,
+            default=DEFAULT_PER_HOOK_TIMEOUT_S,
+            description=(
+                "Default per-hook wall-clock timeout in seconds. "
+                "Default 5.0, clamped [0.1, 30.0]. Hooks may "
+                "register their own timeout via "
+                "``timeout_s=`` kwarg; this is the fallback. "
+                "Effective per-hook timeout at dispatch is "
+                "min(this, remaining phase budget) — a single "
+                "hook cannot push past the phase budget."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook_registry.py"
+            ),
+            example="5.0",
+            since=(
+                "TerminationHookRegistry Slice 4 (2026-05-02)"
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_TERMINATION_HOOK_PHASE_BUDGET_S",
+            type=FlagType.FLOAT,
+            default=DEFAULT_PHASE_BUDGET_S,
+            description=(
+                "Per-phase wall-clock budget for "
+                "PRE_SHUTDOWN_EVENT_SET and POST_ASYNC_CLEANUP "
+                "phases. Default 10.0, clamped [1.0, 60.0]. "
+                "Once exhausted, remaining hooks recorded as "
+                "SKIPPED (never started). Stays under the "
+                "BoundedShutdownWatchdog's 30s grace by default."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook_registry.py"
+            ),
+            example="10.0",
+            since=(
+                "TerminationHookRegistry Slice 4 (2026-05-02)"
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_TERMINATION_HOOK_HARD_EXIT_BUDGET_S",
+            type=FlagType.FLOAT,
+            default=DEFAULT_HARD_EXIT_PHASE_BUDGET_S,
+            description=(
+                "Per-phase budget for the PRE_HARD_EXIT phase "
+                "(invoked by BoundedShutdownWatchdog "
+                "immediately before os._exit). Default 2.0, "
+                "clamped [0.5, 10.0]. Tighter than the regular "
+                "phase budget because the watchdog deadline is "
+                "in single-digit seconds at this point. Use for "
+                "last-mile forensic emission, NOT full state "
+                "flush (that belongs in PRE_SHUTDOWN_EVENT_SET)."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook_registry.py"
+            ),
+            example="2.0",
+            since=(
+                "TerminationHookRegistry Slice 4 (2026-05-02)"
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_TERMINATION_HOOK_MAX_PER_PHASE",
+            type=FlagType.INT,
+            default=16,
+            description=(
+                "Capacity per phase. Default 16, clamped "
+                "[1, 256]. Defends against misconfigured "
+                "plugins registering thousands of hooks (matches "
+                "LifecycleHookRegistry's discipline). Capacity "
+                "exceeded raises HookCapacityExceededError at "
+                "register-time — surfaces operator misconfig at "
+                "boot, not at fire-time."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/battle_test/"
+                "termination_hook_registry.py"
+            ),
+            example="16",
+            since=(
+                "TerminationHookRegistry Slice 4 (2026-05-02)"
+            ),
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    return len(specs)
+
+
 __all__ = [
     "DuplicateHookNameError",
     "HookCapacityExceededError",
@@ -873,8 +1368,11 @@ __all__ = [
     "discover_and_register_default",
     "discover_module_provided_hooks",
     "get_default_registry",
+    "master_enabled",
     "max_hooks_per_phase",
     "per_hook_timeout_s",
     "phase_budget_s",
+    "register_flags",
+    "register_shipped_invariants",
     "reset_default_registry_for_tests",
 ]
