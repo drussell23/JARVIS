@@ -37,7 +37,10 @@ Schema: plan.1
                 "change_type": "modify|create|delete",
                 "description": "What to change and why",
                 "dependencies": ["path/to/other.py"],
-                "estimated_scope": "small|medium|large"
+                "estimated_scope": "small|medium|large",
+                "expected_outcome": "Falsifiable predicate the model "
+                                    "commits to (e.g., 'auth.py exists "
+                                    "and login() returns bool')"
             }
         ],
         "risk_factors": ["Risk description"],
@@ -65,6 +68,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from backend.core.ouroboros.governance.op_context import OperationContext
+from backend.core.ouroboros.governance.plan_falsification import (
+    PlanStepHypothesis,
+    pair_plan_step_with_hypothesis,
+)
 
 logger = logging.getLogger("Ouroboros.PlanGenerator")
 
@@ -94,6 +101,32 @@ def _plan_review_required() -> bool:
         os.environ.get("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", "").strip().lower()
         in _TRUTHY
     )
+
+
+def _plan_hypothesis_emit_enabled() -> bool:
+    """``JARVIS_PLAN_HYPOTHESIS_EMIT_ENABLED`` (default ``true``).
+
+    Sub-flag for PlanFalsificationDetector Slice 3 prompt + parser
+    extension. When **on**, the planning prompt asks the model for a
+    falsifiable ``expected_outcome`` predicate per change, the parser
+    keeps it, and ``PlanResult.to_plan_step_hypotheses()``
+    materializes :class:`PlanStepHypothesis` instances for the
+    detector. When **off**, the schema field is silently dropped at
+    parse time and ``to_plan_step_hypotheses()`` returns ``()`` —
+    the detector then sees zero hypotheses and short-circuits to
+    ``INSUFFICIENT_EVIDENCE`` (legacy DynamicRePlanner reactive path
+    remains the backstop). Asymmetric env semantics: empty/whitespace
+    = unset = default true; explicit truthy/falsy overrides.
+
+    Independent of ``JARVIS_PLAN_FALSIFICATION_ENABLED`` (the
+    detector master flag) so operators can disable hypothesis emission
+    without disabling all detector code paths and vice-versa.
+    """
+    raw = os.environ.get("JARVIS_PLAN_HYPOTHESIS_EMIT_ENABLED", "")
+    raw = raw.strip().lower()
+    if raw == "":
+        return True
+    return raw in _TRUTHY
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +341,14 @@ class PlanResult:
                 deps = change.get("dependencies", [])
                 scope = change.get("estimated_scope", "medium")
                 dep_str = f" (depends on: {', '.join(deps)})" if deps else ""
+                expected = str(change.get("expected_outcome", "")).strip()
+                expected_line = (
+                    f"     Expected outcome: {expected}\n" if expected else ""
+                )
                 parts.append(
                     f"  {i}. `{fp}` [{ct}, {scope}]{dep_str}\n"
                     f"     {desc}\n"
+                    f"{expected_line}"
                 )
 
         if self.risk_factors:
@@ -325,6 +363,60 @@ class PlanResult:
             parts.append(f"**Architectural Notes**: {self.architectural_notes}\n")
 
         return "\n".join(parts)
+
+    def to_plan_step_hypotheses(
+        self,
+        *,
+        emit_enabled: Optional[bool] = None,
+    ) -> tuple:
+        """Materialize :class:`PlanStepHypothesis` instances from
+        ``ordered_changes``.
+
+        Consumers (orchestrator wire-up at Slice 4) feed the result
+        into :func:`detect_falsification`. Returns an empty tuple
+        when planning was skipped, when no changes exist, or when
+        the ``JARVIS_PLAN_HYPOTHESIS_EMIT_ENABLED`` sub-flag is
+        explicitly disabled. Defers per-entry construction to
+        Slice 1's :func:`pair_plan_step_with_hypothesis`
+        convenience constructor so we never duplicate normalization.
+
+        Args:
+          emit_enabled: explicit override (test injection). Defaults
+            to env via :func:`_plan_hypothesis_emit_enabled`.
+
+        Returns:
+          Tuple[PlanStepHypothesis, ...] — empty when emission is
+          off / plan skipped / no changes.
+        """
+        is_enabled = (
+            emit_enabled
+            if emit_enabled is not None
+            else _plan_hypothesis_emit_enabled()
+        )
+        if not is_enabled:
+            return ()
+        if self.skipped or not self.ordered_changes:
+            return ()
+        out: List[PlanStepHypothesis] = []
+        for idx, change in enumerate(self.ordered_changes):
+            if not isinstance(change, dict):
+                continue
+            try:
+                hyp = pair_plan_step_with_hypothesis(
+                    step_index=idx,
+                    ordered_change=change,
+                    expected_outcome=str(
+                        change.get("expected_outcome", "") or ""
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[PlanGenerator] to_plan_step_hypotheses skipped "
+                    "change idx=%d: %s", idx, exc,
+                )
+                continue
+            out.append(hyp)
+        return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +719,8 @@ Return a JSON object matching **exactly** this structure (schema_version: "{_PLA
       "change_type": "<modify|create|delete>",
       "description": "<what to change in this file and why>",
       "dependencies": ["<paths of files that must be changed first>"],
-      "estimated_scope": "<small|medium|large>"
+      "estimated_scope": "<small|medium|large>",
+      "expected_outcome": "<falsifiable predicate this step will satisfy>"
     }}
   ],
   "risk_factors": [
@@ -643,6 +736,7 @@ Rules:
 - `dependencies` within each change refers to OTHER files in the list that must be modified first.
 - `complexity` assessment: trivial = typo/config, moderate = single-concern change, complex = multi-file coordinated change, architectural = cross-cutting refactor.
 - `risk_factors` should be specific and actionable, not generic warnings.
+- `expected_outcome` is a **falsifiable predicate** — a single concrete check the downstream system can use to detect when this step did NOT land as planned. Good predicates are checkable without judgment ("file `auth.py` exists and defines `login(request) -> bool`", "the function `compute_total` returns the sum of its inputs", "the migration adds a non-null column `email` to `users`"). Bad predicates are vague ("auth works", "looks good", "improves performance"). One clear sentence; no hedging.
 - Return ONLY the JSON object. No explanation outside the JSON."""
 
     # ------------------------------------------------------------------
@@ -696,12 +790,19 @@ Rules:
         if not isinstance(ordered_changes, list):
             ordered_changes = []
 
-        # Normalize each change entry
+        # Normalize each change entry. ``expected_outcome`` is gated
+        # by the JARVIS_PLAN_HYPOTHESIS_EMIT_ENABLED sub-flag — when
+        # off, we silently drop any field the model emitted (so legacy
+        # consumers see the legacy shape) and to_plan_step_hypotheses
+        # later returns ``()``. When on, the field is preserved with
+        # safe-default empty string for older models that don't
+        # populate it yet.
+        emit_hypothesis = _plan_hypothesis_emit_enabled()
         normalized_changes: List[Dict[str, Any]] = []
         for change in ordered_changes:
             if not isinstance(change, dict):
                 continue
-            normalized_changes.append({
+            entry: Dict[str, Any] = {
                 "file_path": str(change.get("file_path", "")),
                 "change_type": str(change.get("change_type", "modify")),
                 "description": str(change.get("description", "")),
@@ -710,7 +811,12 @@ Rules:
                     if isinstance(d, str)
                 ],
                 "estimated_scope": str(change.get("estimated_scope", "medium")),
-            })
+            }
+            if emit_hypothesis:
+                entry["expected_outcome"] = str(
+                    change.get("expected_outcome", "") or "",
+                )
+            normalized_changes.append(entry)
 
         risk_factors = [
             str(r) for r in data.get("risk_factors", [])
