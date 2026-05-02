@@ -115,6 +115,13 @@ export function renderHtml(
   .node-detail em { color: var(--vscode-descriptionForeground); font-style: italic; }
   button { padding: 4px 12px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; }
   .empty { text-align: center; padding: 30px; color: var(--vscode-descriptionForeground); font-style: italic; }
+  /* Q2 Slice 7 — reveal-entity flash highlight */
+  @keyframes reveal-pulse {
+    0%   { outline: 0 solid var(--vscode-charts-yellow); }
+    50%  { outline: 4px solid var(--vscode-charts-yellow); }
+    100% { outline: 0 solid var(--vscode-charts-yellow); }
+  }
+  .reveal-flash { animation: reveal-pulse 1.5s ease-out; outline-offset: 2px; }
 </style>
 </head>
 <body>
@@ -351,6 +358,51 @@ ${topology.graphs.length === 0
           if (opId) vscode.postMessage({ type: 'open_op', payload: { op_id: opId } });
         });
       })(links[li]);
+    }
+
+    // Q2 Slice 7 — reveal_entity from extension scrolls + flashes
+    // the matching graph card or unit node. Best-effort: silently
+    // no-ops when the entity isn't in the current snapshot.
+    window.addEventListener('message', function (e) {
+      var msg = e.data || {};
+      if (msg.type !== 'reveal_entity') return;
+      var p = msg.payload || {};
+      var target = null;
+      if (p.kind === 'graph_id') {
+        target = document.querySelector(
+          '.graph-card[data-graph-id="' + cssAttrEscape(p.id) + '"]',
+        );
+      } else if (p.kind === 'unit_id') {
+        // Scope to a specific graph if context provided
+        var scope = document;
+        if (p.context && p.context.graph_id) {
+          var card = document.querySelector(
+            '.graph-card[data-graph-id="' +
+            cssAttrEscape(p.context.graph_id) + '"]',
+          );
+          if (card) scope = card;
+        }
+        var nodes = scope.querySelectorAll('svg.dag .node text');
+        for (var i = 0; i < nodes.length; i++) {
+          if (nodes[i].textContent === p.id) {
+            target = nodes[i].parentElement;
+            break;
+          }
+        }
+      }
+      if (target) {
+        target.scrollIntoView({behavior: 'smooth', block: 'center'});
+        target.classList.add('reveal-flash');
+        setTimeout(function () {
+          target.classList.remove('reveal-flash');
+        }, 1500);
+      }
+    });
+
+    // CSS attr-selector escape — protect against injection.
+    function cssAttrEscape(s) {
+      if (typeof s !== 'string') return '';
+      return s.replace(/([\\\\"\\\\\\\\])/g, '\\\\$1');
     }
   })();
 </script>

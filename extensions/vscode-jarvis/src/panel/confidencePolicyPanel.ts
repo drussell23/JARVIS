@@ -29,6 +29,7 @@ import {
   isPolicyEventType,
 } from '../api/policyTypes';
 import { StreamEventFrame } from '../api/types';
+import { EntityRef } from '../api/entityTypes';
 
 interface MessageFromWebview {
   readonly type:
@@ -113,6 +114,34 @@ export class ConfidencePolicyPanel {
     if (this.panel !== null) {
       this.panel.dispose();
       this.panel = null;
+    }
+  }
+
+  /**
+   * Q2 Slice 7 — cross-panel entity reveal. Opens the panel and
+   * instructs the webview to scroll to the matching proposal row
+   * via a postMessage signal.
+   *
+   * Currently handles ``proposal_id`` only — other kinds are
+   * silently ignored (the linker should have filtered).
+   *
+   * NEVER raises. The reveal handling is best-effort.
+   */
+  public async revealEntity(ref: EntityRef): Promise<void> {
+    await this.show();
+    if (ref.kind !== 'proposal_id') return;
+    if (this.panel === null) return;
+    try {
+      this.panel.webview.postMessage({
+        type: 'reveal_entity',
+        payload: { kind: ref.kind, id: ref.id },
+      });
+    } catch (exc) {
+      this.logger(
+        `confidencePolicy.revealEntity postMessage failed: ${
+          exc instanceof Error ? exc.message : String(exc)
+        }`,
+      );
     }
   }
 
@@ -423,6 +452,13 @@ export function renderHtml(
   #toast { position: fixed; top: 12px; right: 12px; padding: 8px 12px; border-radius: 4px; display: none; max-width: 360px; }
   #toast.success { background: var(--vscode-charts-green); color: black; }
   #toast.error { background: var(--vscode-errorForeground); color: white; }
+  /* Q2 Slice 7 — reveal-entity flash highlight */
+  @keyframes reveal-pulse {
+    0%   { outline: 0 solid var(--vscode-charts-yellow); }
+    50%  { outline: 4px solid var(--vscode-charts-yellow); }
+    100% { outline: 0 solid var(--vscode-charts-yellow); }
+  }
+  .reveal-flash { animation: reveal-pulse 1.5s ease-out; outline-offset: 2px; }
   .small { font-size: 11px; color: var(--vscode-descriptionForeground); }
   .row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 </style>
@@ -586,6 +622,23 @@ ${adapted.in_effect
         t.textContent = p.message || '';
         t.style.display = 'block';
         setTimeout(function () { t.style.display = 'none'; }, 4000);
+      } else if (msg.type === 'reveal_entity') {
+        // Q2 Slice 7 — flash the matching proposal row
+        const p = msg.payload || {};
+        if (p.kind === 'proposal_id' && typeof p.id === 'string') {
+          const rows = document.querySelectorAll('tr');
+          for (let i = 0; i < rows.length; i++) {
+            const td = rows[i].querySelector('td');
+            if (td && td.textContent === p.id) {
+              rows[i].scrollIntoView({behavior: 'smooth', block: 'center'});
+              rows[i].classList.add('reveal-flash');
+              setTimeout(function () {
+                rows[i].classList.remove('reveal-flash');
+              }, 1500);
+              break;
+            }
+          }
+        }
       }
     });
 

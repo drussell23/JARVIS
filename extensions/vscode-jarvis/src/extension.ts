@@ -22,6 +22,8 @@ import { StreamEventFrame } from './api/types';
 import { ExtensionConfig, onConfigChange, readConfig } from './config';
 import { Logger } from './logger';
 import { ConfidencePolicyPanel } from './panel/confidencePolicyPanel';
+import { CrossPanelLinker } from './panel/crossPanelLinker';
+import { findEntityCommand } from './panel/findEntityCommand';
 import { OpDetailPanel } from './panel/opDetailPanel';
 import { TemporalSliderPanel } from './panel/temporalSliderPanel';
 import { WorktreeTopologyPanel } from './panel/worktreeTopologyPanel';
@@ -109,6 +111,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dispose: () => temporalSliderPanel.dispose(),
   });
 
+  // Q2 Slice 7 — cross-panel linker. Single dispatcher that
+  // resolves (EntityKind, id) → panel command. Used by the
+  // unified-search command and (in future slices) by per-panel
+  // entity-link badges.
+  const crossPanelLinker = new CrossPanelLinker(
+    {
+      opDetail: opDetailPanel,
+      temporalSlider: temporalSliderPanel,
+      worktreeTopology: worktreeTopologyPanel,
+      confidencePolicy: confidencePolicyPanel,
+    },
+    (m) => logger.info(m),
+  );
+
   // --- Commands ----------------------------------------------------------
   context.subscriptions.push(
     vscode.commands.registerCommand('jarvisObservability.connect', () => {
@@ -151,6 +167,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       'jarvisObservability.openTemporalSlider',
       async () => {
         await temporalSliderPanel.show();
+      },
+    ),
+    // Q2 Slice 7: unified search across panels.
+    vscode.commands.registerCommand(
+      'jarvisObservability.findEntity',
+      async () => {
+        await findEntityCommand(
+          state.client(),
+          buildPolicyClient(config, abortController.signal),
+          crossPanelLinker,
+          (m) => logger.info(m),
+        );
       },
     ),
   );

@@ -39,6 +39,7 @@ import {
   StreamEventFrame,
   isWorktreeEvent,
 } from '../api/types';
+import { EntityRef } from '../api/entityTypes';
 import {
   renderErrorHtml,
   renderHtml,
@@ -107,6 +108,44 @@ export class WorktreeTopologyPanel {
     if (this.panel !== null) {
       this.panel.dispose();
       this.panel = null;
+    }
+  }
+
+  /**
+   * Q2 Slice 7 — cross-panel entity reveal. Refreshes the panel
+   * and instructs the webview to scroll to the matching graph
+   * card or unit node via a postMessage signal.
+   *
+   * Both ``graph_id`` and ``unit_id`` are accepted; for unit_id
+   * the renderer will scroll to the graph card containing it
+   * (substrate guarantees unit_id uniqueness within a graph but
+   * not across graphs, so caller-supplied ``context.graph_id``
+   * disambiguates when needed).
+   *
+   * NEVER raises. The webview's reveal handling is best-effort
+   * (no-op when the entity isn't in the current snapshot).
+   */
+  public async revealEntity(ref: EntityRef): Promise<void> {
+    await this.show();
+    // The panel currently re-renders on every refresh; the
+    // webview script can listen for a "reveal" message and
+    // scrollIntoView the matching card. We send the post-render
+    // ping after the refresh promise resolves.
+    if (this.panel === null) return;
+    const payload = {
+      kind: ref.kind, id: ref.id,
+      context: ref.context ?? {},
+    };
+    try {
+      this.panel.webview.postMessage({
+        type: 'reveal_entity', payload,
+      });
+    } catch (exc) {
+      this.logger(
+        `worktreeTopology.revealEntity postMessage failed: ${
+          exc instanceof Error ? exc.message : String(exc)
+        }`,
+      );
     }
   }
 

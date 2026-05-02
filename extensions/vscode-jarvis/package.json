@@ -76,6 +76,11 @@
         "command": "jarvisObservability.openTemporalSlider",
         "title": "JARVIS: Open Temporal Slider Panel",
         "icon": "$(history)"
+      },
+      {
+        "command": "jarvisObservability.findEntity",
+        "title": "JARVIS: Find Entity (Op / Session / Graph / Unit / Proposal)",
+        "icon": "$(search)"
       }
     ],
     "menus": {
@@ -109,6 +114,11 @@
           "command": "jarvisObservability.openTemporalSlider",
           "when": "view == jarvisObservability.ops",
           "group": "navigation@5"
+        },
+        {
+          "command": "jarvisObservability.findEntity",
+          "when": "view == jarvisObservability.ops",
+          "group": "navigation@1"
         }
       ]
     },
