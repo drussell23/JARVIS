@@ -459,6 +459,29 @@ class SerpentFlow:
         except Exception:
             self._stream_renderer = None
 
+        # InlinePromptGate Slice 5b (2026-05-02) — phase-boundary
+        # renderer boot wire-up. Subscribes a listener to the
+        # InlinePromptController singleton so phase-boundary prompts
+        # registered by the Slice 2 producer (request_phase_inline_prompt)
+        # render to the operator console with a distinct
+        # ``[Phase Boundary]`` header. Listener filters by the
+        # phase-boundary tool sentinel so per-tool-call prompts (already
+        # rendered by ConsoleInlineRenderer via the middleware path)
+        # are NOT double-rendered. Master-flag-gated via
+        # JARVIS_INLINE_PROMPT_GATE_ENABLED (default true post-Slice-5).
+        # Returns a no-op unsub if controller resolution fails — never
+        # blocks boot. Lazy import mirrors StreamRenderer above so
+        # serpent_flow doesn't hard-depend on the renderer module.
+        try:
+            from backend.core.ouroboros.governance.inline_prompt_gate_renderer import (
+                attach_phase_boundary_renderer,
+            )
+            self._unsub_inline_prompt_renderer: Callable[[], None] = (
+                attach_phase_boundary_renderer(self.console.print)
+            )
+        except Exception:
+            self._unsub_inline_prompt_renderer = lambda: None
+
     # ══════════════════════════════════════════════════════════
     # Zone 0: Boot Banner
     # ══════════════════════════════════════════════════════════
