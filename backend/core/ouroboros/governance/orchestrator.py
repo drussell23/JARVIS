@@ -4812,19 +4812,56 @@ class GovernedOrchestrator:
                             {"reason": "generation_failed", "error": str(exc)},
                         )
                         return ctx
-                    # P2: Dynamic Re-Planning — suggest alternative strategy on failure
+                    # P2: Dynamic Re-Planning — suggest alternative strategy on failure.
+                    # Two-stage cascade:
+                    #   (1) PlanFalsificationDetector (Slice 4 bridge) — proactive,
+                    #       structural, evidence-typed. Preempts when plan steps
+                    #       are falsified by filesystem probe + typed validation
+                    #       evidence.
+                    #   (2) DynamicRePlanner (legacy reactive) — backstop when
+                    #       structural detector returns NO_FALSIFICATION /
+                    #       INSUFFICIENT_EVIDENCE / DISABLED / FAILED.
+                    _replan_text = ""
                     try:
-                        from backend.core.ouroboros.governance.self_evolution import DynamicRePlanner
-                        _attempt_num = self._config.max_generate_retries - generate_retries_remaining + 1
                         _fc = validation.failure_class or "" if 'validation' in dir() else ""
                         _em = validation.short_summary or "" if 'validation' in dir() else ""
-                        _replan = DynamicRePlanner.suggest_replan(_fc, _em, _attempt_num)
-                        if _replan:
-                            _replan_text = DynamicRePlanner.format_for_prompt(_replan)
-                            logger.info(
-                                "[Orchestrator] Dynamic re-plan: %s (attempt %d)",
-                                _replan.trigger[:50], _attempt_num,
+                        _attempt_num = self._config.max_generate_retries - generate_retries_remaining + 1
+                        # Stage 1 — structural falsification (proactive)
+                        try:
+                            from backend.core.ouroboros.governance.plan_falsification_orchestrator_bridge import (  # noqa: E501
+                                bridge_to_replan as _falsification_bridge,
                             )
+                            _fals_verdict, _fals_text = await _falsification_bridge(
+                                plan_json=getattr(ctx, "implementation_plan", "") or "",
+                                validation_failure_class=_fc,
+                                validation_short_summary=_em,
+                                target_files=tuple(getattr(ctx, "target_files", ()) or ()),
+                                project_root=self._config.project_root,
+                            )
+                            if _fals_text:
+                                _replan_text = _fals_text
+                                logger.info(
+                                    "[Orchestrator] Falsification re-plan: "
+                                    "step=%s kinds=%s (attempt %d) [%s]",
+                                    _fals_verdict.falsified_step_index,
+                                    ",".join(_fals_verdict.falsifying_evidence_kinds),
+                                    _attempt_num, ctx.op_id,
+                                )
+                        except Exception as _fb_exc:
+                            logger.debug(
+                                "[Orchestrator] Falsification bridge degraded: %s",
+                                _fb_exc,
+                            )
+                        # Stage 2 — legacy reactive (backstop, only if Stage 1 silent)
+                        if not _replan_text:
+                            from backend.core.ouroboros.governance.self_evolution import DynamicRePlanner
+                            _replan = DynamicRePlanner.suggest_replan(_fc, _em, _attempt_num)
+                            if _replan:
+                                _replan_text = DynamicRePlanner.format_for_prompt(_replan)
+                                logger.info(
+                                    "[Orchestrator] Dynamic re-plan: %s (attempt %d)",
+                                    _replan.trigger[:50], _attempt_num,
+                                )
                     except Exception:
                         _replan_text = ""
                         pass
