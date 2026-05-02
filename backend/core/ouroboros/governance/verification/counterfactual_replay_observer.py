@@ -450,6 +450,13 @@ def read_replay_history(
     ``limit=None`` → returns all records (capped at
     ``replay_history_max_records()``).
 
+    Edge-case race fix (2026-05-01): the read is now wrapped in
+    ``flock_critical_section`` so it serializes with
+    ``_rotate_history()``. Previously the reader was lock-free and
+    could see a transient over-cap state (N+1 lines) between
+    ``flock_append_line`` and the subsequent rotation. The flock
+    hold duration is bounded by the capped file size (≤100K lines).
+
     NEVER raises. Returns empty tuple on missing file or any
     parse fault. Tolerates corrupt lines (skipped silently with
     a debug log)."""
@@ -465,8 +472,25 @@ def read_replay_history(
         if cap == 0:
             return ()
 
-        with path.open("r", encoding="utf-8") as fh:
-            lines = [ln for ln in fh if ln.strip()]
+        # Acquire flock to serialize with _rotate_history().
+        # If the flock cannot be acquired (e.g., stale lock file),
+        # fall through to lock-free read — transient over-cap is
+        # preferable to returning empty on lock failure.
+        lines: List[str] = []
+        try:
+            with flock_critical_section(path) as acquired:
+                if acquired:
+                    with path.open("r", encoding="utf-8") as fh:
+                        lines = [ln for ln in fh if ln.strip()]
+                else:
+                    # Flock not acquired — degrade to lock-free read.
+                    with path.open("r", encoding="utf-8") as fh:
+                        lines = [ln for ln in fh if ln.strip()]
+        except OSError:
+            # File disappeared between exists() and open() — race
+            # with rotation's atomic write. Return empty.
+            return ()
+
         if not lines:
             return ()
 

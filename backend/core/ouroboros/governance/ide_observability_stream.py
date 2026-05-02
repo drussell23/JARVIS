@@ -263,6 +263,26 @@ EVENT_TYPE_COUNTERFACTUAL_BASELINE_UPDATED = (
     "counterfactual_baseline_updated"
 )
 
+# Priority #4 Slice 4 — Speculative Branch Tree observability. Two
+# event types fire from speculative_branch_observer:
+#   * COMPLETE — per-tree SSE: one event per recorded SBT run (after
+#     run_speculative_tree produces a TreeVerdictResult). Payload:
+#     {decision_id, ambiguity_kind, outcome, branch_count,
+#     winning_fingerprint, aggregate_confidence, tightening,
+#     cluster_kind, schema_version}.
+#   * BASELINE_UPDATED — per-aggregation SSE: fires when the periodic
+#     observer recomputes the ambiguity-resolution-rate baseline and
+#     the EffectivenessOutcome changed (or every Nth pass for
+#     liveness). Payload: {outcome, total_trees, actionable_count,
+#     converged_count, ambiguity_resolution_rate, escalation_rate,
+#     truncated_failed_rate, baseline_quality, tightening,
+#     schema_version}.
+# Both are PURE OBSERVABILITY — no authority surface. Cost-contract
+# preserved by AST-pinned construction (observer reads cached
+# artifacts only).
+EVENT_TYPE_SBT_TREE_COMPLETE = "sbt_tree_complete"
+EVENT_TYPE_SBT_BASELINE_UPDATED = "sbt_baseline_updated"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -316,6 +336,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_DAG_FORK_DETECTED,             # Priority 2 Slice 4
     EVENT_TYPE_COUNTERFACTUAL_REPLAY_COMPLETE,   # Priority #3 Slice 4
     EVENT_TYPE_COUNTERFACTUAL_BASELINE_UPDATED,  # Priority #3 Slice 4
+    EVENT_TYPE_SBT_TREE_COMPLETE,                # Priority #4 Slice 4
+    EVENT_TYPE_SBT_BASELINE_UPDATED,             # Priority #4 Slice 4
 })
 
 
@@ -465,6 +487,11 @@ class _Subscriber:
     maxsize: int
     drop_count: int = 0
     created_mono: float = field(default_factory=time.monotonic)
+    # Edge-case race fix (2026-05-01): per-subscriber degradation
+    # tracking so operators can distinguish "one slow client" from
+    # "all clients lagging" — the original aggregate dropped_count
+    # was blind to per-subscriber health.
+    last_drop_at: float = 0.0  # monotonic timestamp of last drop
     _lag_pending: bool = False  # suppress duplicate lag frames
     _closed: bool = False
 
@@ -540,6 +567,80 @@ class StreamEventBroker:
     def dropped_count(self) -> int:
         return self._dropped_count
 
+    # --- per-subscriber health (edge-case race fix 2026-05-01) -----
+
+    def subscriber_health(self) -> List[Dict[str, Any]]:
+        """Per-subscriber health snapshot.
+
+        Edge-case race fix (2026-05-01): the original broker only
+        exposed an aggregate ``dropped_count``. Operators could not
+        distinguish "one slow client" from "all clients lagging".
+
+        Returns a list of dicts, one per active subscriber::
+
+            {
+                "sub_id": int,
+                "op_filter": str | "*",
+                "drop_count": int,
+                "last_drop_ago_s": float | None,
+                "queue_depth": int,
+                "queue_maxsize": int,
+                "status": "healthy" | "lagging" | "wedged",
+                "connected_s": float,
+            }
+
+        Classification heuristic:
+          - ``healthy``: no drops, or no drops in the last 60s
+          - ``lagging``: drops occurring but subscriber still draining
+          - ``wedged``: queue is full AND last drop was < 5s ago
+        """
+        now = time.monotonic()
+        with self._lock:
+            subs = list(self._subscribers.values())
+        result: List[Dict[str, Any]] = []
+        for sub in subs:
+            if sub._closed:
+                continue
+            drop_count = sub.drop_count
+            last_drop_at = sub.last_drop_at
+            queue_depth = sub.queue.qsize()
+            queue_max = sub.maxsize
+            connected_s = now - sub.created_mono
+
+            if last_drop_at > 0:
+                last_drop_ago = now - last_drop_at
+            else:
+                last_drop_ago = None
+
+            # Classification
+            if drop_count == 0 or (
+                last_drop_ago is not None and last_drop_ago > 60.0
+            ):
+                status = "healthy"
+            elif (
+                queue_depth >= queue_max
+                and last_drop_ago is not None
+                and last_drop_ago < 5.0
+            ):
+                status = "wedged"
+            else:
+                status = "lagging"
+
+            result.append({
+                "sub_id": sub.sub_id,
+                "op_filter": sub.op_id_filter or "*",
+                "drop_count": drop_count,
+                "last_drop_ago_s": (
+                    round(last_drop_ago, 1) if last_drop_ago is not None
+                    else None
+                ),
+                "queue_depth": queue_depth,
+                "queue_maxsize": queue_max,
+                "status": status,
+                "connected_s": round(connected_s, 1),
+            })
+        return result
+
     # --- publish -----------------------------------------------------------
 
     def publish(
@@ -598,6 +699,10 @@ class StreamEventBroker:
         and schedule a ``stream_lag`` control frame. The subscriber
         sees the lag frame and can reset its view via the REST
         endpoints.
+
+        Edge-case race fix (2026-05-01): now sets ``sub.last_drop_at``
+        and emits a per-subscriber WARNING log on first drop so
+        operators can grep for individual slow clients.
         """
         try:
             # asyncio.Queue.put_nowait raises asyncio.QueueFull when
@@ -607,8 +712,21 @@ class StreamEventBroker:
         except asyncio.QueueFull:
             self._dropped_count += 1
             sub.drop_count += 1
+            sub.last_drop_at = time.monotonic()
             if not sub._lag_pending:
                 sub._lag_pending = True
+                # Per-subscriber degradation log — first drop for
+                # this subscriber since last ack. Enables operators
+                # to grep for individual slow clients.
+                logger.warning(
+                    "[Stream] subscriber_lagging sub=%d "
+                    "op_filter=%r drops=%d queue_depth=%d/%d",
+                    sub.sub_id,
+                    sub.op_id_filter or "*",
+                    sub.drop_count,
+                    sub.queue.qsize(),
+                    sub.maxsize,
+                )
                 # Attempt to inject a lag frame. If THAT also fails,
                 # the subscriber is thoroughly wedged and we just
                 # drop silently — the disconnect path will clean up.
@@ -620,6 +738,7 @@ class StreamEventBroker:
                     payload={
                         "dropped_since_last_ack": sub.drop_count,
                         "first_missed_event_id": event.event_id,
+                        "subscriber_id": sub.sub_id,
                     },
                 )
                 try:

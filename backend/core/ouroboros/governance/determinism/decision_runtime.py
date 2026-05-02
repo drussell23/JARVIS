@@ -562,13 +562,14 @@ class DecisionRuntime:
         # Master-flag-gated: populated in shadow mode when
         # JARVIS_DAG_PER_WORKER_ORDINALS_ENABLED=true; authoritative
         # for replay when JARVIS_DAG_PER_WORKER_ORDINALS_ENFORCE=true.
-        # Computed lazily once at first record() call to avoid
-        # importing worktree_manager during constructor (keeps the
-        # constructor pure + cage-clean).
         self._per_worker_ordinals: Dict[
             Tuple[str, str, str, str], int
         ] = {}
-        self._worker_id: Optional[str] = None
+        # Edge-case race fix (2026-05-01): worker_id is NO LONGER
+        # cached. worker_id_for_path() is a pure stdlib function
+        # (<1µs, zero I/O). Caching created a cross-contamination
+        # window when a singleton runtime received concurrent
+        # record() calls with different effective worktree contexts.
         self._worktree_path: Optional[str] = worktree_path
         # Lazy lookup index for replay/verify: keys → record
         self._index: Optional[Dict[Tuple[str, str, str, int], DecisionRecord]] = None
@@ -578,24 +579,35 @@ class DecisionRuntime:
     def session_id(self) -> str:
         return self._session_id
 
-    def _resolve_worker_id(self) -> str:
-        """Lazily compute the worker_id once per runtime instance.
+    def _compute_worker_id(self) -> str:
+        """Compute a fresh worker_id on every call — NEVER cached.
 
-        Imports ``worker_id_for_path`` from ``worktree_manager`` lazily
-        so the constructor stays cage-clean (no eager dependency on
-        the W3(6) primitive). Cached after first call. NEVER raises —
-        falls back to ``"unknown-worker"`` on any import / compute
-        failure so the runtime always has a stable identifier."""
-        if self._worker_id is not None:
-            return self._worker_id
+        Edge-case race fix (2026-05-01): the previous ``_resolve_worker_id()``
+        cached into ``self._worker_id`` after first call, creating a
+        cross-contamination window when a singleton runtime received
+        concurrent ``record()`` calls with different effective worktree
+        contexts. ``worker_id_for_path()`` is a pure stdlib function
+        (PID + SHA1 hash, <1µs, zero I/O) — caching was premature
+        optimization.
+
+        NEVER raises — falls back to ``"{pid}-base"`` on any import /
+        compute failure."""
         try:
             from backend.core.ouroboros.governance.worktree_manager import (
                 worker_id_for_path,
             )
-            self._worker_id = worker_id_for_path(self._worktree_path)
+            if self._worktree_path is None:
+                logger.debug(
+                    "[DecisionRuntime] _compute_worker_id: "
+                    "worktree_path is None, using base worker_id",
+                )
+            return worker_id_for_path(self._worktree_path)
         except Exception:  # noqa: BLE001 — defensive
-            self._worker_id = "unknown-worker"
-        return self._worker_id
+            import os as _os
+            try:
+                return f"{_os.getpid()}-base"
+            except Exception:  # noqa: BLE001 — defensive
+                return "0-base"
 
     def _resolved_path(self) -> Path:
         if self._path is not None:
@@ -649,7 +661,7 @@ class DecisionRuntime:
                 # increment so the two counters stay coherent across
                 # concurrent record() calls.
                 if per_worker_master_on:
-                    worker_id_str = self._resolve_worker_id()
+                    worker_id_str = self._compute_worker_id()
                     pw_key = (worker_id_str, op_id, phase, kind)
                     sub_ordinal_val = self._per_worker_ordinals.get(
                         pw_key, 0,
