@@ -195,7 +195,16 @@ class CuriosityRecord:
     Frozen because once persisted it's the system of record for the
     operator-facing audit. Mutating it would break the deterministic
     ledger contract.
-    """
+
+    Q1 Slice 2 — ``shannon_entropy_bits`` quantifies the
+    information-theoretic novelty of the question text via the
+    standard Shannon entropy formula ``H = -Σ p_i log₂ p_i`` over
+    token frequency. Higher entropy ≈ more diverse vocabulary ≈
+    more epistemically novel question. Operators can rank pending
+    questions by this field to budget cost-cap exhaustion toward
+    the most informative inquiries. Defaults to 0.0 for legacy
+    rows (additive schema extension; field absence on read is
+    treated as 0.0)."""
 
     schema_version: str
     question_id: str
@@ -206,9 +215,70 @@ class CuriosityRecord:
     issued_at_monotonic: float
     issued_at_iso: str
     result: str  # "allowed" | "denied:<reason>"
+    shannon_entropy_bits: float = 0.0
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":")) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Shannon entropy — pure-stdlib epistemic novelty quantifier
+# ---------------------------------------------------------------------------
+
+
+def shannon_entropy_bits(text: str) -> float:
+    """Compute the Shannon entropy of a question text in bits.
+
+    H = -Σ p_i log₂ p_i  over the token-frequency distribution
+    where tokens are case-folded whitespace-delimited words with
+    punctuation stripped. Returns 0.0 on empty / single-token
+    input (degenerate distributions). NEVER raises.
+
+    Pure-stdlib: standard formula over a Counter; no model
+    inference, no FX dependency. Bounded computation cost
+    (linear in text length, capped at 8192 chars to defend
+    against pathological inputs).
+
+    Bit interpretation:
+      * H = 0.0 — single distinct token; no information content
+      * H = 1.0 — uniform 2-token distribution
+      * H = log₂(N) — uniform N-distinct-token distribution
+      * Higher H ≈ broader vocabulary ≈ more epistemically novel
+        framing of the inquiry
+
+    The metric is computed at charge time (see ``CuriosityBudget.
+    _new_record``) and persisted as part of the curiosity ledger
+    so operators / analyzers can post-hoc rank questions by
+    information value."""
+    import math
+    from collections import Counter
+    try:
+        if not isinstance(text, str) or not text:
+            return 0.0
+        # Bound input size against pathological lengths.
+        if len(text) > 8192:
+            text = text[:8192]
+        # Tokenize: lowercase, strip surrounding punctuation, drop
+        # empties. Conservative regex-free split — works on Unicode.
+        tokens: list = []
+        for raw in text.lower().split():
+            tok = raw.strip(
+                ".,;:!?\"'()[]{}<>—–-_/\\|`*~#@$%^&+=…",
+            )
+            if tok:
+                tokens.append(tok)
+        if len(tokens) < 2:
+            return 0.0
+        counts = Counter(tokens)
+        total = float(len(tokens))
+        h = 0.0
+        for cnt in counts.values():
+            p = cnt / total
+            if p > 0.0:
+                h -= p * math.log2(p)
+        return float(h)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0.0
 
 
 def _now_iso() -> str:
@@ -372,6 +442,10 @@ class CuriosityBudget:
             issued_at_iso=_now_iso(),
             result=("allowed" if allowed else f"denied:{deny_reason.value}"
                     if deny_reason else "denied:unknown"),
+            # Q1 Slice 2 — quantify epistemic novelty via Shannon
+            # entropy over token frequency. Computed at charge
+            # time so operators can rank questions later.
+            shannon_entropy_bits=shannon_entropy_bits(question_text),
         )
         # Single-line INFO log line (operator-facing audit).
         if allowed:

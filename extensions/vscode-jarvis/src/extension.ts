@@ -41,6 +41,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     opDetailPanel: null,
     confidencePolicyPanel: null,
     worktreeTopologyPanel: null,
+    temporalSliderPanel: null,
     pollTimer: null,
   };
 
@@ -227,6 +228,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (worktreeTopologyPanel.isOpen()) {
           await worktreeTopologyPanel.onStreamEvent(frame);
         }
+        // Gap #1 Slice 2: SSE-driven refresh for the temporal
+        // slider panel on replay_start / replay_end. The panel
+        // filters other event types.
+        if (temporalSliderPanel.isOpen()) {
+          await temporalSliderPanel.onStreamEvent(frame);
+        }
       } catch (exc) {
         logger.error(`applyStreamEvent(${frame.event_type})`, exc);
       }
@@ -284,6 +291,7 @@ interface ActiveState {
   opDetailPanel: OpDetailPanel | null;
   confidencePolicyPanel: ConfidencePolicyPanel | null;
   worktreeTopologyPanel: WorktreeTopologyPanel | null;
+  temporalSliderPanel: TemporalSliderPanel | null;
   pollTimer: NodeJS.Timeout | null;
 }
 
