@@ -453,7 +453,12 @@ def parse_trigger_spec_mapping(
         raise SkillTriggerError(
             f"{path}: missing required field 'kind'"
         )
-    kind = parse_trigger_kind(data["kind"])
+    try:
+        kind = parse_trigger_kind(data["kind"])
+    except SkillTriggerError as exc:
+        # Re-raise with the spec path threaded in so list-element
+        # errors carry the index (e.g., "trigger_specs[1].kind: ...").
+        raise SkillTriggerError(f"{path}.kind: {exc}") from exc
 
     def _opt_str(key: str, default: str = "") -> str:
         v = data.get(key, default)
@@ -561,7 +566,15 @@ def reach_includes(reach: SkillReach, target: SkillReach) -> bool:
         if reach is SkillReach.ANY:
             return True
         if reach is SkillReach.OPERATOR_PLUS_MODEL:
-            return target in (SkillReach.OPERATOR, SkillReach.MODEL)
+            # OPERATOR_PLUS_MODEL is a set; it contains itself plus
+            # the singleton reaches it composes. Excludes AUTONOMOUS
+            # (the proactive surplus -- distinct surface) and ANY
+            # (a strict superset).
+            return target in (
+                SkillReach.OPERATOR,
+                SkillReach.MODEL,
+                SkillReach.OPERATOR_PLUS_MODEL,
+            )
         return reach is target
     except Exception:  # noqa: BLE001 -- defensive
         return False

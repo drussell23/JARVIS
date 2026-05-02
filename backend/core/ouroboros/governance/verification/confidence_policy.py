@@ -87,8 +87,8 @@ circuits to ``outcome=DISABLED`` regardless of inputs.
     risk_engine / change_engine / tool_executor / providers /
     candidate_generator / semantic_guardian / semantic_firewall /
     scoped_tool_backend / subagent_scheduler.
-  * No filesystem I/O. No network. No subprocess. No env
-    mutation. No bare eval-family calls.
+  * No filesystem I/O, no network, no shell-out, no env
+    mutation, no bare eval-family calls.
 """
 from __future__ import annotations
 
