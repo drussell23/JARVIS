@@ -116,17 +116,25 @@ class _StubScheduler:
 
 
 class TestMasterFlag:
-    def test_default_off(self, monkeypatch):
+    def test_default_post_graduation_is_true(self, monkeypatch):
+        """Slice 5 graduation (2026-05-02): substrate is read-only,
+        structurally safe to enable by default."""
         monkeypatch.delenv(
             "JARVIS_WORKTREE_TOPOLOGY_ENABLED", raising=False,
         )
-        assert worktree_topology_enabled() is False
+        assert worktree_topology_enabled() is True
 
     def test_explicit_true(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_WORKTREE_TOPOLOGY_ENABLED", "true",
         )
         assert worktree_topology_enabled() is True
+
+    def test_explicit_false_hot_revert(self, monkeypatch):
+        monkeypatch.setenv(
+            "JARVIS_WORKTREE_TOPOLOGY_ENABLED", "false",
+        )
+        assert worktree_topology_enabled() is False
 
     def test_garbage_value_treated_as_false(self, monkeypatch):
         monkeypatch.setenv(
@@ -135,8 +143,10 @@ class TestMasterFlag:
         assert worktree_topology_enabled() is False
 
     def test_disabled_short_circuit_outcome(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_WORKTREE_TOPOLOGY_ENABLED", raising=False,
+        """When operator hot-reverts, compute_worktree_topology
+        returns DISABLED regardless of inputs."""
+        monkeypatch.setenv(
+            "JARVIS_WORKTREE_TOPOLOGY_ENABLED", "false",
         )
         out = compute_worktree_topology(
             scheduler=_StubScheduler({}),

@@ -83,14 +83,21 @@ WORKTREE_TOPOLOGY_SSE_BRIDGE_SCHEMA_VERSION: str = (
 
 
 def worktree_topology_sse_enabled() -> bool:
-    """``JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED`` (default ``false``
-    until Slice 5). NEVER raises."""
+    """``JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED`` (default ``true`` —
+    graduated 2026-05-02 in Gap #3 Slice 5). The bridge is a pure
+    translator (autonomy → broker), zero scheduler modification;
+    handlers are fault-isolated by the autonomy ``EventEmitter``
+    AND defense-in-depth try/except in each handler body. Safe
+    to enable by default. Operator hot-reverts via explicit
+    ``=false`` (handlers re-check the master flag at runtime).
+
+    NEVER raises."""
     try:
         raw = os.environ.get(
             "JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED", "",
         ).strip().lower()
         if raw == "":
-            return False
+            return True  # graduated 2026-05-02
         return raw in ("1", "true", "yes", "on")
     except Exception:  # noqa: BLE001 — defensive
         return False

@@ -101,15 +101,20 @@ WORKTREE_TOPOLOGY_SCHEMA_VERSION: str = "worktree_topology.1"
 
 
 def worktree_topology_enabled() -> bool:
-    """``JARVIS_WORKTREE_TOPOLOGY_ENABLED`` (default ``false`` until
-    Slice 5). Empty / unset / whitespace = default. Truthy =
-    ``1``/``true``/``yes``/``on`` (case-insensitive). NEVER raises."""
+    """``JARVIS_WORKTREE_TOPOLOGY_ENABLED`` (default ``true`` —
+    graduated 2026-05-02 in Gap #3 Slice 5). The substrate is a
+    pure read-only projection over scheduler in-memory state +
+    caller-supplied git worktree paths; structurally safe to
+    enable by default. Operator hot-reverts via explicit
+    ``=false``.
+
+    Empty / unset / whitespace = graduated default. NEVER raises."""
     try:
         raw = os.environ.get(
             "JARVIS_WORKTREE_TOPOLOGY_ENABLED", "",
         ).strip().lower()
         if raw == "":
-            return False
+            return True  # graduated 2026-05-02
         return raw in ("1", "true", "yes", "on")
     except Exception:  # noqa: BLE001 — defensive
         return False
