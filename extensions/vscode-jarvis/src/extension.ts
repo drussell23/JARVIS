@@ -16,10 +16,12 @@
 
 import * as vscode from 'vscode';
 import { ObservabilityClient } from './api/client';
+import { PolicyClient } from './api/policyClient';
 import { StreamConsumer, StreamState } from './api/stream';
 import { StreamEventFrame } from './api/types';
 import { ExtensionConfig, onConfigChange, readConfig } from './config';
 import { Logger } from './logger';
+import { ConfidencePolicyPanel } from './panel/confidencePolicyPanel';
 import { OpDetailPanel } from './panel/opDetailPanel';
 import { StatusBar } from './status/statusBar';
 import { OpsTreeProvider } from './tree/opsProvider';
@@ -35,6 +37,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     stream: null,
     treeProvider: null,
     opDetailPanel: null,
+    confidencePolicyPanel: null,
     pollTimer: null,
   };
 
@@ -62,6 +65,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   state.opDetailPanel = opDetailPanel;
   context.subscriptions.push({ dispose: () => opDetailPanel.dispose() });
 
+  // Gap #2 Slice 5b: interactive Confidence Policy panel.
+  // Sibling to OpDetailPanel — uses a separate write client + its
+  // own message-passing surface so the read panel stays HTML-only.
+  const confidencePolicyPanel = new ConfidencePolicyPanel(
+    () => buildPolicyClient(config, abortController.signal),
+    (m) => logger.info(m),
+  );
+  state.confidencePolicyPanel = confidencePolicyPanel;
+  context.subscriptions.push({
+    dispose: () => confidencePolicyPanel.dispose(),
+  });
+
   // --- Commands ----------------------------------------------------------
   context.subscriptions.push(
     vscode.commands.registerCommand('jarvisObservability.connect', () => {
@@ -85,6 +100,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('jarvisObservability.showLog', () => {
       logger.show();
     }),
+    // Gap #2 Slice 5b: open the Confidence Policy panel.
+    vscode.commands.registerCommand(
+      'jarvisObservability.openConfidencePolicy',
+      async () => {
+        await confidencePolicyPanel.show();
+      },
+    ),
   );
 
   // --- Config reactivity -------------------------------------------------
@@ -150,6 +172,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (opDetailPanel.isShowing(frame.op_id)) {
           await opDetailPanel.refresh();
         }
+        // Slice 5b: SSE-driven refresh for the policy panel.
+        // The panel itself filters non-confidence_policy_* events.
+        if (confidencePolicyPanel.isOpen()) {
+          await confidencePolicyPanel.onStreamEvent(frame);
+        }
       } catch (exc) {
         logger.error(`applyStreamEvent(${frame.event_type})`, exc);
       }
@@ -205,6 +232,7 @@ interface ActiveState {
   stream: StreamConsumer | null;
   treeProvider: OpsTreeProvider | null;
   opDetailPanel: OpDetailPanel | null;
+  confidencePolicyPanel: ConfidencePolicyPanel | null;
   pollTimer: NodeJS.Timeout | null;
 }
 
@@ -213,6 +241,12 @@ function buildClient(cfg: ExtensionConfig, signal: AbortSignal): ObservabilityCl
     endpoint: cfg.endpoint,
     signal,
   });
+}
+
+function buildPolicyClient(
+  cfg: ExtensionConfig, signal: AbortSignal,
+): PolicyClient {
+  return new PolicyClient({ endpoint: cfg.endpoint, signal });
 }
 
 function shouldRestartStream(a: ExtensionConfig, b: ExtensionConfig): boolean {

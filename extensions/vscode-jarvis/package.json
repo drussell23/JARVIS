@@ -61,6 +61,11 @@
       {
         "command": "jarvisObservability.showLog",
         "title": "JARVIS: Show Output Log"
+      },
+      {
+        "command": "jarvisObservability.openConfidencePolicy",
+        "title": "JARVIS: Open Confidence Policy Panel",
+        "icon": "$(settings-gear)"
       }
     ],
     "menus": {
@@ -79,6 +84,11 @@
           "command": "jarvisObservability.disconnect",
           "when": "view == jarvisObservability.ops && jarvisObservability.connected",
           "group": "navigation@2"
+        },
+        {
+          "command": "jarvisObservability.openConfidencePolicy",
+          "when": "view == jarvisObservability.ops",
+          "group": "navigation@3"
         }
       ]
     },
