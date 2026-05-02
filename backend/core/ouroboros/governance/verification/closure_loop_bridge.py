@@ -423,7 +423,12 @@ def default_propose_callback(
         result = active_ledger.propose(
             proposal_id=proposal_id,
             surface=AdaptationSurface.COHERENCE_AUDITOR_BUDGETS,
-            proposal_kind=record.parameter_name,
+            # The universal cage's _TIGHTEN_KINDS allowlist is keyed
+            # by cross-surface generic verbs (raise_floor /
+            # lower_budget / etc.). The closure-loop's verb is
+            # ``tighten_drift_budget``; the specific parameter
+            # being tightened lives in the payload.parameter_name.
+            proposal_kind="tighten_drift_budget",
             evidence=evidence,
             current_state_hash=current_hash,
             proposed_state_hash=proposed_hash,

@@ -514,6 +514,13 @@ _TIGHTEN_KINDS: Tuple[str, ...] = (
     "widen_approaching", # Confidence approaching_factor — only widen (earlier warning)
     "enable_enforce",    # Confidence enforce — False→True only (BELOW_FLOOR becomes hard block)
     "multi_dim_tighten", # Confidence multi-knob proposal — surface validator confirms ≥2 dimensions actually moved
+    # Q4 P#2 Slice 3 — closure-loop autonomous tightening of coherence
+    # auditor budgets (route_drift_pct / recurrence_count /
+    # confidence_rise_pct). One generic verb covers all three parameters
+    # — the surface validator (coherence_budget_tightener) inspects
+    # the payload's parameter_name and verifies monotonic-tightening
+    # per direction.
+    "tighten_drift_budget",
 )
 
 

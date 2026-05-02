@@ -141,10 +141,12 @@ def test_caps_pinned():
     assert MAX_PROPOSAL_ID_CHARS == 128
 
 
-def test_adaptation_surface_six_values():
+def test_adaptation_surface_seven_values():
     """Pass C shipped with 5 surfaces; Deep Observability Gap #2
     added a 6th (operator-proposed Confidence-monitor threshold
-    tightening). Each value below maps to a registered surface
+    tightening); Q4 Priority #2 Slice 3 added a 7th
+    (autonomous closure-loop tightening of coherence auditor drift
+    budgets). Each value below maps to a registered surface
     validator + an ``adapted_*.yaml`` materialization path. Add
     a new value here whenever a new adaptive surface lands."""
     assert {s.value for s in AdaptationSurface} == {
@@ -154,6 +156,7 @@ def test_adaptation_surface_six_values():
         "risk_tier_floor.tiers",
         "exploration_ledger.category_weights",
         "confidence_monitor.thresholds",
+        "coherence_auditor.budgets",
     }
 
 

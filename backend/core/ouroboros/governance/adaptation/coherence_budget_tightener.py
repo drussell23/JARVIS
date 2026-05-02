@@ -67,10 +67,12 @@ _VALID_PARAMETER_NAMES: frozenset = frozenset({
 })
 
 
-# ``proposal_kind`` for this surface mirrors the parameter name —
-# 1:1 mapping. We accept the same vocabulary the Tightening intent
-# produces.
-_VALID_PROPOSAL_KINDS: frozenset = _VALID_PARAMETER_NAMES
+# ``proposal_kind`` for this surface is the single generic verb the
+# universal cage's ``_TIGHTEN_KINDS`` allowlist accepts. The specific
+# parameter being tightened lives in the payload's
+# ``parameter_name`` field, which we still validate against the
+# allowlist below.
+_VALID_PROPOSAL_KINDS: frozenset = frozenset({"tighten_drift_budget"})
 
 
 # Direction tokens the bridge stamps when building the payload.
@@ -203,8 +205,12 @@ def _coherence_budget_validator(
                     f"coherence_budget_{branch_name}_missing_direction",
                 )
 
-        # 5b. parameter_name agreement across branches + matches
-        # proposal_kind
+        # 5b. parameter_name agreement across branches + each
+        # branch's parameter_name lives in the
+        # _VALID_PARAMETER_NAMES allowlist. The proposal_kind is
+        # the universal-cage verb (tighten_drift_budget); the
+        # parameter being tightened lives only in the payload, so
+        # this check is the per-surface differentiation point.
         cur_param = str(current["parameter_name"])
         prop_param = str(proposed["parameter_name"])
         if cur_param != prop_param:
@@ -213,11 +219,11 @@ def _coherence_budget_validator(
                 f"coherence_budget_parameter_name_mismatch:"
                 f"{cur_param}!={prop_param}",
             )
-        if cur_param != proposal.proposal_kind:
+        if cur_param not in _VALID_PARAMETER_NAMES:
             return (
                 False,
-                f"coherence_budget_parameter_proposal_kind_mismatch:"
-                f"{cur_param}!={proposal.proposal_kind}",
+                f"coherence_budget_parameter_not_in_allowlist:"
+                f"{cur_param}",
             )
 
         # 6. Direction token
