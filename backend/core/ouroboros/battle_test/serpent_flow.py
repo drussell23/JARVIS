@@ -44,6 +44,10 @@ from rich.spinner import SPINNERS
 from rich.status import Status
 from rich.syntax import Syntax
 
+from backend.core.ouroboros.governance.inline_prompt_gate_renderer import (
+    attach_phase_boundary_renderer,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # UI Slice 8 — Ouroboros snake-eating-tail spinner
@@ -428,6 +432,10 @@ class SerpentFlow:
         # as non-terminal and falls back to plain text.
         self.console = Console(emoji=True, highlight=False, force_terminal=True)
 
+        self._unsub_inline_prompt_renderer = attach_phase_boundary_renderer(
+            self.console.print
+        )
+
         # Execution masking (rich.Status)
         self._active_status: Optional[Status] = None
 
@@ -559,6 +567,7 @@ class SerpentFlow:
 
     async def stop(self) -> None:
         """Print the shutdown summary."""
+        self._unsub_inline_prompt_renderer()
         self._stop_status()
         self.show_streaming_end()
         elapsed = time.time() - self._started_at
