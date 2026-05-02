@@ -23,6 +23,7 @@ import { ExtensionConfig, onConfigChange, readConfig } from './config';
 import { Logger } from './logger';
 import { ConfidencePolicyPanel } from './panel/confidencePolicyPanel';
 import { OpDetailPanel } from './panel/opDetailPanel';
+import { WorktreeTopologyPanel } from './panel/worktreeTopologyPanel';
 import { StatusBar } from './status/statusBar';
 import { OpsTreeProvider } from './tree/opsProvider';
 
@@ -38,6 +39,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     treeProvider: null,
     opDetailPanel: null,
     confidencePolicyPanel: null,
+    worktreeTopologyPanel: null,
     pollTimer: null,
   };
 
@@ -77,6 +79,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dispose: () => confidencePolicyPanel.dispose(),
   });
 
+  // Gap #3 Slice 4: read-only Worktree Topology panel.
+  // Reuses the existing ObservabilityClient (same "1.0" schema)
+  // for snapshot fetches; renders a force-directed SVG graph
+  // entirely client-side (no library, no bundler, no supply-chain
+  // surface).
+  const worktreeTopologyPanel = new WorktreeTopologyPanel(
+    state.client,
+    (m) => logger.info(m),
+  );
+  state.worktreeTopologyPanel = worktreeTopologyPanel;
+  context.subscriptions.push({
+    dispose: () => worktreeTopologyPanel.dispose(),
+  });
+
   // --- Commands ----------------------------------------------------------
   context.subscriptions.push(
     vscode.commands.registerCommand('jarvisObservability.connect', () => {
@@ -105,6 +121,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       'jarvisObservability.openConfidencePolicy',
       async () => {
         await confidencePolicyPanel.show();
+      },
+    ),
+    // Gap #3 Slice 4: open the Worktree Topology panel.
+    vscode.commands.registerCommand(
+      'jarvisObservability.openWorktreeTopology',
+      async () => {
+        await worktreeTopologyPanel.show();
       },
     ),
   );
@@ -177,6 +200,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (confidencePolicyPanel.isOpen()) {
           await confidencePolicyPanel.onStreamEvent(frame);
         }
+        // Gap #3 Slice 4: SSE-driven refresh for the worktree
+        // topology panel. The panel filters non-worktree_* events.
+        if (worktreeTopologyPanel.isOpen()) {
+          await worktreeTopologyPanel.onStreamEvent(frame);
+        }
       } catch (exc) {
         logger.error(`applyStreamEvent(${frame.event_type})`, exc);
       }
@@ -233,6 +261,7 @@ interface ActiveState {
   treeProvider: OpsTreeProvider | null;
   opDetailPanel: OpDetailPanel | null;
   confidencePolicyPanel: ConfidencePolicyPanel | null;
+  worktreeTopologyPanel: WorktreeTopologyPanel | null;
   pollTimer: NodeJS.Timeout | null;
 }
 

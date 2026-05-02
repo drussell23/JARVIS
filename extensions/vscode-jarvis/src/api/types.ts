@@ -77,7 +77,17 @@ export type ControlEventType =
   | 'replay_start'
   | 'replay_end';
 
-export type StreamEventType = TaskEventType | ControlEventType;
+// Gap #3 Slice 3 — L3 worktree topology stream events.
+// Translated 1:1 by the agent-side bridge from autonomy
+// EventEmitter (EXECUTION_GRAPH_STATE_CHANGED + WORK_UNIT_STATE_CHANGED).
+export type WorktreeEventType =
+  | 'worktree_topology_updated'
+  | 'worktree_unit_state_changed';
+
+export type StreamEventType =
+  | TaskEventType
+  | ControlEventType
+  | WorktreeEventType;
 
 /** Discriminated-union frame matching the server's StreamEvent shape. */
 export interface StreamEventFrame extends Envelope {
@@ -131,4 +141,114 @@ export function isControlEvent(
   frame: StreamEventFrame,
 ): frame is StreamEventFrame & { event_type: ControlEventType } {
   return CONTROL_EVENT_TYPES.has(frame.event_type as ControlEventType);
+}
+
+const WORKTREE_EVENT_TYPES: ReadonlySet<WorktreeEventType> = new Set([
+  'worktree_topology_updated',
+  'worktree_unit_state_changed',
+]);
+
+export function isWorktreeEvent(
+  frame: StreamEventFrame,
+): frame is StreamEventFrame & { event_type: WorktreeEventType } {
+  return WORKTREE_EVENT_TYPES.has(
+    frame.event_type as WorktreeEventType,
+  );
+}
+
+// --- Gap #3 worktree topology projection wire shapes ----------------------
+//
+// Mirror of the agent-side WorktreeTopology produced by
+// ``verification.worktree_topology.compute_worktree_topology`` and
+// surfaced via ``GET /observability/worktrees`` /
+// ``GET /observability/worktrees/{graph_id}``. The substrate stamps
+// ``schema_version: "worktree_topology.1"`` on the inner topology
+// envelope; the outer HTTP envelope uses the read surface's
+// canonical ``"1.0"``.
+
+export type WorktreeTopologyOutcome =
+  | 'ok'
+  | 'empty'
+  | 'disabled'
+  | 'scheduler_invalid'
+  | 'failed';
+
+export type WorktreeUnitState =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export type WorktreeGraphPhase =
+  | 'created'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export type WorktreeEdgeKind = 'dependency' | 'barrier';
+
+export interface WorktreeNodeProjection {
+  readonly unit_id: string;
+  readonly repo: string;
+  readonly goal: string;
+  readonly target_files: readonly string[];
+  readonly owned_paths: readonly string[];
+  readonly dependency_ids: readonly string[];
+  readonly state: WorktreeUnitState;
+  readonly barrier_id: string;
+  readonly has_worktree: boolean;
+  readonly worktree_path: string;
+  readonly attempt_count: number;
+  readonly schema_version: string;
+}
+
+export interface WorktreeEdgeProjection {
+  readonly from_unit_id: string;
+  readonly to_unit_id: string;
+  readonly edge_kind: WorktreeEdgeKind;
+}
+
+export interface WorktreeGraphProjection {
+  readonly graph_id: string;
+  readonly op_id: string;
+  readonly planner_id: string;
+  readonly plan_digest: string;
+  readonly causal_trace_id: string;
+  readonly phase: WorktreeGraphPhase;
+  readonly concurrency_limit: number;
+  readonly nodes: readonly WorktreeNodeProjection[];
+  readonly edges: readonly WorktreeEdgeProjection[];
+  readonly last_error: string;
+  readonly updated_at_ns: number;
+  readonly checksum: string;
+  readonly schema_version: string;
+}
+
+export interface WorktreeTopologySummary {
+  readonly total_graphs: number;
+  readonly total_units: number;
+  readonly units_by_state: Record<string, number>;
+  readonly graphs_by_phase: Record<string, number>;
+  readonly units_with_worktree: number;
+  readonly orphan_worktree_count: number;
+  readonly orphan_worktree_paths: readonly string[];
+}
+
+export interface WorktreeTopologyProjection {
+  readonly outcome: WorktreeTopologyOutcome;
+  readonly graphs: readonly WorktreeGraphProjection[];
+  readonly summary: WorktreeTopologySummary;
+  readonly detail: string;
+  readonly captured_at_ns: number;
+  readonly schema_version: string;
+}
+
+export interface WorktreesListResponse extends Envelope {
+  readonly topology: WorktreeTopologyProjection;
+}
+
+export interface WorktreeDetailResponse extends Envelope {
+  readonly graph: WorktreeGraphProjection;
 }

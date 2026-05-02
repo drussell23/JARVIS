@@ -13,6 +13,8 @@ import {
   SUPPORTED_SCHEMA_VERSION,
   TaskDetailResponse,
   TaskListResponse,
+  WorktreeDetailResponse,
+  WorktreesListResponse,
   isSupportedSchema,
 } from './types';
 
@@ -84,6 +86,33 @@ export class ObservabilityClient {
     }
     return this.get<TaskDetailResponse>(
       `/observability/tasks/${encodeURIComponent(opId)}`,
+    );
+  }
+
+  // --- Gap #3 Slice 4 — worktree topology consumer ---------------------
+
+  public async worktreesList(): Promise<WorktreesListResponse> {
+    return this.get<WorktreesListResponse>(
+      '/observability/worktrees',
+    );
+  }
+
+  public async worktreeDetail(
+    graphId: string,
+  ): Promise<WorktreeDetailResponse> {
+    // Mirror of the agent-side _SESSION_ID_RE used for graph_id
+    // validation on the server (`tests/governance/test_ide_observability_worktrees.py`
+    // exercises this). Surface a fast 400 client-side instead of
+    // round-tripping a malformed id.
+    if (!/^[A-Za-z0-9_\-:.]{1,128}$/.test(graphId)) {
+      throw new ObservabilityError(
+        `malformed graph_id: ${graphId}`,
+        400,
+        'client.malformed_graph_id',
+      );
+    }
+    return this.get<WorktreeDetailResponse>(
+      `/observability/worktrees/${encodeURIComponent(graphId)}`,
     );
   }
 
