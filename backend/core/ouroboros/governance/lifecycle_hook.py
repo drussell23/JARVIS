@@ -88,25 +88,35 @@ LIFECYCLE_HOOK_SCHEMA_VERSION: str = "lifecycle_hook.1"
 
 
 def lifecycle_hooks_enabled() -> bool:
-    """``JARVIS_LIFECYCLE_HOOKS_ENABLED`` (default ``false`` until
-    Slice 5 graduation).
+    """``JARVIS_LIFECYCLE_HOOKS_ENABLED`` (default ``true`` —
+    graduated 2026-05-02 in Lifecycle Hook Registry Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
+    Asymmetric env semantics — empty/whitespace = unset = graduated
     default; explicit ``0``/``false``/``no``/``off`` evaluates false;
     explicit truthy values evaluate true. Re-read on every call so
     flips hot-revert without restart.
 
-    The default stays off through Slices 1-4 because graduating
-    before the orchestrator wire-up is live (Slice 4) would
-    register hooks but never fire them — operator-confusing.
-    Slice 5 flips the default after the full stack proves out
-    with combined sweep + e2e test.
+    Graduated default-true matches established Move 5 / Move 6 /
+    Priority #1-#5 / Priority #6 / InlinePromptGate / SBT-Probe
+    Escalation discipline:
+      * Slice 1 primitive (pure-stdlib) shipped 2026-05-02.
+      * Slice 2 sync registry shipped 2026-05-02.
+      * Slice 3 async executor shipped 2026-05-02.
+      * Slice 4 orchestrator bridge + PRE_APPLY wire-up shipped
+        2026-05-02.
+      * 197/197 combined sweep + 23 wire-up smoke tests passed.
+      * Two layers of fail-open by construction (Slice 3 FAILED-
+        is-non-blocking + Slice 4 bridge passed=True on crash):
+        a buggy hook substrate cannot block the orchestrator.
+      * No hooks registered today (operators add their own via
+        register_lifecycle_hooks(registry) module-owned contract);
+        graduation activates the SUBSTRATE, not any specific hook.
     """
     raw = os.environ.get(
         "JARVIS_LIFECYCLE_HOOKS_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -618,4 +628,248 @@ __all__ = [
     "lifecycle_hooks_enabled",
     "make_hook_result",
     "max_hooks_per_event",
+    "register_flags",
+    "register_shipped_invariants",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned FlagRegistry contribution (3 flags)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned :class:`FlagRegistry` registration. Discovered
+    automatically by ``flag_registry_seed._discover_module_provided_flags``.
+    Returns count registered."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[LifecycleHook] register_flags degraded: %s", exc,
+        )
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_LIFECYCLE_HOOKS_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/lifecycle_hook.py"
+            ),
+            example="JARVIS_LIFECYCLE_HOOKS_ENABLED=true",
+            description=(
+                "Master switch for the Lifecycle Hook Registry. "
+                "When on, operator-defined hooks fire on the 5 "
+                "phase boundaries (PRE_GENERATE / PRE_APPLY / "
+                "POST_APPLY / POST_VERIFY / ON_OPERATOR_ACTION). "
+                "Two layers of fail-open by construction protect "
+                "against buggy hooks blocking the autonomous loop. "
+                "Graduated default-true 2026-05-02 in Slice 5."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_LIFECYCLE_HOOKS_MAX_PER_EVENT",
+            type=FlagType.INT, default=16,
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/lifecycle_hook.py"
+            ),
+            example="JARVIS_LIFECYCLE_HOOKS_MAX_PER_EVENT=32",
+            description=(
+                "Defense cap on the number of hooks that can be "
+                "registered for ONE event. Prevents misconfigured "
+                "plugins from registering thousands. Floor 1, "
+                "ceiling 256, default 16."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_LIFECYCLE_HOOKS_DEFAULT_TIMEOUT_S",
+            type=FlagType.FLOAT, default=5.0,
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/lifecycle_hook.py"
+            ),
+            example="JARVIS_LIFECYCLE_HOOKS_DEFAULT_TIMEOUT_S=10",
+            description=(
+                "Per-hook wall-clock timeout default. Hooks should "
+                "be fast (notification / log / cheap policy check); "
+                "long-running side effects belong elsewhere. Slice 3 "
+                "executor enforces via asyncio.wait_for. Floor 0.1s, "
+                "ceiling 60s, default 5s."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[LifecycleHook] register_flags spec %s skipped: "
+                "%s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 1's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_pure_stdlib(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 1 stays pure-stdlib at hot path (registration-
+        contract exemption applies)."""
+        violations: list = []
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." in module or "governance" in module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
+                    violations.append(
+                        f"line {lineno}: Slice 1 must be pure-stdlib "
+                        f"— found {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"MUST NOT {node.func.id}()"
+                        )
+            if isinstance(node, _ast.AsyncFunctionDef):
+                violations.append(
+                    f"line {getattr(node, 'lineno', '?')}: Slice 1 "
+                    f"must remain sync — found async def {node.name!r}"
+                )
+        return tuple(violations)
+
+    def _validate_event_taxonomy_5_values(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Closed-taxonomy invariant: LifecycleEvent has exactly
+        5 values. New events require explicit Slice 4 wire-up."""
+        violations: list = []
+        required = {
+            "PRE_GENERATE", "PRE_APPLY", "POST_APPLY",
+            "POST_VERIFY", "ON_OPERATOR_ACTION",
+        }
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef):
+                if node.name == "LifecycleEvent":
+                    seen = set()
+                    for stmt in node.body:
+                        if isinstance(stmt, _ast.Assign):
+                            for tgt in stmt.targets:
+                                if isinstance(tgt, _ast.Name):
+                                    seen.add(tgt.id)
+                    missing = required - seen
+                    extras = seen - required
+                    if missing:
+                        violations.append(
+                            f"LifecycleEvent missing: {sorted(missing)}"
+                        )
+                    if extras:
+                        violations.append(
+                            f"LifecycleEvent unexpected values "
+                            f"(closed-taxonomy violation): "
+                            f"{sorted(extras)}"
+                        )
+        return tuple(violations)
+
+    def _validate_outcome_taxonomy_5_values(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Closed-taxonomy: HookOutcome has exactly 5 values."""
+        violations: list = []
+        required = {
+            "CONTINUE", "BLOCK", "WARN", "DISABLED", "FAILED",
+        }
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef):
+                if node.name == "HookOutcome":
+                    seen = set()
+                    for stmt in node.body:
+                        if isinstance(stmt, _ast.Assign):
+                            for tgt in stmt.targets:
+                                if isinstance(tgt, _ast.Name):
+                                    seen.add(tgt.id)
+                    missing = required - seen
+                    extras = seen - required
+                    if missing:
+                        violations.append(
+                            f"HookOutcome missing: {sorted(missing)}"
+                        )
+                    if extras:
+                        violations.append(
+                            f"HookOutcome unexpected values "
+                            f"(closed-taxonomy violation): "
+                            f"{sorted(extras)}"
+                        )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/lifecycle_hook.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_pure_stdlib",
+            target_file=target,
+            description=(
+                "Slice 1 primitive stays pure-stdlib at hot path "
+                "(no governance imports outside register_flags / "
+                "register_shipped_invariants, no async, no "
+                "exec/eval/compile)."
+            ),
+            validate=_validate_pure_stdlib,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_event_taxonomy_5_values",
+            target_file=target,
+            description=(
+                "LifecycleEvent is a 5-value closed taxonomy "
+                "(PRE_GENERATE / PRE_APPLY / POST_APPLY / "
+                "POST_VERIFY / ON_OPERATOR_ACTION). New events "
+                "require explicit Slice 4 wire-up."
+            ),
+            validate=_validate_event_taxonomy_5_values,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_outcome_taxonomy_5_values",
+            target_file=target,
+            description=(
+                "HookOutcome is a 5-value closed taxonomy "
+                "(CONTINUE / BLOCK / WARN / DISABLED / FAILED). "
+                "BLOCK is the only blocking outcome."
+            ),
+            validate=_validate_outcome_taxonomy_5_values,
+        ),
+    ]

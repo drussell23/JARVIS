@@ -406,4 +406,127 @@ __all__ = [
     "gate_post_verify",
     "gate_pre_apply",
     "gate_pre_generate",
+    "register_shipped_invariants",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 4's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_authority_allowlist(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 4 may import only Slice 1 + Slice 3."""
+        violations: list = []
+        allowed = {
+            "backend.core.ouroboros.governance.lifecycle_hook",
+            "backend.core.ouroboros.governance.lifecycle_hook_executor",
+        }
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        banned_substrings = (
+            "orchestrator", "phase_runner", "iron_gate",
+            "change_engine", "candidate_generator",
+            ".providers", "doubleword_provider", "urgency_router",
+            "auto_action_router", "subagent_scheduler",
+            "tool_executor", "semantic_guardian",
+            "semantic_firewall", "risk_engine",
+        )
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                for ban in banned_substrings:
+                    if ban in module:
+                        violations.append(
+                            f"line {lineno}: BANNED orchestrator-tier "
+                            f"substring {ban!r} in {module!r}"
+                        )
+                if "backend." in module or (
+                    "governance" in module and module
+                ):
+                    if module not in allowed:
+                        violations.append(
+                            f"line {lineno}: import outside Slice 4 "
+                            f"allowlist: {module!r}"
+                        )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    def _validate_fail_open_sentinel(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        """Critical safety property: Slice 4 bridge MUST stamp
+        ``_FAIL_OPEN_DETAIL_PREFIX`` on the gate result when the
+        bridge crashes (broken hook substrate cannot block the
+        autonomous loop)."""
+        violations: list = []
+        if "_FAIL_OPEN_DETAIL_PREFIX" not in source:
+            violations.append(
+                "bridge must define _FAIL_OPEN_DETAIL_PREFIX "
+                "sentinel for fail-open detail stamping"
+            )
+        if 'passed=True' not in source:
+            violations.append(
+                "bridge must contain a passed=True path "
+                "(fail-open philosophy)"
+            )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/"
+        "lifecycle_hook_orchestrator_bridge.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_bridge_authority_allowlist",
+            target_file=target,
+            description=(
+                "Slice 4 bridge imports stay within "
+                "{lifecycle_hook, lifecycle_hook_executor} (+ "
+                "registration-contract exemption). Banned: "
+                "orchestrator-tier."
+            ),
+            validate=_validate_authority_allowlist,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_bridge_fail_open",
+            target_file=target,
+            description=(
+                "Slice 4 bridge must implement fail-open: gate "
+                "returns passed=True with _FAIL_OPEN_DETAIL_PREFIX "
+                "sentinel on bridge crash. Critical safety "
+                "property — broken hook substrate cannot block."
+            ),
+            validate=_validate_fail_open_sentinel,
+        ),
+    ]

@@ -431,4 +431,131 @@ async def fire_hooks(
 __all__ = [
     "LIFECYCLE_HOOK_EXECUTOR_SCHEMA_VERSION",
     "fire_hooks",
+    "register_shipped_invariants",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 3's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_authority_allowlist(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 3 may import only Slice 1 + Slice 2."""
+        violations: list = []
+        allowed = {
+            "backend.core.ouroboros.governance.lifecycle_hook",
+            "backend.core.ouroboros.governance.lifecycle_hook_registry",
+        }
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        banned_substrings = (
+            "orchestrator", "phase_runner", "iron_gate",
+            "change_engine", "candidate_generator",
+            ".providers", "doubleword_provider", "urgency_router",
+            "auto_action_router", "subagent_scheduler",
+            "tool_executor", "semantic_guardian",
+            "semantic_firewall", "risk_engine",
+        )
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                for ban in banned_substrings:
+                    if ban in module:
+                        violations.append(
+                            f"line {lineno}: BANNED orchestrator-tier "
+                            f"substring {ban!r} in {module!r}"
+                        )
+                if "backend." in module or (
+                    "governance" in module and module
+                ):
+                    if module not in allowed:
+                        violations.append(
+                            f"line {lineno}: import outside Slice 3 "
+                            f"allowlist: {module!r}"
+                        )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    def _validate_fail_isolated_gather(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        """Critical safety property: Slice 3 executor MUST use
+        ``return_exceptions=True`` on its asyncio.gather call so
+        one cancelled/failed task doesn't cancel siblings. Drift
+        here would silently break fail-isolation."""
+        violations: list = []
+        if "return_exceptions=True" not in source:
+            violations.append(
+                "executor must use return_exceptions=True on "
+                "asyncio.gather (fail-isolation property)"
+            )
+        if "asyncio.gather" not in source:
+            violations.append(
+                "executor must use asyncio.gather for parallel "
+                "hook execution"
+            )
+        if "asyncio.wait_for" not in source:
+            violations.append(
+                "executor must use asyncio.wait_for for per-hook "
+                "timeout enforcement"
+            )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/lifecycle_hook_executor.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_executor_authority_allowlist",
+            target_file=target,
+            description=(
+                "Slice 3 executor imports stay within "
+                "{lifecycle_hook, lifecycle_hook_registry} (+ "
+                "registration-contract exemption). Banned: "
+                "orchestrator-tier."
+            ),
+            validate=_validate_authority_allowlist,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_executor_fail_isolated",
+            target_file=target,
+            description=(
+                "Slice 3 executor must use asyncio.gather with "
+                "return_exceptions=True (fail-isolation: one "
+                "cancelled/failed task doesn't cancel siblings) "
+                "AND asyncio.wait_for (per-hook timeout)."
+            ),
+            validate=_validate_fail_isolated_gather,
+        ),
+    ]

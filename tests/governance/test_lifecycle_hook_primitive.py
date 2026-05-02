@@ -419,19 +419,21 @@ class TestMakeHookResult:
 
 
 class TestMasterFlagSemantics:
-    def test_default_is_false_pre_graduation(self, monkeypatch):
+    def test_default_is_true_post_graduation(self, monkeypatch):
+        """Slice 5 (2026-05-02) graduated default-true."""
         monkeypatch.delenv(
             "JARVIS_LIFECYCLE_HOOKS_ENABLED", raising=False,
         )
-        assert lifecycle_hooks_enabled() is False
+        assert lifecycle_hooks_enabled() is True
 
-    def test_empty_string_is_default_false(self, monkeypatch):
+    def test_empty_string_is_default_true(self, monkeypatch):
+        """Asymmetric env semantics: empty = unset = graduated default."""
         monkeypatch.setenv("JARVIS_LIFECYCLE_HOOKS_ENABLED", "")
-        assert lifecycle_hooks_enabled() is False
+        assert lifecycle_hooks_enabled() is True
 
-    def test_whitespace_is_default_false(self, monkeypatch):
+    def test_whitespace_is_default_true(self, monkeypatch):
         monkeypatch.setenv("JARVIS_LIFECYCLE_HOOKS_ENABLED", "   ")
-        assert lifecycle_hooks_enabled() is False
+        assert lifecycle_hooks_enabled() is True
 
     @pytest.mark.parametrize(
         "truthy", ["1", "true", "yes", "on", "TRUE"],

@@ -582,7 +582,124 @@ __all__ = [
     "LifecycleHookCallable",
     "LifecycleHookRegistry",
     "LifecycleHookRegistryError",
+    "discover_and_register_default",
     "discover_module_provided_hooks",
     "get_default_registry",
+    "register_shipped_invariants",
     "reset_default_registry_for_tests",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Convenience boot helper
+# ---------------------------------------------------------------------------
+
+
+def discover_and_register_default() -> int:
+    """Convenience wrapper — calls
+    :func:`discover_module_provided_hooks` against the singleton
+    registry. Boot wire-up entry point. Returns count discovered.
+    NEVER raises (per discovery loop's defensive contract).
+
+    Idempotent across calls IF every module's
+    ``register_lifecycle_hooks`` is itself idempotent (most won't
+    be — first call registers, second raises DuplicateHookNameError
+    which the discovery loop swallows). Operators should call once
+    at orchestrator boot."""
+    try:
+        return discover_module_provided_hooks(get_default_registry())
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[LifecycleHookRegistry] discover_and_register_default "
+            "degraded: %s", exc,
+        )
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 2's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_authority_allowlist(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 2 may import only Slice 1 (lifecycle_hook).
+        Registration-contract exemption applies."""
+        violations: list = []
+        allowed = {
+            "backend.core.ouroboros.governance.lifecycle_hook",
+        }
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        banned_substrings = (
+            "orchestrator", "phase_runner", "iron_gate",
+            "change_engine", "candidate_generator",
+            ".providers", "doubleword_provider", "urgency_router",
+            "auto_action_router", "subagent_scheduler",
+            "tool_executor", "semantic_guardian",
+            "semantic_firewall", "risk_engine",
+        )
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                for ban in banned_substrings:
+                    if ban in module:
+                        violations.append(
+                            f"line {lineno}: BANNED orchestrator-tier "
+                            f"substring {ban!r} in {module!r}"
+                        )
+                if "backend." in module or (
+                    "governance" in module and module
+                ):
+                    if module not in allowed:
+                        violations.append(
+                            f"line {lineno}: import outside Slice 2 "
+                            f"allowlist: {module!r}"
+                        )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/lifecycle_hook_registry.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_registry_authority_allowlist",
+            target_file=target,
+            description=(
+                "Slice 2 registry imports stay within "
+                "{lifecycle_hook} (+ registration-contract "
+                "exemption). Banned: orchestrator-tier."
+            ),
+            validate=_validate_authority_allowlist,
+        ),
+    ]
