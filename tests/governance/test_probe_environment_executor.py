@@ -587,6 +587,9 @@ class TestAuthorityInvariants:
             "confidence_probe_runner",
             "confidence_monitor",  # for ConfidenceMonitor type
             "hypothesis_consumers",
+            # SBT-Probe Escalation Bridge (Slice 2, 2026-05-02) —
+            # adds the lazy-import escalation hook on EXHAUSTED.
+            "sbt_escalation_runner",
         )
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):

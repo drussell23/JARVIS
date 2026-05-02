@@ -84,6 +84,7 @@ safe default without invoking the runner — zero cost.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -242,6 +243,44 @@ async def execute_probe_environment(
         )
 
     if verdict.outcome is ProbeOutcome.EXHAUSTED:
+        # SBT-Probe Escalation Bridge Slice 2 (2026-05-02) — when
+        # probe was inconclusive, optionally escalate to a wider
+        # tree-shaped analysis. ``escalate_via_sbt`` returns None
+        # when escalation is NOT warranted (master flag off,
+        # budget exhausted, wrapper error) — in that case we fall
+        # through to the existing INCONCLUSIVE branch below.
+        # Backward-compat by construction: master flag default-FALSE
+        # through Slices 1-2 → escalation always returns None →
+        # behavior unchanged.
+        try:
+            from backend.core.ouroboros.governance.verification.sbt_escalation_runner import (
+                escalate_via_sbt,
+            )
+            # Compose target_descriptor from the ambiguity context's
+            # actual fields (target_symbol + claim), bounded for audit.
+            tgt_sym = str(
+                getattr(ambiguity_context, "target_symbol", "") or ""
+            )
+            claim = str(
+                getattr(ambiguity_context, "claim", "") or ""
+            )
+            target_descriptor = (f"{tgt_sym}|{claim}")[:200]
+            escalation_verdict = await escalate_via_sbt(
+                verdict,
+                op_id=op_id,
+                target_descriptor=target_descriptor,
+                ambiguity_kind="probe_exhausted",
+                confidence_prior=prior,
+            )
+            if escalation_verdict is not None:
+                return escalation_verdict
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[ProbeEnvironmentExecutor] sbt escalation degraded "
+                "(should not happen): %s", exc,
+            )
         return ConfidenceCollapseVerdict(
             action=ConfidenceCollapseAction.INCONCLUSIVE,
             confidence_posterior=prior,
