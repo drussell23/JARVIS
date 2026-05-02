@@ -116,17 +116,26 @@ def _build_router(tmp_path):
 
 
 class TestMasterFlag:
-    def test_default_off(self, monkeypatch):
+    def test_default_post_graduation_is_true(self, monkeypatch):
+        """Slice 5 graduation (2026-05-02): structurally safe by
+        construction (loopback + rate-limit + cage validator +
+        bounded body)."""
         monkeypatch.delenv(
             "JARVIS_IDE_POLICY_ROUTER_ENABLED", raising=False,
         )
-        assert ide_policy_router_enabled() is False
+        assert ide_policy_router_enabled() is True
 
     def test_explicit_true(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_IDE_POLICY_ROUTER_ENABLED", "true",
         )
         assert ide_policy_router_enabled() is True
+
+    def test_explicit_false_hot_revert(self, monkeypatch):
+        monkeypatch.setenv(
+            "JARVIS_IDE_POLICY_ROUTER_ENABLED", "false",
+        )
+        assert ide_policy_router_enabled() is False
 
     def test_garbage_value_treated_as_false(self, monkeypatch):
         monkeypatch.setenv(
@@ -170,8 +179,10 @@ class TestLoopbackBinding:
 
 class TestGate:
     def test_disabled_returns_403(self, monkeypatch, tmp_path):
-        monkeypatch.delenv(
-            "JARVIS_IDE_POLICY_ROUTER_ENABLED", raising=False,
+        # Hot-revert post-graduation: explicit ``=false`` reverts
+        # the panel surface to deny-by-default.
+        monkeypatch.setenv(
+            "JARVIS_IDE_POLICY_ROUTER_ENABLED", "false",
         )
         router, _, _ = _build_router(tmp_path)
         req = _make_request("/policy/confidence")
@@ -705,6 +716,7 @@ class TestAuthorityInvariants:
             "backend.core.ouroboros.governance.adaptation.ledger",
             "backend.core.ouroboros.governance.adaptation.confidence_threshold_tightener",
             "backend.core.ouroboros.governance.adaptation.adapted_confidence_loader",
+            "backend.core.ouroboros.governance.adaptation.yaml_writer",  # Slice 5 cage close
             "backend.core.ouroboros.governance.verification.confidence_policy",
             "backend.core.ouroboros.governance.verification.confidence_monitor",
             "backend.core.ouroboros.governance.ide_observability_stream",

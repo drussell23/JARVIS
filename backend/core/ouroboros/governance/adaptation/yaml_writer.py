@@ -429,10 +429,166 @@ def write_proposal_to_yaml(
     )
 
 
+# ---------------------------------------------------------------------------
+# Gap #2 Slice 5 — confidence-thresholds materialization
+# ---------------------------------------------------------------------------
+#
+# The five Pass C surfaces all use an "append-to-list" YAML schema
+# (latest-occurrence-wins per key). The Confidence-monitor surface
+# uses a SINGLE-DOCUMENT MAPPING schema (see
+# ``adapted_confidence_loader.AdaptedConfidenceThresholds``) — there
+# is one current adapted policy at any time, not a stack of historical
+# proposals. The Confidence loader reads ``thresholds.{floor,
+# window_k, approaching_factor, enforce}`` (a flat mapping), not a
+# list of entries.
+#
+# Rather than fork the per-surface schema map (which would force
+# every existing surface to add a "shape" discriminator field), we
+# ship a SIBLING entry point that REUSES ``_atomic_write_yaml`` +
+# the master flag + the provenance enrichment — a mapping write
+# alongside the list-append writes. Same atomicity, same flock,
+# same defensive contract.
+#
+# A successful write triggers Slice 4's ``confidence_policy_applied``
+# SSE event; the call is wired by ``ide_policy_router._handle_approve``
+# (best-effort — ledger approval succeeds even if YAML writer fails).
+
+
+def _confidence_yaml_path() -> Path:
+    """Resolve the adapted-confidence-thresholds YAML path. Mirrors
+    ``adapted_confidence_loader.adapted_thresholds_path`` so the
+    writer + loader agree by construction. Env-overridable via
+    ``JARVIS_ADAPTED_CONFIDENCE_THRESHOLDS_PATH``."""
+    raw = os.environ.get(
+        "JARVIS_ADAPTED_CONFIDENCE_THRESHOLDS_PATH",
+    )
+    if raw:
+        return Path(raw)
+    return Path(".jarvis") / "adapted_confidence_thresholds.yaml"
+
+
+def write_confidence_proposal_to_yaml(
+    proposal: AdaptationProposal,
+) -> WriteResult:
+    """Materialize an APPROVED Confidence-surface proposal's
+    ``proposed_state_payload`` into the live loader's adapted YAML.
+
+    Pre-checks (in order):
+      1. Master flag off → SKIPPED_MASTER_OFF
+      2. proposal.surface != CONFIDENCE_MONITOR_THRESHOLDS →
+         UNKNOWN_SURFACE (defensive — caller should dispatch by
+         surface).
+      3. proposal.operator_decision != APPROVED →
+         SKIPPED_NOT_APPROVED.
+      4. proposal.proposed_state_payload missing the ``proposed``
+         key → SKIPPED_NO_PAYLOAD.
+
+    On pass:
+      * Compose a single-document mapping
+        ``{schema_version: 1, proposal_id, approved_at,
+        approved_by, thresholds: {<knob>: <value> for each
+        non-baseline knob in payload['proposed']}}``.
+      * Atomic-rename write with cross-process flock (REUSES
+        ``_atomic_write_yaml`` from the existing list-append path).
+
+    Each call OVERWRITES the YAML file (single-document semantic).
+    The loader's tighten-only filter is the second-line defense
+    against any post-write hand-edit that loosens a value.
+
+    NEVER raises into the caller — every failure path returns a
+    structured WriteResult.
+    """
+    if not is_writer_enabled():
+        return WriteResult(
+            status=WriteStatus.SKIPPED_MASTER_OFF,
+            surface=(
+                proposal.surface.value
+                if hasattr(proposal, "surface") else None
+            ),
+        )
+    if proposal.surface is not (
+        AdaptationSurface.CONFIDENCE_MONITOR_THRESHOLDS
+    ):
+        return WriteResult(
+            status=WriteStatus.UNKNOWN_SURFACE,
+            surface=proposal.surface.value,
+            detail=(
+                "use write_proposal_to_yaml for non-confidence "
+                "surfaces"
+            ),
+        )
+    if proposal.operator_decision is not (
+        OperatorDecisionStatus.APPROVED
+    ):
+        return WriteResult(
+            status=WriteStatus.SKIPPED_NOT_APPROVED,
+            surface=proposal.surface.value,
+            detail=(
+                f"operator_decision="
+                f"{proposal.operator_decision.value}"
+            ),
+        )
+    payload = proposal.proposed_state_payload or {}
+    proposed = payload.get("proposed")
+    if not isinstance(proposed, dict) or not proposed:
+        return WriteResult(
+            status=WriteStatus.SKIPPED_NO_PAYLOAD,
+            surface=proposal.surface.value,
+            detail="payload['proposed'] missing or empty",
+        )
+
+    yaml_path = _confidence_yaml_path()
+
+    # Compose the mapping doc shape the loader expects. Only
+    # non-default knobs go into the materialized thresholds map —
+    # if the operator only moved `floor`, the YAML carries
+    # `thresholds: {floor: 0.10}` and the loader leaves the other
+    # three knobs at None (consumer falls through to baseline).
+    # Determining "non-default" requires knowing the baseline; we
+    # delegate that to the loader's per-knob filter at READ time
+    # by including every knob in the payload — the loader is
+    # authoritative on tighten-only.
+    thresholds_block: Dict[str, Any] = {}
+    for key in ("floor", "window_k", "approaching_factor", "enforce"):
+        if key in proposed:
+            thresholds_block[key] = proposed[key]
+
+    if not thresholds_block:
+        return WriteResult(
+            status=WriteStatus.SKIPPED_NO_PAYLOAD,
+            surface=proposal.surface.value,
+            detail="no recognized threshold keys in payload",
+        )
+
+    doc: Dict[str, Any] = {
+        "schema_version": 1,
+        "proposal_id": proposal.proposal_id,
+        "approved_at": proposal.operator_decision_at or "",
+        "approved_by": proposal.operator_decision_by or "",
+        "thresholds": thresholds_block,
+    }
+
+    ok, detail = _atomic_write_yaml(yaml_path, doc)
+    if not ok:
+        return WriteResult(
+            status=WriteStatus.WRITE_FAILED,
+            surface=proposal.surface.value,
+            yaml_path=str(yaml_path),
+            detail=detail,
+        )
+    return WriteResult(
+        status=WriteStatus.OK,
+        surface=proposal.surface.value,
+        yaml_path=str(yaml_path),
+        detail=f"thresholds_keys={sorted(thresholds_block.keys())}",
+    )
+
+
 __all__ = [
     "MAX_EXISTING_YAML_BYTES",
     "WriteResult",
     "WriteStatus",
     "is_writer_enabled",
+    "write_confidence_proposal_to_yaml",
     "write_proposal_to_yaml",
 ]

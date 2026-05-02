@@ -116,6 +116,7 @@ from backend.core.ouroboros.governance.ide_observability import (
     assert_loopback_only,
 )
 from backend.core.ouroboros.governance.ide_observability_stream import (
+    EVENT_TYPE_CONFIDENCE_POLICY_APPLIED,
     EVENT_TYPE_CONFIDENCE_POLICY_APPROVED,
     EVENT_TYPE_CONFIDENCE_POLICY_PROPOSED,
     EVENT_TYPE_CONFIDENCE_POLICY_REJECTED,
@@ -152,13 +153,24 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 
 def ide_policy_router_enabled() -> bool:
-    """``JARVIS_IDE_POLICY_ROUTER_ENABLED`` (default ``false`` until
-    Slice 5 graduation). When off, every route returns ``403``.
+    """``JARVIS_IDE_POLICY_ROUTER_ENABLED`` (default ``true`` —
+    graduated 2026-05-02 in Gap #2 Slice 5). Matches the
+    discipline of ``JARVIS_IDE_OBSERVABILITY_ENABLED`` (the read
+    surface): the write surface is structurally safe by
+    construction (loopback-only bind + per-IP rate limit + cage
+    validator + monotonic-tightening universal rule + bounded
+    body), so default-true is the correct posture for an IDE-
+    facing policy panel. Operator hot-reverts via explicit
+    ``=false``; on revert every route returns ``403``.
+
     NEVER raises."""
     try:
-        return os.environ.get(
+        raw = os.environ.get(
             "JARVIS_IDE_POLICY_ROUTER_ENABLED", "",
-        ).strip().lower() in _TRUTHY
+        ).strip().lower()
+        if raw == "":
+            return True  # graduated 2026-05-02
+        return raw in _TRUTHY
     except Exception:  # noqa: BLE001 — defensive
         return False
 
@@ -728,6 +740,48 @@ class IDEPolicyRouter:
             },
         )
 
+        # Slice 5 cage close: on APPROVED, materialize the
+        # tightening into the live loader's adapted YAML and emit
+        # confidence_policy_applied. Best-effort — the ledger
+        # transition is the source of truth; the YAML write is
+        # the activation step. A YAML write failure does NOT
+        # invalidate the approval (the operator has a
+        # decision-recorded approval; replay can re-materialize).
+        applied_payload: Dict[str, Any] = {
+            "operator": operator,
+            "yaml_path": "",
+            "write_status": "skipped",
+            "write_detail": "",
+        }
+        if target is OperatorDecisionStatus.APPROVED:
+            try:
+                proposal = self._lookup_approved_proposal(
+                    ledger, proposal_id,
+                )
+                if proposal is not None:
+                    write_result = self._materialize_to_yaml(proposal)
+                    applied_payload = {
+                        "operator": operator,
+                        "yaml_path": write_result.yaml_path or "",
+                        "write_status": write_result.status.value,
+                        "write_detail": write_result.detail[:240],
+                    }
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[IDEPolicyRouter] materialize raised: %s",
+                    exc,
+                )
+                applied_payload["write_status"] = "raised"
+                applied_payload["write_detail"] = (
+                    f"{type(exc).__name__}"
+                )
+
+            self._emit_sse(
+                EVENT_TYPE_CONFIDENCE_POLICY_APPLIED,
+                proposal_id,
+                applied_payload,
+            )
+
         return self._json_response(
             request, 200,
             {
@@ -735,8 +789,46 @@ class IDEPolicyRouter:
                 "proposal_id": proposal_id,
                 "operator_decision": target.value,
                 "operator": operator,
+                "applied": (
+                    applied_payload
+                    if target is OperatorDecisionStatus.APPROVED
+                    else None
+                ),
             },
         )
+
+    def _lookup_approved_proposal(
+        self, ledger: AdaptationLedger, proposal_id: str,
+    ) -> Any:
+        """Find the freshly-approved proposal in the ledger so the
+        YAML writer can materialize its payload. Best-effort —
+        returns ``None`` on any failure."""
+        try:
+            history = ledger.history(
+                surface=AdaptationSurface.CONFIDENCE_MONITOR_THRESHOLDS,
+                limit=200,
+            )
+            for p in history:
+                if p.proposal_id == proposal_id and (
+                    p.operator_decision
+                    is OperatorDecisionStatus.APPROVED
+                ):
+                    return p
+        except Exception:  # noqa: BLE001 — defensive
+            return None
+        return None
+
+    def _materialize_to_yaml(self, proposal: Any) -> Any:
+        """Lazy-import the writer so the router stays free of
+        YAML I/O at module-import time. Best-effort dispatch into
+        ``adaptation.yaml_writer.write_confidence_proposal_to_yaml``.
+
+        NEVER raises — the writer itself returns a structured
+        WriteResult on every code path."""
+        from backend.core.ouroboros.governance.adaptation.yaml_writer import (  # noqa: E501
+            write_confidence_proposal_to_yaml,
+        )
+        return write_confidence_proposal_to_yaml(proposal)
 
     async def _handle_snapshot(
         self, request: "web.Request",

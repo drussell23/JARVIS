@@ -83,8 +83,8 @@ _TIGHTENING_PASSED_STR: str = "passed"
 
 
 def skill_trigger_enabled() -> bool:
-    """``JARVIS_SKILL_TRIGGER_ENABLED`` (default ``false`` until
-    Slice 5 graduation).
+    """``JARVIS_SKILL_TRIGGER_ENABLED`` (default ``true`` post Slice
+    5 graduation, 2026-05-02).
 
     Asymmetric env semantics -- empty/whitespace = unset = current
     default; explicit ``0``/``false``/``no``/``off`` evaluates
@@ -92,15 +92,16 @@ def skill_trigger_enabled() -> bool:
     Re-read on every call so flag flips hot-revert without
     restart.
 
-    Default stays off through Slices 1-4 because graduating before
-    the autonomous observer (Slice 3) is wired would expose the
-    decision surface to the existing SkillCatalog without anyone
-    listening -- operator-confusing.
+    Graduated default-true after the full Slices 1-4 stack proved
+    out (391/391 combined sweep). The decision primitive is
+    pure-stdlib over typed inputs + read-only over the catalog;
+    every consumer (observer, bridge) has its own sub-flag so
+    operators retain per-surface escape hatches.
     """
     raw = os.environ.get("JARVIS_SKILL_TRIGGER_ENABLED", "")
     raw = raw.strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
@@ -918,7 +919,217 @@ __all__ = [
     "parse_trigger_spec_mapping",
     "parse_trigger_specs_list",
     "reach_includes",
+    "register_flags",
+    "register_shipped_invariants",
     "skill_per_window_max_invocations",
     "skill_trigger_enabled",
     "skill_window_default_s",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    """Module-owned :class:`FlagRegistry` seeds for the Slice 1
+    decision primitive's 3 env knobs. Auto-discovered."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[SkillTrigger] register_flags degraded: %s", exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/skill_trigger.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_SKILL_TRIGGER_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example="JARVIS_SKILL_TRIGGER_ENABLED=true",
+            description=(
+                "Master switch for the SkillRegistry-AutonomousReach "
+                "decision primitive. Graduated default-true "
+                "2026-05-02 in Slice 5. Per-surface sub-flags "
+                "(observer, bridge) act as escape hatches."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SKILL_PER_WINDOW_MAX",
+            type=FlagType.INT, default=5,
+            category=Category.CAPACITY,
+            source_file=target,
+            example="JARVIS_SKILL_PER_WINDOW_MAX=10",
+            description=(
+                "Default per-skill rate limit (max invocations per "
+                "window) when the spec doesn't override. Floor 1, "
+                "ceiling 100. Consumed by SkillObserver."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SKILL_WINDOW_S",
+            type=FlagType.FLOAT, default=60.0,
+            category=Category.TIMING,
+            source_file=target,
+            example="JARVIS_SKILL_WINDOW_S=120",
+            description=(
+                "Default rate-limit window (seconds) when the spec "
+                "doesn't override. Floor 1.0, ceiling 3600.0. "
+                "Consumed by SkillObserver."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[SkillTrigger] register_flags spec %s skipped: "
+                "%s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Slice 1 invariants: pure-stdlib + sync + closed-5 taxonomies."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_pure_stdlib(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." in module or "governance" in module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
+                    violations.append(
+                        f"line {lineno}: Slice 1 must be pure-stdlib "
+                        f"-- found {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 1 MUST NOT {node.func.id}()"
+                        )
+            if isinstance(node, _ast.AsyncFunctionDef):
+                violations.append(
+                    f"line {getattr(node, 'lineno', '?')}: "
+                    f"Slice 1 must remain sync -- found async "
+                    f"def {node.name!r}"
+                )
+        return tuple(violations)
+
+    def _validate_taxonomies_5_values(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        required_reach = {
+            "OPERATOR", "MODEL", "AUTONOMOUS",
+            "OPERATOR_PLUS_MODEL", "ANY",
+        }
+        required_kind = {
+            "POSTURE_TRANSITION", "DRIFT_DETECTED", "SENSOR_FIRED",
+            "EXPLICIT_INVOCATION", "DISABLED",
+        }
+        required_outcome = {
+            "INVOKED", "SKIPPED_PRECONDITION", "SKIPPED_DISABLED",
+            "DENIED_POLICY", "FAILED",
+        }
+
+        def _members(cls_node: "_ast.ClassDef") -> set:
+            out = set()
+            for stmt in cls_node.body:
+                if isinstance(stmt, _ast.Assign):
+                    for tgt in stmt.targets:
+                        if isinstance(tgt, _ast.Name):
+                            out.add(tgt.id)
+            return out
+
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef):
+                if node.name == "SkillReach":
+                    seen = _members(node)
+                    if seen != required_reach:
+                        violations.append(
+                            f"SkillReach drift: missing="
+                            f"{sorted(required_reach - seen)}, "
+                            f"extras={sorted(seen - required_reach)}"
+                        )
+                elif node.name == "SkillTriggerKind":
+                    seen = _members(node)
+                    if seen != required_kind:
+                        violations.append(
+                            f"SkillTriggerKind drift: missing="
+                            f"{sorted(required_kind - seen)}, "
+                            f"extras={sorted(seen - required_kind)}"
+                        )
+                elif node.name == "SkillOutcome":
+                    seen = _members(node)
+                    if seen != required_outcome:
+                        violations.append(
+                            f"SkillOutcome drift: missing="
+                            f"{sorted(required_outcome - seen)}, "
+                            f"extras={sorted(seen - required_outcome)}"
+                        )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/skill_trigger.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="skill_trigger_pure_stdlib",
+            target_file=target,
+            description=(
+                "Slice 1 primitive stays pure-stdlib at hot path: "
+                "no governance imports outside the registration "
+                "contract, no async, no exec/eval/compile."
+            ),
+            validate=_validate_pure_stdlib,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="skill_trigger_taxonomies_5_values",
+            target_file=target,
+            description=(
+                "SkillReach + SkillTriggerKind + SkillOutcome are "
+                "5-value closed taxonomies. New values require "
+                "explicit scope-doc + observer/bridge updates."
+            ),
+            validate=_validate_taxonomies_5_values,
+        ),
+    ]

@@ -105,8 +105,8 @@ SKILL_OBSERVER_SCHEMA_VERSION: str = "skill_observer.v1"
 
 
 def skill_observer_enabled() -> bool:
-    """``JARVIS_SKILL_OBSERVER_ENABLED`` (default ``false`` until
-    Slice 5 graduation).
+    """``JARVIS_SKILL_OBSERVER_ENABLED`` (default ``true`` post
+    Slice 5 graduation, 2026-05-02).
 
     Independent of the Slice 1 ``JARVIS_SKILL_TRIGGER_ENABLED``
     master flag; an operator may want the catalog/index live for
@@ -116,7 +116,7 @@ def skill_observer_enabled() -> bool:
     raw = os.environ.get("JARVIS_SKILL_OBSERVER_ENABLED", "")
     raw = raw.strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
@@ -762,6 +762,46 @@ class SkillObserver:
                 logger.debug(
                     "[SkillObserver] listener exception: %s", exc,
                 )
+        # Slice 5 graduation: best-effort SSE publish so operators
+        # see the full lifecycle (FIRED + every skip reason). Lazy
+        # import keeps the observer importable when the IDE
+        # observability stream module isn't available (test
+        # isolation, partial deployments). NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                publish_skill_invocation as _publish_skill_invocation,
+            )
+            _publish_skill_invocation(
+                qualified_name=decision.qualified_name,
+                triggered_by_kind=(
+                    decision.triggered_by_kind.value
+                    if decision.triggered_by_kind is not None
+                    else ""
+                ),
+                triggered_by_signal=decision.triggered_by_signal,
+                outcome=(
+                    decision.outcome.value
+                    if decision.outcome is not None else ""
+                ),
+                spec_index=decision.spec_index,
+                fired=decision.fired,
+                skip_reason=decision.skip_reason,
+                invocation_ok=(
+                    decision.invocation_outcome.ok
+                    if decision.invocation_outcome is not None
+                    else None
+                ),
+                invocation_duration_ms=(
+                    decision.invocation_outcome.duration_ms
+                    if decision.invocation_outcome is not None
+                    else None
+                ),
+                decided_at_monotonic=decision.decided_at_monotonic,
+            )
+        except Exception as exc:  # noqa: BLE001 -- best-effort
+            logger.debug(
+                "[SkillObserver] SSE publish degraded: %s", exc,
+            )
 
     # ---------------- observability snapshots -------------------------
 
@@ -836,8 +876,178 @@ __all__ = [
     "SkillObserver",
     "SkillObserverDecision",
     "get_default_observer",
+    "register_flags",
+    "register_shipped_invariants",
     "reset_default_observer",
     "skill_dedup_ttl_s",
     "skill_observer_concurrency",
     "skill_observer_enabled",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 -- Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[SkillObserver] register_flags degraded: %s", exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/skill_observer.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_SKILL_OBSERVER_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example="JARVIS_SKILL_OBSERVER_ENABLED=true",
+            description=(
+                "Master switch for the SkillObserver async fire "
+                "loop. Independent of JARVIS_SKILL_TRIGGER_ENABLED. "
+                "Graduated default-true 2026-05-02 in Slice 5."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SKILL_OBSERVER_CONCURRENCY",
+            type=FlagType.INT, default=4,
+            category=Category.CAPACITY,
+            source_file=target,
+            example="JARVIS_SKILL_OBSERVER_CONCURRENCY=8",
+            description=(
+                "asyncio.Semaphore cap for simultaneous in-flight "
+                "skill invocations. Floor 1, ceiling 32."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SKILL_DEDUP_TTL_S",
+            type=FlagType.FLOAT, default=300.0,
+            category=Category.TIMING,
+            source_file=target,
+            example="JARVIS_SKILL_DEDUP_TTL_S=600",
+            description=(
+                "TTL for the dedup-key cache. Floor 1.0, ceiling "
+                "3600.0. Only used when a spec opts into dedup via "
+                "spec.dedup_key_template."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[SkillObserver] register_flags spec %s skipped: "
+                "%s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 -- Module-owned shipped_code_invariants
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Slice 3 invariants: authority allowlist (Slice 1 + Slice 2 +
+    additive observability) + bounded-concurrency contract."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    _ALLOWED = {
+        "skill_trigger",       # Slice 1 primitive
+        "skill_catalog",       # Slice 2 narrowing index
+        "skill_manifest",      # Slice 1 additive fields
+        # Additive observability (Slice 5 SSE publish + module-owned
+        # registration). Never reached on the hot fire path.
+        "ide_observability_stream",
+        "flag_registry",
+        "shipped_code_invariants",
+    }
+    _FORBIDDEN = {
+        "orchestrator", "phase_runner", "iron_gate",
+        "change_engine", "candidate_generator", "providers",
+        "doubleword_provider", "urgency_router",
+        "auto_action_router", "subagent_scheduler",
+        "tool_executor", "semantic_guardian",
+        "semantic_firewall", "risk_engine",
+    }
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." not in module and "governance" not in module:
+                    continue
+                tail = module.rsplit(".", 1)[-1]
+                if tail in _FORBIDDEN:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"forbidden module {module!r}"
+                    )
+                elif tail not in _ALLOWED:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"unexpected governance import {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 3 MUST NOT {node.func.id}()"
+                        )
+        # Bounded-concurrency contract: SkillObserver MUST hold a
+        # semaphore attribute (renamed = drift signal).
+        for node in _ast.walk(tree):
+            if (
+                isinstance(node, _ast.ClassDef)
+                and node.name == "SkillObserver"
+            ):
+                src_section = source[
+                    getattr(node, "col_offset", 0):
+                    getattr(node, "end_col_offset", 0) + 50000
+                ] if False else source
+                if "asyncio.Semaphore(" not in src_section:
+                    violations.append(
+                        "SkillObserver missing asyncio.Semaphore "
+                        "(bounded-concurrency contract)"
+                    )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/skill_observer.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="skill_observer_authority",
+            target_file=target,
+            description=(
+                "Slice 3 observer authority: imports only "
+                "skill_trigger / skill_catalog / skill_manifest + "
+                "additive observability (ide_observability_stream / "
+                "flag_registry / shipped_code_invariants). Bounded "
+                "concurrency via asyncio.Semaphore. No "
+                "exec/eval/compile."
+            ),
+            validate=_validate,
+        ),
+    ]

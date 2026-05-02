@@ -75,17 +75,25 @@ def _enable(monkeypatch, yaml_path: Path = None):
 
 
 class TestMasterFlagAndPath:
-    def test_default_off(self, monkeypatch):
+    def test_default_post_graduation_is_true(self, monkeypatch):
+        """Slice 5 graduation (2026-05-02): tighten-only filter
+        makes the loader structurally safe to enable by default."""
         monkeypatch.delenv(
             "JARVIS_CONFIDENCE_LOAD_ADAPTED", raising=False,
         )
-        assert is_loader_enabled() is False
+        assert is_loader_enabled() is True
 
     def test_explicit_true(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_CONFIDENCE_LOAD_ADAPTED", "true",
         )
         assert is_loader_enabled() is True
+
+    def test_explicit_false_hot_revert(self, monkeypatch):
+        monkeypatch.setenv(
+            "JARVIS_CONFIDENCE_LOAD_ADAPTED", "false",
+        )
+        assert is_loader_enabled() is False
 
     def test_garbage_value_treated_as_false(self, monkeypatch):
         monkeypatch.setenv(
@@ -119,11 +127,15 @@ class TestMasterFlagAndPath:
 # ============================================================================
 
 
-class TestDefaultOff:
+class TestExplicitlyDisabled:
+    """When the operator hot-reverts the loader, every accessor
+    returns None and the loaded record is empty — pre-Slice-3
+    behavior is byte-identical regardless of YAML state."""
+
     @pytest.fixture(autouse=True)
     def _disable(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_CONFIDENCE_LOAD_ADAPTED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CONFIDENCE_LOAD_ADAPTED", "false",
         )
 
     def test_load_returns_empty(self):
@@ -437,8 +449,10 @@ class TestPrecedenceIntegration:
             confidence_floor,
         )
         monkeypatch.delenv("JARVIS_CONFIDENCE_FLOOR", raising=False)
-        monkeypatch.delenv(
-            "JARVIS_CONFIDENCE_LOAD_ADAPTED", raising=False,
+        # Loader graduated default-true; explicitly disable to
+        # exercise the fall-through-to-hardcoded-default path.
+        monkeypatch.setenv(
+            "JARVIS_CONFIDENCE_LOAD_ADAPTED", "false",
         )
         assert confidence_floor() == 0.05  # hardcoded default
 

@@ -207,17 +207,17 @@ class TestResultProperties:
 
 
 class TestMasterFlag:
-    def test_default_false_pre_graduation(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
         monkeypatch.delenv("JARVIS_SKILL_TRIGGER_ENABLED", raising=False)
-        assert skill_trigger_enabled() is False
+        assert skill_trigger_enabled() is True
 
     def test_empty_string_is_default(self, monkeypatch):
         monkeypatch.setenv("JARVIS_SKILL_TRIGGER_ENABLED", "")
-        assert skill_trigger_enabled() is False
+        assert skill_trigger_enabled() is True
 
     def test_whitespace_is_default(self, monkeypatch):
         monkeypatch.setenv("JARVIS_SKILL_TRIGGER_ENABLED", "   ")
-        assert skill_trigger_enabled() is False
+        assert skill_trigger_enabled() is True
 
     @pytest.mark.parametrize(
         "raw", ["1", "true", "TRUE", "yes", "On", "ON"],
@@ -510,7 +510,9 @@ class TestComputeShouldFire_MasterGate:
         assert out.skill_name == "x"
 
     def test_disabled_via_env(self, monkeypatch):
-        monkeypatch.delenv("JARVIS_SKILL_TRIGGER_ENABLED", raising=False)
+        # Post-graduation default is true; operator escape hatch
+        # is explicit "false".
+        monkeypatch.setenv("JARVIS_SKILL_TRIGGER_ENABLED", "false")
         m = _make_manifest()
         out = compute_should_fire(m, _autonomous_invocation())
         assert out.outcome is SkillOutcome.SKIPPED_DISABLED
@@ -910,14 +912,32 @@ class TestAuthorityInvariants:
     def test_pure_stdlib_no_governance_imports(self):
         source = self._source()
         tree = ast.parse(source)
+        # Slice 5 graduation -- module-owned register_flags +
+        # register_shipped_invariants are the registration
+        # contract; their lazy imports of flag_registry +
+        # shipped_code_invariants are exempt (never reached on
+        # the hot path).
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 module = node.module or ""
                 if "backend." in module or "governance" in module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
                     raise AssertionError(
                         f"Slice 1 must be pure-stdlib -- found "
                         f"governance import {module!r} at line "
-                        f"{getattr(node, 'lineno', '?')}"
+                        f"{lineno}"
                     )
 
     def test_no_async_def_in_module(self):

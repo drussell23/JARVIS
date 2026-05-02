@@ -100,19 +100,19 @@ SKILL_TOOL_PREFIX: str = "skill__"
 
 
 def bridge_enabled() -> bool:
-    """``JARVIS_SKILL_VENOM_BRIDGE_ENABLED`` (default ``false``
-    until Slice 5 graduation).
+    """``JARVIS_SKILL_VENOM_BRIDGE_ENABLED`` (default ``true`` post
+    Slice 5 graduation, 2026-05-02).
 
     Independent of the Slice 1 ``JARVIS_SKILL_TRIGGER_ENABLED``
     master flag -- an operator may want autonomous skills firing
-    via the observer without exposing them to the model. Slice 5
-    flips this default to ``true`` after the full stack proves out.
+    via the observer without exposing them to the model, or
+    vice-versa. Each surface keeps its own escape hatch.
     """
     raw = os.environ.get(
         "JARVIS_SKILL_VENOM_BRIDGE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
@@ -453,6 +453,146 @@ __all__ = [
     "manifest_to_tool_manifest_dict",
     "model_reach_includes_model",
     "qualified_name_to_tool_name",
+    "register_flags",
+    "register_shipped_invariants",
     "render_skill_tool_block",
     "tool_name_to_qualified_name",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 -- Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[SkillVenomBridge] register_flags degraded: %s", exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/skill_venom_bridge.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_SKILL_VENOM_BRIDGE_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example="JARVIS_SKILL_VENOM_BRIDGE_ENABLED=true",
+            description=(
+                "Wire-up sub-flag for the Venom tool-surface "
+                "bridge. Independent of "
+                "JARVIS_SKILL_TRIGGER_ENABLED. Graduated default-"
+                "true 2026-05-02 in Slice 5. When off, skill__* "
+                "tool calls fall through to the existing unknown-"
+                "tool DENY."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SKILL_VENOM_PROMPT_MAX_CHARS",
+            type=FlagType.INT, default=4000,
+            category=Category.CAPACITY,
+            source_file=target,
+            example="JARVIS_SKILL_VENOM_PROMPT_MAX_CHARS=8000",
+            description=(
+                "Char cap for the markdown prompt block listing "
+                "model-reach skills. Floor 200, ceiling 16000."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[SkillVenomBridge] register_flags spec %s "
+                "skipped: %s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 -- Module-owned shipped_code_invariants
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Slice 4 invariants: authority allowlist + dispatch tuple
+    return shape (no ToolResult import => no circular dep)."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    _ALLOWED = {
+        "skill_trigger", "skill_catalog", "skill_manifest",
+        "flag_registry", "shipped_code_invariants",
+    }
+    _FORBIDDEN = {
+        "tool_executor",  # bridge MUST NOT import tool_executor
+        "orchestrator", "phase_runner", "iron_gate",
+        "change_engine", "candidate_generator", "providers",
+        "doubleword_provider", "urgency_router",
+        "auto_action_router", "subagent_scheduler",
+        "semantic_guardian", "semantic_firewall", "risk_engine",
+    }
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." not in module and "governance" not in module:
+                    continue
+                tail = module.rsplit(".", 1)[-1]
+                if tail in _FORBIDDEN:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"forbidden module {module!r}"
+                    )
+                elif tail not in _ALLOWED:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"unexpected governance import {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 4 MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/skill_venom_bridge.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="skill_venom_bridge_authority",
+            target_file=target,
+            description=(
+                "Slice 4 bridge authority: imports only "
+                "skill_trigger / skill_catalog / skill_manifest + "
+                "the registration contract (flag_registry / "
+                "shipped_code_invariants). MUST NOT import "
+                "tool_executor (zero circular-dep contract via the "
+                "(ok, output, error) tuple return). No "
+                "exec/eval/compile."
+            ),
+            validate=_validate,
+        ),
+    ]

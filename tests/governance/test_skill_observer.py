@@ -227,15 +227,15 @@ def invoker():
 
 
 class TestObserverFlag:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
         monkeypatch.delenv(
             "JARVIS_SKILL_OBSERVER_ENABLED", raising=False,
         )
-        assert skill_observer_enabled() is False
+        assert skill_observer_enabled() is True
 
-    def test_empty_is_default_false(self, monkeypatch):
+    def test_empty_is_default_true(self, monkeypatch):
         monkeypatch.setenv("JARVIS_SKILL_OBSERVER_ENABLED", "")
-        assert skill_observer_enabled() is False
+        assert skill_observer_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "yes", "ON"])
     def test_truthy_enables(self, monkeypatch, raw):
@@ -310,10 +310,9 @@ class TestLifecycle:
     async def test_start_short_circuits_when_disabled(
         self, monkeypatch, catalog, bus, invoker,
     ):
-        # Master observer flag explicitly OFF
-        monkeypatch.delenv(
-            "JARVIS_SKILL_OBSERVER_ENABLED", raising=False,
-        )
+        # Master observer flag explicitly OFF (post-graduation
+        # default is true; operator escape hatch is "false").
+        monkeypatch.setenv("JARVIS_SKILL_OBSERVER_ENABLED", "false")
         catalog.register(
             _build_manifest(name="a", trigger_specs=[
                 {"kind": "sensor_fired",

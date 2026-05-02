@@ -135,13 +135,22 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 
 def is_loader_enabled() -> bool:
-    """``JARVIS_CONFIDENCE_LOAD_ADAPTED`` (default ``false`` until
-    Slice 5 graduation). Empty / unset / whitespace = default.
-    NEVER raises."""
+    """``JARVIS_CONFIDENCE_LOAD_ADAPTED`` (default ``true`` —
+    graduated 2026-05-02 in Gap #2 Slice 5). The loader is
+    structurally safe to enable by default: the per-knob
+    tighten-only filter (defense-in-depth) drops any value that
+    would loosen the gate vs. the hardcoded baseline, so an
+    adapted YAML hand-edited to malicious values cannot weaken
+    the gate. Operator hot-reverts via explicit ``=false``.
+
+    Empty / unset / whitespace = graduated default. NEVER raises."""
     try:
-        return os.environ.get(
+        raw = os.environ.get(
             "JARVIS_CONFIDENCE_LOAD_ADAPTED", "",
-        ).strip().lower() in _TRUTHY
+        ).strip().lower()
+        if raw == "":
+            return True  # graduated 2026-05-02
+        return raw in _TRUTHY
     except Exception:  # noqa: BLE001 — defensive
         return False
 

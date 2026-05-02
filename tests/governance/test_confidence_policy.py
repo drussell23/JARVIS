@@ -70,12 +70,14 @@ ConfidencePolicy._replace_via_dict = _replace_via_dict  # type: ignore[attr-defi
 
 
 class TestMasterFlag:
-    def test_default_off(self, monkeypatch):
-        """Slice 1 lands default-off until Slice 5 graduation."""
+    def test_default_post_graduation_is_true(self, monkeypatch):
+        """Slice 5 graduation (2026-05-02): substrate is read-only,
+        needed by every consumer, default-true is structurally
+        safe."""
         monkeypatch.delenv(
             "JARVIS_CONFIDENCE_POLICY_ENABLED", raising=False,
         )
-        assert confidence_policy_enabled() is False
+        assert confidence_policy_enabled() is True
 
     def test_explicit_true(self, monkeypatch):
         monkeypatch.setenv(
@@ -83,11 +85,20 @@ class TestMasterFlag:
         )
         assert confidence_policy_enabled() is True
 
-    def test_whitespace_unset_treated_as_default(self, monkeypatch):
+    def test_explicit_false_hot_revert(self, monkeypatch):
+        """Operator hot-revert: explicit ``=false`` returns False."""
+        monkeypatch.setenv(
+            "JARVIS_CONFIDENCE_POLICY_ENABLED", "false",
+        )
+        assert confidence_policy_enabled() is False
+
+    def test_whitespace_unset_uses_graduated_default(
+        self, monkeypatch,
+    ):
         monkeypatch.setenv(
             "JARVIS_CONFIDENCE_POLICY_ENABLED", "   ",
         )
-        assert confidence_policy_enabled() is False
+        assert confidence_policy_enabled() is True
 
     def test_garbage_value_treated_as_false(self, monkeypatch):
         monkeypatch.setenv(
@@ -96,8 +107,10 @@ class TestMasterFlag:
         assert confidence_policy_enabled() is False
 
     def test_disabled_short_circuit_outcome(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_CONFIDENCE_POLICY_ENABLED", raising=False,
+        """When operator hot-reverts the substrate, compute_policy_diff
+        returns DISABLED regardless of inputs."""
+        monkeypatch.setenv(
+            "JARVIS_CONFIDENCE_POLICY_ENABLED", "false",
         )
         diff = compute_policy_diff(
             current=_baseline(),

@@ -189,6 +189,13 @@ EVENT_TYPE_SESSION_UNPINNED = "session_unpinned"
 # no authority surface.
 EVENT_TYPE_PLAN_FALSIFICATION_VERDICT = "plan_falsification_verdict"
 
+# SkillRegistry-AutonomousReach Slice 5 — observer fire decision.
+# SkillObserver publishes one frame per (skill, signal) evaluation
+# so operators see both FIRED + every skip reason (decision /
+# rate_limit_exhausted / dedup_hit / invoker_raised). Read-only;
+# no authority surface.
+EVENT_TYPE_SKILL_INVOKED = "skill_invoked"
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -1491,6 +1498,59 @@ def publish_plan_falsification_verdict(
     except Exception:  # noqa: BLE001 — best-effort
         logger.debug(
             "[Stream] publish_plan_falsification_verdict exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_skill_invocation(
+    *,
+    qualified_name: str,
+    triggered_by_kind: str,
+    triggered_by_signal: str,
+    outcome: str,
+    spec_index: Optional[int] = None,
+    fired: bool = False,
+    skip_reason: str = "",
+    invocation_ok: Optional[bool] = None,
+    invocation_duration_ms: Optional[float] = None,
+    decided_at_monotonic: float = 0.0,
+) -> Optional[str]:
+    """Best-effort publisher for skill_invoked frames.
+
+    Returns the event_id on success, None when stream is disabled
+    / broker missing / publish raised. NEVER raises. Fired by
+    SkillObserver on every fire-or-skip evaluation so operators
+    see the full lifecycle (FIRED + every skip reason from the
+    closed-4 SKIP_REASON vocabulary -- decision /
+    rate_limit_exhausted / dedup_hit / invoker_raised).
+
+    Read-only payload -- no authority surface."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_SKILL_INVOKED, qualified_name or "unknown",
+            {
+                "qualified_name": str(qualified_name),
+                "triggered_by_kind": str(triggered_by_kind),
+                "triggered_by_signal": str(
+                    triggered_by_signal or "",
+                )[:200],
+                "outcome": str(outcome),
+                "spec_index": spec_index,
+                "fired": bool(fired),
+                "skip_reason": str(skip_reason or "")[:200],
+                "invocation_ok": invocation_ok,
+                "invocation_duration_ms": invocation_duration_ms,
+                "decided_at_monotonic": float(
+                    decided_at_monotonic or 0.0,
+                ),
+            },
+        )
+    except Exception:  # noqa: BLE001 -- best-effort
+        logger.debug(
+            "[Stream] publish_skill_invocation exception",
             exc_info=True,
         )
         return None

@@ -131,15 +131,15 @@ class TestConstants:
 
 
 class TestBridgeFlag:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
         monkeypatch.delenv(
             "JARVIS_SKILL_VENOM_BRIDGE_ENABLED", raising=False,
         )
-        assert bridge_enabled() is False
+        assert bridge_enabled() is True
 
     def test_empty_is_default(self, monkeypatch):
         monkeypatch.setenv("JARVIS_SKILL_VENOM_BRIDGE_ENABLED", "")
-        assert bridge_enabled() is False
+        assert bridge_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "On", "YES"])
     def test_truthy(self, monkeypatch, raw):
@@ -482,9 +482,9 @@ class TestDispatchSkillTool:
     async def test_disabled_returns_error(
         self, monkeypatch, catalog,
     ):
-        monkeypatch.delenv(
-            "JARVIS_SKILL_VENOM_BRIDGE_ENABLED", raising=False,
-        )
+        # Post-graduation default is true; operator escape hatch
+        # is explicit "false".
+        monkeypatch.setenv("JARVIS_SKILL_VENOM_BRIDGE_ENABLED", "false")
         invoker = _StubInvoker()
         ok, output, error = await dispatch_skill_tool(
             "skill__x", {}, catalog=catalog, invoker=invoker,
@@ -642,9 +642,10 @@ class TestPolicyGate:
     ):
         """When bridge sub-flag is OFF, skill__* must NOT pass
         the second-stage allow check -- it falls through to the
-        end of the policy chain."""
-        monkeypatch.delenv(
-            "JARVIS_SKILL_VENOM_BRIDGE_ENABLED", raising=False,
+        end of the policy chain. (Post-graduation default is
+        true; operator escape hatch is explicit "false".)"""
+        monkeypatch.setenv(
+            "JARVIS_SKILL_VENOM_BRIDGE_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.skill_catalog import (
             get_default_catalog,

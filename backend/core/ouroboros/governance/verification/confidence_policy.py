@@ -123,16 +123,22 @@ CONFIDENCE_POLICY_SCHEMA_VERSION: str = "confidence_policy.1"
 
 
 def confidence_policy_enabled() -> bool:
-    """``JARVIS_CONFIDENCE_POLICY_ENABLED`` (default ``false`` until
-    Slice 5). Empty / unset / whitespace = default. Truthy =
-    ``1``/``true``/``yes``/``on`` (case-insensitive). Anything else
-    = false. NEVER raises."""
+    """``JARVIS_CONFIDENCE_POLICY_ENABLED`` (default ``true`` —
+    graduated 2026-05-02 in Gap #2 Slice 5). The substrate is
+    read-only over policies and is needed by every consumer
+    (Slice 2 validator, Slice 4 HTTP router); graduating to
+    default-true preserves invariants and lets consumers
+    function. Operator hot-reverts via explicit ``=false``.
+
+    Empty / unset / whitespace = graduated default. Truthy =
+    ``1``/``true``/``yes``/``on`` (case-insensitive). Anything
+    else = false. NEVER raises."""
     try:
         raw = os.environ.get(
             "JARVIS_CONFIDENCE_POLICY_ENABLED", "",
         ).strip().lower()
         if raw == "":
-            return False
+            return True  # graduated 2026-05-02
         return raw in ("1", "true", "yes", "on")
     except Exception:  # noqa: BLE001 — defensive
         return False
@@ -701,3 +707,80 @@ __all__ = [
     "compute_policy_diff",
     "confidence_policy_enabled",
 ]
+
+
+def register_shipped_invariants() -> list:
+    """Slice 5 cage close — module-owned shipped-code invariant for
+    the Confidence-policy substrate surface (Gap #2 Slice 1).
+
+    Pinned guarantees:
+      * Both closed enums (Kind + Outcome) preserve their full
+        5-value vocabulary.
+      * ``compute_policy_diff`` + ``ConfidencePolicy`` +
+        ``PolicyDiff`` remain exported (consumed by Slice 2
+        validator + Slice 4 router).
+      * ``MonotonicTighteningVerdict`` import preserved so verdict
+        canonical strings stay aligned with the universal cage.
+      * Master flag name canonical.
+
+    NEVER raises. Discovery loop catches exceptions."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_substrate_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("ConfidencePolicy",
+             "Slice 1 frozen dataclass must remain exported"),
+            ("ConfidencePolicyKind",
+             "Slice 1 5-value Kind enum must remain"),
+            ("ConfidencePolicyOutcome",
+             "Slice 1 5-value Outcome enum must remain"),
+            ("PolicyDiff",
+             "Slice 1 frozen diff record must remain"),
+            ("compute_policy_diff",
+             "Slice 1 total decision function must remain"),
+            ("MonotonicTighteningVerdict",
+             "verdict canonical-string import must remain"),
+            ("JARVIS_CONFIDENCE_POLICY_ENABLED",
+             "master flag name canonical"),
+            ("RAISE_FLOOR",
+             "Kind enum must include RAISE_FLOOR"),
+            ("SHRINK_WINDOW",
+             "Kind enum must include SHRINK_WINDOW"),
+            ("WIDEN_APPROACHING",
+             "Kind enum must include WIDEN_APPROACHING"),
+            ("ENABLE_ENFORCE",
+             "Kind enum must include ENABLE_ENFORCE"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"confidence_policy substrate dropped "
+                    f"{symbol!r} — {reason}"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="gap2_confidence_policy_substrate",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "confidence_policy.py"
+            ),
+            description=(
+                "Gap #2 Slice 1 substrate: closed-taxonomy Kind + "
+                "Outcome enums (5 values each), compute_policy_diff "
+                "total function, frozen ConfidencePolicy + PolicyDiff "
+                "records, MonotonicTighteningVerdict canonical-string "
+                "import. Catches refactor that drops the substrate "
+                "surface Slice 2's validator and Slice 4's HTTP "
+                "router both depend on."
+            ),
+            validate=_validate_substrate_surface,
+        ),
+    ]

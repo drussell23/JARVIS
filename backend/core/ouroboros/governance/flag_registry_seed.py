@@ -2481,6 +2481,97 @@ SEED_SPECS: list = [
         example="1000",
         since="Priority #5 Slice 5",
     ),
+    # ====================================================================
+    # Deep Observability Gap #2 — Confidence Threshold Tuner (5 flags)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_POLICY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Substrate master for the Confidence Threshold Tuner "
+            "arc (Gap #2 Slice 1). Read-only over policies; needed "
+            "by every consumer (Slice 2 validator, Slice 4 router). "
+            "Graduated default-true 2026-05-02 (Slice 5)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "confidence_policy.py"
+        ),
+        example="true",
+        since="Gap #2 Slice 1 (graduated Slice 5)",
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_LOAD_ADAPTED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 3 boot-time YAML loader master. When on, "
+            "ConfidenceMonitor accessors consult the loader for "
+            "operator-approved tightenings when env unset (env "
+            "explicit > adapted YAML > hardcoded default). The "
+            "tighten-only filter is structurally safe by "
+            "construction. Graduated default-true 2026-05-02 "
+            "(Slice 5)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/"
+            "adapted_confidence_loader.py"
+        ),
+        example="true",
+        since="Gap #2 Slice 3 (graduated Slice 5)",
+    ),
+    FlagSpec(
+        name="JARVIS_IDE_POLICY_ROUTER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Slice 4 HTTP write authority surface (POST "
+            "/policy/confidence/proposals + approve + reject + GET "
+            "/policy/confidence). Loopback-only + per-IP "
+            "rate-limited + cage-validator-gated. Mirror of "
+            "JARVIS_IDE_OBSERVABILITY_ENABLED discipline. "
+            "Graduated default-true 2026-05-02 (Slice 5)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/ide_policy_router.py"
+        ),
+        example="true",
+        since="Gap #2 Slice 4 (graduated Slice 5)",
+    ),
+    FlagSpec(
+        name="JARVIS_CONFIDENCE_THRESHOLD_OBSERVATION_FLOOR",
+        type=FlagType.INT, default=3,
+        description=(
+            "Minimum number of supporting observations a "
+            "confidence-policy proposal MUST cite in "
+            "evidence.observation_count to clear the surface "
+            "validator (Slice 2). Operator-tunable; stricter "
+            "(higher) requires more evidence per proposal."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/adaptation/"
+            "confidence_threshold_tightener.py"
+        ),
+        example="3",
+        since="Gap #2 Slice 2",
+    ),
+    FlagSpec(
+        name="JARVIS_IDE_POLICY_ROUTER_RATE_LIMIT_PER_MIN",
+        type=FlagType.INT, default=30,
+        description=(
+            "Max writes / minute / client key on the policy router. "
+            "Lower than the read surface's 120/min by design (writes "
+            "are more consequential)."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/ide_policy_router.py"
+        ),
+        example="30",
+        since="Gap #2 Slice 4",
+    ),
 ]
 
 
