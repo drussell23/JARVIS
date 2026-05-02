@@ -2354,6 +2354,133 @@ SEED_SPECS: list = [
         example="1000",
         since="Priority #4 Slice 5",
     ),
+
+    # ====================================================================
+    # Continuous Invariant Gradient Watcher (Priority #5) — 6 flags
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CIGW_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the 4-slice CIGW pipeline. "
+            "When false, every public path short-circuits in "
+            "lockstep (collector → empty, comparator → DISABLED, "
+            "observer → DISABLED). Graduated default-true post-"
+            "Slice-5 (2026-05-02) because CIGW is read-only over "
+            "source files (zero LLM cost on detection path; "
+            "structural metrics via stdlib ast + file.read; "
+            "observational not prescriptive — every reading stamps "
+            "PASSED). Closes the long-horizon semantic drift gap: "
+            "per-APPLY structural metric sampling vs Move 4's "
+            "per-snapshot."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "gradient_watcher.py"
+        ),
+        example="true",
+        since="Priority #5 Slice 5",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_CIGW_COLLECTOR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 2 async collector. When false, "
+            "sample_target / sample_targets / sample_on_apply all "
+            "return empty tuple — the Slice 1 schema stays live "
+            "in serialization paths, but no metric collection. "
+            "Hot-revert knob for cost-cap rollback without breaking "
+            "the rest of the stack."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "gradient_collector.py"
+        ),
+        example="true",
+        since="Priority #5 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_CIGW_COMPARATOR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 3 effectiveness aggregator. "
+            "When false, compare_gradient_history returns DISABLED. "
+            "The stamping logic (MonotonicTighteningVerdict.PASSED) "
+            "remains structurally accessible via stamp_gradient_"
+            "report for callers that want per-report stamping "
+            "without aggregation."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "gradient_comparator.py"
+        ),
+        example="true",
+        since="Priority #5 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_CIGW_OBSERVER_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Sub-gate for the Slice 4 history store + SSE event "
+            "publisher + periodic CIGWObserver. When false, "
+            "record_gradient_report returns DISABLED, no JSONL "
+            "writes, no SSE events. Operators rolling back to a "
+            "no-persistence stance flip this without affecting "
+            "collector/comparator behavior."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "gradient_observer.py"
+        ),
+        example="true",
+        since="Priority #5 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_CIGW_HEALTHY_THRESHOLD_PCT",
+        type=FlagType.FLOAT, default=80.0,
+        description=(
+            "Minimum stable_rate (STABLE_count / actionable_total) "
+            "for CIGWEffectivenessOutcome.HEALTHY. Default 80.0%. "
+            "Cap structure: max(0.0, min(100.0, value)). Operators "
+            "tighten upward (e.g., 95.0) to demand near-zero drift "
+            "before claiming the codebase is structurally healthy. "
+            "Note: ANY breach takes precedence over HEALTHY "
+            "regardless of stable_rate (DEGRADED safer-default "
+            "discipline)."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "gradient_comparator.py"
+        ),
+        example="80.0",
+        since="Priority #5 Slice 5",
+    ),
+    FlagSpec(
+        name="JARVIS_CIGW_HISTORY_MAX_RECORDS",
+        type=FlagType.INT, default=1000,
+        description=(
+            "Bounded ring-buffer cap for the CIGW JSONL history "
+            "store. Default 1000 records, clamped [10, 100000]. "
+            "Rotation truncates after each append (same discipline "
+            "as InvariantDriftStore + Priority #3/#4 Slice 4 "
+            "observers). Larger caps support longer-baseline "
+            "empirical claims at the cost of more disk + slower "
+            "full-history reads."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "gradient_observer.py"
+        ),
+        example="1000",
+        since="Priority #5 Slice 5",
+    ),
 ]
 
 
