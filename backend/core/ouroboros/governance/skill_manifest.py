@@ -46,6 +46,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
+# Slice 1 of the SkillRegistry-AutonomousReach arc: typed reach
+# vocabulary + structured trigger primitive (pure-stdlib). Imported
+# here so SkillManifest can carry the new additive fields with
+# strict-dialect validation. Keeps the existing arc backward-compat:
+# manifests without `reach` / `trigger_specs` keep their current
+# behavior because reach defaults to OPERATOR_PLUS_MODEL and
+# trigger_specs defaults to ().
+from backend.core.ouroboros.governance.skill_trigger import (
+    SkillReach,
+    SkillTriggerError,
+    SkillTriggerSpec,
+    parse_reach,
+    parse_trigger_specs_list,
+)
+
 logger = logging.getLogger("Ouroboros.SkillManifest")
 
 
@@ -219,6 +234,15 @@ class SkillManifest:
     version: str = "0.0.0"
     author: str = ""
     path: Optional[Path] = None
+    # ----- Slice 1 (SkillRegistry-AutonomousReach) additive fields -----
+    # Backward-compat: ``reach`` defaults to OPERATOR_PLUS_MODEL (the
+    # CC-equivalent surface, matches every pre-arc manifest's implicit
+    # behavior). ``trigger_specs`` defaults to empty tuple so existing
+    # manifests are autonomous-inert. The Slice 3 observer will only
+    # fire skills whose ``trigger_specs`` declare matching preconditions
+    # AND whose ``reach`` includes AUTONOMOUS.
+    reach: SkillReach = SkillReach.OPERATOR_PLUS_MODEL
+    trigger_specs: Tuple[SkillTriggerSpec, ...] = ()
     schema_version: str = SKILL_MANIFEST_SCHEMA_VERSION
 
     # --- identity --------------------------------------------------------
@@ -332,6 +356,31 @@ class SkillManifest:
         args_schema = data.get("args_schema") or {}
         _validate_arg_schema(args_schema)
 
+        # ----- Slice 1 (SkillRegistry-AutonomousReach) additive parse -----
+        # Both fields are OPTIONAL. Unknown reach value or malformed
+        # trigger_spec => loud SkillManifestError (re-raised from
+        # SkillTriggerError so the existing dialect-error contract
+        # holds). Missing fields => safe defaults (OPERATOR_PLUS_MODEL,
+        # empty tuple) per backward-compat.
+        try:
+            if "reach" in data and data["reach"] is not None:
+                reach = parse_reach(data["reach"])
+            else:
+                reach = SkillReach.OPERATOR_PLUS_MODEL
+        except SkillTriggerError as exc:
+            raise SkillManifestError(
+                f"manifest: {exc}"
+            ) from exc
+        try:
+            trigger_specs = parse_trigger_specs_list(
+                data.get("trigger_specs"),
+                path="trigger_specs",
+            )
+        except SkillTriggerError as exc:
+            raise SkillManifestError(
+                f"manifest: {exc}"
+            ) from exc
+
         manifest = cls(
             name=name,
             description=description,
@@ -344,6 +393,8 @@ class SkillManifest:
             version=version,
             author=author,
             path=Path(source_path).resolve() if source_path else None,
+            reach=reach,
+            trigger_specs=trigger_specs,
         )
         logger.info(
             "[SkillManifest] loaded qualified=%s version=%s "
@@ -403,6 +454,12 @@ class SkillManifest:
             "permissions": list(self.permissions),
             "args_schema": dict(self.args_schema),
             "path": str(self.path) if self.path else None,
+            # Slice 1 additive fields -- always present in projection
+            # so SSE / REPL clients see the full surface.
+            "reach": self.reach.value,
+            "trigger_specs": [
+                spec.to_dict() for spec in self.trigger_specs
+            ],
         }
 
 
@@ -522,6 +579,11 @@ __all__ = [
     "SkillArgsError",
     "SkillManifest",
     "SkillManifestError",
+    # Slice 1 additive re-exports -- callers can import the new
+    # vocabulary from skill_manifest without a separate import.
+    "SkillReach",
+    "SkillTriggerError",
+    "SkillTriggerSpec",
     "validate_args",
 ]
 
