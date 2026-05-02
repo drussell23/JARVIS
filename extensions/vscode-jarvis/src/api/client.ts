@@ -9,7 +9,14 @@
  */
 
 import {
+  DagRecordResponse,
+  DagSessionResponse,
   HealthResponse,
+  ReplayBaselineReport,
+  ReplayHealthResponse,
+  ReplayVerdictsResponse,
+  SessionDetailResponse,
+  SessionListResponse,
   SUPPORTED_SCHEMA_VERSION,
   TaskDetailResponse,
   TaskListResponse,
@@ -114,6 +121,141 @@ export class ObservabilityClient {
     return this.get<WorktreeDetailResponse>(
       `/observability/worktrees/${encodeURIComponent(graphId)}`,
     );
+  }
+
+  // --- Gap #1 Slice 1 — Sessions / DAG / Replay surface ----------------
+
+  public async sessionList(
+    opts?: {
+      readonly limit?: number;
+      readonly ok?: boolean;
+      readonly bookmarked?: boolean;
+      readonly pinned?: boolean;
+      readonly hasReplay?: boolean;
+      readonly parseError?: boolean;
+      readonly prefix?: string;
+    },
+  ): Promise<SessionListResponse> {
+    const params = new URLSearchParams();
+    if (opts) {
+      if (opts.limit !== undefined) {
+        // Server clamps [1, 1000]; surface a fast 400 for clearly
+        // malformed inputs so we don't waste an HTTP round-trip.
+        if (
+          !Number.isFinite(opts.limit) ||
+          opts.limit < 1 ||
+          opts.limit > 1000
+        ) {
+          throw new ObservabilityError(
+            `malformed limit: ${opts.limit}`,
+            400, 'client.malformed_limit',
+          );
+        }
+        params.set('limit', String(Math.floor(opts.limit)));
+      }
+      if (opts.ok !== undefined) params.set('ok', String(opts.ok));
+      if (opts.bookmarked !== undefined) params.set('bookmarked', String(opts.bookmarked));
+      if (opts.pinned !== undefined) params.set('pinned', String(opts.pinned));
+      if (opts.hasReplay !== undefined) params.set('has_replay', String(opts.hasReplay));
+      if (opts.parseError !== undefined) params.set('parse_error', String(opts.parseError));
+      if (opts.prefix !== undefined && opts.prefix !== '') {
+        if (!/^[A-Za-z0-9_\-:.]{1,128}$/.test(opts.prefix)) {
+          throw new ObservabilityError(
+            `malformed prefix: ${opts.prefix}`,
+            400, 'client.malformed_prefix',
+          );
+        }
+        params.set('prefix', opts.prefix);
+      }
+    }
+    const qs = params.toString();
+    const path = `/observability/sessions${qs ? `?${qs}` : ''}`;
+    return this.get<SessionListResponse>(path);
+  }
+
+  public async sessionDetail(
+    sessionId: string,
+  ): Promise<SessionDetailResponse> {
+    if (!/^[A-Za-z0-9_\-:.]{1,128}$/.test(sessionId)) {
+      throw new ObservabilityError(
+        `malformed session_id: ${sessionId}`,
+        400, 'client.malformed_session_id',
+      );
+    }
+    return this.get<SessionDetailResponse>(
+      `/observability/sessions/${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  public async dagSession(
+    sessionId: string,
+  ): Promise<DagSessionResponse> {
+    if (!/^[A-Za-z0-9_\-:.]{1,128}$/.test(sessionId)) {
+      throw new ObservabilityError(
+        `malformed session_id: ${sessionId}`,
+        400, 'client.malformed_session_id',
+      );
+    }
+    return this.get<DagSessionResponse>(
+      `/observability/dag/${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  public async dagRecord(
+    sessionId: string, recordId: string,
+  ): Promise<DagRecordResponse> {
+    if (!/^[A-Za-z0-9_\-:.]{1,128}$/.test(sessionId)) {
+      throw new ObservabilityError(
+        `malformed session_id: ${sessionId}`,
+        400, 'client.malformed_session_id',
+      );
+    }
+    // Server's _RECORD_ID_RE is wider (256 chars) — phase-capture
+    // composite ids include phase + ordinal segments.
+    if (!/^[A-Za-z0-9_\-:.]{1,256}$/.test(recordId)) {
+      throw new ObservabilityError(
+        `malformed record_id: ${recordId}`,
+        400, 'client.malformed_record_id',
+      );
+    }
+    return this.get<DagRecordResponse>(
+      `/observability/dag/${encodeURIComponent(sessionId)}/${encodeURIComponent(recordId)}`,
+    );
+  }
+
+  public async replayHealth(): Promise<ReplayHealthResponse> {
+    return this.get<ReplayHealthResponse>(
+      '/observability/replay/health',
+    );
+  }
+
+  public async replayBaseline(): Promise<ReplayBaselineReport> {
+    return this.get<ReplayBaselineReport>(
+      '/observability/replay/baseline',
+    );
+  }
+
+  public async replayVerdicts(
+    opts?: { readonly limit?: number },
+  ): Promise<ReplayVerdictsResponse> {
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) {
+      // Server clamps [1, 200].
+      if (
+        !Number.isFinite(opts.limit) ||
+        opts.limit < 1 ||
+        opts.limit > 200
+      ) {
+        throw new ObservabilityError(
+          `malformed limit: ${opts.limit}`,
+          400, 'client.malformed_limit',
+        );
+      }
+      params.set('limit', String(Math.floor(opts.limit)));
+    }
+    const qs = params.toString();
+    const path = `/observability/replay/verdicts${qs ? `?${qs}` : ''}`;
+    return this.get<ReplayVerdictsResponse>(path);
   }
 
   private async get<T extends AnyEnvelope>(path: string): Promise<T> {

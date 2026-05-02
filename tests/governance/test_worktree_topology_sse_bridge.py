@@ -451,12 +451,15 @@ class TestAuthorityInvariants:
                     )
 
     def test_governance_imports_in_allowlist(self, source):
-        """Slice 3 may import ONLY:
+        """Slice 3 may import:
           * autonomy.autonomy_types (EventType)
-          * ide_observability_stream (publish + event constants)"""
+          * ide_observability_stream (publish + event constants)
+          * meta.shipped_code_invariants (Slice 5 cage close —
+            lazy-imported inside register_shipped_invariants)"""
         allowed = {
             "backend.core.ouroboros.governance.autonomy.autonomy_types",
             "backend.core.ouroboros.governance.ide_observability_stream",
+            "backend.core.ouroboros.governance.meta.shipped_code_invariants",
         }
         tree = ast.parse(source)
         for node in ast.walk(tree):

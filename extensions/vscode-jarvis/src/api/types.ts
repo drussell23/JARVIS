@@ -252,3 +252,103 @@ export interface WorktreesListResponse extends Envelope {
 export interface WorktreeDetailResponse extends Envelope {
   readonly graph: WorktreeGraphProjection;
 }
+
+// --- Gap #1 — Sessions / DAG / Replay wire shapes -------------------------
+//
+// Mirror of the agent-side projections returned by:
+//   GET /observability/sessions
+//   GET /observability/sessions/{session_id}
+//   GET /observability/dag/{session_id}
+//   GET /observability/dag/{session_id}/{record_id}
+//   GET /observability/replay/{health,baseline,verdicts,history}
+//
+// Used by the Temporal Slider panel for time-travel debugging
+// across the CausalityDAG.
+
+export interface SessionProjection {
+  readonly session_id: string;
+  readonly ok_outcome?: boolean;
+  readonly bookmarked?: boolean;
+  readonly pinned?: boolean;
+  readonly has_replay?: boolean;
+  readonly parse_error?: boolean;
+  // Substrate-defined free-form metadata (timestamps, op counts,
+  // etc.). The extension renders by key; no field is load-bearing
+  // beyond the discriminants above.
+  readonly [extra: string]: unknown;
+}
+
+export interface SessionListResponse extends Envelope {
+  readonly sessions: readonly SessionProjection[];
+  readonly count: number;
+}
+
+export interface SessionDetailResponse extends Envelope {
+  readonly session: SessionProjection;
+}
+
+export interface DagSessionResponse extends Envelope {
+  readonly session_id: string;
+  readonly node_count: number;
+  readonly edge_count: number;
+  // Capped at 1000 by the substrate (handle_dag_session). Already
+  // ordered by the substrate (insertion order = causality order).
+  readonly record_ids: readonly string[];
+}
+
+export interface DagRecordResponse extends Envelope {
+  readonly record_id: string;
+  // DecisionRecord.to_dict() — free-form per substrate. The
+  // panel renders selected fields if present (phase, op_id,
+  // ts_ns, etc.) but never assumes a strict shape.
+  readonly record: Record<string, unknown>;
+  readonly parents: readonly string[];
+  readonly children: readonly string[];
+  readonly counterfactual_branches: readonly Record<string, unknown>[];
+  readonly subgraph_node_count: number;
+}
+
+export interface ReplayHealthResponse extends Envelope {
+  readonly enabled: boolean;
+  readonly engine_enabled: boolean;
+  readonly comparator_enabled: boolean;
+  readonly observer_enabled: boolean;
+  readonly history_path: string;
+  readonly history_count: number;
+}
+
+export type ReplayVerdictKind =
+  | 'equivalent'
+  | 'diverged_better'
+  | 'diverged_worse'
+  | 'diverged_neutral'
+  | 'failed'
+  | string;  // open vocabulary — substrate may add new kinds
+
+export interface ReplayVerdict {
+  readonly verdict?: ReplayVerdictKind;
+  readonly tightening?: string;
+  readonly cluster_kind?: string;
+  readonly schema_version?: string;
+  readonly [extra: string]: unknown;
+}
+
+export interface ReplayVerdictsResponse extends Envelope {
+  readonly verdicts: readonly ReplayVerdict[];
+  readonly count: number;
+  readonly limit: number;
+}
+
+export type ReplayBaselineOutcome =
+  | 'baseline_ok'
+  | 'baseline_drift'
+  | 'baseline_insufficient'
+  | string;  // open vocabulary
+
+export interface ReplayBaselineReport extends Envelope {
+  readonly outcome: ReplayBaselineOutcome;
+  readonly tightening?: string;
+  readonly stats?: Record<string, unknown>;
+  readonly detail?: string;
+  readonly [extra: string]: unknown;
+}
