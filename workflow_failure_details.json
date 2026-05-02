@@ -1,0 +1,71 @@
+{
+  "workflow_name": "Validate Configuration",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25244265524",
+  "branch": "ouroboros/inline-prompt-gate-5b",
+  "commit_sha": "67a2ff3",
+  "run_number": 3296,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/validate-configuration-run3296-20260502-050112",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Validate Configuration (Run #3296)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 87,
+              "content": "2026-05-02T04:59:34.5414567Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 60,
+              "content": "2026-05-02T04:59:34.5338131Z \u274c VALIDATION FAILED",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2026-05-02T04:59:34.6986002Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 65,
+              "content": "2026-05-02T04:59:34.5341292Z \u26a0\ufe0f  WARNINGS",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 97,
+              "content": "2026-05-02T04:59:34.6986002Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-05-02T05:01:12.889930"
+}
