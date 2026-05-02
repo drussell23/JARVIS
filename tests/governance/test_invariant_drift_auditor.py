@@ -842,6 +842,10 @@ class TestAuthorityInvariants:
             "exploration_required_category_dropped",
             "exploration_bucket_removed",
             "posture_drift",
+            "gradient_drift_detected",  # added 2026-05-02 by
+            # auto_action_router edge-case race-condition fix
+            # (a0782f7d5f); pre-existing addition CIGW will surface
+            # via Slice 4 advisory bridge.
         }
         assert {k.value for k in DriftKind} == expected
 
