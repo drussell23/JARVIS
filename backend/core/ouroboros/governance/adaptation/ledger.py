@@ -194,6 +194,18 @@ class AdaptationSurface(str, enum.Enum):
     HTTP write surface lives in ``ide_policy_router.py`` (Gap #2
     Slice 4)."""
 
+    COHERENCE_AUDITOR_BUDGETS = "coherence_auditor.budgets"
+    """Q4 Priority #2 Slice 3 — autonomous closure-loop proposes
+    tightening on the coherence auditor's drift budgets
+    (``route_drift_pct``, ``recurrence_count``,
+    ``confidence_rise_pct``). Surface validator lives in
+    ``adaptation/coherence_budget_tightener.py``; intent producer
+    is :class:`coherence_action_bridge._DefaultTighteningProposer`;
+    submission path is the closure-loop observer's
+    ``on_record_emitted`` callback (NEVER ``.approve`` — operator
+    approval via ``/adapt`` REPL or VSCode panel remains the sole
+    path to apply)."""
+
 
 class OperatorDecisionStatus(str, enum.Enum):
     """Lifecycle state of one proposal."""
