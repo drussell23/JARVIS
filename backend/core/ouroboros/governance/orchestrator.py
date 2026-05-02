@@ -4837,6 +4837,7 @@ class GovernedOrchestrator:
                                 validation_short_summary=_em,
                                 target_files=tuple(getattr(ctx, "target_files", ()) or ()),
                                 project_root=self._config.project_root,
+                                op_id=ctx.op_id,
                             )
                             if _fals_text:
                                 _replan_text = _fals_text

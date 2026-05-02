@@ -723,6 +723,10 @@ _FORBIDDEN_GOVERNANCE_MODULES = {
 
 _ALLOWED_GOVERNANCE_MODULES = {
     "plan_falsification",  # Slice 1 primitive only
+    # Slice 5 — module-owned FlagRegistry + AST-pin registration
+    # (registration-contract; never reached during hot path).
+    "flag_registry",
+    "shipped_code_invariants",
 }
 
 

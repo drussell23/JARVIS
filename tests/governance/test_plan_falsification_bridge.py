@@ -602,6 +602,13 @@ _FORBIDDEN_GOVERNANCE_MODULES = {
 _ALLOWED_GOVERNANCE_MODULES = {
     "plan_falsification",  # Slice 1 primitive
     "plan_falsification_detector",  # Slice 2 async detector
+    # Slice 5 graduation — additive observability surface only
+    # (publish helper; no authority).
+    "ide_observability_stream",
+    # Slice 5 — module-owned FlagRegistry + AST-pin registration
+    # (registration-contract; never reached during the hot path).
+    "flag_registry",
+    "shipped_code_invariants",
 }
 
 

@@ -545,15 +545,15 @@ class TestPairConstructor:
 
 
 class TestMasterFlagSemantics:
-    def test_default_is_false_pre_graduation(self, monkeypatch):
+    def test_default_is_true_post_graduation(self, monkeypatch):
         monkeypatch.delenv(
             "JARVIS_PLAN_FALSIFICATION_ENABLED", raising=False,
         )
-        assert plan_falsification_enabled() is False
+        assert plan_falsification_enabled() is True
 
-    def test_empty_string_is_default_false(self, monkeypatch):
+    def test_empty_string_is_default_true(self, monkeypatch):
         monkeypatch.setenv("JARVIS_PLAN_FALSIFICATION_ENABLED", "")
-        assert plan_falsification_enabled() is False
+        assert plan_falsification_enabled() is True
 
     @pytest.mark.parametrize(
         "truthy", ["1", "true", "yes", "on", "TRUE"],

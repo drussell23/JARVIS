@@ -589,6 +589,10 @@ def register_shipped_invariants() -> list:
     _ALLOWED = {
         "plan_falsification",
         "plan_falsification_detector",
+        # Additive observability + registration-contract.
+        "ide_observability_stream",
+        "flag_registry",
+        "shipped_code_invariants",
     }
     _FORBIDDEN = {
         "orchestrator", "phase_runner", "iron_gate",
