@@ -1070,3 +1070,344 @@ def tool_schema_subagent_types() -> Tuple[str, ...]:
     error rather than malformed dispatch.
     """
     return tuple(sorted(policy_allowed_subagent_types()))
+
+
+# ============================================================================
+# Slice 2 — Module-owned FlagRegistry contribution (4 per-type kill switches)
+# ============================================================================
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned :class:`FlagRegistry` registration. Discovered
+    automatically by ``flag_registry_seed._discover_module_provided_flags``.
+    Returns count registered.
+
+    Registers the 4 per-type kill switches
+    (``JARVIS_SUBAGENT_<TYPE>_ENABLED``). All default-true post Phase B
+    graduation; the umbrella ``JARVIS_SUBAGENT_DISPATCH_ENABLED`` master
+    switch already exists and is registered elsewhere."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+
+    specs = []
+    _per_type_descriptions = {
+        "EXPLORE": (
+            "Per-type kill switch for read-only EXPLORE subagent "
+            "dispatch. Default true (graduated 2026-04-18). The "
+            "Venom dispatch_subagent tool consults this via "
+            "policy_allowed_subagent_types() at call time."
+        ),
+        "REVIEW": (
+            "Per-type kill switch for REVIEW subagent dispatch. "
+            "Default true post Phase B (2026-04-20). Normally "
+            "orchestrator-driven (post-VALIDATE unconditional, "
+            "Manifesto §6); Venom-path is defense-in-depth."
+        ),
+        "PLAN": (
+            "Per-type kill switch for PLAN subagent dispatch. "
+            "Default true post Phase B (2026-04-20). Normally "
+            "orchestrator-driven (pre-GENERATE for ops with ≥2 "
+            "target files, Manifesto §2 DAG)."
+        ),
+        "GENERAL": (
+            "Per-type kill switch for free-form GENERAL subagent "
+            "dispatch (the Task-tool equivalent). Default true post "
+            "Phase B (2026-04-20). Slice 1 (2026-05-02) wires the "
+            "Venom path through SubagentRequest.from_args() "
+            "synthesizer + Semantic Firewall §5 cage. Operators "
+            "may flip false to disable free-form delegation while "
+            "leaving structured types (EXPLORE/REVIEW/PLAN) enabled."
+        ),
+    }
+
+    for st in SubagentType:
+        spec = FlagSpec(
+            name=f"JARVIS_SUBAGENT_{st.name}_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/subagent_contracts.py"
+            ),
+            example=f"JARVIS_SUBAGENT_{st.name}_ENABLED=true",
+            description=_per_type_descriptions.get(
+                st.name, f"Per-type kill switch for {st.value} subagent.",
+            ),
+        )
+        specs.append(spec)
+
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001 — defensive
+            continue
+    return count
+
+
+# ============================================================================
+# Slice 2 — Module-owned shipped_code_invariants contribution
+# ============================================================================
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 1's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances.
+
+    Five pins enforce the dynamic linkage contract:
+      1. subagent_contracts_dynamic_helpers_present — the 3 helpers
+         exist (subagent_type_enabled / policy_allowed_subagent_types
+         / tool_schema_subagent_types).
+      2. subagent_contracts_synthesizers_present — the 3 synthesizers
+         exist (_synthesize_general_invocation / _synthesize_plan_target
+         / _synthesize_review_target).
+      3. subagent_contracts_from_args_invokes_synthesizers — the
+         from_args classmethod calls the synthesizers (not inline
+         dict literals).
+      4. tool_executor_uses_dynamic_subagent_enum — tool_executor.py
+         manifest enum sourced from _dynamic_subagent_type_enum()
+         helper (no hardcoded list literal).
+      5. tool_executor_uses_dynamic_subagent_policy — GoverningToolPolicy
+         calls policy_allowed_subagent_types() at check site (no
+         hardcoded frozenset).
+    """
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_dynamic_helpers_present(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """The 3 dynamic linkage helpers MUST be defined in
+        subagent_contracts.py. Removing any of them silently breaks
+        the schema↔policy lock."""
+        violations: list = []
+        required = {
+            "subagent_type_enabled",
+            "policy_allowed_subagent_types",
+            "tool_schema_subagent_types",
+        }
+        seen = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef):
+                if node.name in required:
+                    seen.add(node.name)
+        missing = required - seen
+        if missing:
+            violations.append(
+                f"missing dynamic linkage helper(s): {sorted(missing)}"
+            )
+        return tuple(violations)
+
+    def _validate_synthesizers_present(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """The 3 per-type invocation synthesizers MUST be defined in
+        subagent_contracts.py. Removing any silently regresses the
+        Venom-path GENERAL/PLAN/REVIEW dispatch to MalformedGeneralInput."""
+        violations: list = []
+        required = {
+            "_synthesize_general_invocation",
+            "_synthesize_plan_target",
+            "_synthesize_review_target",
+        }
+        seen = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef):
+                if node.name in required:
+                    seen.add(node.name)
+        missing = required - seen
+        if missing:
+            violations.append(
+                f"missing per-type synthesizer(s): {sorted(missing)}"
+            )
+        return tuple(violations)
+
+    def _validate_from_args_invokes_synthesizers(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        """SubagentRequest.from_args MUST call all 3 synthesizers.
+        Inlining the synthesis logic would split the source of truth."""
+        violations: list = []
+        # Source-level check is the cheapest robust shape — the
+        # synthesizers are referenced by name inside the from_args
+        # classmethod body.
+        for required_call in (
+            "_synthesize_general_invocation(",
+            "_synthesize_plan_target(",
+            "_synthesize_review_target(",
+        ):
+            if required_call not in source:
+                violations.append(
+                    f"from_args missing call to {required_call.rstrip('(')}"
+                )
+        return tuple(violations)
+
+    def _validate_tool_executor_uses_dynamic_enum(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        """tool_executor.py's dispatch_subagent manifest enum MUST
+        be sourced from _dynamic_subagent_type_enum() — never a
+        hardcoded list literal. Drift would silently desync the
+        manifest enum from policy_allowed_subagent_types().
+
+        AST walk scopes to the ``"dispatch_subagent"`` ToolManifest
+        construction specifically, so unrelated tools (e.g.,
+        ``delegate_to_agent``'s ``agent_type`` enum) don't trigger
+        false positives."""
+        violations: list = []
+        if "_dynamic_subagent_type_enum(" not in source:
+            violations.append(
+                "tool_executor.py missing call to "
+                "_dynamic_subagent_type_enum() — manifest enum must "
+                "use the dynamic helper"
+            )
+        if "def _dynamic_subagent_type_enum" not in source:
+            violations.append(
+                "tool_executor.py missing _dynamic_subagent_type_enum "
+                "function definition"
+            )
+        # Defense-in-depth: locate the dispatch_subagent ToolManifest
+        # dict literal in the AST and confirm its arg_schema's
+        # subagent_type.enum value is a Call (not a List literal).
+        for node in _ast.walk(tree):
+            # Find dict entries keyed by the literal "dispatch_subagent"
+            # whose value is a Call to ToolManifest(...). Then walk
+            # the kwargs to find arg_schema={...} → subagent_type
+            # entry → enum value. If the enum value is a List literal,
+            # that's the regression.
+            if isinstance(node, _ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if (
+                        isinstance(k, _ast.Constant)
+                        and k.value == "dispatch_subagent"
+                        and isinstance(v, _ast.Call)
+                    ):
+                        for kw in v.keywords:
+                            if kw.arg == "arg_schema" and isinstance(
+                                kw.value, _ast.Dict,
+                            ):
+                                for sk, sv in zip(
+                                    kw.value.keys, kw.value.values,
+                                ):
+                                    if (
+                                        isinstance(sk, _ast.Constant)
+                                        and sk.value == "subagent_type"
+                                        and isinstance(sv, _ast.Dict)
+                                    ):
+                                        for ek, ev in zip(
+                                            sv.keys, sv.values,
+                                        ):
+                                            if (
+                                                isinstance(ek, _ast.Constant)
+                                                and ek.value == "enum"
+                                            ):
+                                                if isinstance(ev, _ast.List):
+                                                    violations.append(
+                                                        "dispatch_subagent "
+                                                        "manifest enum is a "
+                                                        "List literal — "
+                                                        "must be a Call to "
+                                                        "_dynamic_subagent_type_enum()"
+                                                    )
+        return tuple(violations)
+
+    def _validate_tool_executor_uses_dynamic_policy(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """GoverningToolPolicy MUST call policy_allowed_subagent_types()
+        at the dispatch_subagent check site — never a hardcoded
+        frozenset. Drift would silently desync policy from the
+        SubagentType source."""
+        violations: list = []
+        if "policy_allowed_subagent_types(" not in source:
+            violations.append(
+                "tool_executor.py missing call to "
+                "policy_allowed_subagent_types() — policy check must "
+                "use the dynamic helper"
+            )
+        # Pre-Slice-1 hardcoded frozenset shape — must NOT reappear.
+        # Match a tight pattern (the exact pre-Slice-1 line) to
+        # avoid false positives in unrelated code.
+        if '_READ_ONLY_SUBAGENT_TYPES = frozenset(' in source:
+            violations.append(
+                "tool_executor.py has hardcoded "
+                "_READ_ONLY_SUBAGENT_TYPES frozenset literal — the "
+                "dynamic helper was bypassed"
+            )
+        return tuple(violations)
+
+    contracts_target = (
+        "backend/core/ouroboros/governance/subagent_contracts.py"
+    )
+    executor_target = (
+        "backend/core/ouroboros/governance/tool_executor.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="subagent_contracts_dynamic_helpers_present",
+            target_file=contracts_target,
+            description=(
+                "subagent_contracts.py defines the 3 dynamic linkage "
+                "helpers (subagent_type_enabled / "
+                "policy_allowed_subagent_types / "
+                "tool_schema_subagent_types). Removing any silently "
+                "breaks the schema↔policy lock."
+            ),
+            validate=_validate_dynamic_helpers_present,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="subagent_contracts_synthesizers_present",
+            target_file=contracts_target,
+            description=(
+                "subagent_contracts.py defines the 3 per-type "
+                "invocation synthesizers (_synthesize_general_invocation "
+                "/ _synthesize_plan_target / _synthesize_review_target). "
+                "Removing any regresses Venom-path GENERAL/PLAN/REVIEW "
+                "to MalformedGeneralInput."
+            ),
+            validate=_validate_synthesizers_present,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="subagent_contracts_from_args_invokes_synthesizers",
+            target_file=contracts_target,
+            description=(
+                "SubagentRequest.from_args invokes all 3 synthesizers "
+                "by name. Inlining synthesis would split the source "
+                "of truth for per-type invocation construction."
+            ),
+            validate=_validate_from_args_invokes_synthesizers,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="tool_executor_uses_dynamic_subagent_enum",
+            target_file=executor_target,
+            description=(
+                "tool_executor.py dispatch_subagent manifest enum is "
+                "sourced from _dynamic_subagent_type_enum() — never a "
+                "hardcoded list literal. The dynamic helper wraps "
+                "tool_schema_subagent_types() so the manifest stays "
+                "linked to the SubagentType source."
+            ),
+            validate=_validate_tool_executor_uses_dynamic_enum,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="tool_executor_uses_dynamic_subagent_policy",
+            target_file=executor_target,
+            description=(
+                "tool_executor.py GoverningToolPolicy calls "
+                "policy_allowed_subagent_types() at the "
+                "dispatch_subagent check site — never a hardcoded "
+                "frozenset. Schema and policy share the same "
+                "SubagentType source by construction."
+            ),
+            validate=_validate_tool_executor_uses_dynamic_policy,
+        ),
+    ]
