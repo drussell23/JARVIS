@@ -718,6 +718,69 @@ def get_active_recurrence_boosts(
 # ---------------------------------------------------------------------------
 
 
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration for the V3 (Coherence
+    advisory plausibility) Antivenom-v2 surface.
+
+    Discovery contract: the seed loader walks ``verification/`` for
+    modules exposing this name + invokes once at boot.
+
+    Returns count of FlagSpecs registered. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_KNOWN_FAILURE_CLASSES",
+            type=FlagType.STR, default="",
+            description=(
+                "Antivenom V3 — comma-separated list of operator-"
+                "supplied failure-class names that extend the "
+                "structural ``_CORE_FAILURE_CLASSES`` (28 entries "
+                "derived from real production emitters). Empty = "
+                "unset = use core list only. Operators add domain-"
+                "specific failure classes here without editing the "
+                "consumer module — the plausibility check accepts "
+                "them on top of the structural floor. Closes a §29 "
+                "schema-shape-gaming bypass vector by rejecting "
+                "advisories whose extracted failure_class isn't in "
+                "the union."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "postmortem_recall_consumer.py"
+            ),
+            example="my_custom_failure,another_class",
+            since="Antivenom v2 (Priority #6)",
+        ),
+        FlagSpec(
+            name="JARVIS_RECURRENCE_BOOST_PLAUSIBILITY_ENABLED",
+            type=FlagType.BOOL, default=True,
+            description=(
+                "Sub-gate for the V3 plausibility check. When false, "
+                "advisories pass without failure-class validation. "
+                "Default true."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "postmortem_recall_consumer.py"
+            ),
+            example="true",
+            since="Antivenom v2 (Priority #6)",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    return len(specs)
+
+
 __all__ = [
     "POSTMORTEM_RECALL_CONSUMER_SCHEMA_VERSION",
     "RecurrenceBoost",
@@ -728,4 +791,5 @@ __all__ = [
     "compute_recurrence_boosts",
     "get_active_recurrence_boosts",
     "postmortem_recurrence_boost_enabled",
+    "register_flags",
 ]

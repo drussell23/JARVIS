@@ -661,6 +661,124 @@ def compute_bg_spec_structural_check(
 
 
 # ---------------------------------------------------------------------------
+# Antivenom v2 — Module-owned FlagRegistry contribution (Vector 1)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration for the V1 (BG/SPEC
+    Quine-class structural check) Antivenom-v2 surface.
+
+    Discovery contract: the seed loader (``flag_registry_seed
+    ._discover_module_provided_flags``) walks ``verification/`` for
+    modules exposing this name and invokes once at boot. New flags
+    that this module gains in future automatically discover via the
+    same mechanism — no edits to the seed file required.
+
+    Returns count of FlagSpecs registered. NEVER raises — defensive
+    contract is the discovery loop's; this implementation just
+    constructs the spec list."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_BG_SPEC_STRUCTURAL_CHECK_ENABLED",
+            type=FlagType.BOOL, default=True,
+            description=(
+                "Antivenom V1 — BG/SPEC structural AST-fingerprint "
+                "check (closes Quine-class hallucination on the "
+                "background/speculative cost-gated route carve-out "
+                "where Quorum doesn't run). When false, the "
+                "structural filter short-circuits to passthrough; "
+                "BG/SPEC candidates skip Quine validation. Default "
+                "true — the check is zero-cost (single-roll AST "
+                "compare against original source) and closes a "
+                "§29 brutal-review bypass vector."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "generative_quorum_gate.py"
+            ),
+            example="true",
+            since="Antivenom v2 (Priority #6)",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    return len(specs)
+
+
+# ---------------------------------------------------------------------------
+# Antivenom v2 — Module-owned shipped-code invariant (Vector 1)
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code invariant for the V1 surface.
+
+    Discovery contract: ``shipped_code_invariants
+    ._discover_module_provided_invariants`` walks ``verification/``
+    for modules exposing this name + invokes once at boot. Each
+    invariant's ``validate(tree, source) -> Tuple[str, ...]``
+    callback runs structurally during the AST validator pass.
+
+    NEVER raises out of the discovery path."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_v1_bg_spec_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("compute_bg_spec_structural_check",
+             "V1 primitive must remain exported"),
+            ("BgSpecStructuralCheck",
+             "V1 frozen dataclass must remain exported"),
+            ("_bg_spec_structural_check_enabled",
+             "V1 master flag helper must remain"),
+            ("JARVIS_BG_SPEC_STRUCTURAL_CHECK_ENABLED",
+             "V1 master flag name must remain canonical"),
+            ("ast_canonical",
+             "Move 6 ast_canonical reuse contract"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"V1 surface dropped {symbol!r} — {reason} gone"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="antivenom_v1_bg_spec_surface",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "generative_quorum_gate.py"
+            ),
+            description=(
+                "Antivenom V1 (BG/SPEC structural fingerprint check) "
+                "surface MUST preserve compute_bg_spec_structural_check "
+                "+ BgSpecStructuralCheck + master-flag helper + "
+                "Move 6 ast_canonical reuse contract. Catches refactor "
+                "that drops the §29 brutal-review Quine-on-BG bypass "
+                "closure."
+            ),
+            validate=_validate_v1_bg_spec_surface,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -680,5 +798,7 @@ __all__ = [
     "invoke_quorum_for_op",
     "map_consensus_to_action",
     "quorum_gate_enabled",
+    "register_flags",
+    "register_shipped_invariants",
     "should_invoke_quorum",
 ]

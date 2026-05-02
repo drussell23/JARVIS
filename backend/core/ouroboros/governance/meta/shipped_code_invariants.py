@@ -3330,7 +3330,96 @@ def _register_seed_invariants() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Module-owned invariant discovery (mirrors flag_registry's pattern)
+# ---------------------------------------------------------------------------
+#
+# Curated list of provider PACKAGES whose direct submodules may
+# contribute shipped-code invariants via
+# ``register_shipped_invariants() -> List[ShippedCodeInvariant]``.
+# Adding a NEW invariant inside an existing module requires zero
+# edits here — the discovery loop picks it up. Adding an invariant
+# in a NEW package requires one entry. Same architectural pattern
+# as flag_registry_seed._FLAG_PROVIDER_PACKAGES.
+_INVARIANT_PROVIDER_PACKAGES: Tuple[str, ...] = (
+    "backend.core.ouroboros.governance",  # top-level (semantic_firewall, etc.)
+    "backend.core.ouroboros.governance.verification",  # SBT/CIGW/etc.
+)
+
+
+def _discover_module_provided_invariants() -> int:
+    """Walk every package in ``_INVARIANT_PROVIDER_PACKAGES`` for
+    direct submodules exposing
+    ``register_shipped_invariants() -> List[ShippedCodeInvariant]``.
+
+    Each matching module returns its own invariant list, which is
+    then registered via ``register_shipped_code_invariant``. New
+    Antivenom v3/v4/... surfaces register their own structural
+    pins co-located with the consuming code — no edits to this
+    file required.
+
+    NEVER raises. Per-module failures logged + skipped.
+
+    The immune system scales organically: when a new module owns
+    a new structural property, it owns the AST validation too."""
+    discovered = 0
+    try:
+        from importlib import import_module
+        import pkgutil
+        for pkg_name in _INVARIANT_PROVIDER_PACKAGES:
+            try:
+                pkg_mod = import_module(pkg_name)
+                pkg_path = getattr(pkg_mod, "__path__", None)
+                if not pkg_path:
+                    continue
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[ShippedInvariants] provider package %s unavailable: %s",
+                    pkg_name, exc,
+                )
+                continue
+            for _, name, _ispkg in pkgutil.iter_modules(pkg_path):
+                full_name = f"{pkg_name}.{name}"
+                if full_name == __name__:
+                    continue
+                try:
+                    mod = import_module(full_name)
+                    fn = getattr(mod, "register_shipped_invariants", None)
+                    if not callable(fn):
+                        continue
+                    invariants = fn()
+                    if not invariants:
+                        continue
+                    for inv in invariants:
+                        try:
+                            register_shipped_code_invariant(inv)
+                            discovered += 1
+                        except Exception as exc:  # noqa: BLE001 — defensive
+                            logger.debug(
+                                "[ShippedInvariants] register failed for "
+                                "%s/%s: %s",
+                                full_name,
+                                getattr(inv, "invariant_name", "?"),
+                                exc,
+                            )
+                except Exception as exc:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[ShippedInvariants] discover skipped %s: %s",
+                        full_name, exc,
+                    )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[ShippedInvariants] _discover_module_provided_invariants "
+            "exc: %s", exc,
+        )
+    return discovered
+
+
 _register_seed_invariants()
+# Dynamic discovery — invoked AFTER seed so module-owned pins
+# compose on top. Idempotent: re-imports during testing replace
+# existing invariants via override semantics.
+_discover_module_provided_invariants()
 
 
 # ---------------------------------------------------------------------------

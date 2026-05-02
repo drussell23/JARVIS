@@ -2484,13 +2484,102 @@ SEED_SPECS: list = [
 ]
 
 
+import logging as _logging
+
+_logger = _logging.getLogger(__name__)
+
+
+# Curated list of provider PACKAGES whose direct submodules may
+# contribute flags via ``register_flags(registry)``. Adding a NEW
+# flag inside an existing module requires zero edits here — the
+# discovery loop picks it up automatically. Adding a flag in a NEW
+# package requires one entry. This is metadata about WHERE flags
+# live, not the flags themselves.
+_FLAG_PROVIDER_PACKAGES: tuple = (
+    "backend.core.ouroboros.governance",  # top-level (semantic_firewall, etc.)
+    "backend.core.ouroboros.governance.verification",  # SBT/CIGW/Replay/etc.
+)
+
+
+def _discover_module_provided_flags(
+    registry: FlagRegistry,
+) -> int:
+    """Dynamically discover modules that own their FlagSpec
+    declarations.
+
+    Walks every package in ``_FLAG_PROVIDER_PACKAGES`` for direct
+    submodules exposing ``register_flags(registry) -> int``. Each
+    matching module registers its own flags + returns the count.
+
+    Architecture: instead of hardcoding flags into SEED_SPECS, modules
+    that ADD a new flag declare it co-located with the consuming code
+    via their own ``register_flags`` function. Adding a new V5/V6/...
+    surface requires zero edits to this file — the discovery loop
+    finds the new module's registrar and invokes it natively.
+
+    NEVER raises. Per-module failures logged + skipped — boot is never
+    blocked by one misconfigured module."""
+    discovered = 0
+    try:
+        from importlib import import_module
+        import pkgutil
+        for pkg_name in _FLAG_PROVIDER_PACKAGES:
+            try:
+                pkg_mod = import_module(pkg_name)
+                pkg_path = getattr(pkg_mod, "__path__", None)
+                if not pkg_path:
+                    continue
+            except Exception as exc:  # noqa: BLE001 — defensive
+                _logger.debug(
+                    "[FlagRegistry] provider package %s unavailable: %s",
+                    pkg_name, exc,
+                )
+                continue
+            for _, name, _ispkg in pkgutil.iter_modules(pkg_path):
+                full_name = f"{pkg_name}.{name}"
+                # Skip the seed module itself (recursion guard).
+                if full_name == __name__:
+                    continue
+                try:
+                    mod = import_module(full_name)
+                    fn = getattr(mod, "register_flags", None)
+                    if callable(fn):
+                        count = fn(registry)
+                        if isinstance(count, int) and count > 0:
+                            discovered += count
+                            _logger.debug(
+                                "[FlagRegistry] %s registered %d flag(s)",
+                                full_name, count,
+                            )
+                except Exception as exc:  # noqa: BLE001 — defensive
+                    _logger.debug(
+                        "[FlagRegistry] dynamic discovery skipped %s: %s",
+                        full_name, exc,
+                    )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        _logger.debug(
+            "[FlagRegistry] _discover_module_provided_flags exc: %s",
+            exc,
+        )
+    return discovered
+
+
 def seed_default_registry(registry: FlagRegistry) -> int:
-    """Install all SEED_SPECS into ``registry``. Returns count installed.
+    """Install all SEED_SPECS + dynamically-discovered module flags
+    into ``registry``. Returns total count installed.
+
+    Two-tier registration:
+      1. **Static seeds** — the legacy ``SEED_SPECS`` curated list
+         (modules predating the dynamic-discovery pattern).
+      2. **Module-owned** — walks ``verification/`` for modules with
+         ``register_flags(registry)``; each such module declares its
+         own FlagSpecs co-located with the consuming code.
 
     Called once by ``flag_registry.ensure_seeded()``. Idempotent —
-    duplicate calls override-in-place (same content, no warning)."""
+    duplicate calls override-in-place. NEVER raises."""
     registry.bulk_register(SEED_SPECS, override=True)
-    return len(SEED_SPECS)
+    discovered = _discover_module_provided_flags(registry)
+    return len(SEED_SPECS) + discovered
 
 
 __all__ = [

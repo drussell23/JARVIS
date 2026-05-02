@@ -609,6 +609,54 @@ def scan_tool_output(
         )
 
 
+def register_flags(registry):
+    """Module-owned FlagRegistry registration for the V2
+    (Tool-output prompt-injection scanner) Antivenom-v2 surface.
+
+    Discovery contract: the seed loader walks
+    ``governance/`` for top-level modules exposing this name +
+    invokes once at boot.
+
+    Returns count of FlagSpecs registered. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_TOOL_OUTPUT_INJECTION_SCAN_ENABLED",
+            type=FlagType.BOOL, default=True,
+            description=(
+                "Antivenom V2 — semantic-firewall scan over "
+                "read-only tool outputs (read_file / search_code "
+                "/ etc.) BEFORE the next prompt round consumes "
+                "them. 11 prompt-injection detectors; matches "
+                "replaced with [TOOL_INJECTION_REDACTED]. "
+                "Credential shapes excluded (config-file reads "
+                "legitimately contain secrets). Default true — "
+                "closes the highest-rank §29 brutal-review "
+                "Antivenom bypass vector (tool-output prompt "
+                "injection from malicious docstrings / comments "
+                "in vendored dependencies)."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "semantic_firewall.py"
+            ),
+            example="true",
+            since="Antivenom v2 (Priority #6)",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    return len(specs)
+
+
 __all__ = [
     "FirewallResult",
     "ToolOutputScanResult",
@@ -616,6 +664,7 @@ __all__ = [
     "known_tool_whitelist",
     "mutating_tool_set",
     "readonly_tool_whitelist",
+    "register_flags",
     "sanitize_for_firewall",
     "scan_tool_output",
     "validate_boundary_conditions",

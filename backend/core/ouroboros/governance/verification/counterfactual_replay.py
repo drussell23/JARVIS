@@ -1113,6 +1113,56 @@ def validate_swap_payload(
 
 
 # ---------------------------------------------------------------------------
+# Antivenom v2 — Module-owned FlagRegistry contribution (Vector 4)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration for the V4 (Replay
+    payload validation) Antivenom-v2 surface.
+
+    Discovery contract: the seed loader walks ``verification/`` for
+    modules exposing this name + invokes once at boot. Adding a new
+    flag to the V4 surface requires zero edits to the seed file.
+
+    Returns count of FlagSpecs registered. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_REPLAY_PAYLOAD_VALIDATION_ENABLED",
+            type=FlagType.BOOL, default=True,
+            description=(
+                "Antivenom V4 — per-kind whitelist validation of "
+                "``swap_decision_payload`` at both REPL and engine "
+                "entry. When false, payloads pass unchecked "
+                "(replay verdict launderable). Default true — closes "
+                "a §29 brutal-review bypass vector where operator-"
+                "supplied payloads could manufacture artificial "
+                "DIVERGED_BETTER verdicts that bias the recurrence-"
+                "reduction-pct upward."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "counterfactual_replay.py"
+            ),
+            example="true",
+            since="Antivenom v2 (Priority #6)",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    return len(specs)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1128,6 +1178,7 @@ __all__ = [
     "compute_branch_verdict",
     "compute_replay_outcome",
     "counterfactual_replay_enabled",
+    "register_flags",
     "replay_max_duration_seconds",
     "replay_max_phases_per_branch",
     "replay_min_replays_for_baseline",
