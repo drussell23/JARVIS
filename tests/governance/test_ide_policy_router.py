@@ -721,6 +721,9 @@ class TestAuthorityInvariants:
             "backend.core.ouroboros.governance.verification.confidence_monitor",
             "backend.core.ouroboros.governance.ide_observability_stream",
             "backend.core.ouroboros.governance.ide_observability",
+            # Slice 5 cage close: register_shipped_invariants() lazy-
+            # imports the AST-pin registration substrate.
+            "backend.core.ouroboros.governance.meta.shipped_code_invariants",
         }
         tree = ast.parse(source)
         for node in ast.walk(tree):

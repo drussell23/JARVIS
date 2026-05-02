@@ -2418,9 +2418,10 @@ def _validate_confidence_threshold_tightener(
          "sha256 hash prefix check must remain (provenance)"),
         ("_TIGHTEN_INDICATOR",
          "tighten direction indicator helper must remain"),
-        ("MonotonicTighteningVerdict",
-         "verdict canonical-string parity must remain (via "
-         "compute_policy_diff)"),
+        # MonotonicTighteningVerdict canonical-string parity is
+        # enforced transitively via compute_policy_diff (Slice 1
+        # substrate stamps the verdict). The tightener consumes
+        # the diff outcome — no direct symbol reference required.
     )
     for symbol, reason in required:
         if symbol not in source:

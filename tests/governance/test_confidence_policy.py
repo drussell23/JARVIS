@@ -523,12 +523,15 @@ class TestAuthorityInvariants:
                     )
 
     def test_governance_imports_in_allowlist(self, source):
-        """Slice 1 may import ONLY from:
+        """Slice 1 may import from:
           * adaptation.ledger (MonotonicTighteningVerdict)
-          * verification.confidence_monitor (env accessors)"""
+          * verification.confidence_monitor (env accessors)
+          * meta.shipped_code_invariants (Slice 5 cage close —
+            lazy-imported inside register_shipped_invariants)"""
         allowed = {
             "backend.core.ouroboros.governance.adaptation.ledger",
             "backend.core.ouroboros.governance.verification.confidence_monitor",
+            "backend.core.ouroboros.governance.meta.shipped_code_invariants",
         }
         tree = ast.parse(source)
         for node in ast.walk(tree):

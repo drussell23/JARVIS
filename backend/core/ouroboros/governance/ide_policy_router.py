@@ -1009,26 +1009,26 @@ def register_shipped_invariants() -> list:
                     f"ide_policy_router dropped {symbol!r} — "
                     f"{reason}"
                 )
-        forbidden_imports = (
-            "from backend.core.ouroboros.governance.orchestrator",
-            "from backend.core.ouroboros.governance.iron_gate",
-            "from backend.core.ouroboros.governance.policy_engine",
-            "from backend.core.ouroboros.governance.risk_engine",
-            "from backend.core.ouroboros.governance.change_engine",
-            "from backend.core.ouroboros.governance.tool_executor",
-            "from backend.core.ouroboros.governance.providers",
-            "from backend.core.ouroboros.governance.candidate_generator",
-            "from backend.core.ouroboros.governance.semantic_guardian",
-            "from backend.core.ouroboros.governance.semantic_firewall",
-            "from backend.core.ouroboros.governance.scoped_tool_backend",
-            "from backend.core.ouroboros.governance.subagent_scheduler",
+        # Walk actual ImportFrom nodes (substring matching the
+        # source would false-positive on this very pin's
+        # forbidden-token data).
+        import ast as _ast
+        forbidden_module_tokens = (
+            ".orchestrator", ".iron_gate", ".policy_engine",
+            ".risk_engine", ".change_engine", ".tool_executor",
+            ".providers", ".candidate_generator",
+            ".semantic_guardian", ".semantic_firewall",
+            ".scoped_tool_backend", ".subagent_scheduler",
         )
-        for f in forbidden_imports:
-            if f in source:
-                violations.append(
-                    f"ide_policy_router smuggled authority "
-                    f"import: {f}"
-                )
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                for tok in forbidden_module_tokens:
+                    if module.endswith(tok):
+                        violations.append(
+                            f"ide_policy_router smuggled "
+                            f"authority import: {module}"
+                        )
         return tuple(violations)
 
     return [
