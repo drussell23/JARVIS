@@ -11,6 +11,7 @@ File advisory lock prevents two router instances on the same project root.
 from __future__ import annotations
 
 import asyncio
+import threading
 import fcntl
 import logging
 import os
@@ -383,7 +384,29 @@ class UnifiedIntakeRouter:
         # Used to detect when a new signal targets files already under active
         # modification — prevents conflicting concurrent patches.
         # TTL prevents starvation: stale locks are force-released.
+        #
+        # Q3 Slice 1 — ``_active_file_ops_lock`` closes the
+        # TTL-detect/register-overwrite race:
+        #   T1: _find_file_conflict reads entry (op_X, t_old)
+        #       and decides it's stale (now - t_old > TTL).
+        #   T2: register_active_op writes (op_Y, t_now) — fresh.
+        #   T1: del self._active_file_ops[fpath] — silently
+        #       deletes T2's fresh registration; the next
+        #       conflicting envelope dispatches concurrently with
+        #       op_Y, exactly the file conflict the lock was
+        #       meant to prevent.
+        #
+        # Fix: every read/write/delete of _active_file_ops occurs
+        # under _active_file_ops_lock (threading.Lock — works in
+        # async + sync contexts since the critical section is
+        # pure dict mutation, no I/O). The stale-release branch
+        # uses a CAS pattern: capture (op, t) outside the lock
+        # for the test, then under the lock re-verify the entry
+        # is *identity-equivalent* before deletion. A concurrent
+        # write that overwrote the entry between capture and
+        # re-verify causes the CAS to abort the delete.
         self._active_file_ops: Dict[str, Tuple[str, float]] = {}  # file_path -> (op_id, time.monotonic())
+        self._active_file_ops_lock: threading.Lock = threading.Lock()
         self._queued_behind: Dict[str, List[IntentEnvelope]] = {}  # op_id -> [envelopes]
         self._file_lock_ttl_s: float = float(
             os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300")
@@ -1228,19 +1251,42 @@ class UnifiedIntakeRouter:
         """Return the op_id of an active operation that overlaps this envelope's files.
 
         Returns None if no conflict exists (safe to dispatch concurrently).
-        Stale locks (older than ``_file_lock_ttl_s``) are force-released.
+        Stale locks (older than ``_file_lock_ttl_s``) are force-released
+        via a CAS pattern (Q3 Slice 1) — re-verifying the captured
+        entry under ``_active_file_ops_lock`` before delete so a
+        concurrent ``register_active_op`` overwriting the same key
+        is never silently clobbered.
         """
         _now = time.monotonic()
         for fpath in (envelope.target_files or []):
-            entry = self._active_file_ops.get(fpath)
-            if entry is not None:
+            with self._active_file_ops_lock:
+                entry = self._active_file_ops.get(fpath)
+                if entry is None:
+                    continue
                 _op_id, _registered_at = entry
-                if _now - _registered_at > self._file_lock_ttl_s:
-                    logger.warning(
-                        "[Router] Force-releasing stale file lock: %s held by %s for %.0fs (TTL %ds)",
-                        fpath, _op_id[:12], _now - _registered_at, self._file_lock_ttl_s,
-                    )
-                    del self._active_file_ops[fpath]
+                age = _now - _registered_at
+                if age > self._file_lock_ttl_s:
+                    # CAS: confirm the entry is still the stale tuple
+                    # before deleting. If a concurrent register_active_op
+                    # has already written a fresh tuple for this fpath,
+                    # the identity check fails and we abort the delete.
+                    current = self._active_file_ops.get(fpath)
+                    if current is not None and (
+                        current[0] == _op_id
+                        and current[1] == _registered_at
+                    ):
+                        logger.warning(
+                            "[Router] Force-releasing stale file lock: %s held by %s for %.0fs (TTL %ds)",
+                            fpath, _op_id[:12], age, self._file_lock_ttl_s,
+                        )
+                        del self._active_file_ops[fpath]
+                    else:
+                        logger.debug(
+                            "[Router] CAS aborted stale-release on %s: "
+                            "entry mutated under us (was %s, now %s)",
+                            fpath, _op_id[:12],
+                            current[0][:12] if current else "(absent)",
+                        )
                     continue
                 return _op_id
         return None
@@ -1249,23 +1295,43 @@ class UnifiedIntakeRouter:
         """Mark files as actively being modified by an operation.
 
         Called by GLS/orchestrator when an operation enters the GENERATE phase.
+        Q3 Slice 1: holds ``_active_file_ops_lock`` for the whole batch
+        so a concurrent ``release_op`` can't iterate a mid-write view.
         """
         _now = time.monotonic()
-        for fpath in target_files:
-            self._active_file_ops[fpath] = (op_id, _now)
+        with self._active_file_ops_lock:
+            for fpath in target_files:
+                self._active_file_ops[fpath] = (op_id, _now)
 
     async def release_op(self, op_id: str) -> None:
         """Release file locks for a completed/failed operation.
 
         Any envelopes that were queued behind this op are re-ingested
         into the pipeline, now that the conflicting files are free.
-        """
-        # Clear file reservations
-        stale_keys = [k for k, v in self._active_file_ops.items() if v[0] == op_id]
-        for k in stale_keys:
-            del self._active_file_ops[k]
 
-        # Re-ingest queued signals
+        Q3 Slice 1: scan + delete sequence is atomic under
+        ``_active_file_ops_lock`` so a concurrent ``register_active_op``
+        for the SAME op_id (e.g., a retry path that re-registers) can't
+        be clobbered between scan and delete.
+        """
+        # Clear file reservations atomically — also filters by op_id
+        # under the lock so we never delete a key that was already
+        # rewritten to a different op_id by a concurrent registrant.
+        with self._active_file_ops_lock:
+            stale_keys = [
+                k for k, v in self._active_file_ops.items()
+                if v[0] == op_id
+            ]
+            for k in stale_keys:
+                # Re-verify identity under the same lock — defends
+                # against a concurrent register_active_op that
+                # rewrote this exact key between the scan and the
+                # delete (would change v[0] to a different op_id).
+                current = self._active_file_ops.get(k)
+                if current is not None and current[0] == op_id:
+                    del self._active_file_ops[k]
+
+        # Re-ingest queued signals (outside the lock — ingest is async + I/O)
         queued = self._queued_behind.pop(op_id, [])
         for envelope in queued:
             logger.info(

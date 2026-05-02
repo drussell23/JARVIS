@@ -173,7 +173,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint --ext .ts src",
-    "test": "tsc -p ./tsconfig.test.json && node --test dist-test/test/types.test.js dist-test/test/client.test.js dist-test/test/panel.test.js dist-test/test/stream.parser.test.js dist-test/test/stream.lifecycle.test.js dist-test/test/stream.reconnect.test.js dist-test/test/policyClient.test.js dist-test/test/worktreeTopology.test.js dist-test/test/dagReplay.test.js dist-test/test/temporalSlider.test.js",
+    "test": "tsc -p ./tsconfig.test.json && node --test dist-test/test/types.test.js dist-test/test/client.test.js dist-test/test/panel.test.js dist-test/test/stream.parser.test.js dist-test/test/stream.lifecycle.test.js dist-test/test/stream.reconnect.test.js dist-test/test/policyClient.test.js dist-test/test/worktreeTopology.test.js dist-test/test/dagReplay.test.js dist-test/test/temporalSlider.test.js dist-test/test/crossPanel.test.js",
     "clean": "rm -rf dist dist-test"
   },
   "devDependencies": {
