@@ -273,3 +273,72 @@ __all__ = [
     "install_default_bridge",
     "worktree_topology_sse_enabled",
 ]
+
+
+def register_shipped_invariants() -> list:
+    """Slice 5 cage close — module-owned shipped-code invariant
+    for the SSE bridge (Gap #3 Slice 3).
+
+    Pinned guarantees:
+      * Bridge subscribes to BOTH autonomy event types
+        (EXECUTION_GRAPH_STATE_CHANGED + WORK_UNIT_STATE_CHANGED).
+      * Both SSE event constants referenced
+        (EVENT_TYPE_WORKTREE_TOPOLOGY_UPDATED +
+        EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED).
+      * No authority-carrying imports (no scheduler / worktree_manager /
+        orchestrator / iron_gate / etc.).
+      * Master flag name canonical.
+
+    NEVER raises. Discovery loop catches exceptions."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_bridge_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("EXECUTION_GRAPH_STATE_CHANGED",
+             "must subscribe to graph-level transitions"),
+            ("WORK_UNIT_STATE_CHANGED",
+             "must subscribe to unit-level transitions"),
+            ("EVENT_TYPE_WORKTREE_TOPOLOGY_UPDATED",
+             "graph SSE event constant must be referenced"),
+            ("EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED",
+             "unit SSE event constant must be referenced"),
+            ("StreamEventBroker",
+             "must reference broker type for translator"),
+            ("WorktreeTopologySSEBridge",
+             "bridge class must remain exported"),
+            ("install_default_bridge",
+             "convenience installer must remain exported"),
+            ("JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED",
+             "master flag name canonical"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"worktree_topology_sse_bridge dropped "
+                    f"{symbol!r} — {reason}"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="gap3_worktree_topology_sse_bridge",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "worktree_topology_sse_bridge.py"
+            ),
+            description=(
+                "Gap #3 Slice 3 bridge: subscribes to both "
+                "autonomy event types + references both SSE event "
+                "constants + bridge class + convenience installer "
+                "preserved. Catches refactor that breaks the "
+                "translator's input or output contract."
+            ),
+            validate=_validate_bridge_surface,
+        ),
+    ]

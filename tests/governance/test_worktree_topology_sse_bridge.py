@@ -68,17 +68,26 @@ def _enable(monkeypatch):
 
 
 class TestMasterFlag:
-    def test_default_off(self, monkeypatch):
+    def test_default_post_graduation_is_true(self, monkeypatch):
+        """Slice 5 graduation (2026-05-02): bridge is a pure
+        translator with fault-isolated handlers — safe to enable
+        by default."""
         monkeypatch.delenv(
             "JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED", raising=False,
         )
-        assert worktree_topology_sse_enabled() is False
+        assert worktree_topology_sse_enabled() is True
 
     def test_explicit_true(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED", "true",
         )
         assert worktree_topology_sse_enabled() is True
+
+    def test_explicit_false_hot_revert(self, monkeypatch):
+        monkeypatch.setenv(
+            "JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED", "false",
+        )
+        assert worktree_topology_sse_enabled() is False
 
     def test_garbage_value_treated_as_false(self, monkeypatch):
         monkeypatch.setenv(
@@ -255,8 +264,10 @@ class TestPayloadPassthrough:
 
 class TestMasterOffNoOp:
     def test_disabled_handlers_skip_publish(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED", raising=False,
+        # Hot-revert: explicit ``=false`` skips publishes even
+        # when bridge is installed.
+        monkeypatch.setenv(
+            "JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED", "false",
         )
 
         async def main():
@@ -315,8 +326,10 @@ class TestDefensive:
 
 class TestConvenienceMasterOff:
     def test_returns_none_when_disabled(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED", raising=False,
+        # Hot-revert: explicit ``=false`` returns None even
+        # post-graduation.
+        monkeypatch.setenv(
+            "JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED", "false",
         )
         emitter = EventEmitter()
         result = install_default_bridge(emitter)

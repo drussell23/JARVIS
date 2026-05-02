@@ -654,10 +654,13 @@ class TestAuthorityInvariants:
                     )
 
     def test_governance_imports_in_allowlist(self, source):
-        """Slice 1 may import ONLY:
-          * autonomy.subagent_types (frozen DAG types)"""
+        """Slice 1 may import:
+          * autonomy.subagent_types (frozen DAG types)
+          * meta.shipped_code_invariants (Slice 5 cage close —
+            lazy-imported inside register_shipped_invariants)"""
         allowed = {
             "backend.core.ouroboros.governance.autonomy.subagent_types",
+            "backend.core.ouroboros.governance.meta.shipped_code_invariants",
         }
         tree = ast.parse(source)
         for node in ast.walk(tree):

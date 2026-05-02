@@ -955,6 +955,11 @@ class GovernedLoopService:
         self._feedback_loop_task: Optional[asyncio.Task] = None
         self._safety_net: Optional[ProductionSafetyNet] = None
         self._subagent_scheduler: Optional[Any] = None
+        # Gap #3 Slice 5 — hoisted from inner block so the
+        # EventChannelServer + IDE observability router can
+        # project the worktree topology in the GET surface. None
+        # when l3 worktree isolation is disabled.
+        self._worktree_manager: Optional[Any] = None
         # Miner graph coalescer — wired alongside the L3 scheduler below.
         self._graph_coalescer: Optional[Any] = None
         self._advanced_autonomy: Optional[Any] = None
@@ -3286,6 +3291,13 @@ class GovernedLoopService:
                         repo_root=self._config.project_root,
                         worktree_base=_wt_base,
                     )
+                    # Gap #3 Slice 5 — hoist to instance attribute so
+                    # the EventChannelServer + ide_observability
+                    # router can project worktree paths into the
+                    # topology GET surface. Local _wt_manager is the
+                    # canonical reference; instance attribute is the
+                    # cross-block accessor for later wiring.
+                    self._worktree_manager = _wt_manager
                     logger.info("[GovernedLoop] WorktreeManager wired: base=%s", _wt_base)
 
                     # §2 Progressive Awakening: reap orphan worktrees from any
@@ -3342,6 +3354,22 @@ class GovernedLoopService:
                 self._config.execution_graph_state_dir,
                 self._config.max_concurrent_execution_graphs,
             )
+
+            # Gap #3 Slice 5 — install the SSE bridge. Best-effort:
+            # master-flag-off → no-op + returns None. The bridge
+            # subscribes to autonomy EventEmitter events and
+            # republishes on the IDE StreamEventBroker so the IDE
+            # worktree topology panel can refresh without polling.
+            try:
+                from backend.core.ouroboros.governance.verification.worktree_topology_sse_bridge import (
+                    install_default_bridge as _install_topology_bridge,
+                )
+                _install_topology_bridge(self._event_emitter)
+            except Exception as _bridge_exc:
+                logger.debug(
+                    "[GovernedLoop] worktree topology SSE bridge "
+                    "install raised (non-fatal): %s", _bridge_exc,
+                )
 
             # Manifesto §3 parallel DAG: miner signal coalescer — collapses
             # N same-strategy miner candidates into a single ExecutionGraph
@@ -3521,6 +3549,13 @@ class GovernedLoopService:
                 _evt_channel = EventChannelServer(
                     router=_intake,
                     batch_registry=_batch_reg,
+                    # Gap #3 Slice 5 — pass scheduler + WM refs so
+                    # the IDE observability worktree topology
+                    # routes can project live state. Both default
+                    # to None (degrades to 503 cleanly) when L3
+                    # isolation isn't wired.
+                    scheduler=self._subagent_scheduler,
+                    worktree_manager=self._worktree_manager,
                 )
                 if _evt_channel.is_enabled:
                     await _evt_channel.start()

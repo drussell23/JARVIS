@@ -104,11 +104,20 @@ class EventChannelServer:
         doc_staleness_sensor: Any = None,  # Optional[DocStalenessSensor]
         cross_repo_drift_sensor: Any = None,  # Optional[CrossRepoDriftSensor]
         performance_regression_sensor: Any = None,  # Optional[PerformanceRegressionSensor]
+        scheduler: Any = None,  # Gap #3 Slice 5 — Optional[SubagentScheduler] for worktree topology GET routes
+        worktree_manager: Any = None,  # Gap #3 Slice 5 — Optional[WorktreeManager] for topology git query
     ) -> None:
         self._router = router
         self._port = port
         self._host = host
         self._batch_registry = batch_registry
+        # Gap #3 Slice 5 — duck-typed refs threaded through to the
+        # IDEObservabilityRouter so the worktree topology GET
+        # routes can project scheduler in-memory state. Both default
+        # to None — the routes return 503 cleanly when unwired
+        # (graceful degradation; matches the cancel-route discipline).
+        self._scheduler = scheduler
+        self._worktree_manager = worktree_manager
         # Phase B Slice 1 (gap #4 migration): when wired and
         # ``JARVIS_GITHUB_WEBHOOK_ENABLED=true``, GitHub ``issues`` events
         # short-circuit to the sensor's ``ingest_webhook`` so the emitted
@@ -184,7 +193,15 @@ class EventChannelServer:
                 )
                 if ide_observability_enabled():
                     assert_loopback_only(self._host)
-                    IDEObservabilityRouter().register_routes(app)
+                    # Gap #3 Slice 5 — pass scheduler + worktree_manager
+                    # refs so the worktree topology GET routes can
+                    # project live state. Defaults remain None when
+                    # the EventChannelServer was constructed without
+                    # them (older callers); the routes degrade to 503.
+                    IDEObservabilityRouter(
+                        scheduler=self._scheduler,
+                        worktree_manager=self._worktree_manager,
+                    ).register_routes(app)
                     ide_router_mounted = True
             except ValueError as loopback_exc:
                 logger.warning(

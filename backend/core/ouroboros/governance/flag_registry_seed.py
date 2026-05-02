@@ -2572,6 +2572,46 @@ SEED_SPECS: list = [
         example="30",
         since="Gap #2 Slice 4",
     ),
+    # ====================================================================
+    # Deep Observability Gap #3 — Worktree Topology View (2 flags)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_WORKTREE_TOPOLOGY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Substrate master for the L3 worktree topology read view "
+            "(Gap #3 Slice 1). Pure read-only projection over "
+            "SubagentScheduler in-memory state + caller-supplied git "
+            "worktree paths; structurally safe to enable by default. "
+            "Graduated default-true 2026-05-02 (Slice 5)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "worktree_topology.py"
+        ),
+        example="true",
+        since="Gap #3 Slice 1 (graduated Slice 5)",
+    ),
+    FlagSpec(
+        name="JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "SSE bridge master for the L3 worktree topology stream "
+            "(Gap #3 Slice 3). Pure translator (autonomy "
+            "EventEmitter → IDE StreamEventBroker), zero scheduler "
+            "modification; handlers are fault-isolated by autonomy "
+            "AND defense-in-depth try/except in each handler body. "
+            "Graduated default-true 2026-05-02 (Slice 5)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/verification/"
+            "worktree_topology_sse_bridge.py"
+        ),
+        example="true",
+        since="Gap #3 Slice 3 (graduated Slice 5)",
+    ),
 ]
 
 

@@ -1966,3 +1966,69 @@ class IDEObservabilityRouter:
             git_worktree_paths=paths,
         )
 
+
+
+def register_shipped_invariants() -> list:
+    """Gap #3 Slice 5 cage close — module-owned shipped-code
+    invariant for the worktree GET routes.
+
+    Pinned guarantees:
+      * Both worktree route paths registered
+        (``/observability/worktrees`` +
+        ``/observability/worktrees/{graph_id}``).
+      * Both handler methods present.
+      * Constructor accepts ``scheduler`` + ``worktree_manager``
+        kwargs (defense against refactor that drops the duck-
+        typed wiring).
+      * No authority-carrying imports in the new code path.
+
+    NEVER raises. Discovery loop catches exceptions."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_worktree_routes_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ('"/observability/worktrees"',
+             'list route path must remain registered'),
+            ('"/observability/worktrees/{graph_id}"',
+             'detail route path must remain registered'),
+            ('_handle_worktrees_list',
+             'list handler method must remain'),
+            ('_handle_worktree_detail',
+             'detail handler method must remain'),
+            ('_compute_topology',
+             'shared compute helper must remain'),
+            ('scheduler: Optional[Any] = None',
+             'scheduler kwarg must remain on constructor'),
+            ('worktree_manager: Optional[Any] = None',
+             'worktree_manager kwarg must remain on constructor'),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"ide_observability worktree routes "
+                    f"dropped {symbol!r} — {reason}"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="gap3_ide_observability_worktrees_routes",
+            target_file=(
+                "backend/core/ouroboros/governance/ide_observability.py"
+            ),
+            description=(
+                "Gap #3 Slice 2 GET routes: both worktree route "
+                "paths registered + both handler methods + shared "
+                "compute helper + constructor accepts scheduler + "
+                "worktree_manager kwargs. Catches refactor that "
+                "breaks the read-surface wiring."
+            ),
+            validate=_validate_worktree_routes_surface,
+        ),
+    ]

@@ -666,3 +666,85 @@ __all__ = [
     "compute_worktree_topology",
     "worktree_topology_enabled",
 ]
+
+
+def register_shipped_invariants() -> list:
+    """Slice 5 cage close — module-owned shipped-code invariant
+    for the L3 worktree topology substrate (Gap #3 Slice 1).
+
+    Pinned guarantees:
+      * 5-value ``TopologyOutcome`` and 2-value ``EdgeKind``
+        closed enums preserve their full vocabularies.
+      * Frozen records (``WorktreeNode``, ``TopologyEdge``,
+        ``GraphTopology``, ``TopologySummary``,
+        ``WorktreeTopology``) remain exported.
+      * ``compute_worktree_topology`` total decision function
+        remains exported (Slice 2 GET routes + Slice 4 panel
+        both depend on it).
+      * Master flag name canonical.
+
+    NEVER raises. Discovery loop catches exceptions."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_substrate_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("WorktreeNode",
+             "Slice 1 frozen node record must remain exported"),
+            ("TopologyEdge",
+             "Slice 1 frozen edge record must remain exported"),
+            ("GraphTopology",
+             "Slice 1 per-graph projection must remain exported"),
+            ("TopologySummary",
+             "Slice 1 aggregate summary must remain exported"),
+            ("WorktreeTopology",
+             "Slice 1 top-level projection must remain exported"),
+            ("compute_worktree_topology",
+             "Slice 1 total decision function must remain"),
+            ("TopologyOutcome",
+             "Slice 1 5-value Outcome enum must remain"),
+            ("EdgeKind",
+             "Slice 1 2-value EdgeKind enum must remain"),
+            ("JARVIS_WORKTREE_TOPOLOGY_ENABLED",
+             "master flag name canonical"),
+            ("OK", "Outcome enum must include OK"),
+            ("EMPTY", "Outcome enum must include EMPTY"),
+            ("DISABLED", "Outcome enum must include DISABLED"),
+            ("SCHEDULER_INVALID",
+             "Outcome enum must include SCHEDULER_INVALID"),
+            ("FAILED", "Outcome enum must include FAILED"),
+            ("DEPENDENCY",
+             "EdgeKind enum must include DEPENDENCY"),
+            ("BARRIER", "EdgeKind enum must include BARRIER"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"worktree_topology substrate dropped "
+                    f"{symbol!r} — {reason}"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="gap3_worktree_topology_substrate",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "worktree_topology.py"
+            ),
+            description=(
+                "Gap #3 Slice 1 substrate: 5-value Outcome + "
+                "2-value EdgeKind closed enums, 5 frozen "
+                "projection records, compute_worktree_topology "
+                "total function. Catches refactor that drops "
+                "the substrate Slice 2 GET routes + Slice 4 "
+                "panel both depend on."
+            ),
+            validate=_validate_substrate_surface,
+        ),
+    ]
