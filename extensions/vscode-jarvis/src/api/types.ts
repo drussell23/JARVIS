@@ -325,6 +325,38 @@ export interface DagRecordResponse extends Envelope {
   readonly subgraph_node_count: number;
 }
 
+// Q2 Slice 6 — DAG record diff (state-diff between two records
+// in the same session DAG).
+
+export type DagDiffOutcome =
+  | 'ok'
+  | 'empty'
+  | 'truncated'
+  | 'invalid'
+  | 'failed';
+
+export type DagDiffChangeKind =
+  | 'added'
+  | 'removed'
+  | 'modified';
+
+export interface DagDiffFieldChange {
+  readonly path: readonly string[];
+  readonly kind: DagDiffChangeKind;
+  readonly value_a_repr: string;
+  readonly value_b_repr: string;
+}
+
+export interface DagDiffResponse extends Envelope {
+  readonly outcome: DagDiffOutcome;
+  readonly record_id_a: string;
+  readonly record_id_b: string;
+  readonly changes: readonly DagDiffFieldChange[];
+  readonly fields_total: number;
+  readonly fields_changed: number;
+  readonly detail: string;
+}
+
 export interface ReplayHealthResponse extends Envelope {
   readonly enabled: boolean;
   readonly engine_enabled: boolean;

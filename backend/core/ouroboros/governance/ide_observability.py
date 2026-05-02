@@ -291,6 +291,12 @@ class IDEObservabilityRouter:
             "/observability/dag/{session_id}/{record_id}",
             self._handle_dag_record,
         )
+        # Q2 Slice 6 — deterministic state-diff between two DAG
+        # records. Both ids in path; same-session only by design.
+        app.router.add_get(
+            "/observability/dag/{session_id}/diff/{record_id_a}/{record_id_b}",
+            self._handle_dag_diff,
+        )
         # Priority #3 Slice 5b — Counterfactual Replay surface.
         app.router.add_get(
             "/observability/replay/health",
@@ -1819,6 +1825,71 @@ class IDEObservabilityRouter:
         verdicts under the conventional /history naming. Same
         bounded projection + same shape."""
         return await self._handle_replay_verdicts(request)
+
+    # ----------------------------------------------------------------------
+    # Q2 Slice 6 — DAG record diff
+    # ----------------------------------------------------------------------
+
+    async def _handle_dag_diff(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/dag/{session_id}/diff/{record_id_a}/{record_id_b}``
+        — deterministic state-diff between two records in the
+        same DAG.
+
+        Response shape (success): the substrate's
+        ``RecordDiff.to_dict()`` projection — outcome / changes /
+        fields_total / fields_changed / detail.
+
+        Errors mirror the substrate's reason_code vocabulary:
+        ``dag_navigation.disabled`` / ``dag_query.disabled`` →
+        403, ``dag_navigation.not_found`` → 404 (with ``missing``
+        field carrying which id was absent), other errors → 500.
+        Path-param malformation surfaces as 400."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        session_id = request.match_info.get("session_id", "") or ""
+        record_id_a = request.match_info.get("record_id_a", "") or ""
+        record_id_b = request.match_info.get("record_id_b", "") or ""
+        if not _SESSION_ID_RE.match(session_id):
+            return self._error_response(
+                request, 400, "ide_observability.invalid_session_id",
+            )
+        if not _RECORD_ID_RE.match(record_id_a):
+            return self._error_response(
+                request, 400, "ide_observability.invalid_record_id",
+            )
+        if not _RECORD_ID_RE.match(record_id_b):
+            return self._error_response(
+                request, 400, "ide_observability.invalid_record_id",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.dag_navigation import (
+                handle_dag_diff,
+            )
+            result = handle_dag_diff(
+                record_id_a, record_id_b, session_id=session_id,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] dag_diff import/call failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500, "ide_observability.dag_diff_error",
+            )
+        if isinstance(result, dict) and result.get("error"):
+            reason = str(result.get("reason_code", "") or "")
+            return self._error_response(
+                request, self._dag_status_for_reason(reason), reason,
+            )
+        return self._json_response(request, 200, result)
 
     # ----------------------------------------------------------------------
     # Gap #3 Slice 2 — L3 worktree topology projection

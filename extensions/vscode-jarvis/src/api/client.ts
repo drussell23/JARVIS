@@ -9,6 +9,7 @@
  */
 
 import {
+  DagDiffResponse,
   DagRecordResponse,
   DagSessionResponse,
   HealthResponse,
@@ -198,6 +199,32 @@ export class ObservabilityClient {
     }
     return this.get<DagSessionResponse>(
       `/observability/dag/${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  public async dagDiff(
+    sessionId: string, recordIdA: string, recordIdB: string,
+  ): Promise<DagDiffResponse> {
+    if (!/^[A-Za-z0-9_\-:.]{1,128}$/.test(sessionId)) {
+      throw new ObservabilityError(
+        `malformed session_id: ${sessionId}`,
+        400, 'client.malformed_session_id',
+      );
+    }
+    if (!/^[A-Za-z0-9_\-:.]{1,256}$/.test(recordIdA)) {
+      throw new ObservabilityError(
+        `malformed record_id_a: ${recordIdA}`,
+        400, 'client.malformed_record_id',
+      );
+    }
+    if (!/^[A-Za-z0-9_\-:.]{1,256}$/.test(recordIdB)) {
+      throw new ObservabilityError(
+        `malformed record_id_b: ${recordIdB}`,
+        400, 'client.malformed_record_id',
+      );
+    }
+    return this.get<DagDiffResponse>(
+      `/observability/dag/${encodeURIComponent(sessionId)}/diff/${encodeURIComponent(recordIdA)}/${encodeURIComponent(recordIdB)}`,
     );
   }
 

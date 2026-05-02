@@ -412,6 +412,66 @@ def handle_dag_record(record_id: str, session_id: Optional[str] = None) -> Dict[
         return {"error": True, "reason_code": "dag_navigation.error"}
 
 
+def handle_dag_diff(
+    record_id_a: str, record_id_b: str,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Q2 Slice 6 — compute deterministic state-diff between two
+    records in the same DAG.
+
+    Returns the ``RecordDiff.to_dict()`` shape with:
+      ``outcome``, ``record_id_a``, ``record_id_b``, ``changes``,
+      ``fields_total``, ``fields_changed``, ``detail``.
+
+    Errors mirror handle_dag_record's vocabulary:
+      ``dag_navigation.disabled`` / ``dag_query.disabled`` →
+      surface-master gates, ``dag_navigation.not_found`` →
+      either record id absent in the DAG, ``dag_navigation.error``
+      → defensive sentinel.
+
+    Both records MUST belong to the same session DAG (caller
+    supplies ``session_id`` once; both ids resolved against the
+    same ``CausalityDAG`` instance). Cross-session diffing is
+    intentionally NOT supported — semantically meaningless without
+    a shared causality root.
+
+    NEVER raises."""
+    try:
+        if not _get_enabled():
+            return {"error": True, "reason_code": "dag_navigation.disabled"}
+        if not dag_query_enabled():
+            return {"error": True, "reason_code": "dag_query.disabled"}
+        dag = build_dag(session_id)
+        rec_a = dag.node(record_id_a)
+        if rec_a is None:
+            return {
+                "error": True,
+                "reason_code": "dag_navigation.not_found",
+                "missing": record_id_a,
+            }
+        rec_b = dag.node(record_id_b)
+        if rec_b is None:
+            return {
+                "error": True,
+                "reason_code": "dag_navigation.not_found",
+                "missing": record_id_b,
+            }
+        # Lazy substrate import — keeps this module's import
+        # graph clean (dag_record_diff lives one tier above).
+        from backend.core.ouroboros.governance.verification.dag_record_diff import (
+            compute_record_diff,
+        )
+        result = compute_record_diff(
+            record_a=rec_a.to_dict(),
+            record_b=rec_b.to_dict(),
+            record_id_a=record_id_a,
+            record_id_b=record_id_b,
+        )
+        return result.to_dict()
+    except Exception:  # noqa: BLE001
+        return {"error": True, "reason_code": "dag_navigation.error"}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -431,6 +491,7 @@ __all__ = [
     "EVENT_TYPE_DAG_FORK_DETECTED",
     "dag_navigation_enabled",
     "dispatch_dag_command",
+    "handle_dag_diff",
     "handle_dag_record",
     "handle_dag_session",
     "publish_dag_fork_event",

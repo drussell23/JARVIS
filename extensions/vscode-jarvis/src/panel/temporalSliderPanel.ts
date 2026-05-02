@@ -26,6 +26,7 @@
 import * as vscode from 'vscode';
 import { ObservabilityClient, ObservabilityError } from '../api/client';
 import {
+  DagDiffResponse,
   DagRecordResponse,
   DagSessionResponse,
   ReplayHealthResponse,
@@ -34,6 +35,7 @@ import {
   StreamEventFrame,
   isReplayEvent,
 } from '../api/types';
+import { EntityRef } from '../api/entityTypes';
 import {
   TemporalSliderState,
   renderErrorHtml,
@@ -45,7 +47,9 @@ interface MessageFromWebview {
     | 'refresh'
     | 'select_session'
     | 'select_record'
-    | 'set_prefix_filter';
+    | 'set_prefix_filter'
+    | 'set_anchor'
+    | 'clear_anchor';
   readonly payload?: unknown;
 }
 
@@ -59,6 +63,10 @@ interface SelectRecordPayload {
 
 interface PrefixFilterPayload {
   readonly prefix: string;
+}
+
+interface SetAnchorPayload {
+  readonly record_id: string;
 }
 
 export class TemporalSliderPanel {
@@ -78,6 +86,8 @@ export class TemporalSliderPanel {
     record: null,
     replayHealth: null,
     replayVerdicts: null,
+    anchorRecordId: null,
+    diff: null,
   };
 
   // Debounce / dedup state.
@@ -130,6 +140,55 @@ export class TemporalSliderPanel {
 
   public isOpen(): boolean {
     return this.panel !== null;
+  }
+
+  /**
+   * Q2 Slice 7 — cross-panel entity reveal. Scopes the panel to
+   * the supplied entity:
+   *   * ``session_id`` → opens panel + selects that session
+   *   * ``record_id`` → opens panel + selects session (from
+   *     ``context.session_id``) + scrubs to the record
+   *
+   * Other kinds are no-ops (the kind isn't owned by this panel;
+   * the linker should have filtered).
+   *
+   * NEVER raises. Best-effort: if the session isn't in the
+   * current sessions list, the panel still opens but stays at
+   * the default state.
+   */
+  public async revealEntity(ref: EntityRef): Promise<void> {
+    await this.show();
+    if (ref.kind === 'session_id') {
+      await this.handleSelectSession({ session_id: ref.id });
+      return;
+    }
+    if (ref.kind === 'record_id') {
+      const sessionId = ref.context?.session_id;
+      if (typeof sessionId !== 'string' || sessionId === '') {
+        this.logger(
+          `temporalSlider.revealEntity: record_id ${ref.id} ` +
+          `missing session_id context — opening panel only`,
+        );
+        return;
+      }
+      // Set the session first
+      if (this.state.selectedSessionId !== sessionId) {
+        await this.handleSelectSession({ session_id: sessionId });
+      }
+      // Then locate + select the record by id. Refresh re-built
+      // the DAG; selectedRecordIndex was set to 0 by handleSelectSession.
+      const dag = this.state.dag;
+      if (dag === null) return;
+      const idx = dag.record_ids.indexOf(ref.id);
+      if (idx >= 0) {
+        await this.handleSelectRecord({ record_index: idx });
+      } else {
+        this.logger(
+          `temporalSlider.revealEntity: record_id ${ref.id} ` +
+          `not in session ${sessionId} DAG`,
+        );
+      }
+    }
   }
 
   public dispose(): void {
@@ -260,6 +319,14 @@ export class TemporalSliderPanel {
           msg.payload as PrefixFilterPayload,
         );
         return;
+      case 'set_anchor':
+        await this.handleSetAnchor(
+          msg.payload as SetAnchorPayload,
+        );
+        return;
+      case 'clear_anchor':
+        await this.handleClearAnchor();
+        return;
       default:
         this.logger(
           `temporalSlider: unknown message type=${
@@ -275,11 +342,16 @@ export class TemporalSliderPanel {
     const sid = payload?.session_id;
     if (typeof sid !== 'string' || sid === '') return;
     // Reset record selection on new session — a different DAG.
+    // Q2 Slice 6: ALSO clear the anchor — diffing across sessions
+    // is unsupported (substrate forbids cross-session DAG queries),
+    // so a stale anchor would dangle.
     this.state = {
       ...this.state,
       selectedSessionId: sid,
       selectedRecordIndex: 0,  // auto-select first record
       record: null,
+      anchorRecordId: null,
+      diff: null,
     };
     await this.refresh();
   }
@@ -294,13 +366,37 @@ export class TemporalSliderPanel {
     if (idx < 0 || idx >= this.state.dag.record_ids.length) return;
 
     const myToken = ++this.fetchToken;
+    const sid = this.state.selectedSessionId;
     const recordId = this.state.dag.record_ids[idx];
-    const record = await this.fetchRecord(
-      this.state.selectedSessionId, recordId,
-    );
+    const record = await this.fetchRecord(sid, recordId);
     if (myToken !== this.fetchToken || this.panel === null) return;
+
+    // Q2 Slice 6 — auto-fetch diff against the anchor when one
+    // is set AND the new record differs from the anchor.
+    let diff: DagDiffResponse | null = null;
+    const anchor = this.state.anchorRecordId;
+    if (anchor !== null && anchor !== recordId) {
+      // Render with diff=null first (renderer shows "computing…")
+      this.state = {
+        ...this.state,
+        selectedRecordIndex: idx,
+        record,
+        diff: null,
+      };
+      this.renderState();
+      diff = await this.fetchDiff(sid, anchor, recordId);
+      if (myToken !== this.fetchToken || this.panel === null) return;
+      this.state = { ...this.state, diff };
+      this.renderState();
+      return;
+    }
+
+    // No anchor → clear any stale diff
     this.state = {
-      ...this.state, selectedRecordIndex: idx, record,
+      ...this.state,
+      selectedRecordIndex: idx,
+      record,
+      diff: anchor === null ? null : this.state.diff,
     };
     this.renderState();
   }
@@ -316,6 +412,36 @@ export class TemporalSliderPanel {
     const sessions = await this.fetchSessions();
     if (myToken !== this.fetchToken || this.panel === null) return;
     this.state = { ...this.state, sessions };
+    this.renderState();
+  }
+
+  private async handleSetAnchor(
+    payload: SetAnchorPayload,
+  ): Promise<void> {
+    const rid = payload?.record_id;
+    if (typeof rid !== 'string' || rid === '') return;
+    if (this.state.selectedSessionId === null) return;
+    this.state = {
+      ...this.state, anchorRecordId: rid, diff: null,
+    };
+    this.renderState();
+    // If the operator's currently-selected record is different
+    // from the new anchor, kick off a diff fetch immediately.
+    const cur = this.state.record;
+    const sid = this.state.selectedSessionId;
+    if (cur !== null && cur.record_id !== rid && sid !== null) {
+      const myToken = ++this.fetchToken;
+      const diff = await this.fetchDiff(sid, rid, cur.record_id);
+      if (myToken !== this.fetchToken || this.panel === null) return;
+      this.state = { ...this.state, diff };
+      this.renderState();
+    }
+  }
+
+  private async handleClearAnchor(): Promise<void> {
+    this.state = {
+      ...this.state, anchorRecordId: null, diff: null,
+    };
     this.renderState();
   }
 
@@ -374,6 +500,19 @@ export class TemporalSliderPanel {
     }
   }
 
+  private async fetchDiff(
+    sessionId: string, recordIdA: string, recordIdB: string,
+  ): Promise<DagDiffResponse | null> {
+    try {
+      return await this.getClient().dagDiff(
+        sessionId, recordIdA, recordIdB,
+      );
+    } catch (exc) {
+      this.logErr('dagDiff', exc);
+      return null;
+    }
+  }
+
   private logErr(slice: string, exc: unknown): void {
     if (exc instanceof ObservabilityError) {
       this.logger(
@@ -403,6 +542,7 @@ export class TemporalSliderPanel {
       sessions: null, selectedSessionId: null, dag: null,
       selectedRecordIndex: -1, record: null,
       replayHealth: null, replayVerdicts: null,
+      anchorRecordId: null, diff: null,
     };
     this.prefix = '';
   }

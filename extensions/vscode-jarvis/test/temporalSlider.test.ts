@@ -36,6 +36,8 @@ function emptyState(): TemporalSliderState {
     record: null,
     replayHealth: null,
     replayVerdicts: null,
+    anchorRecordId: null,
+    diff: null,
   };
 }
 
@@ -378,4 +380,196 @@ test('isReplayEvent rejects worktree + task + heartbeat events', () => {
   assert.equal(isReplayEvent(mkFrame('worktree_topology_updated')), false);
   assert.equal(isReplayEvent(mkFrame('task_created')), false);
   assert.equal(isReplayEvent(mkFrame('heartbeat')), false);
+});
+
+
+// ============================================================================
+// Q2 Slice 6 — Diff UI
+// ============================================================================
+
+
+function stateWithSelectedRecord(
+  recordId: string,
+): TemporalSliderState {
+  return {
+    ...emptyState(),
+    sessions: {
+      schema_version: '1.0', sessions: [baseSession], count: 1,
+    },
+    selectedSessionId: baseSession.session_id,
+    dag: { ...baseDag, record_ids: [recordId, 'r-other'] },
+    selectedRecordIndex: 0,
+    record: { ...baseRecord, record_id: recordId },
+  };
+}
+
+
+test('renderHtml: no anchor → "Pin as diff anchor" button', () => {
+  const html = renderHtml(stateWithSelectedRecord('r-cur'), 'n');
+  assert.match(html, /id="set-anchor"/);
+  assert.match(html, /Pin as diff anchor/);
+  // No diff section yet
+  assert.doesNotMatch(html, /Diff vs anchor/);
+});
+
+
+test('renderHtml: anchor === current → identity badge', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-cur',
+  }, 'n');
+  assert.match(html, /class="anchor-pill"/);
+  assert.match(html, /id="clear-anchor"/);
+  // Diff section explains the identity case
+  assert.match(html, /current record is the anchor/);
+});
+
+
+test('renderHtml: anchor set + diff loading → "computing…" UX', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-anchor',
+    diff: null,
+  }, 'n');
+  assert.match(html, /Diff vs anchor/);
+  assert.match(html, /computing diff/);
+  assert.match(html, /<code>r-anchor<\/code>/);
+});
+
+
+test('renderHtml: diff OK with changes renders rows by kind', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-anchor',
+    diff: {
+      schema_version: 'dag_record_diff.1',
+      outcome: 'ok',
+      record_id_a: 'r-anchor', record_id_b: 'r-cur',
+      changes: [
+        { path: ['phase'], kind: 'modified',
+          value_a_repr: "'plan'", value_b_repr: "'generate'" },
+        { path: ['x'], kind: 'added',
+          value_a_repr: '', value_b_repr: '42' },
+        { path: ['old_field'], kind: 'removed',
+          value_a_repr: '"gone"', value_b_repr: '' },
+      ],
+      fields_total: 8, fields_changed: 3, detail: '',
+    },
+  }, 'n');
+  assert.match(html, /3 of 8 fields differ/);
+  assert.match(html, /diff-row diff-modified/);
+  assert.match(html, /diff-row diff-added/);
+  assert.match(html, /diff-row diff-removed/);
+  // Path rendered with .-separator
+  assert.match(html, /<code>phase<\/code>/);
+  // Anchor / current spelled out
+  assert.match(html, /anchor:\s*<code>r-anchor<\/code>/);
+  assert.match(html, /current:\s*<code>r-cur<\/code>/);
+});
+
+
+test('renderHtml: diff OK identical records → "records are identical"', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-anchor',
+    diff: {
+      schema_version: 'dag_record_diff.1',
+      outcome: 'ok',
+      record_id_a: 'r-anchor', record_id_b: 'r-cur',
+      changes: [],
+      fields_total: 5, fields_changed: 0, detail: '',
+    },
+  }, 'n');
+  assert.match(html, /records are identical/);
+});
+
+
+test('renderHtml: diff truncated → warning pill', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-anchor',
+    diff: {
+      schema_version: 'dag_record_diff.1',
+      outcome: 'truncated',
+      record_id_a: 'r-anchor', record_id_b: 'r-cur',
+      changes: new Array(10).fill(0).map((_, i) => ({
+        path: [`k${i}`], kind: 'modified' as const,
+        value_a_repr: 'a', value_b_repr: 'b',
+      })),
+      fields_total: 50, fields_changed: 10,
+      detail: 'emitted 10 changes (cap 10); operator should narrow scope',
+    },
+  }, 'n');
+  assert.match(html, /class="warn-pill"/);
+  assert.match(html, /truncated/);
+});
+
+
+test('renderHtml: diff failed → warn box with detail', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-anchor',
+    diff: {
+      schema_version: 'dag_record_diff.1',
+      outcome: 'failed',
+      record_id_a: 'r-anchor', record_id_b: 'r-cur',
+      changes: [],
+      fields_total: 0, fields_changed: 0,
+      detail: 'compute_failed:RuntimeError',
+    },
+  }, 'n');
+  assert.match(html, /class="warn"/);
+  assert.match(html, /compute_failed:RuntimeError/);
+});
+
+
+test('renderHtml: diff empty outcome → "no fields"', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-anchor',
+    diff: {
+      schema_version: 'dag_record_diff.1',
+      outcome: 'empty',
+      record_id_a: 'r-anchor', record_id_b: 'r-cur',
+      changes: [], fields_total: 0, fields_changed: 0, detail: '',
+    },
+  }, 'n');
+  assert.match(html, /no fields on either record/);
+});
+
+
+test('renderHtml: diff payload XSS-escaped in repr fields', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-anchor',
+    diff: {
+      schema_version: 'dag_record_diff.1',
+      outcome: 'ok',
+      record_id_a: 'r-anchor', record_id_b: 'r-cur',
+      changes: [
+        { path: ['<bad>'], kind: 'modified',
+          value_a_repr: '<script>alert(1)</script>',
+          value_b_repr: '"<img src=x>"' },
+      ],
+      fields_total: 1, fields_changed: 1, detail: '',
+    },
+  }, 'n');
+  // Raw injection strings must NOT appear
+  assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
+  assert.doesNotMatch(html, /<img src=x>/);
+  // Escaped forms present
+  assert.match(html, /&lt;script&gt;alert/);
+  assert.match(html, /&lt;bad&gt;/);
+});
+
+
+test('renderHtml: anchor is foreign record → "anchor: <code>...</code>"', () => {
+  const html = renderHtml({
+    ...stateWithSelectedRecord('r-cur'),
+    anchorRecordId: 'r-anchor',
+  }, 'n');
+  // The anchor bar shows the foreign anchor id
+  assert.match(html, /anchor:\s*<code>r-anchor<\/code>/);
+  // Re-pin button visible to operator
+  assert.match(html, /Re-pin to current/);
 });

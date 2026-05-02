@@ -203,6 +203,26 @@ def _generate_attachments_enabled() -> bool:
     raw = os.environ.get(_GENERATE_ATTACHMENTS_ENABLED_ENV, "true").strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
+
+def _skill_prompt_injection_enabled() -> bool:
+    """``JARVIS_SKILL_PROMPT_INJECTION_ENABLED`` (default ``true``).
+
+    Q1 Slice 3 — gates the injection of operator-blessed skills
+    into the GENERATE prompt's tool catalog. When off, the model
+    sees the built-in tool list only (parity with pre-Slice-3
+    behavior); operator-installed skills are dispatchable via the
+    ``mcp_*`` Venom path but are NOT advertised to the model.
+
+    Operator hot-revert via ``=false`` instantly stops the
+    advertisement on the next prompt build (no restart needed).
+    NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_SKILL_PROMPT_INJECTION_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return True  # Q1 Slice 3 graduation default
+    return raw in ("1", "true", "yes", "on")
+
 # BG/SPEC route cost optimization — these routes target text-only models
 # (DW Gemma for BACKGROUND, DW fire-and-forget for SPECULATIVE) where
 # multi-modal payloads would either be dropped by the provider or waste
@@ -1468,6 +1488,25 @@ def _build_tool_section(
             else:
                 base += f"- `{name}(...)` — {desc}\n"
         base += "\n"
+
+    # Q1 Slice 3 — operator-blessed Skills become visible to the
+    # model. Without this injection, ``render_skill_tool_block``
+    # was a dead export: operators could install skills, mark
+    # them MODEL-reach, but the model never saw them in its
+    # prompt and could never reach for them. Default-on behind
+    # ``JARVIS_SKILL_PROMPT_INJECTION_ENABLED`` (graduated).
+    # Best-effort: any failure in the lazy bridge import returns
+    # an empty string and the prompt continues unchanged.
+    if _skill_prompt_injection_enabled():
+        try:
+            from backend.core.ouroboros.governance.skill_venom_bridge import (
+                render_skill_tool_block as _render_skill_block,
+            )
+            skill_block = _render_skill_block()
+            if skill_block:
+                base += skill_block + "\n\n"
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     base += (
         f"Max {MAX_TOOL_ITERATIONS} tool rounds total. After gathering info, respond with the patch JSON.\n\n"

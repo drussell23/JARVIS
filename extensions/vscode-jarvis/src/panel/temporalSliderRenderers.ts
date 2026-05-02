@@ -18,6 +18,7 @@
  */
 
 import {
+  DagDiffResponse,
   DagRecordResponse,
   DagSessionResponse,
   ReplayHealthResponse,
@@ -39,6 +40,14 @@ export interface TemporalSliderState {
   readonly record: DagRecordResponse | null;
   readonly replayHealth: ReplayHealthResponse | null;
   readonly replayVerdicts: ReplayVerdictsResponse | null;
+  // Q2 Slice 6 — diff mode. ``anchorRecordId`` is set when the
+  // operator pins a record as the diff anchor; subsequent record
+  // selection triggers a dagDiff fetch against the anchor and
+  // populates ``diff``. ``diff`` null when no anchor is set OR
+  // when the fetch is in flight (renderer falls back to "diff
+  // loading" UX).
+  readonly anchorRecordId: string | null;
+  readonly diff: DagDiffResponse | null;
 }
 
 export function escapeHtml(s: string): string {
@@ -161,6 +170,83 @@ function renderTickClass(
   return klasses.join(' ');
 }
 
+function renderDiffSection(
+  anchorId: string | null,
+  currentRecordId: string,
+  diff: DagDiffResponse | null,
+): string {
+  // No anchor → operator hasn't engaged diff mode yet
+  if (anchorId === null) {
+    return '';
+  }
+  // Anchor == current → nothing to diff against itself
+  if (anchorId === currentRecordId) {
+    return (
+      `<h4>Diff vs anchor</h4>` +
+      `<div class="dim">current record is the anchor — ` +
+      `select another record to compare</div>`
+    );
+  }
+  // Anchor set + different from current, no diff payload yet
+  if (diff === null) {
+    return (
+      `<h4>Diff vs anchor</h4>` +
+      `<div class="dim">computing diff against ` +
+      `<code>${escapeHtml(anchorId)}</code>…</div>`
+    );
+  }
+  // Failure outcomes
+  if (diff.outcome === 'failed' || diff.outcome === 'invalid') {
+    return (
+      `<h4>Diff vs anchor</h4>` +
+      `<div class="warn">diff ${escapeHtml(diff.outcome)}: ` +
+      `${escapeHtml(diff.detail || '(no detail)')}</div>`
+    );
+  }
+  if (diff.outcome === 'empty') {
+    return (
+      `<h4>Diff vs anchor</h4>` +
+      `<div class="dim">no fields on either record</div>`
+    );
+  }
+  // OK or TRUNCATED — render change list
+  const truncBadge = diff.outcome === 'truncated'
+    ? `<span class="warn-pill">⚠ truncated (${diff.fields_changed} changes ` +
+      `≥ cap)</span> ` : '';
+  if (diff.changes.length === 0) {
+    return (
+      `<h4>Diff vs anchor <span class="dim">` +
+      `(${diff.fields_total} fields, all unchanged)</span></h4>` +
+      `<div class="dim">records are identical</div>`
+    );
+  }
+  const rows = diff.changes.map((c) => {
+    const path = c.path.length > 0 ? c.path.join('.') : '$';
+    return (
+      `<tr class="diff-row diff-${escapeHtml(c.kind)}">` +
+      `<td class="diff-kind">${escapeHtml(c.kind)}</td>` +
+      `<td class="diff-path"><code>${escapeHtml(path)}</code></td>` +
+      `<td class="diff-a">${escapeHtml(c.value_a_repr || '∅')}</td>` +
+      `<td class="diff-b">${escapeHtml(c.value_b_repr || '∅')}</td>` +
+      `</tr>`
+    );
+  }).join('');
+  return (
+    `<h4>Diff vs anchor <span class="dim">` +
+    `(${diff.fields_changed} of ${diff.fields_total} fields differ)` +
+    `</span></h4>` +
+    `<div class="diff-meta">` +
+    `${truncBadge}<span class="dim">anchor: ` +
+    `<code>${escapeHtml(diff.record_id_a)}</code> → ` +
+    `current: <code>${escapeHtml(diff.record_id_b)}</code></span></div>` +
+    `<table class="diff-table">` +
+    `<thead><tr><th>kind</th><th>path</th>` +
+    `<th>anchor (a)</th><th>current (b)</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`
+  );
+}
+
+
 export function renderHtml(
   state: TemporalSliderState, nonce: string,
 ): string {
@@ -187,11 +273,25 @@ export function renderHtml(
         `title="${escapeHtml(rid)}"></div>`,
       ).join('');
 
+  const anchor = state.anchorRecordId;
+  const diff = state.diff;
+  const anchorBadge = anchor === null
+    ? `<button class="anchor-btn" id="set-anchor" data-record-id="${
+        record !== null ? escapeHtml(record.record_id) : ''}">📌 Pin as diff anchor</button>`
+    : (record !== null && record.record_id === anchor)
+      ? `<span class="anchor-pill">📌 anchor</span>` +
+        `<button class="anchor-btn" id="clear-anchor">Clear anchor</button>`
+      : `<span class="dim">📌 anchor: <code>${escapeHtml(anchor)}</code></span>` +
+        `<button class="anchor-btn" id="clear-anchor">Clear</button>` +
+        `<button class="anchor-btn" id="set-anchor" data-record-id="${
+          record !== null ? escapeHtml(record.record_id) : ''}">Re-pin to current</button>`;
+
   const recordPanelHtml = record === null
     ? '<div class="empty">scrub the timeline to inspect a record</div>'
     : `
       <div class="record-header">
         <h3>${escapeHtml(record.record_id)}</h3>
+        <div class="anchor-bar">${anchorBadge}</div>
         <div class="dim">subgraph_node_count: ${record.subgraph_node_count}</div>
       </div>
       <h4>Fields</h4>
@@ -207,6 +307,7 @@ export function renderHtml(
           ).join('') +
           `</div>`
         : ''}
+      ${renderDiffSection(anchor, record.record_id, diff)}
     `;
 
   const verdictsHtml = verdicts.length === 0
@@ -284,6 +385,22 @@ export function renderHtml(
   .verdict-diverged_neutral { background: var(--vscode-charts-yellow); color: black; }
   .verdict-failed           { background: var(--vscode-errorForeground); color: white; }
   .verdict-kind { font-weight: 600; }
+  /* Q2 Slice 6 — diff UI */
+  .anchor-bar { margin: 4px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11px; }
+  .anchor-pill { background: var(--vscode-charts-yellow); color: black; padding: 2px 8px; border-radius: 8px; font-size: 11px; font-family: monospace; }
+  .anchor-btn { font-size: 11px; padding: 2px 8px; cursor: pointer; background: transparent; color: var(--vscode-textLink-foreground); border: 1px solid var(--vscode-panel-border); border-radius: 3px; }
+  .anchor-btn:hover { background: var(--vscode-list-hoverBackground); }
+  .diff-meta { font-size: 11px; margin: 4px 0 8px 0; }
+  .warn { background: var(--vscode-inputValidation-warningBackground); padding: 6px 10px; border: 1px solid var(--vscode-inputValidation-warningBorder); border-radius: 3px; font-size: 12px; }
+  .warn-pill { background: var(--vscode-inputValidation-warningBackground); color: var(--vscode-foreground); padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+  table.diff-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  table.diff-table th { text-align: left; font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); }
+  table.diff-table td { padding: 3px 6px; vertical-align: top; border-bottom: 1px solid var(--vscode-panel-border); font-family: monospace; word-break: break-word; }
+  td.diff-kind { width: 70px; font-weight: 600; }
+  td.diff-path { width: 30%; max-width: 240px; }
+  .diff-row.diff-added    td.diff-kind { color: var(--vscode-charts-green); }
+  .diff-row.diff-removed  td.diff-kind { color: var(--vscode-errorForeground); }
+  .diff-row.diff-modified td.diff-kind { color: var(--vscode-charts-yellow); }
   button { padding: 4px 10px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   input[type="text"] { font-family: monospace; padding: 2px 4px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); }
@@ -437,6 +554,25 @@ export function renderHtml(
           if (idx >= 0) postSelectRecord(idx);
         });
       })(edgeLinks[i]);
+    }
+
+    // Q2 Slice 6 — anchor / clear-anchor wiring for diff mode
+    const setAnchorBtn = document.getElementById('set-anchor');
+    if (setAnchorBtn) {
+      setAnchorBtn.addEventListener('click', function () {
+        const rid = setAnchorBtn.getAttribute('data-record-id');
+        if (rid) {
+          vscode.postMessage({
+            type: 'set_anchor', payload: { record_id: rid },
+          });
+        }
+      });
+    }
+    const clearAnchorBtn = document.getElementById('clear-anchor');
+    if (clearAnchorBtn) {
+      clearAnchorBtn.addEventListener('click', function () {
+        vscode.postMessage({ type: 'clear_anchor' });
+      });
     }
 
     // Keyboard: ←/→ step through records

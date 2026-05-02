@@ -298,3 +298,111 @@ test('replayHealth() surfaces 403 replay_disabled', async () => {
       err instanceof ObservabilityError && err.status === 403,
   );
 });
+
+// --- Q2 Slice 6 — dagDiff -------------------------------------------------
+
+test('dagDiff() encodes both record ids', async () => {
+  let captured = '';
+  const c = mkClient(async (url) => {
+    captured = url;
+    return mkResponse({
+      schema_version: '1.0',
+      outcome: 'ok',
+      record_id_a: 'r:phase:001',
+      record_id_b: 'r:phase:002',
+      changes: [],
+      fields_total: 5, fields_changed: 0, detail: '',
+    });
+  });
+  await c.dagDiff('bt-x:test', 'r:phase:001', 'r:phase:002');
+  assert.match(captured, /bt-x%3Atest/);
+  assert.match(captured, /r%3Aphase%3A001/);
+  assert.match(captured, /r%3Aphase%3A002$/);
+  assert.match(captured, /\/diff\//);
+});
+
+test('dagDiff() returns parsed body', async () => {
+  const c = mkClient(async () => mkResponse({
+    schema_version: '1.0',
+    outcome: 'ok',
+    record_id_a: 'r1', record_id_b: 'r2',
+    changes: [
+      { path: ['phase'], kind: 'modified',
+        value_a_repr: "'plan'", value_b_repr: "'generate'" },
+    ],
+    fields_total: 4, fields_changed: 1, detail: '',
+  }));
+  const r = await c.dagDiff('bt-x', 'r1', 'r2');
+  assert.equal(r.outcome, 'ok');
+  assert.equal(r.changes.length, 1);
+  assert.equal(r.changes[0].kind, 'modified');
+  assert.deepEqual([...r.changes[0].path], ['phase']);
+});
+
+test('dagDiff() rejects malformed session_id', async () => {
+  const c = mkClient(async () => mkResponse({}));
+  await assert.rejects(
+    () => c.dagDiff('has space', 'r1', 'r2'),
+    (err: unknown) =>
+      err instanceof ObservabilityError &&
+      err.reasonCode === 'client.malformed_session_id',
+  );
+});
+
+test('dagDiff() rejects malformed record_id_a', async () => {
+  const c = mkClient(async () => mkResponse({}));
+  await assert.rejects(
+    () => c.dagDiff('bt-x', 'bad space', 'r2'),
+    (err: unknown) =>
+      err instanceof ObservabilityError &&
+      err.reasonCode === 'client.malformed_record_id',
+  );
+});
+
+test('dagDiff() rejects malformed record_id_b', async () => {
+  const c = mkClient(async () => mkResponse({}));
+  await assert.rejects(
+    () => c.dagDiff('bt-x', 'r1', 'bad space'),
+    (err: unknown) =>
+      err instanceof ObservabilityError &&
+      err.reasonCode === 'client.malformed_record_id',
+  );
+});
+
+test('dagDiff() surfaces 404 not_found', async () => {
+  const c = mkClient(async () => mkResponse({
+    schema_version: '1.0',
+    error: true,
+    reason_code: 'dag_navigation.not_found',
+    missing: 'r1',
+  }, 404));
+  try {
+    await c.dagDiff('bt-x', 'r1', 'r2');
+    assert.fail('expected throw');
+  } catch (exc) {
+    assert.ok(exc instanceof ObservabilityError);
+    assert.equal((exc as ObservabilityError).status, 404);
+    assert.equal(
+      (exc as ObservabilityError).reasonCode,
+      'dag_navigation.not_found',
+    );
+  }
+});
+
+test('dagDiff() surfaces truncated outcome cleanly', async () => {
+  const c = mkClient(async () => mkResponse({
+    schema_version: '1.0',
+    outcome: 'truncated',
+    record_id_a: 'r1', record_id_b: 'r2',
+    changes: new Array(10).fill(0).map((_, i) => ({
+      path: [`k${i}`], kind: 'modified',
+      value_a_repr: 'a', value_b_repr: 'b',
+    })),
+    fields_total: 50, fields_changed: 10,
+    detail: 'emitted 10 changes (cap 10); operator should narrow scope',
+  }));
+  const r = await c.dagDiff('bt-x', 'r1', 'r2');
+  assert.equal(r.outcome, 'truncated');
+  assert.equal(r.changes.length, 10);
+  assert.match(r.detail, /narrow scope/);
+});
