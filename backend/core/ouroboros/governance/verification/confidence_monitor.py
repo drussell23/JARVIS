@@ -125,11 +125,19 @@ def confidence_monitor_enforce() -> bool:
     Sub-flag governing the raise path. When on (graduated),
     BELOW_FLOOR mid-stream triggers ``ConfidenceCollapseError`` so
     the GENERATE retry path engages. When off (hot-revert), the
-    monitor observes + tags ctx but does NOT raise."""
+    monitor observes + tags ctx but does NOT raise.
+
+    Precedence: env explicit > adapted YAML > hardcoded default.
+    The adapted YAML can only set this to ``True`` (the loader
+    drops a ``False`` since baseline is False — see
+    ``adapted_confidence_loader._filter_enforce``)."""
     raw = os.environ.get(
         "JARVIS_CONFIDENCE_MONITOR_ENFORCE", "",
     ).strip().lower()
     if raw == "":
+        adapted = _adapted_enforce_or_none()
+        if adapted is not None:
+            return adapted
         return True  # graduated default (Slice 5 — was shadow in Slice 2)
     return raw in ("1", "true", "yes", "on")
 
@@ -158,12 +166,81 @@ _POSTURE_FLOOR_MULTIPLIERS: dict = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Adapted-thresholds loader bridge (Gap #2 Slice 3)
+# ---------------------------------------------------------------------------
+#
+# When the env knob is unset, accessors consult
+# ``adapted_confidence_loader`` for an operator-approved tightening
+# materialized into ``.jarvis/adapted_confidence_thresholds.yaml``.
+# Precedence (load-bearing):
+#
+#     env explicit  >  adapted YAML  >  hardcoded default
+#
+# The loader is default-off (``JARVIS_CONFIDENCE_LOAD_ADAPTED``);
+# when off OR YAML missing OR malformed, the per-knob accessor
+# returns ``None`` and the monitor falls through to its hardcoded
+# default — pre-Slice-3 behavior is byte-identical.
+#
+# Helpers below wrap the loader so a runtime import error or other
+# defensive failure never breaks confidence_monitor's contract of
+# "every accessor NEVER raises". Lazy import inside the helper
+# keeps the module-level import surface unchanged when the loader
+# is disabled.
+
+
+def _adapted_floor_or_none() -> Optional[float]:
+    try:
+        from backend.core.ouroboros.governance.adaptation.adapted_confidence_loader import (  # noqa: E501
+            adapted_floor,
+        )
+        return adapted_floor()
+    except Exception:  # noqa: BLE001 — loader is best-effort
+        return None
+
+
+def _adapted_window_k_or_none() -> Optional[int]:
+    try:
+        from backend.core.ouroboros.governance.adaptation.adapted_confidence_loader import (  # noqa: E501
+            adapted_window_k,
+        )
+        return adapted_window_k()
+    except Exception:  # noqa: BLE001 — loader is best-effort
+        return None
+
+
+def _adapted_approaching_factor_or_none() -> Optional[float]:
+    try:
+        from backend.core.ouroboros.governance.adaptation.adapted_confidence_loader import (  # noqa: E501
+            adapted_approaching_factor,
+        )
+        return adapted_approaching_factor()
+    except Exception:  # noqa: BLE001 — loader is best-effort
+        return None
+
+
+def _adapted_enforce_or_none() -> Optional[bool]:
+    try:
+        from backend.core.ouroboros.governance.adaptation.adapted_confidence_loader import (  # noqa: E501
+            adapted_enforce,
+        )
+        return adapted_enforce()
+    except Exception:  # noqa: BLE001 — loader is best-effort
+        return None
+
+
 def confidence_floor() -> float:
     """``JARVIS_CONFIDENCE_FLOOR`` (default ``0.05``). Floor is the
     minimum acceptable rolling-mean top-1/top-2 margin. Floored at
-    0.0 (negative would be a logical error). NEVER raises."""
+    0.0 (negative would be a logical error).
+
+    Precedence: env explicit > adapted YAML > hardcoded default.
+    NEVER raises."""
     raw = os.environ.get("JARVIS_CONFIDENCE_FLOOR", "").strip()
     if not raw:
+        adapted = _adapted_floor_or_none()
+        if adapted is not None:
+            return adapted
         return _DEFAULT_FLOOR
     try:
         val = float(raw)
@@ -176,9 +253,14 @@ def confidence_floor() -> float:
 
 def confidence_window_k() -> int:
     """``JARVIS_CONFIDENCE_WINDOW_K`` (default ``16``). Floored at 1.
+
+    Precedence: env explicit > adapted YAML > hardcoded default.
     NEVER raises."""
     raw = os.environ.get("JARVIS_CONFIDENCE_WINDOW_K", "").strip()
     if not raw:
+        adapted = _adapted_window_k_or_none()
+        if adapted is not None:
+            return max(_MIN_WINDOW_K, adapted)
         return _DEFAULT_WINDOW_K
     try:
         val = int(raw)
@@ -190,11 +272,17 @@ def confidence_window_k() -> int:
 def confidence_approaching_factor() -> float:
     """``JARVIS_CONFIDENCE_APPROACHING_FACTOR`` (default ``1.5``).
     Floored at 1.0 (factor < 1.0 would invert APPROACHING vs BELOW
-    semantics). NEVER raises."""
+    semantics).
+
+    Precedence: env explicit > adapted YAML > hardcoded default.
+    NEVER raises."""
     raw = os.environ.get(
         "JARVIS_CONFIDENCE_APPROACHING_FACTOR", "",
     ).strip()
     if not raw:
+        adapted = _adapted_approaching_factor_or_none()
+        if adapted is not None:
+            return max(_MIN_APPROACHING_FACTOR, adapted)
         return _DEFAULT_APPROACHING_FACTOR
     try:
         val = float(raw)

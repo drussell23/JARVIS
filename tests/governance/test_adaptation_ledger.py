@@ -141,13 +141,19 @@ def test_caps_pinned():
     assert MAX_PROPOSAL_ID_CHARS == 128
 
 
-def test_adaptation_surface_five_values():
+def test_adaptation_surface_six_values():
+    """Pass C shipped with 5 surfaces; Deep Observability Gap #2
+    added a 6th (operator-proposed Confidence-monitor threshold
+    tightening). Each value below maps to a registered surface
+    validator + an ``adapted_*.yaml`` materialization path. Add
+    a new value here whenever a new adaptive surface lands."""
     assert {s.value for s in AdaptationSurface} == {
         "semantic_guardian.patterns",
         "iron_gate.exploration_floors",
         "scoped_tool_backend.mutation_budget",
         "risk_tier_floor.tiers",
         "exploration_ledger.category_weights",
+        "confidence_monitor.thresholds",
     }
 
 

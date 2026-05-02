@@ -480,13 +480,28 @@ def reset_surface_validators() -> None:
 # Allowlist of proposal_kinds that strictly tighten by construction.
 # Default validator falls back to this when no surface-specific
 # validator is registered.
+#
+# Kinds may be shared across surfaces — the surface-specific
+# validator dispatches on ``proposal.surface``, so collisions on
+# the kind string are intentional and safe (e.g. ``raise_floor``
+# means "raise the IronGate exploration floor" for the IronGate
+# surface and "raise the Confidence floor" for the Confidence
+# surface; the validators don't see each other's surfaces).
 _TIGHTEN_KINDS: Tuple[str, ...] = (
     "add_pattern",      # SemanticGuardian — additive detector
-    "raise_floor",      # IronGate exploration floors — only raise
+    "raise_floor",      # IronGate exploration floors / Confidence floor — only raise
     "lower_budget",     # Mutation budget — only lower
     "add_tier",         # Risk-tier ladder — only insert
     "rebalance_weight",  # Category weights — surface validator MUST verify mass-conservation
     "sunset_candidate",  # Phase 7.9 — advisory signal that an adapted pattern hasn't matched in N days; structurally conservative (operator must still file Pass B amendment to actually remove)
+    # Deep Observability Gap #2 — Confidence-monitor threshold tightenings.
+    # Tighten directions are pinned by ``confidence_policy.compute_policy_diff``;
+    # the surface validator (``confidence_threshold_tightener``) re-runs that
+    # predicate so the cage stays conjunctive.
+    "shrink_window",     # Confidence window_k — only shrink (faster reaction)
+    "widen_approaching", # Confidence approaching_factor — only widen (earlier warning)
+    "enable_enforce",    # Confidence enforce — False→True only (BELOW_FLOOR becomes hard block)
+    "multi_dim_tighten", # Confidence multi-knob proposal — surface validator confirms ≥2 dimensions actually moved
 )
 
 
