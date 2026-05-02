@@ -127,14 +127,17 @@ def test_order2_strictly_above_blocked():
 
 
 # ===========================================================================
-# B — Env knob (default false pre-graduation)
+# B — Env knob (default true post-Q4-P#3 graduation, 2026-05-02)
 # ===========================================================================
 
 
-def test_is_enabled_default_false_pre_graduation():
-    """Slice 2 ships default-OFF. Renamed at Slice 2's graduation
-    cadence (3 clean sessions per the Pass B plan)."""
-    assert is_enabled() is False
+def test_is_enabled_default_true_post_q4_graduation():
+    """Q4 Priority #3 graduation (2026-05-02): operator authorized
+    Pass B Slices 1+2 graduation. Order-2 risk class now active by
+    default. Slice 6.x amendment-protocol flags stay default-false —
+    the only path to actual Order-2 mutations is the operator-only
+    /order2 amend REPL (gated on JARVIS_ORDER2_REPL_ENABLED)."""
+    assert is_enabled() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])
@@ -143,10 +146,18 @@ def test_is_enabled_truthy(monkeypatch, val):
     assert is_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
-def test_is_enabled_falsy(monkeypatch, val):
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
+def test_is_enabled_explicit_falsy(monkeypatch, val):
+    # Empty string excluded — that's now "unset → graduated default
+    # true" per Q4 P#3.
     monkeypatch.setenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", val)
     assert is_enabled() is False
+
+
+@pytest.mark.parametrize("val", ["", "   ", "\t"])
+def test_is_enabled_empty_treats_as_unset(monkeypatch, val):
+    monkeypatch.setenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", val)
+    assert is_enabled() is True
 
 
 # ===========================================================================
@@ -277,9 +288,12 @@ def test_classify_uses_default_manifest_when_none_provided(monkeypatch):
 # ===========================================================================
 
 
-def test_apply_master_off_returns_unchanged_even_on_match():
-    """Pin: master flag off → input tier unchanged regardless of
-    manifest match."""
+def test_apply_master_off_returns_unchanged_even_on_match(monkeypatch):
+    """Pin: master flag explicitly false → input tier unchanged
+    regardless of manifest match. Post-Q4-P#3 graduation, env-unset
+    yields default-true; this test exercises the operator's
+    instant-rollback path."""
+    monkeypatch.setenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", "false")
     m = _loaded_manifest(_entry(path_glob="backend/x.py"))
     result = apply_order2_floor(
         RiskTier.SAFE_AUTO, ["backend/x.py"], manifest=m,
@@ -340,9 +354,11 @@ def test_apply_master_on_miss_returns_unchanged(monkeypatch, input_tier):
 
 
 def test_dual_flag_manifest_off_riskclass_off_unchanged(monkeypatch):
-    """Cage state 1: both flags off → no behaviour change."""
-    monkeypatch.delenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", raising=False)
-    monkeypatch.delenv("JARVIS_ORDER2_MANIFEST_LOADED", raising=False)
+    """Cage state 1: both flags explicitly off → no behaviour change.
+    Post-Q4-P#3 graduation, the rollback path requires explicit
+    `false` since unset = graduated default true."""
+    monkeypatch.setenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_ORDER2_MANIFEST_LOADED", "false")
     reset_default_manifest()
     result = apply_order2_floor(
         RiskTier.SAFE_AUTO,
@@ -352,9 +368,10 @@ def test_dual_flag_manifest_off_riskclass_off_unchanged(monkeypatch):
 
 
 def test_dual_flag_manifest_on_riskclass_off_unchanged(monkeypatch):
-    """Cage state 2: manifest loaded + risk-class off → unchanged.
-    Operator can audit the manifest without enforcement firing."""
-    monkeypatch.delenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", raising=False)
+    """Cage state 2: manifest loaded + risk-class explicitly off →
+    unchanged. Operator can audit the manifest without enforcement
+    firing."""
+    monkeypatch.setenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", "false")
     monkeypatch.setenv("JARVIS_ORDER2_MANIFEST_LOADED", "1")
     monkeypatch.setenv(
         "JARVIS_ORDER2_MANIFEST_PATH",
@@ -369,12 +386,12 @@ def test_dual_flag_manifest_on_riskclass_off_unchanged(monkeypatch):
 
 
 def test_dual_flag_manifest_off_riskclass_on_unchanged(monkeypatch):
-    """Cage state 3: manifest off + risk-class on → unchanged
-    (classifier returns False on empty manifest). Defense in depth:
-    even if the risk-class flag was prematurely flipped, the cage
-    stays inert until the manifest loads."""
+    """Cage state 3: manifest explicitly off + risk-class on →
+    unchanged (classifier returns False on empty manifest). Defense
+    in depth: even if the risk-class flag was prematurely flipped,
+    the cage stays inert until the manifest loads."""
     monkeypatch.setenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", "1")
-    monkeypatch.delenv("JARVIS_ORDER2_MANIFEST_LOADED", raising=False)
+    monkeypatch.setenv("JARVIS_ORDER2_MANIFEST_LOADED", "false")
     reset_default_manifest()
     result = apply_order2_floor(
         RiskTier.SAFE_AUTO,
@@ -435,8 +452,10 @@ def test_apply_emits_no_telemetry_on_miss(monkeypatch, caplog):
 
 
 def test_apply_emits_no_telemetry_when_master_off(monkeypatch, caplog):
-    """Pin: master-off → no log even on match (we short-circuit
-    before the classifier runs)."""
+    """Pin: master explicitly off → no log even on match (short-
+    circuit before classifier runs). Post-Q4-P#3 graduation, the
+    operator's instant-rollback path requires explicit `false`."""
+    monkeypatch.setenv("JARVIS_ORDER2_RISK_CLASS_ENABLED", "false")
     m = _loaded_manifest(_entry(path_glob="backend/x.py"))
     with caplog.at_level(logging.INFO):
         apply_order2_floor(

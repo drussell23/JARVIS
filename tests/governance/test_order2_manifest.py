@@ -168,14 +168,18 @@ def test_manifest_to_dict_stable_shape():
 
 
 # ===========================================================================
-# B — Env knob (default false pre-graduation)
+# B — Env knob (default true post-Q4-P#3 graduation, 2026-05-02)
 # ===========================================================================
 
 
-def test_is_loaded_default_false_pre_graduation():
-    """Slice 1 ships default-OFF. Renamed at Slice 1's own
-    graduation cadence."""
-    assert is_loaded() is False
+def test_is_loaded_default_true_post_q4_graduation():
+    """Q4 Priority #3 graduation (2026-05-02): operator authorized
+    Pass B Slices 1+2 graduation. Manifest now loads on boot —
+    Order-2 governance-code path registry observably active. Slice
+    6.x amendment-protocol flags stay default-false; the only path
+    to Order-2 mutations remains the operator-only /order2 amend
+    REPL gated on JARVIS_ORDER2_REPL_ENABLED."""
+    assert is_loaded() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE"])
@@ -184,10 +188,18 @@ def test_is_loaded_truthy(monkeypatch, val):
     assert is_loaded() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
-def test_is_loaded_falsy(monkeypatch, val):
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
+def test_is_loaded_explicit_falsy(monkeypatch, val):
+    # Empty string excluded — now "unset → graduated default true"
+    # per Q4 P#3.
     monkeypatch.setenv("JARVIS_ORDER2_MANIFEST_LOADED", val)
     assert is_loaded() is False
+
+
+@pytest.mark.parametrize("val", ["", "   ", "\t"])
+def test_is_loaded_empty_treats_as_unset(monkeypatch, val):
+    monkeypatch.setenv("JARVIS_ORDER2_MANIFEST_LOADED", val)
+    assert is_loaded() is True
 
 
 # ===========================================================================
@@ -213,9 +225,11 @@ def test_manifest_path_env_override(monkeypatch, tmp_path):
 # ===========================================================================
 
 
-def test_load_master_off_returns_not_loaded():
-    """Pin: master flag off → empty manifest. Slice 2-6 consumers
-    treat this as 'no Order-2 enforcement' (pre-Pass-B behaviour)."""
+def test_load_master_off_returns_not_loaded(monkeypatch):
+    """Pin: master flag explicitly off → empty manifest. Post-Q4-P#3
+    graduation, the rollback path requires explicit `false` (unset
+    = graduated default true)."""
+    monkeypatch.setenv("JARVIS_ORDER2_MANIFEST_LOADED", "false")
     m = load_manifest()
     assert m.status is ManifestLoadStatus.NOT_LOADED
     assert m.entries == ()
@@ -545,9 +559,13 @@ def test_reset_default_manifest_clears(monkeypatch, tmp_path):
 # ===========================================================================
 
 
-def test_real_manifest_loads_with_nine_entries(monkeypatch):
+def test_real_manifest_loads_with_all_entries(monkeypatch):
     """Pin: the shipped ``.jarvis/order2_manifest.yaml`` loads
-    cleanly with all 9 Body-only entries from Pass B §3.2."""
+    cleanly. Pass B §3.2 documented 9 initial Body-only entries;
+    the file has grown to 12 as more governance-code paths were
+    pinned (cross-Pass evolution). The invariant we pin is
+    LOADED-status + non-empty + zero notes — exact entry count is
+    operational state, not a structural invariant."""
     monkeypatch.setenv("JARVIS_ORDER2_MANIFEST_LOADED", "1")
     monkeypatch.delenv("JARVIS_ORDER2_MANIFEST_PATH", raising=False)
     # Use repo-relative path so the test runs from any cwd.
@@ -555,7 +573,9 @@ def test_real_manifest_loads_with_nine_entries(monkeypatch):
     assert real_path.exists(), "Real manifest YAML missing from repo"
     m = load_manifest(path=real_path)
     assert m.status is ManifestLoadStatus.LOADED
-    assert len(m.entries) == 9
+    # Entry count is the inventory at graduation — at least the 9
+    # Body-only originals from §3.2.
+    assert len(m.entries) >= 9
     assert m.notes == ()
 
 

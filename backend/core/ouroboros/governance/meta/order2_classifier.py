@@ -60,11 +60,17 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 def is_enabled() -> bool:
     """Master flag — ``JARVIS_ORDER2_RISK_CLASS_ENABLED`` (default
-    false until Slice 2's own clean-session graduation).
+    TRUE post Q4 Priority #3 graduation, 2026-05-02).
 
-    When off, :func:`apply_order2_floor` returns its input tier
-    unchanged regardless of manifest match. Hot-revert: single env
-    knob.
+    Operator-authorized graduation: when an op's target_files match
+    a manifest entry, the risk-tier floor elevates to
+    ``ORDER_2_GOVERNANCE`` (above ``BLOCKED``). This DOES NOT
+    permit Order-2 mutations — the only path is operator approval
+    via ``/order2 amend`` (gated by ``JARVIS_ORDER2_REPL_ENABLED``,
+    still default-false). What graduating Slice 2 enables: the
+    classifier elevates governance-path ops to the highest tier;
+    autonomous attempts to modify governance code are structurally
+    blocked at the gate.
 
     Note: there are TWO independent flags in the Pass B revert
     matrix:
@@ -76,10 +82,14 @@ def is_enabled() -> bool:
          even if the manifest is loaded AND classifier matches.
 
     Either flag off → no behaviour change. Both must be on for the
-    Order-2 risk class to fire."""
-    return os.environ.get(
+    Order-2 risk class to fire. Hot-revert: single env knob
+    (``JARVIS_ORDER2_RISK_CLASS_ENABLED=false``)."""
+    raw = os.environ.get(
         "JARVIS_ORDER2_RISK_CLASS_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated 2026-05-02
+    return raw in _TRUTHY
 
 
 # ---------------------------------------------------------------------------

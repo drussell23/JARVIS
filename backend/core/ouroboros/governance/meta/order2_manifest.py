@@ -81,18 +81,29 @@ KNOWN_REPOS: FrozenSet[str] = frozenset({
 
 
 def is_loaded() -> bool:
-    """Master flag — ``JARVIS_ORDER2_MANIFEST_LOADED`` (default false
-    until Slice 1 graduation).
+    """Master flag — ``JARVIS_ORDER2_MANIFEST_LOADED`` (default
+    TRUE post Q4 Priority #3 graduation, 2026-05-02).
+
+    Operator-authorized graduation: the manifest now loads on boot
+    so the Order-2 governance-code path registry is observably
+    active. This DOES NOT authorize Order-2 amendments — those
+    require the Slice 6.x flags
+    (``JARVIS_ORDER2_REVIEW_QUEUE_ENABLED`` /
+    ``JARVIS_ORDER2_REPL_ENABLED``) which stay default-false.
+    What graduating Slice 1 enables: classifier sees the manifest;
+    Slice 2 (when graduated) elevates Order-2 paths to the
+    ``ORDER_2_GOVERNANCE`` risk class; Slice 3 AST validator runs
+    on candidate runners; Slice 4 shadow replay records.
 
     When off, :func:`get_default_manifest` returns an **empty**
-    manifest regardless of what's on disk. Slice 2-6 consumers MUST
-    treat empty-manifest as "no Order-2 paths registered" — which
-    yields the pre-Pass-B behaviour (no ORDER_2_GOVERNANCE
-    classification, no AST validator firing, no shadow replay).
-    Hot-revert is therefore a single env knob."""
-    return os.environ.get(
+    manifest regardless of what's on disk. Hot-revert: single env
+    knob (``JARVIS_ORDER2_MANIFEST_LOADED=false``)."""
+    raw = os.environ.get(
         "JARVIS_ORDER2_MANIFEST_LOADED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated 2026-05-02
+    return raw in _TRUTHY
 
 
 def manifest_path() -> Path:
