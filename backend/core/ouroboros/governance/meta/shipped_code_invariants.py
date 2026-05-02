@@ -3388,9 +3388,15 @@ def _discover_module_provided_invariants() -> int:
                     if not callable(fn):
                         continue
                     invariants = fn()
+                    # Defensive: registrar must return iterable;
+                    # garbage returns silently skipped.
                     if not invariants:
                         continue
-                    for inv in invariants:
+                    try:
+                        invariant_list = list(invariants)
+                    except TypeError:
+                        continue
+                    for inv in invariant_list:
                         try:
                             register_shipped_code_invariant(inv)
                             discovered += 1

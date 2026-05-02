@@ -718,6 +718,59 @@ def get_active_recurrence_boosts(
 # ---------------------------------------------------------------------------
 
 
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code invariant for the V3 (Coherence
+    advisory plausibility) Antivenom-v2 surface.
+
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_v3_plausibility_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("_CORE_FAILURE_CLASSES",
+             "V3 structural floor frozenset must remain"),
+            ("_extract_failure_class",
+             "V3 extraction helper must remain"),
+            ("_advisory_plausibility_enabled",
+             "V3 master flag helper must remain"),
+            ("_build_known_failure_classes",
+             "V3 union builder must remain"),
+            ("JARVIS_KNOWN_FAILURE_CLASSES",
+             "V3 operator-extension flag canonical"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"V3 surface dropped {symbol!r} — {reason} gone"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="antivenom_v3_plausibility_surface",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "postmortem_recall_consumer.py"
+            ),
+            description=(
+                "Antivenom V3 (Coherence advisory plausibility "
+                "check) surface MUST preserve _CORE_FAILURE_CLASSES "
+                "frozenset + extraction + plausibility-enabled "
+                "helper + union builder + operator-extension flag "
+                "canonical. Catches refactor that drops the §29 "
+                "brutal-review schema-shape-gaming closure."
+            ),
+            validate=_validate_v3_plausibility_surface,
+        ),
+    ]
+
+
 def register_flags(registry: Any) -> int:
     """Module-owned FlagRegistry registration for the V3 (Coherence
     advisory plausibility) Antivenom-v2 surface.

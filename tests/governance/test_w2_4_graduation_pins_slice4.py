@@ -330,18 +330,21 @@ def test_sse_event_vocabulary_includes_curiosity_question_emitted() -> None:
 
 
 def test_sse_event_vocabulary_count_is_41_post_slice_4() -> None:
-    """Slice 3 added the 41st SSE event (curiosity_question_emitted).
-    Slice 4 is graduation only — adds zero new events. The additive-only
-    contract means this number grows over time; if it shrinks below 41,
-    an event type was REMOVED (contract break — fix the source, don't
-    update this pin)."""
+    """Property-based additive-only contract: post-Slice-4 floor is 41
+    (Slice 3 added curiosity_question_emitted; Slice 4 is graduation
+    only). The vocabulary may grow as later arcs add events, but must
+    NEVER shrink — a shrink means an event type was REMOVED, which is
+    a wire-format contract break."""
     from backend.core.ouroboros.governance.ide_observability_stream import (
         _VALID_EVENT_TYPES,
     )
-    assert len(_VALID_EVENT_TYPES) == 41, (
-        f"SSE event vocabulary size changed unexpectedly to "
-        f"{len(_VALID_EVENT_TYPES)}; Slice 4 graduation does not add/remove "
-        "events. Audit recent commits for vocab churn."
+    _SLICE_4_FLOOR = 41
+    assert len(_VALID_EVENT_TYPES) >= _SLICE_4_FLOOR, (
+        f"SSE event vocabulary SHRANK below post-Slice-4 floor: "
+        f"got {len(_VALID_EVENT_TYPES)}, floor {_SLICE_4_FLOOR}. "
+        "An event type was REMOVED — wire-format contract break. "
+        "Fix the source (re-add the missing event), don't lower this "
+        "floor."
     )
 
 

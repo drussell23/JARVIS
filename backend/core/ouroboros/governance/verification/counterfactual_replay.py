@@ -1117,6 +1117,56 @@ def validate_swap_payload(
 # ---------------------------------------------------------------------------
 
 
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code invariant for the V4 (Replay payload
+    validation) Antivenom-v2 surface.
+
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_v4_payload_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("validate_swap_payload",
+             "V4 validator must remain exported"),
+            ("_validate_swap_payload_enabled",
+             "V4 master flag helper must remain"),
+            ("JARVIS_REPLAY_PAYLOAD_VALIDATION_ENABLED",
+             "V4 master flag name canonical"),
+            ("DecisionOverrideKind",
+             "V4 schema enum reuse"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"V4 surface dropped {symbol!r} — {reason} gone"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="antivenom_v4_payload_surface",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "counterfactual_replay.py"
+            ),
+            description=(
+                "Antivenom V4 (Replay payload validation) surface "
+                "MUST preserve validate_swap_payload + master-flag "
+                "helper + canonical flag name + DecisionOverrideKind "
+                "enum reuse. Catches refactor that drops the §29 "
+                "brutal-review verdict-laundering closure."
+            ),
+            validate=_validate_v4_payload_surface,
+        ),
+    ]
+
+
 def register_flags(registry: Any) -> int:
     """Module-owned FlagRegistry registration for the V4 (Replay
     payload validation) Antivenom-v2 surface.

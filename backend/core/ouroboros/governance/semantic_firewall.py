@@ -609,6 +609,59 @@ def scan_tool_output(
         )
 
 
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code invariant for the V2 (tool-output
+    prompt-injection scanner) Antivenom-v2 surface.
+
+    NEVER raises. Discovery loop catches exceptions."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_v2_tool_output_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("scan_tool_output",
+             "V2 tool-output scanner must remain exported"),
+            ("ToolOutputScanResult",
+             "V2 frozen dataclass must remain exported"),
+            ("_tool_output_scan_enabled",
+             "V2 master flag helper must remain"),
+            ("JARVIS_TOOL_OUTPUT_INJECTION_SCAN_ENABLED",
+             "V2 master flag name canonical"),
+            ("TOOL_INJECTION_REDACTED",
+             "V2 redaction marker canonical"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"V2 surface dropped {symbol!r} — {reason} gone"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="antivenom_v2_tool_output_surface",
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "semantic_firewall.py"
+            ),
+            description=(
+                "Antivenom V2 (tool-output prompt-injection scanner) "
+                "surface MUST preserve scan_tool_output + "
+                "ToolOutputScanResult + master-flag helper + "
+                "redaction-marker canonical. Catches refactor that "
+                "drops the §29 brutal-review tool-output injection "
+                "closure."
+            ),
+            validate=_validate_v2_tool_output_surface,
+        ),
+    ]
+
+
 def register_flags(registry):
     """Module-owned FlagRegistry registration for the V2
     (Tool-output prompt-injection scanner) Antivenom-v2 surface.
