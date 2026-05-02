@@ -977,11 +977,29 @@ _GATE_VERDICT_VOCABULARY: frozenset = frozenset({
 
 # Per-kind valid key sets. Each DecisionOverrideKind has a closed set
 # of valid payload keys. Unknown keys → validation failure.
+#
+# GATE_DECISION carries the verdict-bias attack surface — its
+# whitelist is the load-bearing pin (only ``verdict`` and only
+# from the closed _GATE_VERDICT_VOCABULARY).
+#
+# The four passthrough kinds (POSTMORTEM_INJECTION, RECURRENCE_BOOST,
+# QUORUM_INVOCATION, COHERENCE_OBSERVER) flow through
+# ``_passthrough_inference`` which does not read payload keys to
+# steer terminal_success or apply_outcome. Their whitelist is a
+# documentation discipline + injection bound rather than a verdict
+# guard. Each kind accepts its production-emitter keys plus the
+# universal ``enabled`` toggle.
 _VALID_PAYLOAD_KEYS: Dict[DecisionOverrideKind, frozenset] = {
     DecisionOverrideKind.GATE_DECISION: frozenset({"verdict"}),
-    DecisionOverrideKind.POSTMORTEM_INJECTION: frozenset({"enabled"}),
-    DecisionOverrideKind.RECURRENCE_BOOST: frozenset({"enabled"}),
-    DecisionOverrideKind.QUORUM_INVOCATION: frozenset({"enabled"}),
+    DecisionOverrideKind.POSTMORTEM_INJECTION: frozenset(
+        {"enabled", "records"}
+    ),
+    DecisionOverrideKind.RECURRENCE_BOOST: frozenset(
+        {"enabled", "boost_count", "failure_class"}
+    ),
+    DecisionOverrideKind.QUORUM_INVOCATION: frozenset(
+        {"enabled", "k_value"}
+    ),
     DecisionOverrideKind.COHERENCE_OBSERVER: frozenset({"enabled"}),
 }
 

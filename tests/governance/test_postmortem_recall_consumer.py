@@ -339,7 +339,10 @@ class TestComputeRecurrenceBoosts:
         boosts = compute_recurrence_boosts([wrong], now_ts=ts)
         assert dict(boosts) == {}
 
-    def test_max_count_clamp(self):
+    def test_max_count_clamp(self, monkeypatch):
+        # Synthetic failure_class — extend the known-classes registry
+        # so the Vector 3 plausibility gate accepts it.
+        monkeypatch.setenv("JARVIS_KNOWN_FAILURE_CLASSES", "x")
         ts = time.time()
         # 20 advisories for same failure_class
         advs = [
@@ -355,7 +358,10 @@ class TestComputeRecurrenceBoosts:
         )
         assert boosts["x"].boost_count == 5
 
-    def test_multi_class_grouping(self):
+    def test_multi_class_grouping(self, monkeypatch):
+        monkeypatch.setenv(
+            "JARVIS_KNOWN_FAILURE_CLASSES", "class_a,class_b",
+        )
         ts = time.time()
         advs = [
             _make_recurrence_advisory(
@@ -576,13 +582,16 @@ class TestGetActiveRecurrenceBoosts:
             record_coherence_advisory(
                 adv, path=tmp_advisory_path,
             )
-        # Read via consumer
+        # Read via consumer — extend the known-classes registry so
+        # the synthetic "real_class" passes the Vector 3 plausibility
+        # gate.
         with mock.patch.dict(
             os.environ,
             {
                 "JARVIS_POSTMORTEM_RECALL_ENABLED": "true",
                 "JARVIS_POSTMORTEM_RECURRENCE_BOOST_ENABLED":
                     "true",
+                "JARVIS_KNOWN_FAILURE_CLASSES": "real_class",
             },
         ):
             boosts = get_active_recurrence_boosts(

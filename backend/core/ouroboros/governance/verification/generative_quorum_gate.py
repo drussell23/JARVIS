@@ -83,6 +83,9 @@ from backend.core.ouroboros.governance.verification.generative_quorum import (
     ConsensusVerdict,
     quorum_enabled,
 )
+from backend.core.ouroboros.governance.verification.ast_canonical import (
+    compute_ast_signature,
+)
 from backend.core.ouroboros.governance.verification.generative_quorum_runner import (
     QuorumRunResult,
     RollGenerator,
@@ -605,17 +608,6 @@ def compute_bg_spec_structural_check(
             return BgSpecStructuralCheck(
                 fingerprint_match=False,
                 anomaly_reason="original_source_not_string",
-            )
-
-        # Lazy import to preserve existing import graph.
-        try:
-            from backend.core.ouroboros.governance.verification.ast_canonical import (
-                compute_ast_signature,
-            )
-        except ImportError:
-            return BgSpecStructuralCheck(
-                fingerprint_match=False,
-                anomaly_reason="ast_canonical_unavailable",
             )
 
         candidate_fp = compute_ast_signature(candidate_source)

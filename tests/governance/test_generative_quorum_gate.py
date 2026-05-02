@@ -726,6 +726,7 @@ class TestAuthorityInvariants:
         tree = ast.parse(gate_source)
         allowed = {
             "backend.core.ouroboros.governance.cost_contract_assertion",
+            "backend.core.ouroboros.governance.verification.ast_canonical",
             "backend.core.ouroboros.governance.verification.generative_quorum",
             "backend.core.ouroboros.governance.verification.generative_quorum_runner",
         }

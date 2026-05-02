@@ -350,22 +350,26 @@ def _extract_failure_class(detail: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Minimal governance-originated failure classes that ALWAYS exist.
-# This is the structural floor — operators extend via env knob.
+# Governance-originated failure classes that ALWAYS exist. Sourced
+# from the real production emitters (every ``failure_class="…"``
+# string used inside ``backend/core/ouroboros/governance/``) plus
+# the legacy *_failure aliases retained for forward compatibility.
+# Operators extend via ``JARVIS_KNOWN_FAILURE_CLASSES`` env CSV.
 _CORE_FAILURE_CLASSES: frozenset = frozenset({
-    "timeout_failure",
-    "validation_failure",
-    "worktree_isolation",
-    "generation_failure",
-    "apply_failure",
-    "verify_failure",
-    "parse_failure",
-    "cost_limit_failure",
-    "context_overflow",
-    "tool_loop_failure",
-    "provider_error",
-    "stream_rupture",
-    "infra",
+    # Phase 2A canonical (ValidationResult.failure_class)
+    "test", "build", "infra", "budget", "none",
+    # Sub-classes emitted by validators / change_engine / orchestrator
+    "ascii", "cancelled", "content", "cost_contract_violation",
+    "dep_file_rename", "diff_apply", "duplication", "env",
+    "exploration", "failed", "json_parse", "multi_file_coverage",
+    "rollback", "schema", "security", "worktree_isolation",
+    # Legacy *_failure aliases (kept for FailureEpisode back-compat)
+    "timeout_failure", "validation_failure", "generation_failure",
+    "apply_failure", "verify_failure", "parse_failure",
+    "cost_limit_failure", "context_overflow", "tool_loop_failure",
+    "provider_error", "stream_rupture",
+    # Test-fixture aliases used in regression suites
+    "test_failure",
 })
 
 
@@ -382,14 +386,15 @@ def _advisory_plausibility_enabled() -> bool:
 
 
 def _build_known_failure_classes() -> frozenset:
-    """Dynamically aggregate known failure classes from:
+    """Aggregate known failure classes from:
 
-      1. ``_CORE_FAILURE_CLASSES`` (hardcoded structural floor)
+      1. ``_CORE_FAILURE_CLASSES`` (production-derived structural floor)
       2. ``JARVIS_KNOWN_FAILURE_CLASSES`` env CSV (operator-extensible)
-      3. ``live_fire_soak._INFRA_FAILURE_CLASSES`` (lazy, defensive)
 
-    Returns a frozenset of all known failure class strings.
-    NEVER raises."""
+    Returns a frozenset of all known failure class strings. The CSV
+    knob is the only operator-controlled extension surface — keeps
+    the AST authority invariant clean (no test-tree imports from
+    governance code). NEVER raises."""
     try:
         classes: set = set(_CORE_FAILURE_CLASSES)
 
@@ -402,16 +407,6 @@ def _build_known_failure_classes() -> frozenset:
                 c = c.strip()
                 if c:
                     classes.add(c)
-
-        # Lazy import from live_fire_soak — defensive.
-        try:
-            from tests.governance.live_fire_soak import (  # type: ignore[import-untyped]
-                _INFRA_FAILURE_CLASSES,
-            )
-            if isinstance(_INFRA_FAILURE_CLASSES, (set, frozenset)):
-                classes.update(str(c) for c in _INFRA_FAILURE_CLASSES)
-        except Exception:  # noqa: BLE001 — test module may not exist
-            pass
 
         return frozenset(classes)
     except Exception:  # noqa: BLE001 — defensive
