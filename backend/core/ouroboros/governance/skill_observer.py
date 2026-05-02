@@ -631,8 +631,17 @@ class SkillObserver:
             ))
             return
 
-        # Dedup check.
-        dedup_key = compute_dedup_key(invocation, spec)
+        # Dedup check -- OPT-IN via spec.dedup_key_template. Skipped
+        # entirely when the operator didn't opt in, so rate-limit
+        # alone bounds invocation. (compute_dedup_key has a
+        # structural-fingerprint fallback for callers that want
+        # one, but the observer treats no-template = no-dedup so
+        # multiple distinct invocations with the same payload
+        # shape aren't silently swallowed.)
+        if spec.dedup_key_template:
+            dedup_key = compute_dedup_key(invocation, spec)
+        else:
+            dedup_key = ""
         if dedup_key and self._is_dedup_hit(dedup_key, now):
             self._emit_decision(SkillObserverDecision(
                 qualified_name=manifest.qualified_name,
