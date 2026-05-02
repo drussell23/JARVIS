@@ -51,12 +51,16 @@ class TestMasterFlagDefaultFalse:
     decision, not an autonomous default. Mirrors the
     JARVIS_PLAN_APPROVAL_MODE pattern."""
 
-    def test_master_default_is_false(self):
+    def test_master_default_is_true_post_q4_graduation(self):
+        # Q4 Priority #1 graduation (2026-05-02): operator
+        # authorized after empirical verification of cost gates.
+        # Sub-gate / risk-tier filter / COST_GATED_ROUTES still
+        # bound K× amplification.
         from backend.core.ouroboros.governance.verification.generative_quorum import (  # noqa: E501
             quorum_enabled,
         )
         os.environ.pop("JARVIS_GENERATIVE_QUORUM_ENABLED", None)
-        assert quorum_enabled() is False
+        assert quorum_enabled() is True
 
     def test_master_explicit_true_flips_on(self):
         from backend.core.ouroboros.governance.verification.generative_quorum import (  # noqa: E501
@@ -360,9 +364,12 @@ class TestFlagRegistrySeeds:
         for flag in MOVE_6_FLAG_NAMES:
             assert flag in names, f"missing flag seed: {flag}"
 
-    def test_master_flag_default_false_in_seed(self):
-        """Catches a future graduation that flips the master
-        without the explicit operator review path."""
+    def test_master_flag_default_true_post_q4_graduation(self):
+        """Q4 Priority #1 graduation (2026-05-02): operator
+        authorized the flip after empirical verification that
+        K× generation cost is bounded by sub-gate + risk-tier
+        filter (APPROVAL_REQUIRED+) + COST_GATED_ROUTES exclusion
+        of BACKGROUND/SPECULATIVE."""
         from backend.core.ouroboros.governance.flag_registry_seed import (  # noqa: E501
             SEED_SPECS,
         )
@@ -370,10 +377,10 @@ class TestFlagRegistrySeeds:
             s for s in SEED_SPECS
             if s.name == "JARVIS_GENERATIVE_QUORUM_ENABLED"
         )
-        assert master.default is False, (
-            "master flag default must remain False until "
-            "operator-explicit graduation — Quorum incurs K× "
-            "generation cost"
+        assert master.default is True, (
+            "master flag default must be True post Q4 P#1 "
+            "graduation — flip back to False is the operator's "
+            "instant-rollback path"
         )
 
     def test_sub_gate_default_true_in_seed(self):

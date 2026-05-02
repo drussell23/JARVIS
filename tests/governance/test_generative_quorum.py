@@ -43,17 +43,27 @@ from backend.core.ouroboros.governance.verification.generative_quorum import (  
 
 
 class TestEnvKnobs:
-    def test_quorum_enabled_default_false(self, monkeypatch):
+    def test_quorum_enabled_default_true_post_graduation(
+        self, monkeypatch,
+    ):
+        # Q4 Priority #1 graduation (2026-05-02): master flag
+        # default-true; operator authorized after empirical
+        # verification that K× cost is structurally bounded.
         monkeypatch.delenv(
             "JARVIS_GENERATIVE_QUORUM_ENABLED", raising=False,
         )
-        assert quorum_enabled() is False
+        assert quorum_enabled() is True
 
     @pytest.mark.parametrize(
         "value,expected",
         [
-            ("", False), ("0", False), ("false", False),
+            # Whitespace / unset = current default (now True post
+            # Q4 Priority #1 graduation).
+            ("", True), ("   ", True),
+            # Explicit falsy variants — instant rollback path.
+            ("0", False), ("false", False),
             ("no", False), ("garbage", False),
+            # Explicit truthy variants.
             ("1", True), ("true", True), ("YES", True),
             ("on", True),
         ],

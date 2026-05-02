@@ -1739,22 +1739,25 @@ SEED_SPECS: list = [
     # ====================================================================
     FlagSpec(
         name="JARVIS_GENERATIVE_QUORUM_ENABLED",
-        type=FlagType.BOOL, default=False,
+        type=FlagType.BOOL, default=True,
         description=(
             "Master kill switch for K-way Generative Quorum. "
-            "Default false post Slice 5 graduation — operators "
-            "explicitly opt in because Quorum incurs K× generation "
-            "cost per APPROVAL_REQUIRED+ op. When false, the gate "
-            "short-circuits to FALL_THROUGH_SINGLE on every op (no "
-            "behavior change from pre-Move-6 baseline)."
+            "Default TRUE post Q4 Priority #1 graduation "
+            "(2026-05-02) — operator authorized after empirical "
+            "verification that the K× generation cost is structurally "
+            "bounded by three downstream gates: (a) "
+            "JARVIS_QUORUM_GATE_ENABLED sub-gate, (b) risk-tier "
+            "filter (APPROVAL_REQUIRED+ only), (c) COST_GATED_ROUTES "
+            "frozenset excluding BACKGROUND/SPECULATIVE. K=3 default "
+            "clamped [2, 5]. Set to false for instant rollback."
         ),
         category=Category.SAFETY,
         source_file=(
             "backend/core/ouroboros/governance/verification/"
             "generative_quorum.py"
         ),
-        example="false",
-        since="Move 6 Slice 5",
+        example="true",
+        since="Move 6 Slice 5 (graduated Q4 P#1, 2026-05-02)",
         posture_relevance=_HARDEN_AND_CONSOLIDATE,
     ),
     FlagSpec(

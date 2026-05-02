@@ -64,10 +64,14 @@ Authority invariants (AST-pinned by companion tests):
   * No mutation tools imported anywhere — read-only contract
     (enforced by Slice 5 graduation pin).
 
-Master flag default-false until Slice 5 graduation:
-``JARVIS_GENERATIVE_QUORUM_ENABLED``. Asymmetric env semantics:
-empty/whitespace = unset = current default; explicit truthy/
-falsy overrides at call time.
+Master flag default-TRUE post Q4 Priority #1 graduation
+(2026-05-02): ``JARVIS_GENERATIVE_QUORUM_ENABLED``. Asymmetric env
+semantics: empty/whitespace = unset = current default; explicit
+truthy/falsy overrides at call time.
+
+Cost contract preserved by construction — see
+:func:`quorum_enabled` for the three downstream gates that bound
+the K× amplification (sub-gate / risk-tier filter / route filter).
 """
 from __future__ import annotations
 
@@ -105,18 +109,34 @@ _AGREEMENT_THRESHOLD_FLOOR: int = 2
 
 
 def quorum_enabled() -> bool:
-    """``JARVIS_GENERATIVE_QUORUM_ENABLED`` (default ``false``
-    until Slice 5 graduation).
+    """``JARVIS_GENERATIVE_QUORUM_ENABLED`` (default ``true`` —
+    operator-authorized graduation per Q4 Priority #1, 2026-05-02).
 
     Asymmetric env semantics: empty/whitespace = unset = current
     default; explicit ``0`` / ``false`` / ``no`` / ``off``
     evaluates false; explicit truthy values evaluate true.
-    Re-read on every call so flips hot-revert without restart."""
+    Re-read on every call so flips hot-revert without restart.
+
+    Cost contract preserved by construction: master-on does NOT
+    mean every op runs Quorum. The K× generation cost is gated by
+    three downstream checks in :func:`should_invoke_quorum`:
+
+      1. ``JARVIS_QUORUM_GATE_ENABLED`` sub-gate (operator's
+         emergency kill switch — flips off without disabling the
+         whole subsystem)
+      2. Risk-tier filter — Quorum invokes only on
+         ``APPROVAL_REQUIRED+`` ops (operator-review-required tier)
+      3. Route filter — ``COST_GATED_ROUTES`` excludes
+         ``BACKGROUND`` / ``SPECULATIVE`` routes structurally
+
+    K=3 default (clamped [2, 5]) bounds amplification. Operators
+    can flip the master back to false (or set the sub-gate false)
+    for instant rollback — both are re-read on every call."""
     raw = os.environ.get(
         "JARVIS_GENERATIVE_QUORUM_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated default 2026-05-02
     return raw in ("1", "true", "yes", "on")
 
 

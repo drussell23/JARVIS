@@ -98,13 +98,16 @@ def make_slow_gen(sleep_s: float, diff: str):
 
 
 class TestDisabledGate:
-    def test_disabled_via_env_unset(self):
+    def test_enabled_via_env_unset_post_q4_graduation(self):
+        # Q4 Priority #1 graduation (2026-05-02): master flag
+        # default-true; unset env now produces CONSENSUS (the
+        # quorum runs). Falsy env explicitly is the new "disabled"
+        # path — covered by ``test_disabled_via_env_explicit_false``.
         os.environ.pop("JARVIS_GENERATIVE_QUORUM_ENABLED", None)
         gen = make_static_gen("def foo(): return 1")
         result = asyncio.run(run_quorum(gen, k=3))
-        assert result.verdict.outcome is ConsensusOutcome.DISABLED
-        assert len(result.rolls) == 0
-        assert len(result.failed_roll_ids) == 0
+        assert result.verdict.outcome is ConsensusOutcome.CONSENSUS
+        assert len(result.rolls) == 3
 
     def test_disabled_via_env_explicit_false(self):
         with mock.patch.dict(

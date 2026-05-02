@@ -435,10 +435,20 @@ class TestSSEEmission:
 
 def _aiohttp_available() -> bool:
     try:
-        import aiohttp  # noqa: F401
+        from aiohttp.test_utils import make_mocked_request  # noqa: F401
         return True
     except ImportError:
         return False
+
+
+def _make_request(path: str):
+    """Build an aiohttp Request bound to a 127.0.0.1 peer so the
+    rate-limiter sees a stable client key. Mirrors the pattern in
+    tests/governance/test_ide_observability_dag_routes.py."""
+    from aiohttp.test_utils import make_mocked_request
+    req = make_mocked_request("GET", path)
+    req._transport_peername = ("127.0.0.1", 0)  # type: ignore[attr-defined]
+    return req
 
 
 @pytest.mark.skipif(
@@ -446,28 +456,46 @@ def _aiohttp_available() -> bool:
     reason="aiohttp not available — GET-route tests skipped",
 )
 class TestGETRoutes:
-    @pytest.fixture
-    async def client(self, aiohttp_client, monkeypatch):
-        from aiohttp import web
-        from backend.core.ouroboros.governance.ide_observability import (
-            IDEObservabilityRouter,
-        )
+    @pytest.fixture(autouse=True)
+    def _ide_obs_on(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_IDE_OBSERVABILITY_ENABLED", "true",
         )
         monkeypatch.setenv(
             "JARVIS_CLOSURE_LOOP_ORCHESTRATOR_ENABLED", "true",
         )
+
+    @pytest.fixture
+    def router(self):
+        from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+            IDEObservabilityRouter,
+        )
+        return IDEObservabilityRouter()
+
+    def test_routes_register(self, router):
+        from aiohttp import web
         app = web.Application()
-        router = IDEObservabilityRouter()
         router.register_routes(app)
-        return await aiohttp_client(app)
+        paths = [
+            getattr(r, "resource", None) and r.resource.canonical
+            for r in app.router.routes()
+        ]
+        for p in (
+            "/observability/closure-loop",
+            "/observability/closure-loop/history",
+            "/observability/closure-loop/pending",
+            "/observability/closure-loop/stats",
+        ):
+            assert p in paths
 
     @pytest.mark.asyncio
-    async def test_health_returns_200_when_master_on(self, client):
-        resp = await client.get("/observability/closure-loop")
+    async def test_health_returns_200_when_master_on(self, router):
+        import json
+        resp = await router._handle_closure_loop_health(
+            _make_request("/observability/closure-loop"),
+        )
         assert resp.status == 200
-        body = await resp.json()
+        body = json.loads(resp.body.decode("utf-8"))
         assert body["enabled"] is True
         assert "history_path" in body
         assert "history_count" in body
@@ -475,82 +503,108 @@ class TestGETRoutes:
 
     @pytest.mark.asyncio
     async def test_health_returns_403_when_master_off(
-        self, aiohttp_client, monkeypatch,
+        self, router, monkeypatch,
     ):
-        from aiohttp import web
-        from backend.core.ouroboros.governance.ide_observability import (
-            IDEObservabilityRouter,
-        )
-        monkeypatch.setenv(
-            "JARVIS_IDE_OBSERVABILITY_ENABLED", "true",
-        )
+        import json
         monkeypatch.setenv(
             "JARVIS_CLOSURE_LOOP_ORCHESTRATOR_ENABLED", "false",
         )
-        app = web.Application()
-        IDEObservabilityRouter().register_routes(app)
-        c = await aiohttp_client(app)
-        resp = await c.get("/observability/closure-loop")
+        resp = await router._handle_closure_loop_health(
+            _make_request("/observability/closure-loop"),
+        )
         assert resp.status == 403
+        body = json.loads(resp.body.decode("utf-8"))
+        assert (
+            body["reason_code"]
+            == "ide_observability.closure_loop_disabled"
+        )
 
     @pytest.mark.asyncio
-    async def test_history_returns_records(self, client):
-        # Seed the ring with one record.
+    async def test_health_returns_403_when_umbrella_off(
+        self, router, monkeypatch,
+    ):
+        import json
+        monkeypatch.setenv(
+            "JARVIS_IDE_OBSERVABILITY_ENABLED", "false",
+        )
+        resp = await router._handle_closure_loop_health(
+            _make_request("/observability/closure-loop"),
+        )
+        assert resp.status == 403
+        body = json.loads(resp.body.decode("utf-8"))
+        assert body["reason_code"] == "ide_observability.disabled"
+
+    @pytest.mark.asyncio
+    async def test_history_returns_records(self, router):
+        import json
         from backend.core.ouroboros.governance.verification.closure_loop_store import (  # noqa: E501
             record_closure_outcome,
         )
         record_closure_outcome(_record())
-        resp = await client.get(
-            "/observability/closure-loop/history?limit=10",
+        resp = await router._handle_closure_loop_history(
+            _make_request(
+                "/observability/closure-loop/history?limit=10",
+            ),
         )
         assert resp.status == 200
-        body = await resp.json()
+        body = json.loads(resp.body.decode("utf-8"))
         assert "records" in body
         assert len(body["records"]) >= 1
         assert body["records"][0]["advisory_id"] == "adv-001"
 
     @pytest.mark.asyncio
-    async def test_history_malformed_limit_400(self, client):
-        resp = await client.get(
-            "/observability/closure-loop/history?limit=garbage",
+    async def test_history_malformed_limit_400(self, router):
+        import json
+        resp = await router._handle_closure_loop_history(
+            _make_request(
+                "/observability/closure-loop/history?limit=garbage",
+            ),
         )
         assert resp.status == 400
+        body = json.loads(resp.body.decode("utf-8"))
+        assert (
+            body["reason_code"]
+            == "ide_observability.malformed_limit"
+        )
 
     @pytest.mark.asyncio
-    async def test_pending_returns_empty_when_no_proposals(self, client):
-        resp = await client.get(
-            "/observability/closure-loop/pending",
+    async def test_pending_returns_empty_when_no_proposals(
+        self, router,
+    ):
+        import json
+        resp = await router._handle_closure_loop_pending(
+            _make_request("/observability/closure-loop/pending"),
         )
         assert resp.status == 200
-        body = await resp.json()
-        assert body == {"proposals": []}
+        body = json.loads(resp.body.decode("utf-8"))
+        assert body["proposals"] == []
+        assert "schema_version" in body
 
     @pytest.mark.asyncio
     async def test_pending_returns_proposal_after_propose(
-        self, client,
+        self, router,
     ):
-        # Drive a real propose through the bridge.
+        import json
         result = default_propose_callback(_record())
         assert result is True
-        resp = await client.get(
-            "/observability/closure-loop/pending",
+        resp = await router._handle_closure_loop_pending(
+            _make_request("/observability/closure-loop/pending"),
         )
         assert resp.status == 200
-        body = await resp.json()
+        body = json.loads(resp.body.decode("utf-8"))
         assert len(body["proposals"]) == 1
         prop = body["proposals"][0]
-        assert (
-            prop["surface"] == "coherence_auditor.budgets"
-        )
+        assert prop["surface"] == "coherence_auditor.budgets"
         assert prop["operator_decision"] == "pending"
 
     @pytest.mark.asyncio
-    async def test_stats_returns_observer_telemetry(self, client):
-        resp = await client.get(
-            "/observability/closure-loop/stats",
+    async def test_stats_returns_observer_telemetry(self, router):
+        import json
+        resp = await router._handle_closure_loop_stats(
+            _make_request("/observability/closure-loop/stats"),
         )
         assert resp.status == 200
-        body = await resp.json()
+        body = json.loads(resp.body.decode("utf-8"))
         assert "pass_index" in body
         assert "outcome_histogram" in body
         assert "schema_version" in body
