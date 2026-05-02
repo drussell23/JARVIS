@@ -311,10 +311,24 @@ class SkillObserver:
         # Lock guards the catalog-change reaction path so a
         # register-during-start race can't double-subscribe.
         self._lifecycle_lock = asyncio.Lock()
+        # Q3 Slice 4 — dedicated lock for ALL ``_subscriptions`` dict
+        # mutations + the bus subscribe/unsubscribe calls that pair
+        # with them. Separate from ``_lifecycle_lock`` because
+        # ``start()`` holds the lifecycle lock while calling
+        # ``_subscribe_manifest`` — sharing one lock would deadlock.
+        # Lock hierarchy: ``_lifecycle_lock`` is OUTER,
+        # ``_subscriptions_lock`` is INNER. ``asyncio.Lock``'s waiter
+        # queue is FIFO, so a register-then-unregister-in-close-
+        # succession sequence serializes in scheduling order
+        # (eliminates leaked-sub-for-unregistered-manifest).
+        self._subscriptions_lock = asyncio.Lock()
         # Catalog-change listener handle (for stop cleanup).
         self._catalog_unsub: Optional[Callable[[], None]] = None
         # Started flag -- prevents duplicate start + drives the
-        # catalog-listener wiring in start.
+        # catalog-listener wiring in start. Q3 Slice 4: ALSO gates
+        # post-stop catalog-change tasks so pending coroutines that
+        # were scheduled before stop() drained don't subscribe new
+        # entries against a torn-down observer.
         self._started = False
 
     # ---------------- lifecycle ---------------------------------------
@@ -368,24 +382,27 @@ class SkillObserver:
 
     async def stop(self) -> int:
         """Unsubscribe everything. Returns count unsubscribed.
-        NEVER raises."""
+        NEVER raises.
+
+        Q3 Slice 4 ordering:
+          1. Flip ``_started=False`` under ``_lifecycle_lock`` so
+             pending catalog-change tasks (waiting on
+             ``_subscriptions_lock``) noop when they finally acquire it.
+          2. Detach the catalog-change listener BEFORE the drain so
+             no NEW tasks are scheduled while we're tearing down.
+          3. Drain ``_subscriptions`` under ``_subscriptions_lock``
+             so an in-flight catalog-change task can't re-add subs
+             concurrently with the drain.
+
+        Without (3), a register-task that already started (acquired
+        ``_subscriptions_lock`` first) would land subs after stop()
+        snapshot but before the bus.unsubscribe loop — leaked subs."""
         async with self._lifecycle_lock:
             if not self._started:
                 return 0
             self._started = False
-            count = 0
-            sub_ids = list(self._subscriptions.keys())
-            for sub_id in sub_ids:
-                try:
-                    ok = await self._bus.unsubscribe(sub_id)
-                    if ok:
-                        count += 1
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "[SkillObserver] unsubscribe(%s) degraded: %s",
-                        sub_id, exc,
-                    )
-                self._subscriptions.pop(sub_id, None)
+            # Step 2 first — close the door so _on_catalog_change can't
+            # schedule new tasks during the drain.
             if self._catalog_unsub is not None:
                 try:
                     self._catalog_unsub()
@@ -395,6 +412,22 @@ class SkillObserver:
                         "degraded: %s", exc,
                     )
                 self._catalog_unsub = None
+            # Step 3 — atomic drain.
+            count = 0
+            async with self._subscriptions_lock:
+                sub_ids = list(self._subscriptions.keys())
+                for sub_id in sub_ids:
+                    try:
+                        ok = await self._bus.unsubscribe(sub_id)
+                        if ok:
+                            count += 1
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "[SkillObserver] unsubscribe(%s) "
+                            "degraded: %s",
+                            sub_id, exc,
+                        )
+                    self._subscriptions.pop(sub_id, None)
             logger.info(
                 "[SkillObserver] stopped unsubs=%d", count,
             )
@@ -409,28 +442,87 @@ class SkillObserver:
     async def _subscribe_manifest(
         self, manifest: SkillManifest,
     ) -> int:
-        """Subscribe every observable spec on a manifest. Returns
-        the count of subscriptions installed (0 if none qualify)."""
+        """Subscribe every observable spec on a manifest, idempotently.
+
+        Q3 Slice 4 atomicity guarantees:
+
+          * Acquires ``_subscriptions_lock`` for the WHOLE body —
+            concurrent calls (e.g. ``start()`` racing a
+            catalog ``skill_registered`` listener task) serialize.
+          * Idempotent: any existing subscriptions already keyed to
+            this ``qualified_name`` are unsubscribed FIRST, so a
+            register-during-start double-subscribe lands a single
+            consistent set of subs at quiescence (the catalog's most
+            recent manifest definition wins).
+          * Gated on ``self._started`` so a task scheduled before
+            ``stop()`` but executed after it cleanly no-ops.
+
+        Returns the count of subscriptions installed for this manifest
+        (NOT counting any prior subs that were dropped). NEVER raises
+        — every per-spec failure is logged at DEBUG and skipped."""
         try:
             specs = tuple(manifest.trigger_specs or ())
         except Exception:  # noqa: BLE001 -- defensive
             return 0
-        count = 0
-        for idx, spec in enumerate(specs):
-            if not isinstance(spec, SkillTriggerSpec):
-                continue
-            # An observable spec needs a non-empty signal_pattern
-            # AND a non-DISABLED kind.
-            if not spec.signal_pattern:
-                continue
-            if spec.kind is SkillTriggerKind.DISABLED:
-                continue
-            sub_id = await self._subscribe_one(
-                manifest.qualified_name, idx, spec,
-            )
-            if sub_id:
-                count += 1
-        return count
+        async with self._subscriptions_lock:
+            if not self._started:
+                # stop() drained between schedule and execution.
+                return 0
+            # Idempotent prefix: drop any existing subs for this
+            # qualified name before re-subscribing.
+            await self._drop_subs_for_qname_locked(manifest.qualified_name)
+            count = 0
+            for idx, spec in enumerate(specs):
+                if not isinstance(spec, SkillTriggerSpec):
+                    continue
+                # An observable spec needs a non-empty signal_pattern
+                # AND a non-DISABLED kind.
+                if not spec.signal_pattern:
+                    continue
+                if spec.kind is SkillTriggerKind.DISABLED:
+                    continue
+                sub_id = await self._subscribe_one(
+                    manifest.qualified_name, idx, spec,
+                )
+                if sub_id:
+                    count += 1
+            return count
+
+    async def _drop_subs_for_qname_locked(self, qname: str) -> int:
+        """Drop every subscription keyed to ``qname``. MUST be called
+        with ``_subscriptions_lock`` held. Returns count dropped."""
+        existing = [
+            s for s, (n, _i) in self._subscriptions.items()
+            if n == qname
+        ]
+        dropped = 0
+        for sub_id in existing:
+            try:
+                ok = await self._bus.unsubscribe(sub_id)
+                if ok:
+                    dropped += 1
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[SkillObserver] drop unsubscribe(%s) degraded: %s",
+                    sub_id, exc,
+                )
+            self._subscriptions.pop(sub_id, None)
+        return dropped
+
+    async def _unsubscribe_qname(self, qname: str) -> int:
+        """Q3 Slice 4 — atomic unsubscribe of all subs for a qname.
+
+        Replaces the sync iterate-and-schedule pattern in
+        ``_on_catalog_change`` (which had two bugs: it iterated
+        ``_subscriptions`` from a sync context where another task
+        could be mutating it, and it scheduled N independent tasks
+        whose interleaving could leak subs). This single-task path
+        takes the lock once, drains under it, and noop-gates on
+        ``self._started`` to handle post-stop scheduling."""
+        async with self._subscriptions_lock:
+            if not self._started:
+                return 0
+            return await self._drop_subs_for_qname_locked(qname)
 
     async def _subscribe_one(
         self,
@@ -467,13 +559,25 @@ class SkillObserver:
     # ---------------- catalog change reactivity -----------------------
 
     def _on_catalog_change(self, payload: Dict[str, Any]) -> None:
-        """SkillCatalog.on_change listener -- reacts to register /
-        unregister. Subscribes new manifests' specs; unsubscribes
-        removed manifests'. Schedules async work via
-        :func:`asyncio.create_task` so the synchronous listener
+        """SkillCatalog.on_change listener — reacts to register /
+        unregister. Schedules async work so the sync listener
         callback never blocks the catalog mutation path.
 
-        NEVER raises -- a failure here cannot stall register/
+        Q3 Slice 4 atomicity model:
+
+          * Each event type maps to ONE coroutine that takes
+            ``_subscriptions_lock`` and operates atomically. We do
+            NOT iterate ``_subscriptions`` here — that read happened
+            under no lock + concurrent mutation could (and did)
+            raise ``RuntimeError: dictionary changed size during
+            iteration`` from a sync callback that has no way to
+            recover.
+          * ``asyncio.Lock`` waiter queue is FIFO, so a register
+            immediately followed by an unregister for the same qname
+            executes in scheduling order — the unregister sees the
+            subs the register installed and clears them.
+
+        NEVER raises — a failure here cannot stall register/
         unregister."""
         try:
             event_type = payload.get("event_type")
@@ -487,15 +591,7 @@ class SkillObserver:
                         self._subscribe_manifest(manifest),
                     )
             elif event_type == "skill_unregistered":
-                # Find subs matching this qname and unsubscribe.
-                sub_ids = [
-                    s for s, (n, _i) in self._subscriptions.items()
-                    if n == qname
-                ]
-                for sub_id in sub_ids:
-                    asyncio.create_task(
-                        self._unsubscribe_one(sub_id),
-                    )
+                asyncio.create_task(self._unsubscribe_qname(qname))
         except Exception as exc:  # noqa: BLE001 -- defensive
             logger.debug(
                 "[SkillObserver] _on_catalog_change degraded: %s",
@@ -503,16 +599,25 @@ class SkillObserver:
             )
 
     async def _unsubscribe_one(self, sub_id: str) -> bool:
-        try:
-            ok = await self._bus.unsubscribe(sub_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "[SkillObserver] _unsubscribe_one degraded: %s",
-                exc,
-            )
-            ok = False
-        self._subscriptions.pop(sub_id, None)
-        return bool(ok)
+        """Unsubscribe a single subscription id atomically.
+
+        Q3 Slice 4 — acquires ``_subscriptions_lock`` so the dict pop
+        + bus.unsubscribe are paired with no other mutator interleaving.
+        Used only for one-off unsubscribe (tests, future targeted
+        cleanup) — the catalog-unregister path uses
+        :meth:`_unsubscribe_qname` so it can drop ALL subs for a qname
+        in a single critical section."""
+        async with self._subscriptions_lock:
+            try:
+                ok = await self._bus.unsubscribe(sub_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[SkillObserver] _unsubscribe_one degraded: %s",
+                    exc,
+                )
+                ok = False
+            self._subscriptions.pop(sub_id, None)
+            return bool(ok)
 
     # ---------------- event handling ----------------------------------
 
