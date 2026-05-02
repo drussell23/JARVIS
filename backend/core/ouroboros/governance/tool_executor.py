@@ -4663,6 +4663,30 @@ class ToolLoopCoordinator:
                         duration_ms=_dur_ms,
                         status=_nstatus,
                     )
+                    # ── Antivenom Vector 2: tool-output injection scan ──
+                    # Scan tool output for prompt-injection patterns
+                    # BEFORE formatting into the generation prompt.
+                    # Lazy import preserves the existing import graph
+                    # (tool_executor never imports semantic_firewall).
+                    try:
+                        from backend.core.ouroboros.governance.semantic_firewall import (
+                            scan_tool_output as _scan_tool_output,
+                        )
+                        _scan = _scan_tool_output(
+                            tool_result.output or "",
+                            tool_name=tc.name,
+                        )
+                        if _scan.injection_count > 0:
+                            tool_result = type(tool_result)(
+                                output=_scan.redacted,
+                                error=tool_result.error,
+                                status=tool_result.status,
+                            )
+                    except ImportError:
+                        pass  # firewall unavailable — skip
+                    except Exception:  # noqa: BLE001 — defensive
+                        pass  # never break the tool loop
+
                     prompt_appendix += _format_tool_result(tc, tool_result)
 
             self._last_records = list(records)

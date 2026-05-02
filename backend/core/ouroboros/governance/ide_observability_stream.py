@@ -283,6 +283,25 @@ EVENT_TYPE_COUNTERFACTUAL_BASELINE_UPDATED = (
 EVENT_TYPE_SBT_TREE_COMPLETE = "sbt_tree_complete"
 EVENT_TYPE_SBT_BASELINE_UPDATED = "sbt_baseline_updated"
 
+# Priority #5 Slice 4 — Continuous Invariant Gradient Watcher
+# observability. Two event types fire from gradient_observer:
+#   * REPORT_RECORDED — per-report SSE: one event per recorded
+#     GradientReport (after compute_gradient_outcome). Payload:
+#     {outcome, total_samples, breach_count, drift_count,
+#     readings_count, tightening, cluster_kind, schema_version}.
+#   * BASELINE_UPDATED — per-aggregation SSE: fires when periodic
+#     observer recomputes the gradient-effectiveness baseline and
+#     the CIGWEffectivenessOutcome changed (or every Nth pass for
+#     liveness). Payload: {outcome, total_reports, actionable_count,
+#     stable_count, drifting_count, breached_count, total_breaches,
+#     stable_rate, drift_rate, breach_rate, baseline_quality,
+#     tightening, schema_version}.
+# Both are PURE OBSERVABILITY — no authority surface. Cost-contract
+# preserved by AST-pinned construction (observer reads cached
+# artifacts only).
+EVENT_TYPE_CIGW_REPORT_RECORDED = "cigw_report_recorded"
+EVENT_TYPE_CIGW_BASELINE_UPDATED = "cigw_baseline_updated"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -338,6 +357,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COUNTERFACTUAL_BASELINE_UPDATED,  # Priority #3 Slice 4
     EVENT_TYPE_SBT_TREE_COMPLETE,                # Priority #4 Slice 4
     EVENT_TYPE_SBT_BASELINE_UPDATED,             # Priority #4 Slice 4
+    EVENT_TYPE_CIGW_REPORT_RECORDED,             # Priority #5 Slice 4
+    EVENT_TYPE_CIGW_BASELINE_UPDATED,            # Priority #5 Slice 4
 })
 
 

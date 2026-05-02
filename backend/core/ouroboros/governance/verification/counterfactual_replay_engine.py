@@ -137,6 +137,7 @@ from backend.core.ouroboros.governance.verification.counterfactual_replay import
     ReplayVerdict,
     compute_replay_outcome,
     counterfactual_replay_enabled,
+    validate_swap_payload,
 )
 
 # Causality DAG (Priority 2 Slice 3 reuse — DAG construction +
@@ -936,6 +937,31 @@ async def run_counterfactual_replay(
             target=None,
             verdict=BranchVerdict.FAILED,
             detail=f"invalid_target_type:{type(target).__name__}",
+        )
+
+    # 2b. Antivenom Vector 4: validate swap_decision_payload
+    # against the per-kind schema whitelist. Poisoned payloads
+    # with unknown keys or out-of-vocabulary values produce
+    # FAILED before any I/O (zero-cost structural guard).
+    payload_valid, payload_reason = validate_swap_payload(
+        target.swap_decision_kind,
+        target.swap_decision_payload,
+    )
+    if not payload_valid:
+        logger.warning(
+            "[replay_engine] payload validation failed for "
+            "%s/%s: %s",
+            target.session_id,
+            target.swap_decision_kind.value,
+            payload_reason,
+        )
+        return ReplayVerdict(
+            outcome=ReplayOutcome.FAILED,
+            target=target,
+            verdict=BranchVerdict.FAILED,
+            detail=(
+                f"payload_validation_failed: {payload_reason}"
+            ),
         )
 
     # 3. Load artifacts off the event loop. NEVER raises — disk

@@ -405,6 +405,27 @@ def _run(args: Tuple[str, ...]) -> ReplayDispatchResult:
         swap_decision_payload=payload,
     )
 
+    # Antivenom Vector 4: validate the constructed payload before
+    # the engine wires. Catches invalid payloads at the REPL
+    # boundary with a friendly error.
+    try:
+        from backend.core.ouroboros.governance.verification.counterfactual_replay import (
+            validate_swap_payload,
+        )
+        p_valid, p_reason = validate_swap_payload(
+            kind_enum, payload,
+        )
+        if not p_valid:
+            return ReplayDispatchResult(
+                ok=False,
+                text=(
+                    f"  /replay run: payload validation failed: "
+                    f"{p_reason}"
+                ),
+            )
+    except ImportError:
+        pass  # validation module unavailable — skip
+
     # Run + record. Wraps in asyncio.run since dispatch is sync.
     try:
         result = asyncio.run(run_counterfactual_replay(target))

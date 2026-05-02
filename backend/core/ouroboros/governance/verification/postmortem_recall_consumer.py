@@ -346,6 +346,79 @@ def _extract_failure_class(detail: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Antivenom Vector 3: failure_class semantic plausibility
+# ---------------------------------------------------------------------------
+
+
+# Minimal governance-originated failure classes that ALWAYS exist.
+# This is the structural floor — operators extend via env knob.
+_CORE_FAILURE_CLASSES: frozenset = frozenset({
+    "timeout_failure",
+    "validation_failure",
+    "worktree_isolation",
+    "generation_failure",
+    "apply_failure",
+    "verify_failure",
+    "parse_failure",
+    "cost_limit_failure",
+    "context_overflow",
+    "tool_loop_failure",
+    "provider_error",
+    "stream_rupture",
+    "infra",
+})
+
+
+def _advisory_plausibility_enabled() -> bool:
+    """``JARVIS_ADVISORY_PLAUSIBILITY_CHECK_ENABLED`` (default
+    ``true``). Kill switch for failure_class semantic plausibility
+    validation. Explicit ``false`` disables."""
+    raw = os.environ.get(
+        "JARVIS_ADVISORY_PLAUSIBILITY_CHECK_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return True
+    return raw in ("1", "true", "yes", "on")
+
+
+def _build_known_failure_classes() -> frozenset:
+    """Dynamically aggregate known failure classes from:
+
+      1. ``_CORE_FAILURE_CLASSES`` (hardcoded structural floor)
+      2. ``JARVIS_KNOWN_FAILURE_CLASSES`` env CSV (operator-extensible)
+      3. ``live_fire_soak._INFRA_FAILURE_CLASSES`` (lazy, defensive)
+
+    Returns a frozenset of all known failure class strings.
+    NEVER raises."""
+    try:
+        classes: set = set(_CORE_FAILURE_CLASSES)
+
+        # Operator-extensible via env CSV.
+        env_csv = os.environ.get(
+            "JARVIS_KNOWN_FAILURE_CLASSES", "",
+        ).strip()
+        if env_csv:
+            for c in env_csv.split(","):
+                c = c.strip()
+                if c:
+                    classes.add(c)
+
+        # Lazy import from live_fire_soak — defensive.
+        try:
+            from tests.governance.live_fire_soak import (  # type: ignore[import-untyped]
+                _INFRA_FAILURE_CLASSES,
+            )
+            if isinstance(_INFRA_FAILURE_CLASSES, (set, frozenset)):
+                classes.update(str(c) for c in _INFRA_FAILURE_CLASSES)
+        except Exception:  # noqa: BLE001 — test module may not exist
+            pass
+
+        return frozenset(classes)
+    except Exception:  # noqa: BLE001 — defensive
+        return _CORE_FAILURE_CLASSES
+
+
+# ---------------------------------------------------------------------------
 # Public: compute_recurrence_boosts
 # ---------------------------------------------------------------------------
 
@@ -426,6 +499,18 @@ def compute_recurrence_boosts(
                 fc = _extract_failure_class(adv.detail)
                 if not fc:
                     continue
+                # Antivenom Vector 3: plausibility gate — cross-
+                # reference against known failure classes.
+                if _advisory_plausibility_enabled():
+                    known = _build_known_failure_classes()
+                    if fc not in known:
+                        logger.warning(
+                            "[PostmortemRecallConsumer] unknown "
+                            "failure_class %r in advisory %s — "
+                            "skipping (plausibility check)",
+                            fc, adv.advisory_id,
+                        )
+                        continue
                 if fc not in per_class:
                     per_class[fc] = []
                 per_class[fc].append(adv)

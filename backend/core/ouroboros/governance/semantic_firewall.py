@@ -58,10 +58,13 @@ Manifesto alignment:
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Mapping, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -482,3 +485,138 @@ def mutating_tool_set() -> FrozenSet[str]:
     """Tools classified as mutating — require explicit opt-in AND a
     NOTIFY_APPLY+ parent risk tier."""
     return _MUTATING_TOOLS
+
+
+# ============================================================================
+# Antivenom Vector 2: Tool-output prompt injection scanner
+# ============================================================================
+#
+# Scans tool result strings for prompt-injection patterns BEFORE they
+# enter the generation prompt. Credential shapes are intentionally
+# EXCLUDED — tool outputs legitimately contain secrets (e.g., a
+# read_file on a config file). Only the 11 prompt-injection patterns
+# run on tool output.
+#
+# Matched content is redacted in-place (replaced with
+# [TOOL_INJECTION_REDACTED: <pattern_hint>]) rather than rejected
+# outright (tool loops must continue).
+
+
+@dataclass(frozen=True)
+class ToolOutputScanResult:
+    """Structured outcome of tool-output injection scanning.
+
+    ``redacted`` is the output with injection patterns replaced.
+    ``injection_count`` is the number of patterns matched.
+    ``redacted_patterns`` is the list of pattern hints that fired."""
+    redacted: str
+    injection_count: int = 0
+    redacted_patterns: Tuple[str, ...] = ()
+
+
+def _tool_output_scan_enabled() -> bool:
+    """``JARVIS_TOOL_OUTPUT_INJECTION_SCAN_ENABLED`` (default
+    ``true``). Kill switch for tool-output injection scanning.
+    Explicit ``false`` disables; empty/unset = default ``true``."""
+    raw = os.environ.get(
+        "JARVIS_TOOL_OUTPUT_INJECTION_SCAN_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return True
+    return raw in ("1", "true", "yes", "on")
+
+
+# Prompt-injection patterns only (NOT credential shapes).
+# These are _INJECTION_PATTERNS[:-5] — the first 11 patterns that
+# detect role-override, XML injection, and gate-bypass instructions.
+# Credential shapes are excluded because tool outputs legitimately
+# contain secrets (read_file on a .env file, search_code matching
+# an API key constant, etc.).
+_TOOL_OUTPUT_INJECTION_PATTERNS: Tuple[re.Pattern, ...] = (
+    _INJECTION_PATTERNS[:-len(_CREDENTIAL_SHAPE_PATTERNS)]
+)
+
+
+def scan_tool_output(
+    text: str,
+    *,
+    tool_name: str = "",
+    max_chars: int = 65536,
+) -> ToolOutputScanResult:
+    """Scan a tool result string for prompt-injection patterns.
+
+    Returns a ``ToolOutputScanResult`` with the redacted output.
+    Matched patterns are replaced in-place with
+    ``[TOOL_INJECTION_REDACTED]``. Credential shapes are NOT
+    scanned (tool outputs legitimately contain secrets).
+
+    Parameters
+    ----------
+    text:
+        The tool output string to scan.
+    tool_name:
+        For diagnostic logging only.
+    max_chars:
+        Hard length cap. Outputs larger than this are truncated
+        before scanning (performance guard). Default 65536.
+
+    NEVER raises."""
+    try:
+        if not _tool_output_scan_enabled():
+            return ToolOutputScanResult(
+                redacted=text if isinstance(text, str) else "",
+            )
+
+        if not isinstance(text, str) or not text:
+            return ToolOutputScanResult(redacted=text or "")
+
+        # Truncate before scanning for performance.
+        s = text[:max_chars] if len(text) > max_chars else text
+
+        hit_patterns: List[str] = []
+        redacted = s
+        for pat in _TOOL_OUTPUT_INJECTION_PATTERNS:
+            if pat.search(redacted):
+                hit_patterns.append(pat.pattern[:60])
+                redacted = pat.sub(
+                    "[TOOL_INJECTION_REDACTED]", redacted,
+                )
+
+        if hit_patterns:
+            logger.warning(
+                "[SemanticFirewall] tool_output_injection_redacted "
+                "tool=%s patterns=%d hits=%s",
+                tool_name or "unknown",
+                len(hit_patterns),
+                "; ".join(hit_patterns[:5]),
+            )
+
+        # Re-attach any truncated tail (unscanned but preserving
+        # the original length contract).
+        if len(text) > max_chars:
+            redacted = redacted + text[max_chars:]
+
+        return ToolOutputScanResult(
+            redacted=redacted,
+            injection_count=len(hit_patterns),
+            redacted_patterns=tuple(hit_patterns),
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        # On any failure, pass through unmodified — never break
+        # the tool loop.
+        return ToolOutputScanResult(
+            redacted=text if isinstance(text, str) else "",
+        )
+
+
+__all__ = [
+    "FirewallResult",
+    "ToolOutputScanResult",
+    "is_within_general_subagent",
+    "known_tool_whitelist",
+    "mutating_tool_set",
+    "readonly_tool_whitelist",
+    "sanitize_for_firewall",
+    "scan_tool_output",
+    "validate_boundary_conditions",
+]

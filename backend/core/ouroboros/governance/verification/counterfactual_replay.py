@@ -959,6 +959,142 @@ def compute_replay_outcome(
 
 
 # ---------------------------------------------------------------------------
+# Antivenom Vector 4: per-kind payload schema validation
+# ---------------------------------------------------------------------------
+
+
+# Closed-vocabulary gate verdicts — the only values a GATE_DECISION
+# payload's "verdict" key may carry. Sourced from the canonical
+# risk-tier vocabulary in counterfactual_replay_engine.py.
+_GATE_VERDICT_VOCABULARY: frozenset = frozenset({
+    "auto_apply",
+    "safe_auto",
+    "notify_apply",
+    "approval_required",
+    "blocked",
+})
+
+
+# Per-kind valid key sets. Each DecisionOverrideKind has a closed set
+# of valid payload keys. Unknown keys → validation failure.
+_VALID_PAYLOAD_KEYS: Dict[DecisionOverrideKind, frozenset] = {
+    DecisionOverrideKind.GATE_DECISION: frozenset({"verdict"}),
+    DecisionOverrideKind.POSTMORTEM_INJECTION: frozenset({"enabled"}),
+    DecisionOverrideKind.RECURRENCE_BOOST: frozenset({"enabled"}),
+    DecisionOverrideKind.QUORUM_INVOCATION: frozenset({"enabled"}),
+    DecisionOverrideKind.COHERENCE_OBSERVER: frozenset({"enabled"}),
+}
+
+
+def _validate_swap_payload_enabled() -> bool:
+    """``JARVIS_REPLAY_PAYLOAD_VALIDATION_ENABLED`` (default
+    ``true``). Kill switch for payload schema validation.
+    Explicit ``false`` disables; empty/unset = default ``true``."""
+    raw = os.environ.get(
+        "JARVIS_REPLAY_PAYLOAD_VALIDATION_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return True
+    return raw in ("1", "true", "yes", "on")
+
+
+def validate_swap_payload(
+    kind: DecisionOverrideKind,
+    payload: Mapping[str, Any],
+) -> Tuple[bool, str]:
+    """Structurally validate ``swap_decision_payload`` against the
+    per-kind schema whitelist. Returns ``(valid, reason)``.
+    NEVER raises.
+
+    Per-kind schemas (closed vocabulary):
+
+      * ``GATE_DECISION``: ``{"verdict": str}`` where verdict ∈
+        ``{auto_apply, safe_auto, notify_apply,
+        approval_required, blocked}``. Empty ``{}`` is also valid
+        (engine treats missing verdict as "halt at swap").
+
+      * ``POSTMORTEM_INJECTION``, ``RECURRENCE_BOOST``,
+        ``QUORUM_INVOCATION``, ``COHERENCE_OBSERVER``: ``{}`` or
+        ``{"enabled": bool}``. No other keys.
+
+    Validation is env-gated via
+    ``JARVIS_REPLAY_PAYLOAD_VALIDATION_ENABLED`` (default ``true``).
+    When disabled, returns ``(True, "")`` unconditionally."""
+    try:
+        if not _validate_swap_payload_enabled():
+            return (True, "")
+
+        if not isinstance(kind, DecisionOverrideKind):
+            return (False, f"invalid kind type: {type(kind).__name__}")
+
+        if not isinstance(payload, Mapping):
+            return (
+                False,
+                f"payload must be a Mapping, got {type(payload).__name__}",
+            )
+
+        # Empty payload is always valid — engine treats it as
+        # "use kind-specific defaults".
+        if not payload:
+            return (True, "")
+
+        valid_keys = _VALID_PAYLOAD_KEYS.get(kind)
+        if valid_keys is None:
+            # Unknown kind — cannot validate; reject defensively.
+            return (
+                False,
+                f"no payload schema for kind {kind.value!r}",
+            )
+
+        # Check for unknown keys.
+        payload_keys = frozenset(str(k) for k in payload.keys())
+        unknown_keys = payload_keys - valid_keys
+        if unknown_keys:
+            return (
+                False,
+                f"unknown key(s) {sorted(unknown_keys)!r} in "
+                f"payload for {kind.value}",
+            )
+
+        # Kind-specific value validation.
+        if kind is DecisionOverrideKind.GATE_DECISION:
+            verdict_raw = payload.get("verdict")
+            if verdict_raw is not None:
+                try:
+                    verdict_str = str(verdict_raw).strip().lower()
+                except Exception:  # noqa: BLE001
+                    return (
+                        False,
+                        f"verdict value not coercible to string",
+                    )
+                if verdict_str not in _GATE_VERDICT_VOCABULARY:
+                    return (
+                        False,
+                        f"invalid verdict {verdict_str!r} for "
+                        f"GATE_DECISION — valid: "
+                        f"{sorted(_GATE_VERDICT_VOCABULARY)}",
+                    )
+        else:
+            # enabled/disabled kinds — validate "enabled" is bool.
+            enabled_raw = payload.get("enabled")
+            if enabled_raw is not None:
+                if not isinstance(enabled_raw, bool):
+                    return (
+                        False,
+                        f"'enabled' must be bool, got "
+                        f"{type(enabled_raw).__name__}",
+                    )
+
+        return (True, "")
+    except Exception as exc:  # noqa: BLE001 — last-resort defensive
+        logger.debug(
+            "[CounterfactualReplay] validate_swap_payload "
+            "raised: %s", exc,
+        )
+        return (False, f"validation error: {exc!r}")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -977,6 +1113,7 @@ __all__ = [
     "replay_max_duration_seconds",
     "replay_max_phases_per_branch",
     "replay_min_replays_for_baseline",
+    "validate_swap_payload",
     "verdict_tolerance_postmortem_count",
     "verdict_tolerance_verify_pass_pct",
 ]
