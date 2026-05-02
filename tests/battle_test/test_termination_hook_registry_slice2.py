@@ -783,16 +783,17 @@ class TestSingleton:
 
 
 class TestDiscovery:
-    def test_discover_empty_when_no_providers(self):
-        # Default battle_test + governance packages don't yet
-        # expose register_termination_hooks (Slice 3 wires the
-        # first one); discovery returns 0 cleanly.
+    def test_discover_finds_default_adapters_module(self):
+        # Slice 3 ships termination_hook_default_adapters in the
+        # battle_test package, which exposes
+        # register_termination_hooks(registry) and registers the
+        # partial_summary_writer hook. Discovery picks it up.
         reg = TerminationHookRegistry()
         discovered = discover_module_provided_hooks(reg)
         assert isinstance(discovered, int)
-        assert discovered >= 0
-        # No hooks yet — count should be 0 in the registry too.
-        assert reg.total_count() == 0
+        # At least the default-adapter hook gets registered.
+        assert discovered >= 1
+        assert reg.total_count() >= 1
 
     def test_discover_picks_up_synthetic_provider(self, monkeypatch):
         # Inject a synthetic module exposing
@@ -853,13 +854,15 @@ class TestDiscovery:
     def test_discover_skips_modules_without_register_function(self):
         # Modules that don't expose register_termination_hooks
         # are silently skipped — no error, no log noise that
-        # breaks anything.
+        # breaks anything. Slice 3 added 1 module that DOES
+        # expose it (the default-adapters); the rest of the
+        # battle_test + governance packages don't, and the
+        # discovery loop must skip them silently.
         reg = TerminationHookRegistry()
         discovered = discover_module_provided_hooks(reg)
-        # battle_test + governance packages have many submodules;
-        # most don't (yet) expose register_termination_hooks. The
-        # discovery returns 0 + does not raise.
-        assert discovered == 0
+        # Exactly the default-adapter module's 1 hook —
+        # no spurious registrations from non-provider modules.
+        assert discovered == 1
 
 
 # ---------------------------------------------------------------------------

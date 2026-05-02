@@ -229,6 +229,29 @@ class BattleTestHarness:
         )
         self._shutdown_watchdog = _BoundedShutdownWatchdog()
 
+        # TerminationHookRegistry Slice 3 — install per-process
+        # active-harness singleton so termination hooks dispatched
+        # from contexts where the harness instance is not in scope
+        # (signal-handler callbacks, wall-clock watchdog tasks)
+        # can resolve us via get_active_harness(). Then run the
+        # auto-discovery loop once so the default adapters' hook
+        # (partial_summary_writer) is installed in the registry.
+        # NEVER raises — both are documented defensive surfaces.
+        try:
+            from backend.core.ouroboros.battle_test.termination_hook_default_adapters import (  # noqa: E501
+                set_active_harness as _set_active_harness,
+            )
+            _set_active_harness(self)
+            from backend.core.ouroboros.battle_test.termination_hook_registry import (  # noqa: E501
+                discover_and_register_default as _disc_term,
+            )
+            _disc_term()
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[Harness] termination-hook wire-up degraded: %s",
+                exc,
+            )
+
         # Component references (populated during boot)
         self._oracle: Any = None
         self._governance_stack: Any = None
@@ -3285,13 +3308,62 @@ class BattleTestHarness:
         # one (e.g. wall_clock_cap raced ahead of the signal).
         if signal_name is not None and self._stop_reason in ("unknown", "", None):
             self._stop_reason = signal_name
+        # TerminationHookRegistry Slice 3 — migrate from direct
+        # _atexit_fallback_write call to registry dispatch.
+        # Byte-equivalent: the registered partial_summary_writer
+        # hook (priority 10, runs first in PRE_SHUTDOWN_EVENT_SET)
+        # invokes the SAME _atexit_fallback_write with the SAME
+        # session_outcome="incomplete_kill" kwarg the direct call
+        # used. Pinned by the byte-equivalency test in
+        # test_termination_hook_slice3_wiring.py. The registry
+        # wrap adds: (a) wall-cap path symmetry — the bug fix;
+        # (b) future-hook composability — operator-defined hooks
+        # can register at PRE_SHUTDOWN_EVENT_SET to fire on
+        # every termination path.
         try:
-            if signal_name is not None:
-                self._atexit_fallback_write(session_outcome="incomplete_kill")
+            from backend.core.ouroboros.battle_test.termination_hook import (  # noqa: E501
+                TerminationCause as _TermCause,
+                TerminationPhase as _TermPhase,
+            )
+            from backend.core.ouroboros.battle_test.termination_hook_registry import (  # noqa: E501
+                get_default_registry as _term_registry,
+            )
+            # Map signal name → cause. The two-way mapping is
+            # tight: the only signal_names the existing handler
+            # supports are sigterm/sigint/sighup; None is the
+            # legacy test-harness path (no session_outcome stamp,
+            # writer uses default — preserved by the adapter's
+            # NORMAL_EXIT branch which calls writer() with no
+            # kwargs).
+            if signal_name == "sigterm":
+                _cause = _TermCause.SIGTERM
+            elif signal_name == "sigint":
+                _cause = _TermCause.SIGINT
+            elif signal_name == "sighup":
+                _cause = _TermCause.SIGHUP
+            elif signal_name is None:
+                # Legacy test-harness path — preserve the no-kwarg
+                # writer call by using NORMAL_EXIT (the adapter's
+                # cause→outcome mapping returns None for this,
+                # which calls writer() with no session_outcome —
+                # the pre-Ticket-B contract).
+                _cause = _TermCause.NORMAL_EXIT
             else:
-                self._atexit_fallback_write()
+                _cause = _TermCause.UNKNOWN
+            _term_registry().dispatch(
+                phase=_TermPhase.PRE_SHUTDOWN_EVENT_SET,
+                cause=_cause,
+                session_dir=str(self._session_dir),
+                started_at=self._started_at,
+                stop_reason=self._stop_reason or (
+                    signal_name or ""
+                ),
+            )
         except Exception:  # noqa: BLE001
-            logger.debug("signal-driven partial write failed", exc_info=True)
+            logger.debug(
+                "signal-driven termination-hook dispatch failed",
+                exc_info=True,
+            )
         # W3(7) Slice 4 — Class F cancel emission for in-flight ops.
         # ADDITIVE to the existing partial-summary write above (operator
         # resolution-4: no harness dependency for correctness; the
@@ -3637,6 +3709,45 @@ class BattleTestHarness:
             time.time() - self._started_at,
             cap_s,
         )
+        # Stamp stop_reason FIRST so the termination-hook adapter
+        # below sees "wall_clock_cap" instead of falling back to
+        # the cause-derived value. Mirrors the signal handler's
+        # discipline at lines 3286-3287 (only stamp if not already
+        # classified — preserves any earlier-path classification).
+        if self._stop_reason in ("unknown", "", None):
+            self._stop_reason = "wall_clock_cap"
+        # TerminationHookRegistry Slice 3 — THE bug fix.
+        # Synchronously dispatch the PRE_SHUTDOWN_EVENT_SET phase
+        # BEFORE arming the BoundedShutdownWatchdog + setting the
+        # wall_clock_event. The registered partial_summary_writer
+        # hook lands a v1.1a-parseable summary.json on disk so
+        # the bounded watchdog's eventual os._exit(75) doesn't
+        # leave the session dir summary-less (the
+        # bt-2026-05-02-203805 reproduction). The registry's
+        # 10s phase budget keeps this within the
+        # BoundedShutdownWatchdog's 30s grace; per-hook timeouts
+        # bound any single hook. Strict-sync (threading-only —
+        # survives a wedged asyncio loop). NEVER raises.
+        try:
+            from backend.core.ouroboros.battle_test.termination_hook import (  # noqa: E501
+                TerminationCause as _TermCause,
+                TerminationPhase as _TermPhase,
+            )
+            from backend.core.ouroboros.battle_test.termination_hook_registry import (  # noqa: E501
+                get_default_registry as _term_registry,
+            )
+            _term_registry().dispatch(
+                phase=_TermPhase.PRE_SHUTDOWN_EVENT_SET,
+                cause=_TermCause.WALL_CLOCK_CAP,
+                session_dir=str(self._session_dir),
+                started_at=self._started_at,
+                stop_reason=self._stop_reason or "wall_clock_cap",
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[WallClockWatchdog] termination-hook dispatch "
+                "degraded: %s", exc,
+            )
         # Harness Epic Slice 1 — arm the bounded-shutdown watchdog in
         # PARALLEL to the asyncio event. If the asyncio loop is wedged
         # (the S6 hypothesis — wall watchdog never fired at 2400s),
