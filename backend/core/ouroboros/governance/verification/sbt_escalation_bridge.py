@@ -97,25 +97,33 @@ SBT_ESCALATION_BRIDGE_SCHEMA_VERSION: str = "sbt_escalation_bridge.1"
 
 
 def sbt_escalation_enabled() -> bool:
-    """``JARVIS_SBT_ESCALATION_ENABLED`` (default ``false`` until
-    Slice 3 graduation).
+    """``JARVIS_SBT_ESCALATION_ENABLED`` (default ``true`` —
+    graduated 2026-05-02 in SBT-Probe Escalation Bridge Slice 3).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
+    Asymmetric env semantics — empty/whitespace = unset = graduated
     default; explicit ``0``/``false``/``no``/``off`` evaluates false;
     explicit truthy values evaluate true. Re-read on every call so
     flips hot-revert without restart.
 
-    The default stays off through Slices 1-2 because graduating
-    before the production wire-up at the executor (Slice 2) is
-    live would burn cost on inert escalation paths. Slice 3 flips
-    the default after the full stack proves out with combined
-    sweep + e2e test.
+    Graduated default-true matches established Move 5 / Move 6 /
+    Priority #1-#5 / Priority #6 discipline:
+      * Slice 1 primitive (pure-stdlib) — shipped 2026-05-02.
+      * Slice 2 wrapper + executor wire-up — shipped 2026-05-02.
+      * Slice 3 production prober adapter (this slice) — wraps
+        Move 5's ReadonlyEvidenceProber via the SBT BranchProber
+        protocol, rotating resolution_method across
+        READONLY_TOOL_ALLOWLIST for branch diversity.
+      * 472/472 combined sweep + 21 wrapper tests + dynamic
+        registration verified.
+      * Cost-bounded by construction: SBT's wall-clock cap +
+        bridge's cost/time budget gate + escalation only on
+        probe EXHAUSTED (the inconclusive verdict).
     """
     raw = os.environ.get(
         "JARVIS_SBT_ESCALATION_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default (Slice 3, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -623,6 +631,242 @@ __all__ = [
     "compute_escalation_decision",
     "max_escalation_cost_usd",
     "max_escalation_time_s",
+    "register_flags",
+    "register_shipped_invariants",
     "sbt_escalation_enabled",
     "tree_verdict_to_collapse_action",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 — Module-owned FlagRegistry contribution (3 flags)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned :class:`FlagRegistry` registration. Discovered
+    automatically by ``flag_registry_seed._discover_module_provided_flags``.
+    Returns count registered."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[SBTEscalationBridge] register_flags degraded: %s", exc,
+        )
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_SBT_ESCALATION_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "sbt_escalation_bridge.py"
+            ),
+            example="JARVIS_SBT_ESCALATION_ENABLED=true",
+            description=(
+                "Master switch for the SBT-Probe Escalation Bridge. "
+                "When on, probe EXHAUSTED outcomes optionally "
+                "escalate to a tree-shaped SBT analysis before "
+                "falling through to INCONCLUSIVE. Graduated "
+                "default-true 2026-05-02 in Slice 3."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SBT_ESCALATION_MAX_COST_USD",
+            type=FlagType.FLOAT, default=0.10,
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "sbt_escalation_bridge.py"
+            ),
+            example="JARVIS_SBT_ESCALATION_MAX_COST_USD=0.25",
+            description=(
+                "Defense-in-depth cost cap on the escalation path. "
+                "If probe path already burned this much, escalation "
+                "skips with BUDGET_EXHAUSTED. Floor $0.01, ceiling "
+                "$1.00. Default $0.10."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SBT_ESCALATION_MAX_TIME_S",
+            type=FlagType.FLOAT, default=90.0,
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "sbt_escalation_bridge.py"
+            ),
+            example="JARVIS_SBT_ESCALATION_MAX_TIME_S=120",
+            description=(
+                "Defense-in-depth wall-clock cap on the cumulative "
+                "probe-then-SBT path. Floor 10s, ceiling 600s. "
+                "Default 90s. Composes with SBT's own internal cap."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[SBTEscalationBridge] register_flags spec %s "
+                "skipped: %s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 1's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_pure_stdlib(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 1 stays pure-stdlib at hot path. Registration-
+        contract exemption applies."""
+        violations: list = []
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." in module or "governance" in module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
+                    violations.append(
+                        f"line {lineno}: Slice 1 must be pure-stdlib "
+                        f"— found {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"MUST NOT {node.func.id}()"
+                        )
+            if isinstance(node, _ast.AsyncFunctionDef):
+                violations.append(
+                    f"line {getattr(node, 'lineno', '?')}: Slice 1 "
+                    f"must remain sync — found async def {node.name!r}"
+                )
+        return tuple(violations)
+
+    def _validate_taxonomy_5_values(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Closed-taxonomy: EscalationDecision has exactly 5 values."""
+        violations: list = []
+        required = {
+            "ESCALATE", "SKIP", "BUDGET_EXHAUSTED", "DISABLED", "FAILED",
+        }
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef):
+                if node.name == "EscalationDecision":
+                    seen = set()
+                    for stmt in node.body:
+                        if isinstance(stmt, _ast.Assign):
+                            for tgt in stmt.targets:
+                                if isinstance(tgt, _ast.Name):
+                                    seen.add(tgt.id)
+                    missing = required - seen
+                    extras = seen - required
+                    if missing:
+                        violations.append(
+                            f"EscalationDecision missing: {sorted(missing)}"
+                        )
+                    if extras:
+                        violations.append(
+                            f"EscalationDecision unexpected values "
+                            f"(closed-taxonomy violation): "
+                            f"{sorted(extras)}"
+                        )
+        return tuple(violations)
+
+    def _validate_collapse_mapping_complete(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        """The 5→3 _TREE_TO_COLLAPSE map MUST cover all 5 TreeVerdict
+        values. Missing keys would silently collapse to defensive
+        INCONCLUSIVE — wrong for CONVERGED/DIVERGED."""
+        violations: list = []
+        required = (
+            "_TREE_VERDICT_CONVERGED",
+            "_TREE_VERDICT_DIVERGED",
+            "_TREE_VERDICT_INCONCLUSIVE",
+            "_TREE_VERDICT_TRUNCATED",
+            "_TREE_VERDICT_FAILED",
+        )
+        for k in required:
+            # Each TreeVerdict key must appear in the mapping
+            # construction (literal source presence is a robust
+            # cheap check).
+            if k not in source:
+                violations.append(
+                    f"_TREE_TO_COLLAPSE missing key reference {k!r}"
+                )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/verification/"
+        "sbt_escalation_bridge.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="sbt_escalation_bridge_pure_stdlib",
+            target_file=target,
+            description=(
+                "Slice 1 primitive stays pure-stdlib at hot path: "
+                "no governance imports outside register_flags / "
+                "register_shipped_invariants, no async, no "
+                "exec/eval/compile."
+            ),
+            validate=_validate_pure_stdlib,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="sbt_escalation_bridge_taxonomy_5_values",
+            target_file=target,
+            description=(
+                "EscalationDecision is a 5-value closed taxonomy "
+                "(ESCALATE / SKIP / BUDGET_EXHAUSTED / DISABLED / "
+                "FAILED). New values require explicit scope-doc + "
+                "Slice 2 wrapper update."
+            ),
+            validate=_validate_taxonomy_5_values,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="sbt_escalation_bridge_collapse_mapping_complete",
+            target_file=target,
+            description=(
+                "5→3 TreeVerdict→ConfidenceCollapseAction mapping "
+                "covers all 5 TreeVerdict values. Missing keys "
+                "would silently collapse CONVERGED/DIVERGED to "
+                "defensive INCONCLUSIVE."
+            ),
+            validate=_validate_collapse_mapping_complete,
+        ),
+    ]

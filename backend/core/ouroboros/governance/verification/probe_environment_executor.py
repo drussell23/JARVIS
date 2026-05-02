@@ -256,6 +256,9 @@ async def execute_probe_environment(
             from backend.core.ouroboros.governance.verification.sbt_escalation_runner import (
                 escalate_via_sbt,
             )
+            from backend.core.ouroboros.governance.verification.sbt_branch_prober_adapter import (
+                get_default_branch_prober,
+            )
             # Compose target_descriptor from the ambiguity context's
             # actual fields (target_symbol + claim), bounded for audit.
             tgt_sym = str(
@@ -265,12 +268,18 @@ async def execute_probe_environment(
                 getattr(ambiguity_context, "claim", "") or ""
             )
             target_descriptor = (f"{tgt_sym}|{claim}")[:200]
+            # Production prober (Slice 3): wraps Move 5's
+            # ReadonlyEvidenceProber via BranchProber Protocol,
+            # rotating resolution_method across the canonical
+            # READONLY_TOOL_ALLOWLIST for branch diversity. Same
+            # singleton across calls (lazy-constructed).
             escalation_verdict = await escalate_via_sbt(
                 verdict,
                 op_id=op_id,
                 target_descriptor=target_descriptor,
                 ambiguity_kind="probe_exhausted",
                 confidence_prior=prior,
+                prober=get_default_branch_prober(),
             )
             if escalation_verdict is not None:
                 return escalation_verdict

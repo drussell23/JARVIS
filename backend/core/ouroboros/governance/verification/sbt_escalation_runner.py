@@ -468,4 +468,142 @@ async def escalate_via_sbt(
 __all__ = [
     "DEFAULT_AMBIGUITY_KIND",
     "escalate_via_sbt",
+    "register_shipped_invariants",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 2's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_authority_allowlist(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 2 wrapper imports stay within the documented set
+        — verification surfaces only. Banned: orchestrator-tier."""
+        violations: list = []
+        allowed = {
+            "backend.core.ouroboros.governance.verification.confidence_probe_bridge",
+            "backend.core.ouroboros.governance.verification.hypothesis_consumers",
+            "backend.core.ouroboros.governance.verification.sbt_escalation_bridge",
+            "backend.core.ouroboros.governance.verification.speculative_branch",
+            "backend.core.ouroboros.governance.verification.speculative_branch_runner",
+        }
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        banned_substrings = (
+            "orchestrator", "phase_runner", "iron_gate",
+            "change_engine", "candidate_generator",
+            ".providers", "doubleword_provider", "urgency_router",
+            "auto_action_router", "subagent_scheduler",
+            "tool_executor", "semantic_guardian",
+            "semantic_firewall", "risk_engine",
+        )
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                for ban in banned_substrings:
+                    if ban in module:
+                        violations.append(
+                            f"line {lineno}: BANNED orchestrator-tier "
+                            f"substring {ban!r} in {module!r}"
+                        )
+                if "backend." in module or (
+                    "governance" in module and module
+                ):
+                    if module not in allowed:
+                        violations.append(
+                            f"line {lineno}: import outside Slice 2 "
+                            f"allowlist: {module!r}"
+                        )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    def _validate_optional_return(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """The ``escalate_via_sbt`` async function MUST return
+        Optional[ConfidenceCollapseVerdict] — not a bare verdict.
+        The Optional return is the wire-up shape that lets the
+        caller fall through to its existing logic on None.
+        Renaming or dropping Optional silently breaks the
+        executor's wire-up."""
+        violations: list = []
+        # Cheap source-level check: the function signature must
+        # reference Optional[ConfidenceCollapseVerdict].
+        if "-> Optional[ConfidenceCollapseVerdict]" not in source:
+            violations.append(
+                "escalate_via_sbt missing "
+                "`-> Optional[ConfidenceCollapseVerdict]` return "
+                "annotation — wire-up contract requires Optional."
+            )
+        # Belt-and-suspenders: confirm the function is async (sync
+        # would break asyncio.wait_for + caller's await).
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AsyncFunctionDef):
+                if node.name == "escalate_via_sbt":
+                    break
+        else:
+            violations.append(
+                "escalate_via_sbt missing or not async"
+            )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/verification/"
+        "sbt_escalation_runner.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="sbt_escalation_runner_authority_allowlist",
+            target_file=target,
+            description=(
+                "Slice 2 wrapper imports stay within "
+                "{confidence_probe_bridge, hypothesis_consumers, "
+                "sbt_escalation_bridge, speculative_branch, "
+                "speculative_branch_runner} (+ registration-contract "
+                "exemption). Banned: orchestrator-tier."
+            ),
+            validate=_validate_authority_allowlist,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="sbt_escalation_runner_optional_return",
+            target_file=target,
+            description=(
+                "escalate_via_sbt async function returns "
+                "Optional[ConfidenceCollapseVerdict] — None means "
+                "caller falls through to existing logic; non-None "
+                "overrides. The wire-up contract requires Optional."
+            ),
+            validate=_validate_optional_return,
+        ),
+    ]

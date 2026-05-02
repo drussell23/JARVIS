@@ -590,6 +590,11 @@ class TestAuthorityInvariants:
             # SBT-Probe Escalation Bridge (Slice 2, 2026-05-02) —
             # adds the lazy-import escalation hook on EXHAUSTED.
             "sbt_escalation_runner",
+            # SBT-Probe Escalation Bridge (Slice 3, 2026-05-02) —
+            # production prober adapter wired into the escalation
+            # call. Wraps Move 5's ReadonlyEvidenceProber via the
+            # SBT BranchProber Protocol.
+            "sbt_branch_prober_adapter",
         )
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):

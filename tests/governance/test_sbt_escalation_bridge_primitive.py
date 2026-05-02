@@ -313,17 +313,19 @@ class TestTreeVerdictToCollapseAction:
 
 
 class TestMasterFlagSemantics:
-    def test_default_is_false_pre_graduation(self, monkeypatch):
+    def test_default_is_true_post_graduation(self, monkeypatch):
+        """Slice 3 (2026-05-02) graduated default-true."""
         monkeypatch.delenv("JARVIS_SBT_ESCALATION_ENABLED", raising=False)
-        assert sbt_escalation_enabled() is False
+        assert sbt_escalation_enabled() is True
 
-    def test_empty_string_is_default_false(self, monkeypatch):
+    def test_empty_string_is_default_true(self, monkeypatch):
+        """Asymmetric env semantics: empty = unset = graduated default."""
         monkeypatch.setenv("JARVIS_SBT_ESCALATION_ENABLED", "")
-        assert sbt_escalation_enabled() is False
+        assert sbt_escalation_enabled() is True
 
-    def test_whitespace_is_default_false(self, monkeypatch):
+    def test_whitespace_is_default_true(self, monkeypatch):
         monkeypatch.setenv("JARVIS_SBT_ESCALATION_ENABLED", "   ")
-        assert sbt_escalation_enabled() is False
+        assert sbt_escalation_enabled() is True
 
     @pytest.mark.parametrize(
         "truthy", ["1", "true", "yes", "on", "TRUE", "Yes"],
