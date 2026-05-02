@@ -156,6 +156,23 @@ export function isWorktreeEvent(
   );
 }
 
+// Gap #1 — replay control frames. The agent's ide_observability_stream
+// emits replay_start / replay_end as control frames around a Last-
+// Event-ID replay window; the temporal slider listens for these to
+// know when to refresh its replay-verdicts ribbon.
+const REPLAY_EVENT_TYPES: ReadonlySet<ControlEventType> = new Set([
+  'replay_start',
+  'replay_end',
+]);
+
+export function isReplayEvent(
+  frame: StreamEventFrame,
+): frame is StreamEventFrame & { event_type: 'replay_start' | 'replay_end' } {
+  return REPLAY_EVENT_TYPES.has(
+    frame.event_type as ControlEventType,
+  );
+}
+
 // --- Gap #3 worktree topology projection wire shapes ----------------------
 //
 // Mirror of the agent-side WorktreeTopology produced by

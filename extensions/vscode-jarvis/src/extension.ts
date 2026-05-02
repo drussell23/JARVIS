@@ -23,6 +23,7 @@ import { ExtensionConfig, onConfigChange, readConfig } from './config';
 import { Logger } from './logger';
 import { ConfidencePolicyPanel } from './panel/confidencePolicyPanel';
 import { OpDetailPanel } from './panel/opDetailPanel';
+import { TemporalSliderPanel } from './panel/temporalSliderPanel';
 import { WorktreeTopologyPanel } from './panel/worktreeTopologyPanel';
 import { StatusBar } from './status/statusBar';
 import { OpsTreeProvider } from './tree/opsProvider';
@@ -93,6 +94,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     dispose: () => worktreeTopologyPanel.dispose(),
   });
 
+  // Gap #1 Slice 2: read-only Temporal Slider panel for
+  // time-travel debugging across the CausalityDAG. Reuses the
+  // existing ObservabilityClient (same "1.0" schema) for sessions
+  // / DAG / replay surface fetches; SSE-driven refresh on
+  // replay_start/end so the verdicts ribbon stays current.
+  const temporalSliderPanel = new TemporalSliderPanel(
+    state.client,
+    (m) => logger.info(m),
+  );
+  state.temporalSliderPanel = temporalSliderPanel;
+  context.subscriptions.push({
+    dispose: () => temporalSliderPanel.dispose(),
+  });
+
   // --- Commands ----------------------------------------------------------
   context.subscriptions.push(
     vscode.commands.registerCommand('jarvisObservability.connect', () => {
@@ -128,6 +143,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       'jarvisObservability.openWorktreeTopology',
       async () => {
         await worktreeTopologyPanel.show();
+      },
+    ),
+    // Gap #1 Slice 2: open the Temporal Slider panel.
+    vscode.commands.registerCommand(
+      'jarvisObservability.openTemporalSlider',
+      async () => {
+        await temporalSliderPanel.show();
       },
     ),
   );
