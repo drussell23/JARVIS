@@ -261,7 +261,13 @@ class TestExecuteProbeEnvironment:
     async def test_exhausted_returns_inconclusive_with_budget_reduction(
         self, monkeypatch,
     ):
-        # Force EXHAUSTED by patching run_probe_loop to return it
+        # Force EXHAUSTED by patching run_probe_loop to return it.
+        # Pin SBT escalation OFF so this test validates the LEGACY
+        # path (probe EXHAUSTED → INCONCLUSIVE with budget
+        # reduction). The escalation graduation is covered by
+        # test_sbt_escalation_graduation.py.
+        monkeypatch.setenv("JARVIS_SBT_ESCALATION_ENABLED", "false")
+
         async def _fake_runner(*a, **kw):
             return ConvergenceVerdict(
                 outcome=ProbeOutcome.EXHAUSTED,
