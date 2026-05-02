@@ -6989,6 +6989,55 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] DeployGate not available", exc_info=True)
 
+            # ── Lifecycle Hook PRE_APPLY gate (Slice 4, 2026-05-02) ──
+            # Operator-defined hooks fire here BEFORE any file write.
+            # BLOCK aggregate routes the op to CANCELLED via the
+            # established ctx.advance(CANCELLED, terminal_reason_code=...)
+            # pattern (mirrors emergency-cancel at line 1820+).
+            # WARN/CONTINUE proceed normally. Master-flag-gated by
+            # JARVIS_LIFECYCLE_HOOKS_ENABLED (default false through
+            # Slices 1-4; Slice 5 graduates). NEVER raises out of the
+            # bridge — fail-open on any bridge-side error (a broken
+            # hook substrate cannot block the autonomous loop).
+            try:
+                from backend.core.ouroboros.governance.lifecycle_hook_orchestrator_bridge import (
+                    gate_pre_apply,
+                )
+                _lh_gate = await gate_pre_apply(
+                    ctx.op_id,
+                    target_files=tuple(ctx.target_files or ()),
+                    diff_summary=str(ctx.description or "")[:1000],
+                    risk_tier=str(getattr(ctx, "risk_tier", "") or ""),
+                )
+                if not _lh_gate.passed:
+                    _block_names = ",".join(_lh_gate.blocking_hooks)[:64]
+                    logger.warning(
+                        "[Orchestrator] Lifecycle hook PRE_APPLY "
+                        "BLOCKED op=%s blocking_hooks=%s",
+                        ctx.op_id, list(_lh_gate.blocking_hooks),
+                    )
+                    if _serpent:
+                        await _serpent.stop(success=False)
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code=(
+                            f"lifecycle_hook_blocked:{_block_names}"
+                        ),
+                    )
+                    return ctx
+                if _lh_gate.should_warn:
+                    logger.info(
+                        "[Orchestrator] Lifecycle hook PRE_APPLY "
+                        "WARNED op=%s warning_hooks=%s",
+                        ctx.op_id, list(_lh_gate.warning_hooks),
+                    )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] Lifecycle hook bridge not "
+                    "available",
+                    exc_info=True,
+                )
+
             # Cross-repo saga path
             if ctx.cross_repo:
                 if "execution_graph" in best_candidate:
