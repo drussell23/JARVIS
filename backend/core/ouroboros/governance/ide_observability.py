@@ -157,6 +157,12 @@ _OP_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 # ids the browser does.
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-:.]{1,128}$")
 
+# Record ids in the CausalityDAG are derived from DecisionRecord
+# stamps. Match the same character class as session_id so URL
+# routing accepts them; cap longer (256) to accommodate phase-
+# capture composite ids that include phase + ordinal segments.
+_RECORD_ID_RE = re.compile(r"^[A-Za-z0-9_\-:.]{1,256}$")
+
 
 class IDEObservabilityRouter:
     """Mounts the GET /observability/* routes on a caller-supplied
@@ -255,6 +261,21 @@ class IDEObservabilityRouter:
         app.router.add_get(
             "/observability/curiosity/{question_id}",
             self._handle_curiosity_detail,
+        )
+        # Time-Travel Debugging Slice 1 (2026-05-02) — CausalityDAG
+        # navigation surface. Delegates to verification.dag_navigation
+        # handlers (the substrate) which already check
+        # JARVIS_DAG_NAVIGATION_GET_ENABLED + dag_query_enabled().
+        # Activates the IDE-side consumer for the navigable session
+        # graph (Causality DAG primitive shipped by Priority #2;
+        # GET surface was structurally orphaned until this slice).
+        app.router.add_get(
+            "/observability/dag/{session_id}",
+            self._handle_dag_session,
+        )
+        app.router.add_get(
+            "/observability/dag/{session_id}/{record_id}",
+            self._handle_dag_record,
         )
         # Priority #3 Slice 5b — Counterfactual Replay surface.
         app.router.add_get(
@@ -1480,6 +1501,146 @@ class IDEObservabilityRouter:
             return None
         # Same upper bound as Slice 4's read_replay_history caller cap.
         return max(1, min(200, n))
+
+    # ---- Time-Travel Debugging Slice 1 (2026-05-02) ---------------------
+    # The CausalityDAG navigation surface. Both handlers delegate to
+    # verification.dag_navigation handlers, which already check
+    # JARVIS_DAG_NAVIGATION_GET_ENABLED + dag_query_enabled() and
+    # NEVER raise. The IDE-side mapping translates the substrate's
+    # closed-vocabulary reason_code strings into HTTP status codes.
+
+    #: Substrate reason_code → HTTP status mapping. Sourced from the
+    #: dag_navigation handlers' documented vocabulary; any new
+    #: reason_code added there must be reflected here.
+    _DAG_REASON_CODE_TO_STATUS: Dict[str, int] = {
+        "dag_navigation.disabled": 403,
+        "dag_query.disabled": 403,
+        "dag_navigation.not_found": 404,
+        "dag_navigation.error": 500,
+    }
+
+    def _dag_status_for_reason(self, reason_code: str) -> int:
+        """Map a dag_navigation reason_code to an HTTP status.
+        Defaults to 500 for unknown codes (defensive — surfaces
+        unexpected substrate signals as server errors rather than
+        silently masking them as 200)."""
+        return self._DAG_REASON_CODE_TO_STATUS.get(
+            str(reason_code or ""), 500,
+        )
+
+    async def _handle_dag_session(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/dag/{session_id}`` — session-level
+        CausalityDAG summary.
+
+        Response shape (success)::
+
+            {
+              "schema_version": "1.0",
+              "session_id": "<id>",
+              "node_count": <int>,
+              "edge_count": <int>,
+              "record_ids": ["<id>", ...]   # capped at 1000 by substrate
+            }
+
+        Errors mirror the substrate's reason_code vocabulary:
+        ``dag_navigation.disabled`` / ``dag_query.disabled`` → 403,
+        ``dag_navigation.error`` → 500.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        session_id = request.match_info.get("session_id", "") or ""
+        if not _SESSION_ID_RE.match(session_id):
+            return self._error_response(
+                request, 400, "ide_observability.invalid_session_id",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.dag_navigation import (
+                handle_dag_session,
+            )
+            result = handle_dag_session(session_id)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] dag_session import/call failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500, "ide_observability.dag_session_error",
+            )
+        if isinstance(result, dict) and result.get("error"):
+            reason = str(result.get("reason_code", "") or "")
+            return self._error_response(
+                request, self._dag_status_for_reason(reason), reason,
+            )
+        return self._json_response(request, 200, result)
+
+    async def _handle_dag_record(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/dag/{session_id}/{record_id}`` —
+        record-level navigation: full DecisionRecord + parents +
+        children + counterfactual_branches + subgraph_node_count.
+
+        Response shape (success)::
+
+            {
+              "schema_version": "1.0",
+              "record_id": "<id>",
+              "record": {...},                # DecisionRecord.to_dict()
+              "parents": ["<id>", ...],
+              "children": ["<id>", ...],
+              "counterfactual_branches": [...],
+              "subgraph_node_count": <int>
+            }
+
+        404 (``dag_navigation.not_found``) when the record_id is
+        unknown in the session DAG; other errors map per
+        ``_DAG_REASON_CODE_TO_STATUS``.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        session_id = request.match_info.get("session_id", "") or ""
+        record_id = request.match_info.get("record_id", "") or ""
+        if not _SESSION_ID_RE.match(session_id):
+            return self._error_response(
+                request, 400, "ide_observability.invalid_session_id",
+            )
+        if not _RECORD_ID_RE.match(record_id):
+            return self._error_response(
+                request, 400, "ide_observability.invalid_record_id",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.dag_navigation import (
+                handle_dag_record,
+            )
+            result = handle_dag_record(record_id, session_id=session_id)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] dag_record import/call failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500, "ide_observability.dag_record_error",
+            )
+        if isinstance(result, dict) and result.get("error"):
+            reason = str(result.get("reason_code", "") or "")
+            return self._error_response(
+                request, self._dag_status_for_reason(reason), reason,
+            )
+        return self._json_response(request, 200, result)
 
     async def _handle_replay_health(self, request: "web.Request") -> Any:
         """GET /observability/replay/health — surface liveness +
