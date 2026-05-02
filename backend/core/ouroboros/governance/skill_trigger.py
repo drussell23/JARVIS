@@ -602,11 +602,13 @@ def _trigger_kind_to_required_reach(
     return SkillReach.AUTONOMOUS
 
 
-def _spec_matches_invocation(
+def spec_matches_invocation(
     spec: SkillTriggerSpec,
     invocation: SkillInvocation,
 ) -> bool:
-    """Structured precondition match. NEVER raises."""
+    """Structured precondition match -- public so SkillCatalog
+    (Slice 2) can reuse the same predicate the decision function
+    uses for its trigger lookup. NEVER raises."""
     try:
         if not isinstance(spec, SkillTriggerSpec):
             return False
@@ -677,7 +679,7 @@ def compute_should_fire(
       5. EXPLICIT_INVOCATION + reach permits + zero specs ->
          INVOKED (operator/model can always invoke an exposed skill).
       6. Walk ``manifest.trigger_specs`` in order. First spec
-         where :func:`_spec_matches_invocation` returns True wins.
+         where :func:`spec_matches_invocation` returns True wins.
       7. No matching spec -> SKIPPED_PRECONDITION.
       8. Matching spec -> INVOKED with Phase C tightening stamped.
 
@@ -783,7 +785,7 @@ def compute_should_fire(
             # Walk specs first in case operator declared an explicit
             # filter; otherwise fall through to the no-spec INVOKED.
             for idx, spec in enumerate(specs):
-                if _spec_matches_invocation(spec, invocation):
+                if spec_matches_invocation(spec, invocation):
                     return SkillResult(
                         outcome=SkillOutcome.INVOKED,
                         skill_name=manifest_name,
@@ -805,7 +807,7 @@ def compute_should_fire(
 
         # 6. Autonomous path -- match required.
         for idx, spec in enumerate(specs):
-            if _spec_matches_invocation(spec, invocation):
+            if spec_matches_invocation(spec, invocation):
                 return SkillResult(
                     outcome=SkillOutcome.INVOKED,
                     skill_name=manifest_name,
@@ -911,6 +913,7 @@ __all__ = [
     "compute_dedup_key",
     "compute_should_fire",
     "parse_reach",
+    "spec_matches_invocation",
     "parse_trigger_kind",
     "parse_trigger_spec_mapping",
     "parse_trigger_specs_list",

@@ -69,6 +69,16 @@ from backend.core.ouroboros.governance.skill_manifest import (
     SkillManifestError,
     validate_args,
 )
+# Slice 2 (SkillRegistry-AutonomousReach): trigger lookup index.
+# Public spec_matches_invocation is the SAME predicate
+# compute_should_fire uses internally -- the catalog narrows
+# candidates; the decision function still authoritatively decides
+# fire/skip. No parallel decision path, no duplication.
+from backend.core.ouroboros.governance.skill_trigger import (
+    SkillInvocation,
+    SkillTriggerKind,
+    spec_matches_invocation,
+)
 
 logger = logging.getLogger("Ouroboros.SkillCatalog")
 
@@ -127,6 +137,17 @@ class SkillCatalog:
         self._by_qualified_name: Dict[str, SkillManifest] = {}
         self._max = max(1, max_skills)
         self._listeners: List[Callable[[Dict[str, Any]], None]] = []
+        # ----- Slice 2 additive trigger lookup index -----
+        # Maps SkillTriggerKind -> List[(qualified_name, spec_index)]
+        # so :meth:`triggers_for_signal` is O(K) where K is the
+        # candidate count for the invocation kind, not O(N x M)
+        # over all manifests x specs. Stored by qualified_name (not
+        # direct manifest ref) so unregister cleanup is a simple
+        # filter; manifest is rehydrated from _by_qualified_name at
+        # lookup time (defensive -- skip if it disappeared).
+        self._triggers_by_kind: Dict[
+            SkillTriggerKind, List[Tuple[str, int]]
+        ] = {}
 
     # --- lifecycle -------------------------------------------------------
 
@@ -156,6 +177,10 @@ class SkillCatalog:
                     f"catalog cap {self._max} reached"
                 )
             self._by_qualified_name[qname] = manifest
+            # Index trigger specs (Slice 2 additive). Atomic with
+            # the primary write so triggers_for_signal can never
+            # observe a partially-registered manifest.
+            self._index_manifest_triggers_locked(manifest)
         logger.info(
             "[SkillCatalog] registered qname=%s version=%s source=%s",
             qname, manifest.version, source.value,
@@ -166,6 +191,11 @@ class SkillCatalog:
     def unregister(self, qualified_name: str) -> bool:
         with self._lock:
             manifest = self._by_qualified_name.pop(qualified_name, None)
+            if manifest is not None:
+                # Cleanup trigger index atomically with the primary
+                # delete so triggers_for_signal can never return an
+                # entry whose manifest no longer exists.
+                self._unindex_manifest_triggers_locked(qualified_name)
         if manifest is None:
             return False
         logger.info(

@@ -158,7 +158,17 @@ def ledger_path() -> Path:
 
 
 class AdaptationSurface(str, enum.Enum):
-    """The 5 adaptive surfaces, one per Pass C §3 thesis bullet."""
+    """Adaptive surfaces routed through the universal cage rule.
+
+    Pass C §3 introduced the original 5 surfaces (one per thesis
+    bullet). Deep Observability Gap #2 added a 6th — operator-
+    proposed Confidence-monitor threshold tightening — that reuses
+    the same propose/approve/reject lifecycle without weakening the
+    cage. Adding a surface is the canonical extension point: every
+    new surface ships its own ``register_surface_validator`` call
+    so the per-surface structural invariant is enforced inside
+    ``AdaptationLedger.propose`` before the universal cage check
+    even runs."""
 
     SEMANTIC_GUARDIAN_PATTERNS = "semantic_guardian.patterns"
     """Slice 2 — POSTMORTEM-mined detector patterns."""
@@ -174,6 +184,15 @@ class AdaptationSurface(str, enum.Enum):
 
     EXPLORATION_LEDGER_CATEGORY_WEIGHTS = "exploration_ledger.category_weights"
     """Slice 5 — category-weight rebalance under mass conservation."""
+
+    CONFIDENCE_MONITOR_THRESHOLDS = "confidence_monitor.thresholds"
+    """Deep Observability Gap #2 — operator-proposed Confidence
+    monitor threshold tightening (floor / window_k / approaching_
+    factor / enforce). Surface validator lives in
+    ``adaptation/confidence_threshold_tightener.py``; substrate
+    decision rule lives in ``verification/confidence_policy.py``;
+    HTTP write surface lives in ``ide_policy_router.py`` (Gap #2
+    Slice 4)."""
 
 
 class OperatorDecisionStatus(str, enum.Enum):
