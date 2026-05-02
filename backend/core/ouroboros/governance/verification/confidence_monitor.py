@@ -723,3 +723,66 @@ __all__ = [
     "confidence_window_k",
     "feed_trace_into_monitor",
 ]
+
+
+def register_shipped_invariants() -> list:
+    """Slice 5 cage close — module-owned shipped-code invariant for
+    the Confidence-monitor adapted-loader bridge (Gap #2 Slice 3).
+
+    Pinned guarantees:
+      * All four lazy-import bridge helpers preserved
+        (``_adapted_floor_or_none`` etc. — refactor that drops one
+        breaks the env-explicit-wins-over-adapted precedence).
+      * Each accessor consults its bridge helper before falling
+        through to the hardcoded default (verified via source-text
+        symbol presence).
+
+    NEVER raises. Discovery loop catches exceptions."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_loader_bridge(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("_adapted_floor_or_none",
+             "Slice 3 lazy-import bridge for floor must remain"),
+            ("_adapted_window_k_or_none",
+             "Slice 3 lazy-import bridge for window_k must remain"),
+            ("_adapted_approaching_factor_or_none",
+             "Slice 3 lazy-import bridge for approaching_factor "
+             "must remain"),
+            ("_adapted_enforce_or_none",
+             "Slice 3 lazy-import bridge for enforce must remain"),
+            ("adapted_confidence_loader",
+             "loader module reference must remain (lazy import)"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"confidence_monitor adapted-loader bridge "
+                    f"dropped {symbol!r} — {reason}"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="gap2_confidence_monitor_loader_bridge",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "confidence_monitor.py"
+            ),
+            description=(
+                "Gap #2 Slice 3 adapted-loader bridge: all four "
+                "lazy-import bridge helpers must remain so the "
+                "env-explicit > adapted YAML > hardcoded-default "
+                "precedence is enforced for every threshold knob. "
+                "Catches refactor that breaks the consumer side of "
+                "the cage materialization path."
+            ),
+            validate=_validate_loader_bridge,
+        ),
+    ]

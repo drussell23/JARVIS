@@ -953,3 +953,99 @@ __all__ = [
     "IDEPolicyRouter",
     "ide_policy_router_enabled",
 ]
+
+
+def register_shipped_invariants() -> list:
+    """Slice 5 cage close — module-owned shipped-code invariant for
+    the Confidence-policy HTTP write surface (Gap #2 Slice 4).
+
+    Pinned guarantees:
+      * Loopback-binding assertion symbol referenced (defense
+        against refactor that drops the loopback-only check).
+      * Surface validator integration: cage substrate symbols
+        (compute_policy_diff, build_proposed_state_payload,
+        AdaptationLedger, AdaptationSurface.CONFIDENCE_MONITOR_THRESHOLDS)
+        all referenced.
+      * All 4 SSE event constants referenced.
+      * No authority-carrying imports (orchestrator / iron_gate /
+        policy_engine / risk_engine / change_engine /
+        tool_executor / providers / candidate_generator).
+
+    NEVER raises. Discovery loop catches exceptions."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_router_surface(tree, source) -> tuple:
+        violations = []
+        required = (
+            ("assert_loopback_only",
+             "loopback-bind assertion must be referenced"),
+            ("compute_policy_diff",
+             "cage substrate predicate must be referenced"),
+            ("build_proposed_state_payload",
+             "Slice 2 helper must be referenced"),
+            ("AdaptationLedger",
+             "ledger substrate type must be referenced"),
+            ("CONFIDENCE_MONITOR_THRESHOLDS",
+             "surface enum value must be referenced"),
+            ("EVENT_TYPE_CONFIDENCE_POLICY_PROPOSED",
+             "Slice 4 SSE event constant must be referenced"),
+            ("EVENT_TYPE_CONFIDENCE_POLICY_APPROVED",
+             "Slice 4 SSE event constant must be referenced"),
+            ("EVENT_TYPE_CONFIDENCE_POLICY_REJECTED",
+             "Slice 4 SSE event constant must be referenced"),
+            ("EVENT_TYPE_CONFIDENCE_POLICY_APPLIED",
+             "Slice 5 cage-close SSE event constant"),
+            ("JARVIS_IDE_POLICY_ROUTER_ENABLED",
+             "master flag name canonical"),
+        )
+        for symbol, reason in required:
+            if symbol not in source:
+                violations.append(
+                    f"ide_policy_router dropped {symbol!r} — "
+                    f"{reason}"
+                )
+        forbidden_imports = (
+            "from backend.core.ouroboros.governance.orchestrator",
+            "from backend.core.ouroboros.governance.iron_gate",
+            "from backend.core.ouroboros.governance.policy_engine",
+            "from backend.core.ouroboros.governance.risk_engine",
+            "from backend.core.ouroboros.governance.change_engine",
+            "from backend.core.ouroboros.governance.tool_executor",
+            "from backend.core.ouroboros.governance.providers",
+            "from backend.core.ouroboros.governance.candidate_generator",
+            "from backend.core.ouroboros.governance.semantic_guardian",
+            "from backend.core.ouroboros.governance.semantic_firewall",
+            "from backend.core.ouroboros.governance.scoped_tool_backend",
+            "from backend.core.ouroboros.governance.subagent_scheduler",
+        )
+        for f in forbidden_imports:
+            if f in source:
+                violations.append(
+                    f"ide_policy_router smuggled authority "
+                    f"import: {f}"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="gap2_ide_policy_router_authority",
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "ide_policy_router.py"
+            ),
+            description=(
+                "Gap #2 Slice 4 HTTP write surface: loopback "
+                "assertion + cage substrate symbols + 4 SSE event "
+                "constants + master flag canonical + no "
+                "authority-carrying imports. Catches refactor that "
+                "weakens the cage discipline of the panel write "
+                "surface."
+            ),
+            validate=_validate_router_surface,
+        ),
+    ]

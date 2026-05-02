@@ -650,6 +650,9 @@ def test_authority_pure_stdlib_only() -> None:
     # imports the substrate, never the reverse).
     allowed_lazy_governance = {
         "backend.core.ouroboros.governance.adaptation.adapted_confidence_loader",
+        # Slice 5 cage close: register_shipped_invariants() lazy-
+        # imports shipped_code_invariants for AST-pin registration.
+        "backend.core.ouroboros.governance.meta.shipped_code_invariants",
     }
 
     def _is_module_level(node: ast.AST) -> bool:

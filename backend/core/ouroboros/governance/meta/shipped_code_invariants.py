@@ -2398,6 +2398,58 @@ def validate_all() -> Tuple[InvariantViolation, ...]:
     return tuple(out)
 
 
+def _validate_confidence_threshold_tightener(
+    tree: ast.AST, source: str,
+) -> Tuple[str, ...]:
+    """Gap #2 Slice 2 surface validator wiring pin. Lives inline
+    because ``adaptation/`` is NOT in the module-owned discovery
+    walk."""
+    violations: list = []
+    required = (
+        ("install_surface_validator",
+         "module-level call to install_surface_validator() must "
+         "remain (cage entry point)"),
+        ("CONFIDENCE_MONITOR_THRESHOLDS",
+         "surface enum value must be referenced"),
+        ("compute_policy_diff",
+         "Slice 1 substrate predicate must be referenced for "
+         "predicate parity with the universal cage"),
+        ("sha256:",
+         "sha256 hash prefix check must remain (provenance)"),
+        ("_TIGHTEN_INDICATOR",
+         "tighten direction indicator helper must remain"),
+        ("MonotonicTighteningVerdict",
+         "verdict canonical-string parity must remain (via "
+         "compute_policy_diff)"),
+    )
+    for symbol, reason in required:
+        if symbol not in source:
+            violations.append(
+                f"confidence_threshold_tightener dropped "
+                f"{symbol!r} — {reason}"
+            )
+    # Defense-in-depth: confirm install_surface_validator() is
+    # called at MODULE level (not just defined). Walk top-level
+    # statements.
+    found_call = False
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(
+            node.value, ast.Call,
+        ):
+            func = node.value.func
+            if isinstance(func, ast.Name) and (
+                func.id == "install_surface_validator"
+            ):
+                found_call = True
+                break
+    if not found_call:
+        violations.append(
+            "install_surface_validator() must be called at "
+            "module level (auto-registration on import)"
+        )
+    return tuple(violations)
+
+
 # ---------------------------------------------------------------------------
 # Seed registration
 # ---------------------------------------------------------------------------
@@ -3365,6 +3417,31 @@ def _register_seed_invariants() -> None:
             validate=(
                 _validate_gradient_observer_uses_flock
             ),
+        ),
+    )
+    # Gap #2 Slice 5 cage close — Slice 2 surface validator wiring.
+    # Lives inline (not module-owned) because adaptation/ is NOT in
+    # _INVARIANT_PROVIDER_PACKAGES.
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "gap2_confidence_threshold_tightener_surface"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/adaptation/"
+                "confidence_threshold_tightener.py"
+            ),
+            description=(
+                "Gap #2 Slice 2 surface validator: must call "
+                "install_surface_validator() at module level, "
+                "reference AdaptationSurface."
+                "CONFIDENCE_MONITOR_THRESHOLDS, run "
+                "compute_policy_diff (predicate parity with cage), "
+                "enforce sha256 hash prefix + tighten indicator. "
+                "Catches refactor that drops cage entry-point "
+                "registration."
+            ),
+            validate=_validate_confidence_threshold_tightener,
         ),
     )
 
