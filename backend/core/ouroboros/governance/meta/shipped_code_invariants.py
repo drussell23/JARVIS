@@ -1699,22 +1699,61 @@ def _validate_speculative_branch_observer_uses_flock(
 # ---------------------------------------------------------------------------
 
 
+#: Module-owned registration contract — function names that the
+#: dynamic discovery loops in ``flag_registry_seed`` and
+#: ``shipped_code_invariants`` invoke at BOOT time. Imports inside
+#: these functions are STRUCTURALLY exempt from hot-path pure-stdlib
+#: pins because the contract guarantees they fire only during
+#: registration, never on the hot path. The contract is enforced by
+#: shared function names (architectural invariant), not by allowlists.
+MODULE_REGISTRATION_CONTRACT_FUNCS: frozenset = frozenset({
+    "register_flags",
+    "register_shipped_invariants",
+})
+
+
+def _registration_contract_line_ranges(
+    tree: ast.Module,
+) -> Tuple[Tuple[int, int], ...]:
+    """Return (start, end) line ranges of every function body that
+    matches the module-owned registration contract. Imports inside
+    these ranges are exempt from hot-path purity pins because they
+    only fire at boot via the dynamic discovery loops."""
+    ranges: List[Tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            if node.name in MODULE_REGISTRATION_CONTRACT_FUNCS:
+                start = getattr(node, "lineno", 0)
+                end = getattr(node, "end_lineno", start) or start
+                ranges.append((start, end))
+    return tuple(ranges)
+
+
 def _validate_counterfactual_replay_pure_stdlib(
     tree: ast.Module, source: str,  # noqa: ARG001
 ) -> Tuple[str, ...]:
     """Slice 1 ``counterfactual_replay`` primitive MUST be pure-stdlib
-    — strongest authority invariant. Replay is observational not
-    prescriptive; the primitive must NEVER reach into governance
-    modules. Zero governance imports, zero exec/eval/compile, zero
-    async (Slice 2's engine wraps via ``asyncio.to_thread``).
-
-    NEVER raises."""
+    on the HOT PATH — strongest authority invariant. Replay is
+    observational not prescriptive; the primitive must NEVER reach
+    into governance modules during operation. Zero governance imports,
+    zero exec/eval/compile, zero async (Slice 2's engine wraps via
+    ``asyncio.to_thread``). Boot-time module-owned registration
+    (``register_flags`` / ``register_shipped_invariants``) is
+    structurally exempt — those imports only fire from the discovery
+    loops, never on the hot replay path. NEVER raises."""
     violations: List[str] = []
+    exempt_ranges = _registration_contract_line_ranges(tree)
+
+    def _in_exempt_range(lineno: int) -> bool:
+        return any(s <= lineno <= e for s, e in exempt_ranges)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
             if "backend." in module or "governance" in module:
-                lineno = getattr(node, "lineno", "?")
+                lineno = getattr(node, "lineno", 0)
+                if _in_exempt_range(lineno):
+                    continue
                 violations.append(
                     f"line {lineno}: counterfactual_replay primitive "
                     f"must be pure-stdlib — found {module!r}"

@@ -718,11 +718,16 @@ class TestAuthorityInvariants:
                     )
 
     def test_governance_imports_in_allowlist(self, gate_source):
-        """Slice 4 may import ONLY:
+        """Slice 4 hot path may import ONLY:
           * Slice 1 (generative_quorum)
           * Slice 3 (generative_quorum_runner) — transitively
             pulls Slice 2 (ast_canonical)
-          * cost_contract_assertion (for COST_GATED_ROUTES)"""
+          * cost_contract_assertion (for COST_GATED_ROUTES)
+        Module-owned registration functions (``register_flags`` /
+        ``register_shipped_invariants``) are STRUCTURALLY exempt —
+        their imports only fire from the boot-time discovery loops,
+        never on the hot path. The contract is enforced by shared
+        function names, not by allowlists."""
         tree = ast.parse(gate_source)
         allowed = {
             "backend.core.ouroboros.governance.cost_contract_assertion",
@@ -730,9 +735,20 @@ class TestAuthorityInvariants:
             "backend.core.ouroboros.governance.verification.generative_quorum",
             "backend.core.ouroboros.governance.verification.generative_quorum_runner",
         }
+        registration_funcs = {"register_flags", "register_shipped_invariants"}
+        exempt_ranges = []
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 if node.module and "governance" in node.module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
                     assert node.module in allowed, (
                         f"governance import outside allowlist: "
                         f"{node.module}"

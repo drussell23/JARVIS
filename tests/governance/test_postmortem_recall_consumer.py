@@ -739,11 +739,15 @@ class TestAuthorityInvariants:
                     assert f not in m, f"forbidden import: {m}"
 
     def test_governance_imports_in_allowlist(self, source):
-        """Slice 4 may import:
+        """Slice 4 hot path may import:
           * Slice 1 (postmortem_recall)
           * Priority #1 Slice 1 (coherence_auditor)
           * Priority #1 Slice 4 (coherence_action_bridge)
-          * adaptation.ledger (MonotonicTighteningVerdict)"""
+          * adaptation.ledger (MonotonicTighteningVerdict)
+        Module-owned registration functions (``register_flags`` /
+        ``register_shipped_invariants``) are STRUCTURALLY exempt —
+        their imports only fire from the boot-time discovery loops,
+        never on the hot path."""
         tree = ast.parse(source)
         allowed = {
             "backend.core.ouroboros.governance.adaptation.ledger",
@@ -751,9 +755,20 @@ class TestAuthorityInvariants:
             "backend.core.ouroboros.governance.verification.coherence_auditor",
             "backend.core.ouroboros.governance.verification.postmortem_recall",
         }
+        registration_funcs = {"register_flags", "register_shipped_invariants"}
+        exempt_ranges = []
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 if node.module and "governance" in node.module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
                     assert node.module in allowed, (
                         f"governance import outside allowlist: "
                         f"{node.module}"
