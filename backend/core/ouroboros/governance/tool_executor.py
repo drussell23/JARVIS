@@ -2336,8 +2336,19 @@ class GoverningToolPolicy:
         repo_root = ctx.repo_root.resolve()
 
         # Rule 0: unknown tool → deny immediately
-        # Exception: MCP tools (prefixed mcp_) are forwarded to external servers (Gap #7)
-        if name not in _L1_MANIFESTS and not name.startswith("mcp_"):
+        # Exceptions:
+        #   * MCP tools (prefixed mcp_) are forwarded to external
+        #     servers (Gap #7).
+        #   * Skill tools (prefixed skill__) are routed via the
+        #     SkillRegistry-AutonomousReach Slice 4 bridge -- the
+        #     deeper allowance check (Rule 0c-skill below) consults
+        #     the catalog so a stale skill__foo after unregister
+        #     still falls through to a clean DENY.
+        if (
+            name not in _L1_MANIFESTS
+            and not name.startswith("mcp_")
+            and not name.startswith("skill__")
+        ):
             return PolicyResult(
                 decision=PolicyDecision.DENY,
                 reason_code="tool.denied.unknown_tool",
@@ -2350,6 +2361,27 @@ class GoverningToolPolicy:
                 reason_code="tool.allowed.mcp_external",
                 detail=f"MCP tool forwarded to external server: {name}",
             )
+        # Rule 0c-skill: SkillRegistry-AutonomousReach Slice 4 -- ALLOW
+        # ``skill__*`` tool names when the bridge sub-flag is on AND the
+        # name resolves to a registered MODEL-reach manifest in the
+        # SkillCatalog. SkillInvoker handles arg validation + entrypoint
+        # auth via the existing arc; the bridge is a router. When the
+        # sub-flag is OFF or the name doesn't resolve, fall through to
+        # the existing unknown-tool DENY (Rule 0).
+        if name.startswith("skill__"):
+            try:
+                from backend.core.ouroboros.governance.skill_venom_bridge import (  # noqa: E501
+                    bridge_enabled as _skill_bridge_enabled,
+                    is_skill_tool_name as _is_skill_tool_name,
+                )
+                if _skill_bridge_enabled() and _is_skill_tool_name(name):
+                    return PolicyResult(
+                        decision=PolicyDecision.ALLOW,
+                        reason_code="tool.allowed.skill_registry",
+                        detail=f"Skill tool routed to SkillInvoker: {name}",
+                    )
+            except Exception:  # noqa: BLE001 -- defensive
+                pass
 
         # Rule 0c: dispatch_subagent — Phase 1 Subagents.
         # ALLOW when subagent_type is a known read-only class AND the master
@@ -3052,6 +3084,37 @@ class AsyncProcessToolBackend:
             # MCP tools: forward to external MCP server (Gap #7)
             if call.name.startswith("mcp_") and self._mcp_client is not None:
                 return await self._run_mcp_tool(call, timeout, cap)
+            # Skill tools (SkillRegistry-AutonomousReach Slice 4):
+            # forward to SkillInvoker via the venom bridge. The bridge
+            # returns a (ok, output, error) tuple to keep this module
+            # free of any reverse import. asyncio.CancelledError
+            # propagates per asyncio convention.
+            if call.name.startswith("skill__"):
+                try:
+                    from backend.core.ouroboros.governance.skill_venom_bridge import (  # noqa: E501
+                        dispatch_skill_tool as _dispatch_skill_tool,
+                    )
+                    ok, output, error = await _dispatch_skill_tool(
+                        call.name, call.arguments or {},
+                    )
+                    truncated = output[:cap] if isinstance(output, str) else ""
+                    return ToolResult(
+                        tool_call=call,
+                        output=truncated,
+                        error=(error or None) if not ok else None,
+                        status=(
+                            ToolExecStatus.SUCCESS if ok
+                            else ToolExecStatus.EXEC_ERROR
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 -- defensive
+                    return ToolResult(
+                        tool_call=call, output="",
+                        error=f"skill_dispatch_internal_error: {exc}",
+                        status=ToolExecStatus.EXEC_ERROR,
+                    )
             # Async-native tools (web search, code exploration, ask_human,
             # delegate_to_agent — Phase 2 sub-agent delegation,
             # dispatch_subagent — Phase 1 subagent via SubagentOrchestrator)
@@ -4578,7 +4641,22 @@ class ToolLoopCoordinator:
             for idx, tc in enumerate(tool_calls):
                 call_id = f"{op_id}:r{round_index}.{idx}:{tc.name}"
                 manifest = _L1_MANIFESTS.get(tc.name)
-                tool_version = manifest.version if manifest else "unknown"
+                # Skill tool version (Slice 4) -- read-only union view;
+                # leaves _L1_MANIFESTS untouched.
+                if manifest is None and tc.name.startswith("skill__"):
+                    try:
+                        from backend.core.ouroboros.governance.skill_venom_bridge import (  # noqa: E501
+                            get_skill_tool_manifest_dict as _get_skill_dict,
+                        )
+                        skill_dict = _get_skill_dict(tc.name)
+                        tool_version = (
+                            str(skill_dict.get("version", "unknown"))
+                            if skill_dict else "unknown"
+                        )
+                    except Exception:  # noqa: BLE001 -- defensive
+                        tool_version = "unknown"
+                else:
+                    tool_version = manifest.version if manifest else "unknown"
 
                 policy_ctx = PolicyContext(repo=repo, repo_root=repo_root,
                     op_id=op_id, call_id=call_id, round_index=round_index,
