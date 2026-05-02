@@ -504,12 +504,38 @@ class SubagentRequest:
             raise ValueError(f"max_depth={self.max_depth} must be >= 1")
 
     @classmethod
-    def from_args(cls, args: Dict[str, Any]) -> "SubagentRequest":
+    def from_args(
+        cls,
+        args: Dict[str, Any],
+        *,
+        parent_op_risk_tier: str = "",
+        parent_op_description: str = "",
+        parent_primary_repo: str = "",
+    ) -> "SubagentRequest":
         """Parse a request from the `dispatch_subagent` tool call arguments.
 
         Clamps parallel_scopes to MAX_PARALLEL_SCOPES so a model requesting
         parallel_scopes=8 receives MAX_PARALLEL_SCOPES (=3) subagents rather
         than a confusing validation error. Unknown subagent_type raises.
+
+        Per-type invocation synthesis (Slice 1, 2026-05-02):
+          When ``subagent_type`` is GENERAL / PLAN / REVIEW the parser
+          synthesizes the corresponding ``general_invocation`` /
+          ``plan_target`` / ``review_target_candidate`` payload from the
+          model's tool args + the orchestrator-supplied parent context
+          kwargs. Defaulting is intentionally TRANSPARENT and CONSERVATIVE
+          — the Semantic Firewall §5 owns rejection at dispatch time, so
+          the model receives an actionable structured error rather than
+          ``MalformedGeneralInput``. NEVER hardcodes tool names; derives
+          conservative defaults from ``readonly_tool_whitelist()``.
+
+          The model can override any synthesized field by supplying it
+          explicitly in the tool args (``operation_scope``,
+          ``max_mutations``, ``allowed_tools``, ``invocation_reason``).
+          ``parent_op_risk_tier`` is intentionally NOT model-overridable —
+          callers (the Venom executor) pass it via the
+          ``parent_op_risk_tier`` kwarg from the policy context, so the
+          model cannot synthesize a fake higher tier.
         """
         parallel = min(int(args.get("parallel_scopes", 1) or 1), MAX_PARALLEL_SCOPES)
         parallel = max(parallel, 1)
@@ -519,17 +545,57 @@ class SubagentRequest:
         except ValueError as e:
             raise ValueError(
                 f"Unknown subagent_type={type_str!r}. "
-                f"Phase 1 supports only: {[t.value for t in SubagentType]}"
+                f"Allowed: {[t.value for t in SubagentType]}"
             ) from e
+
+        goal = str(args.get("goal", "")).strip()
+        target_files = tuple(
+            str(p) for p in (args.get("target_files") or ())
+        )
+        scope_paths = tuple(
+            str(p) for p in (args.get("scope_paths") or ())
+        )
+
+        general_invocation: Optional[Dict[str, Any]] = None
+        plan_target: Optional[Dict[str, Any]] = None
+        review_target_candidate: Optional[Dict[str, Any]] = None
+
+        if st is SubagentType.GENERAL:
+            general_invocation = _synthesize_general_invocation(
+                args=args,
+                goal=goal,
+                target_files=target_files,
+                scope_paths=scope_paths,
+                parent_op_risk_tier=parent_op_risk_tier,
+            )
+        elif st is SubagentType.PLAN:
+            plan_target = _synthesize_plan_target(
+                args=args,
+                goal=goal,
+                target_files=target_files,
+                parent_op_risk_tier=parent_op_risk_tier,
+                parent_op_description=parent_op_description,
+                parent_primary_repo=parent_primary_repo,
+            )
+        elif st is SubagentType.REVIEW:
+            review_target_candidate = _synthesize_review_target(
+                args=args,
+                goal=goal,
+                target_files=target_files,
+            )
+
         return cls(
             subagent_type=st,
-            goal=str(args.get("goal", "")).strip(),
-            target_files=tuple(str(p) for p in (args.get("target_files") or ())),
-            scope_paths=tuple(str(p) for p in (args.get("scope_paths") or ())),
+            goal=goal,
+            target_files=target_files,
+            scope_paths=scope_paths,
             max_files=int(args.get("max_files", 20) or 20),
             max_depth=int(args.get("max_depth", 3) or 3),
             timeout_s=float(args.get("timeout_s", 120.0) or 120.0),
             parallel_scopes=parallel,
+            general_invocation=general_invocation,
+            plan_target=plan_target,
+            review_target_candidate=review_target_candidate,
         )
 
 
@@ -761,3 +827,246 @@ class SubagentRecursionRejection(SubagentError):
             "subagent (recursion ban, Manifesto §5). parent_chain="
             + str(list(self.parent_chain))
         )
+
+
+# ============================================================================
+# Slice 1 — Per-type invocation synthesizers
+# ============================================================================
+#
+# Build the typed per-type invocation field (general_invocation /
+# plan_target / review_target_candidate) from the model's tool args +
+# the orchestrator-supplied parent context. Defaulting is intentionally
+# TRANSPARENT and CONSERVATIVE — the Semantic Firewall §5 owns
+# rejection at dispatch time. The model receives an actionable
+# structured error from the firewall rather than ``MalformedGeneralInput``.
+#
+# Tool-name lists are derived from the canonical
+# ``readonly_tool_whitelist()`` accessor on the firewall; the
+# synthesizers NEVER hardcode tool names.
+
+
+def _synthesize_general_invocation(
+    *,
+    args: Dict[str, Any],
+    goal: str,
+    target_files: Tuple[str, ...],
+    scope_paths: Tuple[str, ...],
+    parent_op_risk_tier: str,
+) -> Dict[str, Any]:
+    """Build the ``general_invocation`` dict the AgenticGeneralSubagent
+    expects, from Venom tool args + parent context.
+
+    Defaulting rules (transparent — firewall enforces):
+      * ``operation_scope`` ← model's explicit ``operation_scope`` arg,
+        else ``scope_paths``, else ``target_files``. If all three empty,
+        passes empty tuple — firewall rejects with actionable message.
+      * ``max_mutations`` ← model's explicit value, else 0 (read-only).
+      * ``allowed_tools`` ← model's explicit value, else canonical
+        read-only whitelist from firewall.readonly_tool_whitelist().
+        The default is intentionally the firewall's own definition so
+        operators editing the whitelist propagate to free-form GENERAL
+        with zero code changes.
+      * ``invocation_reason`` ← model's explicit value, else first 200
+        chars of goal. Firewall enforces non-empty + length cap.
+      * ``parent_op_risk_tier`` ← orchestrator-supplied via from_args
+        kwarg. Model CANNOT override this — passing it in args is
+        silently ignored.
+      * ``goal`` ← passed through verbatim (firewall scans it).
+    """
+    # Model-supplied or fall-through defaults — firewall enforces.
+    operation_scope: Tuple[str, ...] = ()
+    raw_scope = args.get("operation_scope")
+    if raw_scope is not None:
+        if isinstance(raw_scope, (list, tuple)):
+            operation_scope = tuple(str(p) for p in raw_scope)
+        else:
+            operation_scope = (str(raw_scope),)
+    elif scope_paths:
+        operation_scope = scope_paths
+    elif target_files:
+        operation_scope = target_files
+
+    try:
+        max_mutations = int(args.get("max_mutations", 0) or 0)
+    except (TypeError, ValueError):
+        max_mutations = 0
+
+    raw_tools = args.get("allowed_tools")
+    if raw_tools is not None and isinstance(
+        raw_tools, (list, tuple, set, frozenset),
+    ):
+        allowed_tools: Tuple[str, ...] = tuple(
+            str(t) for t in raw_tools
+        )
+    else:
+        # Derive from canonical firewall accessor — never hardcoded.
+        try:
+            from backend.core.ouroboros.governance.semantic_firewall import (
+                readonly_tool_whitelist,
+            )
+            allowed_tools = tuple(sorted(readonly_tool_whitelist()))
+        except Exception:
+            allowed_tools = ()
+
+    raw_reason = args.get("invocation_reason")
+    if raw_reason and str(raw_reason).strip():
+        invocation_reason = str(raw_reason).strip()[:200]
+    else:
+        # Default: first 200 chars of goal. Firewall caps at 200 anyway.
+        invocation_reason = goal[:200] if goal else ""
+
+    return {
+        "goal": goal,
+        "operation_scope": operation_scope,
+        "max_mutations": max_mutations,
+        "allowed_tools": allowed_tools,
+        "invocation_reason": invocation_reason,
+        # Orchestrator-supplied. NOT model-overridable: even if the model
+        # smuggled "parent_op_risk_tier" into args, we ignore that here.
+        "parent_op_risk_tier": str(parent_op_risk_tier or ""),
+    }
+
+
+def _synthesize_plan_target(
+    *,
+    args: Dict[str, Any],
+    goal: str,
+    target_files: Tuple[str, ...],
+    parent_op_risk_tier: str,
+    parent_op_description: str,
+    parent_primary_repo: str,
+) -> Dict[str, Any]:
+    """Build the ``plan_target`` dict for AgenticPlanSubagent.
+
+    Defaulting rules (transparent):
+      * ``op_description`` ← parent_op_description kwarg, else goal.
+      * ``target_files`` ← model's target_files arg.
+      * ``primary_repo`` ← parent_primary_repo kwarg, else ``"jarvis"``
+        (the canonical default).
+      * ``risk_tier`` ← parent_op_risk_tier (orchestrator-supplied).
+    """
+    return {
+        "op_description": (
+            parent_op_description.strip() if parent_op_description
+            else goal
+        ),
+        "target_files": target_files,
+        "primary_repo": (
+            parent_primary_repo.strip() if parent_primary_repo
+            else "jarvis"
+        ),
+        "risk_tier": str(parent_op_risk_tier or ""),
+    }
+
+
+def _synthesize_review_target(
+    *,
+    args: Dict[str, Any],
+    goal: str,
+    target_files: Tuple[str, ...],
+) -> Dict[str, Any]:
+    """Build the ``review_target_candidate`` dict for AgenticReviewSubagent.
+
+    REVIEW is normally orchestrator-driven (post-VALIDATE unconditional)
+    and the orchestrator populates this dict programmatically. The
+    Venom-tool path is defense-in-depth for advanced model workflows;
+    when the model invokes REVIEW it must supply ``file_path``,
+    ``pre_apply_content``, ``candidate_content``, ``generation_intent``
+    in args. Defaulting is conservative — we pass through whatever the
+    model gives, and the AgenticReviewSubagent rejects malformed input
+    with a structured error.
+    """
+    file_path = ""
+    if target_files:
+        file_path = target_files[0]
+    elif args.get("file_path"):
+        file_path = str(args.get("file_path", "")).strip()
+
+    return {
+        "file_path": file_path,
+        "pre_apply_content": str(
+            args.get("pre_apply_content", "") or "",
+        ),
+        "candidate_content": str(
+            args.get("candidate_content", "") or "",
+        ),
+        "generation_intent": str(
+            args.get("generation_intent", "") or goal,
+        ),
+    }
+
+
+# ============================================================================
+# Slice 1 — Dynamic linkage helpers (single-source-of-truth from SubagentType)
+# ============================================================================
+#
+# The Venom tool schema and the GoverningToolPolicy frozenset both
+# derive from these helpers, which in turn derive from the SubagentType
+# enum. Mathematically locked: schema and policy can never drift,
+# because they're both projections of the same source.
+#
+# Per-type kill switches (``JARVIS_SUBAGENT_<TYPE>_ENABLED``) provide
+# hot-revert and per-type graduation control. All four types default
+# enabled (already-graduated infrastructure per Phase B closure
+# 2026-04-20). The umbrella ``JARVIS_SUBAGENT_DISPATCH_ENABLED`` master
+# switch sits above all of them.
+
+
+def subagent_type_enabled(subagent_type: SubagentType) -> bool:
+    """Per-type kill switch. Reads ``JARVIS_SUBAGENT_<TYPE>_ENABLED``.
+
+    All four types default true (already-graduated infrastructure per
+    Phase B closure 2026-04-20). The per-type flag exists as a
+    hot-revert kill switch and as a graduation lever for any future
+    SubagentType added to the enum (new types can ship default-false
+    until they prove out).
+
+    Asymmetric env semantics — empty/whitespace = unset = default.
+    Re-read on every call so flips hot-revert without restart.
+
+    NEVER raises on garbage SubagentType input — non-enum values
+    return False (defensive: an unknown type is always denied).
+    """
+    if not isinstance(subagent_type, SubagentType):
+        return False
+    env_name = f"JARVIS_SUBAGENT_{subagent_type.name}_ENABLED"
+    raw = os.environ.get(env_name, "").strip().lower()
+    if raw == "":
+        return True  # default-true; mature post Phase B
+    return raw in ("1", "true", "yes", "on")
+
+
+def policy_allowed_subagent_types() -> FrozenSet[str]:
+    """Single source of truth — which SubagentType values are
+    currently allowed at the policy layer.
+
+    Filters every SubagentType enum member through its per-type kill
+    switch. ``GoverningToolPolicy`` reads this; the Venom tool schema
+    reads :func:`tool_schema_subagent_types` (which derives from this).
+    The two are mathematically locked: the schema can never advertise
+    a type the policy denies, and vice versa.
+
+    NEVER raises. Empty result is structurally possible (operator
+    disabled all four) — callers should treat empty as "no subagent
+    types allowed" rather than a default fallback.
+    """
+    return frozenset({
+        st.value for st in SubagentType
+        if subagent_type_enabled(st)
+    })
+
+
+def tool_schema_subagent_types() -> Tuple[str, ...]:
+    """Sorted tuple of allowed type strings for the Venom tool's
+    JSONSchema enum. Derived from :func:`policy_allowed_subagent_types`
+    so schema and policy can never drift.
+
+    Sorted for stable schema output (the enum order matters for some
+    downstream JSONSchema validators that hash the schema).
+
+    NEVER raises. Empty tuple if no types enabled — the model sees
+    a tool with an empty enum, the policy denies every call, and the
+    Venom path returns a clear "no subagent types currently enabled"
+    error rather than malformed dispatch.
+    """
+    return tuple(sorted(policy_allowed_subagent_types()))

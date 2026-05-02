@@ -515,6 +515,36 @@ def _validate_python_syntax(rel_path: str, content: str) -> Optional[str]:
 # L1 Tool-Use: Tool Manifests
 # ---------------------------------------------------------------------------
 
+
+def _dynamic_subagent_type_enum() -> Tuple[str, ...]:
+    """Resolve the dispatch_subagent tool's enum dynamically from the
+    canonical SubagentType source (Slice 1, 2026-05-02). Called at
+    module load time to populate the manifest's arg_schema; the
+    POLICY layer also calls policy_allowed_subagent_types() at check
+    time, so the manifest enum is informational and the policy is
+    authoritative — both derive from the same SubagentType source.
+
+    AST-pinned by Slice 2 graduation: the manifest's arg_schema enum
+    MUST be assigned via this helper, not via a hardcoded literal.
+    Drift would silently desync the schema enum from the policy
+    frozenset.
+
+    NEVER raises out — falls through to ('explore',) on any import
+    failure (matches the pre-Slice-1 behavior so manifest construction
+    never blocks module load).
+    """
+    try:
+        from backend.core.ouroboros.governance.subagent_contracts import (
+            tool_schema_subagent_types,
+        )
+        result = tool_schema_subagent_types()
+        if result:
+            return result
+    except Exception:
+        pass
+    return ("explore",)
+
+
 _L1_MANIFESTS: Dict[str, ToolManifest] = {
     "read_file": ToolManifest(
         name="read_file", version="1.2",
@@ -915,30 +945,52 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
     #      diversity-checked, supports parallel_scopes fan-out via
     #      asyncio.TaskGroup, returns typed SubagentFindings. ----
     "dispatch_subagent": ToolManifest(
-        name="dispatch_subagent", version="1.0",
+        name="dispatch_subagent", version="1.1",
         description=(
-            "Spawn a read-only subagent to explore the codebase in its own "
-            "context. Use this when you need to understand a large area "
-            "before making changes — the subagent reads files, searches "
-            "code, and returns structured findings without polluting your "
-            "context. Can fan out in parallel across multiple scopes "
-            "(max 3 concurrent) via asyncio.TaskGroup. Phase 1 supports "
-            "subagent_type='explore' only; dispatch gated by "
-            "JARVIS_SUBAGENT_DISPATCH_ENABLED master switch. The subagent "
-            "is mathematically forbidden from mutations; Iron Gate enforces "
-            "a tool-diversity floor so shallow file-only exploration is "
-            "rejected rather than retried."
+            "Dispatch a typed subagent to do focused work in its own "
+            "context. Per-type semantics: "
+            "(a) explore — read-only investigation; spawns one or more "
+            "subagents to read/search the codebase and return structured "
+            "findings. Use BEFORE making changes when the area is large. "
+            "Can fan out in parallel across multiple scopes (max 3 "
+            "concurrent) via asyncio.TaskGroup. "
+            "(b) general — free-form Task dispatch; the subagent runs "
+            "with the Semantic Firewall §5 cage active (operation_scope, "
+            "max_mutations, allowed_tools, invocation_reason all enforced; "
+            "recursion banned; output sanitized). The model passes a "
+            "free-form goal + the 5 boundary fields; the firewall rejects "
+            "with an actionable structured error if any field is "
+            "insufficient. "
+            "(c) plan — DAG planning for multi-file ops (orchestrator "
+            "normally invokes; tool-path is defense-in-depth). "
+            "(d) review — post-VALIDATE candidate review (orchestrator "
+            "normally invokes; tool-path is defense-in-depth). "
+            "Per-type kill switches: JARVIS_SUBAGENT_<TYPE>_ENABLED "
+            "(default true post Phase B graduation). Master switch: "
+            "JARVIS_SUBAGENT_DISPATCH_ENABLED. Iron Gate enforces "
+            "tool-diversity floor; shallow exploration rejected."
         ),
         arg_schema={
             "subagent_type": {
                 "type": "string",
-                "enum": ["explore"],
+                # Slice 1 (2026-05-02) — dynamic linkage. The enum value
+                # is sourced from tool_schema_subagent_types() so it's
+                # mathematically locked to policy_allowed_subagent_types()
+                # at policy-check time. AST-pinned by Slice 2 graduation.
+                "enum": list(_dynamic_subagent_type_enum()),
                 "default": "explore",
-                "description": "Subagent kind (Phase 1: explore only).",
+                "description": (
+                    "Subagent kind. See tool description for per-type "
+                    "semantics + boundary requirements."
+                ),
             },
             "goal": {
                 "type": "string",
-                "description": "1-2 sentence description of what to find.",
+                "description": (
+                    "Free-form 1-2 sentence (or longer for general) "
+                    "description of what to do. Sanitized + injection-"
+                    "scanned by the Semantic Firewall."
+                ),
             },
             "target_files": {
                 "type": "array",
@@ -965,6 +1017,52 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
                 "description": (
                     "1 = single dispatch; >=2 = parallel fan-out "
                     "(clamped to MAX_PARALLEL_SCOPES=3)."
+                ),
+            },
+            # Slice 1 (2026-05-02) — Semantic Firewall §5 boundary fields
+            # for GENERAL dispatch. PLAN/REVIEW types ignore these
+            # (orchestrator-driven). The synthesizer in
+            # SubagentRequest.from_args() defaults missing fields
+            # transparently; the firewall rejects insufficient values
+            # with a structured actionable error.
+            "operation_scope": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": (
+                    "[GENERAL] Concrete repo-relative paths/globs the "
+                    "subagent may operate within. Defaults to "
+                    "scope_paths if empty, then target_files. Firewall "
+                    "rejects empty / '**' / absolute-outside-/tmp."
+                ),
+            },
+            "max_mutations": {
+                "type": "integer",
+                "default": 0,
+                "description": (
+                    "[GENERAL] Mutation budget. 0 = read-only (default). "
+                    ">0 requires parent op at NOTIFY_APPLY+ AND "
+                    "allowed_tools containing a mutating tool."
+                ),
+            },
+            "allowed_tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": (
+                    "[GENERAL] Explicit subset of tools the subagent "
+                    "may call. Defaults to canonical read-only "
+                    "whitelist (firewall.readonly_tool_whitelist). "
+                    "Mutation tools require parent NOTIFY_APPLY+."
+                ),
+            },
+            "invocation_reason": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "[GENERAL] One-sentence rationale (≤200 chars) for "
+                    "the dispatch. Defaults to the first 200 chars of "
+                    "goal. Firewall enforces non-empty + length cap."
                 ),
             },
         },
@@ -2271,19 +2369,27 @@ class GoverningToolPolicy:
         # it, but the orchestrator typically issues REVIEW itself via
         # dispatch_review() — the tool-path is defense-in-depth for
         # advanced workflows, not the primary invocation.
-        # Phase B: explore (graduated) + review + plan + general.
-        # review/plan/general are orchestrator-driven — the policy
-        # layer allows them for completeness, but primary invocation
-        # is via the orchestrator's dispatch_{review,plan,general}()
-        # methods. GENERAL also enforces the Semantic Firewall (§5)
-        # inside dispatch_general(), which is a stricter boundary than
-        # this policy check.
-        _READ_ONLY_SUBAGENT_TYPES = frozenset(
-            {"explore", "review", "plan", "general"}
-        )
+        # Phase B: explore + review + plan + general (all graduated).
+        # review/plan are orchestrator-driven (the orchestrator's own
+        # dispatch_{review,plan}() methods are the primary invocation;
+        # the tool path is defense-in-depth for advanced model workflows).
+        # GENERAL is the free-form Task dispatch (Slice 1, 2026-05-02);
+        # the Semantic Firewall §5 enforces operation_scope/max_mutations/
+        # allowed_tools/invocation_reason/parent_op_risk_tier as a
+        # stricter boundary than this policy check.
+        #
+        # Slice 1 dynamic linkage: the allowed-types frozenset is
+        # CALL-TIME, sourced from policy_allowed_subagent_types() — itself
+        # derived from the SubagentType enum filtered through per-type
+        # kill switches (JARVIS_SUBAGENT_<TYPE>_ENABLED). Mathematically
+        # locked to the manifest's arg_schema enum (which uses
+        # tool_schema_subagent_types() at module load); both helpers
+        # share the SubagentType source. AST-pinned by Slice 2
+        # graduation.
         if name == "dispatch_subagent":
             try:
                 from backend.core.ouroboros.governance.subagent_contracts import (
+                    policy_allowed_subagent_types,
                     subagent_dispatch_enabled,
                 )
             except Exception:
@@ -2292,16 +2398,17 @@ class GoverningToolPolicy:
                     reason_code="tool.denied.subagent_import_failed",
                     detail="subagent_contracts module not importable",
                 )
+            allowed_types = policy_allowed_subagent_types()
             subagent_type = str(call.arguments.get("subagent_type", "") or "").lower()
-            if subagent_type not in _READ_ONLY_SUBAGENT_TYPES:
+            if subagent_type not in allowed_types:
                 return PolicyResult(
                     decision=PolicyDecision.DENY,
                     reason_code="tool.denied.subagent_type_unsupported",
                     detail=(
-                        f"subagent_type={subagent_type!r} not yet supported. "
-                        f"Currently allowed: {sorted(_READ_ONLY_SUBAGENT_TYPES)}. "
-                        "plan/research/refactor/general are reserved for "
-                        "future phases."
+                        f"subagent_type={subagent_type!r} not currently "
+                        f"enabled. Allowed: {sorted(allowed_types)}. "
+                        "Per-type kill switches: "
+                        "JARVIS_SUBAGENT_<TYPE>_ENABLED."
                     ),
                 )
             if not subagent_dispatch_enabled():
@@ -3444,11 +3551,30 @@ class AsyncProcessToolBackend:
 
         # Parse arguments into the typed request contract. Invalid shapes
         # surface as clear error strings back to the model.
+        #
+        # Slice 1 (2026-05-02): thread parent_op_risk_tier from policy_ctx
+        # into from_args so the GENERAL synthesizer populates the
+        # general_invocation field with the parent's actual risk tier.
+        # The model CANNOT override this — passing parent_op_risk_tier in
+        # tool args is silently ignored by the synthesizer (defense-in-
+        # depth: model can't fake a higher tier to bypass the firewall's
+        # SAFE_AUTO floor check).
+        _parent_tier = ""
+        try:
+            _rt = getattr(policy_ctx, "risk_tier", None)
+            if _rt is not None:
+                # Risk tiers may be enum or string; normalize defensively.
+                _parent_tier = str(getattr(_rt, "name", _rt) or "").upper()
+        except Exception:
+            _parent_tier = ""
         try:
             from backend.core.ouroboros.governance.subagent_contracts import (
                 SubagentRequest,
             )
-            request = SubagentRequest.from_args(call.arguments or {})
+            request = SubagentRequest.from_args(
+                call.arguments or {},
+                parent_op_risk_tier=_parent_tier,
+            )
         except (ValueError, TypeError) as exc:
             return ToolResult(
                 tool_call=call, output="",
