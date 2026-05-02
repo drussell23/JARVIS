@@ -425,4 +425,156 @@ __all__ = [
     "attach_phase_boundary_renderer",
     "format_dismiss_line",
     "format_phase_boundary_block",
+    "register_shipped_invariants",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 4's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_authority_allowlist(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 4 may only import from a small allowlist + the
+        registration-contract exemption. Banned: orchestrator-tier
+        modules. The renderer is operator-UX nicety, not authority
+        — staying scoped is critical."""
+        violations: list = []
+        allowed = {
+            "backend.core.ouroboros.governance.inline_permission_prompt",
+            "backend.core.ouroboros.governance.inline_prompt_gate_runner",
+        }
+        registration_funcs = {
+            "register_flags",
+            "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        banned_substrings = (
+            "orchestrator", "phase_runner", "iron_gate",
+            "change_engine", "candidate_generator",
+            ".providers", "doubleword_provider", "urgency_router",
+            "auto_action_router", "subagent_scheduler",
+            "tool_executor", "semantic_guardian",
+            "semantic_firewall", "risk_engine",
+        )
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                for ban in banned_substrings:
+                    if ban in module:
+                        violations.append(
+                            f"line {lineno}: BANNED orchestrator-tier "
+                            f"substring {ban!r} in {module!r}"
+                        )
+                if "backend." in module or (
+                    "governance" in module and module
+                ):
+                    if module not in allowed:
+                        violations.append(
+                            f"line {lineno}: import outside Slice 4 "
+                            f"allowlist: {module!r}"
+                        )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 4 MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    def _validate_visual_constants(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Visual constants (PHASE_BOUNDARY_HEADER, PROMPT_ID_DISPLAY_CHARS)
+        are operator-visible wire format. Drift here changes the
+        operator's mental model of which prompt is which."""
+        violations: list = []
+        expected_consts = {
+            "PHASE_BOUNDARY_HEADER": "[Phase Boundary]",
+            "PROMPT_ID_DISPLAY_CHARS": 40,
+        }
+        seen: dict = {}
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AnnAssign) and isinstance(
+                node.target, _ast.Name,
+            ):
+                if node.target.id in expected_consts:
+                    if isinstance(node.value, _ast.Constant):
+                        seen[node.target.id] = node.value.value
+            elif isinstance(node, _ast.Assign):
+                for tgt in node.targets:
+                    if (
+                        isinstance(tgt, _ast.Name)
+                        and tgt.id in expected_consts
+                    ):
+                        if isinstance(node.value, _ast.Constant):
+                            seen[tgt.id] = node.value.value
+        for name, expected_value in expected_consts.items():
+            if name not in seen:
+                violations.append(
+                    f"missing visual constant {name!r}"
+                )
+            elif seen[name] != expected_value:
+                violations.append(
+                    f"visual constant {name!r} drifted: "
+                    f"expected {expected_value!r}, got "
+                    f"{seen[name]!r}"
+                )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/"
+        "inline_prompt_gate_renderer.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name=(
+                "inline_prompt_gate_renderer_authority_allowlist"
+            ),
+            target_file=target,
+            description=(
+                "Slice 4 listener-renderer imports stay within "
+                "{inline_permission_prompt, "
+                "inline_prompt_gate_runner} (+ registration-contract "
+                "exemption). Renderer is operator-UX nicety, not "
+                "authority — staying scoped is critical."
+            ),
+            validate=_validate_authority_allowlist,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "inline_prompt_gate_renderer_visual_constants"
+            ),
+            target_file=target,
+            description=(
+                "Visual constants (PHASE_BOUNDARY_HEADER='[Phase "
+                "Boundary]', PROMPT_ID_DISPLAY_CHARS=40) are "
+                "operator-visible wire format. Drift changes the "
+                "operator's mental model of which prompt is which."
+            ),
+            validate=_validate_visual_constants,
+        ),
+    ]

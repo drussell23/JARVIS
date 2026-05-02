@@ -573,4 +573,235 @@ __all__ = [
     "INLINE_PROMPT_GATE_HTTP_SCHEMA_VERSION",
     "InlinePromptGateHTTPRouter",
     "inline_prompt_gate_http_enabled",
+    "register_flags",
+    "register_shipped_invariants",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned FlagRegistry contribution (4 HTTP-side flags)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned :class:`FlagRegistry` registration for the 4
+    HTTP-side env knobs. Discovered automatically by
+    ``flag_registry_seed._discover_module_provided_flags``. Returns
+    the count of flags registered."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[InlinePromptGateHTTP] register_flags degraded: %s", exc,
+        )
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_INLINE_PROMPT_GATE_HTTP_ENABLED",
+            type=FlagType.BOOL, default=False,
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "inline_prompt_gate_http.py"
+            ),
+            example="JARVIS_INLINE_PROMPT_GATE_HTTP_ENABLED=true",
+            description=(
+                "Write-surface gate for the InlinePromptGate HTTP "
+                "POST endpoint. Default-FALSE (operator-controlled "
+                "cost ramp; loopback-bound write authority requires "
+                "explicit opt-in)."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_INLINE_PROMPT_GATE_HTTP_RATE_LIMIT_PER_MIN",
+            type=FlagType.INT, default=60,
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "inline_prompt_gate_http.py"
+            ),
+            example=(
+                "JARVIS_INLINE_PROMPT_GATE_HTTP_RATE_LIMIT_PER_MIN=120"
+            ),
+            description=(
+                "Per-IP sliding-window rate limit for the HTTP "
+                "response surface. Floor 1, ceiling 600. Default 60 "
+                "(half the read-side observability cap; writes are "
+                "rarer)."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_INLINE_PROMPT_GATE_HTTP_MAX_BODY_BYTES",
+            type=FlagType.INT, default=4096,
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "inline_prompt_gate_http.py"
+            ),
+            example=(
+                "JARVIS_INLINE_PROMPT_GATE_HTTP_MAX_BODY_BYTES=8192"
+            ),
+            description=(
+                "Max request body bytes for POST /respond. The "
+                "accepted JSON is tiny; 4KB is generous. Floor 64, "
+                "ceiling 65536."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_INLINE_PROMPT_GATE_HTTP_CORS_ORIGINS",
+            type=FlagType.STR, default="",
+            category=Category.INTEGRATION,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "inline_prompt_gate_http.py"
+            ),
+            example=(
+                "JARVIS_INLINE_PROMPT_GATE_HTTP_CORS_ORIGINS="
+                r"^https?://localhost(:\d+)?$"
+            ),
+            description=(
+                "Comma-separated regex allowlist for "
+                "Access-Control-Allow-Origin. Default covers "
+                "localhost + 127.0.0.1 (any port) + vscode-webview. "
+                "Empty/whitespace = use default."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[InlinePromptGateHTTP] register_flags spec %s "
+                "skipped: %s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 3's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_authority_allowlist(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 3 may only import from a small allowlist. Banned:
+        orchestrator-tier modules. Registration-contract exemption
+        applies (register_flags/register_shipped_invariants are
+        boot-time meta)."""
+        violations: list = []
+        allowed = {
+            "backend.core.ouroboros.governance.inline_permission_prompt",
+            "backend.core.ouroboros.governance.inline_prompt_gate",
+            "backend.core.ouroboros.governance.inline_prompt_gate_runner",
+        }
+        registration_funcs = {
+            "register_flags",
+            "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        banned_substrings = (
+            "orchestrator", "phase_runner", "iron_gate",
+            "change_engine", "candidate_generator",
+            ".providers", "doubleword_provider", "urgency_router",
+            "auto_action_router", "subagent_scheduler",
+            "tool_executor", "semantic_guardian",
+            "semantic_firewall", "risk_engine",
+        )
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                for ban in banned_substrings:
+                    if ban in module:
+                        violations.append(
+                            f"line {lineno}: BANNED orchestrator-tier "
+                            f"substring {ban!r} in {module!r}"
+                        )
+                if "backend." in module or (
+                    "governance" in module and module
+                ):
+                    if module not in allowed:
+                        violations.append(
+                            f"line {lineno}: import outside Slice 3 "
+                            f"allowlist: {module!r}"
+                        )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 3 MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    def _validate_verdict_dispatch_keys(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        """The closed verdict vocabulary on the wire (ACCEPTED_VERDICTS)
+        must remain {allow, allow_always, deny, pause}. Drift here
+        breaks the IDE wire-format contract."""
+        # Pin the literal source — substring match is the cheapest
+        # robust shape (the dict is constructed inline).
+        violations: list = []
+        for required in (
+            '"allow":', '"allow_always":', '"deny":', '"pause":',
+        ):
+            if required not in source:
+                violations.append(
+                    f"missing _VERDICT_DISPATCH key {required!r} "
+                    "(IDE wire-format contract)"
+                )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/inline_prompt_gate_http.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="inline_prompt_gate_http_authority_allowlist",
+            target_file=target,
+            description=(
+                "Slice 3 HTTP write surface imports stay within "
+                "{inline_permission_prompt, inline_prompt_gate, "
+                "inline_prompt_gate_runner} (+ registration-contract "
+                "exemption). Banned: orchestrator-tier modules."
+            ),
+            validate=_validate_authority_allowlist,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="inline_prompt_gate_http_verdict_vocabulary",
+            target_file=target,
+            description=(
+                "Closed verdict vocabulary on the wire "
+                "(_VERDICT_DISPATCH dict) keeps {allow, allow_always, "
+                "deny, pause}. Drift breaks the IDE wire-format "
+                "contract."
+            ),
+            validate=_validate_verdict_dispatch_keys,
+        ),
+    ]

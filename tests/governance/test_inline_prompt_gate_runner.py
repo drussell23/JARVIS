@@ -453,28 +453,41 @@ class TestRunnerAuthorityInvariant:
         return path.read_text()
 
     def test_imports_are_in_allowlist(self):
-        """Slice 2 may import:
+        """Slice 2 hot path may import:
           * Slice 1 (inline_prompt_gate)
           * Controller substrate (inline_permission_prompt)
           * Verdict shapes (inline_permission)
-        Banned: orchestrator-tier modules."""
+        Module-owned registration functions (``register_flags`` /
+        ``register_shipped_invariants``) are STRUCTURALLY exempt —
+        boot-time discovery only. Same exemption as Priority #6
+        closure (commit 441cdc7bd2)."""
         allowed = {
             "backend.core.ouroboros.governance.inline_permission",
             "backend.core.ouroboros.governance.inline_permission_prompt",
             "backend.core.ouroboros.governance.inline_prompt_gate",
         }
         tree = ast.parse(self._runner_source())
+        registration_funcs = {"register_flags", "register_shipped_invariants"}
+        exempt_ranges = []
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 module = node.module or ""
                 if "backend." in module or (
                     "governance" in module and module
                 ):
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
                     if module not in allowed:
                         raise AssertionError(
                             f"Slice 2 imported module outside allowlist: "
-                            f"{module!r} at line "
-                            f"{getattr(node, 'lineno', '?')}"
+                            f"{module!r} at line {lineno}"
                         )
 
     def test_no_orchestrator_tier_imports(self):

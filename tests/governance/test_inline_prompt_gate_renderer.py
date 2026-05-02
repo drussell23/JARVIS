@@ -622,22 +622,35 @@ class TestAuthorityAllowlist:
         return path.read_text()
 
     def test_imports_in_allowlist(self):
+        """Slice 4 hot path allowlist; module-owned registration
+        functions (``register_flags`` / ``register_shipped_invariants``)
+        are STRUCTURALLY exempt — boot-time discovery only."""
         allowed = {
             "backend.core.ouroboros.governance.inline_permission_prompt",
             "backend.core.ouroboros.governance.inline_prompt_gate_runner",
         }
         tree = ast.parse(self._renderer_source())
+        registration_funcs = {"register_flags", "register_shipped_invariants"}
+        exempt_ranges = []
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 module = node.module or ""
                 if "backend." in module or (
                     "governance" in module and module
                 ):
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
                     if module not in allowed:
                         raise AssertionError(
                             f"Slice 4 imported module outside allowlist: "
-                            f"{module!r} at line "
-                            f"{getattr(node, 'lineno', '?')}"
+                            f"{module!r} at line {lineno}"
                         )
 
     def test_no_orchestrator_tier_imports(self):

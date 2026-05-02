@@ -115,25 +115,27 @@ INLINE_PROMPT_GATE_SCHEMA_VERSION: str = "inline_prompt_gate.1"
 
 
 def inline_prompt_gate_enabled() -> bool:
-    """``JARVIS_INLINE_PROMPT_GATE_ENABLED`` (default ``false`` until
-    Slice 5 graduation).
+    """``JARVIS_INLINE_PROMPT_GATE_ENABLED`` (default ``true`` —
+    graduated 2026-05-02 in InlinePromptGate Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
+    Asymmetric env semantics — empty/whitespace = unset = graduated
     default; explicit ``0``/``false``/``no``/``off`` evaluates false;
     explicit truthy values evaluate true.
 
-    Re-read on every call so flips hot-revert without restart. The
-    default stays off through Slices 1-4 because graduating before
-    the producer is wired (Slice 2) + REPL/HTTP response surfaces
-    (Slice 3) + SerpentFlow rendering (Slice 4) are all live would
-    leave operators staring at uncoupled events. Slice 5 flips the
-    default after the full stack proves out.
+    Re-read on every call so flips hot-revert without restart.
+    Graduated default-true because the producer's cost is operator
+    latency only (no $ cost — verdict propagates back through the
+    existing controller's Future), and the full Slices 1-4 stack
+    (primitive + producer/bridge + HTTP response surface +
+    listener-based renderer) all proved out with 420/420 combined
+    sweep. The HTTP write surface (separate flag) stays default-off
+    pending operator-controlled cost ramp.
     """
     raw = os.environ.get(
         "JARVIS_INLINE_PROMPT_GATE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -670,7 +672,272 @@ __all__ = [
     "default_prompt_timeout_s",
     "fingerprint_hex_chars",
     "inline_prompt_gate_enabled",
+    "register_flags",
+    "register_shipped_invariants",
     "summary_max_chars",
     "truncate_fingerprint",
     "truncate_summary",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned FlagRegistry contribution (4 producer-side flags)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned :class:`FlagRegistry` registration for the 4
+    producer-side env knobs. Discovered automatically by
+    ``flag_registry_seed._discover_module_provided_flags``. Returns
+    the count of flags registered."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[InlinePromptGate] register_flags degraded: %s", exc,
+        )
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_INLINE_PROMPT_GATE_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/inline_prompt_gate.py"
+            ),
+            example="JARVIS_INLINE_PROMPT_GATE_ENABLED=true",
+            description=(
+                "Master switch for the InlinePromptGate producer. "
+                "Graduated default-true 2026-05-02 in Slice 5."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_INLINE_PROMPT_GATE_TIMEOUT_S",
+            type=FlagType.FLOAT, default=60.0,
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/inline_prompt_gate.py"
+            ),
+            example="JARVIS_INLINE_PROMPT_GATE_TIMEOUT_S=120",
+            description=(
+                "Operator-response window for phase-boundary prompts. "
+                "Floor 1s, ceiling 3600s. Default 60s."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_INLINE_PROMPT_GATE_SUMMARY_MAX_CHARS",
+            type=FlagType.INT, default=200,
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/inline_prompt_gate.py"
+            ),
+            example="JARVIS_INLINE_PROMPT_GATE_SUMMARY_MAX_CHARS=400",
+            description=(
+                "Truncation cap for change-summary text rendered "
+                "into the prompt. Floor 16, ceiling 1024."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_INLINE_PROMPT_GATE_FINGERPRINT_HEX_CHARS",
+            type=FlagType.INT, default=16,
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/inline_prompt_gate.py"
+            ),
+            example=(
+                "JARVIS_INLINE_PROMPT_GATE_FINGERPRINT_HEX_CHARS=32"
+            ),
+            description=(
+                "Display-prefix length for change-fingerprint hex. "
+                "Full sha256 stays in the request for audit. "
+                "Floor 8, ceiling 64."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[InlinePromptGate] register_flags spec %s "
+                "skipped: %s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned :func:`shipped_code_invariants.register_shipped_code_invariant`
+    contribution. Discovered automatically by
+    ``shipped_code_invariants._discover_module_provided_invariants``.
+    Returns the list of :class:`ShippedCodeInvariant` instances."""
+    import ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_pure_stdlib(
+        tree: "ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 1 primitive must stay pure-stdlib at hot path —
+        no governance imports outside the module-owned registration
+        contract (``register_flags`` / ``register_shipped_invariants``)."""
+        violations: list = []
+        registration_funcs = {
+            "register_flags",
+            "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if "backend." in module or "governance" in module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
+                    violations.append(
+                        f"line {lineno}: Slice 1 must be pure-stdlib "
+                        f"— found {module!r}"
+                    )
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 1 MUST NOT {node.func.id}()"
+                        )
+            if isinstance(node, ast.AsyncFunctionDef):
+                violations.append(
+                    f"line {getattr(node, 'lineno', '?')}: "
+                    f"Slice 1 must remain sync — found async "
+                    f"def {node.name!r}"
+                )
+        return tuple(violations)
+
+    def _validate_taxonomy_5_values(
+        tree: "ast.Module", source: str,
+    ) -> tuple:
+        """Closed-taxonomy invariant: PhaseInlineVerdict has
+        EXACTLY 5 values. New verdict values require explicit
+        scope-doc + bridge update."""
+        violations: list = []
+        required = {"ALLOW", "DENY", "PAUSE_OP", "EXPIRED", "DISABLED"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                if node.name == "PhaseInlineVerdict":
+                    seen = set()
+                    for stmt in node.body:
+                        if isinstance(stmt, ast.Assign):
+                            for tgt in stmt.targets:
+                                if isinstance(tgt, ast.Name):
+                                    seen.add(tgt.id)
+                    missing = required - seen
+                    extras = seen - required
+                    if missing:
+                        violations.append(
+                            f"PhaseInlineVerdict missing required "
+                            f"values: {sorted(missing)}"
+                        )
+                    if extras:
+                        violations.append(
+                            f"PhaseInlineVerdict has unexpected "
+                            f"values (closed-taxonomy violation): "
+                            f"{sorted(extras)}"
+                        )
+        return tuple(violations)
+
+    def _validate_state_byte_parity(
+        tree: "ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 1 redefines controller STATE_* string constants
+        verbatim to stay pure-stdlib. The literals must match the
+        controller's exports — a runtime test asserts byte-parity,
+        but this AST pin asserts the constants are PRESENT with
+        the exact literal string values."""
+        violations: list = []
+        expected = {
+            "_CONTROLLER_STATE_ALLOWED": "allowed",
+            "_CONTROLLER_STATE_DENIED": "denied",
+            "_CONTROLLER_STATE_EXPIRED": "expired",
+            "_CONTROLLER_STATE_PAUSED": "paused",
+        }
+        seen: dict = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AnnAssign) and isinstance(
+                node.target, ast.Name,
+            ):
+                if node.target.id in expected:
+                    if isinstance(node.value, ast.Constant):
+                        seen[node.target.id] = node.value.value
+            elif isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id in expected:
+                        if isinstance(node.value, ast.Constant):
+                            seen[tgt.id] = node.value.value
+        for name, expected_value in expected.items():
+            if name not in seen:
+                violations.append(
+                    f"missing controller-state constant {name!r}"
+                )
+            elif seen[name] != expected_value:
+                violations.append(
+                    f"controller-state constant {name!r} drifted: "
+                    f"expected {expected_value!r}, got "
+                    f"{seen[name]!r}"
+                )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/inline_prompt_gate.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="inline_prompt_gate_pure_stdlib",
+            target_file=target,
+            description=(
+                "Slice 1 primitive stays pure-stdlib at hot path: "
+                "no governance imports outside register_flags / "
+                "register_shipped_invariants, no async, no "
+                "exec/eval/compile."
+            ),
+            validate=_validate_pure_stdlib,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="inline_prompt_gate_taxonomy_5_values",
+            target_file=target,
+            description=(
+                "PhaseInlineVerdict is a 5-value closed taxonomy "
+                "(ALLOW / DENY / PAUSE_OP / EXPIRED / DISABLED). "
+                "New values require explicit scope-doc + bridge "
+                "update."
+            ),
+            validate=_validate_taxonomy_5_values,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="inline_prompt_gate_state_byte_parity",
+            target_file=target,
+            description=(
+                "Controller STATE_* constants redefined verbatim "
+                "with literal byte-parity values (allowed / denied "
+                "/ expired / paused) so Slice 1 stays pure-stdlib."
+            ),
+            validate=_validate_state_byte_parity,
+        ),
+    ]

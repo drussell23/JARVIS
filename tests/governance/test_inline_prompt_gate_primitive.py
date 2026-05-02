@@ -337,23 +337,25 @@ class TestPhaseCTighteningStamp:
 
 
 class TestMasterFlagSemantics:
-    def test_default_is_false_pre_graduation(self, monkeypatch):
+    def test_default_is_true_post_graduation(self, monkeypatch):
+        """Slice 5 (2026-05-02) graduated default-true."""
         monkeypatch.delenv(
             "JARVIS_INLINE_PROMPT_GATE_ENABLED", raising=False,
         )
-        assert inline_prompt_gate_enabled() is False
+        assert inline_prompt_gate_enabled() is True
 
-    def test_empty_string_is_default_false(self, monkeypatch):
+    def test_empty_string_is_default_true(self, monkeypatch):
+        """Asymmetric env semantics: empty = unset = graduated default."""
         monkeypatch.setenv(
             "JARVIS_INLINE_PROMPT_GATE_ENABLED", "",
         )
-        assert inline_prompt_gate_enabled() is False
+        assert inline_prompt_gate_enabled() is True
 
-    def test_whitespace_is_default_false(self, monkeypatch):
+    def test_whitespace_is_default_true(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_INLINE_PROMPT_GATE_ENABLED", "   ",
         )
-        assert inline_prompt_gate_enabled() is False
+        assert inline_prompt_gate_enabled() is True
 
     @pytest.mark.parametrize("truthy", ["1", "true", "yes", "on", "TRUE", "Yes"])
     def test_truthy_values_enable(self, monkeypatch, truthy: str):
@@ -568,6 +570,12 @@ class TestPureStdlibInvariant:
     Move 5/6/Priority #1/#2/#3/#4/#5 Slice 1 pattern)."""
 
     def test_no_governance_imports_at_module_top(self):
+        """Slice 1 stays pure-stdlib at HOT PATH. Imports inside
+        the module-owned registration contract (``register_flags`` /
+        ``register_shipped_invariants``) are STRUCTURALLY exempt
+        because they only fire from the dynamic discovery loops at
+        boot, never on the hot path. Same exemption pattern as
+        Priority #6 closure (commit 441cdc7bd2)."""
         path = (
             pathlib.Path(__file__).parent.parent.parent
             / "backend" / "core" / "ouroboros" / "governance"
@@ -575,14 +583,25 @@ class TestPureStdlibInvariant:
         )
         source = path.read_text()
         tree = ast.parse(source)
+        registration_funcs = {"register_flags", "register_shipped_invariants"}
+        exempt_ranges = []
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 module = node.module or ""
                 if "backend." in module or "governance" in module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
                     raise AssertionError(
                         f"Slice 1 must be pure-stdlib — found "
                         f"governance import {module!r} at line "
-                        f"{getattr(node, 'lineno', '?')}"
+                        f"{lineno}"
                     )
 
     def test_no_async_def_in_module(self):

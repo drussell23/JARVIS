@@ -471,5 +471,152 @@ __all__ = [
     "PHASE_BOUNDARY_RULE_ID",
     "PHASE_BOUNDARY_TOOL_SENTINEL",
     "bridge_to_controller_request",
+    "register_shipped_invariants",
     "request_phase_inline_prompt",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — Module-owned shipped_code_invariants contribution
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Register Slice 2's structural invariants. Discovered
+    automatically. Returns :class:`ShippedCodeInvariant` instances."""
+    import ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate_sentinels_stable(
+        tree: "ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Phase-boundary sentinel constants must remain at exact
+        wire-format values. Renaming any of these silently breaks
+        Slice 4's listener filter, the Slice 3 HTTP filter, and
+        operator-visible audit. Stamped here to prevent silent
+        drift."""
+        violations: list = []
+        expected = {
+            "PHASE_BOUNDARY_TOOL_SENTINEL": "phase_boundary",
+            "PHASE_BOUNDARY_RULE_ID": "phase_boundary_inline_prompt",
+            "PHASE_BOUNDARY_CALL_ID_PREFIX": "pb-",
+            "DEFAULT_REVIEWER": "phase_boundary_producer",
+        }
+        seen: dict = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AnnAssign) and isinstance(
+                node.target, ast.Name,
+            ):
+                if node.target.id in expected:
+                    if isinstance(node.value, ast.Constant):
+                        seen[node.target.id] = node.value.value
+            elif isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id in expected:
+                        if isinstance(node.value, ast.Constant):
+                            seen[tgt.id] = node.value.value
+        for name, expected_value in expected.items():
+            if name not in seen:
+                violations.append(
+                    f"missing sentinel constant {name!r}"
+                )
+            elif seen[name] != expected_value:
+                violations.append(
+                    f"sentinel {name!r} drifted: expected "
+                    f"{expected_value!r}, got {seen[name]!r}"
+                )
+        return tuple(violations)
+
+    def _validate_authority_allowlist(
+        tree: "ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 2 may only import from a small allowlist + the
+        registration-contract exemption. Banned: orchestrator-tier
+        modules."""
+        violations: list = []
+        allowed = {
+            "backend.core.ouroboros.governance.inline_permission",
+            "backend.core.ouroboros.governance.inline_permission_prompt",
+            "backend.core.ouroboros.governance.inline_prompt_gate",
+        }
+        registration_funcs = {
+            "register_flags",
+            "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        banned_substrings = (
+            "orchestrator", "phase_runner", "iron_gate",
+            "change_engine", "candidate_generator",
+            ".providers", "doubleword_provider", "urgency_router",
+            "auto_action_router", "subagent_scheduler",
+            "tool_executor", "semantic_guardian",
+            "semantic_firewall", "risk_engine",
+        )
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                lineno = getattr(node, "lineno", 0)
+                if any(s <= lineno <= e for s, e in exempt_ranges):
+                    continue
+                for ban in banned_substrings:
+                    if ban in module:
+                        violations.append(
+                            f"line {lineno}: BANNED orchestrator-tier "
+                            f"substring {ban!r} in {module!r}"
+                        )
+                if "backend." in module or (
+                    "governance" in module and module
+                ):
+                    if module not in allowed:
+                        violations.append(
+                            f"line {lineno}: import outside Slice 2 "
+                            f"allowlist: {module!r}"
+                        )
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 2 MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/inline_prompt_gate_runner.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="inline_prompt_gate_runner_sentinels_stable",
+            target_file=target,
+            description=(
+                "Phase-boundary sentinel constants "
+                "(PHASE_BOUNDARY_TOOL_SENTINEL / PHASE_BOUNDARY_RULE_ID "
+                "/ PHASE_BOUNDARY_CALL_ID_PREFIX / DEFAULT_REVIEWER) "
+                "remain at exact wire-format values. Drift breaks "
+                "Slice 4 listener filter, Slice 3 HTTP filter, audit."
+            ),
+            validate=_validate_sentinels_stable,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="inline_prompt_gate_runner_authority_allowlist",
+            target_file=target,
+            description=(
+                "Slice 2 producer/bridge imports stay within "
+                "{inline_permission, inline_permission_prompt, "
+                "inline_prompt_gate} (+ registration-contract "
+                "exemption). No orchestrator-tier imports allowed."
+            ),
+            validate=_validate_authority_allowlist,
+        ),
+    ]
