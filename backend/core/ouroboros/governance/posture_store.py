@@ -1,6 +1,6 @@
 """PostureStore — durable current-reading + history ring buffer + override audit.
 
-Three on-disk artifacts under ``.jarvis/``:
+Four on-disk artifacts under ``.jarvis/``:
 
   * ``posture_current.json``  — latest PostureReading, atomically written
     via temp+rename so readers never see a torn write.
@@ -10,6 +10,16 @@ Three on-disk artifacts under ``.jarvis/``:
     operations (set / clear / expired). Dedicated file per §8 so the
     agentic side of the system can never alter its own posture logs by
     touching the current-state file.
+  * ``posture_change_marker.json`` — companion to ``current``: timestamp
+    at which the *posture* (not just the reading) became authoritative.
+    Refreshed atomically with ``write_current`` only on real transitions
+    so same-posture refreshes don't reset the hysteresis window.
+    Survives process restarts so the PostureObserver doesn't lose its
+    hysteresis state and falsely lock into a 15-minute blackout after
+    every reboot. Posture-mismatch invariant: if the marker's recorded
+    posture doesn't match ``current``'s posture, the marker is rejected
+    on read and the observer falls back to the legacy ``inferred_at``
+    proxy (cold-start safety net).
 
 Schema discipline:
   Every written payload carries ``schema_version="1.0"``. Readers reject
@@ -153,6 +163,7 @@ class PostureStore:
     CURRENT_FILENAME = "posture_current.json"
     HISTORY_FILENAME = "posture_history.jsonl"
     AUDIT_FILENAME = "posture_audit.jsonl"
+    CHANGE_MARKER_FILENAME = "posture_change_marker.json"
 
     def __init__(
         self,
@@ -180,6 +191,10 @@ class PostureStore:
     def audit_path(self) -> Path:
         return self._base / self.AUDIT_FILENAME
 
+    @property
+    def change_marker_path(self) -> Path:
+        return self._base / self.CHANGE_MARKER_FILENAME
+
     # ---- current ----------------------------------------------------------
 
     def _atomic_write(self, path: Path, text: str) -> None:
@@ -200,12 +215,36 @@ class PostureStore:
                 pass
             raise
 
-    def write_current(self, reading: PostureReading) -> None:
-        """Atomically persist the latest reading."""
+    def write_current(
+        self,
+        reading: PostureReading,
+        *,
+        change_marker_at: Optional[float] = None,
+    ) -> None:
+        """Atomically persist the latest reading.
+
+        ``change_marker_at`` (optional): when supplied, ALSO refreshes the
+        change-marker side-car with this timestamp + the reading's posture.
+        Pass it ONLY on actual posture transitions (or cold-start) — passing
+        ``None`` on same-posture refreshes preserves the existing marker so
+        the hysteresis window isn't reset every cycle. Both files are
+        written atomically (temp+rename) under the same lock acquisition,
+        so a reader never sees a marker pointing at the wrong posture so
+        long as the writer uses this API."""
         payload = reading_to_json(reading)
         text = json.dumps(payload, indent=2, sort_keys=True)
         with self._lock:
             self._atomic_write(self.current_path, text)
+            if change_marker_at is not None:
+                marker_payload = {
+                    "schema_version": POSTURE_STORE_SCHEMA,
+                    "posture": reading.posture.value,
+                    "change_marker_at": float(change_marker_at),
+                }
+                self._atomic_write(
+                    self.change_marker_path,
+                    json.dumps(marker_payload, indent=2, sort_keys=True),
+                )
 
     def load_current(self) -> Optional[PostureReading]:
         """Return the latest reading, or ``None`` if absent / malformed /
@@ -224,6 +263,60 @@ class PostureStore:
             logger.warning("[PostureStore] current file is not valid JSON")
             return None
         return reading_from_json(payload)
+
+    def load_change_marker_at(
+        self,
+        expected_posture: Optional[Posture] = None,
+    ) -> Optional[float]:
+        """Return the change-marker timestamp paired with ``current``, or
+        ``None`` when the marker is absent / malformed / schema-mismatched
+        / posture-mismatched against ``expected_posture``.
+
+        The posture-mismatch check is the safety net for the case where a
+        legacy observer (no marker support) wrote ``current`` without the
+        side-car, OR a partial write left the marker pointing at a stale
+        posture. In both cases the caller should fall back to the legacy
+        ``inferred_at`` proxy rather than honor a contaminated marker."""
+        path = self.change_marker_path
+        if not path.exists():
+            return None
+        with self._lock:
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                return None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning(
+                "[PostureStore] change_marker file is not valid JSON",
+            )
+            return None
+        if payload.get("schema_version") != POSTURE_STORE_SCHEMA:
+            logger.warning(
+                "[PostureStore] change_marker schema mismatch: %r != %r",
+                payload.get("schema_version"), POSTURE_STORE_SCHEMA,
+            )
+            return None
+        try:
+            marker_posture = Posture.from_str(str(payload.get("posture")))
+            marker_at = float(payload["change_marker_at"])
+        except (KeyError, ValueError, TypeError):
+            logger.warning(
+                "[PostureStore] change_marker malformed payload",
+            )
+            return None
+        if (
+            expected_posture is not None
+            and marker_posture is not expected_posture
+        ):
+            logger.debug(
+                "[PostureStore] change_marker posture %s != expected "
+                "%s — discarding (legacy or torn write)",
+                marker_posture, expected_posture,
+            )
+            return None
+        return marker_at
 
     # ---- history ----------------------------------------------------------
 
@@ -361,9 +454,14 @@ class PostureStore:
         }
 
     def clear_all(self) -> None:
-        """Test helper — remove all three files."""
+        """Test helper — remove all four files."""
         with self._lock:
-            for p in (self.current_path, self.history_path, self.audit_path):
+            for p in (
+                self.current_path,
+                self.history_path,
+                self.audit_path,
+                self.change_marker_path,
+            ):
                 if p.exists():
                     try:
                         p.unlink()

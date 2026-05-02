@@ -563,8 +563,11 @@ class CLASSIFYRunner(PhaseRunner):
                 get_default_index,
             )
             _semi = get_default_index(orch._config.project_root)
-            # Lazy build (hits interval gate on repeat).
-            _semi.build()
+            # Q3 Slice 3 — non-blocking build trigger so CLASSIFY never
+            # stalls on subprocess+embed. format_prompt_sections operates
+            # against the currently-loaded centroid (empty on cold
+            # start → returns None, the if-gate below handles it).
+            _semi.build_async()
             _semi_prompt = _semi.format_prompt_sections()
             if _semi_prompt:
                 _existing = getattr(ctx, "strategic_memory_prompt", "") or ""

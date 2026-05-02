@@ -505,7 +505,12 @@ class PostureObserver:
         self._cycles_ok = 0
         self._cycles_failed = 0
         self._cycles_skipped_hysteresis = 0
-        self._last_change_at: Optional[float] = None
+        # Q3 Slice 2 — hydrate from durable side-car so the hysteresis
+        # window survives process restarts. Cold start / missing /
+        # corrupt / posture-mismatched marker yields None, in which case
+        # the cycle's hysteresis check falls back to the legacy
+        # ``previous.inferred_at`` proxy (backward-compat behavior).
+        self._last_change_at: Optional[float] = self._hydrate_last_change_at()
         # Tier 1 #2 — task-death detection heartbeats. Updated on
         # every cycle so consumers can detect a dead/hung observer
         # task before reading frozen state. Posture health module
@@ -513,6 +518,30 @@ class PostureObserver:
         self._last_cycle_attempt_at_unix: Optional[float] = None
         self._last_cycle_ok_at_unix: Optional[float] = None
         self._consecutive_cycle_failures: int = 0
+
+    # ---- Q3 Slice 2 — durable hysteresis state hydration ---------------
+
+    def _hydrate_last_change_at(self) -> Optional[float]:
+        """Read the change-marker side-car (paired with ``current``) so a
+        process restart doesn't lose hysteresis state. The marker is
+        rejected if its recorded posture doesn't match ``current.posture``
+        — that filters out legacy observers that wrote ``current`` without
+        the marker, plus any partial-write or operator-tampering scenario.
+        Failure modes ALL fall through to ``None`` so the legacy
+        ``previous.inferred_at`` proxy still kicks in. Never raises."""
+        try:
+            current = self._store.load_current()
+            if current is None:
+                return None
+            return self._store.load_change_marker_at(
+                expected_posture=current.posture,
+            )
+        except Exception:  # noqa: BLE001 — defensive at boot
+            logger.debug(
+                "[PostureObserver] hydrate_last_change_at failed",
+                exc_info=True,
+            )
+            return None
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -711,14 +740,25 @@ class PostureObserver:
                 promote = True
 
         if promote:
-            self._store.write_current(to_persist)
-            if previous is None or previous.posture is not to_persist.posture:
+            # Q3 Slice 2 — pair the marker write with current ONLY on real
+            # posture transitions. Same-posture refreshes pass marker=None
+            # so the side-car retains the timestamp at which this posture
+            # actually became authoritative — that's the value we want on
+            # restart, not the most recent reading time.
+            is_change = (
+                previous is None
+                or previous.posture is not to_persist.posture
+            )
+            if is_change:
                 self._last_change_at = now
+                self._store.write_current(to_persist, change_marker_at=now)
                 if self._on_change is not None:
                     try:
                         self._on_change(to_persist, previous)
                     except Exception:
                         logger.debug("[PostureObserver] on_change hook raised", exc_info=True)
+            else:
+                self._store.write_current(to_persist)
             self._cycles_ok += 1
         else:
             self._cycles_skipped_hysteresis += 1

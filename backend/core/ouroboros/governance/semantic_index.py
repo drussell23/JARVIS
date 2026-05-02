@@ -1103,6 +1103,16 @@ class SemanticIndex:
         # Rolling window of cluster-kinds for observed scoring signals
         # (failure-gravity tripwire). Resets on each rebuild.
         self._failure_gravity_window: List[str] = []
+        # Q3 Slice 3 — amortization: keep heavy rebuild work off latency-
+        # sensitive hot paths (intake, CLASSIFY). Single-flight flag +
+        # counters; the worker thread is short-lived and daemonic so it
+        # never blocks process exit.
+        self._async_build_running: bool = False
+        self._async_build_skips_running: int = 0
+        self._async_build_skips_fresh: int = 0
+        self._async_builds_started: int = 0
+        self._async_builds_completed: int = 0
+        self._async_builds_failed: int = 0
 
     # ------------------------------------------------------------------
     # Build
@@ -1276,6 +1286,79 @@ class SemanticIndex:
         except Exception:
             logger.debug("[SemanticIndex] build failed", exc_info=True)
             return False
+
+    # ------------------------------------------------------------------
+    # Q3 Slice 3 — non-blocking build trigger (centroid amortization)
+    # ------------------------------------------------------------------
+
+    def build_async(self) -> str:
+        """Non-blocking build trigger for latency-sensitive call sites.
+
+        Hot paths (intake routing, CLASSIFY phase, score-time consumers)
+        must not stall waiting for ``git log`` subprocesses + corpus
+        assembly + bulk-embedder inference. ``build_async`` returns
+        immediately after at most a single dict lookup + a thread spawn,
+        and the heavy work executes in a daemon worker. Concurrent
+        callers are coalesced via a single-flight flag — at most one
+        rebuild runs at a time per index instance.
+
+        Return values (string sentinels rather than enum so log lines
+        and tests can inspect them without an additional import):
+
+          * ``"started"``           — a worker was spawned
+          * ``"skipped_fresh"``     — the interval gate was satisfied
+          * ``"skipped_running"``   — another rebuild is already in flight
+          * ``"skipped_disabled"``  — master flag off
+
+        Correctness: ``score()`` / ``boost_for()`` / ``format_prompt_sections``
+        keep operating against whichever centroid is currently loaded.
+        That's empty on cold start (returns 0 — which is also what a
+        synchronous ``build()`` would produce on the same first call when
+        the embedder isn't ready yet), and the previous centroid
+        afterwards. The atomic swap inside ``build()`` (single
+        ``self._lock`` critical section over corpus + vectors + centroid +
+        clusters + stats) means readers never observe a half-rebuilt
+        index — the same invariant ``build()`` already guarantees."""
+        if not _is_enabled():
+            return "skipped_disabled"
+        now = time.time()
+        with self._lock:
+            if self._async_build_running:
+                self._async_build_skips_running += 1
+                return "skipped_running"
+            if self._built_at > 0 and (now - self._built_at) < _refresh_s():
+                self._async_build_skips_fresh += 1
+                return "skipped_fresh"
+            self._async_build_running = True
+            self._async_builds_started += 1
+
+        def _worker() -> None:
+            try:
+                ok = self.build(force=True)
+                with self._lock:
+                    if ok:
+                        self._async_builds_completed += 1
+                    else:
+                        self._async_builds_failed += 1
+            except Exception:
+                # build() already swallows internally; this is belt-and-
+                # suspenders for any future regressions in build().
+                logger.debug(
+                    "[SemanticIndex] async build worker raised",
+                    exc_info=True,
+                )
+                with self._lock:
+                    self._async_builds_failed += 1
+            finally:
+                with self._lock:
+                    self._async_build_running = False
+
+        threading.Thread(
+            target=_worker,
+            name="SemanticIndex.build_async",
+            daemon=True,
+        ).start()
+        return "started"
 
     # ------------------------------------------------------------------
     # Slice 3a — cluster build helpers
@@ -1965,6 +2048,23 @@ class SemanticIndex:
                 scored_by_policy=dict(self._stats.scored_by_policy),
             )
 
+    def async_build_stats(self) -> Dict[str, Any]:
+        """Q3 Slice 3 — observability for ``build_async`` single-flight
+        + interval-gate + worker outcome counters. Returned as a plain
+        dict so we don't widen the policy-shaped :class:`IndexStats`
+        dataclass and ripple into every caller. Read-only snapshot
+        (taken under ``self._lock``). Telemetry only — no decisions
+        gate on these counters."""
+        with self._lock:
+            return {
+                "running": self._async_build_running,
+                "started": self._async_builds_started,
+                "completed": self._async_builds_completed,
+                "failed": self._async_builds_failed,
+                "skipped_running": self._async_build_skips_running,
+                "skipped_fresh": self._async_build_skips_fresh,
+            }
+
     def reset(self) -> None:
         """Drop corpus + centroid + counters. Tests only."""
         with self._lock:
@@ -1979,6 +2079,12 @@ class SemanticIndex:
             self._prev_cluster_hashes = frozenset()
             self._failure_gravity_window = []
             self._stats = IndexStats()
+            self._async_build_running = False
+            self._async_build_skips_running = 0
+            self._async_build_skips_fresh = 0
+            self._async_builds_started = 0
+            self._async_builds_completed = 0
+            self._async_builds_failed = 0
 
 
 # ---------------------------------------------------------------------------

@@ -270,8 +270,12 @@ def _compute_priority(
             get_default_index,
         )
         _si = get_default_index()
-        # Lazy build on first use; subsequent signals hit the interval gate.
-        _si.build()
+        # Q3 Slice 3 — non-blocking build trigger. The hot intake path
+        # must not stall on git-log subprocesses + corpus assembly +
+        # bulk-embed. ``build_async`` returns immediately; ``boost_for``
+        # below scores against whichever centroid is currently loaded
+        # (empty on cold start → boost=0, no harm done).
+        _si.build_async()
         semantic_boost = _si.boost_for(envelope.description or "")
         if semantic_boost > 0 or _si.stats().built_at > 0:
             # Stash in envelope evidence for observability. Score itself
