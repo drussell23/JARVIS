@@ -25,10 +25,43 @@ from __future__ import annotations
 
 import threading
 import time
-import unittest.mock as mock
-from typing import List
+from typing import Callable, Optional
 
-import pytest
+
+class _InterceptDict(dict):
+    """Dict subclass that fires a one-shot callback on the second
+    ``.get`` call for a given key. Lets us simulate a fresh
+    write injected into the CAS re-check window without touching
+    real threading primitives."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._intercept_key: Optional[str] = None
+        self._intercept_target_call: int = 2
+        self._intercept_call_count: int = 0
+        self._intercept_cb: Optional[Callable[[], None]] = None
+
+    def arm(
+        self, key: str, target_call: int,
+        cb: Callable[[], None],
+    ) -> None:
+        self._intercept_key = key
+        self._intercept_target_call = target_call
+        self._intercept_call_count = 0
+        self._intercept_cb = cb
+
+    def get(self, key, *args, **kwargs):  # type: ignore[override]
+        if key == self._intercept_key:
+            self._intercept_call_count += 1
+            if (
+                self._intercept_call_count
+                == self._intercept_target_call
+                and self._intercept_cb is not None
+            ):
+                cb = self._intercept_cb
+                self._intercept_cb = None
+                cb()
+        return super().get(key, *args, **kwargs)
 
 
 def _build_router():
@@ -40,7 +73,7 @@ def _build_router():
         UnifiedIntakeRouter,
     )
     r = UnifiedIntakeRouter.__new__(UnifiedIntakeRouter)
-    r._active_file_ops = {}
+    r._active_file_ops = _InterceptDict()
     r._active_file_ops_lock = threading.Lock()
     r._queued_behind = {}
     r._file_lock_ttl_s = 300.0
@@ -125,26 +158,18 @@ class TestStaleReleaseCAS:
         # Plant a stale entry: registered far in the past
         old_t = time.monotonic() - 1000.0
         r._active_file_ops['shared.py'] = ('op-stale', old_t)
-        # Plant a fresh entry that our race-thread will write —
-        # we use a side-effect on dict.get to interleave the
-        # write between the capture + the delete.
-        original_get = r._active_file_ops.get
-        call_count = [0]
-        def _injecting_get(key, *args):
-            call_count[0] += 1
-            # On the SECOND .get (the CAS re-check), inject a
-            # fresh write before the lookup so the CAS sees the
-            # mutated entry.
-            if call_count[0] == 2 and key == 'shared.py':
-                r._active_file_ops[key] = (
-                    'op-fresh', time.monotonic(),
-                )
-            return original_get(key, *args)
-        with mock.patch.object(
-            r._active_file_ops, 'get', side_effect=_injecting_get,
-        ):
-            env = _StubEnvelope(['shared.py'])
-            blocking = r._find_file_conflict(env)
+        # On the SECOND .get (the CAS re-check), inject a fresh
+        # write before super().get returns — so the CAS sees the
+        # mutated entry and aborts.
+        def _overwrite():
+            r._active_file_ops['shared.py'] = (
+                'op-fresh', time.monotonic(),
+            )
+        r._active_file_ops.arm(  # type: ignore[attr-defined]
+            key='shared.py', target_call=2, cb=_overwrite,
+        )
+        env = _StubEnvelope(['shared.py'])
+        r._find_file_conflict(env)  # type: ignore[arg-type]
         # Fresh entry survives (CAS aborted)
         assert 'shared.py' in r._active_file_ops
         assert r._active_file_ops['shared.py'][0] == 'op-fresh'
@@ -156,7 +181,7 @@ class TestStaleReleaseCAS:
         old_t = time.monotonic() - 1000.0
         r._active_file_ops['stale.py'] = ('op-stale', old_t)
         env = _StubEnvelope(['stale.py'])
-        blocking = r._find_file_conflict(env)
+        blocking = r._find_file_conflict(env)  # type: ignore[arg-type]
         assert blocking is None  # no conflict — released
         assert 'stale.py' not in r._active_file_ops
 
@@ -187,20 +212,13 @@ class TestReleaseOpCAS:
         r = _build_router()
         r.register_active_op('op-1', ['a.py'])
 
-        original_get = r._active_file_ops.get
-        injected = [False]
-        def _injecting_get(key, *args):
-            # On the CAS re-check (after the scan), inject the
-            # rewrite so the identity check sees op-2.
-            if not injected[0] and key == 'a.py':
-                injected[0] = True
-                r._active_file_ops[key] = ('op-2', time.monotonic())
-            return original_get(key, *args)
+        def _overwrite():
+            r._active_file_ops['a.py'] = ('op-2', time.monotonic())
 
-        with mock.patch.object(
-            r._active_file_ops, 'get', side_effect=_injecting_get,
-        ):
-            asyncio.run(r.release_op('op-1'))
+        r._active_file_ops.arm(  # type: ignore[attr-defined]
+            key='a.py', target_call=1, cb=_overwrite,
+        )
+        asyncio.run(r.release_op('op-1'))
         # a.py survives because the CAS saw op-2, not op-1
         assert 'a.py' in r._active_file_ops
         assert r._active_file_ops['a.py'][0] == 'op-2'
@@ -213,38 +231,46 @@ class TestReleaseOpCAS:
 
 class TestStress:
     def test_concurrent_register_and_stale_release_preserves_fresh(self):
-        """Stress: 1 thread plants stale entries in a tight loop,
-        another thread re-registers them fresh, a third runs
-        _find_file_conflict to trigger stale-release. Repeat. The
-        invariant: every fresh write either (a) was made while no
-        stale-release was in flight, or (b) survives a concurrent
-        stale-release CAS abort. We verify by counting fresh
-        registrations vs final entries — they should match
-        modulo the in-flight delta."""
+        """Stress: stale entries pre-planted; one registrar thread
+        re-registers fresh against random keys; two finder threads
+        sweep all 100 keys triggering stale-release on whatever's
+        still stale. The invariant we test: any key the registrar
+        WROTE FRESH must NEVER end up either (a) missing from the
+        dict or (b) carrying op-stale. The registrar tracks a
+        last-write timestamp per key under a witness lock; a
+        finder cannot legally drop a key whose latest fresh-write
+        timestamp is more recent than the entry it captured."""
         r = _build_router()
-        ttl = r._file_lock_ttl_s
-        STOP_AFTER_S = 0.3
+        STOP_AFTER_S = 0.5
 
-        # Pre-plant many stale entries.
         long_ago = time.monotonic() - 1000.0
         for i in range(100):
             r._active_file_ops[f'f{i}.py'] = ('op-stale', long_ago)
 
-        fresh_writes: List[str] = []
+        # Witness map: fpath → most-recent fresh-write monotonic
+        # timestamp. Updated AFTER register_active_op returns, so
+        # any time we see a fresh entry on fpath whose ts >= the
+        # witness, that entry is the one the registrar last wrote.
+        witness_lock = threading.Lock()
+        witness: dict = {}
         stop = threading.Event()
 
         def _registrar():
+            i = 0
             while not stop.is_set():
-                fpath = f'f{int(time.monotonic() * 1000) % 100}.py'
+                fpath = f'f{i % 100}.py'
+                i += 1
                 r.register_active_op('op-fresh', [fpath])
-                fresh_writes.append(fpath)
+                ts = time.monotonic()
+                with witness_lock:
+                    witness[fpath] = ts
 
         def _conflict_finder():
             while not stop.is_set():
                 env = _StubEnvelope([
                     f'f{i}.py' for i in range(100)
                 ])
-                r._find_file_conflict(env)
+                r._find_file_conflict(env)  # type: ignore[arg-type]
 
         threads = [
             threading.Thread(target=_registrar),
@@ -258,13 +284,27 @@ class TestStress:
         for t in threads:
             t.join(timeout=5)
 
-        # Invariant: every fresh write either survived to final
-        # state OR was concurrently overwritten by a NEWER fresh
-        # write (same fpath). Critically, no fresh op-fresh write
-        # should appear lost while a stale op-stale entry persists.
-        assert all(
-            v[0] != 'op-stale' for v in r._active_file_ops.values()
-        ), (
-            "stale entry survived after fresh write — TTL race "
-            "fix failed; some writer was clobbered"
-        )
+        # Invariant: every key the registrar WITNESSED writing
+        # fresh must (a) still exist in the dict, and (b) carry
+        # op-fresh — never op-stale. A clobbered fresh write is
+        # the exact symptom of the TTL race we're closing.
+        with witness_lock:
+            tracked = dict(witness)
+        for fpath, ts in tracked.items():
+            entry = r._active_file_ops.get(fpath)
+            assert entry is not None, (
+                f"fresh write to {fpath} at {ts} disappeared — "
+                f"clobbered by stale-release"
+            )
+            op_id, registered_at = entry
+            # The entry's registered_at must be >= when we wrote
+            # fresh — otherwise the dict still holds the stale
+            # tuple (TTL race symptom).
+            if registered_at < ts:
+                # Could be a slightly older fresh write from a
+                # previous loop iteration; only fail if op-stale.
+                assert op_id != 'op-stale', (
+                    f"{fpath} still holds op-stale after fresh "
+                    f"write at {ts} (entry ts={registered_at}) — "
+                    f"TTL race clobber"
+                )
