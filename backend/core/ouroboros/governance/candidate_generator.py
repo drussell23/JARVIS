@@ -51,12 +51,14 @@ Components
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
-from typing import Any, Dict, List, NoReturn, Optional, Protocol, runtime_checkable
+from pathlib import Path
+from typing import Any, Dict, List, NoReturn, Optional, Protocol, Tuple, runtime_checkable
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -1414,6 +1416,187 @@ class CandidateGenerator:
                         "record_success failed",
                         exc_info=True,
                     )
+            # Antivenom Vector 1: BG/SPEC routes structurally skip
+            # Quorum (cost-gated). A single-roll candidate that
+            # claims to modify code but produces an AST fingerprint
+            # identical to the original is a Quine-class hallucination.
+            # Filter such candidates out — empty result is a
+            # correctness win (orchestrator's accept-failure branch
+            # handles it gracefully, no apply, no harm).
+            try:
+                result = await self._apply_bg_spec_structural_filter(
+                    context=context, result=result,
+                )
+            except Exception:  # noqa: BLE001 — never break generate()
+                logger.debug(
+                    "[CandidateGenerator] bg_spec_structural_filter "
+                    "raised; passing through unfiltered result",
+                    exc_info=True,
+                )
+            return result
+
+    async def _apply_bg_spec_structural_filter(
+        self,
+        *,
+        context: OperationContext,
+        result: GenerationResult,
+    ) -> GenerationResult:
+        """Antivenom Vector 1: structural Quine-class guard for
+        BG/SPEC routes.
+
+        Routes BACKGROUND/SPECULATIVE structurally skip the
+        Quorum gate (``COST_GATED_ROUTES`` in
+        ``cost_contract_assertion``). That leaves single-roll
+        generation with no consensus check — a hallucinated
+        candidate whose AST equals the original (different text,
+        same shape) can ship.
+
+        This filter runs ``compute_bg_spec_structural_check`` on
+        each candidate's ``(file_path, full_content)`` pair (or
+        each entry in a multi-file candidate's ``files`` list)
+        against the on-disk original. Anomaly → drop the
+        candidate. New files (no on-disk original) are passed
+        through (no AST to compare).
+
+        Cost: zero LLM calls. AST signature compute is bounded
+        by file size; runs in a thread to avoid blocking the
+        event loop. Master gate
+        ``JARVIS_BG_SPEC_STRUCTURAL_CHECK_ENABLED`` (default
+        ``true``) lives on the primitive in
+        ``generative_quorum_gate``."""
+        try:
+            route = (
+                getattr(context, "provider_route", "") or ""
+            ).strip().lower()
+            if route not in ("background", "speculative"):
+                return result
+            if not result.candidates:
+                return result
+
+            # Lazy import: keep generative_quorum_gate out of the
+            # hot import path for non-BG/SPEC ops.
+            try:
+                from backend.core.ouroboros.governance.verification.generative_quorum_gate import (
+                    compute_bg_spec_structural_check,
+                )
+            except ImportError:
+                return result
+
+            change_desc = (
+                getattr(context, "description", "") or ""
+            )
+            # No claimed change → no Quine vector. Skip.
+            if not change_desc.strip():
+                return result
+
+            cwd = Path.cwd()
+
+            def _check_one(file_path: str, candidate_src: str) -> Tuple[bool, str]:
+                """Return ``(anomaly_detected, reason)``. Best-effort
+                — any failure → no anomaly (defense in depth)."""
+                try:
+                    if not file_path or not isinstance(candidate_src, str):
+                        return (False, "")
+                    p = Path(file_path)
+                    if not p.is_absolute():
+                        p = cwd / p
+                    if not p.exists() or not p.is_file():
+                        # New file — no original to compare.
+                        return (False, "")
+                    try:
+                        original_src = p.read_text(
+                            encoding="utf-8", errors="replace",
+                        )
+                    except OSError:
+                        return (False, "")
+                    chk = compute_bg_spec_structural_check(
+                        candidate_source=candidate_src,
+                        original_source=original_src,
+                        change_description=change_desc,
+                    )
+                    return (chk.anomaly_detected, chk.anomaly_reason)
+                except Exception:  # noqa: BLE001 — defensive
+                    return (False, "")
+
+            def _candidate_anomalous(cand: Dict[str, Any]) -> Tuple[bool, str]:
+                """Multi-file candidate: anomalous iff EVERY entry is
+                anomalous (a partial mix may still be a real change).
+                Single-file candidate: direct check."""
+                files_list = cand.get("files")
+                if isinstance(files_list, list) and files_list:
+                    entries = [
+                        e for e in files_list
+                        if isinstance(e, dict)
+                    ]
+                    if not entries:
+                        return (False, "")
+                    flags: list = []
+                    reasons: list = []
+                    for entry in entries:
+                        anom, reason = _check_one(
+                            entry.get("file_path", ""),
+                            entry.get("full_content", ""),
+                        )
+                        flags.append(anom)
+                        if reason:
+                            reasons.append(reason)
+                    # All-or-nothing: only drop when every entry
+                    # is structurally identical to its original.
+                    if flags and all(flags):
+                        return (
+                            True,
+                            f"multi_file_all_quine: {'; '.join(reasons)[:200]}",
+                        )
+                    return (False, "")
+                # Single-file legacy shape.
+                return _check_one(
+                    cand.get("file_path", ""),
+                    cand.get("full_content", ""),
+                )
+
+            # Run AST signature compute off the event loop. Each
+            # check reads a file; bound the parallelism via the
+            # default thread pool (no extra knobs to tune).
+            anomaly_results: list = await asyncio.gather(
+                *[
+                    asyncio.to_thread(_candidate_anomalous, cand)
+                    for cand in result.candidates
+                ],
+                return_exceptions=True,
+            )
+
+            kept: list = []
+            dropped: int = 0
+            for cand, outcome in zip(result.candidates, anomaly_results):
+                if isinstance(outcome, BaseException):
+                    kept.append(cand)
+                    continue
+                anom, reason = outcome
+                if anom:
+                    dropped += 1
+                    op_id = (
+                        getattr(context, "op_id", "") or "?"
+                    )[:12]
+                    logger.warning(
+                        "[CandidateGenerator] bg_spec_quine_drop "
+                        "op=%s route=%s reason=%s",
+                        op_id, route, (reason or "")[:160],
+                    )
+                else:
+                    kept.append(cand)
+
+            if dropped == 0:
+                return result
+
+            # Replace the candidates tuple. Keep all other
+            # GenerationResult fields intact (provider_name,
+            # duration, tool records, token usage, cost — these
+            # describe what the provider actually did, not the
+            # filter outcome).
+            return dataclasses.replace(
+                result, candidates=tuple(kept),
+            )
+        except Exception:  # noqa: BLE001 — last-resort defensive
             return result
 
     async def _generate_dispatch(

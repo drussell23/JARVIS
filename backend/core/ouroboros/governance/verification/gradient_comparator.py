@@ -117,15 +117,16 @@ def comparator_enabled() -> bool:
     Asymmetric env semantics — empty/whitespace = unset = current
     default; explicit truthy/falsy overrides at call time.
 
-    Default ``false`` until Slice 5 graduation. Both flags must be
-    ``true`` for ``compare_gradient_history`` to actually aggregate;
-    if either is off the comparator returns
-    ``CIGWEffectivenessOutcome.DISABLED`` immediately."""
+    Default ``true`` — graduated 2026-05-02 in Priority #5 Slice 5.
+    Both flags must be ``true`` for ``compare_gradient_history`` to
+    actually aggregate; if either is off the comparator returns
+    ``CIGWEffectivenessOutcome.DISABLED`` immediately. Hot-revert
+    via ``export JARVIS_CIGW_COMPARATOR_ENABLED=false``."""
     raw = os.environ.get(
         "JARVIS_CIGW_COMPARATOR_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 

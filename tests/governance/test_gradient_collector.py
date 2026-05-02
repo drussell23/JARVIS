@@ -130,13 +130,16 @@ async def baz():
 
 class TestCollectorEnabledFlag:
 
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
+        """Slice 5 graduation flipped collector sub-gate to True
+        (2026-05-02)."""
         monkeypatch.delenv("JARVIS_CIGW_COLLECTOR_ENABLED", raising=False)
-        assert collector_enabled() is False
+        assert collector_enabled() is True
 
     def test_empty_treated_as_unset(self, monkeypatch):
+        """Empty = unset = graduated default-true."""
         monkeypatch.setenv("JARVIS_CIGW_COLLECTOR_ENABLED", "")
-        assert collector_enabled() is False
+        assert collector_enabled() is True
 
     @pytest.mark.parametrize("v", ["1", "true", "TRUE", "yes", "ON"])
     def test_truthy(self, monkeypatch, v):

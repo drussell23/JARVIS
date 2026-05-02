@@ -107,16 +107,23 @@ CIGW_SCHEMA_VERSION: str = "gradient_watcher.1"
 
 
 def cigw_enabled() -> bool:
-    """``JARVIS_CIGW_ENABLED`` (default ``false`` until Slice 5
-    graduation).
+    """``JARVIS_CIGW_ENABLED`` (default ``true`` — graduated
+    2026-05-02 in Priority #5 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
+    Asymmetric env semantics — empty/whitespace = unset = graduated
     default; explicit ``0``/``false``/``no``/``off`` evaluates false;
     explicit truthy values evaluate true. Re-read on every call so
-    flips hot-revert without restart."""
+    flips hot-revert without restart.
+
+    Graduated default-true matches Priority #1/#2/#3/#4 discipline
+    because CIGW is read-only over source files (zero LLM cost on
+    detection path; structural metrics via stdlib ast + file.read;
+    observational not prescriptive — every reading stamps PASSED).
+    Operator approval still required for any downstream flag-flip
+    proposal via MetaAdaptationGovernor."""
     raw = os.environ.get("JARVIS_CIGW_ENABLED", "").strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5 graduation
+        return True  # graduated default (Slice 5, 2026-05-02)
     return raw in ("1", "true", "yes", "on")
 
 

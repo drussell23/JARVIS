@@ -513,11 +513,168 @@ async def invoke_quorum_for_op(
 
 
 # ---------------------------------------------------------------------------
+# Antivenom Vector 1: BG/SPEC structural fingerprint validator
+# ---------------------------------------------------------------------------
+
+
+def _bg_spec_structural_check_enabled() -> bool:
+    """``JARVIS_BG_SPEC_STRUCTURAL_CHECK_ENABLED`` (default
+    ``true``). Kill switch for the BG/SPEC AST fingerprint
+    structural check. Explicit ``false`` disables."""
+    raw = os.environ.get(
+        "JARVIS_BG_SPEC_STRUCTURAL_CHECK_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return True
+    return raw in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class BgSpecStructuralCheck:
+    """Result of a zero-cost AST fingerprint comparison between
+    a candidate and its original source. Detects Quine-class
+    hallucinated equivalents that pass single-roll validation
+    but are structurally different from the intended change.
+
+    ``fingerprint_match`` is True when candidate and original
+    have IDENTICAL AST fingerprints (after literal normalization).
+    For BG/SPEC ops that claim to modify code, a match means
+    the candidate is either identical to the original (no-op)
+    or a Quine-class equivalent (different text, same AST).
+
+    ``anomaly_detected`` is True when the check identifies a
+    structural concern: the candidate claims to modify code
+    (change_description non-empty) but produces an identical
+    AST fingerprint to the original."""
+
+    fingerprint_match: bool
+    anomaly_detected: bool = False
+    anomaly_reason: str = ""
+    candidate_fingerprint: str = ""
+    original_fingerprint: str = ""
+    schema_version: str = GENERATIVE_QUORUM_GATE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict:
+        return {
+            "fingerprint_match": self.fingerprint_match,
+            "anomaly_detected": self.anomaly_detected,
+            "anomaly_reason": self.anomaly_reason,
+            "candidate_fingerprint": self.candidate_fingerprint,
+            "original_fingerprint": self.original_fingerprint,
+            "schema_version": self.schema_version,
+        }
+
+
+def compute_bg_spec_structural_check(
+    *,
+    candidate_source: str,
+    original_source: str,
+    change_description: str = "",
+    enabled_override: Optional[bool] = None,
+) -> BgSpecStructuralCheck:
+    """Zero-LLM-cost structural check for BG/SPEC candidates.
+
+    Computes ``ast_canonical.compute_ast_signature`` on both the
+    candidate and original source. When the fingerprints match
+    AND the change_description is non-empty (i.e., the candidate
+    claims to modify code), the check flags a structural anomaly.
+
+    This is NOT a Quorum — it does NOT fire K× generation rolls.
+    It is a cheap supplementary guard that runs after single-roll
+    generation on cost-gated routes.
+
+    NEVER raises. Returns a ``BgSpecStructuralCheck`` with all
+    fields populated."""
+    try:
+        is_enabled = (
+            enabled_override if enabled_override is not None
+            else _bg_spec_structural_check_enabled()
+        )
+        if not is_enabled:
+            return BgSpecStructuralCheck(
+                fingerprint_match=False,
+                anomaly_reason="bg_spec_structural_check_disabled",
+            )
+
+        if not isinstance(candidate_source, str):
+            return BgSpecStructuralCheck(
+                fingerprint_match=False,
+                anomaly_reason="candidate_source_not_string",
+            )
+        if not isinstance(original_source, str):
+            return BgSpecStructuralCheck(
+                fingerprint_match=False,
+                anomaly_reason="original_source_not_string",
+            )
+
+        # Lazy import to preserve existing import graph.
+        try:
+            from backend.core.ouroboros.governance.verification.ast_canonical import (
+                compute_ast_signature,
+            )
+        except ImportError:
+            return BgSpecStructuralCheck(
+                fingerprint_match=False,
+                anomaly_reason="ast_canonical_unavailable",
+            )
+
+        candidate_fp = compute_ast_signature(candidate_source)
+        original_fp = compute_ast_signature(original_source)
+
+        # Empty fingerprints mean syntax error or non-Python —
+        # can't compare, no anomaly detectable.
+        if not candidate_fp or not original_fp:
+            return BgSpecStructuralCheck(
+                fingerprint_match=False,
+                candidate_fingerprint=candidate_fp,
+                original_fingerprint=original_fp,
+                anomaly_reason=(
+                    "fingerprint_empty — syntax_error_or_non_python"
+                ),
+            )
+
+        match = (candidate_fp == original_fp)
+        anomaly = False
+        reason = ""
+
+        if match and change_description and change_description.strip():
+            anomaly = True
+            reason = (
+                f"candidate AST fingerprint matches original "
+                f"despite change_description being non-empty — "
+                f"possible Quine-class equivalence"
+            )
+            logger.warning(
+                "[QuorumGate] bg_spec_structural_anomaly: %s "
+                "fp=%s",
+                reason, candidate_fp[:16],
+            )
+
+        return BgSpecStructuralCheck(
+            fingerprint_match=match,
+            anomaly_detected=anomaly,
+            anomaly_reason=reason,
+            candidate_fingerprint=candidate_fp,
+            original_fingerprint=original_fp,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[QuorumGate] compute_bg_spec_structural_check "
+            "raised: %s", exc,
+        )
+        return BgSpecStructuralCheck(
+            fingerprint_match=False,
+            anomaly_reason=f"check_failed: {exc!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
 __all__ = [
+    "BgSpecStructuralCheck",
     "GENERATIVE_QUORUM_GATE_SCHEMA_VERSION",
     "QUORUM_ELIGIBLE_TIERS",
     "QuorumActionMapping",
@@ -527,6 +684,7 @@ __all__ = [
     "RISK_TIER_BLOCKED",
     "RISK_TIER_NOTIFY_APPLY",
     "RISK_TIER_SAFE_AUTO",
+    "compute_bg_spec_structural_check",
     "invoke_quorum_for_op",
     "map_consensus_to_action",
     "quorum_gate_enabled",
