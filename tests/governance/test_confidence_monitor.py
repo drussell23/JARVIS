@@ -632,24 +632,67 @@ def test_authority_no_forbidden_imports() -> None:
 
 
 def test_authority_pure_stdlib_only() -> None:
+    """Confidence monitor stays stdlib-only at MODULE level. Lazy
+    imports of substrate-tier governance modules (currently:
+    ``adapted_confidence_loader`` for Gap #2 Slice 3 — operator-
+    approved adapted thresholds) are permitted INSIDE accessor
+    bodies because the loader is best-effort and never raises.
+    Module-level imports stay pure stdlib so the cage discipline
+    is enforceable at static-analysis time."""
     src = Path(inspect.getfile(confidence_monitor)).read_text()
     tree = ast.parse(src)
-    allowed_roots = {
+    allowed_stdlib_roots = {
         "collections", "logging", "math", "os", "threading", "time",
         "dataclasses", "enum", "typing", "__future__",
     }
-    for node in ast.walk(tree):
+    # Substrate-tier governance modules permitted as LAZY imports
+    # inside accessor bodies. Each entry must be one-way (consumer
+    # imports the substrate, never the reverse).
+    allowed_lazy_governance = {
+        "backend.core.ouroboros.governance.adaptation.adapted_confidence_loader",
+    }
+
+    def _is_module_level(node: ast.AST) -> bool:
+        # Walk-up the AST is non-trivial in `ast.walk` order; we
+        # explicitly iterate `tree.body` for module-level imports.
+        return False  # placeholder; replaced below by direct iteration
+
+    # Module-level imports must be pure stdlib.
+    for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                assert root in allowed_roots, (
-                    f"non-stdlib import: {alias.name}"
+                assert root in allowed_stdlib_roots, (
+                    f"module-level non-stdlib import: {alias.name}"
                 )
         elif isinstance(node, ast.ImportFrom) and node.module:
             root = node.module.split(".")[0]
-            assert root in allowed_roots, (
-                f"non-stdlib import: {node.module}"
+            assert root in allowed_stdlib_roots, (
+                f"module-level non-stdlib import: {node.module}"
             )
+
+    # Function-body imports: stdlib OR allowlisted substrate-tier.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for child in ast.walk(node):
+                if isinstance(child, ast.Import):
+                    for alias in child.names:
+                        root = alias.name.split(".")[0]
+                        assert (
+                            root in allowed_stdlib_roots
+                            or alias.name in allowed_lazy_governance
+                        ), f"non-stdlib lazy import: {alias.name}"
+                elif (
+                    isinstance(child, ast.ImportFrom)
+                    and child.module
+                ):
+                    root = child.module.split(".")[0]
+                    assert (
+                        root in allowed_stdlib_roots
+                        or child.module in allowed_lazy_governance
+                    ), (
+                        f"non-stdlib lazy import: {child.module}"
+                    )
 
 
 # ===========================================================================

@@ -312,6 +312,27 @@ EVENT_TYPE_SBT_BASELINE_UPDATED = "sbt_baseline_updated"
 EVENT_TYPE_CIGW_REPORT_RECORDED = "cigw_report_recorded"
 EVENT_TYPE_CIGW_BASELINE_UPDATED = "cigw_baseline_updated"
 
+# ----------------------------------------------------------------------
+# Deep Observability Gap #2 Slice 4 — Confidence-policy write surface.
+# ----------------------------------------------------------------------
+#
+# IDE-driven operator proposals to tighten the ConfidenceMonitor
+# threshold knobs. Every event correlates to one AdaptationProposal
+# in the AdaptationLedger; the proposal_id is the op_id field.
+#
+#   * PROPOSED — fires when ide_policy_router accepts a POST and
+#     AdaptationLedger.propose returns OK.
+#   * APPROVED — fires on operator approval (ledger.approve).
+#   * REJECTED — fires on operator rejection (ledger.reject).
+#   * APPLIED  — fires after the YAML writer materializes the
+#     approved proposal into .jarvis/adapted_confidence_thresholds.yaml
+#     (Slice 4 emits PROPOSED / APPROVED / REJECTED; Slice 5 wires
+#     APPLIED to the YAML writer hook).
+EVENT_TYPE_CONFIDENCE_POLICY_PROPOSED = "confidence_policy_proposed"
+EVENT_TYPE_CONFIDENCE_POLICY_APPROVED = "confidence_policy_approved"
+EVENT_TYPE_CONFIDENCE_POLICY_REJECTED = "confidence_policy_rejected"
+EVENT_TYPE_CONFIDENCE_POLICY_APPLIED = "confidence_policy_applied"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -369,6 +390,10 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SBT_BASELINE_UPDATED,             # Priority #4 Slice 4
     EVENT_TYPE_CIGW_REPORT_RECORDED,             # Priority #5 Slice 4
     EVENT_TYPE_CIGW_BASELINE_UPDATED,            # Priority #5 Slice 4
+    EVENT_TYPE_CONFIDENCE_POLICY_PROPOSED,        # Gap #2 Slice 4
+    EVENT_TYPE_CONFIDENCE_POLICY_APPROVED,        # Gap #2 Slice 4
+    EVENT_TYPE_CONFIDENCE_POLICY_REJECTED,        # Gap #2 Slice 4
+    EVENT_TYPE_CONFIDENCE_POLICY_APPLIED,         # Gap #2 Slice 4
 })
 
 
