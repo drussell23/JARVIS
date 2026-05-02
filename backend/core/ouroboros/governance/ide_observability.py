@@ -326,6 +326,29 @@ class IDEObservabilityRouter:
             "/observability/replay/history",
             self._handle_replay_history,
         )
+        # Q4 Priority #2 Slice 4 — closure-loop observability surface.
+        # Read-only over closure_loop_history.jsonl + AdaptationLedger.
+        # Master-flag-off → 403 (port-scanner discipline). When the
+        # closure-loop is in shadow mode (master off), the routes
+        # respond 403 — operators rely on /adapt for the underlying
+        # ledger view and on /observability/replay/* for upstream
+        # state.
+        app.router.add_get(
+            "/observability/closure-loop",
+            self._handle_closure_loop_health,
+        )
+        app.router.add_get(
+            "/observability/closure-loop/history",
+            self._handle_closure_loop_history,
+        )
+        app.router.add_get(
+            "/observability/closure-loop/pending",
+            self._handle_closure_loop_pending,
+        )
+        app.router.add_get(
+            "/observability/closure-loop/stats",
+            self._handle_closure_loop_stats,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -1825,6 +1848,230 @@ class IDEObservabilityRouter:
         verdicts under the conventional /history naming. Same
         bounded projection + same shape."""
         return await self._handle_replay_verdicts(request)
+
+    # ----------------------------------------------------------------------
+    # Q4 Priority #2 Slice 4 — closure-loop observability surface
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _closure_loop_master_enabled() -> bool:
+        """Master flag for the closure-loop. Default-FALSE — port-
+        scanner discipline + operator cost-ramp."""
+        try:
+            from backend.core.ouroboros.governance.verification.closure_loop_orchestrator import (  # noqa: E501
+                closure_loop_orchestrator_enabled,
+            )
+        except ImportError:
+            return False
+        return closure_loop_orchestrator_enabled()
+
+    def _closure_loop_parse_limit(
+        self, request: "web.Request", default: int = 50,
+    ) -> Optional[int]:
+        """Parse ``?limit=N``; bounded [1, 200]. Returns None on
+        malformed (caller emits 400)."""
+        raw = request.query.get("limit")
+        if raw is None:
+            return default
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return max(1, min(200, n))
+
+    async def _handle_closure_loop_health(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/closure-loop`` — surface liveness +
+        flag bundle + outcome histogram. Read-only over the
+        observer's ``stats()`` projection.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "enabled": true,
+              "history_path": ".jarvis/closure_loop_history.jsonl",
+              "history_count": 12,
+              "observer_running": true,
+              "outcome_histogram": {"proposed": 3, ...}
+            }
+
+        Returns 403 ``closure_loop.disabled`` when master flag is
+        off (port-scanner discipline)."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._closure_loop_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.closure_loop_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.closure_loop_observer import (  # noqa: E501
+                get_default_observer as _get_obs,
+            )
+            from backend.core.ouroboros.governance.verification.closure_loop_store import (  # noqa: E501
+                closure_loop_history_path,
+                read_closure_history,
+            )
+            obs = _get_obs()
+            history = read_closure_history()
+            stats = obs.stats()
+            return self._json_response(
+                request, 200,
+                {
+                    "enabled": True,
+                    "history_path": str(closure_loop_history_path()),
+                    "history_count": len(history),
+                    "observer_running": bool(stats.get("is_running")),
+                    "outcome_histogram": dict(
+                        stats.get("outcome_histogram", {}),
+                    ),
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] closure_loop_health failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.closure_loop_health_error",
+            )
+
+    async def _handle_closure_loop_history(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/closure-loop/history?limit=N`` —
+        last N :class:`ClosureLoopRecord` from the JSONL ring buffer
+        (default 50, clamped [1, 200]). Each entry is the
+        ``ClosureLoopRecord.to_dict()`` shape."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._closure_loop_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.closure_loop_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        limit = self._closure_loop_parse_limit(request, default=50)
+        if limit is None:
+            return self._error_response(
+                request, 400, "ide_observability.malformed_limit",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.closure_loop_store import (  # noqa: E501
+                read_closure_history,
+            )
+            history = read_closure_history(limit=limit)
+            return self._json_response(
+                request, 200,
+                {"records": [r.to_dict() for r in history]},
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] closure_loop_history failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.closure_loop_history_error",
+            )
+
+    async def _handle_closure_loop_pending(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/closure-loop/pending`` — pending
+        AdaptationLedger proposals on the
+        ``COHERENCE_AUDITOR_BUDGETS`` surface (i.e. closure-loop-
+        emitted proposals waiting for operator approval). Cross-
+        cuts to ``/adapt`` REPL — same underlying ledger. Read-only
+        projection."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._closure_loop_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.closure_loop_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.adaptation.ledger import (  # noqa: E501
+                AdaptationSurface,
+                OperatorDecisionStatus,
+                get_default_ledger,
+            )
+            ledger = get_default_ledger()
+            rows = ledger.history(
+                surface=AdaptationSurface.COHERENCE_AUDITOR_BUDGETS,
+                limit=200,
+            )
+            pending = [
+                p.to_dict() for p in rows
+                if p.operator_decision is (
+                    OperatorDecisionStatus.PENDING
+                )
+            ]
+            return self._json_response(
+                request, 200, {"proposals": pending},
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] closure_loop_pending failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.closure_loop_pending_error",
+            )
+
+    async def _handle_closure_loop_stats(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/closure-loop/stats`` — full observer
+        telemetry projection (pass_index + counters + dedup ring
+        size + outcome histogram + watermark). Same shape as
+        :meth:`ClosureLoopObserver.stats`."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._closure_loop_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.closure_loop_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.verification.closure_loop_observer import (  # noqa: E501
+                get_default_observer as _get_obs,
+            )
+            stats = _get_obs().stats()
+            return self._json_response(request, 200, stats)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] closure_loop_stats failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.closure_loop_stats_error",
+            )
 
     # ----------------------------------------------------------------------
     # Q2 Slice 6 — DAG record diff

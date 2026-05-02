@@ -465,13 +465,60 @@ async def default_propose_callback_async(
 ) -> None:
     """Async wrapper so the observer's awaitable
     ``on_record_emitted`` contract is satisfied without making the
-    sync ledger call awaitable. NEVER raises."""
+    sync ledger call awaitable. Also emits the
+    ``closure_loop_proposal_emitted`` SSE event on successful
+    proposal so IDE consumers can correlate to /adapt's pending list
+    in real time. NEVER raises — both the propose call and the SSE
+    emit collapse into best-effort outcomes."""
     try:
-        default_propose_callback(record)
+        ok = default_propose_callback(record)
+        if ok:
+            _emit_proposal_emitted_event(record)
     except Exception as exc:  # noqa: BLE001 — defensive
         logger.debug(
             "[ClosureLoopBridge] propose_callback_async internal: %s",
             exc,
+        )
+
+
+def _emit_proposal_emitted_event(record: ClosureLoopRecord) -> None:
+    """Best-effort SSE publish of the
+    ``closure_loop_proposal_emitted`` event. Imports the broker
+    inside the function so a missing IDE-stream module on cold
+    boot doesn't break the propose path. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED,
+            get_default_broker,
+        )
+    except ImportError:
+        return
+    try:
+        broker = get_default_broker()
+        if broker is None:
+            return
+        proposal_id = (
+            f"closure-loop-{record.record_fingerprint}"
+            if record.record_fingerprint else ""
+        )
+        payload = {
+            "advisory_id": record.advisory_id,
+            "drift_kind": record.drift_kind.value,
+            "parameter_name": record.parameter_name,
+            "current_value": record.current_value,
+            "proposed_value": record.proposed_value,
+            "record_fingerprint": record.record_fingerprint,
+            "proposal_id": proposal_id,
+            "schema_version": CLOSURE_LOOP_BRIDGE_SCHEMA_VERSION,
+        }
+        broker.publish(
+            event_type=EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED,
+            op_id=record.advisory_id or "",
+            payload=payload,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[ClosureLoopBridge] SSE publish failed: %s", exc,
         )
 
 

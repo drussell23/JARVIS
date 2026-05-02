@@ -592,10 +592,337 @@ def closure_loop_orchestrator_enabled() -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+# ---------------------------------------------------------------------------
+# Slice 4 — graduation: shipped_code_invariants AST pins + FlagRegistry
+# seeds. Master flag stays DEFAULT-FALSE deliberately (operator cost
+# ramp, mirrors Move 6 graduation discipline) — sub-gates default-true
+# when added in follow-up slices. The closure-loop is read-only over
+# Coherence Auditor advisories + writes only PROPOSED-status rows to
+# AdaptationLedger; operator approval via /adapt or VSCode panel
+# remains the sole path to .approve. These invariants pin that
+# discipline against silent refactor.
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code invariants. Returns the list so the
+    centralized seed loader can register them at boot. NEVER raises
+    (returns ``[]`` on import failure — graduation soak path is
+    fail-open per the established convention).
+
+    Four invariants pin the closure-loop's authority discipline:
+
+      1. ``closure_loop_outcome_vocabulary`` — the 6-value
+         ``ClosureOutcome`` taxonomy is frozen against silent
+         expansion (Slice 5b would add more values; this pin breaks
+         until the test suite is updated).
+      2. ``closure_loop_orchestrator_no_approve`` — orchestrator
+         module body contains zero ``.approve`` calls. Authority
+         invariant: orchestrator may PROPOSE only.
+      3. ``closure_loop_bridge_no_approve`` — bridge module body
+         contains zero ``.approve`` calls. Authority invariant:
+         bridge may PROPOSE only.
+      4. ``closure_loop_observer_no_approve`` — observer module
+         body contains zero ``.approve`` calls. Authority invariant:
+         observer may PROPOSE only.
+    """
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    import ast as _ast
+
+    def _validate_outcome_vocabulary(tree, source) -> tuple:
+        violations = []
+        # Pin the literal 6-value vocabulary against silent
+        # additions. The set must match the closed taxonomy
+        # documented in ClosureOutcome's docstring.
+        required = {
+            "PROPOSED",
+            "SKIPPED_NO_INTENT",
+            "SKIPPED_VALIDATION_FAILED",
+            "SKIPPED_REPLAY_REJECTED",
+            "DISABLED",
+            "FAILED",
+        }
+        seen = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and (
+                node.name == "ClosureOutcome"
+            ):
+                for stmt in node.body:
+                    if isinstance(stmt, _ast.Assign):
+                        for target in stmt.targets:
+                            if isinstance(target, _ast.Name):
+                                seen.add(target.id)
+        missing = required - seen
+        if missing:
+            violations.append(
+                f"ClosureOutcome lost values: {sorted(missing)} — "
+                "the closed taxonomy is frozen by Slice 4 graduation"
+            )
+        unexpected = seen - required - {"_generate_next_value_"}
+        if unexpected:
+            violations.append(
+                f"ClosureOutcome gained unpinned values: "
+                f"{sorted(unexpected)} — update the AST pin AND "
+                "the test suite when widening the vocabulary"
+            )
+        return tuple(violations)
+
+    def _validate_no_approve_call(tree, source) -> tuple:
+        # Generic AST walker — finds .approve(...) function call
+        # patterns anywhere in the module body. The closure-loop
+        # never calls AdaptationLedger.approve.
+        violations = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                func = node.func
+                if isinstance(func, _ast.Attribute) and (
+                    func.attr == "approve"
+                ):
+                    violations.append(
+                        f"forbidden .approve call at line "
+                        f"{node.lineno} — closure-loop may PROPOSE only; "
+                        "operator approval via /adapt remains the gate"
+                    )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="closure_loop_outcome_vocabulary",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_orchestrator.py"
+            ),
+            description=(
+                "ClosureOutcome's 6-value closed taxonomy is frozen. "
+                "Adding a 7th value silently breaks downstream "
+                "_NON_PROPOSAL_OUTCOMES set membership invariants "
+                "and the proposal-emission gate."
+            ),
+            validate=_validate_outcome_vocabulary,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="closure_loop_orchestrator_no_approve",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_orchestrator.py"
+            ),
+            description=(
+                "Orchestrator module body MUST NOT contain any "
+                ".approve() call. The closure-loop's authority is "
+                "PROPOSE only — operator approval via /adapt REPL "
+                "or VSCode confidencePolicyPanel is the SOLE path "
+                "to AdaptationLedger.approve / yaml_writer.write."
+            ),
+            validate=_validate_no_approve_call,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="closure_loop_bridge_no_approve",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_bridge.py"
+            ),
+            description=(
+                "Bridge module body MUST NOT contain any "
+                ".approve() call. The bridge's authority is "
+                "PROPOSE only — same invariant as the orchestrator."
+            ),
+            validate=_validate_no_approve_call,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="closure_loop_observer_no_approve",
+            target_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_observer.py"
+            ),
+            description=(
+                "Observer module body MUST NOT contain any "
+                ".approve() call. The observer's authority is "
+                "READ + PROPOSE only — same invariant."
+            ),
+            validate=_validate_no_approve_call,
+        ),
+    ]
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration. Mirrors the
+    discovery contract used by ``counterfactual_replay`` /
+    ``gradient_observer`` etc. — the seed loader walks
+    ``verification/`` for modules exposing this name + invokes
+    once at boot. Adding a new flag requires zero edits to the seed
+    file. Returns count of FlagSpecs registered. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+    specs = [
+        # --- Master flag (default FALSE — operator cost ramp) -------
+        FlagSpec(
+            name="JARVIS_CLOSURE_LOOP_ORCHESTRATOR_ENABLED",
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Master switch for the autonomous RSI closure-loop. "
+                "When false, the observer reads no advisories, the "
+                "store accepts no records, and the bridge submits "
+                "no proposals. Default FALSE deliberately — operator "
+                "cost ramp (mirrors Move 6 graduation discipline). "
+                "Flip to true after empirical observation in shadow "
+                "mode confirms the chain produces sensible records."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_orchestrator.py"
+            ),
+            example="false",
+            since="Q4 Priority #2 Slice 4",
+        ),
+        # --- Store env knobs -------------------------------------------
+        FlagSpec(
+            name="JARVIS_CLOSURE_LOOP_HISTORY_DIR",
+            type=FlagType.STR,
+            default=".jarvis",
+            description=(
+                "Directory for the closure-loop bounded JSONL ring "
+                "buffer (paired with posture / semantic_index / "
+                "last_session_summary state under .jarvis/)."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_store.py"
+            ),
+            example=".jarvis",
+            since="Q4 Priority #2 Slice 2",
+        ),
+        FlagSpec(
+            name="JARVIS_CLOSURE_LOOP_HISTORY_MAX_RECORDS",
+            type=FlagType.INT,
+            default=1024,
+            description=(
+                "Ring buffer capacity for the closure-loop history. "
+                "Clamped [16, 65536]. Bounded growth is a §8 "
+                "invariant — operators set this once, system rotates."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_store.py"
+            ),
+            example="1024",
+            since="Q4 Priority #2 Slice 2",
+        ),
+        # --- Observer cadence + lifecycle env knobs --------------------
+        FlagSpec(
+            name="JARVIS_CLOSURE_LOOP_OBSERVER_INTERVAL_S",
+            type=FlagType.FLOAT,
+            default=600.0,
+            description=(
+                "Base sleep interval between closure-loop observer "
+                "passes. Default 600s (10 min) clamped [60.0, 7200.0]. "
+                "Matches CIGW + Coherence cadence so the three "
+                "observers tick on similar wall-clock cycles."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_observer.py"
+            ),
+            example="600",
+            since="Q4 Priority #2 Slice 2",
+        ),
+        FlagSpec(
+            name="JARVIS_CLOSURE_LOOP_OBSERVER_DRIFT_MULTIPLIER",
+            type=FlagType.FLOAT,
+            default=0.5,
+            description=(
+                "Multiplier applied to the base interval when the "
+                "previous pass emitted records (operator wants "
+                "quicker re-tick after drift). Default 0.5; clamped "
+                "[0.1, 1.0]; effective interval floored at 60s."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_observer.py"
+            ),
+            example="0.5",
+            since="Q4 Priority #2 Slice 2",
+        ),
+        FlagSpec(
+            name="JARVIS_CLOSURE_LOOP_OBSERVER_FAILURE_BACKOFF_CEILING_S",
+            type=FlagType.FLOAT,
+            default=3600.0,
+            description=(
+                "Upper bound on the linear failure backoff. Default "
+                "3600s (1 hour) clamped [60.0, 86400.0]. Backoff = "
+                "min(ceiling, base × consecutive_failures)."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_observer.py"
+            ),
+            example="3600",
+            since="Q4 Priority #2 Slice 2",
+        ),
+        FlagSpec(
+            name="JARVIS_CLOSURE_LOOP_OBSERVER_LIVENESS_PULSE_PASSES",
+            type=FlagType.INT,
+            default=4,
+            description=(
+                "Emit a liveness record every Nth pass even when "
+                "no new advisories. Default 4; clamped [1, 1024]. "
+                "Set to 1 in tests for deterministic emission."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_observer.py"
+            ),
+            example="4",
+            since="Q4 Priority #2 Slice 2",
+        ),
+        FlagSpec(
+            name="JARVIS_CLOSURE_LOOP_OBSERVER_DEDUP_RING_SIZE",
+            type=FlagType.INT,
+            default=256,
+            description=(
+                "Bounded fingerprint dedup ring size. Default 256; "
+                "clamped [16, 16384]. The same advisory processed "
+                "twice within the ring window is suppressed."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/verification/"
+                "closure_loop_observer.py"
+            ),
+            example="256",
+            since="Q4 Priority #2 Slice 2",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    return len(specs)
+
+
 __all__ = [
     "CLOSURE_LOOP_SCHEMA_VERSION",
     "ClosureLoopRecord",
     "ClosureOutcome",
     "closure_loop_orchestrator_enabled",
     "compute_closure_outcome",
+    "register_flags",
+    "register_shipped_invariants",
 ]

@@ -368,6 +368,14 @@ EVENT_TYPE_CONFIDENCE_POLICY_APPLIED = "confidence_policy_applied"
 EVENT_TYPE_WORKTREE_TOPOLOGY_UPDATED = "worktree_topology_updated"
 EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED = "worktree_unit_state_changed"
 
+# Q4 Priority #2 Slice 4 — closure-loop autonomous-tightening proposal
+# emission. Fires when the bridge submits a PROPOSED-status row to
+# AdaptationLedger.propose; carries advisory_id + parameter_name +
+# proposal_id + record_fingerprint so consumers can correlate to
+# /observability/closure-loop/{history,pending} GETs and to
+# /adapt show <proposal_id>.
+EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED = "closure_loop_proposal_emitted"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -431,6 +439,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CONFIDENCE_POLICY_APPLIED,         # Gap #2 Slice 4
     EVENT_TYPE_WORKTREE_TOPOLOGY_UPDATED,         # Gap #3 Slice 3
     EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED,       # Gap #3 Slice 3
+    EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED,     # Q4 P#2 Slice 4
 })
 
 
