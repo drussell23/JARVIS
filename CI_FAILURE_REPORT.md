@@ -3,33 +3,70 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #51690
-- **Branch**: `fix/ci/pr-automation-validation-run51687-20260502-094700`
-- **Commit**: `c2f64c97a278148841dbb2fbfe9f741cd1d15420`
+- **Run Number**: #51695
+- **Branch**: `fix/ci/pr-automation-validation-run51690-20260502-094912`
+- **Commit**: `541fdaf690789b02821bca964a0c3a0602c13b98`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-02T09:47:31Z
+- **Timestamp**: 2026-05-02T09:49:40Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25249214076)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25249247461)
 
 ## Failure Overview
 
-Total Failed Jobs: **1**
+Total Failed Jobs: **2**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 3s |
+| 1 | Check PR Description | permission_error | high | 107s |
+| 2 | Validate PR Title | timeout | high | 5s |
 
 ## Detailed Analysis
 
-### 1. Validate PR Title
+### 1. Check PR Description
+
+**Status**: ❌ failure
+**Category**: Permission Error
+**Severity**: HIGH
+**Started**: 2026-05-02T09:49:43Z
+**Completed**: 2026-05-02T09:51:30Z
+**Duration**: 107 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25249247461/job/74038645816)
+
+#### Failed Steps
+
+- **Step 2**: Verify PR Description
+
+#### Error Analysis
+
+**Detected Error Patterns:**
+
+- Pattern: `ERROR|Error|error`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 74: `2026-05-02T09:49:54.7154778Z RequestError [HttpError]: fetch failed`
+    - Line 75: `2026-05-02T09:49:54.7191177Z ##[error]Unhandled error: HttpError: fetch failed`
+
+- Pattern: `FAIL|Failed|failed`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 74: `2026-05-02T09:49:54.7154778Z RequestError [HttpError]: fetch failed`
+    - Line 75: `2026-05-02T09:49:54.7191177Z ##[error]Unhandled error: HttpError: fetch failed`
+
+#### Suggested Fixes
+
+1. Review the logs above for specific error messages
+
+---
+
+### 2. Validate PR Title
 
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-02T09:47:34Z
-**Completed**: 2026-05-02T09:47:37Z
-**Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25249214076/job/74038564039)
+**Started**: 2026-05-02T09:49:43Z
+**Completed**: 2026-05-02T09:49:48Z
+**Duration**: 5 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25249247461/job/74038645848)
 
 #### Failed Steps
 
@@ -42,13 +79,13 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-05-02T09:47:35.9434219Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-05-02T09:47:36.3596484Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 30: `2026-05-02T09:49:45.7020438Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-02T09:49:46.3436693Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-05-02T09:47:36.4090659Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-02T09:49:46.4007952Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
@@ -78,5 +115,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-02T09:49:12.891673*
+📊 *Report generated on 2026-05-02T09:52:58.935255*
 🤖 *JARVIS CI/CD Auto-PR Manager*
