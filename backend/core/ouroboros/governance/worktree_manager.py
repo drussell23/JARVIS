@@ -185,6 +185,41 @@ class WorktreeManager:
         logger.info("WorktreeManager: created worktree at %s", wt_path)
         return wt_path
 
+    async def list_worktree_paths(self) -> List[str]:
+        """Gap #3 Slice 2 — return git's current worktree path list.
+
+        Reads ``git worktree list --porcelain`` and projects the
+        ``worktree`` field of every entry into a flat list of
+        absolute path strings. Used by the IDE observability GET
+        endpoint to cross-reference scheduler unit_ids with on-disk
+        worktrees (orphan detection + has_worktree marking).
+
+        Returns an empty list on git failure, missing repo, or
+        unreadable porcelain output. NEVER raises — projection is
+        best-effort by design (worktree absence is a valid state).
+
+        Re-uses the existing ``_run_git_capture`` + module-level
+        ``_parse_worktree_porcelain`` helpers; does NOT shell out
+        beyond a single read-only ``git worktree list`` call.
+        """
+        try:
+            porcelain = await self._run_git_capture(
+                ["worktree", "list", "--porcelain"],
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return []
+        if not porcelain:
+            return []
+        out: List[str] = []
+        try:
+            for entry in _parse_worktree_porcelain(porcelain):
+                p = entry.get("worktree", "")
+                if p:
+                    out.append(p)
+        except Exception:  # noqa: BLE001 — defensive
+            return []
+        return out
+
     async def cleanup(self, worktree_path: Path) -> None:
         """Remove worktree_path from git's worktree list and delete it.
 

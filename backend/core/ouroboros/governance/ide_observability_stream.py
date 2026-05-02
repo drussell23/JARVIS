@@ -340,6 +340,34 @@ EVENT_TYPE_CONFIDENCE_POLICY_APPROVED = "confidence_policy_approved"
 EVENT_TYPE_CONFIDENCE_POLICY_REJECTED = "confidence_policy_rejected"
 EVENT_TYPE_CONFIDENCE_POLICY_APPLIED = "confidence_policy_applied"
 
+# ----------------------------------------------------------------------
+# Deep Observability Gap #3 Slice 3 — L3 worktree topology stream.
+# ----------------------------------------------------------------------
+#
+# IDE-driven view of the SubagentScheduler's in-memory DAG. Two
+# event types translated 1:1 from the autonomy EventEmitter:
+#
+#   * TOPOLOGY_UPDATED — fires on every graph-level state change
+#     (CREATED → RUNNING → COMPLETED / FAILED / CANCELLED). Payload:
+#     {graph_id, phase, ready_units, running_units, completed_units,
+#      failed_units, cancelled_units, last_error}. The ``op_id``
+#     field of the SSE frame carries the agent's op_id so IDE
+#     consumers can correlate with task tree.
+#
+#   * UNIT_STATE_CHANGED — fires when a single work unit transitions
+#     state (PENDING → RUNNING, RUNNING → COMPLETED/FAILED/CANCELLED).
+#     Payload: {graph_id, unit_id, repo, status, barrier_id,
+#      owned_paths, (optional) failure_class, error, runtime_ms,
+#      causal_parent_id}. The frame's op_id carries the agent op_id.
+#
+# Bridge implementation lives in
+# ``verification.worktree_topology_sse_bridge`` — a pure
+# translator (autonomy → broker), zero modifications to the
+# scheduler. Default-off behind
+# ``JARVIS_WORKTREE_TOPOLOGY_SSE_ENABLED``.
+EVENT_TYPE_WORKTREE_TOPOLOGY_UPDATED = "worktree_topology_updated"
+EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED = "worktree_unit_state_changed"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -401,6 +429,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CONFIDENCE_POLICY_APPROVED,        # Gap #2 Slice 4
     EVENT_TYPE_CONFIDENCE_POLICY_REJECTED,        # Gap #2 Slice 4
     EVENT_TYPE_CONFIDENCE_POLICY_APPLIED,         # Gap #2 Slice 4
+    EVENT_TYPE_WORKTREE_TOPOLOGY_UPDATED,         # Gap #3 Slice 3
+    EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED,       # Gap #3 Slice 3
 })
 
 

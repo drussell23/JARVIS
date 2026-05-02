@@ -181,7 +181,13 @@ class IDEObservabilityRouter:
     boundary (GET vs POST, external webhooks vs local IDE).
     """
 
-    def __init__(self, session_dir: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        session_dir: Optional[Path] = None,
+        *,
+        scheduler: Optional[Any] = None,
+        worktree_manager: Optional[Any] = None,
+    ) -> None:
         # sliding-window rate tracker: { client_key -> [ts_epoch_s, ...] }
         self._rate_tracker: Dict[str, List[float]] = {}
         # W3(7) Slice 6 — optional session_dir for /observability/cancels.
@@ -189,6 +195,14 @@ class IDEObservabilityRouter:
         # harness), the cancel routes return 503 cleanly. GLS sets this at
         # construction time when the router is mounted on the harness app.
         self._session_dir: Optional[Path] = session_dir
+        # Gap #3 Slice 2 — optional scheduler + worktree_manager refs
+        # for the /observability/worktrees topology projection. When
+        # either is None the routes return 503 cleanly (graceful
+        # degradation matches the cancel-route discipline above).
+        # Duck-typed (Any) so test fixtures can supply minimal stubs
+        # without booting the full SubagentScheduler.
+        self._scheduler: Optional[Any] = scheduler
+        self._worktree_manager: Optional[Any] = worktree_manager
 
     def register_routes(self, app: "web.Application") -> None:
         app.router.add_get("/observability/health", self._handle_health)
@@ -281,6 +295,18 @@ class IDEObservabilityRouter:
         app.router.add_get(
             "/observability/replay/health",
             self._handle_replay_health,
+        )
+        # Gap #3 Slice 2 — L3 worktree topology projection.
+        # Read-only over scheduler in-memory state + git worktree
+        # paths. 503 cleanly when scheduler/worktree_manager
+        # references are not wired (graceful degradation).
+        app.router.add_get(
+            "/observability/worktrees",
+            self._handle_worktrees_list,
+        )
+        app.router.add_get(
+            "/observability/worktrees/{graph_id}",
+            self._handle_worktree_detail,
         )
         app.router.add_get(
             "/observability/replay/baseline",
@@ -1793,4 +1819,150 @@ class IDEObservabilityRouter:
         verdicts under the conventional /history naming. Same
         bounded projection + same shape."""
         return await self._handle_replay_verdicts(request)
+
+    # ----------------------------------------------------------------------
+    # Gap #3 Slice 2 — L3 worktree topology projection
+    # ----------------------------------------------------------------------
+    #
+    # Read-only projection over scheduler in-memory state + git
+    # worktree paths. The substrate (verification.worktree_topology)
+    # is pure stdlib; the HTTP layer here owns the async git query.
+    #
+    # When scheduler/worktree_manager refs are not wired (default
+    # constructor), the routes return 503 cleanly — same graceful-
+    # degradation discipline as the cancel routes.
+    #
+    # Lazy substrate import keeps ide_observability's module-level
+    # import surface unchanged. The substrate's master flag
+    # (JARVIS_WORKTREE_TOPOLOGY_ENABLED) gates the actual
+    # projection; the HTTP gate here is master + rate-limit only.
+
+    async def _handle_worktrees_list(
+        self, request: "web.Request",
+    ) -> Any:
+        """GET /observability/worktrees — full topology projection.
+
+        Shape::
+
+            {
+              "schema_version": "...",
+              "topology": {<WorktreeTopology.to_dict()>}
+            }
+
+        Returns 503 when scheduler/worktree_manager refs are not
+        wired (graceful degradation), 403 when the observability
+        master is off, 429 on rate limit, 500 on substrate failure.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        if self._scheduler is None:
+            return self._error_response(
+                request, 503,
+                "ide_observability.worktrees_scheduler_not_wired",
+            )
+        try:
+            topology = await self._compute_topology()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] worktrees_list failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.worktrees_compute_error",
+            )
+        return self._json_response(
+            request, 200,
+            {"topology": topology.to_dict()},
+        )
+
+    async def _handle_worktree_detail(
+        self, request: "web.Request",
+    ) -> Any:
+        """GET /observability/worktrees/{graph_id} — per-graph
+        detail.
+
+        Shape::
+
+            {
+              "schema_version": "...",
+              "graph": {<GraphTopology.to_dict()>}
+            }
+
+        Returns 404 when graph_id is not in the projection (the
+        scheduler may have completed and cleaned up between request
+        and response — this is normal, not an error)."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        if self._scheduler is None:
+            return self._error_response(
+                request, 503,
+                "ide_observability.worktrees_scheduler_not_wired",
+            )
+        graph_id = request.match_info.get("graph_id", "")
+        # Reuse the session_id regex — graph_ids are bounded
+        # printable ascii and respect the same character class.
+        if not _SESSION_ID_RE.fullmatch(graph_id):
+            return self._error_response(
+                request, 400,
+                "ide_observability.malformed_graph_id",
+            )
+        try:
+            topology = await self._compute_topology()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] worktree_detail failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.worktrees_compute_error",
+            )
+        for graph in topology.graphs:
+            if graph.graph_id == graph_id:
+                return self._json_response(
+                    request, 200,
+                    {"graph": graph.to_dict()},
+                )
+        return self._error_response(
+            request, 404,
+            "ide_observability.worktree_graph_not_found",
+        )
+
+    async def _compute_topology(self) -> Any:
+        """Lazy-substrate-import + async git query + projection.
+        Best-effort: a worktree_manager that's wired but failing
+        the git query degrades to an empty path list (the
+        substrate still projects the scheduler view; orphan-
+        detection just sees zero on-disk worktrees)."""
+        # Lazy import — keeps module-level surface unchanged so the
+        # existing pure-stdlib pin on top-level imports stays
+        # truthful for the GET routes that don't use the substrate.
+        from backend.core.ouroboros.governance.verification.worktree_topology import (  # noqa: E501
+            compute_worktree_topology,
+        )
+        paths: List[str] = []
+        if self._worktree_manager is not None:
+            try:
+                paths = list(
+                    await self._worktree_manager.list_worktree_paths(),
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                paths = []
+        return compute_worktree_topology(
+            scheduler=self._scheduler,
+            git_worktree_paths=paths,
+        )
 
