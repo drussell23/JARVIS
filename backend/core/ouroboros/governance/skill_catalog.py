@@ -261,11 +261,140 @@ class SkillCatalog:
                     event_type, exc,
                 )
 
+    # --- Slice 2: trigger lookup index -----------------------------------
+
+    def _index_manifest_triggers_locked(
+        self, manifest: SkillManifest,
+    ) -> None:
+        """Add every spec in ``manifest.trigger_specs`` to the
+        kind-keyed index. MUST be called with ``self._lock`` held.
+
+        Defensive: skips garbage entries (non-SkillTriggerSpec /
+        invalid kind) without raising. Pre-arc manifests with the
+        default empty ``trigger_specs`` tuple add zero entries.
+        """
+        try:
+            specs = tuple(
+                getattr(manifest, "trigger_specs", ()) or (),
+            )
+        except Exception:  # noqa: BLE001 -- defensive
+            return
+        qname = manifest.qualified_name
+        for idx, spec in enumerate(specs):
+            kind = getattr(spec, "kind", None)
+            if not isinstance(kind, SkillTriggerKind):
+                continue
+            self._triggers_by_kind.setdefault(kind, []).append(
+                (qname, idx),
+            )
+
+    def _unindex_manifest_triggers_locked(
+        self, qualified_name: str,
+    ) -> None:
+        """Remove every entry referencing ``qualified_name`` from
+        the kind-keyed index. MUST be called with ``self._lock``
+        held. NEVER raises."""
+        for kind in list(self._triggers_by_kind.keys()):
+            entries = self._triggers_by_kind[kind]
+            filtered = [e for e in entries if e[0] != qualified_name]
+            if filtered:
+                self._triggers_by_kind[kind] = filtered
+            else:
+                # Drop empty buckets so the index size matches the
+                # actual trigger surface; keeps observability counts
+                # honest.
+                del self._triggers_by_kind[kind]
+
+    def triggers_for_signal(
+        self, invocation: SkillInvocation,
+    ) -> List[Tuple[SkillManifest, int]]:
+        """Return ``(manifest, spec_index)`` candidates whose
+        trigger spec matches ``invocation``. NEVER raises.
+
+        The catalog NARROWS the candidate set; the load-bearing
+        fire/skip decision still belongs to
+        :func:`compute_should_fire` (master flag, reach gate, risk
+        gate). Callers (Slice 3 observer) should iterate the
+        returned candidates and call ``compute_should_fire`` for
+        each.
+
+        Returns empty list when:
+          * invocation isn't a :class:`SkillInvocation` instance
+          * invocation kind isn't a :class:`SkillTriggerKind`
+          * no manifest has a matching spec (the common-case quiet
+            path -- 99%+ of signals)
+
+        Defensive: re-checks each candidate's manifest still exists
+        in :attr:`_by_qualified_name` before returning, so a race
+        between unregister + lookup can't yield a phantom candidate.
+        """
+        try:
+            if not isinstance(invocation, SkillInvocation):
+                return []
+            kind = invocation.triggered_by_kind
+            if not isinstance(kind, SkillTriggerKind):
+                return []
+            with self._lock:
+                # Snapshot the (qname, spec_index) entries for this
+                # kind so we don't hold the lock during the
+                # per-spec match check.
+                entries = list(
+                    self._triggers_by_kind.get(kind, ()),
+                )
+                # Snapshot the manifests too (manifests are frozen,
+                # so capturing references is safe).
+                manifest_snapshot = dict(self._by_qualified_name)
+            out: List[Tuple[SkillManifest, int]] = []
+            for qname, spec_index in entries:
+                manifest = manifest_snapshot.get(qname)
+                if manifest is None:
+                    continue  # raced with unregister -- skip
+                try:
+                    specs = tuple(manifest.trigger_specs or ())
+                except Exception:  # noqa: BLE001 -- defensive
+                    continue
+                if spec_index < 0 or spec_index >= len(specs):
+                    continue
+                spec = specs[spec_index]
+                if spec_matches_invocation(spec, invocation):
+                    out.append((manifest, spec_index))
+            return out
+        except Exception as exc:  # noqa: BLE001 -- last-resort
+            logger.debug(
+                "[SkillCatalog] triggers_for_signal degraded: %s",
+                exc,
+            )
+            return []
+
+    def trigger_index_counts(self) -> Dict[str, int]:
+        """Return ``{kind_value: spec_count}`` snapshot of the
+        trigger index. Observability helper -- consumed by
+        ``/skills`` REPL + Slice 5 graduation tests.
+
+        Empty kinds are absent (the index drops empty buckets on
+        unregister). NEVER raises."""
+        try:
+            with self._lock:
+                return {
+                    kind.value: len(entries)
+                    for kind, entries in self._triggers_by_kind.items()
+                }
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[SkillCatalog] trigger_index_counts degraded: %s",
+                exc,
+            )
+            return {}
+
+    # --- lifecycle: reset --------------------------------------------------
+
     def reset(self) -> None:
-        """Test helper."""
+        """Test helper. Clears primary index, listeners, and the
+        Slice 2 trigger-by-kind index."""
         with self._lock:
             self._by_qualified_name.clear()
             self._listeners.clear()
+            self._triggers_by_kind.clear()
 
 
 # Module singleton
