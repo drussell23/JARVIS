@@ -175,6 +175,11 @@ class _ClusterLike(Protocol):
     works — we never construct ``ClusterInfo`` ourselves, never import
     ``semantic_index`` directly. Immune to field reordering / new
     optional fields landing in ``ClusterInfo``.
+
+    ``representative_paths`` is the Slice 1 additive field
+    (ClusterIntelligence-CrossSession arc). Older ClusterInfo
+    instances without it project as empty tuple via the defensive
+    ``getattr`` in :func:`compute_codebase_character`.
     """
 
     cluster_id: int
@@ -184,6 +189,7 @@ class _ClusterLike(Protocol):
     nearest_item_source: str
     source_composition: Tuple[Tuple[str, int], ...]
     centroid_hash8: str
+    representative_paths: Tuple[str, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +257,17 @@ class ClusterCharacter:
     nearest_item_source: str
     source_composition: Tuple[Tuple[str, int], ...]
     centroid_hash8: str
+    # Slice 2 (ClusterIntelligence-CrossSession) additive field.
+    # Top-K most-touched repository paths from this cluster's
+    # member commits, sourced from Slice 1's
+    # ClusterInfo.representative_paths. Empty tuple when:
+    #   * Slice 1 master flag is off (paths never enriched)
+    #   * Cluster has zero git_commit members
+    #   * git log --name-only was unavailable at build time
+    # Consumed by ProactiveExploration's envelope target_files
+    # (gated by a separate sub-flag) and by render_prompt_block's
+    # "Files: ..." line under each cluster header.
+    representative_paths: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -265,6 +282,7 @@ class ClusterCharacter:
                 for s, n in self.source_composition
             ],
             "centroid_hash8": str(self.centroid_hash8),
+            "representative_paths": list(self.representative_paths),
         }
 
 
@@ -355,6 +373,14 @@ class CodebaseCharacterSnapshot:
                 lines.append(
                     f"Representative: {cc.nearest_item_excerpt}",
                 )
+            # Slice 2: surface representative file paths inline so
+            # the model sees concrete file targets without grepping.
+            # Backward-compat: line omitted entirely when the tuple
+            # is empty (Slice 1 master flag off / non-commit cluster
+            # / git unavailable).
+            if cc.representative_paths:
+                files_str = ", ".join(cc.representative_paths)
+                lines.append(f"Files: {files_str}")
             lines.append(
                 f"  (signature: {cc.centroid_hash8})",
             )
@@ -489,6 +515,21 @@ def compute_codebase_character(
                 )
             except Exception:  # noqa: BLE001
                 comp_pairs = ()
+            # Slice 2: defensive projection of representative_paths
+            # via getattr -- older ClusterInfo instances (pre-Slice-1)
+            # don't carry the field, and the duck-typed protocol means
+            # we can't assume the attribute exists. Coerce every entry
+            # to str + drop empties so a single malformed item can't
+            # poison the projection.
+            try:
+                rep_paths_raw = getattr(
+                    c, "representative_paths", ()) or ()
+                rep_paths = tuple(
+                    str(p) for p in rep_paths_raw
+                    if isinstance(p, str) and p
+                )
+            except Exception:  # noqa: BLE001 -- defensive
+                rep_paths = ()
             projected.append(
                 ClusterCharacter(
                     cluster_id=int(getattr(c, "cluster_id", 0)),
@@ -508,6 +549,7 @@ def compute_codebase_character(
                     centroid_hash8=str(
                         getattr(c, "centroid_hash8", "") or "",
                     ),
+                    representative_paths=rep_paths,
                 ),
             )
         # Stable sort: size desc, then cluster_id asc.
