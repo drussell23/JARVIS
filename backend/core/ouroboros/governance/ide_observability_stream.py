@@ -196,6 +196,13 @@ EVENT_TYPE_PLAN_FALSIFICATION_VERDICT = "plan_falsification_verdict"
 # no authority surface.
 EVENT_TYPE_SKILL_INVOKED = "skill_invoked"
 
+# ClusterIntelligence-CrossSession Slice 5 — DomainMap entry persisted
+# from a successful cluster_coverage exploration. Fired by the cascade
+# observer's record path. Read-only; no authority surface. Operators
+# subscribe to track which clusters O+V is building cross-session
+# memory for + how the file-set + exploration_count evolve over time.
+EVENT_TYPE_DOMAIN_MAP_UPDATED = "domain_map_updated"
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -1617,6 +1624,57 @@ def publish_skill_invocation(
     except Exception:  # noqa: BLE001 -- best-effort
         logger.debug(
             "[Stream] publish_skill_invocation exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_domain_map_update(
+    *,
+    centroid_hash8: str,
+    cluster_id: int = -1,
+    theme_label: str = "",
+    discovered_files_count: int = 0,
+    architectural_role: str = "",
+    confidence: float = 0.0,
+    exploration_count: int = 0,
+    populated_by_op_id: str = "",
+) -> Optional[str]:
+    """Best-effort publisher for ``domain_map_updated`` frames.
+
+    Returns the event_id on success, None when stream is disabled
+    / broker missing / publish raised. NEVER raises. Fired by
+    the cluster-exploration cascade observer's record path so
+    operators see which clusters O+V is building cross-session
+    memory for.
+
+    Read-only payload -- no authority surface. Carries counts
+    not file lists (the full file-set lives in the DomainMap
+    JSON entry on disk; this is the lightweight notification)."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_DOMAIN_MAP_UPDATED,
+            centroid_hash8 or "unknown",
+            {
+                "centroid_hash8": str(centroid_hash8),
+                "cluster_id": int(cluster_id),
+                "theme_label": str(theme_label or "")[:200],
+                "discovered_files_count": int(discovered_files_count),
+                "architectural_role": str(
+                    architectural_role or "",
+                )[:500],
+                "confidence": float(confidence),
+                "exploration_count": int(exploration_count),
+                "populated_by_op_id": str(
+                    populated_by_op_id or "",
+                ),
+            },
+        )
+    except Exception:  # noqa: BLE001 -- best-effort
+        logger.debug(
+            "[Stream] publish_domain_map_update exception",
             exc_info=True,
         )
         return None

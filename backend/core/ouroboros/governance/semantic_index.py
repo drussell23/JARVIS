@@ -2459,3 +2459,133 @@ def reset_default_index() -> None:
     global _DEFAULT_INDEX
     with _DEFAULT_INDEX_LOCK:
         _DEFAULT_INDEX = None
+
+
+# ---------------------------------------------------------------------------
+# ClusterIntelligence-CrossSession Slice 5 -- Module-owned FlagRegistry
+# seeds for the Slice 1 representative_paths additions only. Pre-existing
+# semantic_index env knobs are seeded elsewhere (flag_registry_seed.py);
+# this register_flags() function adds ONLY the Slice 1 surface so the
+# discovery loop doesn't double-register.
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[SemanticIndex] register_flags degraded: %s", exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/semantic_index.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=(
+                "JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED=true"
+            ),
+            description=(
+                "Master switch for the Slice 1 cluster path "
+                "enrichment. When on, runs a second ``git log "
+                "--name-only`` pass per cluster build to surface "
+                "top-K most-touched files per cluster. Graduated "
+                "default-true 2026-05-03."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_CLUSTER_REPRESENTATIVE_PATH_K",
+            type=FlagType.INT, default=8,
+            category=Category.CAPACITY,
+            source_file=target,
+            example="JARVIS_CLUSTER_REPRESENTATIVE_PATH_K=16",
+            description=(
+                "Top-K most-touched paths surfaced per cluster. "
+                "Floor 1, ceiling 64."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SEMANTIC_GIT_PATH_SCAN_TIMEOUT_S",
+            type=FlagType.FLOAT, default=8.0,
+            category=Category.TIMING,
+            source_file=target,
+            example="JARVIS_SEMANTIC_GIT_PATH_SCAN_TIMEOUT_S=15.0",
+            description=(
+                "Subprocess timeout for the second ``git log "
+                "--name-only`` pass at cluster-build time. Floor "
+                "1.0, ceiling 30.0."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[SemanticIndex] register_flags spec %s skipped: "
+                "%s", spec.name, exc,
+            )
+    return count
+
+
+def register_shipped_invariants() -> list:
+    """Slice 1 invariant: the new commit-paths helpers
+    (_load_commit_paths, _attach_paths_to_clusters) MUST stay
+    defensive (NEVER raise) and MUST NOT exec/eval/compile."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        # The two new Slice 1 helpers must be defined.
+        seen_funcs: set = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef):
+                seen_funcs.add(node.name)
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"semantic_index MUST NOT "
+                            f"{node.func.id}()"
+                        )
+        for required in ("_load_commit_paths",
+                         "_attach_paths_to_clusters"):
+            if required not in seen_funcs:
+                violations.append(
+                    f"missing Slice 1 helper {required!r}"
+                )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/semantic_index.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="semantic_index_slice1_helpers",
+            target_file=target,
+            description=(
+                "Slice 1 helpers _load_commit_paths + "
+                "_attach_paths_to_clusters present; no "
+                "exec/eval/compile anywhere in the module."
+            ),
+            validate=_validate,
+        ),
+    ]

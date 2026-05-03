@@ -62,11 +62,9 @@ def _isolate_env(monkeypatch):
 
 class TestSubFlag:
     def test_default_true_post_graduation(self, monkeypatch):
-        # Post-graduation default is true; explicit "false" is the
-        # operator escape hatch.
-        monkeypatch.setenv(
+        monkeypatch.delenv(
             "JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED",
-            "false",
+            raising=False,
         )
         assert _representative_paths_enabled() is True
 

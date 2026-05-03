@@ -449,3 +449,73 @@ class ProactiveExplorationSensor:
             "running": self._running,
             "explored_domains": len(self._explored_domains),
         }
+
+
+# ---------------------------------------------------------------------------
+# ClusterIntelligence-CrossSession Slice 5 -- Module-owned FlagRegistry
+# seeds for the Slice 2 envelope-routing additions only.
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[ProactiveExplorationSensor] register_flags "
+            "degraded: %s", exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/intake/sensors/"
+        "proactive_exploration_sensor.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=(
+                "JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS"
+                "=true"
+            ),
+            description=(
+                "Slice 2 sub-flag. When on, cluster_coverage "
+                "envelopes use ClusterInfo.representative_paths "
+                "as target_files (when non-empty) instead of the "
+                "(\".\",) project-root sentinel. Composes with "
+                "Slice 1's master flag. Graduated default-true "
+                "2026-05-03."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_EXPLORATION_REPRESENTATIVE_PATH_CAP",
+            type=FlagType.INT, default=8,
+            category=Category.CAPACITY,
+            source_file=target,
+            example=(
+                "JARVIS_EXPLORATION_REPRESENTATIVE_PATH_CAP=16"
+            ),
+            description=(
+                "Hard cap on the number of paths surfaced in a "
+                "cluster_coverage envelope's target_files. Floor "
+                "1, ceiling 32. Independent of Slice 1's K knob "
+                "(which controls what enrichment WRITES); this "
+                "knob caps what the SENSOR consumes."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[ProactiveExplorationSensor] register_flags "
+                "spec %s skipped: %s", spec.name, exc,
+            )
+    return count
