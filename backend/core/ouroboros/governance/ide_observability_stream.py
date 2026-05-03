@@ -386,6 +386,14 @@ EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED = "closure_loop_proposal_emitted"
 # from signal handlers / wall-clock watchdog).
 EVENT_TYPE_TERMINATION_HOOK_DISPATCHED = "termination_hook_dispatched"
 
+# AdmissionGate Slice 3 — fires when CandidateGenerator
+# evaluates the admission gate and the decision is a SHED outcome
+# (SHED_BUDGET_INSUFFICIENT or SHED_QUEUE_DEEP). Carries the full
+# AdmissionRecord projection so IDE consumers can render
+# "saturation event" notifications + correlate to the structural
+# `pre_admission_shed` exhaustion at the orchestrator level.
+EVENT_TYPE_ADMISSION_DECISION_EMITTED = "admission_decision_emitted"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -451,6 +459,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_WORKTREE_UNIT_STATE_CHANGED,       # Gap #3 Slice 3
     EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED,     # Q4 P#2 Slice 4
     EVENT_TYPE_TERMINATION_HOOK_DISPATCHED,       # TermHook Slice 4
+    EVENT_TYPE_ADMISSION_DECISION_EMITTED,        # AdmissionGate Slice 3
 })
 
 
