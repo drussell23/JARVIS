@@ -780,6 +780,70 @@ class BattleTestHarness:
                 self._monitor_restart_pending()
             )
 
+            # Defect #2 fix (2026-05-03) — Production Oracle observer
+            # boot wire-up. The substrate's ``run_periodic`` was never
+            # scheduled by any caller, so the observer's history ring
+            # buffer stayed empty across all soaks (verified in
+            # bt-2026-05-03-060330: production_oracle_observer_tick=0).
+            # Without this boot wire-up, the GET /observability/
+            # production-oracle endpoint returns empty AND the
+            # auto_action_router's oracle veto rule (Rule 1.5) reads
+            # current()=None and falls through to existing rules. The
+            # whole Tier 2 #6 substrate is empirically dead until this
+            # task starts. Master flag JARVIS_PRODUCTION_ORACLE_ENABLED
+            # gates the entire boot path; cancelled on shutdown like
+            # the other monitor tasks.
+            self._production_oracle_monitor_task: Optional[
+                asyncio.Future
+            ] = None
+            try:
+                from backend.core.ouroboros.governance.production_oracle_observer import (  # noqa: E501
+                    get_default_observer as _po_get_observer,
+                    production_oracle_enabled as _po_enabled,
+                )
+                if _po_enabled():
+                    _observer = _po_get_observer(
+                        project_root=self._config.project_root,
+                    )
+
+                    def _posture_provider() -> str:
+                        """Adaptive cadence input: read current posture
+                        from the posture observer's persistent store.
+                        Returns ``"EXPLORE"`` (most conservative
+                        cadence) on any failure -- defensive default
+                        keeps the observer ticking under degraded
+                        posture-store conditions."""
+                        try:
+                            from backend.core.ouroboros.governance.posture_observer import (  # noqa: E501
+                                get_default_store as _ps_get_store,
+                            )
+                            store = _ps_get_store()
+                            reading = store.load_current()
+                            if reading is None:
+                                return "EXPLORE"
+                            return str(reading.posture.value)
+                        except Exception:  # noqa: BLE001
+                            return "EXPLORE"
+
+                    self._production_oracle_monitor_task = (
+                        asyncio.ensure_future(
+                            _observer.run_periodic(
+                                posture_provider=_posture_provider,
+                            )
+                        )
+                    )
+                    logger.info(
+                        "[ProductionOracleObserver] boot wire-up "
+                        "complete — adapters=%d (Defect #2 fix "
+                        "2026-05-03)",
+                        _observer.adapter_count,
+                    )
+            except Exception as _po_exc:  # noqa: BLE001 -- defensive
+                logger.debug(
+                    "[ProductionOracleObserver] boot wire-up degraded: "
+                    "%s", _po_exc, exc_info=True,
+                )
+
             # Register signal handlers
             try:
                 loop = asyncio.get_running_loop()
@@ -4070,6 +4134,20 @@ class BattleTestHarness:
         except Exception:
             pass
 
+        # 0d2. Production Oracle observer (Defect #2 fix 2026-05-03)
+        try:
+            if (
+                hasattr(self, "_production_oracle_monitor_task")
+                and self._production_oracle_monitor_task
+            ):
+                self._production_oracle_monitor_task.cancel()
+                try:
+                    await self._production_oracle_monitor_task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
+
         # 0e. Wall-clock watchdog (Ticket A Guard 2) — may be None when
         # max_wall_seconds_s is disabled.
         try:
@@ -4454,6 +4532,14 @@ def register_shipped_invariants() -> list:
         "JARVIS_WALL_CLOCK_CHECK_INTERVAL_S",
         "JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S",
         "WallClockHardDeadlineThread",
+        # Defect #2 fix (2026-05-03) — boot wire-up for the Production
+        # Oracle observer's run_periodic loop. Without these markers,
+        # the observer is constructed but never starts, leaving its
+        # history ring buffer empty and the auto_action_router's
+        # oracle veto rule (Rule 1.5) reading current()=None.
+        "_production_oracle_monitor_task",
+        "production_oracle_observer",
+        "run_periodic",
     )
 
     def _validate(
