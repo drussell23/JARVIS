@@ -418,3 +418,29 @@ __all__ = [
     "manifest_path",
     "reset_default_manifest",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pass B Graduation Slice 2 — substrate AST pin
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    from backend.core.ouroboros.governance.meta._invariant_helpers import (
+        make_pass_b_substrate_invariant,
+    )
+    inv = make_pass_b_substrate_invariant(
+        invariant_name="pass_b_order2_manifest_substrate",
+        target_file=(
+            "backend/core/ouroboros/governance/meta/order2_manifest.py"
+        ),
+        description=(
+            "Pass B Slice 1 substrate: Order2Manifest + "
+            "Order2ManifestEntry (frozen) + is_loaded + manifest_path "
+            "+ load_manifest present; no dynamic-code calls."
+        ),
+        required_funcs=("is_loaded", "manifest_path", "load_manifest"),
+        required_classes=("Order2Manifest", "Order2ManifestEntry"),
+        frozen_classes=("Order2ManifestEntry",),
+    )
+    return [inv] if inv is not None else []

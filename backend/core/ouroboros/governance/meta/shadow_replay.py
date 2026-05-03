@@ -542,3 +542,33 @@ __all__ = [
     "reset_default_corpus",
     "structural_equal",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pass B Graduation Slice 2 — substrate AST pin
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    from backend.core.ouroboros.governance.meta._invariant_helpers import (
+        make_pass_b_substrate_invariant,
+    )
+    inv = make_pass_b_substrate_invariant(
+        invariant_name="pass_b_shadow_replay_substrate",
+        target_file=(
+            "backend/core/ouroboros/governance/meta/shadow_replay.py"
+        ),
+        description=(
+            "Pass B Slice 4 substrate: is_enabled + corpus_root + "
+            "load_corpus + ReplaySnapshot/Corpus/Divergence (all "
+            "frozen) present; no dynamic-code calls."
+        ),
+        required_funcs=("is_enabled", "corpus_root", "load_corpus"),
+        required_classes=(
+            "ReplaySnapshot", "ReplayCorpus", "ReplayDivergence",
+        ),
+        frozen_classes=(
+            "ReplaySnapshot", "ReplayCorpus", "ReplayDivergence",
+        ),
+    )
+    return [inv] if inv is not None else []

@@ -741,3 +741,41 @@ __all__ = [
     "execute_replay_under_operator_trigger",
     "is_enabled",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pass B Graduation Slice 2 — substrate AST pin
+# ---------------------------------------------------------------------------
+# replay_executor MUST be allowed to call ``compile()`` -- compiling
+# proposed PhaseRunner subclasses in a sandbox is its job. The
+# substrate pin therefore disables the dynamic-builtins ban for this
+# module specifically (the rest of Pass B substrate keeps the ban).
+
+
+def register_shipped_invariants() -> list:
+    from backend.core.ouroboros.governance.meta._invariant_helpers import (
+        make_pass_b_substrate_invariant,
+    )
+    inv = make_pass_b_substrate_invariant(
+        invariant_name="pass_b_replay_executor_substrate",
+        target_file=(
+            "backend/core/ouroboros/governance/meta/replay_executor.py"
+        ),
+        description=(
+            "Pass B Slice 6.1 substrate: is_enabled + "
+            "execute_replay_under_operator_trigger + "
+            "ReplayExecutionResult (frozen) present. Note: master "
+            "flag stays default-FALSE pre-soak per W2(5) policy. "
+            "Dynamic-builtin ban relaxed: this module's job is to "
+            "compile proposed PhaseRunners under operator-authorized "
+            "trigger; the cage is the operator_authorized=True "
+            "requirement, not banning compile()."
+        ),
+        required_funcs=(
+            "is_enabled", "execute_replay_under_operator_trigger",
+        ),
+        required_classes=("ReplayExecutionResult",),
+        frozen_classes=("ReplayExecutionResult",),
+        forbid_dynamic_builtins=False,
+    )
+    return [inv] if inv is not None else []

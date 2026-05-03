@@ -872,3 +872,54 @@ __all__ = [
     "queue_path",
     "reset_default_queue",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pass B Graduation Slice 2 — substrate AST pin + cost-contract cage pin
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    from backend.core.ouroboros.governance.meta._invariant_helpers import (
+        make_pass_b_substrate_invariant,
+        make_locked_truthy_env_invariant,
+    )
+    target = (
+        "backend/core/ouroboros/governance/meta/order2_review_queue.py"
+    )
+    invariants: list = []
+    sub = make_pass_b_substrate_invariant(
+        invariant_name="pass_b_order2_review_queue_substrate",
+        target_file=target,
+        description=(
+            "Pass B Slice 6.2 substrate: is_enabled + "
+            "amendment_requires_operator + queue_path + QueueEntry "
+            "(frozen) present; no dynamic-code calls."
+        ),
+        required_funcs=(
+            "is_enabled", "amendment_requires_operator", "queue_path",
+        ),
+        required_classes=("QueueEntry",),
+        frozen_classes=("QueueEntry",),
+    )
+    if sub is not None:
+        invariants.append(sub)
+    cage = make_locked_truthy_env_invariant(
+        invariant_name="pass_b_amendment_requires_operator_cage",
+        target_file=target,
+        description=(
+            "Pass B cost-contract cage: amendment_requires_operator "
+            "MUST default truthy when "
+            "JARVIS_ORDER2_MANIFEST_AMENDMENT_REQUIRES_OPERATOR is "
+            "unset. Inverting this cage requires editing this source "
+            "file (which is itself Order-2 code per the manifest, "
+            "so the cage gates its own amendment)."
+        ),
+        helper_function_name="amendment_requires_operator",
+        env_var_name=(
+            "JARVIS_ORDER2_MANIFEST_AMENDMENT_REQUIRES_OPERATOR"
+        ),
+    )
+    if cage is not None:
+        invariants.append(cage)
+    return invariants

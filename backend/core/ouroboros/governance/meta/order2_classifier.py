@@ -179,3 +179,31 @@ __all__ = [
     "classify_order2_match",
     "is_enabled",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pass B Graduation Slice 2 — substrate AST pin
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    from backend.core.ouroboros.governance.meta._invariant_helpers import (
+        make_pass_b_substrate_invariant,
+    )
+    inv = make_pass_b_substrate_invariant(
+        invariant_name="pass_b_order2_classifier_substrate",
+        target_file=(
+            "backend/core/ouroboros/governance/meta/order2_classifier.py"
+        ),
+        description=(
+            "Pass B Slice 2 substrate: is_enabled + "
+            "classify_order2_match + apply_order2_floor present; "
+            "no dynamic-code calls."
+        ),
+        required_funcs=(
+            "is_enabled",
+            "classify_order2_match",
+            "apply_order2_floor",
+        ),
+    )
+    return [inv] if inv is not None else []
