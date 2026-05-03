@@ -7498,6 +7498,80 @@ class GovernedOrchestrator:
                         exc_info=True,
                     )
 
+                # Tier 2 #6 follow-up Arc 1 (2026-05-03) — VERIFY hook
+                # for auto_action_router + Production Oracle. Wires the
+                # advisory framework that's been built but unused at
+                # the orchestrator level. Reads the most-recent oracle
+                # observation + recent postmortem outcomes + confidence
+                # verdicts; proposes an AdvisoryAction; logs + emits
+                # SSE event. ADVISORY ONLY -- never blocks COMPLETE,
+                # never mutates Iron Gate / risk / route. Master flag
+                # JARVIS_AUTO_ACTION_VERIFY_HOOK_ENABLED graduated
+                # default-true; operators flip explicit "false" to
+                # silence the loop.
+                try:
+                    if os.environ.get(
+                        "JARVIS_AUTO_ACTION_VERIFY_HOOK_ENABLED", "",
+                    ).strip().lower() not in ("0", "false", "no", "off"):
+                        from backend.core.ouroboros.governance.auto_action_router import (  # noqa: E501
+                            gather_context as _aa_gather,
+                            propose_advisory_action as _aa_propose,
+                            AdvisoryActionType,
+                        )
+                        # current_op_family/risk/route fields ride on
+                        # ctx; defensive getattr in case ctx schema
+                        # ever drifts.
+                        _aa_ctx = _aa_gather(
+                            current_op_family=str(getattr(
+                                ctx, "op_family", "",
+                            ) or ""),
+                            current_risk_tier=str(getattr(
+                                ctx, "risk_tier", "",
+                            ) or ""),
+                            current_route=str(getattr(
+                                ctx, "provider_route", "",
+                            ) or ""),
+                            posture="",
+                            include_oracle=True,
+                        )
+                        _aa_action = _aa_propose(_aa_ctx)
+                        if (
+                            _aa_action.action_type
+                            is not AdvisoryActionType.NO_ACTION
+                        ):
+                            logger.info(
+                                "[Orchestrator] auto_action proposal "
+                                "op=%s action=%s reason=%s",
+                                ctx.op_id[:16],
+                                _aa_action.action_type.value,
+                                _aa_action.reason_code,
+                            )
+                            try:
+                                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                                    publish_auto_action_proposal,
+                                )
+                                publish_auto_action_proposal(
+                                    op_id=ctx.op_id,
+                                    action_type=(
+                                        _aa_action.action_type.value
+                                    ),
+                                    reason_code=_aa_action.reason_code,
+                                    target_op_family=(
+                                        _aa_action.target_op_family
+                                    ),
+                                    proposed_risk_tier=(
+                                        _aa_action.proposed_risk_tier
+                                    ),
+                                    evidence=_aa_action.evidence,
+                                )
+                            except Exception:
+                                pass
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] auto_action_router VERIFY "
+                        "hook failed", exc_info=True,
+                    )
+
                 # On failure: attempt L2 repair before rollback
                 if not _verify_test_passed and self._config.repair_engine is not None:
                     logger.info(

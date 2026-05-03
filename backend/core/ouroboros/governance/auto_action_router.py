@@ -207,6 +207,24 @@ def auto_action_history_k() -> int:
         return _DEFAULT_HISTORY_K
 
 
+def auto_action_oracle_veto_enabled() -> bool:
+    """``JARVIS_AUTO_ACTION_ORACLE_VETO_ENABLED`` (default true).
+    Tier 2 #6 follow-up Arc 1: when on, the router consults the
+    most-recent Production Oracle observation FIRST in the
+    decision precedence; FAILED -> ROUTE_TO_NOTIFY_APPLY (or
+    DEMOTE_RISK_TIER for SAFE_AUTO ops); DEGRADED ->
+    RAISE_EXPLORATION_FLOOR. When off, oracle observations in
+    AutoActionContext are ignored.
+
+    NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_AUTO_ACTION_ORACLE_VETO_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated 2026-05-03
+    return raw in ("1", "true", "yes", "on")
+
+
 def auto_action_failure_rate_trip() -> float:
     """``JARVIS_AUTO_ACTION_FAILURE_RATE_TRIP`` (default 0.5).
     Fraction of failed outcomes in the history window required to
@@ -309,6 +327,32 @@ class RecentAdaptationProposal:
 
 
 @dataclass(frozen=True)
+class RecentOracleObservation:
+    """Most-recent Production Oracle aggregate verdict + provenance.
+
+    Tier 2 #6 follow-up Arc 1 (2026-05-03): the auto_action_router
+    consumes external-reality signals via this slot. Populated by
+    :func:`gather_context` reading the production_oracle_observer's
+    bounded ring buffer; ``None`` when no observation has happened
+    yet OR the master flag is off (cold-boot/disabled paths).
+
+    Frozen because the router treats observations as immutable
+    snapshots; the observer's own ring buffer holds the live state.
+
+    Fields mirror :class:`production_oracle_observer.OracleObservation`
+    projection (no direct import to avoid circular dep at type-level
+    -- the bridge in :func:`gather_context` does the conversion).
+    """
+
+    aggregate_verdict: str  # OracleVerdict.value
+    observed_at_ts: float
+    signal_count: int = 0
+    adapters_queried: int = 0
+    adapters_failed: int = 0
+    posture: str = ""
+
+
+@dataclass(frozen=True)
 class AutoActionContext:
     """Full pre-aggregated input to ``propose_advisory_action``.
 
@@ -316,6 +360,10 @@ class AutoActionContext:
     yet — those land in Slice 2). The current op's identity
     (family + risk + route) lets the router target the proposal
     at the right scope.
+
+    ``recent_oracle_observation`` is OPTIONAL (default None); when
+    populated, the router consults it FIRST (production reality
+    overrides internal observability). Tier 2 #6 follow-up.
     """
 
     recent_outcomes: Tuple[RecentOpOutcome, ...] = ()
@@ -325,6 +373,7 @@ class AutoActionContext:
     current_risk_tier: str = ""
     current_route: str = ""
     posture: str = ""
+    recent_oracle_observation: Optional[RecentOracleObservation] = None
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +581,66 @@ def propose_advisory_action(
     # window).
     recent_verdicts = context.recent_verdicts[-history_k:]
     recent_outcomes = context.recent_outcomes[-history_k:]
+
+    # ── Rule 1.5 (Tier 2 #6 follow-up): Production Oracle veto ──
+    # Production reality wins over internal observability. When the
+    # most-recent oracle observation is FAILED, the router proposes
+    # an action targeted at the current op even if internal signals
+    # haven't caught up yet. DEGRADED -> raise exploration floor for
+    # the op family. Cost contract is preserved structurally:
+    # _propose_action's BG/SPEC guard prevents route escalation.
+    obs = context.recent_oracle_observation
+    if (
+        auto_action_oracle_veto_enabled()
+        and obs is not None
+    ):
+        verdict = (obs.aggregate_verdict or "").strip().lower()
+        if verdict == "failed":
+            current_risk = (
+                context.current_risk_tier or ""
+            ).strip().lower()
+            evidence = (
+                f"Production Oracle aggregate verdict=FAILED "
+                f"(signals={obs.signal_count} "
+                f"adapters={obs.adapters_queried} "
+                f"failed_adapters={obs.adapters_failed} "
+                f"posture={obs.posture!r})"
+            )
+            if current_risk == _RISK_SAFE_AUTO:
+                return _propose_action(
+                    action_type=AdvisoryActionType.DEMOTE_RISK_TIER,
+                    reason_code="production_oracle_failed",
+                    evidence=evidence,
+                    current_route=context.current_route,
+                    target_op_family=context.current_op_family,
+                    proposed_risk_tier=_RISK_NOTIFY_APPLY,
+                    posture=context.posture,
+                )
+            return _propose_action(
+                action_type=AdvisoryActionType.ROUTE_TO_NOTIFY_APPLY,
+                reason_code="production_oracle_failed",
+                evidence=evidence,
+                current_route=context.current_route,
+                target_op_family=context.current_op_family,
+                proposed_risk_tier=_RISK_NOTIFY_APPLY,
+                posture=context.posture,
+            )
+        if verdict == "degraded" and context.current_op_family:
+            return _propose_action(
+                action_type=(
+                    AdvisoryActionType.RAISE_EXPLORATION_FLOOR
+                ),
+                reason_code="production_oracle_degraded",
+                evidence=(
+                    f"Production Oracle aggregate verdict=DEGRADED "
+                    f"(signals={obs.signal_count}); raising "
+                    f"exploration floor for op family"
+                ),
+                current_route=context.current_route,
+                target_op_family=context.current_op_family,
+                target_category=context.current_op_family,
+                posture=context.posture,
+            )
 
     # ── Rule 2: ESCALATE verdict rate → ROUTE_TO_NOTIFY_APPLY ──
     esc_rate, esc_history = _escalate_rate(recent_verdicts)
@@ -857,6 +966,34 @@ def recent_adaptation_proposals(
     return tuple(out)
 
 
+def _read_recent_oracle_observation() -> Optional[RecentOracleObservation]:
+    """Read the most-recent OracleObservation from the production
+    oracle observer's ring buffer + project into the router's frozen
+    shape. Returns ``None`` when the observer hasn't ticked yet OR
+    the master flag is off OR any error occurs (NEVER raises)."""
+    try:
+        from backend.core.ouroboros.governance.production_oracle_observer import (  # noqa: E501
+            get_default_observer,
+            production_oracle_enabled,
+        )
+        if not production_oracle_enabled():
+            return None
+        obs = get_default_observer()
+        current = obs.current()
+        if current is None:
+            return None
+        return RecentOracleObservation(
+            aggregate_verdict=current.aggregate_verdict.value,
+            observed_at_ts=current.observed_at_ts,
+            signal_count=len(current.signals),
+            adapters_queried=current.adapters_queried,
+            adapters_failed=current.adapters_failed,
+            posture=current.posture,
+        )
+    except Exception:  # noqa: BLE001 -- defensive
+        return None
+
+
 def gather_context(
     *,
     current_op_family: str = "",
@@ -864,6 +1001,7 @@ def gather_context(
     current_route: str = "",
     posture: str = "",
     session_id: Optional[str] = None,
+    include_oracle: bool = True,
 ) -> AutoActionContext:
     """One-shot helper that runs all three readers + assembles an
     ``AutoActionContext``.
@@ -874,6 +1012,12 @@ def gather_context(
     fields ride the ctx and parameterize the dispatcher's targeting
     decisions (op family failure rate, risk-tier-specific demote vs
     defer, etc.).
+
+    Tier 2 #6 follow-up Arc 1 (2026-05-03): when ``include_oracle``
+    is True (default) AND the oracle veto is enabled, the helper
+    also reads the most-recent OracleObservation from the production
+    oracle observer's ring buffer and populates
+    ``recent_oracle_observation`` on the context.
 
     NEVER raises — each reader independently swallows failure."""
     return AutoActionContext(
@@ -886,6 +1030,9 @@ def gather_context(
         current_risk_tier=current_risk_tier,
         current_route=current_route,
         posture=posture,
+        recent_oracle_observation=(
+            _read_recent_oracle_observation() if include_oracle else None
+        ),
     )
 
 

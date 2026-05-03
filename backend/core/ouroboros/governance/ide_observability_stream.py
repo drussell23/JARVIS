@@ -236,6 +236,13 @@ EVENT_TYPE_GOAL_INFERENCE_BUILT = "goal_inference_built"
 # polling the GET endpoint.
 EVENT_TYPE_PRODUCTION_ORACLE_SIGNAL = "production_oracle_signal_observed"
 
+# Tier 2 #6 follow-up Arc 1 (2026-05-03) — fired by the orchestrator
+# VERIFY hook when auto_action_router proposes a non-NO_ACTION
+# AdvisoryAction. Read-only; advisory; the proposal is logged + may
+# be reviewed via /auto-action REPL but is NEVER auto-applied while
+# JARVIS_AUTO_ACTION_ENFORCE=false (the only state the arc ships in).
+EVENT_TYPE_AUTO_ACTION_PROPOSAL = "auto_action_proposal"
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -1708,6 +1715,44 @@ def publish_domain_map_update(
     except Exception:  # noqa: BLE001 -- best-effort
         logger.debug(
             "[Stream] publish_domain_map_update exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_auto_action_proposal(
+    *,
+    op_id: str,
+    action_type: str,
+    reason_code: str,
+    target_op_family: str = "",
+    proposed_risk_tier: str = "",
+    evidence: str = "",
+) -> Optional[str]:
+    """Best-effort publisher for ``auto_action_proposal`` frames.
+    Returns the event_id on success, None when stream disabled /
+    broker missing / publish raised. NEVER raises. Fired by the
+    orchestrator VERIFY hook when a non-NO_ACTION proposal lands."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_AUTO_ACTION_PROPOSAL,
+            (op_id or "unknown")[:80],
+            {
+                "op_id": str(op_id or "")[:80],
+                "action_type": str(action_type or "")[:60],
+                "reason_code": str(reason_code or "")[:80],
+                "target_op_family": str(target_op_family or "")[:80],
+                "proposed_risk_tier": (
+                    str(proposed_risk_tier or "")[:40]
+                ),
+                "evidence": str(evidence or "")[:300],
+            },
+        )
+    except Exception:  # noqa: BLE001 -- best-effort
+        logger.debug(
+            "[Stream] publish_auto_action_proposal exception",
             exc_info=True,
         )
         return None
