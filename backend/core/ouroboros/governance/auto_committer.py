@@ -70,7 +70,7 @@ import asyncio
 import hashlib
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -107,6 +107,19 @@ class CommitResult:
     error: str = ""
     skipped_reason: str = ""
     intent_token: str = ""  # §24.6.2 — content-addressed dedup token
+    # AutoCommitterIgnoreGuard Slice 2 -- two defense-layer audit
+    # surfaces. Empty by default (pre-graduation + clean-path).
+    # ``skipped_ignored`` carries paths refused at the per-file
+    # pre-stage gate (Layer 1: gitignore_guard.find_ignored_targets
+    # before each git add). ``aborted_validator_breach`` carries
+    # paths that slipped past Layer 1 and were caught by the
+    # post-stage validator (Layer 2: git diff --cached cross-
+    # checked via the same guard). Layer 2 ABORTS the commit
+    # and resets the index when populated.
+    skipped_ignored: Tuple[str, ...] = field(default_factory=tuple)
+    aborted_validator_breach: Tuple[str, ...] = field(
+        default_factory=tuple,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +202,42 @@ class AutoCommitter:
                     intent_token=intent_token,
                 )
 
-            # Stage the target files
-            staged = await self._stage_files(target_files)
+            # Stage the target files (Slice 2 Layer 1 inside).
+            staged, skipped_ignored = await self._stage_files(
+                target_files,
+            )
             if not staged:
                 return CommitResult(
                     committed=False,
                     skipped_reason="nothing_to_stage",
+                    skipped_ignored=skipped_ignored,
+                )
+
+            # Slice 2 Layer 2: post-stage validator. Cross-check
+            # ``git diff --cached --name-only`` against the
+            # gitignore guard to catch anything that slipped past
+            # Layer 1 (e.g., a path that was clean at pre-stage
+            # but got pulled in by a directory glob, or a Layer 1
+            # subprocess failure that returned empty fail-open).
+            # Two-layer fail-closed contract: Layer 1 fails open;
+            # Layer 2 fails closed (aborts commit + resets index).
+            breach = await self._validate_no_ignored_staged()
+            if breach:
+                logger.warning(
+                    "[AutoCommitter] Layer 2 validator caught "
+                    "%d ignored path(s) past Layer 1: %s -- "
+                    "aborting commit + resetting index",
+                    len(breach), list(breach)[:5],
+                )
+                await self._reset_index()
+                return CommitResult(
+                    committed=False,
+                    error=(
+                        f"gitignore_breach_blocked: "
+                        f"{len(breach)} path(s) refused"
+                    ),
+                    skipped_ignored=skipped_ignored,
+                    aborted_validator_breach=breach,
                 )
 
             # Build structured commit message
@@ -226,6 +269,10 @@ class AutoCommitter:
                 commit_hash=commit_hash,
                 commit_message=message,
                 intent_token=intent_token,
+                # Slice 2: surface Layer 1's refusals even on
+                # success so operators see WHICH paths were
+                # filtered when partitioning mixed inputs.
+                skipped_ignored=skipped_ignored,
             )
 
             # Optional push
@@ -406,8 +453,21 @@ class AutoCommitter:
     # Git operations (async subprocess_exec, no shell injection)
     # ------------------------------------------------------------------
 
-    async def _stage_files(self, target_files: Tuple[str, ...]) -> bool:
-        """Stage target files for commit. Returns True if anything was staged."""
+    async def _stage_files(
+        self, target_files: Tuple[str, ...],
+    ) -> Tuple[bool, Tuple[str, ...]]:
+        """Stage target files for commit. Returns
+        ``(staged_any, skipped_ignored)``.
+
+        AutoCommitterIgnoreGuard Slice 2 Layer 1: when the
+        ``JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED`` master
+        is on, batch-checks ``target_files`` via
+        ``find_ignored_targets`` and refuses to add any path
+        that matches a ``.gitignore`` rule -- even if currently
+        tracked (the ``--no-index`` semantics in the guard).
+        Returned tuple lets the caller surface the refusal in
+        ``CommitResult.skipped_ignored`` for audit.
+        """
         # Check if there are any changes to stage
         proc = await asyncio.create_subprocess_exec(
             "git", "status", "--porcelain",
@@ -418,11 +478,45 @@ class AutoCommitter:
         stdout, _ = await proc.communicate()
         if not stdout.strip():
             logger.debug("[AutoCommitter] No changes detected")
-            return False
+            return (False, ())
 
-        # Stage each target file individually (safer than git add -A)
+        # Slice 2 Layer 1: pre-stage gitignore filter. Single batch
+        # subprocess (cheap; the guard's batched implementation makes
+        # this O(1) git invocations regardless of len(target_files)).
+        # Master-flag-off path returns empty tuple -> no filtering ->
+        # behavior identical to pre-Slice-2.
+        ignored_set: set = set()
+        try:
+            from backend.core.ouroboros.governance.gitignore_guard import (
+                find_ignored_targets,
+            )
+            ignored_paths = find_ignored_targets(
+                self._repo_root, list(target_files),
+            )
+            if ignored_paths:
+                ignored_set = set(ignored_paths)
+                logger.warning(
+                    "[AutoCommitter] gitignore guard refused %d "
+                    "path(s) at pre-stage: %s",
+                    len(ignored_paths),
+                    list(ignored_paths)[:5],
+                )
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            # Guard failure is fail-open by contract (Slice 1's
+            # primitive returns empty on subprocess failure). The
+            # post-stage validator (Layer 2) is the second-layer
+            # safety net.
+            logger.debug(
+                "[AutoCommitter] gitignore guard pre-check "
+                "degraded: %s", exc,
+            )
+
+        # Stage each target file individually (safer than git add -A).
+        # Skip those flagged by the pre-stage guard.
         staged_any = False
         for f in target_files:
+            if f in ignored_set:
+                continue  # Layer 1 refused; recorded for audit
             abs_path = self._repo_root / f
             if not abs_path.exists():
                 continue
@@ -441,7 +535,71 @@ class AutoCommitter:
                     f, stderr.decode(errors="replace").strip(),
                 )
 
-        return staged_any
+        return (staged_any, tuple(ignored_set))
+
+    async def _validate_no_ignored_staged(self) -> Tuple[str, ...]:
+        """Slice 2 Layer 2: post-stage defense. Run
+        ``git diff --cached --name-only`` to enumerate currently-
+        staged paths, then cross-check via the gitignore guard.
+        Returns the ignored subset that slipped past Layer 1
+        (empty when clean).
+
+        NEVER raises. Subprocess failure -> empty tuple (best
+        we can do; the absence of evidence is treated as evidence
+        of absence at this layer because Layer 1 already had
+        a fail-open pass).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "diff", "--cached", "--name-only",
+                cwd=str(self._repo_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return ()
+            staged_paths = [
+                line.strip()
+                for line in stdout.decode(
+                    errors="replace",
+                ).splitlines()
+                if line.strip()
+            ]
+            if not staged_paths:
+                return ()
+            from backend.core.ouroboros.governance.gitignore_guard import (
+                find_ignored_targets,
+            )
+            return find_ignored_targets(
+                self._repo_root, staged_paths,
+            )
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[AutoCommitter] _validate_no_ignored_staged "
+                "degraded: %s", exc,
+            )
+            return ()
+
+    async def _reset_index(self) -> bool:
+        """Slice 2 Layer 2 cleanup. Run ``git reset HEAD --`` to
+        unstage everything when the post-stage validator caught a
+        breach. Returns True on subprocess success. NEVER raises.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "reset", "HEAD", "--",
+                cwd=str(self._repo_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            return proc.returncode == 0
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[AutoCommitter] _reset_index degraded: %s", exc,
+            )
+            return False
 
     async def _git_commit(self, message: str) -> str:
         """Create a git commit. Returns short commit hash."""
