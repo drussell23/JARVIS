@@ -101,6 +101,32 @@ def _active_spinner_name() -> str:
         return _OUROBOROS_SPINNER_NAME
     return "dots"
 
+
+# ══════════════════════════════════════════════════════════════
+# REPL-active flag (2026-05-03)
+# ══════════════════════════════════════════════════════════════
+# Toggled True while a SerpentREPL is running. Read by spinner
+# start-sites (rich.Status / rich.Live) so they can degrade to
+# log-only output when the REPL is active. Rich's Status and Live
+# widgets bypass prompt_toolkit's ``patch_stdout`` via direct
+# cursor manipulation, which clobbers the input prompt under
+# concurrent output. The mirror of the existing ``sys.stdout.isatty()``
+# gate in ``stream_renderer.py``: same architectural pattern,
+# different reason to take the log-only branch.
+_REPL_ACTIVE: bool = False
+
+
+def is_repl_active() -> bool:
+    """True while a SerpentREPL is running.
+
+    Spinner / Live-widget call sites should consult this and
+    fall through to ``console.print``-only output when True so
+    ``patch_stdout`` can coordinate the line with the prompt
+    redraw. Public accessor (no leading underscore) so callers
+    in sibling modules — e.g. ``stream_renderer.py`` — can
+    import and test the same flag without poking the private."""
+    return _REPL_ACTIVE
+
 # ══════════════════════════════════════════════════════════════
 # Color palette (organism theme)
 # ══════════════════════════════════════════════════════════════
@@ -824,8 +850,18 @@ class SerpentFlow:
         resolved at call time via ``_active_spinner_name()`` —
         defaults to the Ouroboros snake-eating-tail glyph; falls
         back to Rich ``"dots"`` when ``JARVIS_UI_OUROBOROS_SPINNER=false``.
+
+        REPL coordination (2026-05-03): when ``is_repl_active()`` is
+        True we degrade to a single ``console.print`` line — Rich
+        Status uses Rich.Live underneath, which writes via direct
+        cursor manipulation that bypasses ``patch_stdout`` and
+        clobbers the input prompt. The status message stays visible;
+        only the animated spinner glyph disappears.
         """
         self._stop_status()
+        if is_repl_active():
+            self.console.print(f"  {message}", highlight=False)
+            return
         _spinner_name = (
             spinner if spinner is not None else _active_spinner_name()
         )
@@ -891,7 +927,19 @@ class SerpentFlow:
         # Live(Syntax) fixed region. ``rich.Status`` is the existing
         # ephemeral primitive: appears, animates, vanishes when
         # ``stop()`` is called.
+        #
+        # REPL coordination (2026-05-03): skip the Status spinner
+        # entirely under an active SerpentREPL — the "🧬 synthesizing"
+        # header line above already announced the stream via
+        # ``_op_line`` (which routes through ``console.print`` and
+        # therefore through ``patch_stdout``), and the
+        # ``[✓] Generated N tokens`` receipt line in
+        # ``show_streaming_end`` closes it. Operators retain full
+        # observability of stream lifecycle; only the animated
+        # token-count tick (which clobbered the prompt) goes away.
         self._stop_status()
+        if is_repl_active():
+            return
         self._active_status = self.console.status(
             self._streaming_spinner_label(),
             spinner=_active_spinner_name(),
@@ -923,6 +971,12 @@ class SerpentFlow:
         existing ⏺ Update / show_diff path renders the resolved code).
         The visible feedback during streaming is the ephemeral
         spinner with a live token count — no fixed terminal region.
+
+        REPL coordination (2026-05-03): when no Status spinner is
+        active (typical under an active SerpentREPL — see
+        ``show_streaming_start``), skip the per-token spinner relabel
+        entirely. The buffer + token count still accumulate for the
+        end-of-stream receipt and any downstream consumer.
         """
         if not token:
             return
@@ -3385,7 +3439,6 @@ class SerpentREPL:
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.formatted_text import HTML
-            from prompt_toolkit.key_binding import KeyBindings
             from prompt_toolkit.patch_stdout import patch_stdout
         except ImportError:
             self._flow.console.print(
@@ -3394,40 +3447,18 @@ class SerpentREPL:
             )
             return
 
-        # REPL UX fix (2026-05-03) — Claude-Code-parity multi-line paste.
-        # Default PromptSession is multiline=False, which makes bracketed
-        # paste split at the first newline and submit each line as a
-        # separate REPL command (any pasted block of free-text gets
-        # shredded into fragments). multiline=True with custom bindings
-        # — Enter submits, Alt+Enter inserts a literal newline — gives
-        # Claude Code's behavior: paste a block, see the whole buffer,
-        # one Enter to submit. Bracketed paste bypasses key bindings,
-        # so newlines from a paste land as buffer content, not submits.
-        _repl_bindings = KeyBindings()
-
-        @_repl_bindings.add("enter")
-        def _(event: Any) -> None:
-            event.current_buffer.validate_and_handle()
-
-        @_repl_bindings.add("escape", "enter")
-        def _(event: Any) -> None:
-            event.current_buffer.insert_text("\n")
-
         # No bottom_toolbar, no refresh_interval — pure flowing CLI.
-        self._session = PromptSession(
-            multiline=True,
-            key_bindings=_repl_bindings,
-        )
+        self._session = PromptSession()
 
-        # REPL UX fix (2026-05-03) — raw=False lets prompt_toolkit
-        # buffer concurrent stdout writes and re-render the prompt
-        # cleanly below each line. raw=True passed bytes through
-        # untouched, which let asynchronous output (sensor logs,
-        # streaming token spinners, harness diagnostics) clobber
-        # the input line so operators couldn't see what they typed.
-        # Matches Claude Code / IPython behavior for prompt stability
-        # under concurrent log flow.
-        with patch_stdout(raw=False):
+        # raw=True preserves Rich's ANSI escape codes (raw=False would
+        # escape them and render them as literal "?[2m" text in the
+        # operator terminal). The trade-off is that the prompt line
+        # can be visually clobbered by concurrent stdout writes from
+        # background sensors — this is a known limitation of mixing
+        # Rich + prompt_toolkit + async output in a single terminal
+        # region. The structural fix (full-screen TUI with a fixed
+        # input region) is a separate, larger arc.
+        with patch_stdout(raw=True):
             while self._running:
                 try:
                     line = await self._session.prompt_async(

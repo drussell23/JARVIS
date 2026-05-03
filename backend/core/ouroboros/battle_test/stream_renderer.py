@@ -178,10 +178,26 @@ class StreamRenderer:
         # event loop running the Claude stream. The consumer task still
         # drains the queue so token_count and the final INFO line stay
         # accurate; only the visible Live widget is skipped.
-        if not sys.stdout.isatty():
+        #
+        # REPL coordination (2026-05-03): the same log-only branch is
+        # also taken when a SerpentREPL is active. Rich.Live writes via
+        # direct cursor manipulation that bypasses ``patch_stdout`` and
+        # clobbers the input prompt under concurrent output. Operators
+        # retain the [StreamRender] INFO line at end-of-stream (token
+        # count + duration + drops) so observability is preserved;
+        # only the per-token visible widget goes away.
+        try:
+            from backend.core.ouroboros.battle_test.serpent_flow import (
+                is_repl_active,
+            )
+            _repl_active = is_repl_active()
+        except Exception:
+            _repl_active = False
+        if not sys.stdout.isatty() or _repl_active:
+            _why = "non-TTY stdout" if not sys.stdout.isatty() else "REPL active"
             logger.debug(
-                "[StreamRender] op=%s non-TTY stdout — Live skipped, log-only stream",
-                op_id,
+                "[StreamRender] op=%s %s — Live skipped, log-only stream",
+                op_id, _why,
             )
             self._live = None
         else:
