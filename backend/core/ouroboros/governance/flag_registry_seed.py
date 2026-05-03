@@ -2852,6 +2852,59 @@ SEED_SPECS: list = [
         example="true",
         since="Pass B Slice 6.3 (graduated 2026-05-03)",
     ),
+
+    # ====================================================================
+    # auto_action_router VERIFY-hook flags (Tier 2 #6 follow-up Arc 1+4)
+    # ====================================================================
+    # Two flags landed during the Production Oracle → auto_action_router
+    # VERIFY wiring arc but were not yet seeded into the centralized
+    # FlagRegistry. Arc 4 closes that discoverability gap so operators
+    # see them in /help flags, get typo detection, and have posture-
+    # relevance tags for HARDEN-mode soaks where production-reality
+    # vetoes are most operationally relevant.
+    FlagSpec(
+        name="JARVIS_AUTO_ACTION_ORACLE_VETO_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the Production Oracle veto rule in "
+            "auto_action_router (Rule 1.5). When on, a recent oracle "
+            "observation with verdict=FAILED proposes "
+            "ROUTE_TO_NOTIFY_APPLY (or DEMOTE_RISK_TIER for "
+            "SAFE_AUTO ops); verdict=DEGRADED proposes "
+            "RAISE_EXPLORATION_FLOOR. Authority-free advisory; "
+            "production reality wins over internal observability. "
+            "Graduated default-true 2026-05-03."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/auto_action_router.py"
+        ),
+        example="true",
+        since="Tier 2 #6 follow-up Arc 1 (graduated 2026-05-03)",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_AUTO_ACTION_VERIFY_HOOK_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Orchestrator VERIFY-phase hook for auto_action_router. "
+            "When on, every successful VERIFY phase calls "
+            "gather_context(include_oracle=True) → "
+            "propose_advisory_action(); non-NO_ACTION proposals "
+            "log + emit SSE auto_action_proposal. ADVISORY ONLY -- "
+            "never blocks COMPLETE; auto-apply requires the "
+            "separate JARVIS_AUTO_ACTION_ENFORCE flag (default-"
+            "false, the only state shipped). Graduated default-"
+            "true 2026-05-03."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/orchestrator.py"
+        ),
+        example="true",
+        since="Tier 2 #6 follow-up Arc 1 (graduated 2026-05-03)",
+        posture_relevance=_ALL_POSTURES_CRITICAL,
+    ),
 ]
 
 
