@@ -2570,6 +2570,55 @@ class CandidateGenerator:
             fallback_tolerance, op_id_short, last_failure or "none",
         )
         if fallback_tolerance == "queue":
+            # Defect #5 fix (2026-05-03) — Read-only cascade reflex.
+            # Soak v5 (bt-2026-05-03-060330) had 17/19 BG ops terminal-
+            # failing here with "background_dw_blocked_by_topology".
+            # The legacy reflex in _generate_background() (line ~2806)
+            # already turns this into a Claude cascade for read-only
+            # ops, but THAT reflex is unreachable because we raise
+            # BEFORE returning to _generate_background. Lift the same
+            # logic here so it actually fires.
+            #
+            # Cost contract preserved: read-only ops are policy-safe
+            # because Rule 0d (in policy_engine.py) refuses every
+            # mutating tool under is_read_only=True. Cascading a
+            # read-only op to Claude carries no write risk; only
+            # synthesis cost (~$0.005/op).
+            #
+            # Mutating BG ops still respect JARVIS_BACKGROUND_ALLOW_
+            # FALLBACK env knob — they fall through to the queue
+            # raise below if the operator hasn't opted in.
+            _is_read_only = bool(
+                getattr(context, "is_read_only", False),
+            )
+            _allow_mutating_fallback = (
+                provider_route == "background"
+                and os.environ.get(
+                    "JARVIS_BACKGROUND_ALLOW_FALLBACK", "",
+                ).strip().lower() in {"1", "true", "yes", "on"}
+            )
+            _can_cascade = (
+                self._fallback is not None
+                and (_is_read_only or _allow_mutating_fallback)
+            )
+            if _can_cascade:
+                _cascade_reason = (
+                    "read_only_cost_safe"
+                    if _is_read_only
+                    else "operator_allow_fallback_env"
+                )
+                logger.info(
+                    "[CandidateGenerator] Sentinel queue tolerance "
+                    "OVERRIDE: route=%s cascading to Claude (%s, "
+                    "op=%s, fallback_tolerance=queue but is_read_only=%s "
+                    "or allow_fallback_env=%s) — Defect #5 fix "
+                    "2026-05-03 lifts the read-only reflex from "
+                    "_generate_background where it was unreachable "
+                    "after sentinel raise",
+                    provider_route, _cascade_reason, op_id_short,
+                    _is_read_only, _allow_mutating_fallback,
+                )
+                return await self._call_fallback(context, deadline)
             # Same exception shape the orchestrator's existing
             # accept-failure branch already handles for BG/SPEC.
             if provider_route == "speculative":
@@ -4323,6 +4372,13 @@ def register_shipped_invariants() -> list:
         "deadline_exhausted_pre_fallback",
         "JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S",
         "_EXPECTED_BACKGROUND_EXC_PATTERNS",
+        # Defect #5 (2026-05-03) — read-only cascade reflex lifted
+        # into _dispatch_via_sentinel queue branch. Pinned via the
+        # cascade-reason marker so a regression that re-removes the
+        # reflex (e.g., reverting to the unconditional raise that
+        # killed 17/19 BG ops in soak v5) fires the AST pin.
+        "Sentinel queue tolerance OVERRIDE",
+        "read_only_cost_safe",
     )
 
     def _validate(
