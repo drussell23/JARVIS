@@ -107,7 +107,17 @@ class StreamRenderer:
     When ``streaming_enabled()`` is False at ``start`` time, the
     renderer becomes a no-op: no Live, no consumer, no INFO line (DEBUG
     line only). ``on_token`` calls fall through silently.
+
+    RenderBackend conformance (Slice 2 of the RenderConductor arc): the
+    ``name`` / ``notify`` / ``flush`` / ``shutdown`` methods below let
+    this renderer plug into ``RenderConductor`` as a backend. Conductor
+    events route to the same internal queue as the legacy ``on_token``
+    entry point — no logic duplication. The legacy API stays functional
+    for back-compat; both paths converge on the queue.
     """
+
+    # RenderBackend Protocol — Slice 2 of the RenderConductor arc.
+    name: str = "stream_renderer"
 
     def __init__(self, console: Optional[Any] = None) -> None:
         self._console = console
@@ -304,6 +314,78 @@ class StreamRenderer:
         self._first_token_mono = None
         self._token_count = 0
         self._dropped_count = 0
+
+    # ------------------------------------------------------------------
+    # RenderBackend Protocol — Slice 2 of RenderConductor arc.
+    # Routes RenderEvents to the same internal pipeline as legacy
+    # ``on_token`` / ``start`` / ``end``. Both legacy callers and
+    # conductor-routed events converge on the queue — no duplication.
+    # ------------------------------------------------------------------
+
+    def notify(self, event: Any) -> None:
+        """Consume a RenderEvent from the conductor.
+
+        Maps event.kind → existing internal method:
+          * REASONING_TOKEN  → on_token(content)
+          * PHASE_BEGIN      → start(op_id, provider) (provider read from
+                                event.metadata.provider, fallback to "")
+          * PHASE_END        → end()
+          * BACKEND_RESET    → end() (idempotent finalizer)
+          * other kinds      → no-op (this renderer surfaces only the
+                                token-stream lifecycle; other regions
+                                are owned by SerpentFlow / OuroborosTUI)
+
+        NEVER raises — defensive everywhere. Lazy import of EventKind
+        keeps stream_renderer free of a hard import on the conductor
+        primitive (the conductor module imports stream_renderer at boot
+        time, not the other way around — preserves dependency direction).
+        """
+        if event is None:
+            return
+        try:
+            kind = getattr(event, "kind", None)
+            kind_value = (
+                kind.value if hasattr(kind, "value") else str(kind or "")
+            )
+            if kind_value == "REASONING_TOKEN":
+                content = getattr(event, "content", "") or ""
+                if content:
+                    self.on_token(content)
+                return
+            if kind_value == "PHASE_BEGIN":
+                op_id = getattr(event, "op_id", None) or ""
+                metadata = getattr(event, "metadata", None) or {}
+                provider = ""
+                try:
+                    provider = str(metadata.get("provider", ""))
+                except Exception:  # noqa: BLE001 — defensive
+                    provider = ""
+                if op_id:
+                    self.start(op_id, provider)
+                return
+            if kind_value in ("PHASE_END", "BACKEND_RESET"):
+                self.end()
+                return
+            # Other event kinds are not surfaced by this renderer.
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[StreamRender] notify(event) failed", exc_info=True,
+            )
+
+    def flush(self) -> None:
+        """Drain any pending tokens. Reuses the existing sync drain path."""
+        try:
+            self._drain_remaining_sync()
+            self._render_buffer_safe()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug("[StreamRender] flush failed", exc_info=True)
+
+    def shutdown(self) -> None:
+        """Tear down the active session if any. Idempotent — wraps end()."""
+        try:
+            self.end()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug("[StreamRender] shutdown failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Introspection (for tests + debugging)
