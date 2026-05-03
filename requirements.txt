@@ -83,6 +83,10 @@
 # [Ouroboros] Modified by Ouroboros (op=op-019ddb3e-) at 2026-04-29 22:00 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019ddc74-c61f-7353-9399-cf4789a7a54b-cau) at 2026-04-30 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019ddc74-) at 2026-04-30 03:37 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019deb52-3914-715c-98b1-0f40854aca39-cau) at 2026-04-30 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019deb52-) at 2026-05-03 00:56 UTC
+# Reason: torch is 6 minor versions behind (installed: 2.5.1, latest: 2.11.0)
+
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
 
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
@@ -236,8 +240,8 @@ threadpoolctl==3.6.0
 tiktoken==0.12.0
 tokenizers>=0.15.2,<1
 tomli==2.3.0
-torch==2.5.1
-torchaudio==2.5.1
+torch==2.11.0
+torchaudio==2.11.0
 tqdm==4.67.1
 transformers>=4.36.0,<5
 typer==0.20.0

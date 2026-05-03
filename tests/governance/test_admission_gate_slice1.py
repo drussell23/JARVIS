@@ -128,9 +128,9 @@ class TestSchemaAndTaxonomy:
 
 
 class TestEnvKnobs:
-    def test_master_default_false(self):
-        # Slice 1 default-false; Slice 3 graduation flips to true.
-        assert admission_gate_enabled() is False
+    def test_master_default_true_post_graduation(self):
+        # Graduated 2026-05-02 (Slice 3): default-True.
+        assert admission_gate_enabled() is True
 
     @pytest.mark.parametrize("val", ["1", "true", "yes", "on"])
     def test_master_truthy_enables(self, monkeypatch, val):
@@ -568,13 +568,22 @@ class TestAuthorityPins:
                 )
 
     def test_no_backend_module_imports(self):
-        # Slice 1 ships PURE-stdlib substrate. NO backend.*
-        # dependencies.
+        # PURE-stdlib substrate at Slice 1. Slice 3 graduation
+        # introduced two registration-contract imports
+        # (FlagRegistry + shipped_code_invariants) — both are
+        # outbound description channels (substrate publishes
+        # metadata, not consumes behavior). Everything else MUST
+        # remain stdlib so the substrate stays caller-agnostic.
+        ALLOWED_BACKEND_IMPORTS = {
+            "backend.core.ouroboros.governance.flag_registry",
+            "backend.core.ouroboros.governance.meta.shipped_code_invariants",
+        }
         imports = self._module_imports()
         for imp in imports:
-            assert not imp.startswith("backend."), (
-                f"non-stdlib import: {imp}"
-            )
+            if imp.startswith("backend."):
+                assert imp in ALLOWED_BACKEND_IMPORTS, (
+                    f"non-stdlib import: {imp}"
+                )
 
     def test_no_exec_eval_compile(self):
         from backend.core.ouroboros.governance import admission_gate
