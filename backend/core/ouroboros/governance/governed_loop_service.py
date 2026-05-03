@@ -1565,8 +1565,94 @@ class GovernedLoopService:
             )
             self._cigw_observer = None
 
+        # ----- Tier 0.5 batch 2 -----
+        # Three more observers from the audit's dead-code list.
+        # Same lazy-import + master/sub-flag-gated + per-observer
+        # fail-open discipline as batch 1.
+
+        # SBTObserver (Priority #4 Slice 5b — Speculative Branch Tree)
+        # Async start. Explicit constructor; reads knobs from env.
+        self._sbt_observer = None
+        try:
+            from backend.core.ouroboros.governance.verification.speculative_branch import (  # noqa: E501
+                sbt_enabled,
+            )
+            from backend.core.ouroboros.governance.verification.speculative_branch_observer import (  # noqa: E501
+                SBTObserver,
+                sbt_observer_enabled,
+            )
+            if sbt_enabled() and sbt_observer_enabled():
+                self._sbt_observer = SBTObserver()
+                await self._sbt_observer.start()
+                logger.info(
+                    "[GovernedLoop] SBTObserver started "
+                    "(Tier 0.5 batch 2)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] SBTObserver startup failed "
+                "(non-fatal)",
+                exc_info=True,
+            )
+            self._sbt_observer = None
+
+        # ReplayObserver (Priority #3 Slice 5b — Counterfactual Replay)
+        # Async start. Explicit constructor.
+        self._replay_observer = None
+        try:
+            from backend.core.ouroboros.governance.verification.counterfactual_replay import (  # noqa: E501
+                counterfactual_replay_enabled,
+            )
+            from backend.core.ouroboros.governance.verification.counterfactual_replay_observer import (  # noqa: E501
+                ReplayObserver,
+                replay_observer_enabled,
+            )
+            if (
+                counterfactual_replay_enabled()
+                and replay_observer_enabled()
+            ):
+                self._replay_observer = ReplayObserver()
+                await self._replay_observer.start()
+                logger.info(
+                    "[GovernedLoop] ReplayObserver started "
+                    "(Tier 0.5 batch 2)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] ReplayObserver startup failed "
+                "(non-fatal)",
+                exc_info=True,
+            )
+            self._replay_observer = None
+
+        # ClosureLoopObserver (Q4 P#2 Slice 4 follow-up).
+        # Async start. Singleton via get_default_observer. Single
+        # master flag — no separate observer sub-flag in this module.
+        self._closure_loop_observer = None
+        try:
+            from backend.core.ouroboros.governance.verification.closure_loop_orchestrator import (  # noqa: E501
+                closure_loop_orchestrator_enabled,
+            )
+            from backend.core.ouroboros.governance.verification.closure_loop_observer import (  # noqa: E501
+                get_default_observer as get_closure_observer,
+            )
+            if closure_loop_orchestrator_enabled():
+                self._closure_loop_observer = get_closure_observer()
+                await self._closure_loop_observer.start()
+                logger.info(
+                    "[GovernedLoop] ClosureLoopObserver started "
+                    "(Tier 0.5 batch 2)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] ClosureLoopObserver startup failed "
+                "(non-fatal)",
+                exc_info=True,
+            )
+            self._closure_loop_observer = None
+
     async def _stop_governance_observers(self) -> None:
-        """Stop the Tier 0.5 batch 1 observers gracefully.
+        """Stop the Tier 0.5 (batches 1+2) observers gracefully.
 
         Mirrors the boot helper. Each observer's stop is awaited
         independently — one observer's stop failure does NOT prevent
@@ -1576,6 +1662,9 @@ class GovernedLoopService:
             "_invariant_drift_observer",
             "_coherence_observer",
             "_cigw_observer",
+            "_sbt_observer",
+            "_replay_observer",
+            "_closure_loop_observer",
         ):
             observer = getattr(self, attr_name, None)
             if observer is None:
