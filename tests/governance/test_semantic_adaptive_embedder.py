@@ -24,7 +24,6 @@ The substrate this suite locks down:
 from __future__ import annotations
 
 import math
-import os
 import sys
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
