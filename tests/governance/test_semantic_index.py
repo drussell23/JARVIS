@@ -228,14 +228,17 @@ def test_boost_clamped_to_max(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_master_off_build_returns_false(tmp_path):
-    # Env unset — master switch off.
+def test_master_off_build_returns_false(tmp_path, monkeypatch):
+    # Post-Tier-0a default is true; explicit "false" is the
+    # operator escape hatch.
+    monkeypatch.setenv("JARVIS_SEMANTIC_INFERENCE_ENABLED", "false")
     idx = si.SemanticIndex(tmp_path)
     assert idx.build() is False
     assert idx.stats().corpus_n == 0
 
 
-def test_master_off_score_returns_zero(tmp_path):
+def test_master_off_score_returns_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_SEMANTIC_INFERENCE_ENABLED", "false")
     idx = si.SemanticIndex(tmp_path)
     assert idx.score("anything") == 0.0
     assert idx.boost_for("anything") == 0
@@ -1558,9 +1561,13 @@ def test_themed_renderer_postmortem_cluster_shown_as_theme(tmp_path, monkeypatch
 
 
 def test_themed_renderer_master_off_returns_none(tmp_path, monkeypatch):
-    """3c test 19: master switch off → None regardless of cluster_mode."""
+    """3c test 19: master switch off → None regardless of cluster_mode.
+
+    Post-Tier-0a default is true; explicit "false" is the operator
+    escape hatch.
+    """
     monkeypatch.setenv("JARVIS_SEMANTIC_INDEX_CLUSTER_MODE", "kmeans")
-    # JARVIS_SEMANTIC_INFERENCE_ENABLED deliberately not set.
+    monkeypatch.setenv("JARVIS_SEMANTIC_INFERENCE_ENABLED", "false")
     idx = _new_index_with_fake_embedder(tmp_path, monkeypatch)
     assert idx.format_prompt_sections() is None
 

@@ -91,8 +91,19 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 
 
 def _is_enabled() -> bool:
-    """Master switch. Off → no import, no disk I/O, no fastembed touch."""
-    return _env_bool("JARVIS_SEMANTIC_INFERENCE_ENABLED", False)
+    """Master switch (default ``true`` post Tier 0a flip 2026-05-03).
+
+    Off → no import, no disk I/O, no fastembed touch.
+
+    Tier 0a hygiene flip: every consumer (StrategicDirection
+    prompt, ProactiveExploration cluster bias, GET route,
+    ClusterIntelligence-CrossSession arc) was structurally live
+    but operationally dormant under default-False. Flipped to
+    True so the substrate that's been graduated across multiple
+    arcs actually fires in production. Operators flip explicit
+    ``false`` to disable.
+    """
+    return _env_bool("JARVIS_SEMANTIC_INFERENCE_ENABLED", True)
 
 
 def _prompt_injection_enabled() -> bool:
