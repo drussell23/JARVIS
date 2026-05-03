@@ -374,6 +374,20 @@ class ProactiveExplorationSensor:
                     )
                     await self._router.ingest(envelope)
                     emitted.append(cluster.centroid_hash8)
+                    # FiringTelemetry instrumentation — fail-open by
+                    # contract; substrate's incr() NEVER raises.
+                    try:
+                        from backend.core.ouroboros.governance.firing_telemetry import (  # noqa: E501
+                            incr_fire_counter,
+                        )
+                        incr_fire_counter(
+                            "cluster_coverage_envelope_emit",
+                        )
+                        incr_fire_counter(
+                            f"cluster_coverage.kind.{cluster.kind}",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     logger.info(
                         "[ExplorationSensor] Cluster-coverage emit "
                         "cluster=%s kind=%s size=%d hash=%s",

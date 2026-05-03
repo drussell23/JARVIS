@@ -1481,6 +1481,22 @@ class GovernedLoopService:
         booting; the loop continues regardless. References are stored
         on ``self._<observer>`` for orderly shutdown.
         """
+        # FiringTelemetry helper — best-effort instrumentation. The
+        # substrate's incr() is total (NEVER raises) so the helper
+        # is just a convenience indirection so tests can mock it.
+        # Importing inside the helper keeps the whole observer-boot
+        # path import-error-resilient (instrumentation degrades to
+        # a no-op if the module is unavailable, observers still
+        # start normally).
+        def _incr_observer_boot(name: str) -> None:
+            try:
+                from backend.core.ouroboros.governance.firing_telemetry import (  # noqa: E501
+                    incr_fire_counter,
+                )
+                incr_fire_counter(f"observer.{name}.booted")
+            except Exception:  # noqa: BLE001
+                pass
+
         # InvariantDriftObserver (Move 4 Slice 5b)
         self._invariant_drift_observer = None
         try:
@@ -1497,6 +1513,7 @@ class GovernedLoopService:
             ):
                 self._invariant_drift_observer = get_drift_observer()
                 self._invariant_drift_observer.start()
+                _incr_observer_boot("invariant_drift")
                 logger.info(
                     "[GovernedLoop] InvariantDriftObserver started "
                     "(Tier 0.5 batch 1)",
@@ -1525,6 +1542,7 @@ class GovernedLoopService:
             ):
                 self._coherence_observer = get_coherence_observer()
                 self._coherence_observer.start()
+                _incr_observer_boot("coherence")
                 logger.info(
                     "[GovernedLoop] CoherenceObserver started "
                     "(Tier 0.5 batch 1)",
@@ -1553,6 +1571,7 @@ class GovernedLoopService:
             if cigw_enabled() and cigw_observer_enabled():
                 self._cigw_observer = CIGWObserver()
                 await self._cigw_observer.start()
+                _incr_observer_boot("cigw")
                 logger.info(
                     "[GovernedLoop] CIGWObserver started "
                     "(Tier 0.5 batch 1)",
@@ -1584,6 +1603,7 @@ class GovernedLoopService:
             if sbt_enabled() and sbt_observer_enabled():
                 self._sbt_observer = SBTObserver()
                 await self._sbt_observer.start()
+                _incr_observer_boot("sbt")
                 logger.info(
                     "[GovernedLoop] SBTObserver started "
                     "(Tier 0.5 batch 2)",
@@ -1613,6 +1633,7 @@ class GovernedLoopService:
             ):
                 self._replay_observer = ReplayObserver()
                 await self._replay_observer.start()
+                _incr_observer_boot("replay")
                 logger.info(
                     "[GovernedLoop] ReplayObserver started "
                     "(Tier 0.5 batch 2)",
@@ -1639,6 +1660,7 @@ class GovernedLoopService:
             if closure_loop_orchestrator_enabled():
                 self._closure_loop_observer = get_closure_observer()
                 await self._closure_loop_observer.start()
+                _incr_observer_boot("closure_loop")
                 logger.info(
                     "[GovernedLoop] ClosureLoopObserver started "
                     "(Tier 0.5 batch 2)",

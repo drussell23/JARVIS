@@ -382,6 +382,14 @@ class IDEObservabilityRouter:
             "/observability/codebase-character",
             self._handle_codebase_character,
         )
+        # FiringTelemetry — bounded read-only projection of per-key
+        # fire counters. Behavioral complement to AST shipped
+        # invariant pins. Lets operators answer "is this substrate
+        # firing under realistic load" without log archaeology.
+        app.router.add_get(
+            "/observability/firing-telemetry",
+            self._handle_firing_telemetry,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -2452,6 +2460,97 @@ class IDEObservabilityRouter:
             return self._error_response(
                 request, 500,
                 "ide_observability.codebase_character_error",
+            )
+
+    # ----------------------------------------------------------------------
+    # FiringTelemetry — read-only projection of per-key fire counters
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _firing_telemetry_master_enabled() -> bool:
+        """Master flag for the firing-telemetry subsystem. Mirrors
+        the codebase-character / admission-gate master-check pattern."""
+        try:
+            from backend.core.ouroboros.governance.firing_telemetry import (  # noqa: E501
+                firing_telemetry_enabled,
+            )
+        except ImportError:
+            return False
+        return firing_telemetry_enabled()
+
+    async def _handle_firing_telemetry(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/firing-telemetry`` — bounded read-
+        only projection of the FiringTelemetryRegistry singleton.
+
+        Behavioral complement to AST shipped invariant pins. AST pins
+        catch *structural* drift (a substrate refactored away); fire
+        counters catch *behavioral* drift (a substrate that ships
+        graduated default-True but never actually .fires() in
+        production).
+
+        Optional ``?limit=N`` overrides the snapshot cap (default
+        from JARVIS_FIRING_TELEMETRY_SNAPSHOT_MAX_KEYS, clamped
+        [1, 8192]). Optional ``?key_prefix=foo.`` filters to keys
+        starting with the given prefix (cheap server-side filter so
+        operators don't pull the whole snapshot just to inspect one
+        subsystem). NEVER raises."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._firing_telemetry_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.firing_telemetry_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        # Optional ?limit=N
+        raw_limit = request.query.get("limit")
+        max_keys: Optional[int] = None
+        if raw_limit is not None:
+            try:
+                max_keys = max(1, min(8192, int(raw_limit)))
+            except (TypeError, ValueError):
+                return self._error_response(
+                    request, 400,
+                    "ide_observability.malformed_limit",
+                )
+        # Optional ?key_prefix=foo.
+        key_prefix = request.query.get("key_prefix") or ""
+        if len(key_prefix) > 128:
+            return self._error_response(
+                request, 400,
+                "ide_observability.malformed_key_prefix",
+            )
+        try:
+            from backend.core.ouroboros.governance.firing_telemetry import (  # noqa: E501
+                get_default_registry,
+            )
+            snap = get_default_registry().snapshot(max_keys=max_keys)
+            payload = snap.to_dict()
+            if key_prefix:
+                filtered = [
+                    c for c in payload["counters"]
+                    if str(c.get("key", "")).startswith(key_prefix)
+                ]
+                payload["counters"] = filtered
+                payload["filter"] = {"key_prefix": key_prefix}
+            return self._json_response(
+                request, 200, {"enabled": True, **payload},
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] firing_telemetry failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.firing_telemetry_error",
             )
 
     # ----------------------------------------------------------------------
