@@ -409,3 +409,30 @@ __all__ = [
     "MetaPhaseRunner",
     "is_enabled",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pass B Graduation Slice 2 — substrate AST pin
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    from backend.core.ouroboros.governance.meta._invariant_helpers import (
+        make_pass_b_substrate_invariant,
+    )
+    inv = make_pass_b_substrate_invariant(
+        invariant_name="pass_b_meta_phase_runner_substrate",
+        target_file=(
+            "backend/core/ouroboros/governance/meta/meta_phase_runner.py"
+        ),
+        description=(
+            "Pass B Slice 5 substrate: is_enabled + MetaPhaseRunner "
+            "+ MetaEvaluation (frozen) present; no dynamic-code "
+            "calls. Note: master flag stays default-FALSE pre-soak "
+            "graduation per W2(5) policy."
+        ),
+        required_funcs=("is_enabled",),
+        required_classes=("MetaPhaseRunner", "MetaEvaluation"),
+        frozen_classes=("MetaEvaluation",),
+    )
+    return [inv] if inv is not None else []

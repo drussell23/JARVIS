@@ -959,3 +959,32 @@ __all__ = [
     "validate_ast",
     "validate_ast_strict",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pass B Graduation Slice 2 — substrate AST pin
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    from backend.core.ouroboros.governance.meta._invariant_helpers import (
+        make_pass_b_substrate_invariant,
+    )
+    inv = make_pass_b_substrate_invariant(
+        invariant_name="pass_b_ast_phase_runner_validator_substrate",
+        target_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "ast_phase_runner_validator.py"
+        ),
+        description=(
+            "Pass B Slice 3 substrate: is_enabled + validate_ast + "
+            "validate_ast_strict + ValidationResult (frozen) "
+            "present; no dynamic-code calls."
+        ),
+        required_funcs=(
+            "is_enabled", "validate_ast", "validate_ast_strict",
+        ),
+        required_classes=("ValidationResult",),
+        frozen_classes=("ValidationResult",),
+    )
+    return [inv] if inv is not None else []

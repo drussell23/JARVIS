@@ -910,3 +910,33 @@ __all__ = [
     "is_enabled",
     "parse_argv",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pass B Graduation Slice 2 — substrate AST pin
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    from backend.core.ouroboros.governance.meta._invariant_helpers import (
+        make_pass_b_substrate_invariant,
+    )
+    inv = make_pass_b_substrate_invariant(
+        invariant_name="pass_b_order2_repl_dispatcher_substrate",
+        target_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "order2_repl_dispatcher.py"
+        ),
+        description=(
+            "Pass B Slice 6.3 substrate: is_enabled + "
+            "dispatch_order2 + parse_argv + DispatchResult (frozen) "
+            "present; no dynamic-code calls. /order2 amend is THE "
+            "only caller in O+V that passes operator_authorized=True "
+            "to the replay executor -- but execution is independently "
+            "gated by JARVIS_REPLAY_EXECUTOR_ENABLED (default-false)."
+        ),
+        required_funcs=("is_enabled", "dispatch_order2", "parse_argv"),
+        required_classes=("DispatchResult",),
+        frozen_classes=("DispatchResult",),
+    )
+    return [inv] if inv is not None else []

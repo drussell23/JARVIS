@@ -2615,6 +2615,243 @@ SEED_SPECS: list = [
         example="true",
         since="Gap #3 Slice 3 (graduated Slice 5)",
     ),
+
+    # ====================================================================
+    # RSI Pass B (Tier 3 #7) Graduation — 2026-05-03
+    # ====================================================================
+    # The Order-2 governance amendment protocol — 6 slices structurally
+    # complete since 2026-04-26 (PRs #22298 → #22517+); 438/438 Pass B
+    # regression suite green. This graduation arc:
+    #   * Seeds all 8 Pass B master flags + 4 path config knobs into
+    #     the FlagRegistry so they become /help flags discoverable +
+    #     typo-detectable + posture-relevance-tagged.
+    #   * Flips 6 read-only/observational/operator-surface flags
+    #     default-true. The substrate is structurally complete; the
+    #     amendment_requires_operator() invariant remains locked-true
+    #     as the cost-contract cage; AST-pinned cross-file in
+    #     order2_review_queue.register_shipped_invariants().
+    #   * Keeps 2 write-path flags (META_PHASE_RUNNER + REPLAY_EXECUTOR)
+    #     EXPLICITLY default-false. These are the autonomy-creation +
+    #     mutation-execution surfaces; graduating them requires
+    #     empirical soak validation that wasn't done. Operators flip
+    #     them after 3-clean-session arcs per the W2(5) policy.
+    FlagSpec(
+        name="JARVIS_ORDER2_MANIFEST_LOADED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Pass B Slice 1 — load the Order-2 manifest at boot. "
+            "Read-only (the manifest is a YAML allowlist of "
+            "governance-code paths). Graduated default-true "
+            "2026-05-03 — gates only manifest loading, not any "
+            "mutation surface. Off → empty manifest, every "
+            "classification falls back to ORDER_1 (Body code)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/order2_manifest.py"
+        ),
+        example="true",
+        since="Pass B Slice 1 (graduated 2026-05-03)",
+    ),
+    FlagSpec(
+        name="JARVIS_ORDER2_MANIFEST_PATH",
+        type=FlagType.STR, default=".jarvis/order2_manifest.yaml",
+        description=(
+            "Filesystem path to the Order-2 manifest YAML. Defaults "
+            "to <project_root>/.jarvis/order2_manifest.yaml. Operators "
+            "override for split repos or alternate manifest layouts."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/order2_manifest.py"
+        ),
+        example=".jarvis/order2_manifest.yaml",
+        since="Pass B Slice 1",
+    ),
+    FlagSpec(
+        name="JARVIS_ORDER2_RISK_CLASS_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Pass B Slice 2 — surface ORDER_2_GOVERNANCE risk class "
+            "for manifest-matched paths. Advisory enrichment; the "
+            "actual risk-floor application happens downstream in "
+            "risk_engine and is independently flag-gated. Graduated "
+            "default-true 2026-05-03."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/order2_classifier.py"
+        ),
+        example="true",
+        since="Pass B Slice 2 (graduated 2026-05-03)",
+    ),
+    FlagSpec(
+        name="JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Pass B Slice 3 — AST-shape validator for proposed "
+            "PhaseRunner subclasses. Read-only static analysis "
+            "(6 rules: ABC inheritance, no I/O in __init__, "
+            "no exec/eval/compile, etc). Graduated default-true "
+            "2026-05-03 — gates only validation, not patch "
+            "application."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "ast_phase_runner_validator.py"
+        ),
+        example="true",
+        since="Pass B Slice 3 (graduated 2026-05-03)",
+    ),
+    FlagSpec(
+        name="JARVIS_SHADOW_PIPELINE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Pass B Slice 4 — shadow-pipeline replay for proposed "
+            "PhaseRunner subclasses. Observational only: replays "
+            "the golden corpus through the proposed runner in a "
+            "sandbox + compares output against the production "
+            "runner. Graduated default-true 2026-05-03."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/shadow_replay.py"
+        ),
+        example="true",
+        since="Pass B Slice 4 (graduated 2026-05-03)",
+    ),
+    FlagSpec(
+        name="JARVIS_SHADOW_REPLAY_CORPUS_PATH",
+        type=FlagType.STR, default=".jarvis/shadow_replay_corpus",
+        description=(
+            "Filesystem path to the golden-replay corpus directory. "
+            "Defaults to <project_root>/.jarvis/shadow_replay_corpus."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/shadow_replay.py"
+        ),
+        example=".jarvis/shadow_replay_corpus",
+        since="Pass B Slice 4",
+    ),
+    FlagSpec(
+        name="JARVIS_META_PHASE_RUNNER_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Pass B Slice 5 — MetaPhaseRunner. THE autonomy-creation "
+            "surface: when on, O+V can PROPOSE new PhaseRunner "
+            "subclasses (proposals still flow through the AST "
+            "validator + shadow replay + review queue + REPL "
+            "approval before any execution). Graduation deliberately "
+            "DEFERRED — defaults stay false until empirical soak "
+            "validation per the W2(5) policy. Operators opt in "
+            "after a 3-clean-session arc."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "meta_phase_runner.py"
+        ),
+        example="true",
+        since="Pass B Slice 5 (default false pre-soak)",
+    ),
+    FlagSpec(
+        name="JARVIS_REPLAY_EXECUTOR_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Pass B Slice 6.1 — sandboxed replay executor. THE "
+            "actual mutation surface: when on AND the caller passes "
+            "operator_authorized=True (only the /order2 amend REPL "
+            "command does so), proposed PhaseRunner subclasses are "
+            "compiled + applied. The amendment_requires_operator() "
+            "cage is locked-true at the AST-pin layer — but the "
+            "flag itself stays default-FALSE pending empirical soak "
+            "validation. Defense-in-depth: flag + operator-cage."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/replay_executor.py"
+        ),
+        example="true",
+        since="Pass B Slice 6.1 (default false pre-soak)",
+    ),
+    FlagSpec(
+        name="JARVIS_ORDER2_REVIEW_QUEUE_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Pass B Slice 6.2 — manifest amendment review queue. "
+            "Operator surface: queues proposed amendments for "
+            "operator inspection via /order2 pending. Mutation is "
+            "structurally gated by amendment_requires_operator() "
+            "(locked-true cage). Graduated default-true 2026-05-03."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "order2_review_queue.py"
+        ),
+        example="true",
+        since="Pass B Slice 6.2 (graduated 2026-05-03)",
+    ),
+    FlagSpec(
+        name="JARVIS_ORDER2_REVIEW_QUEUE_PATH",
+        type=FlagType.STR, default=".jarvis/order2_review_queue.jsonl",
+        description=(
+            "Filesystem path to the flock'd review-queue JSONL. "
+            "Defaults to <project_root>/.jarvis/"
+            "order2_review_queue.jsonl."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "order2_review_queue.py"
+        ),
+        example=".jarvis/order2_review_queue.jsonl",
+        since="Pass B Slice 6.2",
+    ),
+    FlagSpec(
+        name="JARVIS_ORDER2_MANIFEST_AMENDMENT_REQUIRES_OPERATOR",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Pass B cost-contract cage: the load-bearing invariant "
+            "that locks manifest amendments to operator-only paths. "
+            "AST-pinned LOCKED-TRUE in "
+            "order2_review_queue.register_shipped_invariants() — "
+            "operators CAN read this flag's value but flipping it "
+            "false fires a structural pin violation at next "
+            "graduation gate scan. Documented here for "
+            "discoverability; the lock is structural."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "order2_review_queue.py"
+        ),
+        example="true",
+        since="Pass B Slice 6.2 (locked-true cage invariant)",
+    ),
+    FlagSpec(
+        name="JARVIS_ORDER2_REPL_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Pass B Slice 6.3 — /order2 REPL dispatcher (pending, "
+            "show, amend, reject, history, help). Operator surface; "
+            "/order2 amend is THE only caller in O+V that passes "
+            "operator_authorized=True to the replay executor — but "
+            "execution is independently gated by "
+            "JARVIS_REPLAY_EXECUTOR_ENABLED (default-false). "
+            "Graduated default-true 2026-05-03 — operators get the "
+            "REPL discoverability without any auto-mutation surface."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "order2_repl_dispatcher.py"
+        ),
+        example="true",
+        since="Pass B Slice 6.3 (graduated 2026-05-03)",
+    ),
 ]
 
 
