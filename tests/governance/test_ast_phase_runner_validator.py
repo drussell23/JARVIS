@@ -161,16 +161,21 @@ def test_validation_result_default_classes_inspected_empty():
 # ===========================================================================
 
 
-def test_is_enabled_default_false_pre_graduation(monkeypatch):
+def test_is_enabled_default_true_post_graduation(monkeypatch):
+    """Pass B Slice 3 graduation 2026-05-03: master flag flipped
+    default-true. Operators flip explicit ``false`` to opt out."""
     monkeypatch.delenv(
         "JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED", raising=False,
     )
-    assert is_enabled() is False
+    assert is_enabled() is True
 
 
 def test_master_off_returns_skipped(monkeypatch):
-    monkeypatch.delenv(
-        "JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED", raising=False,
+    """Operator-disabled path: explicit ``false`` short-circuits to
+    SKIPPED (post-graduation, the env knob must be set explicitly to
+    disable rather than relying on absence)."""
+    monkeypatch.setenv(
+        "JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED", "false",
     )
     r = validate_ast(_GOOD_RUNNER)
     assert r.status is ValidationStatus.SKIPPED
@@ -616,8 +621,10 @@ def test_strict_raises_on_failed():
 
 
 def test_strict_returns_skipped_when_master_off(monkeypatch):
-    monkeypatch.delenv(
-        "JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED", raising=False,
+    """Post Slice 3 graduation: master flag is default-true; explicit
+    ``false`` must be set to short-circuit strict mode to SKIPPED."""
+    monkeypatch.setenv(
+        "JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED", "false",
     )
     r = validate_ast_strict(_GOOD_RUNNER)
     assert r.status is ValidationStatus.SKIPPED

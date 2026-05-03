@@ -324,9 +324,12 @@ class RejectResult:
 def is_enabled() -> bool:
     """Master flag — ``JARVIS_ORDER2_REVIEW_QUEUE_ENABLED`` (default
     false until Slice 6 graduation)."""
-    return os.environ.get(
+    raw = os.environ.get(
         "JARVIS_ORDER2_REVIEW_QUEUE_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated 2026-05-03 (Pass B Slice 6.2)
+    return raw in _TRUTHY
 
 
 def queue_path() -> Path:

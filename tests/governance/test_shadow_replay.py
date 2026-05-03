@@ -227,18 +227,23 @@ def test_corpus_to_dict_stable_shape():
 # ===========================================================================
 
 
-def test_is_enabled_default_false_pre_graduation():
-    assert is_enabled() is False
+def test_is_enabled_default_true_post_graduation(monkeypatch):
+    """Pass B Slice 4 graduation 2026-05-03: master flag flipped
+    default-true. Empty string + unset both resolve to True."""
+    monkeypatch.delenv("JARVIS_SHADOW_PIPELINE_ENABLED", raising=False)
+    assert is_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["1", "true", "yes", "on"])
+@pytest.mark.parametrize("val", ["1", "true", "yes", "on", ""])
 def test_is_enabled_truthy(monkeypatch, val):
+    """Empty string is now equivalent to unset → graduated default-true."""
     monkeypatch.setenv("JARVIS_SHADOW_PIPELINE_ENABLED", val)
     assert is_enabled() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage", ""])
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "garbage"])
 def test_is_enabled_falsy(monkeypatch, val):
+    """Operator opt-out paths: explicit non-truthy values."""
     monkeypatch.setenv("JARVIS_SHADOW_PIPELINE_ENABLED", val)
     assert is_enabled() is False
 
@@ -264,9 +269,12 @@ def test_corpus_root_env_override(monkeypatch, tmp_path):
 # ===========================================================================
 
 
-def test_load_master_off_returns_not_loaded():
+def test_load_master_off_returns_not_loaded(monkeypatch):
     """Pin: master flag off → empty corpus. Slice 5 consumer treats
-    this as 'no shadow replay enforcement'."""
+    this as 'no shadow replay enforcement'. Post Slice 4 graduation
+    the master flag is default-true; explicit ``false`` must be set
+    to opt out."""
+    monkeypatch.setenv("JARVIS_SHADOW_PIPELINE_ENABLED", "false")
     c = load_corpus()
     assert c.status is ReplayLoadStatus.NOT_LOADED
     assert c.snapshots == ()

@@ -218,16 +218,21 @@ def is_module_side_effect_block_enabled() -> bool:
 
 def is_enabled() -> bool:
     """Master flag —
-    ``JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED`` (default false
-    until Slice 3 graduation).
+    ``JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED`` (graduated
+    default-true 2026-05-03).
 
     When off, :func:`validate_ast` short-circuits to ``ValidationResult
     (status=SKIPPED, ...)``. Slice 5 MetaPhaseRunner treats SKIPPED
     as "no enforcement" so the cage degrades to the existing review
-    path."""
-    return os.environ.get(
+    path. Operators flip explicit ``false`` to opt out of static
+    pre-execution validation (read-only AST scan; safe to graduate
+    -- gates only validation, not patch application)."""
+    raw = os.environ.get(
         "JARVIS_PHASE_RUNNER_AST_VALIDATOR_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated 2026-05-03 (Pass B Slice 3)
+    return raw in _TRUTHY
 
 
 # ---------------------------------------------------------------------------
