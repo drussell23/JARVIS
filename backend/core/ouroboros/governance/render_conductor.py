@@ -121,14 +121,20 @@ def _get_registry() -> Any:
 
 
 def is_enabled() -> bool:
-    """Master switch. Default ``false`` at Slice 1 — graduates to ``true``
-    at Slice 7 once all 7 CC-parity gaps land on the substrate. When off,
-    ``RenderConductor.publish`` becomes a no-op (event dropped before
-    backend dispatch); backends remain registered so a hot-flip works."""
+    """Master switch. Graduated to ``true`` at Slice 7 — substrate
+    is live by default. Producer-side flags (REASONING_STREAM /
+    INPUT_CONTROLLER / THREAD_OBSERVER / CONTEXTUAL_HELP) stay
+    default-false so each surface graduates independently per
+    operator opt-in; at substrate-on with no producers active, the
+    conductor exists + dispatches but receives no events.
+
+    Hot-revert: ``JARVIS_RENDER_CONDUCTOR_ENABLED=false`` returns to
+    pre-Slice-7 behavior (``publish`` becomes no-op; backends remain
+    registered so a re-flip works without re-wire)."""
     reg = _get_registry()
     if reg is None:
-        return False
-    return reg.get_bool(_FLAG_MASTER_ENABLED, default=False)
+        return True
+    return reg.get_bool(_FLAG_MASTER_ENABLED, default=True)
 
 
 def theme_name() -> str:
@@ -811,14 +817,17 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=_FLAG_MASTER_ENABLED,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
                 "Master kill switch for the unified RenderConductor "
-                "substrate (Wave 4 #1, Slices 1-7). Default false at "
-                "Slice 1 — graduates to true at Slice 7 once all 7 "
-                "CC-parity gaps land on the substrate. When false, "
-                "RenderConductor.publish drops events before backend "
-                "dispatch; backends remain registered so hot-flip works."
+                "substrate (Wave 4 #1, Slices 1-7). Graduated default "
+                "true at Slice 7 — substrate is live. Producer-side "
+                "flags (REASONING_STREAM / INPUT_CONTROLLER / "
+                "THREAD_OBSERVER / CONTEXTUAL_HELP) stay default-false "
+                "so each surface opt-ins independently. Hot-revert: "
+                "set false → publish drops events before backend "
+                "dispatch; backends remain registered so re-flip "
+                "works without re-wire."
             ),
             category=Category.SAFETY,
             source_file=(

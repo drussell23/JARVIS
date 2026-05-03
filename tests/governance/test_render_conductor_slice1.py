@@ -452,8 +452,9 @@ class TestResolveDensity:
 
 
 class TestFlagAccessors:
-    def test_is_enabled_default_false(self, fresh_registry):
-        assert rc.is_enabled() is False
+    def test_is_enabled_default_true_post_slice7(self, fresh_registry):
+        # Graduated default true at Slice 7. Hot-revert via env still works.
+        assert rc.is_enabled() is True
 
     def test_is_enabled_env_true(
         self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
@@ -559,7 +560,12 @@ class TestRenderConductor:
         kinds = set(c.regions().keys())
         assert kinds == set(rc.RegionKind)
 
-    def test_publish_no_op_when_master_off(self, fresh_registry):
+    def test_publish_no_op_when_master_off(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        # Hot-revert path: explicit env=false drops events even
+        # though the default is now true.
+        monkeypatch.setenv("JARVIS_RENDER_CONDUCTOR_ENABLED", "false")
         c = rc.RenderConductor()
         rec = RecordingBackend()
         c.add_backend(rec)
@@ -755,14 +761,16 @@ class TestRegisterFlags:
         # Override mode means second call replaces (no duplicate)
         assert len(reg.list_all()) == 5
 
-    def test_master_flag_is_bool_default_false(self, fresh_registry):
+    def test_master_flag_is_bool_default_true_post_slice7(
+        self, fresh_registry,
+    ):
         from backend.core.ouroboros.governance import flag_registry as fr
         reg = fr.FlagRegistry()
         rc.register_flags(reg)
         spec = reg.get_spec("JARVIS_RENDER_CONDUCTOR_ENABLED")
         assert spec is not None
         assert spec.type is fr.FlagType.BOOL
-        assert spec.default is False
+        assert spec.default is True  # graduated at Slice 7
         assert spec.category is fr.Category.SAFETY
 
 
