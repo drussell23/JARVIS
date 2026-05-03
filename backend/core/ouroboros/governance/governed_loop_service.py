@@ -1283,6 +1283,14 @@ class GovernedLoopService:
                 )
                 self._posture_observer = None
 
+            # Tier 0.5 batch 1 — boot-wire the 3 dormant Slice 5b observers
+            # (InvariantDrift / Coherence / CIGW). Each has shipped graduated
+            # default-True for weeks but never .start()ed in production —
+            # caught by the codebase audit as ~5,000 LOC of inert substrate.
+            # Master-flag-gated by each observer's own substrate flags;
+            # fail-open per observer; never blocks the loop.
+            await self._start_governance_observers()
+
             # Wave 3 (6) Slice 5a — register parallel-dispatch env flags into
             # the FlagRegistry so `/help flags --search parallel_dispatch`
             # surfaces all 5 knobs. Best-effort, never-raise (the env reads
@@ -1391,6 +1399,11 @@ class GovernedLoopService:
                     exc_info=True,
                 )
 
+        # Tier 0.5 batch 1 — stop the 3 dormant-now-live Slice 5b observers
+        # (InvariantDrift / Coherence / CIGW). Mirrors the boot wire-up;
+        # fail-open per observer.
+        await self._stop_governance_observers()
+
         # Stop L3 scheduler before background loops so no unit outlives GLS
         if self._subagent_scheduler is not None:
             await self._subagent_scheduler.stop()
@@ -1445,6 +1458,136 @@ class GovernedLoopService:
         self._detach_from_stack()
         self._state = ServiceState.INACTIVE
         logger.info("[GovernedLoop] Stopped")
+
+    # ------------------------------------------------------------------
+    # Tier 0.5 batch 1 — governance observer boot/shutdown helpers
+    # ------------------------------------------------------------------
+
+    async def _start_governance_observers(self) -> None:
+        """Boot the dormant Slice 5b observers (Tier 0.5 batch 1).
+
+        Wires three substrates that shipped graduated default-True but
+        had zero production callers per the codebase audit:
+
+          * ``InvariantDriftObserver`` — Move 4 Slice 5b deferred
+          * ``CoherenceObserver`` — Priority #1 Slice 5b deferred
+          * ``CIGWObserver`` (gradient watcher) — Priority #5 Slice 5b
+            deferred
+
+        Each is master-flag-gated by its own substrate's ``_enabled``
+        accessor (no hardcoded defaults — every flag is operator-
+        controllable). Each is wrapped in its own try/except so a
+        single observer's failure does NOT prevent the others from
+        booting; the loop continues regardless. References are stored
+        on ``self._<observer>`` for orderly shutdown.
+        """
+        # InvariantDriftObserver (Move 4 Slice 5b)
+        self._invariant_drift_observer = None
+        try:
+            from backend.core.ouroboros.governance.invariant_drift_auditor import (  # noqa: E501
+                invariant_drift_auditor_enabled,
+            )
+            from backend.core.ouroboros.governance.invariant_drift_observer import (  # noqa: E501
+                get_default_observer as get_drift_observer,
+                observer_enabled as drift_observer_enabled,
+            )
+            if (
+                invariant_drift_auditor_enabled()
+                and drift_observer_enabled()
+            ):
+                self._invariant_drift_observer = get_drift_observer()
+                self._invariant_drift_observer.start()
+                logger.info(
+                    "[GovernedLoop] InvariantDriftObserver started "
+                    "(Tier 0.5 batch 1)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] InvariantDriftObserver startup "
+                "failed (non-fatal)",
+                exc_info=True,
+            )
+            self._invariant_drift_observer = None
+
+        # CoherenceObserver (Priority #1 Slice 5b)
+        self._coherence_observer = None
+        try:
+            from backend.core.ouroboros.governance.verification.coherence_auditor import (  # noqa: E501
+                coherence_auditor_enabled,
+            )
+            from backend.core.ouroboros.governance.verification.coherence_observer import (  # noqa: E501
+                get_default_observer as get_coherence_observer,
+                observer_enabled as coherence_observer_enabled,
+            )
+            if (
+                coherence_auditor_enabled()
+                and coherence_observer_enabled()
+            ):
+                self._coherence_observer = get_coherence_observer()
+                self._coherence_observer.start()
+                logger.info(
+                    "[GovernedLoop] CoherenceObserver started "
+                    "(Tier 0.5 batch 1)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] CoherenceObserver startup failed "
+                "(non-fatal)",
+                exc_info=True,
+            )
+            self._coherence_observer = None
+
+        # CIGWObserver / GradientObserver (Priority #5 Slice 5b)
+        # Async start. No module-level singleton — construct
+        # explicitly. The default-arg constructor reads all knobs
+        # from env at every interval poll (no hardcoding).
+        self._cigw_observer = None
+        try:
+            from backend.core.ouroboros.governance.verification.gradient_watcher import (  # noqa: E501
+                cigw_enabled,
+            )
+            from backend.core.ouroboros.governance.verification.gradient_observer import (  # noqa: E501
+                CIGWObserver,
+                cigw_observer_enabled,
+            )
+            if cigw_enabled() and cigw_observer_enabled():
+                self._cigw_observer = CIGWObserver()
+                await self._cigw_observer.start()
+                logger.info(
+                    "[GovernedLoop] CIGWObserver started "
+                    "(Tier 0.5 batch 1)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] CIGWObserver startup failed "
+                "(non-fatal)",
+                exc_info=True,
+            )
+            self._cigw_observer = None
+
+    async def _stop_governance_observers(self) -> None:
+        """Stop the Tier 0.5 batch 1 observers gracefully.
+
+        Mirrors the boot helper. Each observer's stop is awaited
+        independently — one observer's stop failure does NOT prevent
+        the others from stopping. NEVER raises.
+        """
+        for attr_name in (
+            "_invariant_drift_observer",
+            "_coherence_observer",
+            "_cigw_observer",
+        ):
+            observer = getattr(self, attr_name, None)
+            if observer is None:
+                continue
+            try:
+                await observer.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[GovernedLoop] %s.stop failed (non-fatal)",
+                    attr_name,
+                    exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # Submit
