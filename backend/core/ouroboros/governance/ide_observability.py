@@ -364,6 +364,13 @@ class IDEObservabilityRouter:
             "/observability/admission-gate",
             self._handle_admission_gate,
         )
+        # CodebaseCharacterDigest Slice 3 — bounded read-only
+        # projection of master-flag + env-knob config + most-recent
+        # snapshot derived from the SemanticIndex.clusters artifact.
+        app.router.add_get(
+            "/observability/codebase-character",
+            self._handle_codebase_character,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -2323,6 +2330,117 @@ class IDEObservabilityRouter:
             return self._error_response(
                 request, 500,
                 "ide_observability.admission_gate_error",
+            )
+
+    # ----------------------------------------------------------------------
+    # CodebaseCharacterDigest Slice 3 — read-only projection
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _codebase_character_master_enabled() -> bool:
+        """Master flag for the codebase-character subsystem.
+        Mirrors the admission-gate master-check pattern."""
+        try:
+            from backend.core.ouroboros.governance.codebase_character import (  # noqa: E501
+                codebase_character_enabled,
+            )
+        except ImportError:
+            return False
+        return codebase_character_enabled()
+
+    async def _handle_codebase_character(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/codebase-character`` — bounded read-
+        only projection of the CodebaseCharacterDigest subsystem.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "enabled": true,
+              "config": {
+                "min_clusters": 2,
+                "stale_after_s": 86400.0,
+                "max_clusters_in_digest": 8,
+                "excerpt_max_chars": 140
+              },
+              "snapshot": {
+                "schema_version": "codebase_character.v1",
+                "outcome": "ready",
+                "clusters": [<ClusterCharacter.to_dict()>, ...],
+                "generated_at_ts": ...,
+                "total_corpus_items": ...,
+                "cluster_mode": "kmeans",
+                "built_at_ts": ...,
+                "truncated_count": 0
+              }
+            }
+
+        Returns 403 ``codebase_character_disabled`` when master flag
+        off (port-scanner discipline). NEVER raises."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._codebase_character_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.codebase_character_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            import time as _time
+            from backend.core.ouroboros.governance.codebase_character import (  # noqa: E501
+                compute_codebase_character,
+                excerpt_max_chars,
+                max_clusters_in_digest,
+                min_clusters,
+                stale_after_s,
+            )
+            from backend.core.ouroboros.governance.semantic_index import (  # noqa: E501
+                get_default_index,
+            )
+            idx = get_default_index()
+            stats = idx.stats()
+            snapshot = compute_codebase_character(
+                enabled=True,
+                clusters=idx.clusters,
+                cluster_mode=getattr(stats, "cluster_mode", "") or "",
+                total_corpus_items=int(
+                    getattr(stats, "corpus_n", 0) or 0,
+                ),
+                built_at_ts=float(
+                    getattr(stats, "built_at", 0.0) or 0.0,
+                ),
+                generated_at_ts=_time.time(),
+            )
+            return self._json_response(
+                request, 200,
+                {
+                    "enabled": True,
+                    "config": {
+                        "min_clusters": min_clusters(),
+                        "stale_after_s": stale_after_s(),
+                        "max_clusters_in_digest": (
+                            max_clusters_in_digest()
+                        ),
+                        "excerpt_max_chars": excerpt_max_chars(),
+                    },
+                    "snapshot": snapshot.to_dict(),
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] codebase_character failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.codebase_character_error",
             )
 
     # ----------------------------------------------------------------------

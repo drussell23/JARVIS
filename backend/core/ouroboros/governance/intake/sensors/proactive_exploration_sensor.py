@@ -31,6 +31,23 @@ _ENTROPY_EXPLORATION_THRESHOLD = float(
 )
 
 
+def _cluster_emit_per_scan() -> int:
+    """Per-scan cap on cluster-coverage emissions.
+
+    Default 1 — one under-touched cluster surfaced per scan keeps the
+    intake queue from flooding while still inverting the doc_staleness:
+    exploration ratio over a single shift. Clamped to [1, 8].
+    """
+    raw = os.environ.get(
+        "JARVIS_EXPLORATION_CLUSTER_EMIT_PER_SCAN", "",
+    ).strip()
+    try:
+        val = int(raw) if raw else 1
+    except (TypeError, ValueError):
+        val = 1
+    return max(1, min(8, val))
+
+
 class ProactiveExplorationSensor:
     """Curiosity sensor — explores domains where the organism is uncertain.
 
@@ -57,6 +74,11 @@ class ProactiveExplorationSensor:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._explored_domains: set[str] = set()
+        # Slice 3 — per-session dedup of cluster-coverage emissions
+        # keyed on centroid_hash8 (stable across rebuilds when the
+        # cluster shape doesn't change; new shape → new hash → new
+        # emission opportunity).
+        self._explored_clusters: set[str] = set()
 
     async def start(self) -> None:
         self._running = True
@@ -159,7 +181,142 @@ class ProactiveExplorationSensor:
         except Exception:
             logger.debug("[ExplorationSensor] Scan error", exc_info=True)
 
+        # CodebaseCharacterDigest Slice 3 — cluster-coverage bias.
+        # Independent signal source: emits even when no failure rules
+        # exist. Inverts the doc_staleness:exploration ratio observed
+        # in soak v3 baseline by giving exploration a structural
+        # cadence keyed on the SemanticIndex k-means cluster set.
+        cluster_explored = await self._emit_cluster_coverage_signals()
+        explored.extend(cluster_explored)
+
         return explored
+
+    async def _emit_cluster_coverage_signals(self) -> List[str]:
+        """Emit IntentEnvelopes for under-touched semantic clusters.
+
+        CodebaseCharacterDigest Slice 3 wire-up. Reads the existing
+        ``SemanticIndex.clusters`` artifact (already built by the v1.0
+        k-means path) and projects through ``compute_codebase_character``.
+        For each READY cluster not yet explored this session, emits a
+        single IntentEnvelope inviting O+V to explore the cluster's
+        domain. Targets are intentionally empty so the model uses its
+        tool loop (read_file / search_code) to discover representative
+        files — no hardcoded path inference.
+
+        Discipline:
+          * Fail-silent on any exception — never break the parent scan.
+          * ImportError-safe — codebase_character / semantic_index
+            module missing → empty list.
+          * Per-scan cap (env-tunable, default 1) prevents intake flood.
+          * Session-dedup on ``centroid_hash8`` — same cluster shape
+            doesn't re-fire within a session.
+          * Cost contract preserved by construction: zero LLM calls,
+            zero file I/O, zero git invocations on the sensor path.
+        """
+        emitted: List[str] = []
+        try:
+            from backend.core.ouroboros.governance.codebase_character import (  # noqa: E501
+                codebase_character_enabled,
+                compute_codebase_character,
+            )
+            from backend.core.ouroboros.governance.semantic_index import (
+                get_default_index,
+            )
+        except ImportError:
+            return emitted
+        if not codebase_character_enabled():
+            return emitted
+        try:
+            import time as _time
+            idx = get_default_index()
+            stats = idx.stats()
+            snapshot = compute_codebase_character(
+                enabled=True,
+                clusters=idx.clusters,
+                cluster_mode=getattr(stats, "cluster_mode", "") or "",
+                total_corpus_items=int(getattr(stats, "corpus_n", 0) or 0),
+                built_at_ts=float(getattr(stats, "built_at", 0.0) or 0.0),
+                generated_at_ts=_time.time(),
+            )
+            if not snapshot.is_ready():
+                return emitted
+            cap = _cluster_emit_per_scan()
+            for cluster in snapshot.clusters:
+                if cluster.centroid_hash8 in self._explored_clusters:
+                    continue
+                if len(emitted) >= cap:
+                    break
+                self._explored_clusters.add(cluster.centroid_hash8)
+                try:
+                    envelope = make_envelope(
+                        source="exploration",
+                        description=(
+                            f"Cluster-coverage exploration: under-touched "
+                            f"semantic cluster '{cluster.theme_label}' "
+                            f"(kind={cluster.kind}, size={cluster.size}). "
+                            f"Use search_code / read_file to discover "
+                            f"representative files in this domain. "
+                            f"Excerpt: {cluster.nearest_item_excerpt}"
+                        ),
+                        target_files=(),  # Let model discover via tool loop
+                        repo=self._repo,
+                        confidence=0.65,
+                        urgency="low",
+                        evidence={
+                            "category": "cluster_coverage",
+                            "cluster_id": cluster.cluster_id,
+                            "centroid_hash8": cluster.centroid_hash8,
+                            "kind": cluster.kind,
+                            "theme_label": cluster.theme_label,
+                            "cluster_size": cluster.size,
+                            "sensor": "ProactiveExplorationSensor",
+                        },
+                        requires_human_ack=False,
+                    )
+                    await self._router.ingest(envelope)
+                    emitted.append(cluster.centroid_hash8)
+                    logger.info(
+                        "[ExplorationSensor] Cluster-coverage emit "
+                        "cluster=%s kind=%s size=%d hash=%s",
+                        cluster.theme_label or "(unlabeled)",
+                        cluster.kind, cluster.size,
+                        cluster.centroid_hash8,
+                    )
+                    # SSE publish — best-effort, never breaks the scan.
+                    try:
+                        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                            EVENT_TYPE_CODEBASE_CHARACTER_INJECTED,
+                            get_default_broker,
+                        )
+                        broker = get_default_broker()
+                        if broker is not None:
+                            broker.publish(
+                                event_type=(
+                                    EVENT_TYPE_CODEBASE_CHARACTER_INJECTED
+                                ),
+                                op_id="",
+                                payload={
+                                    "cluster_id": cluster.cluster_id,
+                                    "centroid_hash8": cluster.centroid_hash8,
+                                    "kind": cluster.kind,
+                                    "theme_label": cluster.theme_label,
+                                    "size": cluster.size,
+                                },
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:
+                    logger.debug(
+                        "[ExplorationSensor] Cluster-coverage emit "
+                        "failed for hash=%s",
+                        cluster.centroid_hash8,
+                    )
+        except Exception:
+            logger.debug(
+                "[ExplorationSensor] Cluster-coverage scan error",
+                exc_info=True,
+            )
+        return emitted
 
     def _infer_target_files(self, domain_key: str) -> Tuple[str, ...]:
         """Infer representative target files from domain key.

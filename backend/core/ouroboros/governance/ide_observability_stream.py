@@ -393,6 +393,12 @@ EVENT_TYPE_TERMINATION_HOOK_DISPATCHED = "termination_hook_dispatched"
 # "saturation event" notifications + correlate to the structural
 # `pre_admission_shed` exhaustion at the orchestrator level.
 EVENT_TYPE_ADMISSION_DECISION_EMITTED = "admission_decision_emitted"
+# CodebaseCharacterDigest Slice 3 — emitted when ProactiveExploration
+# Sensor surfaces an under-touched semantic cluster as an IntentEnvelope.
+# Lets IDE/observability consumers correlate the cluster-coverage bias
+# firing to the resulting GENERATE op (via subsequent task lifecycle
+# events sharing the same op_id once intake assigns one).
+EVENT_TYPE_CODEBASE_CHARACTER_INJECTED = "codebase_character_injected"
 
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
@@ -460,6 +466,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CLOSURE_LOOP_PROPOSAL_EMITTED,     # Q4 P#2 Slice 4
     EVENT_TYPE_TERMINATION_HOOK_DISPATCHED,       # TermHook Slice 4
     EVENT_TYPE_ADMISSION_DECISION_EMITTED,        # AdmissionGate Slice 3
+    EVENT_TYPE_CODEBASE_CHARACTER_INJECTED,       # CodebaseCharDigest Slice 3
 })
 
 
