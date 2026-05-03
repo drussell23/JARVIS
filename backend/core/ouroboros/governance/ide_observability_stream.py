@@ -213,6 +213,15 @@ EVENT_TYPE_AUTO_COMMITTER_IGNORED_BLOCKED = (
     "auto_committer_ignored_blocked"
 )
 
+# ClusterIntelligence-CrossSession empirical-closure addendum —
+# semantic embedder degraded from fastembed (primary) to the pure-
+# stdlib hashing fallback. Fired once per process, when _AdaptiveEmbedder
+# detects fastembed cannot serve embeddings (offline / sandbox / model
+# download failure / runtime error). Operators subscribe to know that
+# the SemanticIndex is running on the lower-quality fallback and may
+# want to repair the fastembed install.
+EVENT_TYPE_SEMANTIC_EMBEDDER_FALLBACK = "semantic_embedder_fallback"
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -1685,6 +1694,43 @@ def publish_domain_map_update(
     except Exception:  # noqa: BLE001 -- best-effort
         logger.debug(
             "[Stream] publish_domain_map_update exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_semantic_embedder_fallback(
+    *,
+    primary_model: str,
+    fallback_model: str,
+    fallback_dim: int = 0,
+) -> Optional[str]:
+    """Best-effort publisher for ``semantic_embedder_fallback`` frames.
+
+    Returns the event_id on success, None when stream is disabled /
+    broker missing / publish raised. NEVER raises. Fired once per
+    process by ``_AdaptiveEmbedder`` when fastembed first fails and
+    the embedder permanently swaps to the stdlib fallback.
+
+    Read-only payload -- no authority surface. Carries model names +
+    dimensionality only; no corpus content, no embeddings, no tokens
+    (the cluster substrate's content lives in ``IndexStats`` projected
+    via the ``GET /observability/codebase-character`` route)."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_SEMANTIC_EMBEDDER_FALLBACK,
+            (primary_model or "unknown")[:200],
+            {
+                "primary_model": str(primary_model or "")[:200],
+                "fallback_model": str(fallback_model or "")[:200],
+                "fallback_dim": int(fallback_dim),
+            },
+        )
+    except Exception:  # noqa: BLE001 -- best-effort
+        logger.debug(
+            "[Stream] publish_semantic_embedder_fallback exception",
             exc_info=True,
         )
         return None
