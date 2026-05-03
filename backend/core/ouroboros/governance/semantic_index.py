@@ -48,9 +48,10 @@ import os
 import subprocess
 import threading
 import time
+import dataclasses as _dc
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from backend.core.secure_logging import sanitize_for_log
 
@@ -138,6 +139,68 @@ def _cache_enabled() -> bool:
 
 def _git_log_limit() -> int:
     return max(1, _env_int("JARVIS_SEMANTIC_GIT_LOG_N", 30, minimum=1))
+
+
+# ---------------------------------------------------------------------------
+# ClusterIntelligence-CrossSession Slice 1 — representative_paths enrichment
+# ---------------------------------------------------------------------------
+#
+# Master flag stays OFF until Slice 5 graduation. When OFF:
+#   * `_assemble_corpus` skips capturing commit_hash on CorpusItem
+#     (existing %ct|%s git log format unchanged on the wire)
+#   * `_load_commit_paths` is never called -- zero extra subprocess
+#   * `_attach_paths_to_clusters` is never called
+#   * `ClusterInfo.representative_paths` defaults to () for every cluster
+# So pre-graduation behavior is byte-identical to today's index.
+
+
+def _representative_paths_enabled() -> bool:
+    """``JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED``
+    (default ``false`` until Slice 5 graduation).
+
+    When on, the cluster builder runs a second ``git log
+    --name-only`` pass to map commits -> file paths, then
+    enriches each ClusterInfo with the top-K most-touched paths
+    across its member commits. ProactiveExploration consumes
+    these in Slice 2 to replace the ``(".",)`` project-root
+    sentinel with a per-cluster bounded scope.
+    """
+    raw = os.environ.get(
+        "JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return False  # pre-graduation default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _cluster_representative_path_k() -> int:
+    """``JARVIS_CLUSTER_REPRESENTATIVE_PATH_K`` (default 8, floor
+    1, ceiling 64). Top-K most-touched paths surfaced per
+    cluster."""
+    raw = os.environ.get(
+        "JARVIS_CLUSTER_REPRESENTATIVE_PATH_K", "",
+    ).strip()
+    try:
+        n = int(raw) if raw else 8
+    except ValueError:
+        n = 8
+    return max(1, min(64, n))
+
+
+def _git_path_scan_timeout_s() -> float:
+    """``JARVIS_SEMANTIC_GIT_PATH_SCAN_TIMEOUT_S`` (default 8.0,
+    floor 1.0, ceiling 30.0). Subprocess timeout for the
+    second ``git log --name-only`` pass. Higher than the
+    ``%ct|%s`` pass (5s) because ``--name-only`` payload is
+    larger and the parse is line-walked."""
+    raw = os.environ.get(
+        "JARVIS_SEMANTIC_GIT_PATH_SCAN_TIMEOUT_S", "",
+    ).strip()
+    try:
+        n = float(raw) if raw else 8.0
+    except ValueError:
+        n = 8.0
+    return max(1.0, min(30.0, n))
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +350,13 @@ class CorpusItem:
     source: str  # SOURCE_* constant
     ts: float
     halflife_days: float = 14.0
+    # Slice 1 (ClusterIntelligence-CrossSession) additive field. Only
+    # populated for ``source == SOURCE_GIT_COMMIT`` items AND only when
+    # ``_representative_paths_enabled()`` is on at corpus-assembly
+    # time. Empty string for every other source / when the master flag
+    # is off. Carries the full 40-char SHA so the path-attach pass can
+    # join member items -> commit -> file paths without a re-walk.
+    commit_hash: str = ""
 
 
 # Cluster-kind labels (§Slice 3a). Source-composition-derived.
@@ -328,6 +398,15 @@ class ClusterInfo:
     nearest_item_text: str
     nearest_item_source: str
     source_composition: Tuple[Tuple[str, int], ...]  # [(source, count), ...]
+    # Slice 1 (ClusterIntelligence-CrossSession) additive field. Top-K
+    # most-touched repository file paths across this cluster's member
+    # commits, ordered by descending touch count + lexicographic tie-
+    # break. Empty tuple when the master flag is off, when the cluster
+    # has zero git_commit members, or when ``git log --name-only``
+    # is unavailable (subprocess not found / timeout / non-zero
+    # return). ProactiveExploration (Slice 2) substitutes these for
+    # the ``(".",)`` project-root sentinel when populated.
+    representative_paths: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -960,6 +1039,214 @@ def _classify_cluster_kind(
 
 
 # ---------------------------------------------------------------------------
+# Slice 1 (ClusterIntelligence-CrossSession) -- commit-paths loader
+# ---------------------------------------------------------------------------
+
+
+_COMMIT_PATH_BLOCK_PREFIX: str = ">>>"
+
+
+def _load_commit_paths(
+    project_root: Path,
+    *,
+    git_limit: int,
+    timeout_s: float,
+) -> Dict[str, Tuple[str, ...]]:
+    """Run a second ``git log --name-only`` pass to map each
+    commit hash -> tuple of repository file paths it touched.
+
+    Output structure (chosen so a single subprocess can be parsed
+    line-by-line without commit-message-content escaping)::
+
+        >>>abc123...
+        path/to/file_a.py
+        path/to/file_b.py
+
+        >>>def456...
+        path/to/file_c.py
+
+    NEVER raises -- every degraded path returns an empty dict so
+    the caller's cluster-build keeps going with the existing
+    ``representative_paths=()`` default. Defensive against:
+      * git binary missing (FileNotFoundError)
+      * subprocess timeout (TimeoutExpired)
+      * non-zero return (unparented branch / shallow clone / etc.)
+      * malformed lines (silently skipped)
+      * ``project_root`` invalid (OSError)
+
+    Cost contract: subprocess timeout is hard-clamped via
+    :func:`_git_path_scan_timeout_s` (1-30s, default 8s). Output is
+    bounded by ``git_limit`` * average-files-per-commit; on this
+    repo that's ~30 commits * <50 files = under 1500 lines.
+    """
+    out: Dict[str, Tuple[str, ...]] = {}
+    try:
+        result = subprocess.run(
+            [
+                "git", "log", f"-{git_limit}",
+                "--name-only",
+                f"--pretty=format:{_COMMIT_PATH_BLOCK_PREFIX}%H",
+            ],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        logger.debug(
+            "[SemanticIndex] git log --name-only unavailable",
+            exc_info=True,
+        )
+        return out
+    if result.returncode != 0:
+        logger.debug(
+            "[SemanticIndex] git log --name-only returned %d",
+            result.returncode,
+        )
+        return out
+
+    current_hash: Optional[str] = None
+    current_paths: List[str] = []
+    try:
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                # Blank line separates commits -- flush current.
+                if current_hash:
+                    out[current_hash] = tuple(current_paths)
+                current_hash = None
+                current_paths = []
+                continue
+            if line.startswith(_COMMIT_PATH_BLOCK_PREFIX):
+                # New commit boundary -- flush previous.
+                if current_hash:
+                    out[current_hash] = tuple(current_paths)
+                hash_only = line[len(_COMMIT_PATH_BLOCK_PREFIX):].strip()
+                if hash_only:
+                    current_hash = hash_only
+                    current_paths = []
+                else:
+                    current_hash = None
+                    current_paths = []
+                continue
+            # Path line under the active commit.
+            if current_hash:
+                # Defensive: skip suspicious paths (absolute,
+                # contains nul). Normal repo paths are forward-slash
+                # relatives; we don't touch them.
+                if "\x00" in line or line.startswith("/"):
+                    continue
+                current_paths.append(line)
+        # Flush trailing block (no blank line after last commit).
+        if current_hash:
+            out[current_hash] = tuple(current_paths)
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.debug(
+            "[SemanticIndex] _load_commit_paths parse degraded: %s",
+            exc,
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Slice 1 -- attach representative_paths to ClusterInfo tuples
+# ---------------------------------------------------------------------------
+
+
+def _attach_paths_to_clusters(
+    clusters: Sequence["ClusterInfo"],
+    centroid_members: Sequence["CorpusItem"],
+    cluster_labels: Sequence[int],
+    commit_paths_by_hash: Mapping[str, Tuple[str, ...]],
+    *,
+    top_k: int,
+) -> List["ClusterInfo"]:
+    """Return new ClusterInfo tuples with ``representative_paths``
+    populated. NEVER raises -- on any degraded path the original
+    cluster is returned unchanged (empty paths preserved).
+
+    Aggregation: for each cluster, walk its member items, drop
+    those with empty ``commit_hash`` (non-commit sources), look
+    up the commit's file paths, count touch frequency across the
+    cluster, then surface top-K paths ordered by ``(-touch_count,
+    path)``. Ties broken lexicographically for determinism.
+
+    Length invariants:
+      * ``cluster_labels`` is parallel to ``centroid_members`` --
+        labels[i] is the cluster_id of centroid_members[i].
+      * mismatched lengths -> defensively return clusters
+        unchanged (the caller's k-means failed to produce parallel
+        outputs; we don't guess).
+    """
+    if not clusters:
+        return list(clusters)
+    if top_k <= 0:
+        return list(clusters)
+    if len(cluster_labels) != len(centroid_members):
+        logger.debug(
+            "[SemanticIndex] _attach_paths labels/members length "
+            "mismatch (%d vs %d) -- returning unchanged",
+            len(cluster_labels), len(centroid_members),
+        )
+        return list(clusters)
+
+    # Bucket member commit-hashes per cluster_id.
+    members_by_cluster: Dict[int, List[str]] = {}
+    try:
+        for member, cid in zip(centroid_members, cluster_labels):
+            commit_hash = getattr(member, "commit_hash", "") or ""
+            if not commit_hash:
+                continue
+            members_by_cluster.setdefault(int(cid), []).append(commit_hash)
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.debug(
+            "[SemanticIndex] _attach_paths bucketing degraded: %s",
+            exc,
+        )
+        return list(clusters)
+
+    out: List["ClusterInfo"] = []
+    for cluster in clusters:
+        try:
+            cid = int(cluster.cluster_id)
+        except Exception:  # noqa: BLE001
+            out.append(cluster)
+            continue
+        member_hashes = members_by_cluster.get(cid, [])
+        if not member_hashes:
+            out.append(cluster)
+            continue
+        # Tally path touch counts across this cluster's commits.
+        path_counts: Dict[str, int] = {}
+        for h in member_hashes:
+            paths = commit_paths_by_hash.get(h, ())
+            for p in paths:
+                if not isinstance(p, str) or not p:
+                    continue
+                path_counts[p] = path_counts.get(p, 0) + 1
+        if not path_counts:
+            out.append(cluster)
+            continue
+        # Top-K by (-count, path) for deterministic ordering.
+        sorted_paths = sorted(
+            path_counts.items(), key=lambda kv: (-kv[1], kv[0]),
+        )
+        representative = tuple(p for p, _ in sorted_paths[:top_k])
+        try:
+            out.append(_dc.replace(
+                cluster, representative_paths=representative,
+            ))
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[SemanticIndex] _attach_paths replace degraded: %s",
+                exc,
+            )
+            out.append(cluster)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Corpus assembler (deterministic, zero model inference)
 # ---------------------------------------------------------------------------
 
@@ -978,9 +1265,20 @@ def _assemble_corpus(
     include_pm_in_centroid = _postmortem_in_centroid()
 
     # --- Git commits (subject lines) ---
+    # Slice 1 (ClusterIntelligence-CrossSession): when the
+    # representative-paths master flag is on, swap the pretty-format
+    # to capture the commit hash too. Subject lines may contain ``|``
+    # so we always split on the first 2 separators -- safe regardless
+    # of subject content. When the flag is off, byte-identical
+    # behavior to the pre-Slice-1 path.
+    capture_commit_hash = _representative_paths_enabled()
+    git_pretty = (
+        "--pretty=format:%ct|%H|%s" if capture_commit_hash
+        else "--pretty=format:%ct|%s"
+    )
     try:
         result = subprocess.run(
-            ["git", "log", f"-{git_limit}", "--pretty=format:%ct|%s"],
+            ["git", "log", f"-{git_limit}", git_pretty],
             cwd=str(project_root),
             capture_output=True,
             text=True,
@@ -991,7 +1289,15 @@ def _assemble_corpus(
             for line in result.stdout.splitlines():
                 if "|" not in line:
                     continue
-                ts_s, subj = line.split("|", 1)
+                if capture_commit_hash:
+                    parts = line.split("|", 2)
+                    if len(parts) != 3:
+                        continue
+                    ts_s, commit_hash, subj = parts
+                    commit_hash = commit_hash.strip()
+                else:
+                    ts_s, subj = line.split("|", 1)
+                    commit_hash = ""
                 try:
                     ts = float(ts_s)
                 except ValueError:
@@ -1001,6 +1307,7 @@ def _assemble_corpus(
                     items.append(CorpusItem(
                         text=cleaned, source=SOURCE_GIT_COMMIT,
                         ts=ts, halflife_days=halflife_default,
+                        commit_hash=commit_hash,
                     ))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         logger.debug("[SemanticIndex] git log unavailable", exc_info=True)
@@ -1448,6 +1755,40 @@ class SemanticIndex:
                 nearest_item_source=nearest.source,
                 source_composition=tuple(sorted(comp.items())),
             ))
+
+        # Slice 1 (ClusterIntelligence-CrossSession) -- enrich each
+        # cluster with its top-K most-touched repository file paths.
+        # Gated by the master flag; when off, every cluster keeps the
+        # default ``representative_paths=()``. The git subprocess
+        # runs at most once per build (bounded timeout), and the
+        # attach pass is pure Python over already-collected items.
+        if (
+            _representative_paths_enabled()
+            and clusters
+            and any(
+                getattr(m, "commit_hash", "")
+                for m in centroid_members
+            )
+        ):
+            try:
+                commit_paths = _load_commit_paths(
+                    self._root,
+                    git_limit=_git_log_limit(),
+                    timeout_s=_git_path_scan_timeout_s(),
+                )
+                if commit_paths:
+                    clusters = _attach_paths_to_clusters(
+                        clusters,
+                        centroid_members,
+                        labels,
+                        commit_paths,
+                        top_k=_cluster_representative_path_k(),
+                    )
+            except Exception as exc:  # noqa: BLE001 -- defensive
+                logger.debug(
+                    "[SemanticIndex] representative_paths "
+                    "enrichment degraded: %s", exc,
+                )
         return (clusters, labels)
 
     @staticmethod
