@@ -156,17 +156,17 @@ class TestCallFallbackWiring:
 
 
 class TestMasterFlagPreservesBehavior:
-    def test_admission_gate_default_off(self, monkeypatch):
-        # Slice 2 ships with master flag default-false so the
-        # wiring lands without changing behavior. Slice 3
-        # graduation flips the default.
+    def test_admission_gate_default_on_post_graduation(
+        self, monkeypatch,
+    ):
+        # Graduated 2026-05-02 (Slice 3): default-True.
         monkeypatch.delenv(
             "JARVIS_ADMISSION_GATE_ENABLED", raising=False,
         )
         from backend.core.ouroboros.governance.admission_gate import (  # noqa: E501
             admission_gate_enabled,
         )
-        assert admission_gate_enabled() is False
+        assert admission_gate_enabled() is True
 
     def test_disabled_gate_decision_proceeds(self):
         # When master flag off, every admission check yields

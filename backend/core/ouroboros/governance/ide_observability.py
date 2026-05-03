@@ -2204,6 +2204,128 @@ class IDEObservabilityRouter:
             )
 
     # ----------------------------------------------------------------------
+    # AdmissionGate Slice 3 — observability surface
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _admission_gate_master_enabled() -> bool:
+        """Master flag for the admission-gate subsystem.
+        Default-true (graduated). 403 ``admission_gate_disabled``
+        when off — port-scanner discipline + operator's instant-
+        rollback path."""
+        try:
+            from backend.core.ouroboros.governance.admission_gate import (  # noqa: E501
+                admission_gate_enabled,
+            )
+        except ImportError:
+            return False
+        return admission_gate_enabled()
+
+    async def _handle_admission_gate(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/admission-gate`` — bounded read-
+        only projection of the AdmissionGate subsystem.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "enabled": true,
+              "config": {
+                "min_viable_call_s": 25.0,
+                "budget_safety_factor": 1.2,
+                "queue_depth_hard_cap": 16,
+                "estimator_alpha": 0.3
+              },
+              "estimator": {
+                "alpha": 0.3,
+                "ewma_per_route_s": {"immediate": 12.4, ...},
+                "sample_counts": {"immediate": 47, ...}
+              },
+              "history": {
+                "capacity": 64,
+                "size": 12,
+                "recent": [<AdmissionRecord.to_dict()>, ...]
+              }
+            }
+
+        Returns 403 ``admission_gate_disabled`` when master flag
+        off (port-scanner discipline). Optional ``?limit=N``
+        bounds the recent-history projection (default 50,
+        clamped [1, 200]). NEVER raises."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._admission_gate_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.admission_gate_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        # Optional ?limit=N
+        raw_limit = request.query.get("limit")
+        if raw_limit is None:
+            limit = 50
+        else:
+            try:
+                limit = max(1, min(200, int(raw_limit)))
+            except (TypeError, ValueError):
+                return self._error_response(
+                    request, 400,
+                    "ide_observability.malformed_limit",
+                )
+        try:
+            from backend.core.ouroboros.governance.admission_gate import (  # noqa: E501
+                budget_safety_factor,
+                min_viable_call_s,
+                queue_depth_hard_cap,
+            )
+            from backend.core.ouroboros.governance.admission_estimator import (  # noqa: E501
+                estimator_alpha,
+                get_default_estimator,
+                get_default_history,
+            )
+            est_stats = get_default_estimator().stats()
+            history = get_default_history()
+            recent = list(history.snapshot(limit=limit))
+            return self._json_response(
+                request, 200,
+                {
+                    "enabled": True,
+                    "config": {
+                        "min_viable_call_s": min_viable_call_s(),
+                        "budget_safety_factor": (
+                            budget_safety_factor()
+                        ),
+                        "queue_depth_hard_cap": (
+                            queue_depth_hard_cap()
+                        ),
+                        "estimator_alpha": estimator_alpha(),
+                    },
+                    "estimator": est_stats,
+                    "history": {
+                        "capacity": history.capacity,
+                        "size": len(recent),
+                        "recent": recent,
+                    },
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] admission_gate failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.admission_gate_error",
+            )
+
+    # ----------------------------------------------------------------------
     # Q2 Slice 6 — DAG record diff
     # ----------------------------------------------------------------------
 
