@@ -144,6 +144,13 @@ class StrategicDirectionService:
         posture_block = self._render_posture_section()
         if posture_block:
             body = f"{body}\n\n{posture_block}"
+        # CodebaseCharacterDigest Slice 2 — additive section. Master
+        # flag default-False until Slice 3 graduation. Mirrors the
+        # posture-section discipline: fail-silent, ImportError-safe,
+        # advisory-only, no execution authority.
+        codebase_char_block = self._render_codebase_character_section()
+        if codebase_char_block:
+            body = f"{body}\n\n{codebase_char_block}"
         return body
 
     @staticmethod
@@ -169,6 +176,61 @@ class StrategicDirectionService:
         except Exception:
             return ""
         return compose_posture_section(reading)
+
+    @staticmethod
+    def _render_codebase_character_section() -> str:
+        """Compose the optional ``## Codebase Character`` block.
+
+        CodebaseCharacterDigest Slice 2 wire-up. Reads the existing
+        ``SemanticIndex.clusters`` artifact (already built by the v1.0
+        k-means path on session boot — we never trigger a rebuild from
+        the prompt path) and projects it through the pure-stdlib
+        ``compute_codebase_character`` total function. Snapshot's
+        ``to_prompt_section`` returns empty for any non-READY outcome
+        (DISABLED / INSUFFICIENT_CLUSTERS / STALE_INDEX / FAILED), so
+        the caller fails open without a code branch.
+
+        Discipline (load-bearing):
+          * Fail-silent on any exception — never break prompt composition.
+          * ImportError-safe — codebase_character or semantic_index
+            module missing → empty string.
+          * Char-budget capped at 1500 to stay within the existing
+            generation prompt envelope (mirrors LastSessionSummary
+            discipline).
+          * Authority-free — the snapshot's prompt section explicitly
+            disclaims authority over Iron Gate, routing, risk tier,
+            policy, or FORBIDDEN_PATH matching.
+        """
+        try:
+            from backend.core.ouroboros.governance.codebase_character import (  # noqa: E501
+                codebase_character_enabled,
+                compute_codebase_character,
+            )
+            from backend.core.ouroboros.governance.semantic_index import (
+                get_default_index,
+            )
+        except ImportError:
+            return ""
+        if not codebase_character_enabled():
+            return ""
+        try:
+            import time as _time
+            idx = get_default_index()
+            # Read existing artifact — DO NOT trigger rebuild from prompt
+            # path. The async build path owns refresh discipline.
+            clusters = idx.clusters
+            stats = idx.stats()
+            snapshot = compute_codebase_character(
+                enabled=True,
+                clusters=clusters,
+                cluster_mode=getattr(stats, "cluster_mode", "") or "",
+                total_corpus_items=int(getattr(stats, "corpus_n", 0) or 0),
+                built_at_ts=float(getattr(stats, "built_at", 0.0) or 0.0),
+                generated_at_ts=_time.time(),
+            )
+            return snapshot.to_prompt_section(max_chars=1500)
+        except Exception:  # noqa: BLE001 — fail-silent
+            return ""
 
     # ------------------------------------------------------------------
     # Internal extraction helpers
