@@ -702,34 +702,68 @@ class DomainMapStore:
 # ---------------------------------------------------------------------------
 
 
-_default_store: Optional[DomainMapStore] = None
+# Multi-repo sharding (Tier 2 #4 Slice C, 2026-05-03):
+# the singleton is keyed on a stable repo signature so workspaces
+# spanning multiple repos get one DomainMapStore per repo. The
+# on-disk layout is already per-``project_root`` (each store's
+# ``self._dir`` is ``<project_root>/.jarvis/domain_map``) -- only
+# the in-memory store object is sharded. Single-repo callers see
+# byte-identical behavior (one signature -> one entry).
+_default_stores: Dict[str, DomainMapStore] = {}
 _default_store_lock = threading.Lock()
 
 
 def get_default_store(
     project_root: Optional[Path] = None,
 ) -> Optional[DomainMapStore]:
-    """Lazy singleton. First call must supply ``project_root``;
-    subsequent calls return the existing instance regardless of
-    later root args (project_root is fixed for the process).
+    """Return the per-repo :class:`DomainMapStore` for ``project_root``.
 
-    Returns ``None`` only if a first-time construction is
-    attempted without ``project_root``."""
-    global _default_store
+    Keyed on the stable shard signature derived from the resolved
+    absolute path (see
+    :func:`multi_repo.repo_signature.compute_repo_signature`). Same
+    path -> same instance every call; distinct paths -> distinct
+    instances.
+
+    Returns ``None`` when called with no ``project_root`` AND no
+    store has been constructed yet for any shard. Once a store
+    exists, ``None``-arg lookups remain ``None`` -- the deferred-
+    init contract means callers MUST disambiguate which repo they
+    want by passing ``project_root`` (multi-repo callers can no
+    longer rely on a global "current" store).
+    """
+    if project_root is None:
+        return None
+    from backend.core.ouroboros.governance.multi_repo.repo_signature import (  # noqa: E501
+        compute_repo_signature,
+    )
+    signature = compute_repo_signature(Path(project_root))
     with _default_store_lock:
-        if _default_store is not None:
-            return _default_store
+        existing = _default_stores.get(signature)
+        if existing is not None:
+            return existing
+        instance = DomainMapStore(project_root=project_root)
+        _default_stores[signature] = instance
+        return instance
+
+
+def reset_default_store(
+    project_root: Optional[Path] = None,
+) -> None:
+    """Clear cached :class:`DomainMapStore` instances.
+
+    With no argument, clears every shard (matches the legacy
+    test-fixture behavior). With ``project_root`` supplied, clears
+    only that repo's shard so other repos keep their state.
+    """
+    with _default_store_lock:
         if project_root is None:
-            return None
-        _default_store = DomainMapStore(project_root=project_root)
-        return _default_store
-
-
-def reset_default_store() -> None:
-    """Test helper. Clears the singleton without touching disk."""
-    global _default_store
-    with _default_store_lock:
-        _default_store = None
+            _default_stores.clear()
+            return
+        from backend.core.ouroboros.governance.multi_repo.repo_signature import (  # noqa: E501
+            compute_repo_signature,
+        )
+        signature = compute_repo_signature(Path(project_root))
+        _default_stores.pop(signature, None)
 
 
 __all__ = [

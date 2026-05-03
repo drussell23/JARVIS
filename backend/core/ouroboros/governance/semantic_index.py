@@ -2665,29 +2665,60 @@ class SemanticIndex:
 # Process-wide singleton (mirror of conversation_bridge.get_default_bridge)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_INDEX: Optional[SemanticIndex] = None
+# Multi-repo sharding (Tier 2 #4 Slice B, 2026-05-03):
+# the singleton is keyed on a stable repo signature so workspaces
+# spanning multiple repos (jarvis + prime + reactor-core via
+# RepoRegistry) get one SemanticIndex per repo instead of all repos
+# silently sharing the first-caller's root. Single-repo callers see
+# byte-identical behavior -- one signature -> one entry in the dict.
+_DEFAULT_INDICES: Dict[str, SemanticIndex] = {}
 _DEFAULT_INDEX_LOCK = threading.Lock()
 
 
 def get_default_index(project_root: Optional[Path] = None) -> SemanticIndex:
-    """Return the process-wide :class:`SemanticIndex` singleton.
+    """Return the per-repo :class:`SemanticIndex` for ``project_root``.
 
-    First call decides the project root. Subsequent calls ignore the
-    ``project_root`` argument and return the cached instance.
+    The instance is keyed on a stable shard signature derived from
+    the resolved absolute path (see
+    :func:`multi_repo.repo_signature.compute_repo_signature`). Same
+    path -> same instance, every call. Distinct paths -> distinct
+    instances; this is the multi-repo sharding contract.
+
+    ``project_root=None`` falls back to ``os.getcwd()`` -- preserves
+    the legacy single-repo contract where callers don't specify a
+    root.
     """
-    global _DEFAULT_INDEX
+    from backend.core.ouroboros.governance.multi_repo.repo_signature import (  # noqa: E501
+        compute_repo_signature,
+    )
+    root = Path(project_root) if project_root else Path(os.getcwd())
+    signature = compute_repo_signature(root)
     with _DEFAULT_INDEX_LOCK:
-        if _DEFAULT_INDEX is None:
-            root = Path(project_root) if project_root else Path(os.getcwd())
-            _DEFAULT_INDEX = SemanticIndex(root)
-        return _DEFAULT_INDEX
+        existing = _DEFAULT_INDICES.get(signature)
+        if existing is not None:
+            return existing
+        instance = SemanticIndex(root)
+        _DEFAULT_INDICES[signature] = instance
+        return instance
 
 
-def reset_default_index() -> None:
-    """Clear the process-wide singleton. Primarily for tests."""
-    global _DEFAULT_INDEX
+def reset_default_index(project_root: Optional[Path] = None) -> None:
+    """Clear the cached :class:`SemanticIndex` instances.
+
+    With no argument, clears every entry (matches the legacy
+    test-fixture behavior). With ``project_root`` supplied, clears
+    only that repo's shard so other repos in the same process keep
+    their state.
+    """
+    from backend.core.ouroboros.governance.multi_repo.repo_signature import (  # noqa: E501
+        compute_repo_signature,
+    )
     with _DEFAULT_INDEX_LOCK:
-        _DEFAULT_INDEX = None
+        if project_root is None:
+            _DEFAULT_INDICES.clear()
+            return
+        signature = compute_repo_signature(Path(project_root))
+        _DEFAULT_INDICES.pop(signature, None)
 
 
 # ---------------------------------------------------------------------------
