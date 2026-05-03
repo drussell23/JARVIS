@@ -197,9 +197,18 @@ class ProductionOracleObserver:
             maxlen=history_size or history_ring_size(),
         )
         self._current: Optional[OracleObservation] = None
-        self._lock = asyncio.Lock()
+        # Lazy lock: constructed on first async access. Avoids the
+        # Python 3.9 "no current event loop in thread" failure when
+        # the observer is constructed in sync test/verdict context
+        # before any asyncio.run().
+        self._lock: Optional[asyncio.Lock] = None
         self._tick_count: int = 0
         self._failure_count: int = 0
+
+    def _ensure_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     @property
     def adapter_count(self) -> int:
@@ -266,7 +275,7 @@ class ProductionOracleObserver:
             adapters_queried=len(self._adapters),
             adapters_failed=adapters_failed,
         )
-        async with self._lock:
+        async with self._ensure_lock():
             self._current = obs
             self._history.append(obs)
             self._tick_count += 1
@@ -328,7 +337,12 @@ class ProductionOracleObserver:
 
 
 _DEFAULT_OBSERVER: Optional[ProductionOracleObserver] = None
-_DEFAULT_OBSERVER_LOCK = asyncio.Lock()
+# NB: do NOT construct asyncio.Lock at module-load time -- Python 3.9
+# raises "no current event loop in thread" when the import happens
+# before asyncio.run() / get_event_loop(). The singleton constructor
+# is only ever called from a coroutine OR from a sync test setup
+# where the next call is inside asyncio.run -- the GIL gives us
+# adequate atomicity for the simple "is None?" check + assignment.
 
 
 def get_default_observer(
