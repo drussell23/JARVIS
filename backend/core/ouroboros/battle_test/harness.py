@@ -1071,6 +1071,47 @@ class BattleTestHarness:
                     except Exception:
                         pass
 
+            # RenderConductor Slice 2 — wire whichever renderers are alive
+            # as backends. Master flag (JARVIS_RENDER_CONDUCTOR_ENABLED)
+            # default-false until Slice 7 graduation, so publishes are
+            # no-ops until operators flip the flag — backends remain
+            # registered so the hot-flip works without re-wire. NEVER
+            # raises; boot is not blocked by rendering glue.
+            try:
+                from backend.core.ouroboros.governance.render_backends import (
+                    wire_render_conductor,
+                )
+                from backend.core.ouroboros.battle_test.stream_renderer import (
+                    get_stream_renderer,
+                )
+
+                def _posture_provider() -> Optional[str]:
+                    try:
+                        from backend.core.ouroboros.governance.posture_store import (
+                            PostureStore,
+                        )
+                        store = PostureStore(
+                            base_dir=self._config.repo_path / ".jarvis",
+                        )
+                        reading = store.load_current()
+                        if reading is None:
+                            return None
+                        return reading.posture.value
+                    except Exception:  # noqa: BLE001 — defensive
+                        return None
+
+                wire_render_conductor(
+                    stream_renderer=get_stream_renderer(),
+                    serpent_flow=self._serpent_flow,
+                    ouroboros_console=getattr(self, "_tui_console", None),
+                    posture_provider=_posture_provider,
+                )
+            except Exception as _wire_exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[harness] render conductor wire failed: %s",
+                    _wire_exc,
+                )
+
             logger.info("Governance stack booted")
         except Exception as exc:
             logger.warning("Governance stack failed to boot: %s", exc)

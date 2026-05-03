@@ -344,9 +344,7 @@ class StreamRenderer:
             return
         try:
             kind = getattr(event, "kind", None)
-            kind_value = (
-                kind.value if hasattr(kind, "value") else str(kind or "")
-            )
+            kind_value = getattr(kind, "value", None) or str(kind or "")
             if kind_value == "REASONING_TOKEN":
                 content = getattr(event, "content", "") or ""
                 if content:
