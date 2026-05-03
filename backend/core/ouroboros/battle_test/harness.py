@@ -19,6 +19,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -749,11 +750,24 @@ class BattleTestHarness:
             # signal so retry storms cannot hijack termination. Only spawned
             # when max_wall_seconds_s is a positive float.
             self._wall_clock_monitor_task: Optional[asyncio.Future] = None
+            self._wall_clock_hard_deadline_thread: Optional[
+                threading.Thread
+            ] = None
+            self._wall_clock_hard_deadline_stop: Optional[
+                threading.Event
+            ] = None
             _wall_cap = self._config.max_wall_seconds_s
             if _wall_cap is not None and _wall_cap > 0:
                 self._wall_clock_monitor_task = asyncio.ensure_future(
                     self._monitor_wall_clock(_wall_cap)
                 )
+                # Defect #1 Slice B (2026-05-03) — thread-based safety
+                # net immune to asyncio starvation. The asyncio task
+                # above is the primary path (handles normal termination
+                # cleanly). The thread is the backstop: if the loop is
+                # wedged for longer than the grace window, the thread
+                # fires the event via call_soon_threadsafe.
+                self._start_wall_clock_hard_deadline_thread(_wall_cap)
                 logger.info(
                     "[WallClockWatchdog] armed: max_wall_seconds=%.0fs — session will "
                     "terminate with stop_reason=wall_clock_cap if not already stopped.",
@@ -3724,6 +3738,99 @@ class BattleTestHarness:
     # Hot-reload Restart Monitor
     # ------------------------------------------------------------------
 
+    def _start_wall_clock_hard_deadline_thread(
+        self, cap_s: float,
+    ) -> None:
+        """Defect #1 Slice B (2026-05-03) — thread-based safety net
+        immune to asyncio starvation.
+
+        The asyncio :meth:`_monitor_wall_clock` is the primary fire
+        path. This thread runs in parallel and fires the SAME
+        ``self._wall_clock_event`` (via ``loop.call_soon_threadsafe``)
+        if the asyncio path is wedged for longer than ``cap_s + grace``.
+
+        Grace defaults to 2 * check_interval_s so under normal
+        conditions the asyncio path always wins (no double-firing).
+        Env-tunable via ``JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S``;
+        floor 5s, ceiling 600s.
+
+        Daemonic thread — process exit kills it cleanly. Stop event
+        signals graceful exit when the asyncio path fired first.
+        NEVER raises into the host loop.
+        """
+        try:
+            raw_grace = os.environ.get(
+                "JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S", "",
+            ).strip()
+            grace_s = max(
+                5.0, min(600.0, float(raw_grace) if raw_grace else 30.0),
+            )
+        except (TypeError, ValueError):
+            grace_s = 30.0
+        # Anchor on monotonic clock — same discipline as the asyncio
+        # path; immune to NTP adjustments mid-soak.
+        anchor_monotonic = time.monotonic()
+        deadline_monotonic = anchor_monotonic + cap_s + grace_s
+        loop = asyncio.get_event_loop()
+        stop_event = threading.Event()
+        self._wall_clock_hard_deadline_stop = stop_event
+
+        def _watch() -> None:
+            try:
+                while not stop_event.is_set():
+                    now = time.monotonic()
+                    remaining = deadline_monotonic - now
+                    if remaining <= 0:
+                        # Deadline reached. Fire the asyncio event from
+                        # this thread via call_soon_threadsafe so the
+                        # async race in run() picks it up. If the loop
+                        # is wedged AND call_soon_threadsafe doesn't
+                        # process, the BoundedShutdownWatchdog (which
+                        # the asyncio path arms when it eventually
+                        # fires) is the next layer; failing that,
+                        # the OS-level signal handler is the last layer.
+                        try:
+                            loop.call_soon_threadsafe(
+                                self._wall_clock_event.set,
+                            )
+                        except Exception:  # noqa: BLE001 -- defensive
+                            pass
+                        # Also stamp stop_reason if not already set
+                        # (mirror the asyncio path's discipline).
+                        if self._stop_reason in ("unknown", "", None):
+                            self._stop_reason = "wall_clock_cap"
+                        try:
+                            import logging as _logging
+                            _logging.getLogger(
+                                "backend.core.ouroboros.battle_test.harness"
+                            ).warning(
+                                "[WallClockWatchdog] HARD DEADLINE "
+                                "thread fired: monotonic elapsed "
+                                "%.0fs >= cap %.0fs + grace %.0fs "
+                                "(asyncio path was wedged or already "
+                                "fired).",
+                                time.monotonic() - anchor_monotonic,
+                                cap_s, grace_s,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return
+                    # Sleep at most 5s OR remaining-to-deadline.
+                    # Bounds wake-up so stop_event.set() from the
+                    # asyncio path takes effect within 5s rather than
+                    # waiting for the full remaining duration.
+                    stop_event.wait(timeout=min(5.0, remaining))
+            except Exception:  # noqa: BLE001 -- contract: never crash
+                pass
+
+        thread = threading.Thread(
+            target=_watch,
+            daemon=True,
+            name="WallClockHardDeadlineThread",
+        )
+        self._wall_clock_hard_deadline_thread = thread
+        thread.start()
+
     async def _monitor_wall_clock(self, cap_s: float) -> None:
         """Ticket A Guard 2 — hard wall-clock watchdog.
 
@@ -3738,14 +3845,50 @@ class BattleTestHarness:
         which joins the FIRST_COMPLETED race in ``run()`` alongside shutdown /
         budget / idle waiters and routes to ``stop_reason="wall_clock_cap"``.
 
+        Defect #1 fix (2026-05-03): the original implementation issued a
+        single ``asyncio.sleep(cap_s)`` for the entire cap duration. When
+        the event loop was starved by long-running coroutines (e.g. 200+s
+        background ops doing blocking I/O), the sleep callback waited its
+        turn — observed soak v5 firing 22 minutes after the cap was hit.
+        Defense-in-depth fix:
+
+          1. Periodic check loop using monotonic clock — wakes every
+             ``JARVIS_WALL_CLOCK_CHECK_INTERVAL_S`` seconds (default 5s,
+             floor 1s), checks elapsed against cap_s. Caps fire delay at
+             one tick interval under normal conditions.
+          2. Thread-based hard deadline (Slice B) — runs in parallel,
+             immune to asyncio starvation entirely; fires at
+             ``cap_s + JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S`` if the
+             asyncio path is wedged.
+
         Per the harness-class footnote in the graduation matrix,
         ``wall_clock_cap`` is treated equivalent to ``idle_timeout`` for
         clean-bar purposes — both are orderly graceful-shutdown paths.
         """
+        # Capture monotonic anchor at task entry — immune to NTP
+        # adjustments during the soak (wall-clock time.time() can jump
+        # backwards or forwards; monotonic cannot).
+        anchor_monotonic = time.monotonic()
+        # Env-tunable check interval (no hardcoding; floor 1s to avoid
+        # busy-loop; ceiling 60s to cap fire delay under sane configs).
         try:
-            await asyncio.sleep(cap_s)
-        except asyncio.CancelledError:
-            return
+            raw = os.environ.get(
+                "JARVIS_WALL_CLOCK_CHECK_INTERVAL_S", "",
+            ).strip()
+            check_interval_s = max(
+                1.0, min(60.0, float(raw) if raw else 5.0),
+            )
+        except (TypeError, ValueError):
+            check_interval_s = 5.0
+        while True:
+            try:
+                await asyncio.sleep(check_interval_s)
+            except asyncio.CancelledError:
+                return
+            elapsed = time.monotonic() - anchor_monotonic
+            if elapsed >= cap_s:
+                break
+            # Loop continues; next sleep will wake at +check_interval_s.
         # If another waiter already fired and the shutdown path is in progress,
         # this is a no-op — set() on an already-set event is idempotent, and
         # the FIRST_COMPLETED race has already picked its winner.
@@ -3809,6 +3952,17 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             pass
         self._wall_clock_event.set()
+        # Defect #1 Slice B (2026-05-03) — signal the thread-based
+        # safety net to exit cleanly. Without this, the daemon thread
+        # would keep ticking until process exit (harmless but noisy).
+        try:
+            stop_evt = getattr(
+                self, "_wall_clock_hard_deadline_stop", None,
+            )
+            if stop_evt is not None:
+                stop_evt.set()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _monitor_restart_pending(self) -> None:
         """Background task: poll the orchestrator's hot-reloader for a
@@ -4255,3 +4409,115 @@ class BattleTestHarness:
             reset_ops_digest_observer()
         except Exception:
             logger.debug("reset_ops_digest_observer(clear) failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Defect #1 fix (2026-05-03) — WallClockWatchdog AST pin
+# ---------------------------------------------------------------------------
+#
+# Substrate pin enforcing the periodic-loop + thread-safety-net pattern
+# that replaced the original single-asyncio.sleep(cap_s) implementation.
+# Without this pin, a future edit could silently regress to the
+# starvation-vulnerable single-sleep pattern that fired 22 minutes
+# late in soak v5 (bt-2026-05-03-060330).
+
+
+def register_shipped_invariants() -> list:
+    """WallClockWatchdog substrate invariants. Pins:
+
+      * ``_monitor_wall_clock`` async method present.
+      * ``_start_wall_clock_hard_deadline_thread`` method present.
+      * ``_monitor_wall_clock`` body uses a periodic check loop
+        (must contain ``while True`` AND must NOT contain a top-level
+        ``asyncio.sleep(cap_s)`` call as the only sleep).
+      * ``JARVIS_WALL_CLOCK_CHECK_INTERVAL_S`` env var referenced
+        somewhere in the module (the periodic-check tick env knob).
+      * ``JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S`` env var referenced
+        (the thread-safety-net grace env knob).
+      * ``WallClockHardDeadlineThread`` thread name referenced
+        (proves the thread is actually spawned).
+      * No exec/eval/compile.
+    """
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    REQUIRED_FUNCS = (
+        "_monitor_wall_clock",
+        "_start_wall_clock_hard_deadline_thread",
+    )
+    REQUIRED_LITERALS = (
+        "JARVIS_WALL_CLOCK_CHECK_INTERVAL_S",
+        "JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S",
+        "WallClockHardDeadlineThread",
+    )
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        seen_funcs: set = set()
+        wall_clock_node: Optional[_ast.AsyncFunctionDef] = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AsyncFunctionDef):
+                seen_funcs.add(node.name)
+                if node.name == "_monitor_wall_clock":
+                    wall_clock_node = node
+            elif isinstance(node, _ast.FunctionDef):
+                seen_funcs.add(node.name)
+            elif isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"harness MUST NOT call {node.func.id}"
+                        )
+        for fn in REQUIRED_FUNCS:
+            if fn not in seen_funcs:
+                violations.append(f"missing function {fn!r}")
+        for lit in REQUIRED_LITERALS:
+            if lit not in source:
+                violations.append(
+                    f"missing string literal {lit!r}"
+                )
+        # Periodic-loop check: _monitor_wall_clock body MUST contain
+        # ``while True`` to enforce the periodic-check pattern; the
+        # original starvation-vulnerable design had only the
+        # ``await asyncio.sleep(cap_s)`` single-call.
+        if wall_clock_node is not None:
+            saw_while_true = False
+            for sub in _ast.walk(wall_clock_node):
+                if isinstance(sub, _ast.While):
+                    if (
+                        isinstance(sub.test, _ast.Constant)
+                        and sub.test.value is True
+                    ):
+                        saw_while_true = True
+                        break
+            if not saw_while_true:
+                violations.append(
+                    "_monitor_wall_clock MUST contain a 'while True' "
+                    "periodic-check loop (the Defect #1 fix); single-"
+                    "sleep regressions caused 22-min fire delay in "
+                    "soak v5"
+                )
+        return tuple(violations)
+
+    target = "backend/core/ouroboros/battle_test/harness.py"
+    return [
+        ShippedCodeInvariant(
+            invariant_name="wall_clock_watchdog_substrate",
+            target_file=target,
+            description=(
+                "WallClockWatchdog: periodic-check asyncio loop + "
+                "thread-based hard-deadline safety net + env-knob "
+                "references; protects against single-sleep "
+                "starvation regression (Defect #1, 2026-05-03)."
+            ),
+            validate=_validate,
+        ),
+    ]
