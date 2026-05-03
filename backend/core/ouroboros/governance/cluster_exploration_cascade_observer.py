@@ -79,7 +79,7 @@ _CLUSTER_COVERAGE_CATEGORY: str = "cluster_coverage"
 
 def cascade_observer_enabled() -> bool:
     """``JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED`` (default
-    ``false`` until Slice 5 graduation).
+    ``true`` post Slice 5 graduation, 2026-05-03).
 
     When off:
       * :func:`observe_cluster_coverage_completion` short-circuits
@@ -95,7 +95,7 @@ def cascade_observer_enabled() -> bool:
         "JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

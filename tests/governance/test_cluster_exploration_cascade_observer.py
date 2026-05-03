@@ -96,11 +96,11 @@ class TestConstants:
 
 
 class TestCascadeFlag:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
         monkeypatch.delenv(
             "JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED", raising=False,
         )
-        assert cascade_observer_enabled() is False
+        assert cascade_observer_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "On", "YES"])
     def test_truthy(self, monkeypatch, raw):
@@ -223,7 +223,11 @@ class TestParseTag:
 class TestObserveCompletion:
     @pytest.mark.asyncio
     async def test_master_off_returns_none(self, store, monkeypatch):
-        # cascade observer flag NOT set
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch for the cascade observer.
+        monkeypatch.setenv(
+            "JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED", "false",
+        )
         monkeypatch.setenv("JARVIS_DOMAIN_MAP_ENABLED", "true")
         out = await observe_cluster_coverage_completion(
             op_id="op-1",
@@ -243,7 +247,9 @@ class TestObserveCompletion:
         monkeypatch.setenv(
             "JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED", "true",
         )
-        monkeypatch.delenv("JARVIS_DOMAIN_MAP_ENABLED", raising=False)
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv("JARVIS_DOMAIN_MAP_ENABLED", "false")
         store = DomainMapStore(project_root=tmp_path)
         out = await observe_cluster_coverage_completion(
             op_id="op-1",
@@ -429,8 +435,10 @@ class TestObserveCompletion:
 
 class TestRenderPriorContext:
     def test_master_off_returns_empty(self, store, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED", raising=False,
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
+            "JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED", "false",
         )
         # Even with an entry on disk, master-off returns empty.
         store.record_exploration("abc12345", theme_label="x")
@@ -443,7 +451,9 @@ class TestRenderPriorContext:
         monkeypatch.setenv(
             "JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED", "true",
         )
-        monkeypatch.delenv("JARVIS_DOMAIN_MAP_ENABLED", raising=False)
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv("JARVIS_DOMAIN_MAP_ENABLED", "false")
         store = DomainMapStore(project_root=tmp_path)
         out = render_prior_context_block(
             "abc12345", store=store,
