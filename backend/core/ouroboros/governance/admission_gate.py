@@ -119,22 +119,32 @@ def _env_int_clamped(
 
 def admission_gate_enabled() -> bool:
     """Master switch — ``JARVIS_ADMISSION_GATE_ENABLED`` (default
-    FALSE until Slice 3 graduation).
+    TRUE post Slice 3 graduation, 2026-05-02).
 
-    Default-false is the conservative disposition: Slice 1 + 2
-    ship the substrate but don't change behavior until operators
-    explicitly opt in via env or until Slice 3 flips the
-    graduated default.
+    Operator-authorized graduation: the gate is now active by
+    default. Ops whose remaining budget cannot cover the
+    projected semaphore wait + ``min_viable_call_s`` are
+    structurally rejected with cause=``pre_admission_shed``
+    instead of consuming a slot they can't use. Hot-revert:
+    ``JARVIS_ADMISSION_GATE_ENABLED=false`` instantly disables
+    the gate (re-read on every dispatch).
 
-    Asymmetric env semantics: empty/whitespace = unset = current
-    default; explicit ``0`` / ``false`` / ``no`` / ``off``
-    evaluates false; explicit truthy values evaluate true.
-    Re-read on every call so flips hot-revert without restart."""
+    Default-true rationale: the gate is SAFETY infrastructure —
+    same disposition as the TerminationHookRegistry master.
+    Default-false would mean operators must explicitly opt in to
+    having the saturation pathology fixed; flipping the default
+    so the bug fix is on by default is the correct safety bias.
+
+    Asymmetric env semantics: empty/whitespace = unset =
+    graduated default true; explicit ``0`` / ``false`` / ``no`` /
+    ``off`` evaluates false; explicit truthy values evaluate
+    true. Re-read on every call so flips hot-revert without
+    restart."""
     raw = os.environ.get(
         "JARVIS_ADMISSION_GATE_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 3 graduation
+        return True  # graduated 2026-05-02 (Slice 3)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -633,6 +643,406 @@ def compute_admission_decision(
     )
 
 
+# ---------------------------------------------------------------------------
+# Slice 3 graduation — module-owned shipped_code_invariants + FlagRegistry
+# seeds. Discovered automatically via the
+# _INVARIANT_PROVIDER_PACKAGES + _FLAG_PROVIDER_PACKAGES contracts
+# (governance package already in both lists).
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code invariants. Returns the list so
+    the centralized seed loader can register them at boot. NEVER
+    raises (returns ``[]`` on import failure — graduation soak
+    path is fail-open per the established convention).
+
+    Four invariants pin the admission-gate arc's correctness-
+    critical surfaces:
+
+      1. ``admission_decision_vocabulary`` — the 5-value
+         :class:`AdmissionDecision` taxonomy is frozen against
+         silent expansion. Adding a 6th value silently breaks
+         the ``_PROCEED_OUTCOMES`` / ``_SHED_OUTCOMES``
+         partition invariants.
+      2. ``candidate_generator_admission_check_present`` — the
+         ``_call_fallback`` body MUST contain the admission-gate
+         dispatch. THIS IS THE BUG-FIX REGRESSION PIN — if a
+         future refactor removes the ``compute_admission_decision``
+         call from ``_call_fallback``, the IMMEDIATE-route
+         saturation pathology silently regresses (the
+         bt-2026-05-02-234923 reproduction returns).
+      3. ``compute_admission_decision_total`` — the substrate's
+         decision function MUST NOT contain any ``raise``
+         statement in its body. The "NEVER raises" contract is
+         load-bearing for the fail-open discipline at the
+         caller site.
+      4. ``admission_gate_no_caller_imports`` — the substrate
+         module MUST NOT import ``candidate_generator`` /
+         ``providers`` / ``orchestrator`` / etc. The dependency
+         direction is one-way (caller imports us; we import
+         nothing back) — promoted from Slice 1's local AST test
+         to a shipped invariant so production graduation soaks
+         enforce it too.
+    """
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    import ast as _ast
+
+    def _validate_decision_vocabulary(tree, source) -> tuple:
+        violations = []
+        required = {
+            "ADMIT",
+            "SHED_BUDGET_INSUFFICIENT",
+            "SHED_QUEUE_DEEP",
+            "DISABLED",
+            "FAILED",
+        }
+        seen = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and (
+                node.name == "AdmissionDecision"
+            ):
+                for stmt in node.body:
+                    if isinstance(stmt, _ast.Assign):
+                        for target in stmt.targets:
+                            if isinstance(target, _ast.Name):
+                                seen.add(target.id)
+        missing = required - seen
+        if missing:
+            violations.append(
+                f"AdmissionDecision lost values: "
+                f"{sorted(missing)} — closed taxonomy frozen by "
+                "Slice 3 graduation"
+            )
+        unexpected = seen - required - {"_generate_next_value_"}
+        if unexpected:
+            violations.append(
+                f"AdmissionDecision gained unpinned values: "
+                f"{sorted(unexpected)} — update the AST pin AND "
+                "the _PROCEED_OUTCOMES / _SHED_OUTCOMES "
+                "partition when widening the vocabulary"
+            )
+        return tuple(violations)
+
+    def _validate_call_fallback_admission_check(
+        tree, source,
+    ) -> tuple:
+        violations = []
+        # _call_fallback body MUST contain both:
+        #   1. import of compute_admission_decision (lazy import)
+        #   2. .is_shed() check on the decision record
+        #   3. raise of "pre_admission_shed" cause
+        # Walk the AST for an async function named
+        # "_call_fallback" inside the CandidateGenerator class.
+        found_fn = False
+        for node in _ast.walk(tree):
+            if isinstance(
+                node,
+                (_ast.FunctionDef, _ast.AsyncFunctionDef),
+            ) and node.name == "_call_fallback":
+                found_fn = True
+                try:
+                    body_src = _ast.unparse(node)
+                except AttributeError:
+                    body_src = source
+                if "compute_admission_decision" not in body_src:
+                    violations.append(
+                        "_call_fallback body MUST import "
+                        "compute_admission_decision — "
+                        "AdmissionGate Slice 2 wired this; "
+                        "removal regresses the IMMEDIATE-route "
+                        "saturation bug fix"
+                    )
+                if ".is_shed(" not in body_src:
+                    violations.append(
+                        "_call_fallback body MUST check "
+                        ".is_shed() on the admission record — "
+                        "the shed branch is the bug fix"
+                    )
+                if "pre_admission_shed" not in body_src:
+                    violations.append(
+                        "_call_fallback body MUST raise "
+                        "EXHAUSTION with cause="
+                        "'pre_admission_shed' on shed — the "
+                        "literal cause string is the "
+                        "observability contract"
+                    )
+                break
+        if not found_fn:
+            violations.append(
+                "_call_fallback method not found in "
+                "candidate_generator — refactor "
+                "renamed/removed the function the bug fix lives "
+                "in"
+            )
+        return tuple(violations)
+
+    def _validate_decision_function_total(
+        tree, source,
+    ) -> tuple:
+        # Walk the AST for compute_admission_decision; assert
+        # NO Raise nodes inside its body. This is the "NEVER
+        # raises" contract — load-bearing for caller fail-open.
+        violations = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef) and (
+                node.name == "compute_admission_decision"
+            ):
+                for sub in _ast.walk(node):
+                    if isinstance(sub, _ast.Raise):
+                        violations.append(
+                            f"compute_admission_decision body "
+                            f"contains a `raise` statement at "
+                            f"line {sub.lineno} — the function "
+                            "MUST be total (NEVER raises)"
+                        )
+                break
+        return tuple(violations)
+
+    def _validate_no_caller_imports(tree, source) -> tuple:
+        violations = []
+        forbidden = {
+            "candidate_generator", "providers",
+            "orchestrator", "urgency_router",
+            "iron_gate", "risk_tier", "change_engine",
+            "gate", "yaml_writer", "policy",
+        }
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom) and node.module:
+                parts = node.module.split(".")
+                for f in forbidden:
+                    if f in parts:
+                        violations.append(
+                            f"forbidden caller-side import: "
+                            f"{node.module} (substrate must "
+                            "stay caller-agnostic — dependency "
+                            "direction is one-way)"
+                        )
+            elif isinstance(node, _ast.Import):
+                for alias in node.names:
+                    parts = alias.name.split(".")
+                    for f in forbidden:
+                        if f in parts:
+                            violations.append(
+                                f"forbidden caller-side "
+                                f"import: {alias.name}"
+                            )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="admission_decision_vocabulary",
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "admission_gate.py"
+            ),
+            description=(
+                "AdmissionDecision's 5-value closed taxonomy is "
+                "frozen. Adding a 6th value silently breaks the "
+                "_PROCEED_OUTCOMES / _SHED_OUTCOMES partition "
+                "invariants and the proceeds()/is_shed() "
+                "helpers at every call site."
+            ),
+            validate=_validate_decision_vocabulary,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "candidate_generator_admission_check_present"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "candidate_generator.py"
+            ),
+            description=(
+                "THE BUG-FIX REGRESSION PIN. _call_fallback "
+                "MUST contain the admission-gate dispatch + "
+                ".is_shed() branch + pre_admission_shed cause "
+                "string. Slice 2 wired these to fix the "
+                "bt-2026-05-02-234923 IMMEDIATE-route "
+                "saturation reproduction. Silent removal "
+                "regresses the bug."
+            ),
+            validate=_validate_call_fallback_admission_check,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "compute_admission_decision_total"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "admission_gate.py"
+            ),
+            description=(
+                "compute_admission_decision MUST NOT contain a "
+                "`raise` statement in its body. The 'NEVER "
+                "raises' contract is load-bearing for the "
+                "caller's fail-open discipline at the "
+                "_call_fallback integration site."
+            ),
+            validate=_validate_decision_function_total,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="admission_gate_no_caller_imports",
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "admission_gate.py"
+            ),
+            description=(
+                "Substrate stays caller-agnostic: no "
+                "candidate_generator / providers / "
+                "orchestrator imports. Dependency direction is "
+                "one-way — caller imports us; we import "
+                "nothing back. Promoted from Slice 1's local "
+                "AST test to a shipped invariant for "
+                "production graduation enforcement."
+            ),
+            validate=_validate_no_caller_imports,
+        ),
+    ]
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration. Mirrors the
+    discovery contract used by all prior arcs (closure-loop /
+    termination-hook / etc.) — the seed loader walks
+    ``_FLAG_PROVIDER_PACKAGES`` (governance is already in the
+    list) and invokes once at boot. Adding a new flag requires
+    zero edits to the seed file. Returns count of FlagSpecs
+    registered. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+    specs = [
+        FlagSpec(
+            name="JARVIS_ADMISSION_GATE_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for the AdmissionGate. "
+                "Default TRUE post Slice 3 graduation "
+                "(2026-05-02) — the gate is SAFETY "
+                "infrastructure that prevents "
+                "IMMEDIATE-route saturation when multiple "
+                "ops compete for the Claude API connection "
+                "pool. Hot-revert: ``=false`` instantly "
+                "disables (re-read on every dispatch — flips "
+                "take effect immediately for the next op "
+                "without restart)."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "admission_gate.py"
+            ),
+            example="true",
+            since="AdmissionGate Slice 3 (2026-05-02)",
+        ),
+        FlagSpec(
+            name="JARVIS_ADMISSION_MIN_VIABLE_CALL_S",
+            type=FlagType.FLOAT,
+            default=25.0,
+            description=(
+                "Minimum Claude-fallback call duration we need "
+                "to leave AFTER the projected semaphore wait. "
+                "Default 25.0 seconds, clamped [10.0, 60.0]. "
+                "An IMMEDIATE-route Claude call with extended-"
+                "thinking + Venom tool loop typically needs "
+                "25-90 seconds for one round; 25s is the floor "
+                "where ANY useful work can land. Lower values "
+                "risk admitting ops that time out at the API "
+                "layer instead of at the gate — defeating the "
+                "gate's purpose."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "admission_gate.py"
+            ),
+            example="25.0",
+            since="AdmissionGate Slice 3 (2026-05-02)",
+        ),
+        FlagSpec(
+            name="JARVIS_ADMISSION_BUDGET_SAFETY_FACTOR",
+            type=FlagType.FLOAT,
+            default=1.2,
+            description=(
+                "Multiplier on the projected semaphore wait "
+                "time when checking budget viability. Default "
+                "1.2, clamped [1.0, 3.0]. Higher = MORE "
+                "shedding (more conservative); lower = LESS "
+                "shedding (more aggressive admission). The "
+                "EWMA projection is an estimate — the safety "
+                "factor accounts for variance."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "admission_gate.py"
+            ),
+            example="1.2",
+            since="AdmissionGate Slice 3 (2026-05-02)",
+        ),
+        FlagSpec(
+            name="JARVIS_ADMISSION_QUEUE_DEPTH_HARD_CAP",
+            type=FlagType.INT,
+            default=16,
+            description=(
+                "Absolute upper bound on the semaphore queue "
+                "depth. Default 16, clamped [1, 128]. Even "
+                "when budget math says ok, a runaway queue is "
+                "dangerous (memory, head-of-line blocking, "
+                "observability distortion). The hard cap is "
+                "second-line defense: any op arriving when "
+                "the queue is at this depth is "
+                "SHED_QUEUE_DEEP regardless of budget."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "admission_gate.py"
+            ),
+            example="16",
+            since="AdmissionGate Slice 3 (2026-05-02)",
+        ),
+        FlagSpec(
+            name="JARVIS_ADMISSION_ESTIMATOR_ALPHA",
+            type=FlagType.FLOAT,
+            default=0.3,
+            description=(
+                "EWMA weight on the new observation in the "
+                "WaitTimeEstimator. Default 0.3, clamped "
+                "[0.05, 0.95]. Higher alpha = more responsive "
+                "to recent waits (good when queue depth is "
+                "volatile; can over-react to outliers). Lower "
+                "alpha = smoother projection (good when queue "
+                "depth is steady; slow to react to genuine "
+                "load changes)."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "admission_estimator.py"
+            ),
+            example="0.3",
+            since="AdmissionGate Slice 3 (2026-05-02)",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    return len(specs)
+
+
 __all__ = [
     "ADMISSION_GATE_SCHEMA_VERSION",
     "AdmissionContext",
@@ -643,4 +1053,6 @@ __all__ = [
     "compute_admission_decision",
     "min_viable_call_s",
     "queue_depth_hard_cap",
+    "register_flags",
+    "register_shipped_invariants",
 ]

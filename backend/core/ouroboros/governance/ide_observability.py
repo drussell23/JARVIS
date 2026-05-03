@@ -357,6 +357,13 @@ class IDEObservabilityRouter:
             "/observability/termination-hooks",
             self._handle_termination_hooks,
         )
+        # AdmissionGate Slice 3 — bounded read-only projection
+        # of master-flag + env-knob config + estimator stats +
+        # recent admission decisions ring (default 64 entries).
+        app.router.add_get(
+            "/observability/admission-gate",
+            self._handle_admission_gate,
+        )
 
     # --- request-path helpers ---------------------------------------------
 

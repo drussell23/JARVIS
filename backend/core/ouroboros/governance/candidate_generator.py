@@ -1158,6 +1158,22 @@ class CandidateGenerator:
             os.environ.get("OUROBOROS_TIER0_SKIP_WINDOW_S", "30")
         )
 
+        # AdmissionGate Slice 2 — per-route rolling EWMA of
+        # observed _fallback_sem wait times. Feeds the
+        # admission gate's projected_wait_s input. Updated
+        # post-acquire in _call_fallback after every successful
+        # sem.acquire(). Master flag default-FALSE until Slice 3
+        # graduation, so the gate is constructed but doesn't
+        # change behavior — pre-Slice-2 path preserved when
+        # disabled.
+        try:
+            from backend.core.ouroboros.governance.admission_estimator import (  # noqa: E501
+                WaitTimeEstimator as _WaitTimeEstimator,
+            )
+            self._wait_estimator = _WaitTimeEstimator()
+        except Exception:  # noqa: BLE001 — defensive
+            self._wait_estimator = None
+
         # ── Phase 1 Step 3A: state hoist (un-quarantine blueprint) ──
         # Invariant: every mutable field that must survive
         # `importlib.reload(candidate_generator)` lives on `self._state`
@@ -3566,10 +3582,150 @@ class CandidateGenerator:
             _max_cap,
         )
 
+        # AdmissionGate Slice 2 — pre-acquire viability check.
+        # Refuses admission when projected wait + min-viable
+        # call exceeds remaining budget, sheds load BEFORE
+        # consuming a semaphore slot. Master flag default-FALSE
+        # until Slice 3 — disabled gate degrades to ADMIT
+        # (preserves pre-Slice-2 behavior). NEVER raises;
+        # adopting a fail-open posture so a gate bug cannot
+        # itself starve a legitimate op.
+        try:
+            from backend.core.ouroboros.governance.admission_gate import (  # noqa: E501
+                AdmissionContext as _AdmissionContext,
+                admission_gate_enabled as _admission_gate_enabled,
+                compute_admission_decision as _compute_admission_decision,
+            )
+            _wait_est = getattr(self, "_wait_estimator", None)
+            _projected_wait = (
+                _wait_est.project_wait(_op_route)
+                if _wait_est is not None else 0.0
+            )
+            # _fallback_sem._value is "slots free"; depth =
+            # capacity − free.
+            _live_depth = max(
+                0,
+                self._fallback_concurrency
+                - int(getattr(self._fallback_sem, "_value", 0)),
+            )
+            _admission_ctx = _AdmissionContext(
+                route=_op_route,
+                remaining_s=_pre_sem_remaining,
+                queue_depth=_live_depth,
+                projected_wait_s=_projected_wait,
+                op_id=str(getattr(context, "op_id", ""))[:48],
+            )
+            _admission = _compute_admission_decision(
+                _admission_ctx,
+                enabled=_admission_gate_enabled(),
+                decided_at_ts=time.time(),
+            )
+            # Slice 3 — record EVERY decision (admit + shed) to
+            # the bounded ring so the GET /observability/admission-
+            # gate route shows recent admission patterns.
+            # Best-effort, NEVER raises into the call path.
+            try:
+                from backend.core.ouroboros.governance.admission_estimator import (  # noqa: E501
+                    get_default_history as _admit_history,
+                )
+                _admit_history().record(_admission.to_dict())
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[CandidateGenerator] admission history "
+                    "record degraded: %s", exc,
+                )
+            if _admission.is_shed():
+                logger.info(
+                    "[CandidateGenerator] Pre-admission shed "
+                    "decision=%s reason=%s route=%s "
+                    "remaining=%.2fs projected_wait=%.2fs "
+                    "queue_depth=%d required_budget=%.2fs",
+                    _admission.decision.value,
+                    _admission.reason, _admission.route,
+                    _admission.remaining_s,
+                    _admission.projected_wait_s,
+                    _admission.queue_depth,
+                    _admission.required_budget_s,
+                )
+                # Slice 3 — publish SSE event for IDE
+                # consumers to surface saturation in real time.
+                # Best-effort.
+                try:
+                    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                        EVENT_TYPE_ADMISSION_DECISION_EMITTED,
+                        get_default_broker,
+                    )
+                    _br = get_default_broker()
+                    if _br is not None:
+                        _br.publish(
+                            event_type=(
+                                EVENT_TYPE_ADMISSION_DECISION_EMITTED
+                            ),
+                            op_id=str(
+                                getattr(context, "op_id", "")
+                                or "",
+                            )[:48],
+                            payload=_admission.to_dict(),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "[CandidateGenerator] admission SSE "
+                        "publish degraded: %s", exc,
+                    )
+                self._raise_exhausted(
+                    "pre_admission_shed",
+                    context=context,
+                    deadline=deadline,
+                    sem_wait_total_s=0.0,
+                    pre_sem_remaining_s=round(
+                        _pre_sem_remaining, 2,
+                    ),
+                    admission_decision=(
+                        _admission.decision.value
+                    ),
+                    admission_reason=_admission.reason,
+                    projected_wait_s=round(
+                        _admission.projected_wait_s, 2,
+                    ),
+                    queue_depth_at_check=(
+                        _admission.queue_depth
+                    ),
+                    required_budget_s=round(
+                        _admission.required_budget_s, 2,
+                    ),
+                )
+        except RuntimeError:
+            # _raise_exhausted raises RuntimeError — don't
+            # swallow our own structural shed.
+            raise
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            logger.debug(
+                "[CandidateGenerator] Admission gate "
+                "degraded — proceeding to acquire: %s", exc,
+            )
+
         try:
             async with self._fallback_sem:
                 _sem_wait_s = time.monotonic() - _sem_t0
                 _parent_remaining = self._remaining_seconds(deadline)
+
+                # AdmissionGate Slice 2 — feed observed wait
+                # back to the EWMA estimator so the next op's
+                # projection reflects actual queue pressure.
+                # NEVER raises into the call path.
+                try:
+                    _wait_est_post = getattr(
+                        self, "_wait_estimator", None,
+                    )
+                    if _wait_est_post is not None:
+                        _wait_est_post.update_observed(
+                            _op_route, _sem_wait_s,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "[CandidateGenerator] Estimator "
+                        "update degraded: %s", exc,
+                    )
 
                 if _sem_wait_s > 1.0:
                     logger.info(
