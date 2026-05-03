@@ -42,6 +42,7 @@ Dependency direction (beef #3):
 from __future__ import annotations
 
 import hashlib
+import re
 import logging
 import math
 import os
@@ -113,6 +114,14 @@ def _prompt_injection_enabled() -> bool:
 
 def _embedder_name() -> str:
     return os.environ.get("JARVIS_SEMANTIC_EMBEDDER", "fastembed").strip().lower()
+
+
+def _fastembed_fallback_enabled() -> bool:
+    return _env_bool("JARVIS_SEMANTIC_EMBEDDER_FALLBACK_ENABLED", True)
+
+
+def _stdlib_embedder_dim() -> int:
+    return _env_int("JARVIS_SEMANTIC_STDLIB_EMBEDDER_DIM", 128, minimum=16)
 
 
 def _halflife_days() -> float:
@@ -566,6 +575,215 @@ class _Embedder:
         except Exception:
             logger.debug("[SemanticIndex] embed() failed", exc_info=True)
             return None
+
+
+class _StdlibHashingEmbedder:
+    """Pure-stdlib hashing embedder. Drop-in sibling of :class:`_Embedder`.
+
+    Activates as fallback when fastembed cannot load (offline / sandbox /
+    HF Xet downloader failure / model not pre-fetched), or as primary when
+    ``JARVIS_SEMANTIC_EMBEDDER=stdlib``. Uses only ``hashlib`` + ``re`` +
+    ``math`` -- zero external deps, zero network, zero disk I/O.
+
+    Algorithm (HashingVectorizer-style with sublinear TF):
+      1. Tokenize: ``\\w+`` regex (Unicode-aware) on the lowercased text.
+      2. For each token: md5 hash -> first 8 bytes -> int -> mod ``dim``.
+         Deterministic across runs and across processes.
+      3. Per-bucket sublinear scaling: ``1 + log(count)`` -- standard
+         TF-IDF practice; reduces dominance of repeated tokens.
+      4. L2-normalize the vector. (Required for downstream cosine
+         arithmetic to behave correctly against fastembed centroids.)
+      5. Return as ``List[List[float]]`` matching :class:`_Embedder`'s
+         output shape exactly so the SemanticIndex sees no difference.
+
+    Quality posture: Substantially weaker than fastembed for short
+    natural-language semantic similarity, but adequate for clustering
+    a CODE corpus where token vocabulary itself is a strong signal
+    (``backend/voice/wake_word.py`` and ``backend/vision/frame_server.py``
+    share very few tokens, so cluster boundaries are crisp). The arc-
+    closing soak v4 will measure this empirically.
+
+    Mirrors the :class:`_Embedder` contract:
+      * ``model_name`` property
+      * ``disabled`` property (always ``False`` -- pure stdlib never
+        structurally fails at construction or first-use time).
+      * ``_lazy_init()`` returns ``True`` (no work to do).
+      * ``embed(texts)`` returns ``Optional[List[List[float]]]``.
+    """
+
+    MODEL_NAME = "stdlib-hashing-tfidf-v1"
+    _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+    def __init__(self, model_name: str = "", dim: Optional[int] = None) -> None:
+        self._model_name = (model_name or self.MODEL_NAME).strip() or self.MODEL_NAME
+        resolved_dim = int(dim) if dim is not None else _stdlib_embedder_dim()
+        self._dim = max(16, resolved_dim)
+
+    @property
+    def disabled(self) -> bool:
+        return False
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def _lazy_init(self) -> bool:  # noqa: D401 -- mirror sibling shape
+        return True
+
+    @staticmethod
+    def _hash_token(token: str, dim: int) -> int:
+        """Deterministic token -> bucket index. md5 first-8-bytes mod dim."""
+        digest = hashlib.md5(
+            token.encode("utf-8", errors="replace"),
+        ).digest()
+        return int.from_bytes(digest[:8], "little") % dim
+
+    @classmethod
+    def _embed_one(cls, text: str, dim: int) -> List[float]:
+        if not text:
+            return [0.0] * dim
+        tokens = cls._TOKEN_RE.findall(text.lower())
+        if not tokens:
+            return [0.0] * dim
+        counts: Dict[int, int] = {}
+        for tok in tokens:
+            idx = cls._hash_token(tok, dim)
+            counts[idx] = counts.get(idx, 0) + 1
+        vec = [0.0] * dim
+        for idx, c in counts.items():
+            if c > 0:
+                vec[idx] = 1.0 + math.log(c)
+        norm_sq = 0.0
+        for x in vec:
+            norm_sq += x * x
+        if norm_sq > 0.0:
+            inv_norm = 1.0 / math.sqrt(norm_sq)
+            vec = [x * inv_norm for x in vec]
+        return vec
+
+    def embed(self, texts: Sequence[str]) -> Optional[List[List[float]]]:
+        if not texts:
+            return []
+        try:
+            return [self._embed_one(t or "", self._dim) for t in texts]
+        except Exception:  # noqa: BLE001 -- fail-soft mirrors sibling
+            logger.debug(
+                "[SemanticIndex] stdlib embed() failed", exc_info=True,
+            )
+            return None
+
+
+class _AdaptiveEmbedder:
+    """Composes :class:`_Embedder` + :class:`_StdlibHashingEmbedder`.
+
+    Adaptive (probes), dynamic (no hardcoding), robust (always works).
+    On first ``embed()`` call, attempts the primary (fastembed). If the
+    primary returns ``None`` (lazy import failed / model download failed
+    / runtime error), permanently swaps to the stdlib fallback and
+    publishes a one-time observability event so operators see the
+    degradation without searching log noise.
+
+    Mirrors :class:`_Embedder` contract -- drop-in replacement at the
+    SemanticIndex construction site (line 1412).
+    """
+
+    def __init__(
+        self,
+        primary_model_name: str = "BAAI/bge-small-en-v1.5",
+    ) -> None:
+        self._primary = _Embedder(primary_model_name)
+        self._fallback = _StdlibHashingEmbedder()
+        self._using_fallback: bool = False
+        self._fallback_event_published: bool = False
+        self._lock = threading.Lock()
+
+    @property
+    def disabled(self) -> bool:
+        return False
+
+    @property
+    def model_name(self) -> str:
+        if self._using_fallback:
+            return self._fallback.model_name
+        return self._primary.model_name
+
+    @property
+    def using_fallback(self) -> bool:
+        return self._using_fallback
+
+    def _lazy_init(self) -> bool:  # noqa: D401 -- mirror sibling shape
+        return True
+
+    def embed(self, texts: Sequence[str]) -> Optional[List[List[float]]]:
+        if not texts:
+            return []
+        with self._lock:
+            if self._using_fallback:
+                return self._fallback.embed(texts)
+            primary_result = self._primary.embed(texts)
+            if primary_result is not None:
+                return primary_result
+            self._using_fallback = True
+            self._publish_fallback_event_once()
+        return self._fallback.embed(texts)
+
+    def _publish_fallback_event_once(self) -> None:
+        if self._fallback_event_published:
+            return
+        self._fallback_event_published = True
+        logger.warning(
+            "[SemanticIndex] embedder fallback activated: %s -> %s "
+            "(fastembed unavailable; cluster substrate switching to "
+            "pure-stdlib hashing TF-IDF)",
+            self._primary.model_name,
+            self._fallback.model_name,
+        )
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                publish_semantic_embedder_fallback,
+            )
+            publish_semantic_embedder_fallback(
+                primary_model=self._primary.model_name,
+                fallback_model=self._fallback.model_name,
+                fallback_dim=self._fallback.dim,
+            )
+        except Exception:  # noqa: BLE001 -- best-effort
+            logger.debug(
+                "[SemanticIndex] fallback SSE publish skipped",
+                exc_info=True,
+            )
+
+
+def _embedder_factory(
+    primary_model_name: str = "BAAI/bge-small-en-v1.5",
+) -> Any:
+    """Construct the embedder per env config. Single source of truth.
+
+    Resolution (env-driven, no hardcoding beyond the well-known mode
+    strings):
+      * ``JARVIS_SEMANTIC_EMBEDDER=stdlib`` -> stdlib only (offline/CI
+        explicit selection; never attempts fastembed import).
+      * ``JARVIS_SEMANTIC_EMBEDDER=fastembed`` (default) AND
+        ``JARVIS_SEMANTIC_EMBEDDER_FALLBACK_ENABLED=true`` (default
+        post-graduation) -> :class:`_AdaptiveEmbedder` (fastembed primary,
+        stdlib fallback on first-use failure).
+      * ``JARVIS_SEMANTIC_EMBEDDER=fastembed`` AND fallback explicitly
+        disabled -> bare :class:`_Embedder` (legacy behavior; fails
+        closed if fastembed unavailable).
+      * Unknown mode -> :class:`_AdaptiveEmbedder` (safest default).
+    """
+    mode = _embedder_name()
+    if mode == "stdlib":
+        return _StdlibHashingEmbedder()
+    if mode == "fastembed":
+        if _fastembed_fallback_enabled():
+            return _AdaptiveEmbedder(primary_model_name)
+        return _Embedder(primary_model_name)
+    return _AdaptiveEmbedder(primary_model_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1409,7 +1627,7 @@ class SemanticIndex:
 
     def __init__(self, project_root: Path) -> None:
         self._root = Path(project_root).resolve()
-        self._embedder = _Embedder()
+        self._embedder = _embedder_factory()
         self._lock = threading.RLock()
         self._stats = IndexStats()
         self._corpus: List[CorpusItem] = []
@@ -2534,6 +2752,41 @@ def register_flags(registry) -> int:  # noqa: ANN001
                 "1.0, ceiling 30.0."
             ),
         ),
+        # ClusterIntelligence-CrossSession empirical-closure addendum
+        # (2026-05-03) — adaptive embedder substrate.
+        FlagSpec(
+            name="JARVIS_SEMANTIC_EMBEDDER_FALLBACK_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=(
+                "JARVIS_SEMANTIC_EMBEDDER_FALLBACK_ENABLED=true"
+            ),
+            description=(
+                "Master switch for the fastembed -> stdlib-hashing "
+                "fallback path. When on (default), the SemanticIndex "
+                "constructs an _AdaptiveEmbedder that probes "
+                "fastembed first and silently swaps to the pure-"
+                "stdlib hashing TF-IDF embedder on first-use "
+                "failure (offline / sandbox / model not pre-fetched). "
+                "Off -> bare _Embedder (legacy; fails closed if "
+                "fastembed unavailable). Operators flip explicit "
+                "false to opt-out of fallback."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_SEMANTIC_STDLIB_EMBEDDER_DIM",
+            type=FlagType.INT, default=128,
+            category=Category.CAPACITY,
+            source_file=target,
+            example="JARVIS_SEMANTIC_STDLIB_EMBEDDER_DIM=256",
+            description=(
+                "Dimensionality of the stdlib hashing embedder's "
+                "output vectors. Larger -> fewer hash collisions, "
+                "more accurate cosine, slower per-embed cost. "
+                "Floor 16."
+            ),
+        ),
     ]
     count = 0
     for spec in specs:
@@ -2585,6 +2838,63 @@ def register_shipped_invariants() -> list:
                 )
         return tuple(violations)
 
+    def _validate_adaptive_embedder(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        """Empirical-closure addendum: the adaptive embedder substrate
+        MUST stay structurally independent of fastembed at the stdlib
+        layer (no fastembed imports inside _StdlibHashingEmbedder body)
+        AND the factory function + both embedder siblings + the wrapper
+        MUST be defined."""
+        violations: list = []
+        seen_classes: set = set()
+        seen_funcs: set = set()
+        stdlib_class_node: Optional[_ast.ClassDef] = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef):
+                seen_classes.add(node.name)
+                if node.name == "_StdlibHashingEmbedder":
+                    stdlib_class_node = node
+            elif isinstance(node, _ast.FunctionDef):
+                seen_funcs.add(node.name)
+        for required_class in (
+            "_Embedder",
+            "_StdlibHashingEmbedder",
+            "_AdaptiveEmbedder",
+        ):
+            if required_class not in seen_classes:
+                violations.append(
+                    f"missing embedder class {required_class!r}"
+                )
+        if "_embedder_factory" not in seen_funcs:
+            violations.append(
+                "missing _embedder_factory() function"
+            )
+        # Structural independence: the stdlib embedder body MUST NOT
+        # import fastembed (otherwise fallback isn't truly independent).
+        if stdlib_class_node is not None:
+            for sub in _ast.walk(stdlib_class_node):
+                if isinstance(sub, (_ast.Import, _ast.ImportFrom)):
+                    raw = getattr(sub, "module", None) or ""
+                    names = [a.name for a in getattr(sub, "names", [])]
+                    if (
+                        "fastembed" in raw
+                        or any("fastembed" in n for n in names)
+                    ):
+                        violations.append(
+                            "_StdlibHashingEmbedder MUST NOT import "
+                            "fastembed (independence broken)"
+                        )
+                        break
+        # SemanticIndex.__init__ MUST construct the embedder via the
+        # factory, never the bare _Embedder() class. Pinned because the
+        # adaptive substrate's whole value depends on that single line.
+        if "self._embedder = _embedder_factory()" not in source:
+            violations.append(
+                "SemanticIndex.__init__ MUST use _embedder_factory()"
+            )
+        return tuple(violations)
+
     target = (
         "backend/core/ouroboros/governance/semantic_index.py"
     )
@@ -2598,5 +2908,18 @@ def register_shipped_invariants() -> list:
                 "exec/eval/compile anywhere in the module."
             ),
             validate=_validate,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="semantic_index_adaptive_embedder",
+            target_file=target,
+            description=(
+                "ClusterIntelligence-CrossSession empirical-closure "
+                "addendum: _Embedder + _StdlibHashingEmbedder + "
+                "_AdaptiveEmbedder + _embedder_factory all present; "
+                "stdlib embedder body MUST NOT import fastembed "
+                "(structural independence); SemanticIndex.__init__ "
+                "MUST construct via _embedder_factory()."
+            ),
+            validate=_validate_adaptive_embedder,
         ),
     ]
