@@ -99,15 +99,16 @@ def _get_registry() -> Any:
 
 
 def is_enabled() -> bool:
-    """Master gate. Default ``false`` at Slice 5 — graduates with the
-    conductor at Slice 7. When off, :meth:`ThreadObserver.start` returns
-    immediately without registering on the bridge; the bridge keeps
-    storing turns for its CONTEXT_EXPANSION consumer (descriptive vs
-    rendering split)."""
+    """Master gate. Graduated default ``true`` at Slice 7 follow-up
+    #4 — ThreadObserver registers on the bridge at boot and pumps
+    turns into the conductor as THREAD_TURN events. Hot-revert via
+    ``JARVIS_THREAD_OBSERVER_ENABLED=false`` → observer doesn't
+    register; bridge keeps storing turns for its CONTEXT_EXPANSION
+    consumer (descriptive vs rendering split)."""
     reg = _get_registry()
     if reg is None:
-        return False
-    return reg.get_bool(_FLAG_THREAD_OBSERVER_ENABLED, default=False)
+        return True
+    return reg.get_bool(_FLAG_THREAD_OBSERVER_ENABLED, default=True)
 
 
 def speaker_mapping_override() -> Mapping[str, "Speaker"]:
@@ -546,14 +547,15 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=_FLAG_THREAD_OBSERVER_ENABLED,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
                 "Master gate for the ThreadObserver substrate (Wave 4 "
-                "#1, Slice 5). When false, the observer doesn't "
-                "register on ConversationBridge — bridge keeps storing "
-                "turns for its CONTEXT_EXPANSION consumer (descriptive "
-                "vs rendering split). Graduates with the conductor at "
-                "Slice 7."
+                "#1, Slice 5). Graduated default true at Slice 7 "
+                "follow-up #4 — observer registers on "
+                "ConversationBridge at boot and pumps each turn into "
+                "the conductor as a THREAD_TURN event. Hot-revert via "
+                "false → observer doesn't register; bridge keeps "
+                "storing turns for its CONTEXT_EXPANSION consumer."
             ),
             category=Category.SAFETY,
             source_file=(

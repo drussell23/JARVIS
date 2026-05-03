@@ -137,15 +137,17 @@ def _get_registry() -> Any:
 
 
 def is_enabled() -> bool:
-    """Master gate. Default ``false`` at Slice 4 — graduates to ``true``
-    at Slice 7 once the cancel-handler is wired in SerpentFlow. When
-    off, :meth:`InputController.start` is a no-op; the registry remains
-    alive so a hot-flip mid-session can register handlers + start the
-    reader without re-construction."""
+    """Master gate. Graduated default ``true`` at Slice 7 follow-up
+    #4 — InputController is wired at boot via the harness, with
+    SerpentFlow's ``_handle_cancel`` registered into
+    ``KeyActionRegistry[CANCEL_CURRENT_OP]`` for Esc-mid-token
+    interrupt. Hot-revert via ``JARVIS_INPUT_CONTROLLER_ENABLED=false``
+    → ``InputController.start`` becomes a no-op (registry remains
+    alive so a re-flip works without re-wire)."""
     reg = _get_registry()
     if reg is None:
-        return False
-    return reg.get_bool(_FLAG_INPUT_CONTROLLER_ENABLED, default=False)
+        return True
+    return reg.get_bool(_FLAG_INPUT_CONTROLLER_ENABLED, default=True)
 
 
 def raw_mode_enabled() -> bool:
@@ -939,13 +941,14 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=_FLAG_INPUT_CONTROLLER_ENABLED,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
                 "Master gate for the InputController + KeyBus substrate "
-                "(Wave 4 #1, Slice 4). Default false — when off, "
-                "InputController.start is no-op, KeyBus.publish drops "
-                "events. KeyActionRegistry stays alive (descriptive). "
-                "Graduates with the conductor at Slice 7."
+                "(Wave 4 #1, Slice 4). Graduated default true at "
+                "Slice 7 follow-up #4 — Esc-mid-token interrupt "
+                "operational. Reader still short-circuits to no-op on "
+                "non-TTY stdin / REPL-active / no-loop conditions. "
+                "Hot-revert via false → InputController.start no-op."
             ),
             category=Category.SAFETY,
             source_file=(

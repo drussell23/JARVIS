@@ -90,14 +90,17 @@ def _get_registry() -> Any:
 
 
 def is_enabled() -> bool:
-    """Master gate. Default ``false`` at Slice 6 — graduates with the
-    conductor at Slice 7. When off, :meth:`ContextualHelpResolver.
-    resolve` returns an empty page (the resolver stays alive so callers
-    can hold a reference; only the rendering surface is gated)."""
+    """Master gate. Graduated default ``true`` at Slice 7 follow-up
+    #4 — ContextualHelpResolver returns ranked pages from the typed
+    registry aggregation; ``?`` keypress (Slice 4 binding default)
+    publishes a MODAL_PROMPT page. Hot-revert via
+    ``JARVIS_CONTEXTUAL_HELP_ENABLED=false`` → ``resolve`` returns an
+    empty page (resolver stays alive so callers can hold a reference;
+    only the rendering surface is gated)."""
     reg = _get_registry()
     if reg is None:
-        return False
-    return reg.get_bool(_FLAG_CONTEXTUAL_HELP_ENABLED, default=False)
+        return True
+    return reg.get_bool(_FLAG_CONTEXTUAL_HELP_ENABLED, default=True)
 
 
 def default_page_size() -> int:
@@ -735,12 +738,14 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=_FLAG_CONTEXTUAL_HELP_ENABLED,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
                 "Master gate for the ContextualHelpResolver substrate "
-                "(Wave 4 #1, Slice 6). Default false — when off, "
-                "resolve() returns an empty page (resolver stays "
-                "alive). Graduates with the conductor at Slice 7."
+                "(Wave 4 #1, Slice 6). Graduated default true at "
+                "Slice 7 follow-up #4 — resolve() returns ranked "
+                "pages over the typed registry aggregation; '?' "
+                "keypress publishes MODAL_PROMPT pages. Hot-revert "
+                "via false → empty page (resolver stays alive)."
             ),
             category=Category.SAFETY,
             source_file=(

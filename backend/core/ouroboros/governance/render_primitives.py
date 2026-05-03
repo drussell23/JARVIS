@@ -100,10 +100,11 @@ def _get_registry() -> Any:
 
 
 def reasoning_stream_enabled() -> bool:
-    """Master gate for ReasoningStream emission. Default ``false`` at
-    Slice 3 — flips to ``true`` at Slice 7 graduation. When ``false``,
+    """Master gate for ReasoningStream emission. Graduated default
+    ``true`` at Slice 7 follow-up #4 — the substrate is now the
+    single producer of REASONING_TOKEN events. When ``false``,
     producer-side calls become no-ops (legacy direct stream_renderer
-    path remains the active rendering route).
+    path remains the active rendering route — hot-revert).
 
     Note: even when ``true``, the conductor's master flag
     ``JARVIS_RENDER_CONDUCTOR_ENABLED`` must ALSO be ``true`` for events
@@ -111,8 +112,8 @@ def reasoning_stream_enabled() -> bool:
     so operators can A/B without ambiguity."""
     reg = _get_registry()
     if reg is None:
-        return False
-    return reg.get_bool(_FLAG_REASONING_STREAM_ENABLED, default=False)
+        return True
+    return reg.get_bool(_FLAG_REASONING_STREAM_ENABLED, default=True)
 
 
 def file_ref_hyperlink_enabled() -> bool:
@@ -600,13 +601,15 @@ def register_flags(registry: Any) -> int:
         FlagSpec(
             name=_FLAG_REASONING_STREAM_ENABLED,
             type=FlagType.BOOL,
-            default=False,
+            default=True,
             description=(
                 "Master gate for ReasoningStream emission (Wave 4 #1, "
-                "Slice 3). When false, producer-side calls are no-ops "
-                "and the legacy stream_renderer.on_token direct path "
-                "is the active rendering route. Graduates with the "
-                "RenderConductor master flag at Slice 7."
+                "Slice 3). Graduated default true at Slice 7 follow-up "
+                "#4 — substrate is the single producer of "
+                "REASONING_TOKEN events. Hot-revert via "
+                "JARVIS_REASONING_STREAM_ENABLED=false → providers.py "
+                "falls back to legacy direct stream_renderer.on_token "
+                "path."
             ),
             category=Category.SAFETY,
             source_file=(
