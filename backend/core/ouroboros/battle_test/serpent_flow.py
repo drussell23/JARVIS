@@ -3385,6 +3385,7 @@ class SerpentREPL:
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.formatted_text import HTML
+            from prompt_toolkit.key_binding import KeyBindings
             from prompt_toolkit.patch_stdout import patch_stdout
         except ImportError:
             self._flow.console.print(
@@ -3393,10 +3394,40 @@ class SerpentREPL:
             )
             return
 
-        # No bottom_toolbar, no refresh_interval — pure flowing CLI.
-        self._session = PromptSession()
+        # REPL UX fix (2026-05-03) — Claude-Code-parity multi-line paste.
+        # Default PromptSession is multiline=False, which makes bracketed
+        # paste split at the first newline and submit each line as a
+        # separate REPL command (any pasted block of free-text gets
+        # shredded into fragments). multiline=True with custom bindings
+        # — Enter submits, Alt+Enter inserts a literal newline — gives
+        # Claude Code's behavior: paste a block, see the whole buffer,
+        # one Enter to submit. Bracketed paste bypasses key bindings,
+        # so newlines from a paste land as buffer content, not submits.
+        _repl_bindings = KeyBindings()
 
-        with patch_stdout(raw=True):
+        @_repl_bindings.add("enter")
+        def _(event: Any) -> None:
+            event.current_buffer.validate_and_handle()
+
+        @_repl_bindings.add("escape", "enter")
+        def _(event: Any) -> None:
+            event.current_buffer.insert_text("\n")
+
+        # No bottom_toolbar, no refresh_interval — pure flowing CLI.
+        self._session = PromptSession(
+            multiline=True,
+            key_bindings=_repl_bindings,
+        )
+
+        # REPL UX fix (2026-05-03) — raw=False lets prompt_toolkit
+        # buffer concurrent stdout writes and re-render the prompt
+        # cleanly below each line. raw=True passed bytes through
+        # untouched, which let asynchronous output (sensor logs,
+        # streaming token spinners, harness diagnostics) clobber
+        # the input line so operators couldn't see what they typed.
+        # Matches Claude Code / IPython behavior for prompt stability
+        # under concurrent log flow.
+        with patch_stdout(raw=False):
             while self._running:
                 try:
                     line = await self._session.prompt_async(

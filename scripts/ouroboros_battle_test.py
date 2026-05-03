@@ -61,6 +61,25 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 
+# REPL UX fix (2026-05-03) — silence the per-fork tokenizers warning at its
+# source. The warning prints to OS-level stderr from forked subprocesses,
+# which bypasses prompt_toolkit's patch_stdout entirely and clobbers the
+# REPL prompt line on every sensor fork. The huggingface library itself
+# tells you to set this env var; we honor any operator override via
+# setdefault so it isn't hardcoded.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# macOS fork-safety fix (2026-05-03) — Apple's libdispatch / Objective-C
+# runtime aborts (SIGABRT, "multi-threaded process forked / crashed on
+# child side of fork pre-exec") when fork() is called after threads
+# have started. The harness goes multi-threaded at boot (asyncio +
+# sensors + embedding service), and downstream subprocess.Popen calls
+# (git, pytest, model downloads) use fork+exec on macOS. Apple ships
+# this env var EXPLICITLY for the fork+exec case where the child
+# replaces its image immediately — it is the documented fix, not a
+# workaround. setdefault honors any operator override.
+os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+
 # Ensure the project root is importable regardless of cwd.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
