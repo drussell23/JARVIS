@@ -352,10 +352,15 @@ def get_default_observer(
     bundle pre-registered. First call constructs + bundles the
     adapters; subsequent calls return the cached instance.
 
-    Default bundle (always safe to register):
+    Default bundle (always safe to register; each adapter reports
+    DISABLED cleanly when its env config is absent so the aggregator
+    handles the no-config case naturally):
       * StdlibSelfHealthOracle (offline; zero network)
-      * HTTPHealthCheckOracle (env-config; reports DISABLED when
-        no URL set -- safe to register unconditionally)
+      * HTTPHealthCheckOracle (generic HTTP healthcheck)
+      * SentryOracle (Tier 2 #6 follow-up Arc 2; requires
+        SENTRY_AUTH_TOKEN + JARVIS_SENTRY_ORG)
+      * DatadogOracle (Tier 2 #6 follow-up Arc 2; requires
+        DD_API_KEY + DD_APP_KEY)
     """
     global _DEFAULT_OBSERVER
     if _DEFAULT_OBSERVER is not None:
@@ -366,10 +371,18 @@ def get_default_observer(
     from backend.core.ouroboros.governance.http_healthcheck_oracle import (  # noqa: E501
         HTTPHealthCheckOracle,
     )
+    from backend.core.ouroboros.governance.sentry_oracle import (
+        SentryOracle,
+    )
+    from backend.core.ouroboros.governance.datadog_oracle import (
+        DatadogOracle,
+    )
     obs = ProductionOracleObserver(
         adapters=[
             StdlibSelfHealthOracle(project_root=project_root),
             HTTPHealthCheckOracle(),
+            SentryOracle(),
+            DatadogOracle(),
         ],
     )
     _DEFAULT_OBSERVER = obs
