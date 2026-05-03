@@ -741,5 +741,190 @@ __all__ = [
     "domain_map_lock_timeout_s",
     "domain_map_role_max_chars",
     "get_default_store",
+    "register_flags",
+    "register_shipped_invariants",
     "reset_default_store",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 -- Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[DomainMap] register_flags degraded: %s", exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/domain_map_memory.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_DOMAIN_MAP_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example="JARVIS_DOMAIN_MAP_ENABLED=true",
+            description=(
+                "Master switch for cross-session DomainMap "
+                "persistence. When off, every public method on "
+                "DomainMapStore short-circuits to no-op-safe "
+                "defaults. Graduated default-true 2026-05-03 in "
+                "Slice 5."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_DOMAIN_MAP_FILES_CAP",
+            type=FlagType.INT, default=64,
+            category=Category.CAPACITY,
+            source_file=target,
+            example="JARVIS_DOMAIN_MAP_FILES_CAP=128",
+            description=(
+                "Hard cap on discovered_files per DomainMap "
+                "entry. Floor 1, ceiling 256. Prevents pathological "
+                "explorations from ballooning a single entry."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_DOMAIN_MAP_ROLE_MAX_CHARS",
+            type=FlagType.INT, default=500,
+            category=Category.CAPACITY,
+            source_file=target,
+            example="JARVIS_DOMAIN_MAP_ROLE_MAX_CHARS=1000",
+            description=(
+                "Hard cap on architectural_role string length at "
+                "write time. Floor 32, ceiling 4000. Bounds the "
+                "Slice 4 stub + future Venom-round role inference."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_DOMAIN_MAP_LOCK_TIMEOUT_S",
+            type=FlagType.FLOAT, default=5.0,
+            category=Category.TIMING,
+            source_file=target,
+            example="JARVIS_DOMAIN_MAP_LOCK_TIMEOUT_S=10.0",
+            description=(
+                "Cross-process flock acquisition timeout for "
+                "record_exploration's read-modify-write critical "
+                "section. Floor 0.1s, ceiling 30.0s."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[DomainMap] register_flags spec %s skipped: %s",
+                spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 -- Module-owned shipped_code_invariants
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Slice 3 invariants: authority allowlist (only
+    cross_process_jsonl + the registration contract) + frozen
+    DomainMapEntry contract + NEVER-raise IO discipline."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    _ALLOWED = {
+        "cross_process_jsonl",
+        # Registration contract.
+        "flag_registry",
+        "shipped_code_invariants",
+    }
+    _FORBIDDEN = {
+        "orchestrator", "phase_runner", "iron_gate",
+        "change_engine", "candidate_generator", "providers",
+        "doubleword_provider", "urgency_router",
+        "auto_action_router", "subagent_scheduler",
+        "tool_executor", "semantic_guardian",
+        "semantic_firewall", "risk_engine",
+    }
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." not in module and "governance" not in module:
+                    continue
+                tail = module.rsplit(".", 1)[-1]
+                if tail in _FORBIDDEN:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"forbidden module {module!r}"
+                    )
+                elif tail not in _ALLOWED:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"unexpected governance import {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 3 MUST NOT {node.func.id}()"
+                        )
+        # DomainMapEntry must remain frozen.
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and (
+                node.name == "DomainMapEntry"
+            ):
+                # Walk decorators looking for @dataclass(frozen=True)
+                frozen_seen = False
+                for dec in node.decorator_list:
+                    if isinstance(dec, _ast.Call):
+                        for kw in dec.keywords:
+                            if (
+                                kw.arg == "frozen"
+                                and isinstance(kw.value, _ast.Constant)
+                                and kw.value.value is True
+                            ):
+                                frozen_seen = True
+                if not frozen_seen:
+                    violations.append(
+                        "DomainMapEntry must be @dataclass"
+                        "(frozen=True)"
+                    )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/domain_map_memory.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="domain_map_memory_authority",
+            target_file=target,
+            description=(
+                "Slice 3 DomainMap authority: imports only "
+                "cross_process_jsonl + the registration contract. "
+                "DomainMapEntry stays @dataclass(frozen=True). "
+                "No exec/eval/compile."
+            ),
+            validate=_validate,
+        ),
+    ]

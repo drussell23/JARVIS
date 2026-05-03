@@ -274,7 +274,7 @@ async def observe_cluster_coverage_completion(
         theme_label = str(tag.get("theme_label", "") or "")
         centroid_hash8 = str(tag.get("centroid_hash8", "") or "")
 
-        return target_store.record_exploration(
+        merged = target_store.record_exploration(
             centroid_hash8,
             theme_label=theme_label,
             discovered_files=filtered_files,
@@ -283,6 +283,34 @@ async def observe_cluster_coverage_completion(
             cluster_id=cluster_id,
             op_id=op_id,
         )
+        # Slice 5 graduation: best-effort SSE publish on every
+        # successful persist so observability sees the full
+        # cross-session memory evolution. Lazy import keeps the
+        # cascade observer importable when the IDE observability
+        # stream module isn't available (test isolation, partial
+        # deployments). NEVER raises.
+        if merged is not None:
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                    publish_domain_map_update as _publish_domain_map_update,
+                )
+                _publish_domain_map_update(
+                    centroid_hash8=merged.centroid_hash8,
+                    cluster_id=merged.cluster_id,
+                    theme_label=merged.theme_label,
+                    discovered_files_count=len(
+                        merged.discovered_files,
+                    ),
+                    architectural_role=merged.architectural_role,
+                    confidence=merged.confidence,
+                    exploration_count=merged.exploration_count,
+                    populated_by_op_id=merged.populated_by_op_id,
+                )
+            except Exception as exc:  # noqa: BLE001 -- best-effort
+                logger.debug(
+                    "[ClusterCascade] SSE publish degraded: %s", exc,
+                )
+        return merged
     except Exception as exc:  # noqa: BLE001 -- last-resort defensive
         logger.debug(
             "[ClusterCascade] observe_cluster_coverage_completion "
@@ -368,5 +396,171 @@ __all__ = [
     "auto_role_enabled",
     "cascade_observer_enabled",
     "observe_cluster_coverage_completion",
+    "register_flags",
+    "register_shipped_invariants",
     "render_prior_context_block",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 -- Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[ClusterCascade] register_flags degraded: %s", exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/"
+        "cluster_exploration_cascade_observer.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=(
+                "JARVIS_CLUSTER_CASCADE_OBSERVER_ENABLED=true"
+            ),
+            description=(
+                "Master switch for the ClusterIntelligence cascade "
+                "observer. When off, observe_cluster_coverage_"
+                "completion is no-op + render_prior_context_block "
+                "returns empty string. Graduated default-true "
+                "2026-05-03 in Slice 5."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_DOMAIN_MAP_AUTO_ROLE_ENABLED",
+            type=FlagType.BOOL, default=False,
+            category=Category.EXPERIMENTAL,
+            source_file=target,
+            example="JARVIS_DOMAIN_MAP_AUTO_ROLE_ENABLED=true",
+            description=(
+                "Stub flag for architectural-role inference via "
+                "Venom round. Today only stamps a "
+                "``role_inference_pending`` placeholder marker; "
+                "actual Venom call deferred to a post-Slice-5 "
+                "cost-authorized arc. Default false (no cost "
+                "commitment)."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_CLUSTER_CASCADE_PRIOR_CONTEXT_MAX_FILES",
+            type=FlagType.INT, default=8,
+            category=Category.CAPACITY,
+            source_file=target,
+            example=(
+                "JARVIS_CLUSTER_CASCADE_PRIOR_CONTEXT_MAX_FILES=16"
+            ),
+            description=(
+                "Hard cap on prior-discovered files surfaced in "
+                "the envelope description block. Floor 1, ceiling "
+                "32. Independent of Slice 1's K knob."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[ClusterCascade] register_flags spec %s "
+                "skipped: %s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 -- Module-owned shipped_code_invariants
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Slice 4 invariants: authority allowlist (only DomainMap +
+    additive observability + flag registration) + NEVER-raise
+    discipline pin."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    _ALLOWED = {
+        "domain_map_memory",
+        # Additive observability (Slice 5 SSE publish + module-owned
+        # registration). Never reached on the hot path's defensive
+        # short-circuit branches.
+        "ide_observability_stream",
+        "flag_registry",
+        "shipped_code_invariants",
+    }
+    _FORBIDDEN = {
+        "orchestrator", "phase_runner", "iron_gate",
+        "change_engine", "candidate_generator", "providers",
+        "doubleword_provider", "urgency_router",
+        "auto_action_router", "subagent_scheduler",
+        "tool_executor", "semantic_guardian",
+        "semantic_firewall", "risk_engine",
+    }
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." not in module and "governance" not in module:
+                    continue
+                tail = module.rsplit(".", 1)[-1]
+                if tail in _FORBIDDEN:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"forbidden module {module!r}"
+                    )
+                elif tail not in _ALLOWED:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"unexpected governance import {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"Slice 4 MUST NOT {node.func.id}()"
+                        )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/"
+        "cluster_exploration_cascade_observer.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="cluster_cascade_observer_authority",
+            target_file=target,
+            description=(
+                "Slice 4 cascade observer authority: imports "
+                "only domain_map_memory + the registration "
+                "contract (flag_registry + shipped_code_invariants) "
+                "+ ide_observability_stream (SSE publish). "
+                "Forbidden: orchestrator / iron_gate / providers / "
+                "tool_executor / etc. No exec/eval/compile."
+            ),
+            validate=_validate,
+        ),
+    ]

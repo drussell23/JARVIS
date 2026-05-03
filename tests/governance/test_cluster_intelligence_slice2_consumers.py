@@ -377,9 +377,11 @@ def _build_sensor():
 class TestSensorEnvelopeRouting:
     @pytest.mark.asyncio
     async def test_subflag_off_uses_sentinel(self, monkeypatch):
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS",
-            raising=False,
+            "false",
         )
         sensor, router = _build_sensor()
         snapshot = _stub_snapshot(
@@ -532,9 +534,11 @@ class TestSensorEnvelopeRouting:
     async def test_description_hint_sentinel_when_no_paths(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS",
-            raising=False,
+            "false",
         )
         sensor, router = _build_sensor()
         snapshot = _stub_snapshot(paths=("a.py",))  # populated but flag off
