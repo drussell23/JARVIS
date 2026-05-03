@@ -229,6 +229,13 @@ EVENT_TYPE_SEMANTIC_EMBEDDER_FALLBACK = "semantic_embedder_fallback"
 # /observability/goal-inference GET. Read-only; no authority surface.
 EVENT_TYPE_GOAL_INFERENCE_BUILT = "goal_inference_built"
 
+# Production Oracle (Tier 2 #6) Slice D — fired on every observer tick
+# with the lightweight aggregate verdict + adapter counts. Read-only;
+# advisory; never mutates Iron Gate / risk / route. Operators
+# subscribe to track production-health drift in real time without
+# polling the GET endpoint.
+EVENT_TYPE_PRODUCTION_ORACLE_SIGNAL = "production_oracle_signal_observed"
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -1701,6 +1708,45 @@ def publish_domain_map_update(
     except Exception:  # noqa: BLE001 -- best-effort
         logger.debug(
             "[Stream] publish_domain_map_update exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_production_oracle_signal(
+    *,
+    aggregate_verdict: str,
+    signal_count: int = 0,
+    adapters_queried: int = 0,
+    adapters_failed: int = 0,
+    tick_duration_ms: int = 0,
+    posture: str = "",
+) -> Optional[str]:
+    """Best-effort publisher for ``production_oracle_signal_observed``
+    frames. Returns the event_id on success, None when the stream is
+    disabled / broker missing / publish raised. NEVER raises.
+
+    Read-only payload. Carries the aggregate verdict + counts only
+    (not raw signal payloads -- those are visible via the GET route's
+    history projection)."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_PRODUCTION_ORACLE_SIGNAL,
+            (aggregate_verdict or "unknown")[:40],
+            {
+                "aggregate_verdict": str(aggregate_verdict or "")[:40],
+                "signal_count": int(signal_count),
+                "adapters_queried": int(adapters_queried),
+                "adapters_failed": int(adapters_failed),
+                "tick_duration_ms": int(tick_duration_ms),
+                "posture": str(posture or "")[:40],
+            },
+        )
+    except Exception:  # noqa: BLE001 -- best-effort
+        logger.debug(
+            "[Stream] publish_production_oracle_signal exception",
             exc_info=True,
         )
         return None
