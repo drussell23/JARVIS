@@ -253,6 +253,12 @@ class IDEObservabilityRouter:
             "/observability/goal-inference",
             self._handle_goal_inference,
         )
+        # Production Oracle (Tier 2 #6) Slice D — recent observation
+        # ring buffer + current aggregate verdict.
+        app.router.add_get(
+            "/observability/production-oracle",
+            self._handle_production_oracle,
+        )
         # SensorGovernor + MemoryPressureGate — Wave 1 #3 Slice 3.
         app.router.add_get(
             "/observability/governor", self._handle_governor_snapshot,
@@ -2446,6 +2452,97 @@ class IDEObservabilityRouter:
             return self._error_response(
                 request, 500,
                 "ide_observability.codebase_character_error",
+            )
+
+    # ----------------------------------------------------------------------
+    # Production Oracle (Tier 2 #6) Slice D — observer projection
+    # ----------------------------------------------------------------------
+
+    async def _handle_production_oracle(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/production-oracle`` — bounded read-
+        only projection of the Production Oracle observer state.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "enabled": true,
+              "config": {
+                "history_size": 64,
+                "fail_threshold": 0.8,
+                "degrade_threshold": 0.5
+              },
+              "current": {<project_observation()>} | null,
+              "history": [<project_observation()>, ...],
+              "tick_count": 17,
+              "failure_count": 0,
+              "adapter_count": 2
+            }
+
+        Returns 403 ``production_oracle_disabled`` when master flag
+        off (port-scanner discipline). 200 with current=null when no
+        ticks have occurred yet (cold boot)."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        try:
+            from backend.core.ouroboros.governance.production_oracle_observer import (  # noqa: E501
+                production_oracle_enabled,
+            )
+            if not production_oracle_enabled():
+                return self._error_response(
+                    request, 403,
+                    "ide_observability.production_oracle_disabled",
+                )
+        except Exception:  # noqa: BLE001 -- defensive: treat as disabled
+            return self._error_response(
+                request, 403,
+                "ide_observability.production_oracle_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.production_oracle_observer import (  # noqa: E501
+                get_default_observer,
+                project_observation,
+                history_ring_size,
+                fail_threshold_severity,
+                degrade_threshold_severity,
+            )
+            obs = get_default_observer()
+            current = obs.current()
+            history = obs.history()
+            payload = {
+                "enabled": True,
+                "config": {
+                    "history_size": history_ring_size(),
+                    "fail_threshold": fail_threshold_severity(),
+                    "degrade_threshold": degrade_threshold_severity(),
+                },
+                "current": (
+                    project_observation(current) if current else None
+                ),
+                "history": [
+                    project_observation(o) for o in history
+                ],
+                "tick_count": obs.tick_count,
+                "failure_count": obs.failure_count,
+                "adapter_count": obs.adapter_count,
+            }
+            return self._json_response(request, 200, payload)
+        except Exception:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[IDEObservability] production_oracle failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.production_oracle_error",
             )
 
     # ----------------------------------------------------------------------
