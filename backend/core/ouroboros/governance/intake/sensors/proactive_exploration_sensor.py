@@ -258,7 +258,12 @@ class ProactiveExplorationSensor:
                             f"representative files in this domain. "
                             f"Excerpt: {cluster.nearest_item_excerpt}"
                         ),
-                        target_files=(),  # Let model discover via tool loop
+                        # Project-root sentinel — cluster-coverage doesn't
+                        # know specific files at emit time (the model uses
+                        # search_code / read_file in its tool loop to
+                        # discover representative files in the cluster's
+                        # domain). The bounded scope is the whole project.
+                        target_files=(".",),
                         repo=self._repo,
                         confidence=0.65,
                         urgency="low",

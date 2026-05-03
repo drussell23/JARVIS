@@ -196,11 +196,12 @@ class TestFrozenRecords:
 
 
 class TestMasterFlag:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
+        # Graduated 2026-05-02 (Slice 3): default-True.
         monkeypatch.delenv(
             "JARVIS_CODEBASE_CHARACTER_DIGEST_ENABLED", raising=False,
         )
-        assert codebase_character_enabled() is False
+        assert codebase_character_enabled() is True
 
     @pytest.mark.parametrize("v", ["1", "true", "yes", "on", "TRUE"])
     def test_truthy(self, monkeypatch, v):
@@ -219,11 +220,12 @@ class TestMasterFlag:
         assert codebase_character_enabled() is False
 
     @pytest.mark.parametrize("v", ["", "   ", "\t"])
-    def test_empty_unset(self, monkeypatch, v):
+    def test_empty_unset_post_graduation(self, monkeypatch, v):
+        # Empty / whitespace = unset → graduated default-True.
         monkeypatch.setenv(
             "JARVIS_CODEBASE_CHARACTER_DIGEST_ENABLED", v,
         )
-        assert codebase_character_enabled() is False
+        assert codebase_character_enabled() is True
 
 
 class TestMinClusters:
@@ -715,10 +717,16 @@ class TestAuthorityPins:
                 )
 
     def test_pure_stdlib_no_backend_imports(self):
-        # Slice 1 ships pure-stdlib substrate. Slice 3 may add the two
-        # registration-contract imports (flag_registry +
-        # shipped_code_invariants), but Slice 1 must be stdlib-only.
-        ALLOWED_BACKEND_IMPORTS: set = set()
+        # PURE-stdlib substrate at Slice 1. Slice 3 graduation
+        # introduced two registration-contract imports
+        # (FlagRegistry + shipped_code_invariants) — both are
+        # outbound description channels (substrate publishes
+        # metadata, not consumes behavior). Everything else MUST
+        # remain stdlib so the substrate stays caller-agnostic.
+        ALLOWED_BACKEND_IMPORTS = {
+            "backend.core.ouroboros.governance.flag_registry",
+            "backend.core.ouroboros.governance.meta.shipped_code_invariants",
+        }
         imports = _module_imports()
         for imp in imports:
             if imp.startswith("backend."):
