@@ -623,11 +623,22 @@ class TestSingleton:
         assert s is not None
 
     def test_subsequent_calls_return_same(self, tmp_path):
+        """Multi-repo sharding (Tier 2 #4 Slice C): identity is keyed
+        on the per-shard signature, not the global singleton. Same
+        ``project_root`` arg -> same instance. The no-arg lookup
+        post-construction now returns ``None`` by design (deferred-
+        init contract for multi-repo callers); single-repo callers
+        always pass ``project_root`` explicitly so they see byte-
+        identical behavior."""
         reset_default_store()
         s1 = get_default_store(tmp_path)
-        s2 = get_default_store()
+        s2 = get_default_store(tmp_path)
         s3 = get_default_store(tmp_path)
         assert s1 is s2 is s3
+        # No-arg post-construction is None (multi-repo disambiguation
+        # contract). Pre-shard this returned the first-set instance,
+        # which is exactly the silent-shared-state bug Slice C closes.
+        assert get_default_store() is None
 
 
 # ---------------------------------------------------------------------------

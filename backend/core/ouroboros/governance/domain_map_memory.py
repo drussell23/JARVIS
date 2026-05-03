@@ -886,6 +886,10 @@ def register_shipped_invariants() -> list:
         # Registration contract.
         "flag_registry",
         "shipped_code_invariants",
+        # Multi-repo sharding shard key (Tier 2 #4 Slice C, 2026-05-03).
+        # Pure-stdlib helper consumed by get_default_store() to key
+        # the per-repo singleton dict. Authority-free.
+        "repo_signature",
     }
     _FORBIDDEN = {
         "orchestrator", "phase_runner", "iron_gate",
