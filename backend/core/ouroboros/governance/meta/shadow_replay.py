@@ -109,9 +109,12 @@ def is_enabled() -> bool:
     NOT_LOADED. Slice 5 MetaPhaseRunner consumer treats this as
     "no shadow replay enforcement" so the cage degrades to the
     existing review path."""
-    return os.environ.get(
+    raw = os.environ.get(
         "JARVIS_SHADOW_PIPELINE_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated 2026-05-03 (Pass B Slice 4)
+    return raw in _TRUTHY
 
 
 def corpus_root() -> Path:

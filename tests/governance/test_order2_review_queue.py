@@ -265,9 +265,13 @@ def test_master_flag_off_returns_disabled(monkeypatch, tmp_path):
     assert res.status is EnqueueStatus.DISABLED
 
 
-def test_master_default_off_when_unset(monkeypatch):
+def test_master_default_true_post_graduation(monkeypatch):
+    """Pass B Slice 6.2 graduation 2026-05-03: review queue master
+    flag flipped default-true. Mutation is structurally gated by
+    amendment_requires_operator() (locked-true cage), so graduating
+    the queue surface is safe."""
     monkeypatch.delenv("JARVIS_ORDER2_REVIEW_QUEUE_ENABLED", raising=False)
-    assert is_enabled() is False
+    assert is_enabled() is True
 
 
 def test_disabled_returns_empty_lists_for_read_methods(monkeypatch, tmp_path):
