@@ -3439,6 +3439,7 @@ class SerpentREPL:
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.formatted_text import HTML
+            from prompt_toolkit.key_binding import KeyBindings
             from prompt_toolkit.patch_stdout import patch_stdout
         except ImportError:
             self._flow.console.print(
@@ -3447,17 +3448,62 @@ class SerpentREPL:
             )
             return
 
-        # No bottom_toolbar, no refresh_interval — pure flowing CLI.
-        self._session = PromptSession()
+        # Claude-Code-parity REPL (2026-05-03 refactor):
+        #
+        # multiline=True + bracketed paste + Enter-submits binding gives
+        # the input behavior operators expect from CC: paste a multi-line
+        # block, see the entire buffer, press Enter once to submit. The
+        # default ``PromptSession()`` is multiline=False, which makes
+        # bracketed paste split at the first newline and submit each line
+        # separately — pasting a task block shreds it into fragments.
+        #
+        # Rendering hints minimize per-keystroke redraws (auto_suggest,
+        # complete_while_typing, history search all off) so prompt redraws
+        # stay quick under concurrent sensor output.
+        #
+        # The companion fix is the spinner gate: ``rich.Status`` and
+        # ``rich.Live`` writers (which bypass ``patch_stdout`` via direct
+        # cursor manipulation) consult ``is_repl_active()`` and degrade
+        # to ``console.print``-only output while the REPL runs. That
+        # eliminates the prompt-clobber root cause structurally — both
+        # input handling and output coordination land in this commit.
+        _repl_bindings = KeyBindings()
+
+        @_repl_bindings.add("enter")
+        def _on_enter(event: Any) -> None:
+            event.current_buffer.validate_and_handle()
+
+        @_repl_bindings.add("escape", "enter")
+        def _on_alt_enter(event: Any) -> None:
+            event.current_buffer.insert_text("\n")
+
+        def _continuation(width: int, line_number: int, is_soft_wrap: bool) -> str:
+            return " " * max(width - 2, 0) + "│ "
+
+        self._session = PromptSession(
+            multiline=True,
+            key_bindings=_repl_bindings,
+            wrap_lines=True,
+            complete_while_typing=False,
+            enable_history_search=False,
+            auto_suggest=None,
+            prompt_continuation=_continuation,
+        )
 
         # raw=True preserves Rich's ANSI escape codes (raw=False would
-        # escape them and render them as literal "?[2m" text in the
-        # operator terminal). The trade-off is that the prompt line
-        # can be visually clobbered by concurrent stdout writes from
-        # background sensors — this is a known limitation of mixing
-        # Rich + prompt_toolkit + async output in a single terminal
-        # region. The structural fix (full-screen TUI with a fixed
-        # input region) is a separate, larger arc.
+        # escape them to literal "?[2m" text). With the spinner gate
+        # above silencing the bypass writers, raw=True now coexists
+        # cleanly with the REPL prompt redraw.
+        #
+        # Toggle the module-level _REPL_ACTIVE flag so spinner start
+        # sites in this file (and Live-widget start in stream_renderer)
+        # consult is_repl_active() and degrade to log-only mode while
+        # the REPL is alive. Safe-failure: if an exception escapes the
+        # with-block, the flag stays True — that keeps spinners
+        # suppressed (the safe direction — they only re-enable on a
+        # clean REPL exit).
+        global _REPL_ACTIVE
+        _REPL_ACTIVE = True
         with patch_stdout(raw=True):
             while self._running:
                 try:
@@ -3661,6 +3707,10 @@ class SerpentREPL:
                     continue
                 except asyncio.CancelledError:
                     break
+        # Clean exit — clear the REPL flag so any subsequent
+        # non-REPL caller (one-shot scripts, headless harnesses)
+        # gets normal spinner behavior. See is_repl_active().
+        _REPL_ACTIVE = False
 
     def _print_status(self) -> None:
         """Print detailed organism status as inline scrollable output.
