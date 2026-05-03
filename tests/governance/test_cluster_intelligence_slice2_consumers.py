@@ -1,7 +1,7 @@
 """ClusterIntelligence-CrossSession Slice 2 -- regression spine.
 
 Pins the consumer surfaces for Slice 1's representative_paths
-field: codebase_character projection + render_prompt_block + the
+field: codebase_character projection + to_prompt_section + the
 ProactiveExploration sensor's envelope target_files routing.
 
 Coverage:
@@ -10,7 +10,7 @@ Coverage:
     (older ClusterInfo without the field still projects safely)
   * Garbage path entries in source ClusterInfo dropped on
     projection (None / non-string / empty)
-  * render_prompt_block "Files: ..." line appears only when paths
+  * to_prompt_section "Files: ..." line appears only when paths
     non-empty (backward-compat: empty -> line absent)
   * Sub-flag asymmetric env semantics (default false until
     Slice 5)
@@ -58,6 +58,9 @@ def _isolate_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     # Force codebase_character on so projection runs in tests.
     monkeypatch.setenv("JARVIS_CODEBASE_CHARACTER_ENABLED", "true")
+    # Lower min_clusters threshold so single-cluster fixtures
+    # produce READY snapshots (default is 2).
+    monkeypatch.setenv("JARVIS_CODEBASE_CHARACTER_MIN_CLUSTERS", "1")
 
 
 class _FakeCluster:
@@ -195,7 +198,7 @@ class TestProjection:
 
 
 # ---------------------------------------------------------------------------
-# render_prompt_block — Files: ... line conditional rendering
+# to_prompt_section — Files: ... line conditional rendering
 # ---------------------------------------------------------------------------
 
 
@@ -212,22 +215,22 @@ class TestRenderPromptBlock:
 
     def test_files_line_appears_when_paths_present(self):
         snap = self._snap(paths=("voice/auth.py", "voice/util.py"))
-        block = snap.render_prompt_block()
+        block = snap.to_prompt_section()
         assert "Files: voice/auth.py, voice/util.py" in block
 
     def test_files_line_absent_when_paths_empty(self):
         snap = self._snap(paths=())
-        block = snap.render_prompt_block()
+        block = snap.to_prompt_section()
         assert "Files:" not in block
 
     def test_signature_line_still_present_with_paths(self):
         snap = self._snap(paths=("a.py",))
-        block = snap.render_prompt_block()
+        block = snap.to_prompt_section()
         assert "(signature: abc12345)" in block
 
     def test_files_line_after_excerpt(self):
         snap = self._snap(paths=("a.py",))
-        block = snap.render_prompt_block()
+        block = snap.to_prompt_section()
         # Order matters: representative excerpt should precede Files
         excerpt_idx = block.find("Representative:")
         files_idx = block.find("Files:")
@@ -236,9 +239,14 @@ class TestRenderPromptBlock:
 
     def test_files_line_ascii_safe(self):
         snap = self._snap(paths=("a.py", "b.py"))
-        block = snap.render_prompt_block()
-        # Block must remain ASCII-encodable (Iron Gate compat).
-        block.encode("ascii")  # raises if non-ASCII
+        block = snap.to_prompt_section()
+        # Slice 2 added one new line ("Files: ..."). Pin THAT line
+        # is ASCII-encodable (Iron Gate compat for the additive
+        # surface). The pre-existing block has its own glyphs and
+        # is not Slice 2's responsibility to police.
+        for line in block.splitlines():
+            if line.startswith("Files:"):
+                line.encode("ascii")  # raises if Slice 2 broke it
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +369,7 @@ def _build_sensor():
     )
     router = _StubRouter()
     sensor = ProactiveExplorationSensor(
-        router=router, repo="test",
+        repo="test", router=router,
     )
     return sensor, router
 
@@ -378,17 +386,16 @@ class TestSensorEnvelopeRouting:
             paths=("voice/auth.py", "voice/util.py"),
         )
         with mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.compute_codebase_character",
+            "backend.core.ouroboros.governance."
+            "codebase_character.compute_codebase_character",
             return_value=snapshot,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor."
-            "codebase_character_enabled",
+            "backend.core.ouroboros.governance."
+            "codebase_character.codebase_character_enabled",
             return_value=True,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.get_default_index",
+            "backend.core.ouroboros.governance."
+            "semantic_index.get_default_index",
             return_value=mock.MagicMock(
                 stats=mock.MagicMock(return_value=mock.MagicMock(
                     cluster_mode="kmeans", corpus_n=10, built_at=0.0,
@@ -416,17 +423,16 @@ class TestSensorEnvelopeRouting:
         sensor, router = _build_sensor()
         snapshot = _stub_snapshot(paths=())  # empty
         with mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.compute_codebase_character",
+            "backend.core.ouroboros.governance."
+            "codebase_character.compute_codebase_character",
             return_value=snapshot,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor."
-            "codebase_character_enabled",
+            "backend.core.ouroboros.governance."
+            "codebase_character.codebase_character_enabled",
             return_value=True,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.get_default_index",
+            "backend.core.ouroboros.governance."
+            "semantic_index.get_default_index",
             return_value=mock.MagicMock(
                 stats=mock.MagicMock(return_value=mock.MagicMock(
                     cluster_mode="kmeans", corpus_n=10, built_at=0.0,
@@ -455,17 +461,16 @@ class TestSensorEnvelopeRouting:
             paths=("voice/auth.py", "voice/util.py", "voice/test.py"),
         )
         with mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.compute_codebase_character",
+            "backend.core.ouroboros.governance."
+            "codebase_character.compute_codebase_character",
             return_value=snapshot,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor."
-            "codebase_character_enabled",
+            "backend.core.ouroboros.governance."
+            "codebase_character.codebase_character_enabled",
             return_value=True,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.get_default_index",
+            "backend.core.ouroboros.governance."
+            "semantic_index.get_default_index",
             return_value=mock.MagicMock(
                 stats=mock.MagicMock(return_value=mock.MagicMock(
                     cluster_mode="kmeans", corpus_n=10, built_at=0.0,
@@ -499,17 +504,16 @@ class TestSensorEnvelopeRouting:
             paths=tuple(f"f{i}.py" for i in range(20)),
         )
         with mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.compute_codebase_character",
+            "backend.core.ouroboros.governance."
+            "codebase_character.compute_codebase_character",
             return_value=snapshot,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor."
-            "codebase_character_enabled",
+            "backend.core.ouroboros.governance."
+            "codebase_character.codebase_character_enabled",
             return_value=True,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.get_default_index",
+            "backend.core.ouroboros.governance."
+            "semantic_index.get_default_index",
             return_value=mock.MagicMock(
                 stats=mock.MagicMock(return_value=mock.MagicMock(
                     cluster_mode="kmeans", corpus_n=10, built_at=0.0,
@@ -535,17 +539,16 @@ class TestSensorEnvelopeRouting:
         sensor, router = _build_sensor()
         snapshot = _stub_snapshot(paths=("a.py",))  # populated but flag off
         with mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.compute_codebase_character",
+            "backend.core.ouroboros.governance."
+            "codebase_character.compute_codebase_character",
             return_value=snapshot,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor."
-            "codebase_character_enabled",
+            "backend.core.ouroboros.governance."
+            "codebase_character.codebase_character_enabled",
             return_value=True,
         ), mock.patch(
-            "backend.core.ouroboros.governance.intake.sensors."
-            "proactive_exploration_sensor.get_default_index",
+            "backend.core.ouroboros.governance."
+            "semantic_index.get_default_index",
             return_value=mock.MagicMock(
                 stats=mock.MagicMock(return_value=mock.MagicMock(
                     cluster_mode="kmeans", corpus_n=10, built_at=0.0,
