@@ -836,6 +836,15 @@ class OperationContext:
     # ---- Signal metadata (propagated from IntentEnvelope at intake) ----
     signal_urgency: str = ""   # "critical" | "high" | "normal" | "low"
     signal_source: str = ""    # "test_failure" | "voice_human" | "ai_miner" | etc.
+    # JSON-encoded snapshot of the originating envelope's
+    # ``evidence`` dict. Frozen-friendly (string, no Mapping
+    # ordering issues). Default empty string when no envelope (op
+    # constructed manually) or when envelope.evidence was empty.
+    # Consumers (Slice 4 ClusterIntelligence-CrossSession cascade
+    # observer; future arcs that need typed signal context) parse
+    # via ``json.loads`` defensively. Bounded by intake-side
+    # caller; orchestrator does not re-validate.
+    intake_evidence_json: str = ""
 
     # ---- Complexity classification (stamped at CLASSIFY by ComplexityClassifier) ----
     task_complexity: str = ""  # "trivial" | "simple" | "light" | "heavy_code" | "complex"
@@ -942,6 +951,7 @@ class OperationContext:
         correlation_id: str = "",
         signal_urgency: str = "",
         signal_source: str = "",
+        intake_evidence_json: str = "",
         is_read_only: bool = False,
         attachments: Tuple[Attachment, ...] = (),
         # F2 Slice 2 — optional pre-stamped provider route + reason.
@@ -1028,6 +1038,7 @@ class OperationContext:
             "reasoning_chain_result": None,
             "signal_urgency": signal_urgency,
             "signal_source": signal_source,
+            "intake_evidence_json": intake_evidence_json,
             "task_complexity": "",
             "provider_route": provider_route,
             "provider_route_reason": provider_route_reason,
@@ -1078,6 +1089,7 @@ class OperationContext:
             frozen_autonomy_tier="governed",
             signal_urgency=signal_urgency,
             signal_source=signal_source,
+            intake_evidence_json=intake_evidence_json,
             provider_route=provider_route,
             provider_route_reason=provider_route_reason,
             is_read_only=is_read_only,

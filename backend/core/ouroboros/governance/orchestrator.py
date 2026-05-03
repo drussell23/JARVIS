@@ -7471,6 +7471,33 @@ class GovernedOrchestrator:
                         exc_info=True,
                     )
 
+                # ClusterIntelligence-CrossSession Slice 4 -- post-
+                # verify cascade: persist cluster_coverage explorations
+                # into DomainMap so the next session sees prior context.
+                # NEVER raises into the orchestrator. Master flag default-
+                # off until Slice 5 graduation; observer short-circuits
+                # cleanly when the op wasn't a cluster_coverage envelope.
+                try:
+                    from backend.core.ouroboros.governance.cluster_exploration_cascade_observer import (  # noqa: E501
+                        observe_cluster_coverage_completion as _cascade_observe,
+                    )
+                    await _cascade_observe(
+                        op_id=ctx.op_id,
+                        intake_evidence_json=getattr(
+                            ctx, "intake_evidence_json", "",
+                        ) or "",
+                        touched_files=tuple(
+                            getattr(ctx, "target_files", ()) or (),
+                        ),
+                        verify_passed=bool(_verify_test_passed),
+                        project_root=self._config.project_root,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] cluster cascade observer call failed",
+                        exc_info=True,
+                    )
+
                 # On failure: attempt L2 repair before rollback
                 if not _verify_test_passed and self._config.repair_engine is not None:
                     logger.info(

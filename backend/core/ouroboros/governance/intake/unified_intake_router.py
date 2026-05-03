@@ -1080,12 +1080,31 @@ class UnifiedIntakeRouter:
             if _env_routing
             else ""
         )
+        # ClusterIntelligence-CrossSession Slice 4: snapshot
+        # envelope.evidence as JSON onto ctx so post-verify
+        # cascade observers (and future arcs needing typed signal
+        # context) can extract structured tags without a separate
+        # side-channel. Defensive serialize -- if evidence isn't
+        # JSON-encodable (shouldn't happen but be safe), stamp
+        # empty string so downstream parsers see "no signal" not
+        # "corrupt signal".
+        try:
+            import json as _json_local
+            _intake_evidence_json = (
+                _json_local.dumps(
+                    dict(envelope.evidence or {}), sort_keys=True,
+                )
+                if envelope.evidence else ""
+            )
+        except (TypeError, ValueError):
+            _intake_evidence_json = ""
         ctx = OperationContext.create(
             target_files=envelope.target_files,
             description=envelope.description,
             op_id=envelope.causal_id,
             signal_urgency=envelope.urgency,
             signal_source=envelope.source,
+            intake_evidence_json=_intake_evidence_json,
             is_read_only=_is_read_only_at_intake,
             provider_route=_pre_route,
             provider_route_reason=_pre_route_reason,

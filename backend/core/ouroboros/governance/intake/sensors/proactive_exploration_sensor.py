@@ -314,10 +314,32 @@ class ProactiveExplorationSensor:
                         " Use search_code / read_file to discover "
                         "representative files in this domain."
                     )
+                # ClusterIntelligence-CrossSession Slice 4 -- prefix
+                # the description with prior-exploration context from
+                # DomainMap when an entry exists for this cluster.
+                # Empty string when: cascade observer flag off, or
+                # DomainMap flag off, or no prior entry. Defensive:
+                # never raises into the envelope build.
+                prior_context_block = ""
+                try:
+                    from backend.core.ouroboros.governance.cluster_exploration_cascade_observer import (  # noqa: E501
+                        render_prior_context_block as _render_prior,
+                    )
+                    prior_context_block = _render_prior(
+                        cluster.centroid_hash8,
+                        project_root=self._project_root,
+                    )
+                except Exception:  # noqa: BLE001 -- defensive
+                    prior_context_block = ""
+                prior_context_prefix = (
+                    f"{prior_context_block} "
+                    if prior_context_block else ""
+                )
                 try:
                     envelope = make_envelope(
                         source="exploration",
                         description=(
+                            f"{prior_context_prefix}"
                             f"Cluster-coverage exploration: under-touched "
                             f"semantic cluster '{cluster.theme_label}' "
                             f"(kind={cluster.kind}, size={cluster.size})."
