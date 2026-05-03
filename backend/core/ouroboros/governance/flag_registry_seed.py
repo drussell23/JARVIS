@@ -2956,6 +2956,39 @@ SEED_SPECS: list = [
         example="JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S=60.0",
         since="Defect #1 fix (2026-05-03)",
     ),
+
+    # ====================================================================
+    # CandidateGenerator Defect #4 fix (2026-05-03)
+    # ====================================================================
+    # Soak v5 saw 3 EXHAUSTION events with remaining_s=0.0 + 4 unhandled
+    # asyncio task exceptions. Fix: pre-fallback budget short-circuit
+    # raises a clean cause when remaining budget < min_viable, instead
+    # of attempting a doomed fallback call that gets CancelledError'd
+    # mid-flight. Slice A's task-leak callback consumes any straggler
+    # exceptions from shielded background tasks.
+    FlagSpec(
+        name="JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S",
+        type=FlagType.FLOAT, default=5.0,
+        description=(
+            "Pre-fallback budget short-circuit threshold. When "
+            "remaining deadline budget at _call_fallback entry is "
+            "less than this many seconds, raise "
+            "deadline_exhausted_pre_fallback (clean cause) instead "
+            "of attempting a fallback call that will be CancelledError'd "
+            "mid-flight. Floor 1s, ceiling 60s. Default 5s -- safer "
+            "to skip than to attempt a doomed call. Soak v5's 3 "
+            "EXHAUSTION events with remaining_s=0.0 + the 4 "
+            "unhandled asyncio task exceptions pattern is "
+            "structurally fixed by this short-circuit (Defect #4 "
+            "Slice B 2026-05-03)."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/governance/candidate_generator.py"
+        ),
+        example="JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S=10.0",
+        since="Defect #4 fix (2026-05-03)",
+    ),
 ]
 
 

@@ -394,6 +394,77 @@ _CONTENT_FAILURE_PATTERNS: frozenset = frozenset({
 })
 
 
+# Defect #4 Slice A (2026-05-03) — task-leak prevention.
+#
+# Soak v5 (bt-2026-05-03-060330) recorded 4 "Task exception was never
+# retrieved" asyncio errors. Root cause: ensure_future/create_task
+# spawns of provider .generate() coroutines were wrapped in
+# asyncio.shield(...) which prevents cancellation when the outer
+# wait_for times out. The shielded task continues running; if it
+# later raises (e.g., RuntimeError('all_providers_exhausted')) and
+# nobody awaits the result, asyncio's default handler logs the
+# unhandled exception.
+#
+# Fix: every ensure_future/create_task of .generate() (or background
+# poll wrappers) gets _swallow_task_exception attached as a
+# done_callback. The callback retrieves the exception, classifies
+# it, and either logs at DEBUG (expected: all_providers_exhausted /
+# CancelledError / TimeoutError) or WARNING (unexpected). The task
+# exception is consumed either way.
+
+_EXPECTED_BACKGROUND_EXC_PATTERNS = (
+    "all_providers_exhausted",
+    "deadline_exhausted_pre_fallback",
+    "topology_block",
+    "fallback_disabled_by_env",
+    "queue_only_dispatch",
+)
+
+
+def _swallow_task_exception(task: "asyncio.Future") -> None:
+    """Done-callback that retrieves + classifies + consumes a task
+    exception so it never reaches asyncio's default handler.
+
+    Attach to every ``asyncio.ensure_future(...)`` /
+    ``asyncio.create_task(...)`` of provider .generate() or
+    background poll coroutines that may outlive their primary
+    awaiter (e.g., shielded tasks that survive outer wait_for
+    timeouts).
+
+    NEVER raises -- contract: even a misbehaving exception accessor
+    must not propagate.
+    """
+    try:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        msg = str(exc) if exc else ""
+        # Expected provider/orchestration exceptions: log at DEBUG.
+        # The exception was already logged at the raise site; this
+        # callback exists to CONSUME the exception, not re-log it.
+        is_expected = (
+            isinstance(exc, asyncio.CancelledError)
+            or isinstance(exc, asyncio.TimeoutError)
+            or any(p in msg for p in _EXPECTED_BACKGROUND_EXC_PATTERNS)
+        )
+        if is_expected:
+            logger.debug(
+                "[CandidateGenerator] background task expected exit: "
+                "%s(%s)", type(exc).__name__, msg[:120],
+            )
+        else:
+            logger.warning(
+                "[CandidateGenerator] background task unhandled "
+                "exception (consumed by _swallow_task_exception to "
+                "prevent asyncio leak): %s(%s)",
+                type(exc).__name__, msg[:200],
+            )
+    except Exception:  # noqa: BLE001 -- contract: never crash callback
+        pass
+
+
 def _is_content_failure(exc: BaseException) -> bool:
     """Return True if *exc* is a content/model failure (not infrastructure).
 
@@ -1911,6 +1982,13 @@ class CandidateGenerator:
                     _gen_task = asyncio.ensure_future(
                         self._tier0.generate(context, deadline),
                     )
+                    # Defect #4 Slice A — leak-prevention callback.
+                    # The shield above means _gen_task survives outer
+                    # wait_for cancellation; if it later raises with
+                    # nobody awaiting, asyncio's default handler logs
+                    # "Task exception was never retrieved". The
+                    # callback consumes the exception cleanly.
+                    _gen_task.add_done_callback(_swallow_task_exception)
                     try:
                         result = await asyncio.wait_for(
                             asyncio.shield(_gen_task), timeout=tier0_budget,
@@ -2072,6 +2150,13 @@ class CandidateGenerator:
                                     self._background_poll_tier0(pending, context),
                                     name=f"dw-poll-{pending.batch_id[:12]}",
                                 )
+                                # Defect #4 Slice A — defensive
+                                # callback (background_poll_tier0
+                                # already has try/except internally,
+                                # but the callback ensures even an
+                                # asyncio.CancelledError that bypasses
+                                # the wrapper gets consumed).
+                                task.add_done_callback(_swallow_task_exception)
                                 self._background_polls[_op_id] = task
                     except asyncio.CancelledError:
                         raise
@@ -2951,6 +3036,12 @@ class CandidateGenerator:
                 _gen_task = asyncio.ensure_future(
                     self._tier0.generate(context, deadline),
                 )
+                # Defect #4 Slice A — speculative pre-dispatch site.
+                # Stored for later retrieval, but if op completes
+                # without retrieving (timeout / route change /
+                # demotion), the task continues. Callback consumes
+                # exceptions silently.
+                _gen_task.add_done_callback(_swallow_task_exception)
                 # Store for later retrieval
                 self._background_polls[_op_id] = _gen_task
                 logger.info(
@@ -2967,6 +3058,8 @@ class CandidateGenerator:
                             self._background_poll_tier0(pending, context),
                             name=f"speculative-{_op_id[:12]}",
                         )
+                        # Defect #4 Slice A — defensive callback.
+                        task.add_done_callback(_swallow_task_exception)
                         self._background_polls[_op_id] = task
                         logger.info(
                             "[CandidateGenerator] SPECULATIVE: DW batch submitted "
@@ -3496,6 +3589,46 @@ class CandidateGenerator:
         _pre_sem_remaining = self._remaining_seconds(deadline)
         _sem_t0 = time.monotonic()
         _phase_hint = getattr(getattr(context, "phase", None), "name", "?")
+
+        # Defect #4 Slice B (2026-05-03) — pre-fallback budget short-
+        # circuit. Soak v5 saw 3 EXHAUSTION events with remaining_s=0.0
+        # and fallback_err_class=CancelledError -- ops were entering
+        # _call_fallback with insufficient budget, the call attempt
+        # was cancelled mid-flight, and the resulting CancelledError
+        # was relabeled as "fallback_failed". Wasted CPU + provider
+        # call attempt + log noise + the unhandled-exception cascade.
+        #
+        # Fix: detect the "deadline already exhausted" pre-condition
+        # and raise a clean cause sentinel instead of attempting an
+        # invariably-doomed call. Env-tunable floor protects against
+        # over-aggressive shedding (e.g., complex routes with legit
+        # 4-5s remaining might still complete in fast paths).
+        try:
+            raw_min_viable = os.environ.get(
+                "JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S", "",
+            ).strip()
+            min_viable_s = max(
+                1.0, min(60.0, float(raw_min_viable) if raw_min_viable else 5.0),
+            )
+        except (TypeError, ValueError):
+            min_viable_s = 5.0
+        if _pre_sem_remaining <= min_viable_s:
+            logger.info(
+                "[CandidateGenerator] Pre-fallback short-circuit: "
+                "remaining=%.2fs <= min_viable=%.2fs route=%s "
+                "(Defect #4 Slice B fix avoids attempting a doomed "
+                "fallback call that would CancelledError mid-flight)",
+                _pre_sem_remaining, min_viable_s, _op_route,
+            )
+            self._raise_exhausted(
+                "deadline_exhausted_pre_fallback",
+                context=context,
+                deadline=deadline,
+                pre_sem_remaining_s=round(_pre_sem_remaining, 2),
+                min_viable_s=round(min_viable_s, 2),
+                phase=_phase_hint,
+                route=_op_route,
+            )
 
         # Route-aware fallback ceiling: complex routes get a wider
         # synthesis window (180s) because their tool-result prompts are
@@ -4153,3 +4286,130 @@ class CandidateGenerator:
             _PRIMARY_MAX_TIMEOUT_S,
         )
         return max(budget, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Defect #4 fix (2026-05-03) — substrate AST pin
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Defect #4 substrate pin. Pins:
+
+      * ``_swallow_task_exception`` helper present (Slice A
+        task-leak prevention).
+      * ``deadline_exhausted_pre_fallback`` cause string present
+        (Slice B pre-fallback budget short-circuit).
+      * Every ``asyncio.ensure_future(...)`` / ``asyncio.create_task(...)``
+        of provider .generate() OR background-poll coroutines has a
+        paired ``add_done_callback(_swallow_task_exception)`` within
+        the surrounding statements (catches the regression to
+        unprotected task spawns).
+      * No exec/eval/compile.
+    """
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    REQUIRED_FUNCS = (
+        "_swallow_task_exception",
+        "register_shipped_invariants",
+    )
+    REQUIRED_LITERALS = (
+        "deadline_exhausted_pre_fallback",
+        "JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S",
+        "_EXPECTED_BACKGROUND_EXC_PATTERNS",
+    )
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        seen_funcs: set = set()
+        # Compute the line range of _swallow_task_exception so we can
+        # exclude its body (docstring mentions ensure_future/create_task
+        # in documentation, would be false positives).
+        helper_line_range: tuple = (-1, -1)
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef):
+                seen_funcs.add(node.name)
+                if node.name == "_swallow_task_exception":
+                    helper_line_range = (
+                        node.lineno,
+                        getattr(node, "end_lineno", node.lineno + 80) or 0,
+                    )
+            elif isinstance(node, _ast.AsyncFunctionDef):
+                seen_funcs.add(node.name)
+            elif isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"candidate_generator MUST NOT call "
+                            f"{node.func.id}"
+                        )
+        for fn in REQUIRED_FUNCS:
+            if fn not in seen_funcs:
+                violations.append(f"missing function {fn!r}")
+        for lit in REQUIRED_LITERALS:
+            if lit not in source:
+                violations.append(
+                    f"missing string literal {lit!r}"
+                )
+        # Pairing pin: every ensure_future / create_task of a
+        # provider .generate() must have add_done_callback in the
+        # next ~10 source lines. Source-level heuristic (cheap +
+        # robust to AST traversal noise from nested coroutines).
+        # Skip lines inside _swallow_task_exception body (its
+        # docstring mentions the spawn primitives as documentation).
+        lines = source.splitlines()
+        helper_lo, helper_hi = helper_line_range
+        for idx, line in enumerate(lines):
+            line_no = idx + 1
+            if helper_lo <= line_no <= helper_hi:
+                continue  # skip inside helper body
+            stripped = line.strip()
+            if (
+                ("asyncio.ensure_future" in stripped
+                 or "asyncio.create_task" in stripped)
+                and (".generate(" in stripped
+                     or "_background_poll_tier0" in stripped
+                     or ("generate" in stripped and "self._tier0" in stripped))
+            ):
+                # Look for add_done_callback in next 10 source lines.
+                window = lines[idx:idx + 10]
+                if not any(
+                    "add_done_callback" in w
+                    and "_swallow_task_exception" in w
+                    for w in window
+                ):
+                    violations.append(
+                        f"line {line_no}: ensure_future/create_task "
+                        "of .generate() / background-poll must have "
+                        "paired add_done_callback(_swallow_task_"
+                        "exception) within 10 lines (Defect #4 "
+                        "Slice A task-leak prevention)"
+                    )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/candidate_generator.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="candidate_generator_defect4_substrate",
+            target_file=target,
+            description=(
+                "Defect #4: _swallow_task_exception helper + paired "
+                "add_done_callback for every ensure_future/create_task "
+                "of provider .generate() / background-poll + "
+                "deadline_exhausted_pre_fallback short-circuit cause; "
+                "no dynamic-code calls."
+            ),
+            validate=_validate,
+        ),
+    ]
