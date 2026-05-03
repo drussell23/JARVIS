@@ -48,6 +48,45 @@ def _cluster_emit_per_scan() -> int:
     return max(1, min(8, val))
 
 
+def _use_representative_paths_enabled() -> bool:
+    """``JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS``
+    (default ``false`` until Slice 5 graduation).
+
+    ClusterIntelligence-CrossSession Slice 2 sub-flag. When on,
+    cluster_coverage envelopes use ``cluster.representative_paths``
+    as ``target_files=`` (when the tuple is non-empty) instead of
+    the legacy ``(".",)`` project-root sentinel. Composes with
+    Slice 1's master flag -- when Slice 1 is off,
+    representative_paths is always empty and this flag has no
+    visible effect (sentinel fall-through). Operators flip OFF to
+    keep the path-aware enrichment in observability without
+    affecting envelope routing (shadow mode).
+    """
+    raw = os.environ.get(
+        "JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS", "",
+    ).strip().lower()
+    if raw == "":
+        return False  # pre-graduation default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _representative_path_envelope_cap() -> int:
+    """``JARVIS_EXPLORATION_REPRESENTATIVE_PATH_CAP`` (default 8,
+    floor 1, ceiling 32). Hard cap on the number of paths surfaced
+    in a cluster_coverage envelope's ``target_files`` -- prevents
+    a pathological cluster from flooding intake routing budget.
+    Independent of Slice 1's top-K knob (which controls what
+    enrichment writes); this knob caps what the sensor consumes."""
+    raw = os.environ.get(
+        "JARVIS_EXPLORATION_REPRESENTATIVE_PATH_CAP", "",
+    ).strip()
+    try:
+        val = int(raw) if raw else 8
+    except (TypeError, ValueError):
+        val = 8
+    return max(1, min(32, val))
+
+
 class ProactiveExplorationSensor:
     """Curiosity sensor — explores domains where the organism is uncertain.
 
@@ -247,23 +286,45 @@ class ProactiveExplorationSensor:
                 if len(emitted) >= cap:
                     break
                 self._explored_clusters.add(cluster.centroid_hash8)
+                # Slice 2 (ClusterIntelligence-CrossSession): substitute
+                # representative_paths for the project-root sentinel
+                # when (a) the sub-flag is on AND (b) the cluster has
+                # non-empty paths. Composes with Slice 1's master --
+                # when Slice 1 is off, representative_paths is always
+                # empty and the sentinel fallback fires regardless.
+                rep_paths_raw = tuple(
+                    getattr(cluster, "representative_paths", ()) or ()
+                )
+                use_paths = (
+                    _use_representative_paths_enabled()
+                    and bool(rep_paths_raw)
+                )
+                if use_paths:
+                    cap = _representative_path_envelope_cap()
+                    target_files: Tuple[str, ...] = tuple(
+                        rep_paths_raw[:cap],
+                    )
+                    description_path_hint = (
+                        f" Representative files: "
+                        f"{', '.join(target_files)}."
+                    )
+                else:
+                    target_files = (".",)
+                    description_path_hint = (
+                        " Use search_code / read_file to discover "
+                        "representative files in this domain."
+                    )
                 try:
                     envelope = make_envelope(
                         source="exploration",
                         description=(
                             f"Cluster-coverage exploration: under-touched "
                             f"semantic cluster '{cluster.theme_label}' "
-                            f"(kind={cluster.kind}, size={cluster.size}). "
-                            f"Use search_code / read_file to discover "
-                            f"representative files in this domain. "
-                            f"Excerpt: {cluster.nearest_item_excerpt}"
+                            f"(kind={cluster.kind}, size={cluster.size})."
+                            f"{description_path_hint}"
+                            f" Excerpt: {cluster.nearest_item_excerpt}"
                         ),
-                        # Project-root sentinel — cluster-coverage doesn't
-                        # know specific files at emit time (the model uses
-                        # search_code / read_file in its tool loop to
-                        # discover representative files in the cluster's
-                        # domain). The bounded scope is the whole project.
-                        target_files=(".",),
+                        target_files=target_files,
                         repo=self._repo,
                         confidence=0.65,
                         urgency="low",
@@ -275,6 +336,17 @@ class ProactiveExplorationSensor:
                             "theme_label": cluster.theme_label,
                             "cluster_size": cluster.size,
                             "sensor": "ProactiveExplorationSensor",
+                            # Slice 2: emit the path-routing decision
+                            # in evidence so observability + future
+                            # cascade observers see whether routing
+                            # was sentinel or path-aware.
+                            "target_files_source": (
+                                "representative_paths" if use_paths
+                                else "project_root_sentinel"
+                            ),
+                            "representative_paths_count": len(
+                                rep_paths_raw,
+                            ),
                         },
                         requires_human_ack=False,
                     )
