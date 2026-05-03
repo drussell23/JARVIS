@@ -248,6 +248,11 @@ class IDEObservabilityRouter:
         app.router.add_get(
             "/observability/verbs", self._handle_verbs_list,
         )
+        # MissionInferrer Slice C — current InferenceResult projection.
+        app.router.add_get(
+            "/observability/goal-inference",
+            self._handle_goal_inference,
+        )
         # SensorGovernor + MemoryPressureGate — Wave 1 #3 Slice 3.
         app.router.add_get(
             "/observability/governor", self._handle_governor_snapshot,
@@ -2441,6 +2446,140 @@ class IDEObservabilityRouter:
             return self._error_response(
                 request, 500,
                 "ide_observability.codebase_character_error",
+            )
+
+    # ----------------------------------------------------------------------
+    # MissionInferrer Slice C — current InferenceResult projection
+    # ----------------------------------------------------------------------
+
+    async def _handle_goal_inference(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/goal-inference`` — bounded read-only
+        projection of the current ``InferenceResult`` cached by
+        ``GoalInferenceEngine``.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "enabled": true,
+              "config": {
+                "min_confidence": 0.5,
+                "top_k": 3,
+                "priority_boost_max": 0.5,
+                "refresh_s": 1800
+              },
+              "snapshot": {
+                "built_at": ...,
+                "build_ms": ...,
+                "build_reason": "first_build|refresh_elapsed|disabled",
+                "total_samples": 17,
+                "sources_contributing": {"commits": 5, ...},
+                "hypotheses": [
+                  {
+                    "inferred_id": "inf-XXXXXXXXXX",
+                    "theme": "...",
+                    "confidence": 0.78,
+                    "supporting_sources": ["commits", "memory"],
+                    "supporting_files": ["a.py", ...],
+                    "tokens": ["alpha", "beta", ...]
+                  },
+                  ...
+                ]
+              }
+            }
+
+        Returns 403 ``goal_inference_disabled`` when the master flag
+        is off (port-scanner discipline). 200 with empty hypotheses
+        when the engine has no cached result yet (cold boot). NEVER
+        raises -- defensive 500 on unexpected errors."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        try:
+            from backend.core.ouroboros.governance.goal_inference import (
+                inference_enabled,
+            )
+            if not inference_enabled():
+                return self._error_response(
+                    request, 403,
+                    "ide_observability.goal_inference_disabled",
+                )
+        except Exception:  # noqa: BLE001 -- defensive: treat as disabled
+            return self._error_response(
+                request, 403,
+                "ide_observability.goal_inference_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.goal_inference import (
+                get_default_engine,
+                min_confidence,
+                top_k,
+                priority_boost_max,
+                refresh_s,
+            )
+            engine = get_default_engine()
+            cached = engine.get_current() if engine is not None else None
+            hypotheses_payload = []
+            if cached is not None:
+                for g in cached.inferred:
+                    hypotheses_payload.append({
+                        "inferred_id": g.inferred_id,
+                        "theme": str(g.theme)[:200],
+                        "confidence": float(g.confidence),
+                        "supporting_sources": list(
+                            g.supporting_sources,
+                        ),
+                        "supporting_files": list(
+                            g.supporting_files,
+                        )[:20],
+                        "tokens": list(g.tokens)[:20],
+                    })
+            snapshot_payload = {
+                "built_at": (
+                    float(cached.built_at) if cached else 0.0
+                ),
+                "build_ms": (
+                    int(cached.build_ms) if cached else 0
+                ),
+                "build_reason": (
+                    str(cached.build_reason) if cached else "no_cache"
+                ),
+                "total_samples": (
+                    int(cached.total_samples) if cached else 0
+                ),
+                "sources_contributing": (
+                    dict(cached.sources_contributing) if cached else {}
+                ),
+                "hypotheses": hypotheses_payload,
+            }
+            return self._json_response(
+                request, 200,
+                {
+                    "enabled": True,
+                    "config": {
+                        "min_confidence": min_confidence(),
+                        "top_k": top_k(),
+                        "priority_boost_max": priority_boost_max(),
+                        "refresh_s": refresh_s(),
+                    },
+                    "snapshot": snapshot_payload,
+                },
+            )
+        except Exception:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[IDEObservability] goal_inference failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request, 500,
+                "ide_observability.goal_inference_error",
             )
 
     # ----------------------------------------------------------------------

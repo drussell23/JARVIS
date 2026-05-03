@@ -64,7 +64,15 @@ def _reset_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_inference_disabled_by_default():
+def test_inference_default_true_post_graduation(monkeypatch):
+    """Post Slice C graduation 2026-05-03 the master flag defaults
+    True. Operators flip explicit ``false`` to opt-out."""
+    monkeypatch.delenv("JARVIS_GOAL_INFERENCE_ENABLED", raising=False)
+    assert inference_enabled() is True
+
+
+def test_inference_explicit_false_overrides_graduated_default(monkeypatch):
+    monkeypatch.setenv("JARVIS_GOAL_INFERENCE_ENABLED", "false")
     assert inference_enabled() is False
 
 

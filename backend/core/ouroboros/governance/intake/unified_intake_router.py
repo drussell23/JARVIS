@@ -291,9 +291,64 @@ def _compute_priority(
     except Exception as exc:
         logger.debug("[Router] semantic alignment scorer failed: %s", exc)
 
+    # MissionInferrer Slice B — soft inferred-direction priority boost.
+    # Reads the cached InferenceResult via get_current() (cache-only, no
+    # rebuild trigger from intake — CONTEXT_EXPANSION already triggers
+    # build() per-op, keeping the cache fresh). Cap is enforced inside
+    # priority_boost_for_signal via priority_boost_max() env knob,
+    # default 0.5, hard ceiling 1.0 — strictly below declared-goal boost.
+    #
+    # Authority invariant: priority ordering ONLY. NEVER fed to
+    # UrgencyRouter, Iron Gate, risk tier, policy engine, FORBIDDEN_PATH,
+    # or approval gating. Cost-contract: cannot escalate BG/SPEC routes
+    # (route is a separate decision in UrgencyRouter, untouched here).
+    inferred_direction_boost = 0
+    try:
+        from backend.core.ouroboros.governance.goal_inference import (
+            get_default_engine,
+            inference_enabled,
+            priority_boost_for_signal,
+        )
+        if inference_enabled():
+            _engine = get_default_engine()
+            if _engine is not None:
+                _cached = _engine.get_current()
+                if _cached is not None and _cached.inferred:
+                    _raw = priority_boost_for_signal(
+                        signal_description=envelope.description or "",
+                        signal_target_files=envelope.target_files or (),
+                        result=_cached,
+                    )
+                    # int projection: any positive raw boost lands at
+                    # least one priority point. Banker's rounding would
+                    # silently drop the natural single-match score
+                    # (0.5) to 0, neutralizing the wire-up. ceil()
+                    # preserves the discrimination signal; the float
+                    # cap (priority_boost_max) still bounds the raw
+                    # value above so operators set the FLOAT ceiling
+                    # and the INT projection follows naturally.
+                    import math as _math
+                    inferred_direction_boost = (
+                        int(_math.ceil(_raw)) if _raw > 0.0 else 0
+                    )
+                    if inferred_direction_boost > 0 and isinstance(
+                        envelope.evidence, dict,
+                    ):
+                        envelope.evidence["inferred_direction_boost"] = (
+                            inferred_direction_boost
+                        )
+                        envelope.evidence[
+                            "inferred_direction_raw"
+                        ] = round(float(_raw), 3)
+    except Exception as exc:  # noqa: BLE001 -- defensive fail-soft
+        logger.debug(
+            "[Router] inferred-direction boost skipped: %s", exc,
+        )
+
     priority = (
         base - urgency + cost_penalty - confidence_bonus
         - dep_bonus - goal_boost - semantic_boost
+        - inferred_direction_boost
     )
     return priority, alignment
 

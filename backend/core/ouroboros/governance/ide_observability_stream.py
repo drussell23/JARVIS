@@ -222,6 +222,13 @@ EVENT_TYPE_AUTO_COMMITTER_IGNORED_BLOCKED = (
 # want to repair the fastembed install.
 EVENT_TYPE_SEMANTIC_EMBEDDER_FALLBACK = "semantic_embedder_fallback"
 
+# MissionInferrer Slice C — fired by GoalInferenceEngine.build() on
+# cache miss (when signal extraction + clustering actually re-runs).
+# Carries the lightweight projection of the new InferenceResult so
+# operators see hypotheses change in real time without polling the
+# /observability/goal-inference GET. Read-only; no authority surface.
+EVENT_TYPE_GOAL_INFERENCE_BUILT = "goal_inference_built"
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -1694,6 +1701,53 @@ def publish_domain_map_update(
     except Exception:  # noqa: BLE001 -- best-effort
         logger.debug(
             "[Stream] publish_domain_map_update exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_goal_inference_built(
+    *,
+    built_at: float,
+    build_ms: int,
+    total_samples: int,
+    hypotheses_count: int,
+    top_theme: str = "",
+    top_confidence: float = 0.0,
+    sources_contributing: int = 0,
+    build_reason: str = "",
+) -> Optional[str]:
+    """Best-effort publisher for ``goal_inference_built`` frames.
+
+    Returns the event_id on success, None when stream is disabled /
+    broker missing / publish raised. NEVER raises. Fired by
+    ``GoalInferenceEngine.build()`` only on cache miss (the actual
+    rebuild path), not on every cache-hit ``build()`` invocation.
+
+    Read-only payload -- no authority surface. Carries the lightweight
+    projection (counts + top theme) so operators can subscribe and
+    correlate inferred-direction shifts to behavior changes without
+    polling the GET endpoint or reading raw evidence."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_GOAL_INFERENCE_BUILT,
+            (top_theme or "no-theme")[:100],
+            {
+                "built_at": float(built_at),
+                "build_ms": int(build_ms),
+                "total_samples": int(total_samples),
+                "hypotheses_count": int(hypotheses_count),
+                "top_theme": str(top_theme or "")[:200],
+                "top_confidence": float(top_confidence),
+                "sources_contributing": int(sources_contributing),
+                "build_reason": str(build_reason or "")[:50],
+            },
+        )
+    except Exception:  # noqa: BLE001 -- best-effort
+        logger.debug(
+            "[Stream] publish_goal_inference_built exception",
             exc_info=True,
         )
         return None

@@ -73,8 +73,15 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def inference_enabled() -> bool:
-    """Master switch. Default OFF — explicit opt-in required."""
-    return os.environ.get(_ENV_ENABLED, "0").strip().lower() in _TRUTHY
+    """Master switch. Graduated default-ON 2026-05-03 (Slice C).
+
+    The substrate has been live behind this flag since Phase 7.x with
+    the engine wired into orchestrator.py CONTEXT_EXPANSION; Slice B
+    added the production intake-priority wire-up; Slice C ships
+    observability + flips this default. Operators who want the engine
+    silent flip explicit ``false``.
+    """
+    return os.environ.get(_ENV_ENABLED, "1").strip().lower() in _TRUTHY
 
 
 def prompt_injection_enabled() -> bool:
@@ -676,6 +683,28 @@ class GoalInferenceEngine:
             len(result.inferred),
             (result.inferred[0].confidence if result.inferred else 0.0),
         )
+        # Slice C — best-effort SSE publish on cache miss only. Never
+        # raises into build(); never fires on cache hits (avoids
+        # observability storm under hot intake load).
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                publish_goal_inference_built,
+            )
+            top = result.inferred[0] if result.inferred else None
+            publish_goal_inference_built(
+                built_at=result.built_at,
+                build_ms=result.build_ms,
+                total_samples=result.total_samples,
+                hypotheses_count=len(result.inferred),
+                top_theme=(top.theme if top else ""),
+                top_confidence=(top.confidence if top else 0.0),
+                sources_contributing=len(source_counts),
+                build_reason=result.build_reason,
+            )
+        except Exception:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[GoalInference] SSE publish skipped", exc_info=True,
+            )
         return result
 
     def get_current(self) -> Optional[InferenceResult]:
@@ -1009,3 +1038,304 @@ def register_default_engine(engine: Optional[GoalInferenceEngine]) -> None:
 def reset_default_engine() -> None:
     global _DEFAULT_ENGINE
     _DEFAULT_ENGINE = None
+
+
+# ---------------------------------------------------------------------------
+# MissionInferrer Slice A — Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+#
+# Eight env knobs surface here. Master + sub-gate stay at their original
+# defaults pre-graduation; Slice C flips the master to true after the
+# Slice B intake wire-up lands and is regression-tested.
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[GoalInference] register_flags degraded: %s", exc,
+        )
+        return 0
+    target = "backend/core/ouroboros/governance/goal_inference.py"
+    specs = [
+        FlagSpec(
+            name=_ENV_ENABLED,
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=f"{_ENV_ENABLED}=true",
+            description=(
+                "Master switch for cross-signal goal inference. "
+                "When on, GoalInferenceEngine pulls signals from "
+                "commits + REPL + memory + completed ops + file "
+                "hotspots + declared goals every refresh window "
+                "and surfaces ranked hypotheses to CONTEXT_EXPANSION "
+                "+ intake priority boost. Graduated default-true "
+                "2026-05-03 (Slice C)."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_PROMPT_INJECTION,
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=f"{_ENV_PROMPT_INJECTION}=true",
+            description=(
+                "Sub-gate for the CONTEXT_EXPANSION prompt section. "
+                "When master is on but this is off, hypotheses are "
+                "computed (and flow into intake priority boost) but "
+                "are NOT injected into the model prompt. Useful for "
+                "A/B observation of pure-cognition vs prompt-influence "
+                "effects."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_MIN_CONFIDENCE,
+            type=FlagType.FLOAT, default=0.5,
+            category=Category.CAPACITY,
+            source_file=target,
+            example=f"{_ENV_MIN_CONFIDENCE}=0.65",
+            description=(
+                "Minimum confidence threshold for an inferred goal "
+                "to surface. Clamped to [0.0, 1.0]. Lower = more "
+                "noise; higher = stricter filter."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_TOP_K,
+            type=FlagType.INT, default=3,
+            category=Category.CAPACITY,
+            source_file=target,
+            example=f"{_ENV_TOP_K}=5",
+            description=(
+                "Maximum number of inferred goals surfaced per "
+                "build. Clamped to [1, 10]."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_COMMIT_LOOKBACK,
+            type=FlagType.INT, default=30,
+            category=Category.CAPACITY,
+            source_file=target,
+            example=f"{_ENV_COMMIT_LOOKBACK}=60",
+            description=(
+                "Number of recent commits scanned for the commits "
+                "signal. Clamped to [5, 200]."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_MAX_AGE_S,
+            type=FlagType.INT, default=86400,
+            category=Category.TIMING,
+            source_file=target,
+            example=f"{_ENV_MAX_AGE_S}=172800",
+            description=(
+                "Maximum age (seconds) of an event to contribute to "
+                "the inferred-direction signal. Older signals are "
+                "filtered out before clustering. Floor 3600 (1 hour)."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_PRIORITY_BOOST_MAX,
+            type=FlagType.FLOAT, default=0.5,
+            category=Category.SAFETY,
+            source_file=target,
+            example=f"{_ENV_PRIORITY_BOOST_MAX}=0.5",
+            description=(
+                "Hard cap on the soft intake-priority boost contributed "
+                "by inferred goals. Strictly below declared-goal boost "
+                "(1.0-2.0) so inferred signal cannot outweigh explicit "
+                "goals. Clamped to [0.0, 1.0]."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_REFRESH_S,
+            type=FlagType.INT, default=1800,
+            category=Category.TIMING,
+            source_file=target,
+            example=f"{_ENV_REFRESH_S}=900",
+            description=(
+                "Cadence (seconds) at which GoalInferenceEngine.build() "
+                "re-runs signal extraction + clustering. Cache hits "
+                "between refreshes are O(1). Clamped to [60, 86400]."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[GoalInference] register_flags spec %s skipped: %s",
+                spec.name, exc,
+            )
+    return count
+
+
+def register_shipped_invariants() -> list:
+    """MissionInferrer Slice A invariant: the substrate's load-bearing
+    surface MUST stay structurally intact. Pins:
+
+      * 6 extract_*_signal helpers present (one per signal source).
+      * GoalInferenceEngine class + render_prompt_section function.
+      * priority_boost_for_signal exported (Slice B intake hook).
+      * accept_inferred_goal + reject_inferred_goal exported (REPL).
+      * No exec/eval/compile anywhere in the module.
+      * InferredGoal + SignalSample dataclasses MUST stay frozen
+        (their hash-stable identity is consumed by /infer accept/reject
+        and by FEEDBACK memory; mutating fields would silently corrupt
+        cross-session memory).
+    """
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    REQUIRED_FUNCS = (
+        "extract_commits_signal",
+        "extract_repl_signal",
+        "extract_memory_signal",
+        "extract_completed_ops_signal",
+        "extract_file_hotspots_signal",
+        "extract_declared_goals_signal",
+        "render_prompt_section",
+        "priority_boost_for_signal",
+        "accept_inferred_goal",
+        "reject_inferred_goal",
+    )
+    REQUIRED_CLASSES = ("GoalInferenceEngine",)
+    FROZEN_DATACLASSES = ("InferredGoal", "SignalSample")
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        seen_funcs: set = set()
+        seen_classes: set = set()
+        frozen_status: dict = {}
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef):
+                seen_funcs.add(node.name)
+            elif isinstance(node, _ast.ClassDef):
+                seen_classes.add(node.name)
+                if node.name in FROZEN_DATACLASSES:
+                    frozen = False
+                    for dec in node.decorator_list:
+                        # Match @dataclass(frozen=True) variants.
+                        if isinstance(dec, _ast.Call):
+                            for kw in dec.keywords:
+                                if (
+                                    kw.arg == "frozen"
+                                    and isinstance(kw.value, _ast.Constant)
+                                    and kw.value.value is True
+                                ):
+                                    frozen = True
+                                    break
+                    frozen_status[node.name] = frozen
+            elif isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"goal_inference MUST NOT "
+                            f"{node.func.id}()"
+                        )
+        for fn in REQUIRED_FUNCS:
+            if fn not in seen_funcs:
+                violations.append(f"missing function {fn!r}")
+        for cls in REQUIRED_CLASSES:
+            if cls not in seen_classes:
+                violations.append(f"missing class {cls!r}")
+        for cls in FROZEN_DATACLASSES:
+            if not frozen_status.get(cls, False):
+                violations.append(
+                    f"{cls} dataclass MUST stay frozen=True "
+                    "(hash-stable identity required for accept/reject "
+                    "+ FEEDBACK memory)"
+                )
+        return tuple(violations)
+
+    # Slice B regression pin: the intake router MUST consume
+    # priority_boost_for_signal in _compute_priority. Without this,
+    # MissionInferrer is decorative (prompt-only). The pin protects
+    # the production-side wire-up from silent deletion across edits.
+    INTAKE_ROUTER_FILE = (
+        "backend/core/ouroboros/governance/intake/unified_intake_router.py"
+    )
+
+    def _validate_intake_consumer(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        violations: list = []
+        # Cheap source-level check: the import + call must both appear.
+        if "priority_boost_for_signal" not in source:
+            violations.append(
+                "unified_intake_router.py MUST import + call "
+                "priority_boost_for_signal (MissionInferrer Slice B "
+                "production wire-up)"
+            )
+            return tuple(violations)
+        if "inferred_direction_boost" not in source:
+            violations.append(
+                "_compute_priority MUST compose "
+                "inferred_direction_boost into priority computation"
+            )
+        # AST-level confirmation: search for an actual Call to
+        # priority_boost_for_signal so renaming-related drift is caught.
+        found_call = False
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                func = node.func
+                if (
+                    isinstance(func, _ast.Name)
+                    and func.id == "priority_boost_for_signal"
+                ):
+                    found_call = True
+                    break
+                if (
+                    isinstance(func, _ast.Attribute)
+                    and func.attr == "priority_boost_for_signal"
+                ):
+                    found_call = True
+                    break
+        if not found_call:
+            violations.append(
+                "no Call to priority_boost_for_signal found in "
+                "unified_intake_router.py AST"
+            )
+        return tuple(violations)
+
+    target = "backend/core/ouroboros/governance/goal_inference.py"
+    return [
+        ShippedCodeInvariant(
+            invariant_name="goal_inference_substrate",
+            target_file=target,
+            description=(
+                "MissionInferrer substrate: 6 signal extractors + "
+                "GoalInferenceEngine + render/priority/accept/reject "
+                "exports + frozen InferredGoal/SignalSample + "
+                "no exec/eval/compile."
+            ),
+            validate=_validate,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="goal_inference_intake_consumer",
+            target_file=INTAKE_ROUTER_FILE,
+            description=(
+                "MissionInferrer Slice B production wire-up: "
+                "_compute_priority MUST consume "
+                "priority_boost_for_signal so inferred-direction "
+                "boost actually steers intake (not just prompt). "
+                "Cross-file regression pin owned by goal_inference."
+            ),
+            validate=_validate_intake_consumer,
+        ),
+    ]
