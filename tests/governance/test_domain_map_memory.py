@@ -99,19 +99,19 @@ class TestSchemaVersion:
 
 
 class TestMasterFlag:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
         monkeypatch.delenv(
             "JARVIS_DOMAIN_MAP_ENABLED", raising=False,
         )
-        assert domain_map_enabled() is False
+        assert domain_map_enabled() is True
 
     def test_empty_is_default(self, monkeypatch):
         monkeypatch.setenv("JARVIS_DOMAIN_MAP_ENABLED", "")
-        assert domain_map_enabled() is False
+        assert domain_map_enabled() is True
 
     def test_whitespace_is_default(self, monkeypatch):
         monkeypatch.setenv("JARVIS_DOMAIN_MAP_ENABLED", "   ")
-        assert domain_map_enabled() is False
+        assert domain_map_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "On"])
     def test_truthy(self, monkeypatch, raw):
@@ -284,7 +284,9 @@ class TestEntryFromDictDefensive:
 
 class TestLookup:
     def test_master_off_returns_none(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("JARVIS_DOMAIN_MAP_ENABLED", raising=False)
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv("JARVIS_DOMAIN_MAP_ENABLED", "false")
         s = DomainMapStore(project_root=tmp_path)
         # Even if there's a file on disk, master-off short-circuits.
         s._dir.mkdir(parents=True, exist_ok=True)
@@ -334,7 +336,9 @@ class TestLookup:
 
 class TestListAll:
     def test_master_off_returns_empty(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("JARVIS_DOMAIN_MAP_ENABLED", raising=False)
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv("JARVIS_DOMAIN_MAP_ENABLED", "false")
         s = DomainMapStore(project_root=tmp_path)
         s._dir.mkdir(parents=True, exist_ok=True)
         (s._dir / "abc12345.json").write_text(
@@ -377,7 +381,9 @@ class TestListAll:
 
 class TestRecordCreate:
     def test_master_off_returns_none(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("JARVIS_DOMAIN_MAP_ENABLED", raising=False)
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv("JARVIS_DOMAIN_MAP_ENABLED", "false")
         s = DomainMapStore(project_root=tmp_path)
         out = s.record_exploration(
             "abc12345", theme_label="x",

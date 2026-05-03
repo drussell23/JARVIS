@@ -61,18 +61,20 @@ def _isolate_env(monkeypatch):
 
 
 class TestSubFlag:
-    def test_default_false(self, monkeypatch):
-        monkeypatch.delenv(
+    def test_default_true_post_graduation(self, monkeypatch):
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED",
-            raising=False,
+            "false",
         )
-        assert _representative_paths_enabled() is False
+        assert _representative_paths_enabled() is True
 
     def test_empty_is_default(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED", "",
         )
-        assert _representative_paths_enabled() is False
+        assert _representative_paths_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "yes", "On"])
     def test_truthy(self, monkeypatch, raw):
@@ -517,9 +519,11 @@ class TestAttachPaths:
 
 class TestGitPrettyFormatSwap:
     def test_format_unchanged_when_flag_off(self, tmp_path, monkeypatch):
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED",
-            raising=False,
+            "false",
         )
         from backend.core.ouroboros.governance import (
             semantic_index as si,
@@ -606,9 +610,11 @@ class TestGitPrettyFormatSwap:
         assert second.text == "simple subject"
 
     def test_commit_hash_empty_when_flag_off(self, tmp_path, monkeypatch):
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED",
-            raising=False,
+            "false",
         )
         from backend.core.ouroboros.governance import (
             semantic_index as si,

@@ -50,7 +50,7 @@ def _cluster_emit_per_scan() -> int:
 
 def _use_representative_paths_enabled() -> bool:
     """``JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS``
-    (default ``false`` until Slice 5 graduation).
+    (default ``true`` post Slice 5 graduation, 2026-05-03).
 
     ClusterIntelligence-CrossSession Slice 2 sub-flag. When on,
     cluster_coverage envelopes use ``cluster.representative_paths``
@@ -66,7 +66,7 @@ def _use_representative_paths_enabled() -> bool:
         "JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS", "",
     ).strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

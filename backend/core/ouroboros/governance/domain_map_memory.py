@@ -115,8 +115,8 @@ _DEFAULT_ROLE_MAX_CHARS: int = 500
 
 
 def domain_map_enabled() -> bool:
-    """``JARVIS_DOMAIN_MAP_ENABLED`` (default ``false`` until
-    Slice 5 graduation).
+    """``JARVIS_DOMAIN_MAP_ENABLED`` (default ``true`` post Slice
+    5 graduation, 2026-05-03).
 
     Asymmetric env semantics -- empty/whitespace = unset = current
     default; explicit truthy/falsy overrides. Re-read on every
@@ -131,7 +131,7 @@ def domain_map_enabled() -> bool:
         "JARVIS_DOMAIN_MAP_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 

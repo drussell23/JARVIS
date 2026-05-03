@@ -261,19 +261,19 @@ from backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sens
 
 
 class TestSensorSubFlag:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
         monkeypatch.delenv(
             "JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS",
             raising=False,
         )
-        assert _use_representative_paths_enabled() is False
+        assert _use_representative_paths_enabled() is True
 
     def test_empty_is_default(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_PROACTIVE_EXPLORATION_USE_REPRESENTATIVE_PATHS",
             "",
         )
-        assert _use_representative_paths_enabled() is False
+        assert _use_representative_paths_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "yes", "On"])
     def test_truthy(self, monkeypatch, raw):

@@ -156,7 +156,7 @@ def _git_log_limit() -> int:
 
 def _representative_paths_enabled() -> bool:
     """``JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED``
-    (default ``false`` until Slice 5 graduation).
+    (default ``true`` post Slice 5 graduation, 2026-05-03).
 
     When on, the cluster builder runs a second ``git log
     --name-only`` pass to map commits -> file paths, then
@@ -164,12 +164,16 @@ def _representative_paths_enabled() -> bool:
     across its member commits. ProactiveExploration consumes
     these in Slice 2 to replace the ``(".",)`` project-root
     sentinel with a per-cluster bounded scope.
+
+    Graduated default-true after the full Slices 1-4 stack
+    proved out (485/485 combined sweep). Cost contract:
+    one bounded ``git log`` subprocess per cluster build.
     """
     raw = os.environ.get(
         "JARVIS_SEMANTIC_INDEX_REPRESENTATIVE_PATHS_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
