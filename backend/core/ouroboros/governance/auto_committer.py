@@ -230,6 +230,25 @@ class AutoCommitter:
                     len(breach), list(breach)[:5],
                 )
                 await self._reset_index()
+                # Slice 3 graduation: best-effort SSE publish on
+                # Layer 2 abort so observability sees the ABORT
+                # event live. NEVER raises into the commit path.
+                try:
+                    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                        publish_auto_committer_ignored_blocked as _pub_blocked,
+                    )
+                    _pub_blocked(
+                        op_id=op_id,
+                        layer="layer2_validator",
+                        blocked_paths=tuple(breach),
+                        skipped_count=len(breach),
+                        aborted=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "[AutoCommitter] SSE publish (layer2) "
+                        "degraded: %s", exc,
+                    )
                 return CommitResult(
                     committed=False,
                     error=(
@@ -501,6 +520,25 @@ class AutoCommitter:
                     len(ignored_paths),
                     list(ignored_paths)[:5],
                 )
+                # Slice 3 graduation: best-effort SSE publish so
+                # observability sees Layer 1 skips live. NEVER
+                # raises into the staging path.
+                try:
+                    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                        publish_auto_committer_ignored_blocked as _pub_blocked,
+                    )
+                    _pub_blocked(
+                        op_id="",  # _stage_files doesn't have op_id
+                        layer="layer1_prestage",
+                        blocked_paths=tuple(ignored_paths),
+                        skipped_count=len(ignored_paths),
+                        aborted=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "[AutoCommitter] SSE publish (layer1) "
+                        "degraded: %s", exc,
+                    )
         except Exception as exc:  # noqa: BLE001 -- defensive
             # Guard failure is fail-open by contract (Slice 1's
             # primitive returns empty on subprocess failure). The
