@@ -120,17 +120,21 @@ class SerpentFlowBackend:
     # Closed taxonomy of which event kinds this adapter actively handles
     # vs. which it documented-no-ops. The union MUST cover every
     # EventKind value (AST-pinned).
+    #
+    # Slice 7 graduation: 5 event kinds promoted from _NO_OP_KINDS to
+    # _HANDLED_KINDS. Only BACKEND_RESET remains a documented no-op
+    # (lifecycle event, no SerpentFlow API correspondence).
     _HANDLED_KINDS: frozenset = frozenset({
         "PHASE_BEGIN",
         "REASONING_TOKEN",
         "PHASE_END",
-    })
-    _NO_OP_KINDS: frozenset = frozenset({
         "FILE_REF",
         "STATUS_TICK",
         "MODAL_PROMPT",
         "MODAL_DISMISS",
         "THREAD_TURN",
+    })
+    _NO_OP_KINDS: frozenset = frozenset({
         "BACKEND_RESET",
     })
 
@@ -181,9 +185,24 @@ class SerpentFlowBackend:
                 if hasattr(self._flow, "show_streaming_end"):
                     self._flow.show_streaming_end()
                 return
+            if kind == "FILE_REF":
+                self._handle_file_ref(event)
+                return
+            if kind == "STATUS_TICK":
+                self._handle_status_tick(event)
+                return
+            if kind == "MODAL_PROMPT":
+                self._handle_modal_prompt(event)
+                return
+            if kind == "MODAL_DISMISS":
+                self._handle_modal_dismiss(event)
+                return
+            if kind == "THREAD_TURN":
+                self._handle_thread_turn(event)
+                return
             if kind in self._NO_OP_KINDS:
-                # Documented no-op — Slices 3-6 will surface these as
-                # their typed primitives ship.
+                # Documented no-op (BACKEND_RESET is a lifecycle event
+                # with no SerpentFlow API correspondence).
                 return
             # Unknown closed-taxonomy value — log once and continue.
             logger.debug(
@@ -194,6 +213,111 @@ class SerpentFlowBackend:
                 "[SerpentFlowBackend] notify failed for kind=%s",
                 kind, exc_info=True,
             )
+
+    # -- Slice 7 event-kind handlers (feature-detected) ----------------
+
+    def _handle_file_ref(self, event: Any) -> None:
+        """FILE_REF → flow.show_diff(path, diff_text) if metadata
+        carries both; else flow.show_code_preview(path) if available;
+        else fall back to console.print of the canonical render."""
+        metadata = _event_metadata(event)
+        path = str(metadata.get("path", "") or "")
+        if not path:
+            return
+        diff_text = str(metadata.get("diff_text", "") or "")
+        if diff_text and hasattr(self._flow, "show_diff"):
+            try:
+                self._flow.show_diff(path, diff_text)
+                return
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+        if hasattr(self._flow, "show_code_preview"):
+            try:
+                self._flow.show_code_preview(path)
+                return
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+        # Fallback: print via console attribute (SerpentFlow has one).
+        self._console_print(getattr(event, "content", "") or path)
+
+    def _handle_status_tick(self, event: Any) -> None:
+        """STATUS_TICK → metadata-driven dispatch. Recognised metadata
+        keys map to specific update_* methods on SerpentFlow:
+          * ``cost`` → flow.update_cost(amount)
+          * ``sensors`` → flow.update_sensors(count)
+          * ``provider_chain`` → flow.update_provider_chain(chain)
+        Unrecognised metadata falls through to console.print of the
+        event's content (status line text)."""
+        metadata = _event_metadata(event)
+        # Try each typed update path; first successful match wins.
+        for key, method_name, coerce in (
+            ("cost", "update_cost", float),
+            ("sensors", "update_sensors", int),
+            ("provider_chain", "update_provider_chain", str),
+            ("intent_chain", "update_intent_chain", str),
+        ):
+            if key not in metadata:
+                continue
+            method = getattr(self._flow, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method(coerce(metadata[key]))
+                return
+            except Exception:  # noqa: BLE001 — defensive
+                continue
+        # Generic status text fallback
+        content = getattr(event, "content", "") or ""
+        if content:
+            self._console_print(content)
+
+    def _handle_modal_prompt(self, event: Any) -> None:
+        """MODAL_PROMPT → render the modal text via console.print.
+        SerpentFlow doesn't have a dedicated modal surface; the
+        flowing CLI shows it as an inline prompt block. Slice 6's
+        contextual help panel is the primary producer."""
+        content = getattr(event, "content", "") or ""
+        if content:
+            self._console_print(f"\n[bold cyan]── help ──[/bold cyan]\n{content}\n")
+
+    def _handle_modal_dismiss(self, event: Any) -> None:
+        """MODAL_DISMISS → render a separator marking the close. The
+        flowing CLI doesn't track modal state; it just shows the
+        separator and continues the stream."""
+        del event
+        self._console_print("[dim]── /help ──[/dim]\n")
+
+    def _handle_thread_turn(self, event: Any) -> None:
+        """THREAD_TURN → render the speaker-tagged turn. SerpentFlow
+        doesn't have a dedicated thread region in Slice 7; emit as a
+        speaker-prefixed line in the flowing log. Slice 8+ may add a
+        sticky thread region."""
+        metadata = _event_metadata(event)
+        speaker = str(metadata.get("speaker", "") or "?")
+        content = getattr(event, "content", "") or ""
+        if not content:
+            return
+        prefix = {
+            "USER":       "[bold]you[/bold]",
+            "ASSISTANT":  "[cyan]model[/cyan]",
+            "POSTMORTEM": "[dim]postmortem[/dim]",
+            "TOOL":       "[dim]tool[/dim]",
+            "SYSTEM":     "[dim]sys[/dim]",
+        }.get(speaker, "[dim]?[/dim]")
+        self._console_print(f"  {prefix}: {content}")
+
+    def _console_print(self, text: str) -> None:
+        """Defensive console.print via the flow's console attribute.
+        SerpentFlow exposes ``self.console`` (Rich Console). When
+        unavailable, falls through to logger DEBUG."""
+        try:
+            console = getattr(self._flow, "console", None)
+            if console is not None and hasattr(console, "print"):
+                console.print(text)
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        logger.debug("[SerpentFlowBackend] %s", text)
 
     def flush(self) -> None:
         """SerpentFlow has no explicit flush hook — best-effort no-op.
@@ -236,17 +360,18 @@ class OuroborosConsoleBackend:
 
     name: str = "ouroboros_console"
 
+    # Slice 7 graduation — symmetric with SerpentFlowBackend.
     _HANDLED_KINDS: frozenset = frozenset({
         "PHASE_BEGIN",
         "REASONING_TOKEN",
         "PHASE_END",
-    })
-    _NO_OP_KINDS: frozenset = frozenset({
         "FILE_REF",
         "STATUS_TICK",
         "MODAL_PROMPT",
         "MODAL_DISMISS",
         "THREAD_TURN",
+    })
+    _NO_OP_KINDS: frozenset = frozenset({
         "BACKEND_RESET",
     })
 
@@ -281,6 +406,21 @@ class OuroborosConsoleBackend:
                 if hasattr(self._console, "show_streaming_end"):
                     self._console.show_streaming_end()
                 return
+            if kind == "FILE_REF":
+                self._handle_file_ref(event)
+                return
+            if kind == "STATUS_TICK":
+                self._handle_status_tick(event)
+                return
+            if kind == "MODAL_PROMPT":
+                self._handle_modal_prompt(event)
+                return
+            if kind == "MODAL_DISMISS":
+                self._handle_modal_dismiss(event)
+                return
+            if kind == "THREAD_TURN":
+                self._handle_thread_turn(event)
+                return
             if kind in self._NO_OP_KINDS:
                 return
             logger.debug(
@@ -292,6 +432,65 @@ class OuroborosConsoleBackend:
                 "[OuroborosConsoleBackend] notify failed for kind=%s",
                 kind, exc_info=True,
             )
+
+    # -- Slice 7 event-kind handlers (feature-detected) ----------------
+
+    def _handle_file_ref(self, event: Any) -> None:
+        """OuroborosConsole has show_diff(file_path, diff_text)."""
+        metadata = _event_metadata(event)
+        path = str(metadata.get("path", "") or "")
+        if not path:
+            return
+        diff_text = str(metadata.get("diff_text", "") or "")
+        if hasattr(self._console, "show_diff"):
+            try:
+                self._console.show_diff(path, diff_text)
+                return
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+        self._console_print(getattr(event, "content", "") or path)
+
+    def _handle_status_tick(self, event: Any) -> None:
+        """OuroborosConsole exposes show_cost_update."""
+        metadata = _event_metadata(event)
+        if "cost" in metadata and hasattr(
+            self._console, "show_cost_update",
+        ):
+            try:
+                self._console.show_cost_update(float(metadata["cost"]))
+                return
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+        content = getattr(event, "content", "") or ""
+        if content:
+            self._console_print(content)
+
+    def _handle_modal_prompt(self, event: Any) -> None:
+        content = getattr(event, "content", "") or ""
+        if content:
+            self._console_print(f"\n── help ──\n{content}\n")
+
+    def _handle_modal_dismiss(self, event: Any) -> None:
+        del event
+        self._console_print("── /help ──\n")
+
+    def _handle_thread_turn(self, event: Any) -> None:
+        metadata = _event_metadata(event)
+        speaker = str(metadata.get("speaker", "") or "?")
+        content = getattr(event, "content", "") or ""
+        if not content:
+            return
+        self._console_print(f"  [{speaker.lower()}] {content}")
+
+    def _console_print(self, text: str) -> None:
+        try:
+            console = getattr(self._console, "console", None)
+            if console is not None and hasattr(console, "print"):
+                console.print(text)
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        logger.debug("[OuroborosConsoleBackend] %s", text)
 
     def flush(self) -> None:
         return
@@ -499,6 +698,107 @@ def _validate_adapter_protocol_conformance(
     return tuple(violations)
 
 
+_SLICE7_HANDLED_GRADUATIONS: tuple = (
+    "FILE_REF", "STATUS_TICK", "MODAL_PROMPT",
+    "MODAL_DISMISS", "THREAD_TURN",
+)
+_SLICE7_HARNESS_WIRING_TOKENS: tuple = (
+    "wire_render_conductor",
+    "InputController",
+    "ThreadObserver",
+    "ContextualHelpResolver",
+    "register_help_action_handlers",
+)
+
+
+def _validate_serpent_handles_slice7_kinds(
+    tree: Any, source: str,
+) -> tuple:
+    """SerpentFlowBackend._HANDLED_KINDS MUST contain the 5 Slice 7
+    graduation event kinds (FILE_REF / STATUS_TICK / MODAL_PROMPT /
+    MODAL_DISMISS / THREAD_TURN). Catches a future patch reverting
+    the graduation by moving them back to _NO_OP_KINDS."""
+    del source
+    import ast
+    found_in_handled: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "SerpentFlowBackend":
+            for stmt in node.body:
+                # Look for: _HANDLED_KINDS: frozenset = frozenset({...})
+                if isinstance(stmt, ast.AnnAssign) and isinstance(
+                    stmt.target, ast.Name,
+                ) and stmt.target.id == "_HANDLED_KINDS":
+                    if isinstance(stmt.value, ast.Call):
+                        # frozenset(set_literal_or_iterable)
+                        for arg in stmt.value.args:
+                            if isinstance(arg, (ast.Set, ast.List, ast.Tuple)):
+                                for elt in arg.elts:
+                                    if isinstance(elt, ast.Constant) and isinstance(
+                                        elt.value, str,
+                                    ):
+                                        found_in_handled.add(elt.value)
+    missing = set(_SLICE7_HANDLED_GRADUATIONS) - found_in_handled
+    if missing:
+        return (
+            f"SerpentFlowBackend._HANDLED_KINDS missing graduation kinds: "
+            f"{sorted(missing)}",
+        )
+    return ()
+
+
+def _validate_ouroboros_handles_slice7_kinds(
+    tree: Any, source: str,
+) -> tuple:
+    """OuroborosConsoleBackend._HANDLED_KINDS MUST contain the 5
+    Slice 7 graduation event kinds. Symmetric pin to SerpentFlow."""
+    del source
+    import ast
+    found_in_handled: set = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, ast.ClassDef,
+        ) and node.name == "OuroborosConsoleBackend":
+            for stmt in node.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(
+                    stmt.target, ast.Name,
+                ) and stmt.target.id == "_HANDLED_KINDS":
+                    if isinstance(stmt.value, ast.Call):
+                        for arg in stmt.value.args:
+                            if isinstance(arg, (ast.Set, ast.List, ast.Tuple)):
+                                for elt in arg.elts:
+                                    if isinstance(elt, ast.Constant) and isinstance(
+                                        elt.value, str,
+                                    ):
+                                        found_in_handled.add(elt.value)
+    missing = set(_SLICE7_HANDLED_GRADUATIONS) - found_in_handled
+    if missing:
+        return (
+            f"OuroborosConsoleBackend._HANDLED_KINDS missing graduation "
+            f"kinds: {sorted(missing)}",
+        )
+    return ()
+
+
+def _validate_harness_wiring_present(
+    tree: Any, source: str,
+) -> tuple:
+    """harness.py MUST contain the Slice 7 graduation wiring tokens
+    (wire_render_conductor + InputController + ThreadObserver +
+    ContextualHelpResolver + register_help_action_handlers). Pinned
+    so a refactor cannot silently drop the boot wire and leave the
+    substrate orphan."""
+    del tree
+    missing = [
+        token for token in _SLICE7_HARNESS_WIRING_TOKENS
+        if token not in source
+    ]
+    if missing:
+        return (
+            f"harness.py missing Slice 7 wiring tokens: {missing}",
+        )
+    return ()
+
+
 def _validate_streamrenderer_protocol_conformance(
     tree: Any, source: str,
 ) -> tuple:
@@ -580,6 +880,55 @@ def register_shipped_invariants() -> List:
                 "if any renderer drops backend conformance, this fails."
             ),
             validate=_validate_streamrenderer_protocol_conformance,
+        ),
+        # Slice 7 graduation pins — catch reverts of the 5-kind backend
+        # handler expansion + the harness boot wire.
+        ShippedCodeInvariant(
+            invariant_name="render_backends_serpent_handles_slice7_kinds",
+            target_file=(
+                "backend/core/ouroboros/governance/render_backends.py"
+            ),
+            description=(
+                "Slice 7 graduation pin: SerpentFlowBackend._HANDLED_"
+                "KINDS MUST contain FILE_REF / STATUS_TICK / "
+                "MODAL_PROMPT / MODAL_DISMISS / THREAD_TURN. A future "
+                "patch moving any of these back to _NO_OP_KINDS would "
+                "silently revert Gap #2/#3/#6/#7 rendering — caught "
+                "here at boot."
+            ),
+            validate=_validate_serpent_handles_slice7_kinds,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="render_backends_ouroboros_handles_slice7_kinds",
+            target_file=(
+                "backend/core/ouroboros/governance/render_backends.py"
+            ),
+            description=(
+                "Symmetric Slice 7 graduation pin for "
+                "OuroborosConsoleBackend._HANDLED_KINDS — same 5 "
+                "kinds. Symmetry is a property: if the SerpentFlow "
+                "fallback ever drops backend conformance for these "
+                "kinds, the operator-visible surface becomes "
+                "asymmetric depending on which renderer is active."
+            ),
+            validate=_validate_ouroboros_handles_slice7_kinds,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="harness_wires_render_substrate",
+            target_file=(
+                "backend/core/ouroboros/battle_test/harness.py"
+            ),
+            description=(
+                "Slice 7 graduation pin: the harness boot sequence "
+                "MUST contain the 5 Slice 7 wiring tokens: "
+                "wire_render_conductor + InputController + "
+                "ThreadObserver + ContextualHelpResolver + "
+                "register_help_action_handlers. Catches a refactor "
+                "that silently drops a producer-singleton "
+                "construction — without it the operator-side surface "
+                "would orphan even with the substrate flag on."
+            ),
+            validate=_validate_harness_wiring_present,
         ),
     ]
 

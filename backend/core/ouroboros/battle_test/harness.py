@@ -1073,9 +1073,11 @@ class BattleTestHarness:
 
             # RenderConductor Slice 2 — wire whichever renderers are alive
             # as backends. Master flag (JARVIS_RENDER_CONDUCTOR_ENABLED)
-            # default-false until Slice 7 graduation, so publishes are
-            # no-ops until operators flip the flag — backends remain
-            # registered so the hot-flip works without re-wire. NEVER
+            # graduated default-true at Slice 7. Producer-side flags
+            # (REASONING_STREAM / INPUT_CONTROLLER / THREAD_OBSERVER /
+            # CONTEXTUAL_HELP) stay default-false so each surface opts
+            # in independently; substrate is alive at default but no
+            # producer emits events until those flags flip. NEVER
             # raises; boot is not blocked by rendering glue.
             try:
                 from backend.core.ouroboros.governance.render_backends import (
@@ -1110,6 +1112,110 @@ class BattleTestHarness:
                 logger.debug(
                     "[harness] render conductor wire failed: %s",
                     _wire_exc,
+                )
+
+            # RenderConductor Slice 7 — graduation wiring. Constructs
+            # the producer-side observers (InputController / ThreadObserver
+            # / ContextualHelpResolver) and registers them as process
+            # singletons. Each is gated by its own master flag (default
+            # false) so default behavior is unchanged. Operators opt-in
+            # per surface. SerpentFlow's existing _handle_cancel(op_id,
+            # immediate=True) is registered into KeyActionRegistry under
+            # CANCEL_CURRENT_OP — the Esc-mid-token wire (Gap #5).
+            # NEVER raises; boot is not blocked by render glue.
+            try:
+                from backend.core.ouroboros.governance import key_input as _ki
+                from backend.core.ouroboros.governance import (
+                    render_thread as _rt,
+                )
+                from backend.core.ouroboros.governance import (
+                    render_help as _rh,
+                )
+
+                # InputController — raw-stdin reader. Construction is
+                # cheap; .start() short-circuits per its own gates
+                # (master flag / TTY / REPL active).
+                _input_ctrl = _ki.InputController()
+                _ki.register_input_controller(_input_ctrl)
+
+                # Wire SerpentFlow._handle_cancel into the action
+                # registry. The handler is async; KeyActionRegistry
+                # schedules it via asyncio.ensure_future when a loop
+                # is running, else closes the coroutine cleanly.
+                _flow_for_cancel = self._serpent_flow
+                if _flow_for_cancel is not None and hasattr(
+                    _flow_for_cancel, "_handle_cancel",
+                ):
+                    def _cancel_current_op_via_flow(_event: Any) -> Any:
+                        try:
+                            gls = getattr(_flow_for_cancel, "_gls", None)
+                            op_id = ""
+                            if gls is not None and hasattr(
+                                gls, "current_generating_op_id",
+                            ):
+                                try:
+                                    op_id = (
+                                        gls.current_generating_op_id() or ""
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    op_id = ""
+                            if not op_id:
+                                return None
+                            return _flow_for_cancel._handle_cancel(
+                                op_id, immediate=True,
+                            )
+                        except Exception:  # noqa: BLE001 — defensive
+                            return None
+                    _input_ctrl.registry.register(
+                        _ki.KeyAction.CANCEL_CURRENT_OP,
+                        _cancel_current_op_via_flow,
+                    )
+
+                # ThreadObserver — sync bridge → conductor pump.
+                # .start() is no-op when its master flag is off; bridge
+                # remains alive for its CONTEXT_EXPANSION consumer.
+                _thread_obs = _rt.ThreadObserver()
+                _rt.register_thread_observer(_thread_obs)
+                _thread_obs.start()
+
+                # ContextualHelpResolver — read-only ranking surface.
+                _help_resolver = _rh.ContextualHelpResolver()
+                _rh.register_help_resolver(_help_resolver)
+                _rh.register_help_action_handlers(
+                    _help_resolver,
+                    posture_provider=_posture_provider,
+                )
+
+                # InputController.start() — actually begin reading
+                # stdin if all gates pass. Async — schedule + forget.
+                try:
+                    _ic_start = _input_ctrl.start()
+                    if asyncio.iscoroutine(_ic_start):
+                        try:
+                            _loop = asyncio.get_running_loop()
+                            _loop.create_task(_ic_start)
+                        except RuntimeError:
+                            try:
+                                _ic_start.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[harness] InputController start scheduling failed",
+                        exc_info=True,
+                    )
+
+                logger.info(
+                    "[harness] Slice 7 graduation wired: input_controller=%s "
+                    "thread_observer=%s help_resolver=%s",
+                    "registered" if _ki.get_input_controller() else "off",
+                    "active" if _thread_obs.active else "inactive",
+                    "registered" if _rh.get_help_resolver() else "off",
+                )
+            except Exception as _grad_exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[harness] Slice 7 graduation wire failed: %s",
+                    _grad_exc,
                 )
 
             logger.info("Governance stack booted")

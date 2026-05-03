@@ -510,7 +510,12 @@ class TestEndToEndConductorPublish:
         assert flow.tokens == ["ABC"]
         assert console.tokens == ["ABC"]
 
-    def test_master_off_no_event_reaches_backends(self, fresh_registry):
+    def test_master_off_no_event_reaches_backends(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        # Hot-revert: explicit env=false drops events even though
+        # the post-Slice-7 default is true.
+        monkeypatch.setenv("JARVIS_RENDER_CONDUCTOR_ENABLED", "false")
         flow = _StubFlow()
         c = rb.wire_render_conductor(serpent_flow=flow)
         assert c is not None
@@ -562,14 +567,14 @@ def slice2_pins() -> list:
 
 
 class TestSlice2ASTPinsClean:
-    def test_three_pins_registered(self, slice2_pins):
-        assert len(slice2_pins) == 3
+    def test_original_three_pins_present(self, slice2_pins):
+        # Slice 2 shipped 3 pins. Slice 7 added 3 more graduation
+        # pins to the same register_shipped_invariants. Assert the
+        # original 3 are still present (rather than counting total).
         names = {i.invariant_name for i in slice2_pins}
-        assert names == {
-            "render_backends_no_authority_imports",
-            "render_backends_adapter_protocol_conformance",
-            "streamrenderer_protocol_conformance",
-        }
+        assert "render_backends_no_authority_imports" in names
+        assert "render_backends_adapter_protocol_conformance" in names
+        assert "streamrenderer_protocol_conformance" in names
 
     def test_no_authority_imports_clean(self, slice2_pins):
         import inspect
