@@ -203,6 +203,16 @@ EVENT_TYPE_SKILL_INVOKED = "skill_invoked"
 # memory for + how the file-set + exploration_count evolve over time.
 EVENT_TYPE_DOMAIN_MAP_UPDATED = "domain_map_updated"
 
+# AutoCommitterIgnoreGuard Slice 3 — gitignore breach blocked. Fired
+# by AutoCommitter when Layer 1 (pre-stage) refuses ignored paths OR
+# Layer 2 (post-stage validator) catches a breach that slipped past
+# Layer 1 and aborts the commit. Read-only; no authority surface.
+# Operators subscribe to monitor the AutoCommitter sovereignty
+# boundary live.
+EVENT_TYPE_AUTO_COMMITTER_IGNORED_BLOCKED = (
+    "auto_committer_ignored_blocked"
+)
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -1676,6 +1686,46 @@ def publish_domain_map_update(
         logger.debug(
             "[Stream] publish_domain_map_update exception",
             exc_info=True,
+        )
+        return None
+
+
+def publish_auto_committer_ignored_blocked(
+    *,
+    op_id: str,
+    layer: str,
+    blocked_paths: Tuple[str, ...] = (),
+    skipped_count: int = 0,
+    aborted: bool = False,
+) -> Optional[str]:
+    """Best-effort publisher for ``auto_committer_ignored_blocked``
+    frames. Fired by AutoCommitter when Layer 1 (pre-stage)
+    refuses ignored paths OR Layer 2 (post-stage validator)
+    catches a breach + aborts the commit.
+
+    ``layer`` ∈ ``{"layer1_prestage", "layer2_validator"}``.
+    ``aborted`` is True only for Layer 2 catches (Layer 1 is
+    silent skip + commit may still succeed for clean inputs).
+
+    Read-only payload -- no authority surface. NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        return get_default_broker().publish(
+            EVENT_TYPE_AUTO_COMMITTER_IGNORED_BLOCKED,
+            op_id or "unknown",
+            {
+                "op_id": str(op_id),
+                "layer": str(layer),
+                "blocked_paths": list(blocked_paths)[:32],
+                "skipped_count": int(skipped_count),
+                "aborted": bool(aborted),
+            },
+        )
+    except Exception:  # noqa: BLE001 -- best-effort
+        logger.debug(
+            "[Stream] publish_auto_committer_ignored_blocked "
+            "exception", exc_info=True,
         )
         return None
 

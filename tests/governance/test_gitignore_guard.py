@@ -114,24 +114,24 @@ class TestSchemaVersion:
 
 
 class TestMasterFlag:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
         monkeypatch.delenv(
             "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED",
             raising=False,
         )
-        assert gitignore_guard_enabled() is False
+        assert gitignore_guard_enabled() is True
 
     def test_empty_is_default(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED", "",
         )
-        assert gitignore_guard_enabled() is False
+        assert gitignore_guard_enabled() is True
 
     def test_whitespace_is_default(self, monkeypatch):
         monkeypatch.setenv(
             "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED", "   ",
         )
-        assert gitignore_guard_enabled() is False
+        assert gitignore_guard_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "On"])
     def test_truthy(self, monkeypatch, raw):
@@ -223,9 +223,11 @@ class TestMasterOffShortCircuits:
     def test_is_path_ignored_master_off_returns_false(
         self, tmp_path, monkeypatch,
     ):
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED",
-            raising=False,
+            "false",
         )
         # Even a clearly-ignored .pyc returns False when master off.
         assert is_path_ignored(tmp_path, "x.pyc") is False
@@ -233,9 +235,11 @@ class TestMasterOffShortCircuits:
     def test_find_ignored_targets_master_off_returns_empty(
         self, tmp_path, monkeypatch,
     ):
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED",
-            raising=False,
+            "false",
         )
         assert find_ignored_targets(
             tmp_path, ["x.pyc", "y.pyc"],
@@ -244,27 +248,33 @@ class TestMasterOffShortCircuits:
     def test_find_tracked_but_ignored_master_off_returns_empty(
         self, tmp_path, monkeypatch,
     ):
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED",
-            raising=False,
+            "false",
         )
         assert find_tracked_but_ignored(tmp_path) == ()
 
     def test_classify_master_off_returns_disabled(
         self, tmp_path, monkeypatch,
     ):
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED",
-            raising=False,
+            "false",
         )
         out = classify_path(tmp_path, "x.pyc")
         assert out is GitignoreGuardOutcome.DISABLED
 
     def test_master_off_no_subprocess(self, tmp_path, monkeypatch):
         """Ensure master-off path does NOT launch any subprocess."""
-        monkeypatch.delenv(
+        # Post-graduation default is true; explicit "false" is the
+        # operator escape hatch.
+        monkeypatch.setenv(
             "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED",
-            raising=False,
+            "false",
         )
         with mock.patch(
             "subprocess.run",

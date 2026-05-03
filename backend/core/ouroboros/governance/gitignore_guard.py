@@ -76,7 +76,7 @@ _BATCH_SIZE: int = 500
 
 def gitignore_guard_enabled() -> bool:
     """``JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED`` (default
-    ``false`` until Slice 3 graduation).
+    ``true`` post Slice 3 graduation, 2026-05-03).
 
     When off, every public function returns the no-op default:
       * :func:`is_path_ignored` -> False (treats everything as
@@ -86,6 +86,11 @@ def gitignore_guard_enabled() -> bool:
 
     No subprocess is launched on any path when the flag is off.
 
+    Graduated default-true after the full Slices 1-2 stack proved
+    out (72/72 combined sweep + e2e Layer 2 catches Layer-1-fail-
+    open). Tier 0b hygiene gate is now structurally enforced
+    by default; operators retain ``"false"`` escape hatch.
+
     Asymmetric env semantics -- empty/whitespace = unset = current
     default; explicit truthy/falsy overrides. Re-read on every
     call so flag flips hot-revert.
@@ -94,7 +99,7 @@ def gitignore_guard_enabled() -> bool:
         "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # pre-graduation default
+        return True  # graduated default
     return raw in ("1", "true", "yes", "on")
 
 
@@ -455,4 +460,181 @@ __all__ = [
     "gitignore_check_timeout_s",
     "gitignore_guard_enabled",
     "is_path_ignored",
+    "register_flags",
+    "register_shipped_invariants",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 -- Module-owned FlagRegistry seeds
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry) -> int:  # noqa: ANN001
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.warning(
+            "[GitignoreGuard] register_flags degraded: %s", exc,
+        )
+        return 0
+    target = (
+        "backend/core/ouroboros/governance/gitignore_guard.py"
+    )
+    specs = [
+        FlagSpec(
+            name="JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED",
+            type=FlagType.BOOL, default=True,
+            category=Category.SAFETY,
+            source_file=target,
+            example=(
+                "JARVIS_AUTO_COMMITTER_GITIGNORE_GUARD_ENABLED=true"
+            ),
+            description=(
+                "Master switch for the AutoCommitter gitignore "
+                "guard. When on, every git add (Layer 1 pre-stage) "
+                "AND every commit attempt (Layer 2 post-stage) "
+                "consults git check-ignore --no-index to refuse "
+                "ignored paths regardless of tracked status. "
+                "Closes the soak-v4 sovereignty breach (93 tracked-"
+                "but-ignored .pyc files about to land in main). "
+                "Graduated default-true 2026-05-03 in Slice 3."
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_GITIGNORE_CHECK_TIMEOUT_S",
+            type=FlagType.FLOAT, default=5.0,
+            category=Category.TIMING,
+            source_file=target,
+            example="JARVIS_GITIGNORE_CHECK_TIMEOUT_S=10.0",
+            description=(
+                "Subprocess timeout for git check-ignore calls. "
+                "Bounded so a hung git binary cannot stall "
+                "AutoCommitter. Floor 1.0, ceiling 30.0."
+            ),
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[GitignoreGuard] register_flags spec %s "
+                "skipped: %s", spec.name, exc,
+            )
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 -- Module-owned shipped_code_invariants
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Slice 1 invariants: pure-stdlib + closed-5 outcome
+    taxonomy + ``--no-index`` flag presence (the load-bearing
+    structural property -- without it the guard silently lets
+    tracked-but-ignored paths through)."""
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    def _validate(
+        tree: "_ast.Module", source: str,
+    ) -> tuple:
+        violations: list = []
+        registration_funcs = {
+            "register_flags", "register_shipped_invariants",
+        }
+        exempt_ranges = []
+        for fnode in _ast.walk(tree):
+            if isinstance(fnode, _ast.FunctionDef):
+                if fnode.name in registration_funcs:
+                    start = getattr(fnode, "lineno", 0)
+                    end = getattr(fnode, "end_lineno", start) or start
+                    exempt_ranges.append((start, end))
+        # Pure-stdlib at hot path: no governance imports outside
+        # the registration contract.
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if "backend." in module or "governance" in module:
+                    lineno = getattr(node, "lineno", 0)
+                    if any(s <= lineno <= e for s, e in exempt_ranges):
+                        continue
+                    violations.append(
+                        f"line {lineno}: gitignore_guard must be "
+                        f"pure-stdlib -- found {module!r}"
+                    )
+            if isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"gitignore_guard MUST NOT "
+                            f"{node.func.id}()"
+                        )
+        # Closed-5 GitignoreGuardOutcome taxonomy.
+        required = {
+            "CLEAN", "SKIPPED_IGNORED",
+            "BLOCKED_TRACKED_IGNORED", "DISABLED", "FAILED",
+        }
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef):
+                if node.name == "GitignoreGuardOutcome":
+                    seen = set()
+                    for stmt in node.body:
+                        if isinstance(stmt, _ast.Assign):
+                            for tgt in stmt.targets:
+                                if isinstance(tgt, _ast.Name):
+                                    seen.add(tgt.id)
+                    missing = required - seen
+                    extras = seen - required
+                    if missing:
+                        violations.append(
+                            f"GitignoreGuardOutcome missing "
+                            f"required values: {sorted(missing)}"
+                        )
+                    if extras:
+                        violations.append(
+                            f"GitignoreGuardOutcome has unexpected "
+                            f"values (closed-taxonomy violation): "
+                            f"{sorted(extras)}"
+                        )
+        # The load-bearing ``--no-index`` flag MUST appear in the
+        # check-ignore subprocess args. Without it git skips
+        # tracked-but-ignored paths, silently breaching.
+        if '"--no-index"' not in source and "'--no-index'" not in source:
+            violations.append(
+                "git check-ignore call missing --no-index flag "
+                "(load-bearing for tracked-but-ignored detection)"
+            )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/gitignore_guard.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name="gitignore_guard_purity_and_no_index",
+            target_file=target,
+            description=(
+                "Slice 1 primitive stays pure-stdlib at hot path "
+                "(no governance imports outside register_flags / "
+                "register_shipped_invariants); GitignoreGuardOutcome "
+                "is the closed-5 taxonomy; the load-bearing "
+                "--no-index flag is present in the check-ignore "
+                "subprocess args (without it, tracked-but-ignored "
+                "paths silently breach -- the soak-v4 root cause)."
+            ),
+            validate=_validate,
+        ),
+    ]
