@@ -491,6 +491,49 @@ class EventChannelServer:
                     "wiring failed: %s", id_exc,
                 )
 
+            # Move 5 Slice 5b — Confidence Probe observability GET
+            # routes. Mirrors the auto-action / invariant-drift mount
+            # pattern above: loopback-asserted, rate-limited via the
+            # shared IDEObservabilityRouter helper, CORS-aware. Unlike
+            # Move 4 the mount is unconditional — the probe module's
+            # per-request _gate() runs the bridge_enabled() master-flag
+            # check on every request, so operators can live-toggle the
+            # flag without restarting the harness (see
+            # confidence_probe_observability.py:246 for the design
+            # intent). Producer side (probe runner + observer) is
+            # owned by governed_loop_service.py boot. Per-arc fresh
+            # IDEObservabilityRouter instance preserves Move 4's
+            # per-arc rate-limit bucket convention.
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+                    IDEObservabilityRouter as _IDEObsRouterCP,
+                    assert_loopback_only as _assert_loopback_cp,
+                )
+                from backend.core.ouroboros.governance.verification.confidence_probe_observability import (  # noqa: E501
+                    register_confidence_probe_routes,
+                )
+                _assert_loopback_cp(self._host)
+                _cp_helper = _IDEObsRouterCP()
+                register_confidence_probe_routes(
+                    app,
+                    rate_limit_check=lambda req: (
+                        _cp_helper._check_rate_limit(
+                            _cp_helper._client_key(req),
+                        )
+                    ),
+                    cors_headers=_cp_helper._cors_headers,
+                )
+            except ValueError as cp_loopback_exc:
+                logger.warning(
+                    "[EventChannel] confidence-probe observability "
+                    "refused: %s", cp_loopback_exc,
+                )
+            except Exception as cp_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] confidence-probe observability "
+                    "wiring failed: %s", cp_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is

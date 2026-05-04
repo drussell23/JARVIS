@@ -489,6 +489,29 @@ class TestObservabilityRoutes:
         assert "edit_file" not in body["allowlist"]
         assert "bash" not in body["allowlist"]
 
+    def test_event_channel_imports_confidence_probe_module(self):
+        """Slice 5b A — pin the event_channel mount so a future
+        refactor cannot silently drop the wiring. Mirrors the
+        Move 4 pattern in test_invariant_drift_graduation.py."""
+        path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "backend" / "core" / "ouroboros" / "governance"
+            / "event_channel.py"
+        )
+        source = path.read_text(encoding="utf-8")
+        assert (
+            "register_confidence_probe_routes" in source
+        ), (
+            "event_channel must mount the confidence-probe GET "
+            "routes (Slice 5b A)"
+        )
+        assert (
+            "Move 5 Slice 5b" in source
+        ), (
+            "event_channel must mark the wiring with the slice "
+            "comment for traceability"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 7. Full-revert matrix
