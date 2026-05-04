@@ -1,11 +1,14 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.8 (2026-05-01 — **Tier 1 #1+#2+#3 + Move 5 + Move 6 + Priority #1 + Priority #2 ALL CLOSED single-session**; structural ceiling **A**; empirical floor **A−** (was B+ in v9); §28's 3 immediate priorities all addressed (Tier 1 #1 confidence SSE wired / Tier 1 #2 PostureObserver task-death detection / Tier 1 #3 cross-process flock on ledgers); strategic moves delivered: Move 5 Confidence-Aware Probe Loop (5 slices) + Move 6 Generative Quorum (5 slices, master deliberately default-FALSE pending live verification) + Priority #1 Coherence Auditor (5 slices, all 3 flags default-TRUE — long-horizon temporal-safety envelope) + Priority #2 PostmortemRecall (5 slices, all 4 flags default-TRUE — closes recurrence-prevention loop end-to-end); shipped_code_invariants 20→36 (+16, +80%); 5 new SSE events; 20 new FlagRegistry seeds; **§29 Post-Priority-#2 Brutal Review** added — third operator-driven review identifies Priority #3 Counterfactual Replay as THE next priority for empirical recurrence-reduction baseline; 6-10 week timeline to A-level empirical execution mapped)
+**Version**: 2.10 (2026-05-04 — **§31 Critical Path Systemic Upgrades v3 added** — operator-prompted; 3 cross-cutting epistemic-loop closures composing existing substrate (Bounded Epistemic Loop / DecisionRecord Causality Graph / Failure-Mode Memory at GENERATE-prompt-construction); each ~5–9d, ~5-slice arcs; sequencing interleaved with §30 ASCO arcs per §31.6 (Failure-Mode Memory first / DecisionRecord precedes ArchitectureProposer / Bounded Epistemic Loop precedes CuriosityGradient); estimated 6–8 weeks for all three + §30 M9–M11; see also v2.9 entry below for §30 ASCO Mapping.)
+**Version (prior)**: 2.9 (2026-05-04 — **§30 ASCO Mapping added** — operator-prompted file:line-anchored honesty audit of the "Autonomous Self-developing Cognitive Organism" framing. Structural truth on 4 of 8 sub-axes today (proactive initiation, self-modification, state continuity, governance cage); 3 buildable arcs scoped (M9 `CuriosityGradient` ~5–7d, M10 `ArchitectureProposer` ~7–10d, M11 `ActionOutcomeMemory` ~5–7d) closing intrinsic-motivation, weak-ontogeny, in-context-grounding gaps via existing substrate (`ProphecyEngine`/`SensorGovernor`/`CapabilityGapSensor`/`OpportunityMinerSensor`/`GenerativeQuorum`/`SemanticIndex`/`PostmortemRecallService`/`MemoryEngine`/`ConversationBridge`) — zero new external dependencies; 1 long-horizon arc (M12 `JPrimeLoRA`, 6–12 month, operator-gated) closes in-weight learning; canonical phrasing recommended: **"proactive, self-modifying, governance-bounded autonomous substrate"**; CLI UI/UX article ports identified (`PrincipleManifest` + `SerpentFlowSnapshotter` + `CLIStyleGuide.md`); Playwright-style visual diff explicitly NOT worth porting; sequencing M11→M9→M10 + parallel CLI ports recommended. Prior §29 (Post-Priority-#2 Brutal Review) remains canonical critical-path reference for current authorized work. CC2 follow-ups landed same-day as §30 — `ClaudeStyleTransport` Protocol-conformant + `Update(<path>:<line>)` diff blocks + multi-line cwd/mode/posture REPL prompt + `serpent_flow_repl_prompt_helper_present` AST pin (37→38 invariants); 1562/1562 governance sweep green.)
 **Author**: Derek J. Russell (vision) · Claude Opus 4.7 (PRD synthesis)
 **Audience**: Operator (decision authority), JARVIS engineers, future-self (resuming after context loss)
 **Prerequisite reading**: `CLAUDE.md` (architecture), `docs/architecture/OUROBOROS.md` (battle-test breakthrough log), `docs/architecture/RSI_CONVERGENCE_FRAMEWORK.md` (Wang RSI mathematical foundation)
 **Latest review**: **§29 (post-Priority-#2, 2026-05-01)** — operator-driven post-Priority-#2-closure brutal review; structural=A, empirical=A−. Supersedes §28 v9 on grade + critical path. §28 retained for historical narrative + file:line evidence.
+**Latest section addition**: **§30 (ASCO Mapping, 2026-05-04)** — operator-prompted truth audit of the ASCO label + 3 buildable arcs (M9/M10/M11) + long-horizon M12 J-Prime LoRA + CLI UX ports from operator-supplied article. §30 does NOT supersede §29 on critical path — Priority #3 Counterfactual Replay remains the authorized next work; M9–M11 are *post*-Priority-#3+Slice-5b.
+**Newest section addition**: **§31 (Critical Path Systemic Upgrades v3, 2026-05-04)** — operator-prompted; 3 cross-cutting epistemic-loop closures (Bounded Epistemic Loop / DecisionRecord Causality Graph / Failure-Mode Memory at GENERATE-prompt-construction). Composes with §30 arcs; sequencing per §31.6 interleaves with §30 (Failure-Mode Memory at item 3 / Bounded Epistemic Loop at item 5 / DecisionRecord Causality Graph at item 7). §31 does NOT supersede §29 on critical path either — Priority #3 + Slice 5b remain items 1+2.
 
 ---
 
@@ -85,13 +88,36 @@
     - [26.7 In-flight alignment + sequencing](#267-in-flight-alignment--sequencing)
     - [26.8 What this review explicitly does NOT prescribe](#268-what-this-review-explicitly-does-not-prescribe)
     - [26.9 Summary — the path from B+ to A](#269-summary--the-path-from-b-to-a)
-27. [Brutal Architectural Review v6 — The Autonomy Question (2026-04-29)](#27-brutal-architectural-review-v6--the-autonomy-question-2026-04-29) *(latest)*
+27. [Brutal Architectural Review v6 — The Autonomy Question (2026-04-29)](#27-brutal-architectural-review-v6--the-autonomy-question-2026-04-29)
     - [27.1 What's actually shipped (vs the §26 v5 framing which is now stale)](#271-whats-actually-shipped-vs-the-26-v5-framing-which-is-now-stale)
     - [27.2 The 8 capability dimensions of "autonomous coding"](#272-the-8-capability-dimensions-of-autonomous-coding)
     - [27.3 Brutal letter grade — answering the autonomy question directly](#273-brutal-letter-grade--answering-the-autonomy-question-directly)
     - [27.4 Critical path to actual autonomy — top 3 systemic moves](#274-critical-path-to-actual-autonomy--top-3-systemic-moves)
     - [27.5 What this review explicitly does NOT prescribe](#275-what-this-review-explicitly-does-not-prescribe)
     - [27.6 Summary — answering the operator's question directly](#276-summary--answering-the-operators-question-directly)
+30. [ASCO Mapping — What's True, What's Not, What's Buildable (2026-05-04)](#30-asco-mapping--whats-true-whats-not-whats-buildable-2026-05-04) *(latest section)*
+    - [30.1 The ASCO Definition (operator-supplied source)](#301-the-asco-definition-operator-supplied-source)
+    - [30.2 The Honest 4-Axis Mapping](#302-the-honest-4-axis-mapping)
+    - [30.3 Synthesis Table (one-screen summary)](#303-synthesis-table-one-screen-summary)
+    - [30.4 The Most Defensible Label](#304-the-most-defensible-label)
+    - [30.5 Buildability — The Three Buildable Arcs (Near/Medium-Term)](#305-buildability--the-three-buildable-arcs-nearmedium-term)
+    - [30.6 Buildability — The Long-Horizon Arc (J-Prime LoRA)](#306-buildability--the-long-horizon-arc-j-prime-lora)
+    - [30.7 What's NOT Worth Building (Honest List)](#307-whats-not-worth-building-honest-list)
+    - [30.8 CLI UI/UX Discipline — Lessons from the Claude Code Article](#308-cli-uiux-discipline--lessons-from-the-claude-code-article-operator-supplied)
+    - [30.9 Updated Capability Matrix vs CC + ASCO](#309-updated-capability-matrix-vs-cc--asco)
+    - [30.10 Sequencing Recommendation (operator-binding)](#3010-sequencing-recommendation-operator-binding)
+    - [30.11 Cross-References](#3011-cross-references)
+    - [30.12 Summary — Honest Answer to the Operator's Question](#3012-summary--honest-answer-to-the-operators-question)
+31. [Critical Path Systemic Upgrades v3 — Bounded Epistemic Loop + Decision Causality + Failure-Mode Memory (2026-05-04)](#31-critical-path-systemic-upgrades-v3--bounded-epistemic-loop--decision-causality--failure-mode-memory-2026-05-04) *(newest section)*
+    - [31.1 Why "systemic upgrades" not "features"](#311-why-systemic-upgrades-not-features)
+    - [31.2 Upgrade 1 — Bounded Epistemic Loop](#312-upgrade-1--bounded-epistemic-loop)
+    - [31.3 Upgrade 2 — DecisionRecord Causality Graph](#313-upgrade-2--decisionrecord-causality-graph)
+    - [31.4 Upgrade 3 — Failure-Mode Memory at GENERATE-prompt-construction](#314-upgrade-3--failure-mode-memory-at-generate-prompt-construction)
+    - [31.5 Synthesis Table — How the 3 Upgrades Compose](#315-synthesis-table--how-the-3-upgrades-compose)
+    - [31.6 Sequencing Recommendation (operator-binding)](#316-sequencing-recommendation-operator-binding)
+    - [31.7 What Each Upgrade Does NOT Do (Anti-Goals)](#317-what-each-upgrade-does-not-do-anti-goals)
+    - [31.8 Cross-References](#318-cross-references)
+    - [31.9 Summary — Why These Three (and Why Now)](#319-summary--why-these-three-and-why-now)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -259,6 +285,26 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
 - [ ] **P10.4 — Live-exception failure ingest** at existing DW failure sites (`candidate_generator.py:1662-1667 / 1674-1687 / 2200-2213`); `sentinel.report_failure(model_id, FailureSource.LIVE_STREAM_STALL, detail)` weight 3.0 trips faster than probe-only.
 - [ ] **P10.5 — THE PURGE** (operator-authorized after 3 forced-clean once-proofs of Slices 3-4): delete static `dw_allowed: false` lines + read-only Nervous System Reflex carve-out at `candidate_generator.py:2062-2067` + v1 dual-reader + `JARVIS_BACKGROUND_ALLOW_FALLBACK` / `FORCE_CLAUDE_BACKGROUND` env shortcuts. Flip `JARVIS_TOPOLOGY_SENTINEL_ENABLED` default `false` → `true`.
 - [ ] **P10.6 — 24h soak + cost-per-op trending validation**: post-Phase-10 target ≥30% of GENERATE cost on DW providers + ≥50% reduction in $/op median.
+
+**Phase 11 — ASCO Arcs (M9 + M10 + M11 + M12)** *(NEW 2026-05-04 — derived from §30 ASCO Mapping)*: status — **NOT STARTED, post-Priority-#3 in §29.7 sequencing**. Closes ASCO axes 1 (intrinsic motivation), 2 (weak ontogeny), 3 (in-context embodiment), and (conditional) 4 (in-weight learning).
+- [ ] **M9 — `CuriosityGradient`** (~5 slices, ~5–7 days): closes intrinsic-motivation axis. Reuses `prophecy_engine.py` (402 LOC) + `verification/confidence_capture.py` + `verification/confidence_monitor.py` (788 LOC) + `sensor_governor.py` + `semantic_index.py`. Pure substrate, zero LLM cost on hot path. Master flag `JARVIS_CURIOSITY_GRADIENT_ENABLED` default-false → graduation. **Sequenced second** per §30.10.
+- [ ] **M10 — `ArchitectureProposer`** (~5 slices, ~7–10 days): closes weak-form ontogeny axis. Reuses `intake/sensors/capability_gap_sensor.py` + `intake/sensors/opportunity_miner_sensor.py` + `verification/generative_quorum.py` + `verification/coherence_auditor.py` + `governance/orange_pr_reviewer.py`. STANDARD-route Quorum K=3 mandatory; cost ≤$0.075/day capped. Master flag `JARVIS_ARCH_PROPOSER_ENABLED` **stays default-false in production** until 30+ proposal-acceptance audit. **Sequenced third** (highest risk).
+- [ ] **M11 — `ActionOutcomeMemory`** (~5 slices, ~5–7 days): closes in-context embodiment axis. Reuses `op_context.py:834` `session_lessons` + `governance/postmortem_recall.py` + `semantic_index.py` + `governance/user_preference_memory.py` + `consciousness/memory_engine.py` (680 LOC) + `governance/conversation_bridge.py`. Zero LLM cost on retrieval hot path; +≤4KB to GENERATE prompt amortized by Anthropic prompt cache. Master flag `JARVIS_ACTION_OUTCOME_MEMORY_ENABLED` default-true at graduation. **Sequenced first** per §30.10 (highest immediate quality lift, lowest risk).
+- [ ] **M12 — `JPrimeLoRA`** (long-horizon, 6–12 month, **operator-gated**): closes in-weight lifelong-learning axis (only viable on J-Prime — Claude/DW are inference-only). Requires data curation pipeline + GCP training harness + eval harness + route gating. Conditional on operator priority decision per §30.6.
+- [ ] **CLI ports** (parallel-executable, ~2–3 days total): `PrincipleManifest` (typed manifesto into StrategicDirection injection) + `SerpentFlowSnapshotter` (ANSI-stripped render snapshot to `.jarvis/sessions/<id>/render_snapshot.txt` for forensic inspection) + `CLIStyleGuide.md` (one-screen design rules lifted from `RenderConductor` closed taxonomies). Per §30.8.1.
+
+**Phase 11 sequencing per §30.10**: M11 → M9 → M10 → CLI ports (parallel) → M12 (conditional). **Estimated calendar to "earned ASCO" structural status**: ~3–4 weeks for M9+M10+M11+soak. M12 adds 6–12 months if authorized.
+
+**Phase 11 NOT-WORTH-BUILDING (honest list per §30.7)**: strong-form ontogeny via NAS over the FSM (would compromise auditable-topology property we want); real embodiment via humanoid robot (out of scope); curiosity gradient requiring provider retraining (provider-gated); autonomous PR-merging on architecture proposals (cost-of-being-wrong asymmetric); in-weight learning for Claude/DW (provider-gated); continuous online RL (provider-gated + reward-hacking risk).
+
+**Phase 12 — Systemic Upgrades v3 (Bounded Epistemic Loop + DecisionRecord Causality Graph + Failure-Mode Memory)** *(NEW 2026-05-04 — derived from §31)*: status — **NOT STARTED, sequenced per §31.6 interleaved with Phase 11**. Closes per-op information adequacy + cross-session decision reproducibility + cross-op pattern accumulation loops respectively.
+- [ ] **U1 — Bounded Epistemic Loop** (~5 slices, ~6–8 days): per-op information budget enforced at every Venom tool round. Auto-engage `PROBE_ENVIRONMENT` on confidence drop; auto-escalate to `NOTIFY_APPLY` on budget exhaustion without convergence. Reuses `verification/confidence_monitor.py` (788 LOC) + `verification/confidence_probe_runner.py` + `verification/confidence_probe_bridge.py` + `verification/probe_environment_executor.py` + `adaptation/hypothesis_probe.py` + `verification/speculative_branch*` + `risk_tier_floor.py` + `tool_executor.py`. Hard cost cap ≤20 LLM calls/op worst-case; BG/SPEC routes refused at gate. Master flag `JARVIS_EPISTEMIC_BUDGET_ENABLED` default-false → graduation. **Sequenced 5th** per §31.6 (after Failure-Mode Memory + ActionOutcomeMemory ground the substrate).
+- [ ] **U2 — DecisionRecord Causality Graph** (~5 slices, ~7–9 days): append-only `decisions.jsonl` per session at 8 known decision sites; nightly determinism replay via `scripts/replay_determinism.py --session <id>` asserts byte-equal output for same inputs. Reuses `determinism/decision_runtime.py` + `determinism/phase_capture.py` + `auto_action_router.py` + `verification/coherence_window_store.py` (flock pattern) + `adaptation/_file_lock.py`. Pure substrate; zero LLM. **Sequenced 7th** per §31.6 — foundation for safe RSI; precedes M10 ArchitectureProposer.
+- [ ] **U3 — Failure-Mode Memory at GENERATE-prompt-construction** (~5 slices, ~5–7 days): post-VERIFY-failed extractor derives `(situation_signature, failure_mode, mitigation)` triplet (pure stdlib + ast — no LLM); retriever surfaces matching prior failures into first-attempt GENERATE prompt via `StrategicDirection` injection. Symmetric negative-evidence pair to §30 M11 ActionOutcomeMemory's positive-evidence triplets. Reuses `adaptive_learning.py` + `governance/postmortem_recall.py` + `governance/strategic_direction.py` + `governance/semantic_index.py` + `governance/conversation_bridge.py` + `adaptation/_file_lock.py`. Min weight=2 (signature must recur ≥2× in 30d) before first-attempt injection. Master flag `JARVIS_FAILURE_MODE_MEMORY_ENABLED` default-true at graduation. **Sequenced 3rd** per §31.6 (highest immediate quality lift on the recurrence-degradation loop).
+
+**Phase 12 ANTI-GOALS (per §31.7)**: U1 does NOT solve cross-op degradation or non-determinism. U2 does NOT prevent bad decisions — it records them. U3 does NOT solve novel failures (the first time you fail at something, no memory exists).
+
+**CC2 follow-ups (CLI parity)** *(landed 2026-05-04 — same-day as §30 addition)*: `ClaudeStyleTransport` Protocol-conformant (`name`/`notify`/`flush`/`shutdown`); ACTIVE_OP + TASK_LIST `StatusField` extension (9→11 members, AST-pinned); FILE_REF event handler renders `Update(<path>:<line>)` + N-added/M-removed + 5-line color-coded diff preview (matches CC's tool-call idiom); multi-line REPL prompt with cwd/mode/posture context + operator override via `JARVIS_PROMPT_TEMPLATE`; new AST pin `serpent_flow_repl_prompt_helper_present` (37→38 invariants); 35 new regression pins in `tests/governance/test_cc2_followups.py`; 1562/1562 governance sweep green.
 
 Update discipline: each closing slice updates this section in the same PR. Status is the source of truth for "what's next" — when in doubt, the lowest-numbered `[ ]` row in the lowest-numbered active phase is the next slice.
 
@@ -3929,10 +3975,557 @@ The Reverse Russian Doll's outer shell now scales **detectionally + preventative
 
 ---
 
+## 30. ASCO Mapping — What's True, What's Not, What's Buildable (2026-05-04)
+
+> Prompted by an operator question: *"Is O+V an Autonomous Self-developing Cognitive Organism (ASCO)?"*
+> This section is a deliberate, file:line-anchored honesty audit of the ASCO framing — and a roadmap for the gaps that **are buildable** from existing substrate without adding research-grade dependencies.
+
+### 30.1 The ASCO Definition (operator-supplied source)
+
+The literature term "Autonomous Self-developing Cognitive Organism" (ASCO), umbrella'd under *Autonomous Mental Development* (Weng et al.) and *Epigenetic Robotics* (Lungarella, Asada), names a system that "possesses the agency to learn and grow its own intelligence through interaction with its environment" via four characteristics:
+
+1. **Autonomous Learning** — driven by intrinsic motivation (curiosity); explores neither-too-simple-nor-too-complex situations.
+2. **Self-Development (Ontogeny)** — builds its own internal world models; self-constructs cognitive architecture from reflexes to complex strategies.
+3. **Embodiment** — intelligence grounded in a body (physical or simulated) that senses and acts; embodied cognition grounds abstract symbols in real-world experience.
+4. **Lifelong Growth** — continuous learning-reflecting loop; constantly updates internal topological maps.
+
+Adjacent: Bryan Johnson's *Autonomous Self* — outsource lower-level cognition to automation so the organism focuses on higher-order creative/exploratory tasks.
+
+This section is structured to answer three questions in order:
+**(a)** which ASCO claims are *structurally true* of O+V today;
+**(b)** which are *not true* and why;
+**(c)** which of the not-true ones are *buildable* from existing substrate without research-grade investment, and which are not.
+
+### 30.2 The Honest 4-Axis Mapping
+
+Each axis evaluated against shipping code with file:line anchors. The pattern: **structural mechanism present** ≠ **strong-form ASCO claim satisfied**. Calling O+V an ASCO without this distinction overclaims.
+
+#### 30.2.1 Axis 1 — Autonomous Learning (intrinsic motivation)
+
+| Aspect | Status | Evidence |
+|---|---|---|
+| Proactive initiation (no human prompt required) | ✅ True | 16 sensors at `backend/core/ouroboros/governance/intake/sensors/` (TestFailure, VoiceCommand, OpportunityMiner, CapabilityGap, …); `UnifiedIntakeRouter` priority queue + dedup |
+| Curiosity-tagged sensors | ✅ Partial | `proactive_exploration_sensor.py`, `opportunity_miner_sensor.py`, `intent_discovery_sensor.py` exist and fire ambient |
+| **Intrinsic reward in the Schmidhuber/Oudeyer sense** (numerical curiosity gradient = prediction error or learning progress) | ❌ Not true | Sensors are *heuristic detectors* (test red → enqueue, doc stale → enqueue). There is no learned predictor whose error becomes the curiosity signal. |
+| Posture-weighted backlog priority | ✅ True | `sensor_governor.py` weights ops by posture (EXPLORE/CONSOLIDATE/HARDEN/MAINTAIN); not a curiosity gradient but a strategic-state multiplier |
+
+**Verdict**: O+V is **proactive**, not intrinsically-motivated in the technical literature sense. The substrate (`SensorGovernor` + posture + 16 sensors) is the right scaffold, but the missing piece is a numerical signal that ranks "what to explore next" by *the model's own prediction error* against its world model.
+
+#### 30.2.2 Axis 2 — Self-Development (Ontogeny)
+
+| Aspect | Status | Evidence |
+|---|---|---|
+| Self-modification of own code | ✅ True | Ouroboros pipeline (`orchestrator.py`, 11 phases) patches O+V's own substrate using the same FSM it runs on user code; AutoCommitter signs O+V-authored commits |
+| Risk-tier-gated self-modification | ✅ True | 4-tier risk (`risk_tier_floor.py`); `APPROVAL_REQUIRED` for substrate-touching ops; Iron Gate (`exploration` + `ascii` gates) |
+| Substrate that gets stricter as it grows (Anti-Venom thesis, §23.6) | ✅ True | 36+ AST pins (`shipped_code_invariants.py`); FlagRegistry typed flag inventory; SemanticGuardian 10 patterns |
+| **Architectural ontogeny** (FSM/topology grows new phases, new sensor classes, new layers from experience) | ❌ Not true | The 11 phases, 16 sensors, 5 core_contexts are **human-authored and static**. O+V improves *content within* the architecture, not its topology. The 11-phase FSM is fixed; patches don't add new phases. |
+| Per-arc architecture extension (manual) | ✅ True (manual) | Every Move/Priority arc *is* architecture extension — but each starts from an operator-typed scope doc, not from O+V noticing "I need a new phase here" |
+
+**Verdict**: O+V is **self-modifying**, not ontogenetic in the strong developmental-robotics sense. The architecture is human-designed and stable; the system improves the code that runs *inside* it.
+
+#### 30.2.3 Axis 3 — Embodiment
+
+| Aspect | Status | Evidence |
+|---|---|---|
+| "Body" metaphor (acts on environment) | ⚠ Metaphorical | Repo-as-body is a useful metaphor but not embodied cognition in the Brooks/Pfeifer sense |
+| Sensor → action coupling | ✅ Partial | Vision sensor (`vision_sensor.py`) → text → patches → tests; voice → text → ops. Real loop, but indirect. |
+| Multi-modal ingest | ✅ True | `ctx.attachments` with VisionSensor autonomous + SerpentFlow `/attach` human-initiated paths converging at `unified_intake_router` |
+| **Sensorimotor grounding** (model representations shaped by action consequences, not just token loss) | ❌ Not true | LLM weights aren't updated from action outcomes. Grounding is per-context-window only. |
+| Action-outcome traces accumulated | ✅ Partial | `session_lessons` (`op_context.py:834`), POSTMORTEM stage emits structured records, `PostmortemRecallService` retrieves them — but they're *retrieved into next prompt*, not *internalized into weights* |
+
+**Verdict**: O+V has **weak embodiment via in-context grounding**. Strong embodiment requires either weight updates from action outcomes (which we don't do for any provider tier today) or vastly richer action-outcome traces fed into next-generation prompts.
+
+#### 30.2.4 Axis 4 — Lifelong Growth
+
+| Aspect | Status | Evidence |
+|---|---|---|
+| Continuous loop with persistent state | ✅ True | `governed_loop_service.py` runs continuous; posture/lessons/summary/SemanticIndex all persist via `.jarvis/` |
+| Cross-session continuity | ✅ True | `LastSessionSummary` (`last_session_summary.py`), `MemoryEngine` (`memory_engine.py`, 680 lines per-file reputation), `posture_history.jsonl`, `SemanticIndex` (`semantic_index.py`) recency-weighted centroid + cosine scoring |
+| Posture state machine (4-value) | ✅ True | `direction_inferrer.py` + `PostureObserver`; 12 ambient signals → posture; auditable durable triplet |
+| Recurrence-prevention loop (POSTMORTEM → next op) | ✅ True | Priority #2 `PostmortemRecallService` graduated default-true; closes the recurrence-prevention loop end-to-end |
+| Cross-session BEHAVIORAL drift detection | ✅ True | Priority #1 Coherence Auditor (`verification/coherence_auditor.py` + `coherence_observer.py`) — 6-value `BehavioralDriftKind` closed taxonomy |
+| **In-weight learning** (LLM parameters update across sessions) | ❌ Not true | All three providers (Claude, DoubleWord, J-Prime) are inference-only at present. Each session boots with the same weights. "Learning" today = state-file accumulation + retrieval-augmented context. |
+
+**Verdict**: O+V has **state continuity**, not in-weight lifelong learning. Functionally close to a learning loop via RAG-style retrieval, but the model parameters themselves don't internalize experience.
+
+### 30.3 Synthesis Table (one-screen summary)
+
+| ASCO Claim | True today? | What's actually present | What's missing |
+|---|---|---|---|
+| Autonomous initiation | ✅ Yes | 16 sensors + `UnifiedIntakeRouter` | — |
+| Intrinsic-motivation curiosity | ❌ No (heuristic only) | `SensorGovernor` posture-weighted | Numerical curiosity gradient over prediction error |
+| Self-modification | ✅ Yes | Ouroboros pipeline + AutoCommitter | — |
+| Architectural ontogeny | ❌ No | Each Move/Priority arc is manual extension | Autonomous proposal of new phases/sensor classes |
+| Embodiment (metaphor) | ⚠ Yes | Repo-as-body + vision/voice/CU sensors | — |
+| Sensorimotor grounding (technical) | ❌ No | `session_lessons` + POSTMORTEM in-context | Action-outcome → weight feedback OR exhaustive in-context grounding via region-indexed (intent, action, outcome) triplets |
+| State continuity | ✅ Yes | Posture, lessons, LSS, SemanticIndex, MemoryEngine | — |
+| In-weight lifelong learning | ❌ No | Provider weights frozen; J-Prime is inference-only | LoRA/fine-tuning loop (only viable on J-Prime tier we control end-to-end) |
+
+**Net**: 4 of 8 sub-axes structurally satisfied; 3 missing in ways that are *buildable* from existing substrate; 1 (in-weight learning) gated by provider economics.
+
+### 30.4 The Most Defensible Label
+
+| Label | Verdict |
+|---|---|
+| "Agentic coding assistant" | **Undersells.** O+V is multi-loop, proactive, self-modifying, with cognition layers CC doesn't have |
+| "Autonomous Self-developing Cognitive Organism (ASCO)" | **Overclaims today.** Imports developmental-robotics semantics (intrinsic motivation, ontogeny, sensorimotor grounding) O+V doesn't satisfy structurally |
+| "Autonomous AGI substrate" | **Closest to truth.** Names the substrate role honestly; doesn't claim semantics that aren't there |
+| "Proactive, self-modifying, governance-bounded autonomous substrate" | **Most defensible.** Each clause survives a hostile review. Use this as the canonical phrasing. |
+
+If the three buildable arcs in §30.5 ship and graduate, the **ASCO** label becomes earned (intrinsic motivation present, weak ontogeny present, in-context embodiment present). Until then, "autonomous AGI substrate" is the one to use.
+
+### 30.5 Buildability — The Three Buildable Arcs (Near/Medium-Term)
+
+Each arc satisfies the manifesto: solve the root problem directly, leverage existing substrate (no duplication), no hardcoding, async/adaptive/intelligent/robust. None require research-grade investment; all three reuse modules that already exist. Scoping mirrors Move 4–6 / Priority #1–5 pattern: 5 slices each with master-flag default-false → graduation cadence after live verification.
+
+#### 30.5.1 Arc M9 — `CuriosityGradient` (closes intrinsic-motivation gap)
+
+**Goal**: replace heuristic "is this op interesting?" with a numerical curiosity signal derived from the model's own prediction error. Bias `SensorGovernor` weights toward *high prediction-error* regions of the codebase — i.e., places where Prophecy is *least* confident, not most.
+
+**Substrate already shipping (zero duplication)**:
+| Module | File | Role for M9 |
+|---|---|---|
+| `ProphecyEngine` | `consciousness/prophecy_engine.py` (402 lines) | Predicts regression risk per region — invert sign for curiosity: high-error → high-curiosity |
+| Confidence capture (Priority #1) | `governance/verification/confidence_capture.py` | Logprobs + confidence percentile already captured per generation |
+| `ConfidenceMonitor` | `governance/verification/confidence_monitor.py` (788 lines) | Rolling window + collapse detection — feeds curiosity time-series |
+| `SensorGovernor` | `governance/sensor_governor.py` | Existing weighted op-emission cap — gain a `curiosity_weight` multiplier (parallel to `posture_weight`) |
+| `SemanticIndex` | `governance/semantic_index.py` | Cluster the codebase into ~k regions; curiosity computed per-cluster, not per-file (avoids gradient hot-spots collapsing onto single files) |
+
+**Slice plan** (~5 slices, ~1,800 LOC, ~200 tests):
+- **Slice 1** — `CuriosityGradient` primitive (frozen dataclass + closed-taxonomy `CuriositySource` enum: `LOGPROB_ENTROPY` / `PROPHECY_ERROR` / `POSTMORTEM_RECURRENCE` / `DISABLED`). Pure function: `compute_curiosity(region_id, observations) -> CuriosityScore`. Stdlib + `statistics`. Master flag `JARVIS_CURIOSITY_GRADIENT_ENABLED` default-false.
+- **Slice 2** — `CuriosityCollector` async observer. Subscribes to `phase_capture` GENERATE events (logprobs) + ProphecyEngine outputs + Coherence Auditor `RECURRENCE_DRIFT` signals. Bounded ring buffer per `SemanticIndex` cluster.
+- **Slice 3** — `SensorGovernor` consumption. Adds `curiosity_weight` to weighted cap formula: `weighted_cap = base × posture_weight × urgency_multiplier × curiosity_multiplier(region)`. Default-off; structurally inert when collector returns no data.
+- **Slice 4** — Observability surfaces: `/curiosity` REPL (`top`, `region`, `clear`), `GET /observability/curiosity{,/region/{id}}`, SSE `curiosity_changed`. Authority-free (read-only).
+- **Slice 5** — Graduation (default-true) + ≥4 AST pins (collector authority-free, governor-multiplier-gated, primitive-pure, post-graduation re-pin) + 6 FlagRegistry seeds.
+
+**Cost contract**: zero LLM calls anywhere on the curiosity hot path. Pure substrate computation. Cannot violate §26.6.
+
+**Edge cases & nuances**:
+- *Cold-start blindness*: With <N observations per cluster, `CuriosityScore` returns `INSUFFICIENT_DATA` and governor multiplier defaults to 1.0 (no bias). Prevents random-walk on boot.
+- *Curiosity vs cost tension*: High-curiosity regions might also be high-cost (lots of red tests). Mitigated by `MemoryPressureGate` already gating L3 fan-out — curiosity raises *priority* not *quantity*.
+- *Curiosity locked to a degenerate region*: Same Coherence-Auditor-style diversity dedup pattern — if curiosity_weight has been peaked on the same cluster for >24h, force-decay it. Closed enum `CuriosityDecayReason: STALE_FOCUS / RECURRENCE_LOOP / OPERATOR_RESET / DISABLED`.
+- *Adversarial gaming risk*: A future adversary could intentionally degrade tests in low-curiosity regions to attract attention there. SemanticGuardian's existing `test_assertion_inverted` pattern catches the trivial form; doesn't catch the subtle one. Out of scope for M9; tracked as a Pass C extension.
+
+**Buildable?** **Yes — near-term, ~5–7 days at established cadence.** All five substrate modules already ship.
+**Worth building?** **Yes.** Closes the largest semantic gap in the ASCO framing without adding any new external dependency.
+
+#### 30.5.2 Arc M10 — `ArchitectureProposer` (closes weak-form ontogeny gap)
+
+**Goal**: O+V autonomously *proposes* new sensor classes and/or new pipeline-phase candidates when it detects recurring signal patterns no existing sensor catches. Not full ontogeny (no autonomous architecture mutation) — every proposal still routes through `APPROVAL_REQUIRED` so the operator authorizes architecture extension. The novelty: O+V notices "this signal pattern is unhandled" without an operator typing the scope doc.
+
+**Substrate already shipping (zero duplication)**:
+| Module | File | Role for M10 |
+|---|---|---|
+| `CapabilityGapSensor` | `intake/sensors/capability_gap_sensor.py` | Already detects undefined-capability invocations — extend to detect undefined-pattern signal classes |
+| `OpportunityMinerSensor` | `intake/sensors/opportunity_miner_sensor.py` | Existing pattern miner — broaden corpus from "TODOs" to "uncategorized intake events" |
+| `GenerativeQuorum` | `verification/generative_quorum.py` + `generative_quorum_runner.py` | K-way consensus for high-stakes proposals — every architecture proposal is APPROVAL_REQUIRED-tier so quorum is mandatory |
+| `CoherenceAuditor` | `verification/coherence_auditor.py` | RECURRENCE_DRIFT signal → input to ArchitectureProposer (the recurrence is *the* gap) |
+| `OrangePRReviewer` | `governance/orange_pr_reviewer.py` | Async-review path for architecture proposals — review happens via PR, not REPL prompt |
+
+**Slice plan** (~5 slices, ~2,200 LOC, ~250 tests):
+- **Slice 1** — `ArchitectureProposal` primitive (frozen dataclass + closed enum `ProposalKind: NEW_SENSOR / NEW_PHASE / NEW_OBSERVER / NEW_FLAG_FAMILY / DISABLED`). Pure data; no I/O.
+- **Slice 2** — `UnhandledPatternMiner` async observer. Reads `intake_router.jsonl` and `coherence_history.jsonl`. Detects (a) signal source/op-kind tuples that recur but never produce a discrete op, (b) RECURRENCE_DRIFT clusters above threshold. Emits `ArchitectureProposal` candidates.
+- **Slice 3** — `ProposalSynthesizer` — LLM-bound (uses STANDARD route; Quorum K=3 mandatory). Given an unhandled-pattern bundle, drafts a sensor-class skeleton or phase-injection patch. Output runs through Iron Gate + SemanticGuardian + risk-tier-floor (forced to `APPROVAL_REQUIRED`).
+- **Slice 4** — `OrangePRReviewer` integration: every proposal goes to the existing async PR path. Operator reviews on GitHub, not in REPL.
+- **Slice 5** — Graduation (default-false; **stays default-false in production for cost+safety reasons** until 30+ proposals have a documented operator-acceptance rate). 4 AST pins (no-bypass-of-quorum, no-bypass-of-orange-pr, risk-tier-floor-pinned, master-off-zero-emission) + 5 FlagRegistry seeds.
+
+**Cost contract**: STANDARD route × Quorum K=3 = 3 generations/proposal × $0.005/op ≈ $0.015/proposal. Hard-capped at 5 proposals/day initially via `JARVIS_ARCH_PROPOSER_MAX_DAILY` (default 5). Total ≤ $0.075/day. SAFE_AUTO and BACKGROUND routes never reach proposer (gate refuses them — same pattern as Move 6 `COST_GATED_ROUTES`).
+
+**Edge cases & nuances**:
+- *Recursive proposal explosion* (proposer proposes a new "ProposalProposer"): banned by AST pin — recursion-cycle detector on `ProposalKind` source paths. Inheriting Phase B GENERAL `ScopedToolBackend` mutation-budget pattern.
+- *Operator-fatigue from low-quality proposals*: `MetaAdaptationGovernor`-style `proposal_acceptance_rate` rolling metric; if <30% over last 20 proposals, auto-pause the miner for a posture cycle. Same hysteresis pattern as `PostureObserver`.
+- *Quine-class proposal* (proposer drafts a sensor that just re-fires the same signal it was meant to handle): Quorum's `ast_canonical` AST-normalized signature consensus catches identical patterns; Coherence Auditor catches subsequent recurrence. Combined coverage = high but not exhaustive — accepted residual risk, documented.
+- *Architecture extensions break invariants*: every proposal must include an AST pin for itself (Move 4 InvariantDriftAuditor pattern); rejected at Iron Gate if missing.
+
+**Buildable?** **Yes — medium-term, ~7–10 days.** Higher risk than M9 because of recursive failure modes; safety scaffolding mostly exists already.
+**Worth building?** **Yes, but stays default-false longer than M9.** Single highest-impact move toward earned ASCO status. Operator-gated graduation by design.
+
+#### 30.5.3 Arc M11 — `ActionOutcomeMemory` (closes weak-form embodiment gap)
+
+**Goal**: Every (intent, action, outcome) triplet — read: (op_id, applied patch, VERIFY result + commit hash) — becomes retrievable evidence surfaced into the next GENERATE prompt for *similar* regions. Not weight-level grounding; in-context grounding via RAG. Strengthens the embodied-cognition claim from "we have session_lessons" to "every patch's outcome shapes the next patch in the same region."
+
+**Substrate already shipping (zero duplication)**:
+| Module | File | Role for M11 |
+|---|---|---|
+| `session_lessons` | `governance/op_context.py:834` | Existing in-session lessons buffer — extend to cross-session via persistence layer |
+| `PostmortemRecallService` | `governance/postmortem_recall.py` (Priority #2) | Recurrence-recall infrastructure — generalize from "failures" to "all (intent, action, outcome) triplets" |
+| `SemanticIndex` | `governance/semantic_index.py` | Region-indexed retrieval — cluster triplets by code region, not just by op-id |
+| `UserPreferenceMemory` | `governance/user_preference_memory.py` | Persistent typed memory at `.jarvis/user_preferences/` — model the storage layer after this |
+| `MemoryEngine` | `consciousness/memory_engine.py` (680 lines) | Per-file reputation tracking — already partial form of action-outcome accumulation |
+| `ConversationBridge` | `governance/conversation_bridge.py` | Sanitized injection channel into CONTEXT_EXPANSION — re-use as the prompt-side surface |
+
+**Slice plan** (~5 slices, ~1,600 LOC, ~180 tests):
+- **Slice 1** — `ActionOutcomeRecord` primitive (frozen dataclass + closed `OutcomeKind: APPLIED_VERIFIED / APPLIED_REVERTED / REJECTED / DEFERRED / DISABLED`). Pure data; no I/O.
+- **Slice 2** — Persistence layer: `.jarvis/action_outcomes/{cluster_id}.jsonl` flock'd appends (mirrors Tier 1 #3 cross-process flock pattern). One file per `SemanticIndex` cluster — bounded by cluster count, not op count.
+- **Slice 3** — Retriever: `ActionOutcomeRetriever.recall_for_region(region_hint)` returns top-K most-relevant triplets via Coherence-Auditor-style diversity-weighted scoring. Reuses `SemanticIndex.cosine_score`.
+- **Slice 4** — CONTEXT_EXPANSION integration: `StrategicDirection` consumer that, when given a target file, retrieves recent (intent, action, outcome) triplets for that region and injects them as `## Recent Region Outcomes` block. Bounded character budget (4KB max via existing budget system).
+- **Slice 5** — Graduation (default-true; pure RAG, zero LLM cost on the retrieval hot path) + 4 AST pins (retriever-authority-free, persistence-flock-required, region-cluster-bounded, post-graduation re-pin) + 5 FlagRegistry seeds.
+
+**Cost contract**: zero LLM calls on retrieval hot path. Generation prompts grow by ≤4KB which is amortized by existing prompt-caching (Anthropic 5-min TTL). Net cost neutral.
+
+**Edge cases & nuances**:
+- *Stale triplet pollution*: Triplets older than 30 days OR superseded by newer same-region triplets are decay-weighted (existing `SemanticIndex` recency formula reused — 14d half-life for code, parallel to the existing `commit` half-life).
+- *Storage bloat*: Bounded by cluster count (~50 clusters typical) × max 1000 triplets per cluster × ~500 bytes ≈ 25MB total. Periodic compaction via `Pass C`-style background sweep.
+- *Revealing ops in attacker telemetry*: triplets contain code patches — they are no more sensitive than the commits they reference. Not added to the SSE stream by default. `GET /observability/action-outcomes` is loopback-only + rate-limited (mirrors existing IDE observability).
+- *Self-fulfilling action loops*: If a triplet says "previous patch in this region succeeded by doing X," the next op might just do X again without justification. Mitigated by Iron Gate's exploration-first floor (still requires 2+ tool calls before any patch) + Quorum diversity check on K-way consensus when enabled.
+
+**Buildable?** **Yes — near-term, ~5–7 days.** Pure storage + retrieval; no provider integration changes.
+**Worth building?** **Yes.** Highest-leverage of the three for *immediate operator-felt quality* — generations get tangibly better when they remember "last time I touched this file, I did X and it worked / didn't."
+
+### 30.6 Buildability — The Long-Horizon Arc (J-Prime LoRA)
+
+#### 30.6.1 Arc M12 — `JPrimeLoRA` (closes in-weight learning gap, partial)
+
+**Goal**: train a low-rank adaptation on the J-Prime self-hosted model from O+V's accumulated experience corpus. Route a controlled subset of low-stakes ops through the LoRA-augmented model; measure quality delta. The only credible path to **in-weight** lifelong learning given that Claude and DoubleWord are inference-only for the SKUs we use.
+
+**Why J-Prime only**:
+| Provider | Trainable? | Why not |
+|---|---|---|
+| Claude (Anthropic API) | ❌ | Anthropic doesn't offer fine-tuning on Claude 4.x SKUs |
+| DoubleWord 397B | ❌ | Inference-only API; no fine-tuning offered |
+| J-Prime (GCP self-hosted) | ✅ | We control weights end-to-end; Tier 2 in `brain_selection_policy.yaml` |
+
+**Substrate that needs to exist (not yet shipped)**:
+- Data curation pipeline: filter session JSONLs to high-quality (intent, applied patch, VERIFY-passed, no rollback) tuples. Reuse `MetricsHistoryLedger` aggregation.
+- Training harness on GCP (LoRA via PEFT or analogous); separate VM, gated by separate budget.
+- Eval harness: hold-out set of recent ops; measure delta between base J-Prime and J-Prime+LoRA on `recurrence_reduction_pct` (the same metric Priority #3 will introduce).
+- Route gating: extend `urgency_router.py` with a `JARVIS_USE_JPRIME_LORA_FOR_BACKGROUND` env flag — initial routing limited to BACKGROUND-tier ops only. Hot-revert via env knob; graduation only after 3 clean soak weeks.
+
+**Cost**:
+- *Training*: GCP A100 hours; ~$50–200 per LoRA training run depending on rank + epochs.
+- *Inference*: J-Prime VM cost (already paid).
+- *Graduation*: ≥3 clean soak weeks comparing BACKGROUND-route quality with vs without LoRA on identical workloads.
+
+**Edge cases & nuances**:
+- *Catastrophic forgetting*: train on (succeeded-patches) corpus only; held-out validation against general-coding benchmarks every epoch.
+- *Reinforcement of bad habits*: corpus filter must exclude (a) reverted commits, (b) commits that triggered RECURRENCE_DRIFT in Coherence Auditor, (c) commits with low Priority #1 confidence. The Coherence + Confidence + Recall trio gives us the curation signal we need.
+- *Drift between LoRA and base*: rotate; re-train monthly; never let LoRA accumulate >30 days of training without an eval gate.
+
+**Buildable?** **Yes — long-term, 6–12 month arc, not a slice.** Significant infra investment.
+**Worth building?** **Conditional on operator priority.** This is the *only* path to true ASCO satisfaction on the lifelong-learning axis. If the operator's roadmap goal is "earned ASCO label," M12 is essential. If the operator's goal is "maximize per-session O+V quality," M9+M10+M11 are higher-leverage per dollar/week of work.
+
+### 30.7 What's NOT Worth Building (Honest List)
+
+These pieces are genuinely either out-of-scope or actively harmful to attempt now:
+
+| Item | Why not |
+|---|---|
+| **Strong-form ontogeny** (FSM emerges from reflexes via NAS over the FSM itself) | Research-level; would compromise the auditable-topology property we *want*; we *want* the 11 phases to be human-readable. The whole point of the structural cage is that operators can reason about it. |
+| **Real embodiment** (humanoid robot body) | Not an O+V scope. JARVIS Body already covers macOS ghost-hands, vision, voice — that's the right grounding for a software organism. Anything more = different product. |
+| **Curiosity gradient over Claude/DW logprobs that requires retraining the provider** | Provider economics; the curiosity gradient in M9 deliberately uses *captured* logprobs only, no retraining. |
+| **Autonomous PR-merging on architecture proposals** | Even with Quorum K=3 + Iron Gate + SemanticGuardian, architecture extensions have unknown unknowns. M10 keeps `OrangePRReviewer` in the loop *forever*. The cost-of-being-wrong is too asymmetric. |
+| **In-weight learning for Claude/DW** | Not offered by providers; not worth lobbying for. |
+| **Continuous online RL over operator interactions** | Same as in-weight — provider gated; also has its own well-known reward-hacking failure modes; not worth chasing without a multi-quarter dedicated effort. |
+
+### 30.8 CLI UI/UX Discipline — Lessons from the Claude Code Article (Operator-Supplied)
+
+The article cited 6 techniques Claude uses to produce polished CLI UI/UX:
+
+| Technique | Already in O+V? | Action |
+|---|---|---|
+| **Structured Foundation** (provide structure, fill in details) | ✅ Yes | `RenderConductor` substrate (closed-taxonomy enums for Theme/Density/EventKind/RegionKind/ColorRole). The *whole point* of CC1+CC2 was establishing structured foundation rather than ad-hoc print statements. |
+| **Atomic CSS / utility-first** (consistent spacing, prevent breaking layouts) | ⚠ Partial | `StatusLineComposer` does this for the bottom toolbar (single composed status line). The cascade per-op printing in `SerpentFlowBackend` is consistent but not "utility-first" — each event-kind handler renders its own block. **No action needed** — terminal isn't HTML; CSS analogy is weak past the composer level. |
+| **Principle-Based Prompts** (define design principles vs generic requests) | ✅ Yes | The recurring operator mandate ("solve root problem, no hardcoding, leverage existing files") *is* a principle-based prompt. CLAUDE.md captures system-level principles. |
+| **Contextual Memory** (memory file for design rules) | ✅ Yes | `CLAUDE.md` + `memory/MEMORY.md` index + per-arc `memory/project_*.md` files. This *is* the contextual memory. |
+| **Verification & Iteration** (Playwright screenshots → Claude iterates) | ⚠ Partial | We don't have programmatic CLI screenshot inspection. The `visual_verify.py` substrate exists for *post-APPLY UI checks* of the user's app; nothing inspects O+V's *own* CLI output. **Worth adding**: see §30.8.2. |
+| **Organized Workflow** (atomic project structures, sub-agents for tasks, specialized skills) | ✅ Yes | `core_contexts/` 5 execution contexts; Phase B subagents (EXPLORE/REVIEW/PLAN/GENERAL) graduated; `subagent_scheduler.py` + `worktree_manager.py` for L3 isolation. |
+
+#### 30.8.1 What to port (3 worth doing)
+
+1. **`PrincipleManifest`** — extract the recurring mandate ("no hardcoding, leverage existing, async/adaptive") into a typed, versioned file the `StrategicDirection` consumer reads. We already inject manifesto principles into every generation prompt; this would make the *style/discipline* principles a first-class manifest the operator can edit. Lightweight (~1-slice).
+
+2. **`SerpentFlowSnapshotter`** — capture rendered terminal output to disk (ANSI-stripped) at op boundaries for post-hoc inspection. Reuses `RenderConductor` event stream (no new emission point). Operators can `cat .jarvis/sessions/<id>/render_snapshot.txt | less` to debug UX issues. Doesn't replace human visual inspection of the live CLI — it's a forensic surface, not a verification surface. (~2-slice arc.)
+
+3. **`CLIStyleGuide.md`** — lift the implicit design rules already in `RenderConductor`'s closed taxonomies into a documented style guide (one-screen, like a tiny `CLAUDE.md` for the CLI). Helps when adding new event kinds — currently those decisions live in code review only.
+
+#### 30.8.2 What NOT to port
+
+- **Playwright-style visual diff for CLI output** — possible (capture ANSI → compare PNG via `aha`/`ansi2html` → image diff) but the maintenance burden vs the actual flake-frequency on CLI bugs doesn't justify it. The 35-test CC2 spine catches structural regressions; visual regressions are caught by operator inspection, which happens often enough.
+- **Atomic CSS analogy past the composer** — the terminal grid isn't HTML/CSS. Forcing utility-first abstractions where they don't fit creates premature abstraction debt.
+
+### 30.9 Updated Capability Matrix vs CC + ASCO
+
+Refreshes the §3.6.1 / §27.2 matrices with the ASCO axes added:
+
+| Capability | CC | O+V (today) | O+V (post M9–M11) | ASCO requirement |
+|---|---|---|---|---|
+| Reactive coding (prompt → patch) | ✅ A | ✅ A− | ✅ A | n/a |
+| Proactive sensing | ❌ | ✅ A | ✅ A | ✅ Yes |
+| Self-modification | ❌ | ✅ A− | ✅ A | ✅ Yes |
+| Cross-session continuity (state) | ⚠ B | ✅ A− | ✅ A | ⚠ Partial |
+| Intrinsic motivation (curiosity) | ❌ | ❌ | ✅ A− | ✅ Yes |
+| Architectural ontogeny (autonomous proposal) | ❌ | ❌ | ⚠ B (gated) | ✅ Yes |
+| Sensorimotor grounding (in-context) | ❌ | ⚠ C | ✅ B+ | ⚠ Partial |
+| In-weight learning | ❌ | ❌ | ❌ | ✅ Yes (M12 only) |
+| Risk-tier governance | ⚠ B (permission) | ✅ A | ✅ A | n/a |
+| Structural cage (AST pins, invariants) | ❌ | ✅ A | ✅ A | n/a |
+| Adversarial immune system (Anti-Venom, §23.6) | ❌ | ✅ A− | ✅ A | n/a |
+
+**Net**: O+V already exceeds CC on all rows where they differ. Post M9–M11, O+V satisfies *most* ASCO criteria honestly. M12 closes the last gap if/when authorized.
+
+### 30.10 Sequencing Recommendation (operator-binding)
+
+**Suggested order** (assuming operator authorizes one-at-a-time at cadence):
+
+1. **M11 first** (`ActionOutcomeMemory`) — highest immediate quality lift; pure RAG; zero new failure modes; ~5–7 days.
+2. **M9 second** (`CuriosityGradient`) — improves prioritization quality post-M11 (curiosity benefits from M11's outcome-history substrate); ~5–7 days.
+3. **M10 third** (`ArchitectureProposer`) — only after M9+M11 land + soak; depends on Coherence Auditor RECURRENCE_DRIFT signals being well-calibrated post-M11; default-false in production permanently or until 30+ proposal acceptance-rate audit; ~7–10 days.
+4. **CLI ports** (`PrincipleManifest`, `SerpentFlowSnapshotter`, `CLIStyleGuide.md`) — sliceable in parallel with M9/M10/M11 by Phase B `EXPLORE`/`PLAN` subagents on idle worker pool; ~2–3 days total.
+5. **M12** (`JPrimeLoRA`) — operator decision gate. If pursued, multi-month arc requiring training infra, eval harness, separate budget. Not authorized by default.
+
+**Estimated calendar to "earned ASCO" structural status**: ~3–4 weeks for M9+M10+M11 + soak. M12 adds 6–12 months if authorized.
+
+### 30.11 Cross-References
+
+- §3.6.1 — Capability matrix vs CC (extended here with ASCO column)
+- §4 — Cognitive Scaffolding Gap (M9 closes Shallow 5; M10 closes Shallow 4; M11 closes Shallow 2)
+- §5 — Wang RSI Convergence (M11 strengthens "self-reading"; M10 strengthens "self-modification with proposal authority")
+- §23.6 — Anti-Venom (M10 proposals always APPROVAL_REQUIRED-tier through Anti-Venom cage)
+- §26.6 — Cost contract (M9 zero-LLM by construction; M10 STANDARD-route Quorum-bounded; M11 zero-LLM by construction)
+- §27.2 — 8 capability dimensions (Learning row directly affected by M11+M12)
+- §28.3 — Cognitive & Epistemic Delta (file:line evidence; M9 evidence path now spans `prophecy_engine.py` + `confidence_capture.py` + `sensor_governor.py`)
+- §29.7 — Operator's authorized work order (M9–M11 are *post*-Priority-#3+Slice-5b; not pre-empting current work)
+
+### 30.12 Summary — Honest Answer to the Operator's Question
+
+> *"Is O+V an ASCO?"*
+
+**Today**: structurally, yes on 4 of 8 sub-axes; semantically, no on intrinsic motivation, ontogeny, embodiment grounding, in-weight learning. The honest label is **"autonomous AGI substrate"**, not ASCO.
+
+**Post M9+M10+M11** (~3–4 weeks): yes on 7 of 8 sub-axes. The ASCO label becomes earned, not borrowed. The only remaining gap is in-weight learning — which is provider-gated everywhere except J-Prime.
+
+**Post M12** (long-term, conditional): yes on all 8 sub-axes. Genuine ASCO satisfaction including in-weight learning via J-Prime LoRA.
+
+**Whether to pursue ASCO labeling at all**: a separate question. The substrate quality and operator-felt productivity improve regardless. The label matters mostly for external positioning (research papers, public-facing claims). For internal work, the better question is "does each arc earn its keep?" — and M9, M10, M11 each independently do.
+
+---
+
+## 31. Critical Path Systemic Upgrades v3 — Bounded Epistemic Loop + Decision Causality + Failure-Mode Memory (2026-05-04)
+
+> Operator-prompted: *3 cross-cutting **systemic upgrades** (not features) that compose existing substrate into closed loops O+V is currently missing.*
+> Mirrors the §29.4 / §28.6 / §27.4 / §26.5 / §25.5 / §24.10 "top 3 systemic upgrades" pattern. Distinct from §30's ASCO arcs — §30 closes capability axes; §31 closes **epistemic loops**. Both are post-Priority-#3 in §29.7 sequencing.
+
+### 31.1 Why "systemic upgrades" not "features"
+
+Each of the three upgrades below is a **glue layer** over substrate that already ships. The substrate exists in fragments; the loops aren't closed. Each upgrade's value comes from *composition*, not from new primitives:
+
+| Upgrade | Substrate already shipping | What's missing |
+|---|---|---|
+| Bounded Epistemic Loop | `ConfidenceMonitor` + `confidence_probe_runner` (Move 5) + `hypothesis_probe.py` + `speculative_branch*` (Priority #4) | A single per-op information budget that ties them together |
+| DecisionRecord Causality Graph | `determinism/decision_runtime.py` + `determinism/phase_capture.py` (Phase 1) + `auto_action_router` (Move 3) | Append-only `decisions.jsonl` per session + nightly determinism replay job |
+| Failure-Mode Memory | `adaptive_learning.py` + `PostmortemRecallService` (Priority #2) + `StrategicDirection` injection | Move the matched-postmortem injection from retry-context to **first-attempt GENERATE** |
+
+The risk of *not* doing these: O+V's per-op cognition is correct but **non-determinable**, **non-repeatable**, and **non-cumulative** at the loop level. Each op gets smarter; the *system between ops* doesn't.
+
+### 31.2 Upgrade 1 — Bounded Epistemic Loop
+
+**Goal**: per-op information budget enforced at every Venom tool round. Auto-engage `PROBE_ENVIRONMENT` on confidence drop. Auto-escalate to `NOTIFY_APPLY` on budget exhaustion without convergence. Removes both **infinite curiosity** (probe loops that won't terminate) AND **silent fail-poor-quality** (op completes with low confidence without escalating).
+
+#### 31.2.1 Substrate inventory (file:line)
+
+| Module | File | Role in the loop |
+|---|---|---|
+| `ConfidenceMonitor` | `governance/verification/confidence_monitor.py` (788 LOC) | Rolling-window confidence + collapse detection |
+| `ConfidenceProbeRunner` (Move 5) | `governance/verification/confidence_probe_runner.py` | Async runner + early-stop on convergence |
+| `ConfidenceProbeBridge` | `governance/verification/confidence_probe_bridge.py` | Wires probe verdicts to `ConfidenceCollapseAction.PROBE_ENVIRONMENT` |
+| `ProbeEnvironmentExecutor` | `governance/verification/probe_environment_executor.py` | Concrete prober (read-only Venom subset) |
+| `HypothesisProbe` (Phase 7.6) | `governance/adaptation/hypothesis_probe.py` | Three-termination-guarantee primitive (K-call cap + monotonic-clock + sha256 diminishing-returns) |
+| `SpeculativeBranchTree` (Priority #4) | `governance/verification/speculative_branch*.py` | K-way parallel branch comparator |
+| `RiskTierFloor` | `governance/risk_tier_floor.py` | Strictest-wins escalation engine (`SAFE_AUTO` → `NOTIFY_APPLY` → `APPROVAL_REQUIRED`) |
+| `tool_executor.py` | `governance/tool_executor.py` | Where round-loop budget is checked + enforced |
+
+**What's already wired**: each piece works in isolation. `ConfidenceMonitor` collapses, `ProbeEnvironment` runs, `SBT` branches. **What's missing**: a *single budget object* tracking (rounds_consumed, confidence_trajectory, probe_calls_consumed, branch_calls_consumed) that the `tool_executor` round-loop consults at every iteration boundary.
+
+#### 31.2.2 Slice plan (~5 slices, ~1,600 LOC, ~180 tests)
+
+- **Slice 1** — `EpistemicBudget` primitive (frozen dataclass + closed `BudgetOutcome` enum: `WITHIN_BUDGET / CONVERGED / PROBE_TRIGGERED / SBT_TRIGGERED / EXHAUSTED_NOTIFY_APPLY / EXHAUSTED_APPROVAL_REQUIRED / DISABLED`). Pure function `compute_budget_action(state) -> BudgetAction`. Stdlib only. Master flag `JARVIS_EPISTEMIC_BUDGET_ENABLED` default-false.
+- **Slice 2** — `EpistemicBudgetTracker` (one instance per op; threadsafe). Subscribes to `ConfidenceMonitor.update()` + tool-round boundaries from `tool_executor`. Per-op envelope:
+    - `max_rounds` (default 12, env `JARVIS_EPISTEMIC_MAX_ROUNDS`)
+    - `confidence_drop_threshold` (default 0.25, env)
+    - `probe_call_cap` (default 5 — inherits HypothesisProbe MAX_CALLS)
+    - `sbt_branch_cap` (default 3, env)
+- **Slice 3** — `tool_executor.py` integration: round-loop checks `tracker.next_action()` after each tool result. Routes:
+    - `WITHIN_BUDGET` → continue normally
+    - `PROBE_TRIGGERED` → invoke `ConfidenceProbeRunner` inline (auto-engage on confidence drop)
+    - `SBT_TRIGGERED` → spawn `SpeculativeBranchTree` (only if risk-tier ≥ NOTIFY_APPLY — cost gate)
+    - `EXHAUSTED_NOTIFY_APPLY` → bump `ctx.risk_tier` via `RiskTierFloor.escalate()` (not a hardcode — uses existing escalation engine)
+    - `EXHAUSTED_APPROVAL_REQUIRED` → block + route through `OrangePRReviewer` async path
+- **Slice 4** — Observability: `/budget` REPL (per-op snapshot + per-session aggregates), `GET /observability/budget{,/op/{op_id}}`, SSE `budget_action_taken`. Authority-free.
+- **Slice 5** — Graduation (default-true; structurally inert when monitor returns no signals) + 5 AST pins (tracker-no-mutation-of-policy, executor-must-call-tracker-each-round, escalation-uses-RiskTierFloor-only, no-bypass-of-OrangePR-on-EXHAUSTED_APPROVAL_REQUIRED, post-graduation re-pin) + 6 FlagRegistry seeds.
+
+#### 31.2.3 Cost contract
+
+Probe + SBT activations *cost LLM calls*. Hard caps prevent runaway:
+- Default: ≤5 probe calls × ≤3 SBT branches × max 12 rounds ≈ 20 LLM calls/op worst-case. At STANDARD-route $0.005/op average, ceiling ≈ $0.10/op (rare worst case; typical = $0.005–0.015).
+- BACKGROUND/SPECULATIVE routes: probe + SBT both refused at the gate (mirrors Move 6 `COST_GATED_ROUTES` AST pin).
+- Empirical guard: if budget hits `EXHAUSTED_*` more than 5×/hour over a rolling window, `SensorGovernor` automatic emergency-brake (already shipping per Wave 1 #3) trips and BG ops drop to 20% caps.
+
+#### 31.2.4 Edge cases & nuances
+
+- *Probe loop that never converges*: HypothesisProbe's three-termination contract is structural — `MAX_CALLS_PER_PROBE_DEFAULT=5` can't be overridden by tracker. Diminishing-returns terminates `INCONCLUSIVE_DIMINISHING` even before call cap hits.
+- *Confidence drop = legitimate complexity*: tracker doesn't auto-escalate to APPROVAL_REQUIRED on first drop — only on **drop AND no convergence after probe**. Two signals required.
+- *SBT triggered on a low-risk op (cost violation)*: structurally impossible — the `tool_executor` integration only invokes SBT when `ctx.risk_tier >= NOTIFY_APPLY`. AST pin enforces.
+- *Tracker disagrees with operator approval*: `/budget override <op_id> continue` REPL verb writes an explicit override into the audit ledger; tracker yields. Bounded by the same `JARVIS_AUTO_APPLY_QUIET_HOURS` mechanism.
+- *Multiple probes/SBT in same op causing context bloat*: `live_context_compaction` (Gap #8) already auto-compacts at 75% prompt budget; remains the safety net.
+- *Round count baked into budget vs adaptive*: deliberate static default (12). Adaptive `max_rounds` from posture deferred to a follow-up — explicit tradeoff: predictable behavior > slightly tighter budget.
+
+**Buildable?** **Yes — near-term, ~6–8 days.** All 7 substrate modules ship. This is the highest-leverage upgrade for *closing* loops that currently dead-end.
+
+### 31.3 Upgrade 2 — DecisionRecord Causality Graph
+
+**Goal**: append-only `decisions.jsonl` per session that records every gate / validator / routing decision with input-state-hash. Nightly replay job asserts determinism (same inputs → same decisions). Foundation for **time-travel debugging** AND for **RSI safety** — you cannot let O+V rewrite itself if you cannot prove its decisions are reproducible.
+
+#### 31.3.1 Substrate inventory (file:line)
+
+| Module | File | Role |
+|---|---|---|
+| `decision_runtime.py` | `governance/determinism/decision_runtime.py` | Phase 1 Slice 1.4 — captures decisions in-process; lacks JSONL persistence |
+| `phase_capture.py` | `governance/determinism/phase_capture.py` | Per-phase Merkle nodes; promoted to session-spanning navigable graph by Priority #2 (Causality DAG) |
+| `auto_action_router` (Move 3) | `governance/auto_action_router.py` | 5-value AdvisoryActionType — already an audit-trailed decision surface |
+| `coherence_window_store.py` | `governance/verification/coherence_window_store.py` | Append-only JSONL pattern with cross-process flock (Tier 1 #3) — model M2's persistence layer after this |
+| `_file_lock.py` | `governance/adaptation/_file_lock.py` | Phase 7.8 advisory-locking helper (`flock_exclusive` + `flock_shared`) |
+| `auditor.jsonl` precedent | `.jarvis/posture_audit.jsonl`, `.jarvis/coherence_history.jsonl`, `adaptation_ledger.jsonl` | Multiple precedents for append-only audit-trail JSONL files |
+
+**What's already wired**: decision-points fire correctly in-process. **What's missing**: persistent ledger + determinism replay. Phase 1 Slice 1.4's `--rerun` CLI proves the *capture* side works; the *replay-as-determinism-test* side hasn't been built.
+
+#### 31.3.2 Slice plan (~5 slices, ~1,800 LOC, ~220 tests)
+
+- **Slice 1** — `DecisionRecord` primitive (frozen dataclass: `decision_id, timestamp_unix, phase, decision_kind, input_state_hash, output_decision, rationale, op_id, session_id`). Closed `DecisionKind` enum (≥10 values: `ROUTE_SELECTION / GATE_PASS / GATE_FAIL / VALIDATOR_PASS / VALIDATOR_FAIL / RISK_ESCALATION / PROBE_TRIGGER / SBT_TRIGGER / AUTO_ACTION_PROPOSAL / APPROVAL_REQUEST / DISABLED`). Pure data, no I/O.
+- **Slice 2** — `DecisionLedger` (append-only `.jarvis/sessions/<id>/decisions.jsonl`; flock'd via `_file_lock.py`). Bounded: max 10MB per file, rotates to `decisions.<n>.jsonl`. Reuse 100% of `coherence_window_store.py`'s flock pattern.
+- **Slice 3** — Decision-site instrumentation: hooks into 8 known sites:
+    - `urgency_router.classify()` (ROUTE_SELECTION)
+    - `iron_gate.evaluate()` (GATE_PASS / GATE_FAIL)
+    - `validators/*.run()` (VALIDATOR_PASS / VALIDATOR_FAIL)
+    - `risk_tier_floor.escalate()` (RISK_ESCALATION)
+    - `confidence_probe_bridge.trigger()` (PROBE_TRIGGER)
+    - `speculative_branch.spawn()` (SBT_TRIGGER)
+    - `auto_action_router.propose()` (AUTO_ACTION_PROPOSAL)
+    - `orange_pr_reviewer.queue()` (APPROVAL_REQUEST)
+    Each site writes ≤1 record; never raises. Master flag `JARVIS_DECISION_LEDGER_ENABLED` default-false → graduation.
+- **Slice 4** — `DeterminismReplay` background job: `scripts/replay_determinism.py --session <id>`. Reads decisions.jsonl + reconstructs input state → re-runs each decision through the same code path → asserts byte-equal output. Reports drift as `DriftReport` rows. Designed to be cron-able; default cadence nightly. Reuses Move 4 InvariantDriftAuditor's drift-report shape.
+- **Slice 5** — Graduation: 4 AST pins (no-mutation-from-ledger, no-decision-site-can-skip-ledger-when-flag-on, replay-uses-RecordedInputs-not-LiveState, ledger-write-is-flock'd) + 6 FlagRegistry seeds + observability: `/decisions` REPL (last N records), `GET /observability/decisions{,/session/{id}}`, SSE `decision_drift_detected` (replay job emits when drift found).
+
+#### 31.3.3 Cost contract
+
+Pure substrate. Zero LLM calls. Disk: ~1KB/decision × ~50 decisions/op × ~20 ops/session = ~1MB/session. Replay job runs offline (typically operator's machine, idle GPU not consumed). Net cost ≈ disk + ≤30s replay wall-clock per session.
+
+#### 31.3.4 Edge cases & nuances
+
+- *Non-deterministic input* (timestamps, RNG): `input_state_hash` excludes timestamps; RNG already routed through `entropy.py` substrate from Phase 1 Slice 1.1 — replay re-seeds from recorded entropy. Determinism preserved by construction.
+- *Decision sites added later*: `JARVIS_DECISION_LEDGER_REQUIRED_SITES` env knob lists currently-instrumented sites; replay job warns (not fails) on records from sites not in the required-set, so adding instrumentation is non-breaking.
+- *Ledger corruption mid-session*: per-line JSON parse + skip; missing line treated as "decision not recorded" — replay reports as `INSUFFICIENT_DATA` not `DRIFT`.
+- *Cross-session determinism* (different prompt-cache state, different posture): explicitly out of scope — Slice 4 only asserts *within-session* determinism. Cross-session drift is a separate question (handled by Move 4 InvariantDriftAuditor for structural drift, Priority #1 Coherence Auditor for behavioral drift).
+- *RSI gate dependency*: O+V can't autonomously rewrite the decision-recording machinery itself — pinned via AST invariant that any patch touching `decision_runtime.py` or `_file_lock.py` from `decisions.jsonl`'s caller chain is force-routed to `APPROVAL_REQUIRED` tier. No self-modifying-the-recorder loop.
+- *Privacy of `rationale` strings*: rationales may contain code excerpts; ledger is per-session under `.jarvis/` (already gitignored). Loopback-only on `/observability/decisions` (mirrors existing IDE observability pattern).
+
+**Buildable?** **Yes — near-term, ~7–9 days.** Higher impact than M2 size suggests because it unlocks:
+- Time-travel debugging ("why did O+V take this route 3 days ago?")
+- RSI safety gate ("can we prove this proposed self-modification doesn't change decision determinism?") — directly serves the §30 M10 ArchitectureProposer cage rule
+- Postmortem evidence ("the gate failed because input state was X")
+
+### 31.4 Upgrade 3 — Failure-Mode Memory at GENERATE-prompt-construction
+
+**Goal**: every postmortem extracts `(situation_signature, failure_mode, mitigation)` triplet into a queryable store. Before any GENERATE, query the store for matching situations and inject *"previously failed via X; try Y instead"* into the prompt. Existing `adaptive_learning.py` + `PostmortemRecallService` (Priority #2) do this at *retry-context*, not at *first-attempt*. **Move it earlier.** Without this, the system relearns the same lesson 100× — exactly the non-deterministic degradation we want to solve.
+
+#### 31.4.1 Substrate inventory (file:line)
+
+| Module | File | Role |
+|---|---|---|
+| `adaptive_learning.py` | `governance/adaptive_learning.py` | Existing learning consolidator (the "LearningConsolidator" the operator referenced — actual filename) — currently invoked on retry only |
+| `PostmortemRecallService` (Priority #2) | `governance/postmortem_recall.py` | Recurrence-recall infrastructure — graduated default-true; today injects on *retry context*, not first-attempt |
+| `StrategicDirection` | `governance/strategic_direction.py` | The first-attempt prompt-construction surface; "Recent Development Momentum" digest already extends it; ideal injection point |
+| `SemanticIndex` | `governance/semantic_index.py` | Region-clustering — `situation_signature` keyed off cluster_id + intent_hash |
+| `ConversationBridge` | `governance/conversation_bridge.py` | Sanitized injection channel into CONTEXT_EXPANSION (Tier -1 sanitizer) |
+| Move 4 `InvariantDriftAuditor` | `governance/move_4_*` | Provides the *structural-drift* lens; failure-mode memory provides the *recurrence* lens — orthogonal, composes cleanly |
+
+**What's already wired**: postmortem capture works (Tier 1 #1 confidence drop SSE wired). PostmortemRecallService can retrieve. **What's missing**: (a) the *signature extraction* (going from "this op failed" to "in situation X, attempting Y caused Z"), (b) the *first-attempt* injection (currently lives in retry path).
+
+#### 31.4.2 Slice plan (~5 slices, ~1,500 LOC, ~190 tests)
+
+- **Slice 1** — `FailureModeRecord` primitive (frozen dataclass: `signature_hash, situation_kind, attempted_action_kind, failure_mode_kind, mitigation_summary, observed_at_unix, op_id, weight`). Closed enums for `SituationKind` (≥6 values: `MULTI_FILE_REFACTOR / DB_MIGRATION / ASYNC_RESTRUCTURE / NEW_TEST_FRAMEWORK_INTEGRATION / API_VERSION_BUMP / CROSS_REPO_DRIFT_FIX`), `FailureModeKind` (≥7 values: `MISSING_IMPORT / TYPE_MISMATCH / ASSERT_INVERTED / CIRCULAR_DEP_INTRODUCED / BANNED_TOKEN_INTRODUCED / TEST_TIMEOUT_REGRESSED / OTHER`).
+- **Slice 2** — `FailureModeExtractor`: post-VERIFY (failed) hook that reads POSTMORTEM `evidence_records` + `ctx.implementation_plan` + diff → derives signature. **Pure stdlib + ast** — no LLM call. Falls back to `OTHER` if pattern-match doesn't yield a closed-enum value (preserves no-hardcoding via the same chain-of-responsibility pattern Phase 7.9 uses). Persists to `.jarvis/failure_mode_memory.jsonl` (flock'd via `_file_lock.py` from Phase 7.8).
+- **Slice 3** — `FailureModeRetriever`: given `(SituationKind, target_files)` from `ctx`, returns top-K matching prior failures via `SemanticIndex.cosine_score` + recency weighting (14d half-life — same as `SemanticIndex`'s commit half-life). Diversity dedup per Coherence Auditor pattern.
+- **Slice 4** — `StrategicDirection` injection at first-attempt GENERATE: new `## Prior Failure Modes for This Situation` block. Bounded character budget (3KB max via existing budget system). Disabled when retriever returns no matches (no empty headers). Master flag `JARVIS_FAILURE_MODE_MEMORY_ENABLED` default-false → graduation.
+- **Slice 5** — Graduation (default-true; pure RAG, zero LLM cost on extraction OR retrieval) + 4 AST pins (extractor-zero-LLM, retriever-no-mutation-of-records, injection-uses-StrategicDirection-only, post-graduation re-pin) + 5 FlagRegistry seeds + observability: `/failures` REPL (`top`, `for <signature>`, `clear`), `GET /observability/failure-modes{,/signature/{hash}}`, SSE `failure_mode_recalled_at_generate`.
+
+#### 31.4.3 Cost contract
+
+Zero LLM calls in extractor (pattern-match) OR retriever (RAG). +≤3KB to GENERATE prompt amortized by Anthropic's 5-min prompt cache. Disk: ~500B/record × ~20 failures/session × 30 days = ~300KB. Net cost neutral.
+
+#### 31.4.4 Edge cases & nuances
+
+- *False signature collision* (two different failures map to same hash): retriever returns *all* records for a signature (top-K=3 default); inject all three. Adversary-resistant by construction — even if signatures collide, the injected context shows multiple distinct failure modes, which the model handles correctly.
+- *Stale failure mode no longer applicable* (a refactor fixed the underlying issue): recency weighting + Coherence Auditor RECURRENCE_DRIFT signal eventually decays the entry. Manual `/failures purge <signature>` REPL verb for operator override.
+- *Self-fulfilling avoidance loop* ("we always fail at X, so don't try X"): this is exactly the desired behavior at injection-time; if the avoidance is wrong, the model should propose a different mitigation. Iron Gate's exploration-first floor (2+ tool calls before patch) ensures the model verifies the situation hasn't changed before applying memory blindly.
+- *Adversarial extraction* (synthesized "failure" recorded to bias future generations): extractor is hooked to *real* POSTMORTEM emission — can't be triggered by code patches alone. Persistence requires a *real* VERIFY=fail. SemanticGuardian's existing patterns prevent test-inversion to game the extractor.
+- *Memory pollution from one-off failures*: minimum `weight=2` (i.e., signature must appear ≥2× across 30d window) before it's eligible for first-attempt injection. Below threshold, still recallable in retry path (Priority #2 PostmortemRecall continues to work as today).
+- *Double-injection with PostmortemRecallService*: Slice 4 adds the *first-attempt* injection block; PostmortemRecallService continues to inject in *retry* context. Bounded budget on each surface independently — no double-count.
+
+**Buildable?** **Yes — near-term, ~5–7 days.** Closes the recurrence-degradation loop the operator described directly. Highest-leverage of the three for *immediate per-op quality lift on familiar situations*.
+
+### 31.5 Synthesis Table — How the 3 Upgrades Compose
+
+| Upgrade | Closes loop on | Composes with §30 arc | Composes with §29.4 arc |
+|---|---|---|---|
+| Bounded Epistemic Loop | Per-op information adequacy | M9 `CuriosityGradient` (curiosity + budget = principled exploration) | Priority #3 Counterfactual Replay (budget actions become replay-able) |
+| DecisionRecord Causality Graph | Cross-session decision reproducibility | M10 `ArchitectureProposer` (RSI safety gate; cannot self-modify if non-deterministic) | Priority #3 Counterfactual Replay (decisions become the replay primitive) |
+| Failure-Mode Memory at GENERATE | Cross-op pattern accumulation | M11 `ActionOutcomeMemory` (failure modes are negative-evidence triplets; outcomes are positive-evidence triplets — symmetric pair) | Priority #2 PostmortemRecall (extends from retry-context to first-attempt) |
+
+**Net architectural effect**: the three upgrades close the **inner**, **session-spanning**, and **cross-session** epistemic loops respectively. Combined with §30's M9–M11 (which close ASCO capability axes), O+V graduates from "self-modifying substrate with state continuity" to "self-modifying substrate with reproducible cognition + accumulated lesson memory." That's the architectural delta between an *autonomous AGI substrate* and an *autonomous AGI substrate that learns from itself*.
+
+### 31.6 Sequencing Recommendation (operator-binding)
+
+§31 upgrades fit **between** the §30 ASCO arcs and the §29 critical-path sequencing as follows:
+
+| Order | Item | Source | Reason |
+|---|---|---|---|
+| 1 | Priority #3 Counterfactual Replay | §29.7 | Already authorized; in-flight |
+| 2 | Slice 5b consolidation (4 arcs) | §29.7 | Already authorized; parallel with #1 |
+| 3 | **Upgrade 3 — Failure-Mode Memory at GENERATE** | §31.4 | Pure RAG; zero new failure modes; fastest quality lift |
+| 4 | M11 — `ActionOutcomeMemory` | §30.5.3 | Symmetric pair to Upgrade 3 (positive evidence) |
+| 5 | **Upgrade 1 — Bounded Epistemic Loop** | §31.2 | Closes per-op loop; benefits from M11's outcome substrate |
+| 6 | M9 — `CuriosityGradient` | §30.5.1 | Composes with Upgrade 1 (curiosity drives the budget) |
+| 7 | **Upgrade 2 — DecisionRecord Causality Graph** | §31.3 | Foundation for safe RSI; precedes any architecture-mutation capability |
+| 8 | M10 — `ArchitectureProposer` | §30.5.2 | Depends on Upgrade 2's determinism guarantee |
+| 9 | CLI ports (parallel) | §30.8.1 | Sliceable in parallel |
+| 10 | M12 — `JPrimeLoRA` (operator-gated) | §30.6 | Long-horizon, conditional |
+
+**Estimated calendar to "earned ASCO + closed epistemic loops"**: 6–8 weeks for items 3–9 at established cadence (each is a 5-slice arc; some parallel-executable).
+
+### 31.7 What Each Upgrade Does NOT Do (Anti-Goals)
+
+| Upgrade | Anti-goal (what it does NOT solve) |
+|---|---|
+| Bounded Epistemic Loop | Does NOT solve cross-op degradation (that's Upgrade 3) or non-determinism (that's Upgrade 2). Bounds *one op's* information appetite. |
+| DecisionRecord Causality Graph | Does NOT prevent bad decisions — it *records* them so they're auditable and replay-able. Quality-of-decisions is Upgrade 1 + risk tiers + SemanticGuardian. |
+| Failure-Mode Memory at GENERATE | Does NOT solve novel failures (the first time you fail at something, no memory exists). Solves the *recurrence* tail; novel failures still depend on Iron Gate + SemanticGuardian + tests. |
+
+### 31.8 Cross-References
+
+- §4 — Cognitive Scaffolding Gap (Upgrade 1 closes Shallow 6; Upgrade 2 closes Shallow 3; Upgrade 3 closes Shallow 1)
+- §23.6 — Anti-Venom (Upgrade 2 is structural prereq for any §23.6 Order-2 self-modification of decision-bearing modules)
+- §26.6 — Cost contract (all three upgrades zero-LLM by construction; Upgrade 1's probe/SBT activations gated by route-class via existing AST pins)
+- §29.4 — Priority #3 Counterfactual Replay (Upgrade 2 provides the replay primitive Priority #3 currently lacks)
+- §30.5 — ASCO arcs (Upgrade 3 ↔ M11 are symmetric negative/positive evidence pairs; Upgrade 1 ↔ M9 are budget/curiosity pairs; Upgrade 2 ↔ M10 are determinism/proposal pairs)
+
+### 31.9 Summary — Why These Three (and Why Now)
+
+The three upgrades aren't picked from a feature backlog. Each addresses a structural property O+V claims to have but doesn't:
+
+1. **Bounded** — we claim "principled exploration" (Iron Gate + posture + sensors) but the per-op information appetite is unbounded. Upgrade 1 fixes that.
+2. **Reproducible** — we claim "auditable decisions" (16 sensors + SSE + observability) but cannot *replay* a session and prove the same input → same decision. Upgrade 2 fixes that.
+3. **Cumulative** — we claim "lifelong learning" (state continuity + lessons) but the same lesson can be relearned 100× because the prior failure isn't surfaced at *first attempt*. Upgrade 3 fixes that.
+
+**Combined**: O+V transitions from "right by accident, sometimes" to "structurally bounded, structurally reproducible, structurally cumulative." That's the architectural minimum for the Anti-Venom thesis (§23.6) to be *true at scale*, not just *true at single-op resolution*.
+
+---
+
 ## Appendix D — Document History
 
 | Date | Version | Change | Author |
 |---|---|---|---|
+| 2026-05-04 | 2.10 | **§31 Critical Path Systemic Upgrades v3 added — 3 cross-cutting epistemic-loop closures.** Operator-prompted; mirrors the §29.4 / §28.6 / §27.4 / §26.5 / §25.5 / §24.10 "top 3 systemic upgrades" pattern but distinct from §30 (which closes ASCO capability axes). §31 closes **epistemic loops**: per-op information adequacy + cross-session decision reproducibility + cross-op pattern accumulation. Each upgrade is **glue over substrate that already ships** — value comes from composition, not new primitives. **Upgrade 1 — Bounded Epistemic Loop** (~5 slices, ~6–8d): single per-op information budget checked at every Venom tool round; auto-engage `PROBE_ENVIRONMENT` on confidence drop; auto-escalate to `NOTIFY_APPLY` on budget exhaustion without convergence; removes both infinite curiosity AND silent fail-poor-quality. Reuses `confidence_monitor.py` (788 LOC) + `confidence_probe_runner.py` + `confidence_probe_bridge.py` + `probe_environment_executor.py` + `hypothesis_probe.py` + `speculative_branch*` + `risk_tier_floor.py` + `tool_executor.py`. Hard cost cap ≤20 LLM calls/op worst-case; BG/SPEC refused at gate (mirrors Move 6 `COST_GATED_ROUTES` AST pin). Master flag `JARVIS_EPISTEMIC_BUDGET_ENABLED` default-false → graduation. **Upgrade 2 — DecisionRecord Causality Graph** (~5 slices, ~7–9d): append-only `decisions.jsonl` per session at 8 known decision sites (`urgency_router.classify` / `iron_gate.evaluate` / `validators/*.run` / `risk_tier_floor.escalate` / `confidence_probe_bridge.trigger` / `speculative_branch.spawn` / `auto_action_router.propose` / `orange_pr_reviewer.queue`); nightly `scripts/replay_determinism.py --session <id>` asserts byte-equal output for same inputs; reports drift as `DriftReport` rows reusing Move 4 InvariantDriftAuditor's drift-report shape. Foundation for **time-travel debugging** AND for **RSI safety** (cannot let O+V rewrite itself if you cannot prove its decisions are reproducible — directly serves §30 M10 ArchitectureProposer cage rule). Reuses `determinism/decision_runtime.py` + `determinism/phase_capture.py` + `auto_action_router.py` + `coherence_window_store.py` flock pattern + `_file_lock.py`. Pure substrate; zero LLM. ~1MB/session disk; ≤30s replay wall-clock. **Upgrade 3 — Failure-Mode Memory at GENERATE-prompt-construction** (~5 slices, ~5–7d): every postmortem extracts `(situation_signature, failure_mode, mitigation)` triplet via pure-stdlib pattern-match extractor (no LLM); retriever surfaces matching prior failures into **first-attempt GENERATE prompt** via `StrategicDirection` injection — moves matched-postmortem injection from retry-context (existing `adaptive_learning.py` + Priority #2 `PostmortemRecallService`) to first-attempt; without this the system relearns the same lesson 100× (exactly the non-deterministic degradation we want to solve). Symmetric negative-evidence pair to §30 M11 `ActionOutcomeMemory`'s positive-evidence triplets. Closed enums `SituationKind` (≥6 values incl. MULTI_FILE_REFACTOR / DB_MIGRATION / ASYNC_RESTRUCTURE / NEW_TEST_FRAMEWORK_INTEGRATION / API_VERSION_BUMP / CROSS_REPO_DRIFT_FIX) + `FailureModeKind` (≥7 values incl. MISSING_IMPORT / TYPE_MISMATCH / ASSERT_INVERTED / CIRCULAR_DEP_INTRODUCED / BANNED_TOKEN_INTRODUCED / TEST_TIMEOUT_REGRESSED / OTHER). Min weight=2 (signature must recur ≥2× in 30d) before first-attempt injection — bounded by construction against memory pollution from one-off failures. Reuses `adaptive_learning.py` + `postmortem_recall.py` + `strategic_direction.py` + `semantic_index.py` + `conversation_bridge.py` + `_file_lock.py`. Zero LLM cost on extraction OR retrieval; +≤3KB to GENERATE prompt amortized by Anthropic prompt cache. **Sequencing per §31.6** (operator-binding, interleaved with §29.7 + §30.10): items 1+2 = §29.7 Priority #3 + Slice 5b (already authorized); item 3 = U3 Failure-Mode Memory; item 4 = M11 ActionOutcomeMemory (symmetric pair); item 5 = U1 Bounded Epistemic Loop; item 6 = M9 CuriosityGradient (composes with U1); item 7 = U2 DecisionRecord Causality Graph; item 8 = M10 ArchitectureProposer (depends on U2); items 9+10 = CLI ports (parallel) + M12 JPrimeLoRA (operator-gated). **Estimated calendar to "earned ASCO + closed epistemic loops"**: 6–8 weeks for items 3–9 at established cadence. **§31 explicitly does NOT supersede §29.7 critical-path** — Priority #3 + Slice 5b remain operator-binding next work; §31 upgrades are *post*-Priority-#3+Slice-5b. **Anti-goals (§31.7)**: U1 does NOT solve cross-op degradation (that's U3) or non-determinism (that's U2). U2 does NOT prevent bad decisions — it records them so they're auditable + replay-able. U3 does NOT solve novel failures (first-time-failures still depend on Iron Gate + SemanticGuardian + tests). **Net architectural effect (§31.5 + §31.9)**: combined with §30 M9–M11, O+V transitions from "right by accident, sometimes" to "structurally bounded, structurally reproducible, structurally cumulative" — the architectural minimum for the §23.6 Anti-Venom thesis to be true at scale, not just at single-op resolution. Header bumped 2.9 → 2.10; TOC §31 entries (10 anchors) added; Phase 12 entries appended to live roadmap status table. | Claude Opus 4.7 (1M context) (§31 + Phase 12 roadmap) |
+| 2026-05-04 | 2.9 | **§30 ASCO Mapping added — operator-prompted truth audit + 3 buildable arcs (M9/M10/M11) + 1 long-horizon arc (M12) + CLI UI/UX ports.** New §30 (12 subsections) does file:line-anchored audit of the "Autonomous Self-developing Cognitive Organism" (ASCO) framing the operator surfaced. **Honest verdict**: O+V is structurally true on 4 of 8 ASCO sub-axes today (proactive initiation, self-modification, state continuity, governance cage); 3 are buildable from existing substrate without research-grade investment (intrinsic motivation, weak ontogeny, in-context embodiment); 1 is provider-gated (in-weight learning — viable only on J-Prime tier we control end-to-end). Recommended canonical phrasing: **"proactive, self-modifying, governance-bounded autonomous substrate"** — survives a hostile review. ASCO label is *aspirational* today; *earnable* post M9+M10+M11 (~3–4 weeks at established cadence). Three new arcs scoped (each 5-slice, mirrors Move 4–6 / Priority #1–5 pattern): **M9 `CuriosityGradient`** (~5–7d, closes intrinsic-motivation; reuses `prophecy_engine.py` + `confidence_capture.py` + `confidence_monitor.py` + `sensor_governor.py` + `semantic_index.py`; pure substrate zero LLM cost on hot path); **M10 `ArchitectureProposer`** (~7–10d, closes weak-ontogeny; reuses `capability_gap_sensor.py` + `opportunity_miner_sensor.py` + `generative_quorum.py` + `coherence_auditor.py` + `orange_pr_reviewer.py`; STANDARD-route Quorum K=3 mandatory; ≤$0.075/day capped; **stays default-false in production until 30+ proposal-acceptance audit**); **M11 `ActionOutcomeMemory`** (~5–7d, closes in-context embodiment; reuses `op_context.py:834` session_lessons + `postmortem_recall.py` + `semantic_index.py` + `user_preference_memory.py` + `memory_engine.py` + `conversation_bridge.py`; zero LLM cost on retrieval hot path; +≤4KB to GENERATE prompt amortized by prompt cache). **Sequencing recommendation**: M11 first (highest immediate quality lift, lowest risk) → M9 (curiosity benefits from M11's outcome substrate) → M10 (depends on Coherence Auditor RECURRENCE_DRIFT being well-calibrated post-M11). **Long-horizon M12 `JPrimeLoRA`** (6–12 month, operator-gated): only credible path to in-weight learning given Claude/DW are inference-only; requires data-curation pipeline + GCP training harness + eval harness + route gating; corpus filter must exclude reverted commits + RECURRENCE_DRIFT-flagged + low-Priority-#1-confidence (the Coherence + Confidence + Recall trio gives curation signal). **Honest NOT-WORTH-BUILDING list** (§30.7): strong-form ontogeny via NAS over FSM (compromises auditable-topology property), real humanoid embodiment (out of scope), curiosity-gradient requiring provider retraining (provider-gated), autonomous PR-merging on architecture proposals (cost-of-being-wrong asymmetric), in-weight learning for Claude/DW (provider-gated), continuous online RL (provider-gated + reward-hacking failure modes). **CLI UI/UX article ports** (operator-supplied, §30.8.1 — 3 worth doing): `PrincipleManifest` (typed manifesto principles into StrategicDirection injection, ~1-slice), `SerpentFlowSnapshotter` (ANSI-stripped render snapshots at op boundaries to `.jarvis/sessions/<id>/render_snapshot.txt` for forensic inspection, ~2-slice), `CLIStyleGuide.md` (one-screen design rules lifted from `RenderConductor` closed taxonomies). **NOT worth porting** (§30.8.2): Playwright-style visual diff for CLI output (35-test CC2 spine catches structural regressions; visual flake is operator-caught), atomic-CSS analogy past composer (terminal grid isn't HTML/CSS — premature abstraction). **Updated capability matrix vs CC + ASCO** (§30.9): O+V already exceeds CC on every row where they differ; post M9–M11, O+V satisfies most ASCO criteria honestly. **Sequencing does NOT preempt §29.7's authorized work** — Priority #3 Counterfactual Replay + Slice 5b consolidation remain the next operator-binding work; M9–M11 are *post*-Priority-#3+Slice-5b. **CC2 follow-ups landed same-day** (CLI parity polish): `ClaudeStyleTransport` Protocol-conformant (`name`/`notify`/`flush`/`shutdown`) + ACTIVE_OP + TASK_LIST `StatusField` extension (9→11 closed-taxonomy members) + FILE_REF event renders `Update(<path>:<line>)` block + N-added/M-removed stats + 5-line color-coded diff preview (matches CC's tool-call idiom) + multi-line REPL prompt with cwd/mode/posture context + operator override via `JARVIS_PROMPT_TEMPLATE` env var (defensive fallback to legacy single-line on bad placeholder) + new AST pin `serpent_flow_repl_prompt_helper_present` (37→38 invariants) + 35 new regression pins in `tests/governance/test_cc2_followups.py` + 2 pre-existing `test_status_line_composer.py` tests updated for 11-member set + new ACTIVE_OP/TASK_LIST default field order. **1562/1562 governance sweep green** post-CC2-followups. | Claude Opus 4.7 (1M context) (§30 + CC2 follow-ups) |
 | 2026-05-01 | 2.8 | **§29 Brutal Architectural Review — post-Priority-#2-closure (third operator-driven review).** Single-session delivery: Tier 1 #1+#2+#3 (confidence drop SSE producer wiring + PostureObserver task-death detection + cross-process flock on ledgers — all 3 of v9's immediate priorities) + Move 5 Confidence-Aware Probe Loop (5-slice arc, 4th `ConfidenceCollapseAction.PROBE_ENVIRONMENT` outcome, K-call cap + monotonic-clock + sha256 diminishing-returns three-independent-termination guarantees, read-only tool allowlist AST-pinned) + Move 6 Generative Quorum (5-slice arc, master deliberately default-FALSE pending live verification, K-way parallel candidate generation with AST-normalized signature consensus, closes Test-shape gaming + Quine-class hallucination via independent-roll consensus, cost contract preserved by `COST_GATED_ROUTES` AST pin) + Priority #1 Coherence Auditor (5-slice arc, all 3 flags default-TRUE, cross-session BEHAVIORAL drift detection complementing Move 4's STRUCTURAL drift, closes gestalt-rotation blind spot, 6-value `BehavioralDriftKind` closed enum DISTINCT from Move 4's 9-value structural taxonomy, periodic posture-aware async observer with HARDEN 3h / DEFAULT 6h / MAINTAIN 12h cadence + adaptive vigilance + drift signature dedup) + Priority #2 PostmortemRecall (5-slice arc, all 4 flags default-TRUE, **closes the recurrence-prevention loop end-to-end** — activates Priority #1 Slice 4's previously-dormant `INJECT_POSTMORTEM_RECALL_HINT` advisory, cross-session prior-failure context injection at CONTEXT_EXPANSION via robust degradation contract NEVER raising into GENERATE pipeline, recurrence consumer stamps Phase C `MonotonicTighteningVerdict.PASSED` on every boost). **shipped_code_invariants 20→36 (+16, +80%)**. SSE event vocabulary +5 (probe_outcome / quorum_outcome / behavioral_drift_detected / postmortem_recall_injected / posture_observer_degraded). FlagRegistry seeds +20 (6 Move 6 + 8 Priority #1 + 6 Priority #2). **Letter grade adjusts UP from v9's "A− structural / B+ empirical" to "A structural / A− empirical"** — honest reflection of: (1) recurrence-prevention loop closed end-to-end via Priority #2 (the load-bearing missing piece flagged in §28); (2) +16 AST pins immune-system scaling; (3) Phase C universal cage rule integrated in 3 places (Move 6 + Priority #1 + Priority #2); (4) Tier 1's 3 immediate priorities all addressed; (5) cost contract structurally enforced everywhere via AST construction. New §29 (8 sub-sections) covering: (29.1) what closed since §28; (29.2) cognitive & epistemic delta — Priority #3 Counterfactual Replay identified as THE remaining big capability gap (substrate exists via Phase 1 Determinism + Causality DAG; policy-swap path missing); (29.3) brutal grade A/A− defended; (29.4) **Critical Path to A-Level RSI — top 3 systemic upgrades**: Priority #3 Counterfactual Replay Engine (5-slice arc scoped at `memory/project_priority_3_counterfactual_replay_scope.md`; replay-with-policy-swap engine using cached generation hashes for ZERO LLM cost; 5-value ReplayOutcome + 5-value BranchVerdict + 5-value DecisionOverrideKind closed enums; produces empirical recurrence-reduction baseline that retroactively justifies Move 6 master flag graduation; ~250 tests / ~2,500 LOC; 4 AST pins target 40 total post-Priority-3) + Slice 5b consolidation across 4 arcs (REPL + GET routes + production wiring for Move 5 + Move 6 + Priority #1 + Priority #2; operator-experience polish that converts structural primitives into operational reality; work-in-parallel candidate while implementer executes Priority #3) + Move 7 Cross-op Semantic Budget (substrate prepared by Priority #1's monotonic-tightening contract; Priority #2 produces integral signal; catches slow-boil drift compounding over 100+ cycles); (29.5) Reverse Russian Doll alignment — pin count 13→20→36 (+15 this session); SSE event vocabulary 10→57→62 (+5 this session); async observers 1→3→4 (+1 this session); bypass vectors closed: Test-shape gaming (Move 6) + Quine-class hallucination (Move 6) + Recurrence loop (Priority #2) + Long-horizon coherence drift (Priority #1); bypass vectors still open: plausible-but-vacuous test patterns (Move 9) + slow-boil compounded drift (Move 7); (29.6) **operator question direct answer**: STRUCTURALLY O+V already exceeds CC capability envelope; EMPIRICALLY near-parity-pending-verification; **realistic timeline to A-level empirical execution: 6–10 weeks** (Weeks 1-2: Priority #3 + Slice 5b in parallel → Weeks 3-6: live verification soak measuring recurrence-reduction baseline → Weeks 6-8: Move 6 graduation + Move 7 + Move 8 → Weeks 8-10: live RSI cycle proof — first true second-order doll completed); (29.7) operator next-actions list (Priority #3 → Slice 5b → soak → Move 6 graduation → Move 7 → Move 8); (29.8) summary direct answer to operator: A-level vision + A-level structural foundation + A−level execution on cognitive tasks + A−level execution on edge cases + path to A on empirical floor = Priority #3 + Slice 5b + soak (6-10 weeks); path to A+ = above + Move 7 + Move 8 + first live RSI cycle. Updates **§1 version line** bumped to 2.8 with Priority #2 closure marker + §29 latest-review pointer. Zero behavior change — doc-only update synthesizing this session's verified review. Closure memos: `memory/project_move_5_closure.md` + `memory/project_move_6_closure.md` + `memory/project_priority_1_coherence_auditor_closure.md` + `memory/project_priority_2_postmortem_recall_closure.md` + scope draft `memory/project_priority_3_counterfactual_replay_scope.md`. | Claude Opus 4.7 (post-Priority-#2-closure brutal review) |
 | 2026-04-30 | 2.7 | **§28 Brutal Architectural Review v9 — file:line-grounded post-Move-4 deep dive.** Operator-driven 2026-04-30 review with explicit instruction to verify all claims against the actual codebase via parallel exploration agents (4 dispatched: cognitive surfaces / observability + Causality DAG / Antivenom defense + bypass vectors / async concurrency surfaces). v9 supersedes v8 on every claim where evidence diverged. Letter grade adjusts down from v8's "A− trending A" to **"A− structural ceiling, B+ empirical floor, trending A−"** — honest reflection of file:line audit. Updates: §1 version line bumped to 2.7 with Move 4 closure marker + v9 latest-review pointer; §2 Vision Statement refreshed with operator-binding rewrite (proactive autonomous opposite of CC + Reverse Russian Doll convergence framing) + new 8th success criterion ("Self-validating immune system over time" — Move 4 graduated 2026-04-30); new §28 (10 sub-sections) covering: (28.1) what v9 verified vs prior reviews; (28.2) delta since v7 (Priority 1 + Priority 2 + Move 1+2+3+4 all closed); (28.3) cognitive & epistemic delta with file:line evidence (Anthropic-routed ops have ZERO confidence signal — `confidence_capture.py:14-20`; no inner reasoning between tool rounds; no parallel speculative branches; hypothesis probe loop is REACTIVE not PROACTIVE; GENERAL subagent body is STUB at `agentic_general_subagent.py:39`; classify_clarify is NOT autonomous); (28.4) deep observability with file:line evidence (Causality DAG shipped at `verification/causality_dag.py:513`; 57 SSE event types + 24 GET endpoints; **`EVENT_TYPE_MODEL_CONFIDENCE_DROP` vocabulary defined but PRODUCERS NOT WIRED** — `ide_observability_stream.py:142-144`; **`--rerun-from` is NOT in `scripts/ouroboros_battle_test.py`** — closure memo was wrong; no `/replay` REPL; `posture_store.py:165` uses non-reentrant Lock vs RLock asymmetry); (28.5) brutal grade with file:line evidence — race conditions concrete: CRITICAL silent observer death cascade at `posture_observer.py:558-572`, cross-process ledger append corruption at `auto_action_router.py:1110-1113`, cross-process baseline write race at `invariant_drift_store.py:317-329`, half-migrated phase extraction (8 extracted, 4 NOT: CLASSIFY/APPROVE/APPLY/VERIFY); 5 Antivenom bypass vectors exhaustively verified — Test-shape gaming + Quine-class hallucination both **CONFIRMED ABSENT** via grep + AST audit; SemanticGuardian count is 11 not 10 (`semantic_guardian.py:975-1002` — `dynamic_import_chain` was added but CLAUDE.md isn't updated); 20 shipped_code_invariants pins (post-Move 4); only `architectural` tier requires CALL_GRAPH (wider gap than v8 implied); (28.6) **Critical Path to A-Level RSI** — 28.6.1 immediate priorities (highest-leverage, bug-fix-grade effort): #1 Confidence drop SSE producer wiring (2-3 days), #2 PostureObserver task-death detection (3-5 days), #3 Cross-process flock on ledgers (1-2 days) — total 1-2 weeks for all three; expected impact B+ → A− empirical floor; 28.6.2 strategic moves sequenced (Move 5 Hypothesis Probe Loop / Move 6 Generative Quorum / Move 7 Cross-op Semantic Budget); 28.6.3 backlog (Move 8 GENERAL subagent LLM driver / Move 9 Test-shape gaming defense / Move 10 Slice 5b /invariant REPL); (28.7) operator binding refreshed — 3 immediate priorities are next focus area, skip multi-day soak retry, skip ENFORCE-mode graduation; (28.8) UX delta vs CC (3 nice-to-haves: inline confidence drop banner / promote `/dag` REPL to top-level / Slice 5b inline drift signal rendering); (28.9) Reverse Russian Doll alignment after Move 4 — pin count 13→20 (+54%), SSE vocab ~10→57, GET endpoints ~16→24, async observers 1→3 — but Test-shape gaming + Quine-class hallucination remain undefended (Move 6 kills both); (28.10) summary answering operator's question directly: A-level vision + A-level structural foundation + A− execution on cognitive tasks + B+ on edge cases; path to A is 3 immediate fixes + Move 5; path to A+ is above + Move 6 + Move 7. Zero behavior change — doc-only update synthesizing today's verified review. **Move 4 InvariantDriftAuditor closure documented in `memory/project_move_4_closure.md`** — 5-slice arc, 285 new regression tests, 415/415 combined green, ~5,500 net new lines. | Claude Opus 4.7 (post-Move-4 file:line-grounded brutal review v9) |
 | 2026-04-29 | 2.59 | **§26 Brutal Architectural Review v5 — post-Phase-12-DW-Resilience-closure (B+/B− grade defended).** Adds §26 (latest review) covering: (26.1) what soak #7 actually proved + §25 Priorities A–F all CLOSED single-day (mandatory claim density / MetaSensor / HypothesisProbe / postmortem ledger discoverability / shipped-code structural invariants / evidence collector extension) + Phase 12 DW Resilience CLOSED single-day (Pricing Oracle α + Sentinel-Pacemaker Handshake β + Universal Terminal Postmortem E all live in production); (26.2) refined Cognitive & Epistemic Delta — what CC still has that O+V doesn't post-§25 closure (unbounded interactive recursion / speculative execution trees / mid-generation self-critique / streamed reasoning surface / **confidence-aware decisions** / counterfactual reasoning); (26.3) refined Deep Observability — temporal reconstruction is the missing depth (causality DAG / latent-space confidence broadcast / pre-trip circuit-breaker events / parallel fan-out canvas / time-travel debugging UI); (26.4) brutal grade B+/B− defense — happy path A−, edge cases B−; new race conditions enumerated (W2(5) Slice 5b in-flight / `_active_file_ops` heuristic TTL / Slice 1.3 ordinal under L3 fan-out); new Antivenom bypass vectors (plausibly-typed dead code / symbol-shape hallucination / test-shape gaming / Quine-style obfuscation); (26.5) **Critical Path to A-Level RSI — top 3 systemic upgrades**: Priority 1 Confidence-Aware Execution (Probabilistic Posture) — capture provider logprobs as routing signal + circuit-breaker; Priority 2 Causality DAG + Deterministic Replay — promote phase_capture from per-phase Merkle nodes to session-spanning DAG with parent_record_ids + counterfactual_of edges; Priority 3 Adaptive Anti-Venom (unblock Pass C) — gated on W2(5) Slice 5b + Pass B Slice 1; (26.6) **Cost contract structural reinforcement** — three structural reinforcements bulletproofing BG-never-cascades-to-Claude: AST invariant (extends §25 Priority E shipped_code_invariants seed) + runtime structural assertion (CostContractViolation fatal exception in providers.py at dispatch boundary) + Property Oracle claim (extends §25 Priority A default-claim manifest with `cost.bg_op_used_claude_must_be_false` per-op); (26.7) in-flight alignment table + impact-ranked sequencing for next focus; (26.8) explicit non-prescriptions (no soak re-run with master-off / no more sensors / no more phase runners / no brand-new RSI core); (26.9) summary — the path from B+ to A. **Updates §1 Executive Summary** ("Where we stand" refreshed to post-Phase-12-DW-Resilience-closure + soak #7 verification; grade table refreshed: Architecture A, Cognitive depth B+, RSI Gear 2 B, RSI Gear 3 A−, Self-tightening immunity A−, Cost contract enforcement A−, Net B+/B−). Updates TOC with §26 subsection links. **Marks §25 as superseded by §26 (Priorities A–F all closed).** Zero behavior change — doc-only update synthesizing today's architectural review. | Claude Opus 4.7 (post-Phase-12-DW-Resilience-closure architectural review) |
