@@ -456,11 +456,1033 @@ def compute_signature_hash(
         return hashlib.sha256(b"").hexdigest()
 
 
+# ===========================================================================
+# Slice 2 — FailureModeExtractor + persistence
+#
+# Post-VERIFY-failed hook that reads:
+#   * POSTMORTEM evidence_records (root_cause + failed_phase +
+#     next_safe_action + target_files; duck-typed — accepts the
+#     :class:`postmortem_recall.PostmortemRecord` shape OR an
+#     equivalent dict)
+#   * ctx.implementation_plan (schema "plan.1" from
+#     :mod:`plan_generator`; optional)
+#   * diff text (concatenated patch hunks; optional)
+# -> derives a :class:`FailureModeRecord` via chain-of-responsibility
+# pattern matchers. Pure stdlib + ``ast`` — zero LLM calls.
+#
+# Persistence layer is dedup-aware: records sharing a
+# :func:`compute_signature_hash` within ``dedup_window_days()`` are
+# merged (weight++, observed_at_unix updated to most recent) rather
+# than appended. This is the ``min weight=2`` mechanic from PRD
+# §31.4.6 (memory pollution defense).
+# ===========================================================================
+
+
+import json
+import re
+import time
+from pathlib import Path
+
+# Reuse the same flock primitive Slice C ships for the Quorum
+# observer + Move 4 InvariantDriftStore. Same authority floor — no
+# duplication.
+from backend.core.ouroboros.governance.cross_process_jsonl import (
+    flock_append_line,
+    flock_critical_section,
+)
+
+
+# ---------------------------------------------------------------------------
+# Persistence env knobs — clamping discipline mirrors Slice C
+# ---------------------------------------------------------------------------
+
+
+def _read_int_knob(
+    name: str, default: int, floor: int, ceiling: int,
+) -> int:
+    """Bounded integer env-knob read. NEVER raises."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+        if n < floor:
+            return floor
+        if n > ceiling:
+            return ceiling
+        return n
+    except (TypeError, ValueError):
+        return default
+
+
+def history_dir() -> Path:
+    """``JARVIS_FAILURE_MODE_HISTORY_DIR`` — default
+    ``.jarvis/failure_mode_memory``. Same root convention as Move 4
+    InvariantDriftStore + Move 6 Quorum + Coherence."""
+    raw = os.environ.get(
+        "JARVIS_FAILURE_MODE_HISTORY_DIR",
+        ".jarvis/failure_mode_memory",
+    ).strip()
+    return Path(raw or ".jarvis/failure_mode_memory")
+
+
+def history_path() -> Path:
+    """``<history_dir()>/failure_modes.jsonl``."""
+    return history_dir() / "failure_modes.jsonl"
+
+
+def history_max_records() -> int:
+    """``JARVIS_FAILURE_MODE_HISTORY_MAX_RECORDS`` — bounded ring-
+    buffer cap. Default 5000 (~300KB at 60B/record per PRD §31.4.3
+    cost contract). Clamped [50, 100000]."""
+    return _read_int_knob(
+        "JARVIS_FAILURE_MODE_HISTORY_MAX_RECORDS",
+        5000, 50, 100_000,
+    )
+
+
+def dedup_window_days() -> int:
+    """``JARVIS_FAILURE_MODE_DEDUP_WINDOW_DAYS`` — recurrence dedup
+    window. Default 30 (PRD §31.4.6). Records sharing a signature
+    within this window are merged (weight++) instead of appended.
+    Clamped [1, 365]."""
+    return _read_int_knob(
+        "JARVIS_FAILURE_MODE_DEDUP_WINDOW_DAYS",
+        30, 1, 365,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Closed taxonomies for extractor + persistence outcomes
+# ---------------------------------------------------------------------------
+
+
+class ExtractionOutcome(str, enum.Enum):
+    """Closed taxonomy for :func:`extract_failure_mode` results.
+
+    Caller branches on the enum, never on free-form fields. Used
+    by Slice 5 telemetry to emit per-class extraction metrics."""
+
+    OK = "ok"
+    """Both situation_kind and failure_mode_kind classified to
+    closed-enum members; record built."""
+
+    OK_PARTIAL = "ok_partial"
+    """Record built but at least one classifier fell through to
+    a sentinel (UNKNOWN / OTHER). Slice 4's first-attempt
+    injection gates these out via the min-weight rule."""
+
+    DISABLED = "disabled"
+    """Master flag is off — no extraction attempted."""
+
+    REJECTED = "rejected"
+    """Garbage input (None postmortem, no root_cause, etc.)."""
+
+
+class RecordOutcome(str, enum.Enum):
+    """Closed taxonomy for :func:`record_failure_mode` persistence
+    results. Mirrors the SBT / CIGW / Quorum observer pattern."""
+
+    OK_NEW = "ok_new"
+    """New signature appended."""
+
+    OK_DEDUPED = "ok_deduped"
+    """Existing signature within dedup window — weight++ merge."""
+
+    DISABLED = "disabled"
+    """Master flag is off."""
+
+    REJECTED = "rejected"
+    """Garbage input (non-FailureModeRecord)."""
+
+    PERSIST_ERROR = "persist_error"
+    """Disk fault during flock'd append / read."""
+
+    SERIALIZE_ERROR = "serialize_error"
+    """Record's :meth:`to_dict` produced non-JSON-serializable."""
+
+
+# ---------------------------------------------------------------------------
+# PRD §31.4.2 Slice 2 — Pattern matchers (chain-of-responsibility)
+#
+# Each classifier is a pure function returning Optional[Enum]; None
+# signals "no match — pass to next classifier in chain". Final
+# classifier in chain returns the sentinel (UNKNOWN / OTHER).
+#
+# Patterns are derived empirically from real postmortem signatures
+# observed in production debug.log lines and from SemanticGuardian's
+# documented diagnostic vocabulary. No hardcoded literal mapping
+# table — each is a regex-against-real-evidence.
+# ---------------------------------------------------------------------------
+
+
+# SituationKind classifiers --------------------------------------------------
+
+
+_RE_DB_MIGRATION_PATH = re.compile(
+    r"(^|/)migrations?/", re.IGNORECASE,
+)
+_RE_DB_MIGRATION_DDL = re.compile(
+    r"\b(CREATE|ALTER|DROP)\s+(TABLE|INDEX|COLUMN|CONSTRAINT)\b",
+    re.IGNORECASE,
+)
+_RE_ASYNC_TOKEN = re.compile(
+    r"\b(async\s+def|await\s+|asyncio\.|run_until_complete|"
+    r"create_task|gather)\b",
+)
+_RE_TEST_FRAMEWORK = re.compile(
+    r"(^|/)conftest\.py$|@pytest\.fixture|"
+    r"\bunittest\.TestCase\b|\bpytest\.mark\.",
+)
+_RE_API_VERSION_BUMP = re.compile(
+    r"\bversion\s*=\s*['\"]?\d+\.\d+|"
+    r"\b__version__\s*=|"
+    r"\bsetup\.cfg|\bpyproject\.toml|\brequirements.*\.txt",
+)
+
+
+def _classify_db_migration(
+    *, target_files: Tuple[str, ...], diff: str, plan_text: str,
+) -> Optional[SituationKind]:
+    """Match if any target file lives under ``migrations/`` OR diff
+    contains DDL statements OR plan approach mentions migration."""
+    for f in target_files:
+        if _RE_DB_MIGRATION_PATH.search(f):
+            return SituationKind.DB_MIGRATION
+    if _RE_DB_MIGRATION_DDL.search(diff or ""):
+        return SituationKind.DB_MIGRATION
+    if "migration" in (plan_text or "").lower():
+        return SituationKind.DB_MIGRATION
+    return None
+
+
+def _classify_async_restructure(
+    *, target_files: Tuple[str, ...], diff: str, plan_text: str,
+) -> Optional[SituationKind]:
+    """Match if diff has substantive async-keyword changes (>=3
+    occurrences — rules out incidental mentions) or plan explicitly
+    targets async."""
+    if diff:
+        if len(_RE_ASYNC_TOKEN.findall(diff)) >= 3:
+            return SituationKind.ASYNC_RESTRUCTURE
+    if plan_text:
+        lower = plan_text.lower()
+        if "async" in lower and (
+            "restructure" in lower
+            or "migrate" in lower
+            or "convert" in lower
+        ):
+            return SituationKind.ASYNC_RESTRUCTURE
+    return None
+
+
+def _classify_test_framework_integration(
+    *, target_files: Tuple[str, ...], diff: str, plan_text: str,
+) -> Optional[SituationKind]:
+    """Match if a NEW conftest.py is being added OR pytest fixture
+    decorators introduced in an unrelated location."""
+    has_conftest_new = any(
+        f.endswith("conftest.py") for f in target_files
+    )
+    if has_conftest_new and "+++ " in (diff or ""):
+        # New file shape — diff has +++ marker for additions
+        if "@pytest.fixture" in (diff or ""):
+            return SituationKind.NEW_TEST_FRAMEWORK_INTEGRATION
+    if _RE_TEST_FRAMEWORK.search(diff or ""):
+        if "framework" in (plan_text or "").lower():
+            return SituationKind.NEW_TEST_FRAMEWORK_INTEGRATION
+    return None
+
+
+def _classify_api_version_bump(
+    *, target_files: Tuple[str, ...], diff: str, plan_text: str,
+) -> Optional[SituationKind]:
+    """Match if version-related files / tokens dominate the diff."""
+    files_str = " ".join(target_files)
+    if (
+        "pyproject.toml" in files_str
+        or "setup.cfg" in files_str
+        or "requirements" in files_str
+    ):
+        if _RE_API_VERSION_BUMP.search(diff or ""):
+            return SituationKind.API_VERSION_BUMP
+    if plan_text:
+        lower = plan_text.lower()
+        if (
+            "version bump" in lower
+            or "upgrade" in lower
+            or "semver" in lower
+        ):
+            return SituationKind.API_VERSION_BUMP
+    return None
+
+
+def _classify_cross_repo_drift_fix(
+    *, target_files: Tuple[str, ...], diff: str, plan_text: str,
+) -> Optional[SituationKind]:
+    """Match if plan mentions cross-repo drift / sibling repo
+    reconciliation, OR diff path traverses ``..`` (cross-repo)."""
+    if plan_text:
+        lower = plan_text.lower()
+        if (
+            "cross-repo" in lower
+            or "cross repo" in lower
+            or "sibling repo" in lower
+            or "drift" in lower and "repo" in lower
+        ):
+            return SituationKind.CROSS_REPO_DRIFT_FIX
+    for f in target_files:
+        if "../" in f:
+            return SituationKind.CROSS_REPO_DRIFT_FIX
+    return None
+
+
+def _classify_multi_file_refactor(
+    *, target_files: Tuple[str, ...], diff: str, plan_text: str,
+) -> Optional[SituationKind]:
+    """Lowest-priority structural classifier. Match if >=2 source
+    files touched. Runs LAST among situation classifiers because
+    DB_MIGRATION / ASYNC_RESTRUCTURE / etc. are more specific
+    (a multi-file migration should classify as DB_MIGRATION, not
+    MULTI_FILE_REFACTOR)."""
+    py_files = [
+        f for f in target_files
+        if f.endswith(".py") or f.endswith(".pyi")
+    ]
+    if len(py_files) >= 2:
+        return SituationKind.MULTI_FILE_REFACTOR
+    return None
+
+
+# Order is load-bearing — first match wins. Specific BEFORE general.
+_SITUATION_CLASSIFIERS = (
+    _classify_db_migration,
+    _classify_async_restructure,
+    _classify_test_framework_integration,
+    _classify_api_version_bump,
+    _classify_cross_repo_drift_fix,
+    _classify_multi_file_refactor,
+)
+
+
+def _classify_situation(
+    *,
+    target_files: Tuple[str, ...],
+    diff: str,
+    plan_text: str,
+) -> SituationKind:
+    """Walk the chain; first non-None match wins. Returns
+    :attr:`SituationKind.UNKNOWN` if none matched. NEVER raises."""
+    for fn in _SITUATION_CLASSIFIERS:
+        try:
+            result = fn(
+                target_files=target_files,
+                diff=diff,
+                plan_text=plan_text,
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[failure_mode_memory] situation classifier %s "
+                "raised: %s", fn.__name__, exc,
+            )
+            continue
+        if result is not None:
+            return result
+    return SituationKind.UNKNOWN
+
+
+# FailureModeKind classifiers ------------------------------------------------
+
+
+_RE_MISSING_IMPORT = re.compile(
+    r"\b(ImportError|ModuleNotFoundError|"
+    r"NameError.*not defined|undefined name|"
+    r"removed_import_still_referenced)\b",
+    re.IGNORECASE,
+)
+_RE_TYPE_MISMATCH = re.compile(
+    r"\b(TypeError|"
+    r"argument.*has incompatible type|"
+    r"incompatible types|"
+    r"return-type.*not assignable|"
+    r"function_body_collapsed)\b",
+    re.IGNORECASE,
+)
+_RE_ASSERT_INVERTED = re.compile(
+    r"\b(test_assertion_inverted|"
+    r"assert.*inverted|"
+    r"assertion.*flipped)\b",
+    re.IGNORECASE,
+)
+_RE_CIRCULAR_DEP = re.compile(
+    r"\b(circular import|circular dep|"
+    r"cyclic import|import cycle|"
+    r"partially initialized module)\b",
+    re.IGNORECASE,
+)
+_RE_BANNED_TOKEN = re.compile(
+    r"\b(banned[_ ]token|"
+    r"ASCII[_ ]strict[_ ]gate|"
+    r"iron[_ ]gate.*reject|"
+    r"forbidden token)\b",
+    re.IGNORECASE,
+)
+_RE_TEST_TIMEOUT = re.compile(
+    r"\b(pytest.*timeout|"
+    r"timed?[_ ]out.*after|"
+    r"test.*exceeded.*timeout|"
+    r"TimeoutError)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_circular_dep(*, root_cause: str) -> Optional[
+    FailureModeKind
+]:
+    """Circular-dep BEFORE missing-import (a circular import raises
+    ImportError; we want the more specific classification first)."""
+    if _RE_CIRCULAR_DEP.search(root_cause or ""):
+        return FailureModeKind.CIRCULAR_DEP_INTRODUCED
+    return None
+
+
+def _classify_missing_import(*, root_cause: str) -> Optional[
+    FailureModeKind
+]:
+    if _RE_MISSING_IMPORT.search(root_cause or ""):
+        return FailureModeKind.MISSING_IMPORT
+    return None
+
+
+def _classify_type_mismatch(*, root_cause: str) -> Optional[
+    FailureModeKind
+]:
+    if _RE_TYPE_MISMATCH.search(root_cause or ""):
+        return FailureModeKind.TYPE_MISMATCH
+    return None
+
+
+def _classify_assert_inverted(*, root_cause: str) -> Optional[
+    FailureModeKind
+]:
+    if _RE_ASSERT_INVERTED.search(root_cause or ""):
+        return FailureModeKind.ASSERT_INVERTED
+    return None
+
+
+def _classify_banned_token(*, root_cause: str) -> Optional[
+    FailureModeKind
+]:
+    if _RE_BANNED_TOKEN.search(root_cause or ""):
+        return FailureModeKind.BANNED_TOKEN_INTRODUCED
+    return None
+
+
+def _classify_test_timeout(*, root_cause: str) -> Optional[
+    FailureModeKind
+]:
+    if _RE_TEST_TIMEOUT.search(root_cause or ""):
+        return FailureModeKind.TEST_TIMEOUT_REGRESSED
+    return None
+
+
+# Order is load-bearing — circular before missing-import (more
+# specific); banned-token before type-mismatch (Iron Gate banned
+# tokens often manifest as TypeError). First match wins.
+_FAILURE_MODE_CLASSIFIERS = (
+    _classify_circular_dep,
+    _classify_banned_token,
+    _classify_assert_inverted,
+    _classify_test_timeout,
+    _classify_missing_import,
+    _classify_type_mismatch,
+)
+
+
+def _classify_failure_mode(*, root_cause: str) -> FailureModeKind:
+    """Walk the chain; first non-None match wins. Returns
+    :attr:`FailureModeKind.OTHER` if none matched. NEVER raises."""
+    for fn in _FAILURE_MODE_CLASSIFIERS:
+        try:
+            result = fn(root_cause=root_cause)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[failure_mode_memory] failure-mode classifier %s "
+                "raised: %s", fn.__name__, exc,
+            )
+            continue
+        if result is not None:
+            return result
+    return FailureModeKind.OTHER
+
+
+# ---------------------------------------------------------------------------
+# Mitigation derivation — short operator-readable hints per kind
+# ---------------------------------------------------------------------------
+
+
+_MITIGATION_TEMPLATES: Dict[FailureModeKind, str] = {
+    FailureModeKind.MISSING_IMPORT: (
+        "Verify every referenced name has an import in the "
+        "touched file(s). Run a grep for the symbol before "
+        "patching."
+    ),
+    FailureModeKind.TYPE_MISMATCH: (
+        "Read the touched function's signature + return type "
+        "before editing. Match exact dataclass field shape; "
+        "preserve Optional/Union/Protocol types."
+    ),
+    FailureModeKind.ASSERT_INVERTED: (
+        "DO NOT negate assertion polarity. The original "
+        "expectation is correct; fix the implementation, not "
+        "the test."
+    ),
+    FailureModeKind.CIRCULAR_DEP_INTRODUCED: (
+        "Move shared types to a lower-level module. Avoid "
+        "importing siblings from the same package layer."
+    ),
+    FailureModeKind.BANNED_TOKEN_INTRODUCED: (
+        "Use the established async / subprocess-free path. "
+        "Iron Gate banned this pattern for a reason — find "
+        "the existing helper rather than re-introducing the "
+        "primitive."
+    ),
+    FailureModeKind.TEST_TIMEOUT_REGRESSED: (
+        "Profile the slow path before patching. Look for "
+        "added blocking I/O, missing async, or unbounded "
+        "loops introduced by the candidate."
+    ),
+    FailureModeKind.OTHER: (
+        "Read the previous postmortem's root_cause carefully "
+        "before retrying."
+    ),
+}
+
+
+def _derive_mitigation(
+    failure_mode: FailureModeKind,
+    *,
+    next_safe_action: str = "",
+) -> str:
+    """Build the mitigation string. Combines the per-kind template
+    with the postmortem's ``next_safe_action`` when present (latter
+    is operator/system-prescribed; takes precedence as the suffix)."""
+    base = _MITIGATION_TEMPLATES.get(
+        failure_mode, _MITIGATION_TEMPLATES[FailureModeKind.OTHER],
+    )
+    nsa = (next_safe_action or "").strip()
+    if nsa and nsa.lower() != "none":
+        return f"{base} Next-safe-action: {nsa}"
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Attempt-kind extraction — short free-form tag from plan + diff
+# ---------------------------------------------------------------------------
+
+
+_RE_DEF_ADDED = re.compile(r"^\+\s*def\s+(\w+)", re.MULTILINE)
+_RE_CLASS_ADDED = re.compile(
+    r"^\+\s*class\s+(\w+)", re.MULTILINE,
+)
+_RE_DATACLASS_DECORATOR = re.compile(
+    r"^\+\s*@dataclass", re.MULTILINE,
+)
+_RE_ASYNC_DEF_ADDED = re.compile(
+    r"^\+\s*async\s+def\s+(\w+)", re.MULTILINE,
+)
+
+
+def _extract_attempt_kind(
+    *, plan_text: str, diff: str,
+) -> str:
+    """Best-effort short tag for the attempt shape. Falls back to
+    ``"unspecified"`` when nothing matches. Pure pattern-match —
+    no LLM. Returns lowercase short string."""
+    diff = diff or ""
+    plan_lower = (plan_text or "").lower()
+
+    # Most specific first
+    if _RE_DATACLASS_DECORATOR.search(diff):
+        return "add_dataclass"
+    if _RE_ASYNC_DEF_ADDED.search(diff):
+        return "add_async_function"
+    if _RE_CLASS_ADDED.search(diff):
+        return "add_class"
+    if _RE_DEF_ADDED.search(diff):
+        return "add_function"
+
+    # Plan-text hints (less specific)
+    for token, tag in (
+        ("rename", "rename_symbol"),
+        ("inline", "inline_constant"),
+        ("extract", "extract_method"),
+        ("refactor", "refactor"),
+        ("migration", "migration_step"),
+        ("upgrade", "upgrade_dependency"),
+        ("fix", "fix_bug"),
+    ):
+        if token in plan_lower:
+            return tag
+
+    return "unspecified"
+
+
+# ---------------------------------------------------------------------------
+# Postmortem duck-typing — accept PostmortemRecord OR equivalent dict
+# ---------------------------------------------------------------------------
+
+
+def _postmortem_field(postmortem: Any, field: str, default: Any = "") -> Any:  # noqa: E501
+    """Read a postmortem field via getattr (object) OR .get (dict).
+    NEVER raises."""
+    try:
+        if hasattr(postmortem, field):
+            return getattr(postmortem, field)
+        if isinstance(postmortem, dict):
+            return postmortem.get(field, default)
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+    return default
+
+
+def _plan_text_for_classification(plan: Any) -> str:
+    """Flatten the structured plan dict (schema "plan.1") into a
+    text blob for substring matching. Reads ``approach`` +
+    ``risk_factors`` + each change's ``rationale``. Defensive
+    against missing keys / wrong types. NEVER raises."""
+    if plan is None:
+        return ""
+    parts: list = []
+    try:
+        if isinstance(plan, dict):
+            approach = plan.get("approach", "")
+            if isinstance(approach, str):
+                parts.append(approach)
+            risks = plan.get("risk_factors", [])
+            if isinstance(risks, list):
+                for r in risks:
+                    if isinstance(r, str):
+                        parts.append(r)
+            changes = plan.get("changes", [])
+            if isinstance(changes, list):
+                for c in changes:
+                    if isinstance(c, dict):
+                        rat = c.get("rationale", "")
+                        if isinstance(rat, str):
+                            parts.append(rat)
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Public extractor — composes classifiers + mitigation + attempt-kind
+# ---------------------------------------------------------------------------
+
+
+def extract_failure_mode(
+    postmortem: Any,
+    *,
+    plan: Optional[Any] = None,
+    diff: str = "",
+    enabled_override: Optional[bool] = None,
+) -> Tuple[ExtractionOutcome, Optional[FailureModeRecord]]:
+    """Extract a :class:`FailureModeRecord` from a POSTMORTEM
+    payload + optional plan + optional diff.
+
+    Decision tree:
+
+      1. ``enabled_override`` (test fixture) OR
+         :func:`failure_mode_memory_enabled` is False → DISABLED.
+      2. ``postmortem`` lacks both ``op_id`` and ``root_cause`` →
+         REJECTED (no signal worth recording).
+      3. Run situation classifiers (chain-of-responsibility);
+         result UNKNOWN counts as partial.
+      4. Run failure-mode classifiers; result OTHER counts as
+         partial.
+      5. Derive attempt_kind from plan + diff (defaults to
+         ``"unspecified"``).
+      6. Derive mitigation from kind + ``next_safe_action``.
+      7. Compute signature_hash.
+      8. Build :class:`FailureModeRecord` with weight=1 (Slice 2's
+         persistence layer increments on signature match).
+
+    NEVER raises. All failures map to closed
+    :class:`ExtractionOutcome` values."""
+    try:
+        if enabled_override is False:
+            return (ExtractionOutcome.DISABLED, None)
+        if enabled_override is None:
+            if not failure_mode_memory_enabled():
+                return (ExtractionOutcome.DISABLED, None)
+
+        if postmortem is None:
+            return (ExtractionOutcome.REJECTED, None)
+
+        op_id = str(_postmortem_field(postmortem, "op_id", ""))
+        root_cause = str(
+            _postmortem_field(postmortem, "root_cause", ""),
+        )
+        if not op_id and not root_cause:
+            return (ExtractionOutcome.REJECTED, None)
+
+        target_files_raw = _postmortem_field(
+            postmortem, "target_files", (),
+        )
+        if isinstance(target_files_raw, (list, tuple)):
+            target_files = tuple(
+                str(t) for t in target_files_raw if t
+            )
+        else:
+            target_files = ()
+
+        next_safe_action = str(
+            _postmortem_field(postmortem, "next_safe_action", ""),
+        )
+        observed_at = float(
+            _postmortem_field(
+                postmortem, "timestamp_unix",
+                _postmortem_field(
+                    postmortem, "observed_at_unix", time.time(),
+                ),
+            ) or time.time()
+        )
+
+        plan_text = _plan_text_for_classification(plan)
+
+        situation = _classify_situation(
+            target_files=target_files,
+            diff=diff,
+            plan_text=plan_text,
+        )
+        mode = _classify_failure_mode(root_cause=root_cause)
+        attempt = _extract_attempt_kind(
+            plan_text=plan_text, diff=diff,
+        )
+        mitigation = _derive_mitigation(
+            mode, next_safe_action=next_safe_action,
+        )
+        sig = compute_signature_hash(
+            situation_kind=situation,
+            attempted_action_kind=attempt,
+            target_files=target_files,
+        )
+
+        record = FailureModeRecord(
+            signature_hash=sig,
+            situation_kind=situation,
+            attempted_action_kind=attempt,
+            failure_mode_kind=mode,
+            mitigation_summary=mitigation,
+            observed_at_unix=observed_at,
+            op_id=op_id,
+            weight=1,
+        )
+
+        is_partial = (
+            situation is SituationKind.UNKNOWN
+            or mode is FailureModeKind.OTHER
+        )
+        outcome = (
+            ExtractionOutcome.OK_PARTIAL
+            if is_partial
+            else ExtractionOutcome.OK
+        )
+        return (outcome, record)
+    except Exception as exc:  # noqa: BLE001 — last-resort defensive
+        logger.debug(
+            "[failure_mode_memory] extract_failure_mode raised: %s",
+            exc,
+        )
+        return (ExtractionOutcome.REJECTED, None)
+
+
+# ---------------------------------------------------------------------------
+# Persistence — dedup-aware flock'd JSONL store
+# ---------------------------------------------------------------------------
+
+
+def _serialize_record(record: FailureModeRecord) -> Optional[str]:
+    """Render record as one JSONL line. NEVER raises."""
+    try:
+        return json.dumps(
+            record.to_dict(), sort_keys=True, ensure_ascii=True,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.debug(
+            "[failure_mode_memory] serialize: %s", exc,
+        )
+        return None
+
+
+def _read_existing_records(
+    path: Path,
+) -> Tuple[FailureModeRecord, ...]:
+    """Defensively read all records from the JSONL store. Corrupt
+    lines silently dropped. NEVER raises."""
+    if not path.exists():
+        return ()
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            lines = [ln for ln in fh if ln.strip()]
+    except OSError:
+        return ()
+    out: list = []
+    for raw in lines:
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        rec = FailureModeRecord.from_dict(payload)
+        if rec is not None:
+            out.append(rec)
+    return tuple(out)
+
+
+def _within_dedup_window(
+    candidate_ts: float, existing_ts: float, window_days: int,
+) -> bool:
+    """True iff the two timestamps are within ``window_days``
+    days of each other."""
+    if window_days <= 0:
+        return False
+    delta = abs(candidate_ts - existing_ts)
+    return delta <= float(window_days) * 86400.0
+
+
+def record_failure_mode(
+    record: FailureModeRecord,
+    *,
+    enabled_override: Optional[bool] = None,
+    now_ts: Optional[float] = None,
+) -> RecordOutcome:
+    """Persist a :class:`FailureModeRecord` to the bounded JSONL
+    store with dedup-aware merge.
+
+    Decision tree:
+
+      1. Flag check — ``enabled_override`` OR master flag.
+      2. Type check — must be a :class:`FailureModeRecord`.
+      3. Acquire flock'd critical section on the store path.
+      4. Read existing records.
+      5. Find any record sharing the same ``signature_hash`` AND
+         within :func:`dedup_window_days` of the candidate.
+         * If found: replace with merged record (weight++,
+           observed_at_unix = max).
+         * If not: append candidate verbatim.
+      6. Truncate to :func:`history_max_records` ring-buffer cap.
+      7. Atomic-write the truncated payload back.
+
+    Cross-process safe via the :mod:`cross_process_jsonl` flock
+    helper Slice C established. NEVER raises."""
+    try:
+        if enabled_override is False:
+            return RecordOutcome.DISABLED
+        if enabled_override is None:
+            if not failure_mode_memory_enabled():
+                return RecordOutcome.DISABLED
+
+        if not isinstance(record, FailureModeRecord):
+            return RecordOutcome.REJECTED
+
+        line = _serialize_record(record)
+        if line is None:
+            return RecordOutcome.SERIALIZE_ERROR
+
+        path = history_path()
+        # Slice 5 may surface ``now_ts`` for ledger telemetry; today
+        # the dedup decision uses ``record.observed_at_unix`` (the
+        # canonical postmortem timestamp) so ``now_ts`` is consumed
+        # only when the caller passes it for synthetic-time tests.
+        _now_ts = now_ts if now_ts is not None else time.time()
+        del _now_ts  # explicitly unused in Slice 2; reserved for Slice 5
+        window = dedup_window_days()
+        cap = history_max_records()
+
+        with flock_critical_section(path) as acquired:
+            if not acquired:
+                # Best-effort fallback — fire a non-locked append
+                # rather than dropping the record entirely.
+                ok = flock_append_line(path, line)
+                return (
+                    RecordOutcome.OK_NEW if ok
+                    else RecordOutcome.PERSIST_ERROR
+                )
+            existing = _read_existing_records(path)
+            merged_records: list = []
+            deduped = False
+            for old in existing:
+                if (
+                    old.signature_hash == record.signature_hash
+                    and _within_dedup_window(
+                        record.observed_at_unix,
+                        old.observed_at_unix,
+                        window,
+                    )
+                ):
+                    if not deduped:
+                        merged_records.append(
+                            FailureModeRecord(
+                                signature_hash=old.signature_hash,
+                                situation_kind=old.situation_kind,
+                                attempted_action_kind=(
+                                    old.attempted_action_kind
+                                ),
+                                failure_mode_kind=(
+                                    old.failure_mode_kind
+                                ),
+                                mitigation_summary=(
+                                    record.mitigation_summary
+                                    or old.mitigation_summary
+                                ),
+                                observed_at_unix=max(
+                                    old.observed_at_unix,
+                                    record.observed_at_unix,
+                                ),
+                                op_id=record.op_id or old.op_id,
+                                weight=(
+                                    int(old.weight)
+                                    + int(record.weight)
+                                ),
+                            )
+                        )
+                        deduped = True
+                    else:
+                        # Already merged once; preserve any other
+                        # records sharing the signature outside the
+                        # window unchanged. (If multiple in-window
+                        # records exist, treat first as canonical.)
+                        merged_records.append(old)
+                else:
+                    merged_records.append(old)
+
+            if not deduped:
+                merged_records.append(record)
+
+            # Ring-buffer truncate. Keep most-recent by
+            # observed_at_unix.
+            merged_records.sort(
+                key=lambda r: r.observed_at_unix,
+            )
+            if len(merged_records) > cap:
+                merged_records = merged_records[-cap:]
+
+            try:
+                payload = "\n".join(
+                    _serialize_record(r) or ""
+                    for r in merged_records
+                )
+                if payload:
+                    payload = payload + "\n"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                    fh.flush()
+            except OSError as exc:
+                logger.debug(
+                    "[failure_mode_memory] write failed: %s", exc,
+                )
+                return RecordOutcome.PERSIST_ERROR
+
+        return (
+            RecordOutcome.OK_DEDUPED if deduped
+            else RecordOutcome.OK_NEW
+        )
+    except Exception as exc:  # noqa: BLE001 — last-resort defensive
+        logger.debug(
+            "[failure_mode_memory] record_failure_mode raised: %s",
+            exc,
+        )
+        return RecordOutcome.PERSIST_ERROR
+
+
+def read_failure_mode_history(
+    *,
+    limit: Optional[int] = None,
+    since_unix: float = 0.0,
+) -> Tuple[FailureModeRecord, ...]:
+    """Read records from the store, sorted ascending by
+    ``observed_at_unix``, optionally filtered to those at or after
+    ``since_unix``, with a tail-clamp at ``limit`` (default
+    :func:`history_max_records`). NEVER raises."""
+    try:
+        path = history_path()
+        records = _read_existing_records(path)
+        if not records:
+            return ()
+        cap_max = history_max_records()
+        cap = (
+            int(limit) if limit is not None else cap_max
+        )
+        cap = max(0, min(cap, cap_max))
+        if cap == 0:
+            return ()
+        filtered = [
+            r for r in records
+            if r.observed_at_unix >= float(since_unix or 0.0)
+        ]
+        filtered.sort(key=lambda r: r.observed_at_unix)
+        if cap < len(filtered):
+            filtered = filtered[-cap:]
+        return tuple(filtered)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[failure_mode_memory] read_failure_mode_history "
+            "raised: %s", exc,
+        )
+        return ()
+
+
+# ---------------------------------------------------------------------------
+# Convenience composer — extract + record in one call
+# ---------------------------------------------------------------------------
+
+
+def record_postmortem(
+    postmortem: Any,
+    *,
+    plan: Optional[Any] = None,
+    diff: str = "",
+    enabled_override: Optional[bool] = None,
+    now_ts: Optional[float] = None,
+) -> Tuple[ExtractionOutcome, RecordOutcome]:
+    """Compose :func:`extract_failure_mode` + :func:`record_failure_mode`
+    in one call. Caller passes the POSTMORTEM evidence + optional
+    plan + diff; returns both outcomes for visibility.
+
+    NEVER raises."""
+    extraction, record = extract_failure_mode(
+        postmortem,
+        plan=plan,
+        diff=diff,
+        enabled_override=enabled_override,
+    )
+    if record is None:
+        return (extraction, RecordOutcome.REJECTED)
+    persist = record_failure_mode(
+        record,
+        enabled_override=enabled_override,
+        now_ts=now_ts,
+    )
+    return (extraction, persist)
+
+
 __all__ = [
     "FAILURE_MODE_MEMORY_SCHEMA_VERSION",
+    "ExtractionOutcome",
     "FailureModeKind",
     "FailureModeRecord",
+    "RecordOutcome",
     "SituationKind",
     "compute_signature_hash",
+    "dedup_window_days",
+    "extract_failure_mode",
     "failure_mode_memory_enabled",
+    "history_dir",
+    "history_max_records",
+    "history_path",
+    "read_failure_mode_history",
+    "record_failure_mode",
+    "record_postmortem",
 ]

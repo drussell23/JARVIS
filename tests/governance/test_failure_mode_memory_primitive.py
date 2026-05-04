@@ -613,27 +613,53 @@ class TestAuthorityInvariants:
 
 
 class TestPublicExports:
-    def test_all_lists_six_public_names(self):
+    def test_all_lists_slice_1_and_slice_2_public_names(self):
+        """Slice 1 surface (6 names) + Slice 2 surface (10 names) =
+        16 public exports. Future slices append; never remove."""
         from backend.core.ouroboros.governance import failure_mode_memory  # noqa: E501
-        assert sorted(failure_mode_memory.__all__) == sorted([
+        expected = sorted([
+            # Slice 1 — primitive
             "FAILURE_MODE_MEMORY_SCHEMA_VERSION",
             "FailureModeKind",
             "FailureModeRecord",
             "SituationKind",
             "compute_signature_hash",
             "failure_mode_memory_enabled",
+            # Slice 2 — extractor + persistence
+            "ExtractionOutcome",
+            "RecordOutcome",
+            "dedup_window_days",
+            "extract_failure_mode",
+            "history_dir",
+            "history_max_records",
+            "history_path",
+            "read_failure_mode_history",
+            "record_failure_mode",
+            "record_postmortem",
         ])
+        assert sorted(failure_mode_memory.__all__) == expected
 
     def test_helpers_are_underscore_prefixed(self):
-        """Internal helpers (_situation_kind_from_value /
-        _failure_mode_kind_from_value / _canonicalize_target_files)
-        are NOT in __all__ — they're implementation, not API."""
+        """Internal helpers are NOT in __all__ — they're
+        implementation, not API. Slice 2 adds more internal
+        helpers (classifiers, mitigation derivation, etc.) — pin
+        a representative set."""
         from backend.core.ouroboros.governance import failure_mode_memory  # noqa: E501
         for name in (
+            # Slice 1
             "_situation_kind_from_value",
             "_failure_mode_kind_from_value",
             "_canonicalize_target_files",
+            # Slice 2
+            "_classify_situation",
+            "_classify_failure_mode",
+            "_extract_attempt_kind",
+            "_derive_mitigation",
+            "_serialize_record",
+            "_read_existing_records",
+            "_within_dedup_window",
+            "_postmortem_field",
+            "_plan_text_for_classification",
         ):
             assert name not in failure_mode_memory.__all__
-            # But they exist as attributes (callable from tests).
             assert hasattr(failure_mode_memory, name)
