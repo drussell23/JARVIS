@@ -488,6 +488,61 @@ class BattleTestHarness:
     async def run(self) -> None:
         """Main lifecycle method: boot, wait for stop signal, shutdown, report."""
         self._started_at = time.time()
+
+        # Asyncio loop-level exception handler — global safety net for
+        # the entire session lifetime (2026-05-03 audit). Replaces both
+        # asyncio's default handler (which formats with no message,
+        # producing the "Unhandled exception in event loop" stderr noise
+        # that bypasses patch_stdout) AND prompt_toolkit's handler
+        # (which prints + blocks on "Press ENTER to continue...").
+        #
+        # Architectural intent: 182+ ensure_future/create_task spawn
+        # sites exist across the repo. Per-callsite add_done_callback
+        # consumers (Defect #4 pattern) remain best-practice but
+        # cannot scale to every callsite without ongoing audit churn.
+        # The loop handler is the structural safety net — every leaked
+        # exception lands in debug.log with full classification, no
+        # terminal pollution, no operator-visible chatter. Per-callsite
+        # callbacks remain valuable as DEBUG-classified swallowers
+        # (silent on expected patterns); this handler catches the rest.
+        #
+        # Reuses _EXPECTED_BACKGROUND_EXC_PATTERNS from candidate_generator
+        # for classification — single source of truth.
+        try:
+            from backend.core.ouroboros.governance.candidate_generator import (
+                _EXPECTED_BACKGROUND_EXC_PATTERNS,
+            )
+        except Exception:
+            _EXPECTED_BACKGROUND_EXC_PATTERNS = ()
+        _async_leak_logger = logging.getLogger("asyncio.leak")
+        _running_loop = asyncio.get_event_loop()
+
+        def _harness_loop_exception_handler(loop_, ctx_):
+            msg = ctx_.get("message", "Unhandled exception in event loop")
+            exc = ctx_.get("exception")
+            extras = " | ".join(
+                f"{k}={ctx_[k]!r}"
+                for k in sorted(ctx_)
+                if k not in ("message", "exception")
+            )
+            full = f"[asyncio leak] {msg}" + (f" | {extras}" if extras else "")
+            if exc is None:
+                _async_leak_logger.warning(full)
+                return
+            if isinstance(exc, asyncio.CancelledError):
+                _async_leak_logger.debug(full, exc_info=exc)
+                return
+            err_str = str(exc)
+            if any(p in err_str for p in _EXPECTED_BACKGROUND_EXC_PATTERNS):
+                _async_leak_logger.debug(full, exc_info=exc)
+                return
+            _async_leak_logger.warning(full, exc_info=exc)
+
+        try:
+            _running_loop.set_exception_handler(_harness_loop_exception_handler)
+        except Exception:
+            logger.debug("Failed to install harness asyncio exception handler", exc_info=True)
+
         # Create events inside the running loop (Python 3.9 compat)
         self._shutdown_event = asyncio.Event()
         self._cost_tracker.budget_event = asyncio.Event()
