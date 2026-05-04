@@ -4177,6 +4177,43 @@ class SerpentREPL:
                         rest = line.split(None, 1)[1].strip()
                         self._print_auto_action(arg=rest)
                         continue
+                    # Slice 5b E — observability REPL surfaces.
+                    # Each verb consumes the SAME readers as its
+                    # /observability/<verb> HTTP route via the
+                    # dispatch_<verb>_command function in its
+                    # corresponding *_repl.py module.
+                    if line in ("probe", "/probe") or (
+                        line.startswith("probe ")
+                        or line.startswith("/probe ")
+                    ):
+                        self._print_observability_verb(
+                            line, "probe",
+                        )
+                        continue
+                    if line in ("coherence", "/coherence") or (
+                        line.startswith("coherence ")
+                        or line.startswith("/coherence ")
+                    ):
+                        self._print_observability_verb(
+                            line, "coherence",
+                        )
+                        continue
+                    if line in ("quorum", "/quorum") or (
+                        line.startswith("quorum ")
+                        or line.startswith("/quorum ")
+                    ):
+                        self._print_observability_verb(
+                            line, "quorum",
+                        )
+                        continue
+                    if line in (
+                        "postmortems", "/postmortems",
+                    ) or (
+                        line.startswith("postmortems ")
+                        or line.startswith("/postmortems ")
+                    ):
+                        self._print_postmortems(line)
+                        continue
                     if line in ("help", "/help"):
                         self._print_help()
                         continue
@@ -4681,6 +4718,82 @@ class SerpentREPL:
         )
         f.console.print(f"      [dim]{evidence}[/dim]")
 
+    def _print_observability_verb(
+        self, line: str, name: str,
+    ) -> None:
+        """Slice 5b E — generic observability REPL surface.
+
+        Routes ``line`` to the corresponding ``dispatch_<name>_-
+        command`` function in the ``<name>_repl`` module. The
+        dispatcher returns a frozen ``*DispatchResult`` whose
+        ``text`` field is plain-text already formatted; we print
+        with ``highlight=False`` so Rich does not auto-color the
+        operator's content.
+
+        Single helper instead of N near-identical wrappers — the
+        only thing that varies between probe / coherence / quorum
+        is the dispatcher import. NEVER raises out of this method;
+        any failure renders a one-line dim notice."""
+        f = self._flow
+        f.console.print()
+        try:
+            if name == "probe":
+                from backend.core.ouroboros.governance.probe_repl import (  # noqa: E501
+                    dispatch_probe_command as _dispatch,
+                )
+            elif name == "coherence":
+                from backend.core.ouroboros.governance.coherence_repl import (  # noqa: E501
+                    dispatch_coherence_command as _dispatch,
+                )
+            elif name == "quorum":
+                from backend.core.ouroboros.governance.quorum_repl import (  # noqa: E501
+                    dispatch_quorum_command as _dispatch,
+                )
+            else:
+                f.console.print(
+                    f"[dim]/{name} surface unknown[/dim]"
+                )
+                f.console.print()
+                return
+            result = _dispatch(line)
+            if not result.matched:
+                f.console.print(
+                    f"[dim]/{name}: not a {name} command[/dim]"
+                )
+            else:
+                f.console.print(result.text, highlight=False)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            f.console.print(
+                f"[dim]/{name} surface unavailable: "
+                f"{type(exc).__name__}[/dim]"
+            )
+        f.console.print()
+
+    def _print_postmortems(self, line: str) -> None:
+        """Slice 5b E — ``/postmortems`` REPL surface.
+
+        Wraps the existing ``dispatch_postmortems_command``
+        (Priority #2 graduated). NEVER raises."""
+        f = self._flow
+        f.console.print()
+        try:
+            from backend.core.ouroboros.governance.postmortem_observability import (  # noqa: E501
+                dispatch_postmortems_command,
+            )
+            # dispatch_postmortems_command expects argv (list of
+            # tokens AFTER the verb name), unlike the probe/cohe-
+            # rence/quorum dispatchers that take the full line.
+            tokens = line.strip().split()
+            argv = tokens[1:] if len(tokens) > 1 else []
+            result = dispatch_postmortems_command(argv)
+            f.console.print(result.rendered_text, highlight=False)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            f.console.print(
+                f"[dim]/postmortems surface unavailable: "
+                f"{type(exc).__name__}[/dim]"
+            )
+        f.console.print()
+
     def _print_help(self) -> None:
         """Print available REPL commands."""
         lines = [
@@ -4688,6 +4801,10 @@ class SerpentREPL:
             f"  [{_C['dim']}]/cost[/{_C['dim']}]             cost breakdown by route",
             f"  [{_C['dim']}]/posture[/{_C['dim']}]          current strategic posture",
             f"  [{_C['dim']}]/auto-action[/{_C['dim']}]      recent advisory proposals (stats|<op_id>)",
+            f"  [{_C['dim']}]/probe[/{_C['dim']}]            confidence-probe loop status (Move 5)",
+            f"  [{_C['dim']}]/coherence[/{_C['dim']}]        coherence-auditor flags + audits (Priority #1)",
+            f"  [{_C['dim']}]/quorum[/{_C['dim']}]           generative-quorum status + history (Move 6)",
+            f"  [{_C['dim']}]/postmortems[/{_C['dim']}]      recent postmortems + DAG (Priority #2)",
             f"  [{_C['dim']}]/lessons[/{_C['dim']}]          show session lesson buffer",
             f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]       cancel an in-flight operation",
             f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]      set risk ceiling",

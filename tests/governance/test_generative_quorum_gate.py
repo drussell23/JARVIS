@@ -103,9 +103,11 @@ def make_verdict(outcome: ConsensusOutcome) -> ConsensusVerdict:
 
 class TestQuorumGateEnabledKnob:
     def test_default_is_true_post_graduation(self):
-        """Slice 5 graduated 2026-05-01 — sub-gate now defaults
-        true. Master flag (``JARVIS_GENERATIVE_QUORUM_ENABLED``)
-        remains operator-controlled (default false)."""
+        """Slice 5 graduated 2026-05-01 — sub-gate defaults true.
+        Master flag (``JARVIS_GENERATIVE_QUORUM_ENABLED``)
+        graduated default-TRUE on 2026-05-02 (Q4 Priority #1) —
+        both gates default-on; either can be flipped to false
+        for independent instant-revert."""
         os.environ.pop("JARVIS_QUORUM_GATE_ENABLED", None)
         assert quorum_gate_enabled() is True
 

@@ -1129,6 +1129,40 @@ def publish_terminal_postmortem_persisted(
 
 
 # ---------------------------------------------------------------------------
+# Slice 5b E — /help auto-discovery
+# ---------------------------------------------------------------------------
+
+
+def register_verbs(registry: Any) -> int:
+    """Register the ``/postmortems`` verb. Auto-discovered by
+    :func:`help_dispatcher._discover_module_provided_verbs`.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.help_dispatcher import (
+            VerbSpec,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    try:
+        registry.register(VerbSpec(
+            name="/postmortems",
+            one_line=(
+                "Recent postmortems, distributions, and "
+                "causality DAG navigation (Priority #2)."
+            ),
+            category="observability",
+            help_text=render_help(),
+        ))
+        return 1
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[postmortem_observability] register_verbs swallowed",
+            exc_info=True,
+        )
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1148,6 +1182,7 @@ __all__ = [
     "postmortem_observability_enabled",
     "publish_terminal_postmortem_persisted",
     "register_postmortem_routes",
+    "register_verbs",
     "render_distribution",
     "render_help",
     "render_postmortem_detail",

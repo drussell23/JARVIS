@@ -2,11 +2,19 @@
 
 Coverage:
 
-  * **Master flag default-FALSE** — ``JARVIS_GENERATIVE_QUORUM_
-    ENABLED`` deliberately remains operator-controlled
-    (cost-correct: K× generation cost ramp is opt-in).
+  * **Master flag default-TRUE post Q4 Priority #1 graduation
+    (2026-05-02)** — ``JARVIS_GENERATIVE_QUORUM_ENABLED``
+    operator-authorized after empirical verification that the
+    K× generation cost is structurally bounded by three downstream
+    gates: (a) ``JARVIS_QUORUM_GATE_ENABLED`` sub-gate,
+    (b) risk-tier filter (APPROVAL_REQUIRED+ only),
+    (c) ``COST_GATED_ROUTES`` frozenset excluding
+    BACKGROUND/SPECULATIVE. End-to-end coverage in
+    :class:`TestEndToEndMove6Mechanism` proves the three-gate
+    contract holds under master-on. Operator may instant-revert
+    via explicit env false.
   * **Sub-gate flag default-TRUE** — graduated. Operator may
-    revert via explicit env false.
+    revert via explicit env false (independent kill switch).
   * **Asymmetric env semantics** — empty/whitespace = unset =
     current default; explicit ``0``/``false``/``no``/``off``
     hot-reverts; truthy variants flip on.
@@ -40,16 +48,30 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# 1. Master flag — DELIBERATELY default-false (operator-controlled)
+# 1. Master flag — graduated default-TRUE (Q4 Priority #1, 2026-05-02)
 # ---------------------------------------------------------------------------
 
 
-class TestMasterFlagDefaultFalse:
-    """Slice 5 graduates the OBSERVABILITY surfaces but keeps the
-    master flag default-false. Rationale: Quorum incurs K× generation
-    cost on every APPROVAL_REQUIRED+ op — this is an explicit operator
-    decision, not an autonomous default. Mirrors the
-    JARVIS_PLAN_APPROVAL_MODE pattern."""
+class TestMasterFlagDefaultTrue:
+    """Slice 5 graduated the OBSERVABILITY surfaces (2026-05-01).
+    Master flag was subsequently graduated default-TRUE on
+    2026-05-02 (Q4 Priority #1) after empirical verification that
+    the K× generation cost is structurally bounded by three
+    downstream gates rather than an opt-in flag:
+
+      1. ``JARVIS_QUORUM_GATE_ENABLED`` sub-gate (independent
+         operator kill switch)
+      2. Risk-tier filter — Quorum invokes only on
+         ``APPROVAL_REQUIRED+`` ops (the operator-review-required
+         tier where the K× audit value is highest)
+      3. ``COST_GATED_ROUTES`` frozenset structurally excludes
+         BACKGROUND / SPECULATIVE routes — pinned by AST invariant
+         ``quorum_gate_consumes_cost_gated_routes``
+
+    End-to-end three-gate cost-contract coverage lives in
+    :class:`TestEndToEndMove6Mechanism` (BG-route master-on still
+    fires zero rolls). Operator instant-revert remains hot via
+    explicit env false on either master or sub-gate."""
 
     def test_master_default_is_true_post_q4_graduation(self):
         # Q4 Priority #1 graduation (2026-05-02): operator

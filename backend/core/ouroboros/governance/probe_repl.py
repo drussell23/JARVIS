@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 import shlex
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List
 
 from backend.core.ouroboros.governance.verification.confidence_probe_bridge import (  # noqa: E501
     CONFIDENCE_PROBE_BRIDGE_SCHEMA_VERSION,
