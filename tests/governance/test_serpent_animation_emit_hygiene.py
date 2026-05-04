@@ -273,25 +273,54 @@ class TestStartTimeResetAfterStop:
 
 
 class TestElapsedClamp:
+    def test_clamp_formula_positive_overflow(self):
+        # Replicates the clamp from stop():
+        # elapsed = max(0.0, min(elapsed_raw, 86400.0))
+        raw = 100000.0  # > 24h, simulates stale state
+        clamped = max(0.0, min(raw, 86400.0))
+        assert clamped == 86400.0
+
+    def test_clamp_formula_normal_value_passthrough(self):
+        raw = 42.5  # normal op duration
+        clamped = max(0.0, min(raw, 86400.0))
+        assert clamped == 42.5
+
+    def test_clamp_formula_negative_floored(self):
+        raw = -5.0  # would happen if monotonic clock went backwards
+        clamped = max(0.0, min(raw, 86400.0))
+        assert clamped == 0.0
+
+    def test_clamp_formula_at_boundary(self):
+        raw = 86400.0  # exactly 24h
+        clamped = max(0.0, min(raw, 86400.0))
+        assert clamped == 86400.0
+
     @pytest.mark.asyncio
-    async def test_stale_start_time_clamped(
+    async def test_stop_with_mocked_clock_clamps_emit(
         self, monkeypatch: pytest.MonkeyPatch, capsys,
     ):
+        # Integration: simulate stale state via monkeypatched
+        # time.monotonic returning a value far ahead of _start_time.
+        # _start_time stays positive (passes guard); elapsed_raw is
+        # huge; emit shows clamped 86400.0s.
         monkeypatch.setattr(sa, "_ENABLED", True)
         sa._SUPPRESSED = False
         s = sa.OuroborosSerpent()
-        # Simulate stale state: _start_time set to a very old value
-        # (e.g., process started 7 days ago, this state leaked)
-        s._start_time = time.monotonic() - (8 * 86400)  # 8 days ago
+        s._start_time = 1.0  # small positive — passes guard
         s._running = True
+        # Patch time.monotonic INSIDE serpent_animation to simulate
+        # a clock 8 days ahead
+        monkeypatch.setattr(sa.time, "monotonic", lambda: 8 * 86400)
         await s.stop(success=False)
         captured = capsys.readouterr().err
         import re
         m = re.search(r"in (\d+\.\d+)s", captured)
-        assert m is not None
+        assert m is not None, (
+            f"Expected emit with elapsed time; captured: {captured!r}"
+        )
         elapsed = float(m.group(1))
-        # Clamped to 24h max
-        assert elapsed <= 86400.0
+        # Clamped to 24h max — even though raw diff would be ~8d
+        assert elapsed == 86400.0
 
 
 # ---------------------------------------------------------------------------

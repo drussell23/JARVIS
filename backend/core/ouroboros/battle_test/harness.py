@@ -1093,10 +1093,43 @@ class BattleTestHarness:
                     repo_path=self._config.repo_path,
                 )
                 self._serpent_flow.set_plan_review_mode(self._plan_before_execute)
-                _serpent_transport = SerpentTransport(flow=self._serpent_flow)
+
+                # CC1 — operator-selectable per-op rendering. Default
+                # CLAUDE: terse one-line-per-op idiom matching Claude
+                # Code's tool-call visual model. Hot-revert via
+                # JARVIS_RENDER_MODE=SERPENT restores the legacy
+                # multi-line per-op blocks.
+                _render_mode_label = "serpent"
+                _chosen_transport: Any = None
+                try:
+                    from backend.core.ouroboros.governance.claude_style_transport import (  # noqa: E501
+                        ClaudeStyleTransport,
+                        RenderMode,
+                        resolve_render_mode,
+                    )
+                    if resolve_render_mode() is RenderMode.CLAUDE:
+                        _chosen_transport = ClaudeStyleTransport(
+                            console=self._serpent_flow.console,
+                        )
+                        _render_mode_label = "claude"
+                except Exception as _crm_exc:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[harness] claude_style_transport selection "
+                        "failed: %s — falling back to SerpentTransport",
+                        _crm_exc,
+                    )
+                if _chosen_transport is None:
+                    _chosen_transport = SerpentTransport(flow=self._serpent_flow)
+                    _render_mode_label = "serpent"
+
                 if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
-                    self._governance_stack.comm._transports.append(_serpent_transport)
-                    logger.info("SerpentFlow wired (flowing organism CLI)")
+                    self._governance_stack.comm._transports.append(
+                        _chosen_transport,
+                    )
+                    logger.info(
+                        "Per-op transport wired (mode=%s)",
+                        _render_mode_label,
+                    )
                 # Suppress raw stdout streaming — SerpentFlow handles it via CommProtocol
                 try:
                     from backend.core.ouroboros.governance.serpent_animation import suppress as _suppress_serpent

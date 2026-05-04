@@ -356,19 +356,28 @@ def fu5_pins() -> list:
 
 
 class TestProducerDefaultPins:
-    def test_four_pins_present(self, fu5_pins):
-        assert len(fu5_pins) == 4
+    def test_followup_5_original_four_pins_present(self, fu5_pins):
+        # fu#5 shipped 4 graduation pins. Future arc work (D5, etc.)
+        # adds more "default_true" pins to the same register_-
+        # shipped_invariants. Assert the original 4 are still present;
+        # use >= for total count to remain forward-compatible.
+        assert len(fu5_pins) >= 4
         names = {i.invariant_name for i in fu5_pins}
-        assert names == {
+        for expected in (
             "render_primitives_reasoning_stream_default_true",
             "key_input_input_controller_default_true",
             "render_thread_thread_observer_default_true",
             "render_help_contextual_help_default_true",
-        }
+        ):
+            assert expected in names
 
     def test_each_pin_clean_against_real_source(self, fu5_pins):
         import ast
         import inspect
+        # Map pin names to their target modules. Unknown pins
+        # (added in future slices) are skipped — the per-pin AST
+        # validation is owned by the slice that added the pin, not
+        # this followups spine.
         for pin in fu5_pins:
             target_module: Any = None
             if "reasoning_stream" in pin.invariant_name:
@@ -379,6 +388,10 @@ class TestProducerDefaultPins:
                 target_module = rt
             elif "contextual_help" in pin.invariant_name:
                 target_module = rh
+            else:
+                # Unknown pin (e.g. D5's emit_tier / composer
+                # graduations) — owned + tested by its own slice.
+                continue
             src = inspect.getsource(target_module)
             tree = ast.parse(src)
             assert pin.validate(tree, src) == (), (

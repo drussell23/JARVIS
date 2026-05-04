@@ -1198,10 +1198,22 @@ class SerpentFlow:
             f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
             if prov else ""
         )
-        self._op_line(
-            op_id,
-            f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}]{via_str}",
-        )
+        # D3 emit-tier wire: TERTIARY only. The "synthesizing" tick is
+        # a per-stream-start status indicator that adds noise at
+        # default density. The bottom_toolbar spinner already shows
+        # streaming state; this line is redundant for NORMAL operators.
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            _emit_synthesizing = should_emit("show_streaming_start")
+        except Exception:  # noqa: BLE001 — defensive
+            _emit_synthesizing = True  # gate failure → emit
+        if _emit_synthesizing:
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}]{via_str}",
+            )
 
         # Refactored 2026-05-03: drive the prompt_toolkit
         # bottom_toolbar via _spinner_state. No Rich.Live, no
@@ -1386,7 +1398,18 @@ class SerpentFlow:
                 f"[{_C['neural']}]🗺️  planned[/{_C['neural']}]   {detail}",
             )
         else:
-            # Plan phase starting
+            # Plan phase starting — D3 emit-tier wire: TERTIARY only.
+            # The "reasoning about implementation strategy..." line is
+            # internal model thinking; operators at NORMAL density
+            # don't need to see it per op.
+            try:
+                from backend.core.ouroboros.governance.render_emit_tier import (
+                    should_emit,
+                )
+                if not should_emit("_render_plan_phase"):
+                    return
+            except Exception:  # noqa: BLE001 — defensive
+                pass  # gate failure → emit (default-visible)
             self._op_line(
                 op_id,
                 f"[{_C['neural']}]🗺️  planning[/{_C['neural']}]  "
@@ -1492,8 +1515,27 @@ class SerpentFlow:
     # ── Provider routing ──────────────────────────────────────
 
     def op_provider(self, op_id: str, provider: str) -> None:
-        """Provider was selected for this operation."""
+        """Provider was selected for this operation.
+
+        D3 emit-tier wire: this method is TERTIARY (deep-debug only).
+        At default density (NORMAL), the line is suppressed because
+        ``set_op_route`` already emits the route info — this would
+        be a redundant ``⚡ routing`` tick. The provider mapping is
+        still tracked in ``self._op_providers`` regardless of
+        visibility (that state is consumed by ``op_completed``)."""
+        # State tracking: always update the providers dict — downstream
+        # callers depend on it for the resolution receipt.
         self._op_providers[op_id] = provider
+        # Visibility gate: skip the emit when tier-gating is on and
+        # this method's tier is hidden at the current density.
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            if not should_emit("op_provider"):
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass  # gate failure → emit (default-visible)
         prov = _prov(provider)
         self._op_line(
             op_id,
@@ -2352,7 +2394,37 @@ class SerpentFlow:
     # ══════════════════════════════════════════════════════════
 
     def update_intent_discovery(self, cycle: int, submitted: int) -> None:
-        """IntentDiscoverySensor found something."""
+        """IntentDiscoverySensor found something.
+
+        D4 wire: when StatusLineComposer is registered + enabled,
+        feed the composed status line via update_field() instead of
+        emitting a separate console line. Falls back to legacy
+        console.print when composer is unavailable (defensive)."""
+        # D4 composer feed — tries composer first; falls back to
+        # legacy emit if composer not registered or disabled.
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+                get_status_line_composer,
+            )
+            if get_status_line_composer() is not None:
+                update_field(
+                    StatusField.INTENT_DISCOVERY,
+                    {"cycle": cycle, "submitted": submitted},
+                )
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        # Legacy direct emit (fallback when composer not wired)
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            if not should_emit("update_intent_discovery"):
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         self.console.print(
             f"  [{_C['neural']}]🧬 discovery[/{_C['neural']}]  "
             f"cycle {cycle} — {submitted} intent{'s' if submitted != 1 else ''} submitted",
@@ -2361,6 +2433,28 @@ class SerpentFlow:
 
     def update_dream_engine(self, blueprints: int, title: str = "") -> None:
         """DreamEngine produced a blueprint."""
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+                get_status_line_composer,
+            )
+            if get_status_line_composer() is not None:
+                update_field(
+                    StatusField.DREAM_ENGINE,
+                    {"blueprints": blueprints, "title": title},
+                )
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            if not should_emit("update_dream_engine"):
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         title_str = f'  "{title[:40]}"' if title else ""
         self.console.print(
             f"  [{_C['neural']}]💭 dreaming[/{_C['neural']}]   "
@@ -2370,6 +2464,28 @@ class SerpentFlow:
 
     def update_learning(self, rules: int, trend: str = "→") -> None:
         """Learning consolidation update."""
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+                get_status_line_composer,
+            )
+            if get_status_line_composer() is not None:
+                update_field(
+                    StatusField.LEARNING,
+                    {"rules": rules, "trend": trend},
+                )
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            if not should_emit("update_learning"):
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         self.console.print(
             f"  [{_C['neural']}]📖 learning[/{_C['neural']}]   "
             f"{rules} rules consolidated  trend: {trend}",
@@ -2435,8 +2551,20 @@ class SerpentFlow:
     def update_cost(
         self, total: float, remaining: float, breakdown: Dict[str, float],
     ) -> None:
-        """Cost tick — shown periodically between operations."""
+        """Cost tick — shown periodically between operations.
+
+        D4 wire: feed the composer (state-only update; no separate
+        emit). State attr ``self._cost_total`` preserved for any
+        downstream consumers that read it directly."""
         self._cost_total = total
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+            )
+            update_field(StatusField.COST, total)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     def set_op_route(
         self,
@@ -2532,12 +2660,32 @@ class SerpentFlow:
         self._plan_review_mode = enabled
 
     def update_sensors(self, count: int) -> None:
-        """Update active sensor count (tracked for status bar)."""
+        """Update active sensor count (tracked for status bar).
+
+        D4 wire: feed the composer alongside state-only update."""
         self._sensors_active = count
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+            )
+            update_field(StatusField.SENSORS, count)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     def update_provider_chain(self, chain: str) -> None:
-        """Show the provider chain (displayed in boot banner, not inline)."""
-        pass  # Handled by boot_banner now
+        """Show the provider chain (displayed in boot banner, not inline).
+
+        D4 wire: feed the composer (chain shows in composed status
+        line when composer is enabled). Boot banner emit unchanged."""
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+            )
+            update_field(StatusField.PROVIDER_CHAIN, chain)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     # ══════════════════════════════════════════════════════════
     # Proactive event interruptions

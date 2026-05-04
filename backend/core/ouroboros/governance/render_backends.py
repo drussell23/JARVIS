@@ -349,15 +349,52 @@ class SerpentFlowBackend:
         self._console_print(getattr(event, "content", "") or path)
 
     def _handle_status_tick(self, event: Any) -> None:
-        """STATUS_TICK → metadata-driven dispatch. Recognised metadata
-        keys map to specific update_* methods on SerpentFlow:
-          * ``cost`` → flow.update_cost(amount)
-          * ``sensors`` → flow.update_sensors(count)
-          * ``provider_chain`` → flow.update_provider_chain(chain)
-        Unrecognised metadata falls through to console.print of the
-        event's content (status line text)."""
+        """STATUS_TICK → metadata-driven dispatch.
+
+        Three branches in priority order:
+
+          1. **D5 composer bridge** — when ``metadata.composed_status``
+             is True, the event was published by the
+             :class:`StatusLineComposer`. ``event.content`` carries
+             the composed status line; route directly to
+             ``flow._spinner_state.message`` (the prompt_toolkit
+             bottom_toolbar surface). Single source of truth for
+             the always-current status line.
+          2. **Typed update_* dispatch** — recognised metadata keys
+             map to specific ``update_*`` methods on SerpentFlow
+             (cost, sensors, provider_chain, intent_chain). Used by
+             callers that publish STATUS_TICK without going through
+             the composer.
+          3. **Console fallback** — generic status text printed via
+             ``console.print``. Last-resort path for events that
+             don't match either typed dispatch or composer marker.
+        """
         metadata = _event_metadata(event)
-        # Try each typed update path; first successful match wins.
+
+        # Branch 1: D5 composer bridge
+        if metadata.get("composed_status") is True:
+            content = getattr(event, "content", "") or ""
+            spinner_state = getattr(self._flow, "_spinner_state", None)
+            if spinner_state is not None:
+                try:
+                    spinner_state.message = content
+                    # Mark active so prompt_toolkit's bottom_toolbar
+                    # callable knows to render the composed line
+                    # (vs. the empty-state placeholder).
+                    if hasattr(spinner_state, "active"):
+                        spinner_state.active = bool(content)
+                    return
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[SerpentFlowBackend] composed status write "
+                        "failed", exc_info=True,
+                    )
+                    # fall through to console fallback below
+            else:
+                # No _spinner_state — fall through to console fallback
+                pass
+
+        # Branch 2: typed update_* dispatch
         for key, method_name, coerce in (
             ("cost", "update_cost", float),
             ("sensors", "update_sensors", int),
@@ -374,7 +411,8 @@ class SerpentFlowBackend:
                 return
             except Exception:  # noqa: BLE001 — defensive
                 continue
-        # Generic status text fallback
+
+        # Branch 3: console fallback
         content = getattr(event, "content", "") or ""
         if content:
             self._console_print(content)
@@ -598,8 +636,26 @@ class OuroborosConsoleBackend:
         self._console_print(getattr(event, "content", "") or path)
 
     def _handle_status_tick(self, event: Any) -> None:
-        """OuroborosConsole exposes show_cost_update."""
+        """OuroborosConsole STATUS_TICK handler.
+
+        D5 composer bridge first, then typed dispatch, then console
+        fallback (mirrors SerpentFlowBackend). OuroborosConsole
+        doesn't have a persistent bottom-toolbar surface, so the
+        composed status line falls through to ``console.print`` —
+        but tagged with a distinctive ``status:`` prefix so operators
+        can grep for it.
+        """
         metadata = _event_metadata(event)
+
+        # Branch 1: D5 composer bridge — OuroborosConsole has no
+        # persistent footer; print the composed line as a status row.
+        if metadata.get("composed_status") is True:
+            content = getattr(event, "content", "") or ""
+            if content:
+                self._console_print(f"  [dim]status:[/dim] {content}")
+            return
+
+        # Branch 2: typed dispatch
         if "cost" in metadata and hasattr(
             self._console, "show_cost_update",
         ):
@@ -608,6 +664,8 @@ class OuroborosConsoleBackend:
                 return
             except Exception:  # noqa: BLE001 — defensive
                 pass
+
+        # Branch 3: generic console fallback
         content = getattr(event, "content", "") or ""
         if content:
             self._console_print(content)
@@ -1285,6 +1343,45 @@ def register_shipped_invariants() -> List:
             ),
             validate=_make_producer_default_validator(
                 "JARVIS_CONTEXTUAL_HELP_ENABLED",
+            ),
+        ),
+        # D5 graduation pins — JARVIS_EMIT_TIER_GATING_ENABLED +
+        # JARVIS_STATUS_LINE_COMPOSER_ENABLED. Same pattern as
+        # Slice 7 follow-up #5 — catches a refactor that flips
+        # either default back to False without coordinated test
+        # update.
+        ShippedCodeInvariant(
+            invariant_name=(
+                "render_emit_tier_gating_enabled_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/render_emit_tier.py"
+            ),
+            description=(
+                "D5 graduated JARVIS_EMIT_TIER_GATING_ENABLED to "
+                "default true. The FlagSpec MUST carry default=True; "
+                "a refactor reverting it to False would silently "
+                "restore the noisy 6-lines-per-op CLI."
+            ),
+            validate=_make_producer_default_validator(
+                "JARVIS_EMIT_TIER_GATING_ENABLED",
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "status_line_composer_enabled_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/status_line_composer.py"
+            ),
+            description=(
+                "D5 graduated JARVIS_STATUS_LINE_COMPOSER_ENABLED to "
+                "default true. The FlagSpec MUST carry default=True; "
+                "a refactor reverting it to False would silently "
+                "restore the N-scattered-update_*-emits pattern."
+            ),
+            validate=_make_producer_default_validator(
+                "JARVIS_STATUS_LINE_COMPOSER_ENABLED",
             ),
         ),
         # D2 — serpent_animation stop() guards (boot-time UX fix).
