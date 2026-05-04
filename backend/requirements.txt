@@ -104,7 +104,7 @@ playwright>=1.40.0  # For page navigation, content extraction, form automation
 
 # Computer Vision dependencies
 opencv-python>=4.8.0  # For image processing
-pytesseract>=0.3.10  # For OCR text extraction
+pytesseract>=0.3.13  # For OCR text extraction
 Pillow>=10.0.0  # For image manipulation
 pyobjc-core==10.1  # Core PyObjC for macOS - specific version for miniforge compatibility
 pyobjc-framework-Cocoa==12.0  # Required base framework
