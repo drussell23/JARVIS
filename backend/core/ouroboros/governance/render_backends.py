@@ -1004,6 +1004,28 @@ def _validate_harness_wiring_present(
     return ()
 
 
+def _validate_serpent_flow_prompt_helper(
+    tree: Any, source: str,
+) -> tuple:
+    """Cross-file pin: serpent_flow.py MUST contain
+    ``_build_repl_prompt_html`` AND its call from the REPL loop
+    (CC2.4 multi-line prompt). Without these, the REPL falls back
+    to the legacy single-line prompt and operators lose the
+    cwd / mode / posture context."""
+    del tree
+    required = (
+        "_build_repl_prompt_html",
+        "JARVIS_PROMPT_TEMPLATE",
+    )
+    missing = [t for t in required if t not in source]
+    if missing:
+        return (
+            f"serpent_flow.py missing prompt template tokens: "
+            f"{missing} — multi-line REPL prompt won't render",
+        )
+    return ()
+
+
 def _validate_serpent_animation_stop_guards(
     tree: Any, source: str,
 ) -> tuple:
@@ -1383,6 +1405,23 @@ def register_shipped_invariants() -> List:
             validate=_make_producer_default_validator(
                 "JARVIS_STATUS_LINE_COMPOSER_ENABLED",
             ),
+        ),
+        # CC2.4 — multi-line REPL prompt helper presence pin.
+        ShippedCodeInvariant(
+            invariant_name="serpent_flow_repl_prompt_helper_present",
+            target_file=(
+                "backend/core/ouroboros/battle_test/serpent_flow.py"
+            ),
+            description=(
+                "CC2.4: serpent_flow.py MUST contain "
+                "_build_repl_prompt_html (the multi-line cwd/mode/"
+                "posture prompt builder) AND reference "
+                "JARVIS_PROMPT_TEMPLATE (the operator override env "
+                "var). Without these, the REPL reverts to the "
+                "legacy single-line prompt and operators lose CC-"
+                "style context. Pin reads serpent_flow.py source."
+            ),
+            validate=_validate_serpent_flow_prompt_helper,
         ),
         # D2 — serpent_animation stop() guards (boot-time UX fix).
         ShippedCodeInvariant(

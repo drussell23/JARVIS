@@ -111,6 +111,9 @@ class StatusField(str, enum.Enum):
     INTENT_DISCOVERY = "INTENT_DISCOVERY"
     DREAM_ENGINE = "DREAM_ENGINE"
     LEARNING = "LEARNING"
+    # CC2 additions — surface what's happening RIGHT NOW.
+    ACTIVE_OP = "ACTIVE_OP"          # most recent INTENT — "TestFailure(op7c17)"
+    TASK_LIST = "TASK_LIST"          # in-flight summary — "3 active · 1 queued"
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +185,33 @@ def _format_learning(value: Any) -> str:
     return str(value or "")
 
 
+def _format_active_op(value: Any) -> str:
+    """ACTIVE_OP renders as the current Sensor(short_id) — the
+    'what's happening now' anchor. Empty string when no op active."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    return s[:48]
+
+
+def _format_task_list(value: Any) -> str:
+    """TASK_LIST renders as compact counts: '3 active · 1 queued ·
+    12 done'. Dict input expected; missing keys default to 0."""
+    if isinstance(value, dict):
+        active = int(value.get("active", 0) or 0)
+        queued = int(value.get("queued", 0) or 0)
+        done = int(value.get("done", 0) or 0)
+        parts: List[str] = []
+        if active:
+            parts.append(f"{active} active")
+        if queued:
+            parts.append(f"{queued} queued")
+        if done:
+            parts.append(f"{done} done")
+        return " · ".join(parts) if parts else ""
+    return str(value or "")
+
+
 _FIELD_FORMATTERS: Mapping[StatusField, Callable[[Any], str]] = {
     StatusField.COST:              _format_cost,
     StatusField.SENSORS:           _format_sensors,
@@ -192,10 +222,14 @@ _FIELD_FORMATTERS: Mapping[StatusField, Callable[[Any], str]] = {
     StatusField.INTENT_DISCOVERY:  _format_intent_discovery,
     StatusField.DREAM_ENGINE:      _format_dream_engine,
     StatusField.LEARNING:          _format_learning,
+    StatusField.ACTIVE_OP:         _format_active_op,
+    StatusField.TASK_LIST:         _format_task_list,
 }
 
 
 _DEFAULT_FIELD_ORDER: Tuple[StatusField, ...] = (
+    StatusField.ACTIVE_OP,        # what's happening now — first
+    StatusField.TASK_LIST,        # in-flight count — second
     StatusField.POSTURE,
     StatusField.COST,
     StatusField.SENSORS,
@@ -608,6 +642,7 @@ _FORBIDDEN_AUTHORITY_MODULES: tuple = (
 _EXPECTED_STATUS_FIELD = frozenset({
     "COST", "SENSORS", "PROVIDER_CHAIN", "INTENT_CHAIN", "POSTURE",
     "SESSION_LESSONS", "INTENT_DISCOVERY", "DREAM_ENGINE", "LEARNING",
+    "ACTIVE_OP", "TASK_LIST",
 })
 
 

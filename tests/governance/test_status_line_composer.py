@@ -84,11 +84,13 @@ def composer_on(monkeypatch: pytest.MonkeyPatch, fresh_registry):
 
 
 class TestStatusFieldClosedTaxonomy:
-    def test_exact_nine_members(self):
+    def test_exact_eleven_members(self):
+        # CC2.1 added ACTIVE_OP + TASK_LIST (claude-code parity)
         assert {m.value for m in slc.StatusField} == {
             "COST", "SENSORS", "PROVIDER_CHAIN", "INTENT_CHAIN",
             "POSTURE", "SESSION_LESSONS", "INTENT_DISCOVERY",
             "DREAM_ENGINE", "LEARNING",
+            "ACTIVE_OP", "TASK_LIST",
         }
 
 
@@ -151,8 +153,11 @@ class TestComposerBasicFlow:
 class TestFieldOrder:
     def test_default_order(self, fresh_registry):
         order = slc.field_order()
-        # POSTURE is first in default
-        assert order[0] is slc.StatusField.POSTURE
+        # CC2.1: ACTIVE_OP / TASK_LIST take leading slots (claude-
+        # code parity); POSTURE drops to third
+        assert order[0] is slc.StatusField.ACTIVE_OP
+        assert order[1] is slc.StatusField.TASK_LIST
+        assert slc.StatusField.POSTURE in order
 
     def test_operator_override_order(
         self, monkeypatch: pytest.MonkeyPatch, fresh_registry,

@@ -3787,6 +3787,112 @@ class SerpentApprovalProvider:
 # ══════════════════════════════════════════════════════════════
 
 
+# ══════════════════════════════════════════════════════════════
+# CC2.4 — multi-line context-aware prompt template
+# ══════════════════════════════════════════════════════════════
+#
+# Renders a Claude-Code-style multi-line REPL prompt with cwd +
+# render mode + posture context. Operator-overrideable via
+# JARVIS_PROMPT_TEMPLATE env var. Template uses Python str.format
+# placeholders — {cwd} {mode} {posture} {sensors} {fallback}.
+# Defensive — every accessor returns a degraded fallback rather
+# than raising; the legacy single-line prompt always resolves.
+
+_DEFAULT_PROMPT_TEMPLATE = (
+    "\n  <ansigreen>{cwd}</ansigreen>"
+    "  <ansicyan>({mode} · {posture})</ansicyan>\n"
+    "<b>{fallback}</b>"
+)
+
+
+def _build_repl_prompt_html(fallback: str) -> Any:
+    """Render the multi-line REPL prompt as prompt_toolkit HTML.
+
+    Reads JARVIS_PROMPT_TEMPLATE env var (default in-code). Template
+    placeholders ({cwd}, {mode}, {posture}, {sensors}, {fallback})
+    resolved defensively — each accessor returns "?" on failure
+    rather than raising. The {fallback} placeholder always carries
+    the legacy single-line prompt string so operators who set a
+    minimal template still get a working prompt.
+
+    Returns prompt_toolkit ``HTML`` instance ready for
+    ``prompt_async(message=...)``.
+    """
+    template = os.environ.get(
+        "JARVIS_PROMPT_TEMPLATE", _DEFAULT_PROMPT_TEMPLATE,
+    ) or _DEFAULT_PROMPT_TEMPLATE
+
+    # Resolve each placeholder defensively.
+    def _cwd() -> str:
+        try:
+            cwd = os.getcwd()
+            home = os.path.expanduser("~")
+            if cwd.startswith(home):
+                cwd = "~" + cwd[len(home):]
+            # Truncate long paths .../parent/dir
+            if len(cwd) > 50:
+                parts = cwd.split(os.sep)
+                cwd = ".../" + os.sep.join(parts[-2:])
+            return cwd
+        except Exception:
+            return "?"
+
+    def _mode() -> str:
+        try:
+            from backend.core.ouroboros.governance.claude_style_transport import (  # noqa: E501
+                resolve_render_mode,
+            )
+            return resolve_render_mode().value.lower()
+        except Exception:
+            return "?"
+
+    def _posture() -> str:
+        try:
+            from backend.core.ouroboros.governance.posture_store import (
+                PostureStore,
+            )
+            from pathlib import Path
+            store = PostureStore(base_dir=Path(".jarvis"))
+            reading = store.load_current()
+            return reading.posture.value if reading else "?"
+        except Exception:
+            return "?"
+
+    def _sensors() -> str:
+        # Reuses status_line_composer state if registered
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (  # noqa: E501
+                get_status_line_composer,
+                StatusField,
+            )
+            comp = get_status_line_composer()
+            if comp is not None:
+                snap = comp.snapshot()
+                count = snap.get(StatusField.SENSORS, 0)
+                return str(int(count) if count else 0)
+            return "?"
+        except Exception:
+            return "?"
+
+    try:
+        rendered = template.format(
+            cwd=_cwd(),
+            mode=_mode(),
+            posture=_posture(),
+            sensors=_sensors(),
+            fallback=fallback,
+        )
+    except (KeyError, IndexError, ValueError):
+        # Operator typo'd template — fall back to legacy single-line
+        rendered = f"<b>{fallback}</b>"
+
+    # Lazy HTML import (mirrors SerpentREPL pattern — prompt_toolkit
+    # is an optional runtime dep we never want to require at module
+    # import time).
+    from prompt_toolkit.formatted_text import HTML as _HTML
+    return _HTML(rendered)
+
+
 class SerpentREPL:
     """Non-blocking REPL with persistent status bar (Zone 2 + Zone 3).
 
@@ -4024,8 +4130,18 @@ class SerpentREPL:
         with patch_stdout(raw=True):
             while self._running:
                 try:
+                    # CC2.4 — multi-line context-aware prompt. Operator-
+                    # overrideable via JARVIS_PROMPT_TEMPLATE. Falls
+                    # back to the legacy single-line prompt when the
+                    # template renderer fails (defensive).
+                    try:
+                        prompt_html = _build_repl_prompt_html(
+                            self._prompt_str,
+                        )
+                    except Exception:
+                        prompt_html = HTML(f"<b>{self._prompt_str}</b>")
                     line = await self._session.prompt_async(
-                        HTML(f"<b>{self._prompt_str}</b>"),
+                        prompt_html,
                         set_exception_handler=False,
                     )
                     line = line.strip()

@@ -234,6 +234,41 @@ class ClaudeStyleTransport:
         self._op_state: Dict[str, _OpState] = {}
         self._boot_recovery_count: int = 0
         self._boot_recovery_flushed: bool = False
+        # CC2.1 — running counters for TASK_LIST composer field
+        self._done_count: int = 0
+        self._failed_count: int = 0
+
+    # -- composer feed (CC2.1) --------------------------------------
+
+    def _feed_composer(self) -> None:
+        """Push current state into the StatusLineComposer (D5).
+        Sets ACTIVE_OP + TASK_LIST fields. NEVER raises — composer
+        unavailable is a no-op."""
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (  # noqa: E501
+                StatusField,
+                update_field,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return
+        try:
+            # ACTIVE_OP = most recent INTENT (newest started)
+            active_label = ""
+            if self._op_state:
+                latest = max(
+                    self._op_state.values(),
+                    key=lambda s: s.started_monotonic,
+                )
+                active_label = f"{latest.sensor}({latest.short_id})"
+            update_field(StatusField.ACTIVE_OP, active_label)
+            # TASK_LIST = compact counts
+            update_field(StatusField.TASK_LIST, {
+                "active": len(self._op_state),
+                "queued": 0,  # populated by TaskListObserver (CC2.3)
+                "done": self._done_count + self._failed_count,
+            })
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     # -- transport contract -----------------------------------------
 
@@ -311,6 +346,8 @@ class ClaudeStyleTransport:
             target_files=tuple(payload.get("target_files", []) or []),
         )
         self._op_state[op_id] = state
+        # CC2.1 — feed composer with current ACTIVE_OP + TASK_LIST
+        self._feed_composer()
         # Render: `· <Sensor>(<short_id>) <summary>`
         target_repr = ""
         if state.target_files:
@@ -374,6 +411,8 @@ class ClaudeStyleTransport:
                 f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
                 f" done [dim]({elapsed})[/dim]{files_repr}"
             )
+            self._done_count += 1
+            self._feed_composer()
             return
 
         if outcome in ("failed", "postmortem"):
@@ -383,6 +422,8 @@ class ClaudeStyleTransport:
                 f"[bold]{state.sensor}[/bold]([dim]{state.short_id}[/dim])"
                 f" shed: [red]{reason}[/red] [dim]({elapsed})[/dim]"
             )
+            self._failed_count += 1
+            self._feed_composer()
             return
 
         if outcome == "noop":
@@ -490,6 +531,113 @@ class ClaudeStyleTransport:
         except Exception:  # noqa: BLE001 — defensive
             pass
         logger.debug("[claude_style_transport] %s", text)
+
+    # -- RenderBackend Protocol (CC2.2) -----------------------------
+    # ClaudeStyleTransport doubles as a RenderBackend so it can
+    # consume FILE_REF events from the conductor and render them as
+    # Claude-style "Update(<path>) | Added N, removed M" blocks.
+    # This is purely additive — the transport's primary surface
+    # remains the CommProtocol send() above.
+
+    name: str = "claude_style"
+
+    _HANDLED_KINDS: frozenset = frozenset({"FILE_REF"})
+    _NO_OP_KINDS: frozenset = frozenset({
+        "PHASE_BEGIN", "PHASE_END", "REASONING_TOKEN",
+        "STATUS_TICK", "MODAL_PROMPT", "MODAL_DISMISS",
+        "THREAD_TURN", "BACKEND_RESET",
+    })
+
+    def notify(self, event: Any) -> None:
+        """RenderBackend Protocol — receive RenderEvents from the
+        conductor. ClaudeStyleTransport only handles FILE_REF;
+        everything else is a documented no-op (CommProtocol surface
+        handles ops via send())."""
+        if event is None:
+            return
+        try:
+            kind = getattr(event, "kind", None)
+            kind_value = (
+                getattr(kind, "value", None) or str(kind or "")
+            )
+            if kind_value == "FILE_REF":
+                self._handle_file_ref(event)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[claude_style_transport] notify failed", exc_info=True,
+            )
+
+    def flush(self) -> None:
+        """RenderBackend Protocol — no-op for this transport."""
+        return
+
+    def shutdown(self) -> None:
+        """RenderBackend Protocol — no-op for this transport."""
+        return
+
+    def _handle_file_ref(self, event: Any) -> None:
+        """FILE_REF → render as Claude-style Update(<path>) block.
+
+        Format::
+
+          Update(<path>)
+            Added N lines, removed M lines
+            [diff hunks first ~5 lines, dim]
+        """
+        try:
+            metadata = getattr(event, "metadata", None) or {}
+            path = str(metadata.get("path", "") or "")
+            if not path:
+                return
+            line = metadata.get("line")
+            line_repr = f":{line}" if line else ""
+            # Diff stats from metadata if present (added/removed)
+            added = metadata.get("added_lines")
+            removed = metadata.get("removed_lines")
+            diff_text = str(metadata.get("diff_text", "") or "")
+            self._safe_print(
+                f"  [bold]Update[/bold]("
+                f"[cyan]{path}{line_repr}[/cyan])"
+            )
+            if added is not None or removed is not None:
+                stats = []
+                if added is not None:
+                    stats.append(f"Added {added} lines")
+                if removed is not None:
+                    stats.append(f"removed {removed} lines")
+                if stats:
+                    self._safe_print(
+                        f"  [dim]{', '.join(stats)}[/dim]"
+                    )
+            elif diff_text:
+                # Fallback: count + and - lines from diff_text
+                added_n = sum(
+                    1 for ln in diff_text.splitlines()
+                    if ln.startswith("+") and not ln.startswith("+++")
+                )
+                removed_n = sum(
+                    1 for ln in diff_text.splitlines()
+                    if ln.startswith("-") and not ln.startswith("---")
+                )
+                if added_n or removed_n:
+                    self._safe_print(
+                        f"  [dim]Added {added_n} lines, "
+                        f"removed {removed_n} lines[/dim]"
+                    )
+                # First 5 lines of diff for context
+                preview_lines = diff_text.splitlines()[:5]
+                for prev in preview_lines:
+                    color = (
+                        "green" if prev.startswith("+")
+                        else "red" if prev.startswith("-")
+                        else "dim"
+                    )
+                    self._safe_print(f"    [{color}]{prev[:80]}[/{color}]")
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[claude_style_transport] _handle_file_ref failed",
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
