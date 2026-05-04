@@ -879,7 +879,9 @@ class TestAuthorityInvariants:
 
 
 class TestPublicExports:
-    def test_all_lists_slice_1_public_names(self):
+    def test_all_lists_slices_1_and_2_public_names(self):
+        """Slice 1 contract (12) + 5 cost/probe re-exports +
+        Slice 2 tracker (3) = 20 public exports."""
         from backend.core.ouroboros.governance import epistemic_budget  # noqa: E501
         expected = sorted([
             # Cost-gate symbols (re-exported for caller
@@ -903,5 +905,9 @@ class TestPublicExports:
             "epistemic_max_rounds",
             "epistemic_sbt_branch_cap",
             "epistemic_tracker_ttl_s",
+            # Slice 2 tracker
+            "EpistemicBudgetTracker",
+            "get_default_tracker",
+            "reset_default_tracker_for_tests",
         ])
         assert sorted(epistemic_budget.__all__) == expected
