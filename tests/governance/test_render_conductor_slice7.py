@@ -340,7 +340,23 @@ class TestSerpentFlowHandlers:
             kind=rc.EventKind.MODAL_PROMPT, region=rc.RegionKind.MODAL,
             role=rc.ColorRole.CONTENT, content="help body here",
         ))
-        assert any("help body here" in p for p in flow.console.prints)
+        # Backlog #3: NORMAL/FULL density uses Rich Panel via the
+        # console. The recorder captures the Panel object directly;
+        # check the Panel's renderable carries our content.
+        from rich.panel import Panel
+        rendered = [
+            p for p in flow.console.prints
+            if isinstance(p, Panel) or (
+                isinstance(p, str) and "help body here" in p
+            )
+        ]
+        assert rendered
+        # If a Panel landed, inspect its renderable for the content.
+        for p in rendered:
+            if isinstance(p, Panel):
+                assert "help body here" in str(p.renderable)
+                return
+        # Otherwise the inline-fallback path fired — fine.
 
     def test_modal_dismiss_renders_separator(self, fresh_registry):
         flow = _RichFlow()

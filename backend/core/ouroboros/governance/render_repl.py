@@ -386,24 +386,25 @@ def _describe_help_resolver(*, verbose: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _register_verb_in_help_dispatcher() -> None:
-    """Best-effort registration with help_dispatcher.VerbRegistry.
+def register_verbs(registry: Any) -> int:
+    """Register the ``/render`` verb into a :class:`VerbRegistry`.
 
-    Lazy import + try/except — render_repl is importable even if
-    help_dispatcher isn't available (e.g. unit tests on this module
-    in isolation). Production boot import-order has help_dispatcher
-    seeded long before render_repl is reached, so the verb shows up
-    in ``/help`` enumeration.
+    Auto-discovered by :func:`help_dispatcher._discover_module_provided_-
+    verbs` at first ``get_default_verb_registry`` call (and re-discovered
+    after each ``reset_default_verb_registry``). Returns the count of
+    verbs installed.
+
+    Replaces the prior import-time side effect — tests that reset
+    ``_default_verbs`` between assertions now re-discover this verb
+    via the seed loop instead of needing the module to be re-imported.
     """
     try:
         from backend.core.ouroboros.governance.help_dispatcher import (
             VerbSpec,
-            get_default_verb_registry,
         )
     except Exception:  # noqa: BLE001 — defensive
-        return
+        return 0
     try:
-        registry = get_default_verb_registry()
         registry.register(VerbSpec(
             name="/render",
             one_line=(
@@ -413,14 +414,12 @@ def _register_verb_in_help_dispatcher() -> None:
             category="observability",
             help_text=_HELP,
         ))
+        return 1
     except Exception:  # noqa: BLE001 — defensive
         logger.debug(
             "[render_repl] verb registration failed", exc_info=True,
         )
-
-
-# Register on import (mirrors help_dispatcher._seed_builtin_verbs pattern).
-_register_verb_in_help_dispatcher()
+        return 0
 
 
 # ---------------------------------------------------------------------------

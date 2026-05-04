@@ -92,6 +92,99 @@ def _event_metadata(event: Any) -> dict:
         return {}
 
 
+def _active_density() -> str:
+    """Read the conductor's currently-resolved density. Returns the
+    string value (``"COMPACT"`` / ``"NORMAL"`` / ``"FULL"``) or
+    ``"NORMAL"`` as defensive fallback. Cheap — reuses the conductor's
+    existing resolution path; no env scan duplicated here."""
+    try:
+        from backend.core.ouroboros.governance.render_conductor import (
+            get_render_conductor,
+        )
+        conductor = get_render_conductor()
+        if conductor is None:
+            return "NORMAL"
+        return conductor.active_density().value
+    except Exception:  # noqa: BLE001 — defensive
+        return "NORMAL"
+
+
+def _terminal_width() -> int:
+    """Resolve the operator terminal width. Uses ``shutil.get_terminal_-
+    size`` which honors ``COLUMNS`` env / OS termios; defaults to 80
+    on any failure. No JARVIS_*_WIDTH knob — operators tune via the
+    standard ``COLUMNS`` env that every Unix tool already honors."""
+    try:
+        import shutil
+        return max(20, shutil.get_terminal_size((80, 24)).columns)
+    except Exception:  # noqa: BLE001 — defensive
+        return 80
+
+
+# Bounded ring buffer for FILE_REF dedup. Same path:line within the
+# last N events suppressed at the backend boundary — operator UX win
+# (FILE_REF spam during tight loops collapses to one render).
+_FILE_REF_DEDUP_WINDOW: int = 16
+
+
+class _RingDedup:
+    """Tiny bounded ring buffer used to suppress immediate-repeat
+    FILE_REF events. Per-backend (not shared) so each adapter's
+    suppression decisions are independent. Thread-safe via a
+    ``threading.Lock`` (FILE_REF can fire from any context — Slice 7
+    producer wiring eventually pumps from generator runner threads)."""
+
+    def __init__(self, window: int = _FILE_REF_DEDUP_WINDOW) -> None:
+        import threading
+        self._window = max(1, int(window))
+        self._buf: List[str] = []
+        self._lock = threading.Lock()
+
+    def seen_recently(self, key: str) -> bool:
+        """Return True iff ``key`` is in the ring (suppress this
+        event); else record it and return False (let it through)."""
+        if not key:
+            return False
+        with self._lock:
+            if key in self._buf:
+                return True
+            self._buf.append(key)
+            if len(self._buf) > self._window:
+                self._buf.pop(0)
+            return False
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buf.clear()
+
+
+def _resolve_role_style(event: Any) -> str:
+    """Map the event's stamped :class:`ColorRole` to a Rich-compatible
+    style string via the conductor's active theme. Returns ``""`` when
+    the conductor isn't registered or theme resolution fails — Rich
+    treats empty style as default text."""
+    try:
+        from backend.core.ouroboros.governance.render_conductor import (
+            ColorRole,
+            RenderDensity,
+            get_render_conductor,
+        )
+        conductor = get_render_conductor()
+        if conductor is None:
+            return ""
+        role = getattr(event, "role", None)
+        if not isinstance(role, ColorRole):
+            return ""
+        density_str = _active_density()
+        try:
+            density = RenderDensity(density_str)
+        except ValueError:
+            density = RenderDensity.NORMAL
+        return conductor.active_theme().resolve(role, density)
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # SerpentFlowBackend — wraps the preferred CC-style flowing CLI
 # ---------------------------------------------------------------------------
@@ -143,6 +236,7 @@ class SerpentFlowBackend:
         not import ``SerpentFlow`` directly — duck-typed by the adapter
         contract so tests can substitute a stub."""
         self._flow = flow
+        self._file_ref_dedup = _RingDedup()
 
     def notify(self, event: Any) -> None:
         """Route a RenderEvent to the wrapped SerpentFlow. Total over
@@ -219,10 +313,24 @@ class SerpentFlowBackend:
     def _handle_file_ref(self, event: Any) -> None:
         """FILE_REF → flow.show_diff(path, diff_text) if metadata
         carries both; else flow.show_code_preview(path) if available;
-        else fall back to console.print of the canonical render."""
+        else fall back to console.print of the canonical render.
+
+        Slice 7 follow-up backlog #3: dedup repeats within the last
+        16 events. Same path:line:column key suppressed — operator UX
+        win against FILE_REF spam during tight loops (e.g. a tool
+        loop visiting the same file 30 times). Dedup runs at the
+        backend boundary, after the conductor's fan-out, so other
+        backends still see the event for their own coalescing."""
         metadata = _event_metadata(event)
         path = str(metadata.get("path", "") or "")
         if not path:
+            return
+        # Dedup key: path + line + column (anchor variations should
+        # render — they're navigation distinctions, not noise).
+        line = metadata.get("line")
+        column = metadata.get("column")
+        dedup_key = f"{path}:{line}:{column}"
+        if self._file_ref_dedup.seen_recently(dedup_key):
             return
         diff_text = str(metadata.get("diff_text", "") or "")
         if diff_text and hasattr(self._flow, "show_diff"):
@@ -272,13 +380,38 @@ class SerpentFlowBackend:
             self._console_print(content)
 
     def _handle_modal_prompt(self, event: Any) -> None:
-        """MODAL_PROMPT → render the modal text via console.print.
-        SerpentFlow doesn't have a dedicated modal surface; the
-        flowing CLI shows it as an inline prompt block. Slice 6's
-        contextual help panel is the primary producer."""
+        """MODAL_PROMPT → render the modal text. Slice 7 follow-up
+        backlog #3: when the wrapped renderer's console exposes a
+        Rich-compatible API AND density is not COMPACT, render via
+        Rich Panel for clean visual separation; else fall through to
+        the inline prompt block. COMPACT density collapses to a
+        single one-liner — operator can still see "?" worked, with
+        full content on a follow-up FULL-density frame."""
         content = getattr(event, "content", "") or ""
-        if content:
-            self._console_print(f"\n[bold cyan]── help ──[/bold cyan]\n{content}\n")
+        if not content:
+            return
+        density = _active_density()
+        if density == "COMPACT":
+            # One-liner — clip to terminal width minus marker.
+            width = max(20, _terminal_width() - 16)
+            clipped = content.replace("\n", " ")[:width]
+            self._console_print(f"  /help: {clipped}…")
+            return
+        # NORMAL / FULL — try Rich Panel via the console attribute.
+        try:
+            console = getattr(self._flow, "console", None)
+            if console is not None:
+                from rich.panel import Panel
+                console.print(
+                    Panel(content, title="help", expand=False),
+                )
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        # Fallback: inline prompt block.
+        self._console_print(
+            f"\n[bold cyan]── help ──[/bold cyan]\n{content}\n",
+        )
 
     def _handle_modal_dismiss(self, event: Any) -> None:
         """MODAL_DISMISS → render a separator marking the close. The
@@ -289,22 +422,36 @@ class SerpentFlowBackend:
 
     def _handle_thread_turn(self, event: Any) -> None:
         """THREAD_TURN → render the speaker-tagged turn. SerpentFlow
-        doesn't have a dedicated thread region in Slice 7; emit as a
-        speaker-prefixed line in the flowing log. Slice 8+ may add a
-        sticky thread region."""
+        doesn't have a dedicated sticky thread region in Slice 7;
+        emit as a speaker-prefixed line in the flowing log.
+
+        Slice 7 follow-up backlog #3: consume the conductor-stamped
+        ``ColorRole`` (which Slice 5's :func:`publish_thread_turn`
+        already maps per-speaker — USER→EMPHASIS, ASSISTANT→CONTENT,
+        POSTMORTEM→MUTED, etc.) via the active theme instead of
+        hardcoding per-speaker color tags. The label remains keyed
+        to ``speaker`` for semantic clarity; the *style* derives
+        from the role.
+        """
         metadata = _event_metadata(event)
         speaker = str(metadata.get("speaker", "") or "?")
         content = getattr(event, "content", "") or ""
         if not content:
             return
-        prefix = {
-            "USER":       "[bold]you[/bold]",
-            "ASSISTANT":  "[cyan]model[/cyan]",
-            "POSTMORTEM": "[dim]postmortem[/dim]",
-            "TOOL":       "[dim]tool[/dim]",
-            "SYSTEM":     "[dim]sys[/dim]",
-        }.get(speaker, "[dim]?[/dim]")
-        self._console_print(f"  {prefix}: {content}")
+        # Speaker label remains a closed-taxonomy lookup (semantic
+        # text, not visual style). Theme-resolved Rich style wraps it.
+        speaker_label = {
+            "USER":       "you",
+            "ASSISTANT":  "model",
+            "POSTMORTEM": "postmortem",
+            "TOOL":       "tool",
+            "SYSTEM":     "sys",
+        }.get(speaker, "?")
+        style = _resolve_role_style(event)
+        if style:
+            self._console_print(f"  [{style}]{speaker_label}[/{style}]: {content}")
+        else:
+            self._console_print(f"  {speaker_label}: {content}")
 
     def _console_print(self, text: str) -> None:
         """Defensive console.print via the flow's console attribute.
@@ -799,6 +946,33 @@ def _validate_harness_wiring_present(
     return ()
 
 
+def _validate_help_dispatcher_verb_discovery(
+    tree: Any, source: str,
+) -> tuple:
+    """help_dispatcher.py MUST expose ``_discover_module_provided_verbs``
+    AND call it from ``get_default_verb_registry`` (Slice 7 follow-up
+    backlog #2). Without this hook, modules like ``render_repl`` lose
+    their verb registration after every ``reset_default_verb_registry``
+    call (test isolation, hot reloads). Pinned cross-file so future
+    refactors of help_dispatcher cannot silently drop the discovery
+    loop."""
+    del tree
+    missing = []
+    if "_discover_module_provided_verbs" not in source:
+        missing.append("_discover_module_provided_verbs definition")
+    # The call site MUST be inside get_default_verb_registry's
+    # singleton-construction branch.
+    if "_discover_module_provided_verbs(_default_verbs)" not in source:
+        missing.append(
+            "_discover_module_provided_verbs(_default_verbs) call",
+        )
+    if missing:
+        return (
+            f"help_dispatcher.py missing verb discovery hook: {missing}",
+        )
+    return ()
+
+
 # ---------------------------------------------------------------------------
 # Slice 7 follow-up #5: AST pins on the 4 producer-side flag defaults.
 # Each pin reads the per-slice register_flags source and verifies the
@@ -1087,6 +1261,26 @@ def register_shipped_invariants() -> List:
             validate=_make_producer_default_validator(
                 "JARVIS_CONTEXTUAL_HELP_ENABLED",
             ),
+        ),
+        # Backlog #2 — verb discovery hook in help_dispatcher.
+        ShippedCodeInvariant(
+            invariant_name=(
+                "help_dispatcher_verb_discovery_present"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/help_dispatcher.py"
+            ),
+            description=(
+                "Slice 7 follow-up backlog #2: help_dispatcher.py MUST "
+                "expose _discover_module_provided_verbs AND call it "
+                "from get_default_verb_registry. Without this hook, "
+                "module-owned verbs (render_repl./render, future "
+                "REPL surfaces) lose registration after every "
+                "reset_default_verb_registry call (test isolation, "
+                "hot reload). Pinned cross-file so future refactors "
+                "cannot silently drop the discovery loop."
+            ),
+            validate=_validate_help_dispatcher_verb_discovery,
         ),
     ]
 
