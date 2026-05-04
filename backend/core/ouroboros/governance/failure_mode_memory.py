@@ -88,22 +88,40 @@ FAILURE_MODE_MEMORY_SCHEMA_VERSION: str = "failure_mode_memory.1"
 
 
 def failure_mode_memory_enabled() -> bool:
-    """``JARVIS_FAILURE_MODE_MEMORY_ENABLED`` (default ``false``
-    until Slice 5 graduation per PRD §31.4).
+    """``JARVIS_FAILURE_MODE_MEMORY_ENABLED`` (default ``true`` —
+    graduated PRD §31.4 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
-    default (false for Slice 1); explicit ``1``/``true``/``yes``/
-    ``on`` flips on. Same shape as
-    :func:`coherence_auditor_enabled` /
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default (true post-Slice-5); explicit ``0``/``false``/``no``/
+    ``off`` evaluates false; explicit truthy values evaluate true.
+    Same shape as :func:`coherence_auditor_enabled` /
     :func:`cigw_enabled` / :func:`quorum_enabled` graduated flags
-    so the Slice 5 graduation flip is a one-character edit.
+    so the operator instant-revert idiom is consistent across the
+    governance surface.
 
-    Re-read on every call so flips hot-revert without restart."""
+    Re-read on every call so flips hot-revert without restart.
+
+    Cost contract preserved by construction: graduating default-true
+    is appropriate because the entire 5-slice arc is **zero LLM**
+    end-to-end:
+
+      * Extractor (Slice 2) — pure regex over postmortem evidence
+      * Retriever (Slice 3) — deterministic enum-match + Jaccard +
+        log-scale weight + 14d half-life recency
+      * Injection (Slice 4) — pure markdown render; bounded 3KB
+        char budget amortized by Anthropic 5-min prompt cache
+      * Persistence (Slice 2) — flock'd JSONL; ~300KB disk over
+        30 days at 20 failures/session
+
+    Operator instant-revert: ``JARVIS_FAILURE_MODE_MEMORY_ENABLED=
+    false`` flips the master off; the next call to
+    :func:`failure_mode_memory_enabled` re-reads + every public
+    surface short-circuits to its disabled outcome."""
     raw = os.environ.get(
         "JARVIS_FAILURE_MODE_MEMORY_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 1 default; flips to True at Slice 5
+        return True  # Slice 5 graduated default (PRD §31.4)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -2010,6 +2028,151 @@ def compose_failure_modes_section(
         return ""
 
 
+# ===========================================================================
+# Slice 5 — Graduation operator surfaces
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Operational maintenance — clear store (operator-triggered)
+# ---------------------------------------------------------------------------
+
+
+def clear_failure_mode_history(
+    *,
+    enabled_override: Optional[bool] = None,
+) -> bool:
+    """Truncate the failure-mode JSONL store. Operational
+    maintenance — called by the ``/failures clear`` REPL verb.
+
+    Master flag is checked: a disabled subsystem refuses the
+    clear (the operator should re-enable + re-clear if they want
+    the records gone). NEVER raises. Returns True on success,
+    False on master-off / fault."""
+    try:
+        if enabled_override is False:
+            return False
+        if enabled_override is None:
+            if not failure_mode_memory_enabled():
+                return False
+        path = history_path()
+        if not path.exists():
+            return True  # already empty
+        with flock_critical_section(path) as acquired:
+            if not acquired:
+                return False
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.debug(
+                    "[failure_mode_memory] clear unlink: %s", exc,
+                )
+                return False
+        return True
+    except Exception as exc:  # noqa: BLE001 — last-resort defensive
+        logger.debug(
+            "[failure_mode_memory] clear_failure_mode_history "
+            "raised: %s", exc,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# SSE publisher — fires on first-attempt match injection
+# ---------------------------------------------------------------------------
+
+
+def publish_failure_mode_recalled(
+    *,
+    op_id: str,
+    situation_kind: str,
+    match_count: int,
+    top_signature: Optional[str] = None,
+    top_weight: int = 0,
+) -> Optional[str]:
+    """Fire ``EVENT_TYPE_FAILURE_MODE_RECALLED_AT_GENERATE`` for
+    one Slice 4 prompt-section injection. Lazy
+    ``ide_observability_stream`` import + best-effort publish +
+    never-raise contract — mirrors :func:`publish_quorum_outcome`
+    discipline.
+
+    Returns the broker frame_id on publish, ``None`` on
+    suppression/failure (master-off / broker-missing /
+    publish-error). NEVER raises."""
+    if not failure_mode_memory_enabled():
+        return None
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            EVENT_TYPE_FAILURE_MODE_RECALLED_AT_GENERATE,
+            get_default_broker,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        broker = get_default_broker()
+        return broker.publish(
+            event_type=(
+                EVENT_TYPE_FAILURE_MODE_RECALLED_AT_GENERATE
+            ),
+            op_id=str(op_id or ""),
+            payload={
+                "schema_version": (
+                    FAILURE_MODE_MEMORY_SCHEMA_VERSION
+                ),
+                "op_id": str(op_id or ""),
+                "situation_kind": str(situation_kind or ""),
+                "match_count": int(match_count),
+                "top_signature": (
+                    str(top_signature)[:64]
+                    if top_signature is not None else None
+                ),
+                "top_weight": int(top_weight),
+            },
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[failure_mode_memory] SSE publish swallowed",
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Single-record lookup — for /failures for <signature> + HTTP
+# /observability/failure-modes/signature/{hash}
+# ---------------------------------------------------------------------------
+
+
+def find_failure_mode_by_signature(
+    signature_hash: str,
+) -> Optional[FailureModeRecord]:
+    """Return the (single) record matching ``signature_hash``.
+    Persistence layer guarantees at most one record per signature
+    within the dedup window; if multiple exist outside the window
+    (sliding-window semantics), the most recent wins. NEVER
+    raises."""
+    try:
+        sig = (signature_hash or "").strip().lower()
+        if not sig:
+            return None
+        records = _read_existing_records(history_path())
+        match = None
+        for rec in records:
+            if (rec.signature_hash or "").lower() == sig:
+                if (
+                    match is None
+                    or rec.observed_at_unix > match.observed_at_unix
+                ):
+                    match = rec
+        return match
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[failure_mode_memory] find_failure_mode_by_signature "
+            "raised: %s", exc,
+        )
+        return None
+
+
 __all__ = [
     "DEFAULT_PROMPT_SECTION_BUDGET",
     "FAILURE_MODE_MEMORY_SCHEMA_VERSION",
@@ -2020,6 +2183,7 @@ __all__ = [
     "RecordOutcome",
     "SituationKind",
     "classify_situation_from_ctx",
+    "clear_failure_mode_history",
     "compose_failure_modes_section",
     "compute_signature_hash",
     "dedup_window_days",
@@ -2028,9 +2192,11 @@ __all__ = [
     "failure_mode_min_weight",
     "failure_mode_recency_halflife_days",
     "failure_mode_top_k",
+    "find_failure_mode_by_signature",
     "history_dir",
     "history_max_records",
     "history_path",
+    "publish_failure_mode_recalled",
     "read_failure_mode_history",
     "record_failure_mode",
     "record_postmortem",

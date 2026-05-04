@@ -24,14 +24,17 @@ import pytest
 
 
 class TestMasterFlag:
-    def test_default_is_false_pre_graduation(self, monkeypatch):
+    def test_default_is_true_post_graduation(self, monkeypatch):
+        """Slice 5 graduation: ``JARVIS_FAILURE_MODE_MEMORY_ENABLED``
+        flips false → true (PRD §31.4). Operator instant-revert
+        via explicit env false."""
         monkeypatch.delenv(
             "JARVIS_FAILURE_MODE_MEMORY_ENABLED", raising=False,
         )
         from backend.core.ouroboros.governance.failure_mode_memory import (  # noqa: E501
             failure_mode_memory_enabled,
         )
-        assert failure_mode_memory_enabled() is False
+        assert failure_mode_memory_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on", "TRUE", "Yes"],
@@ -65,8 +68,8 @@ class TestMasterFlag:
         from backend.core.ouroboros.governance.failure_mode_memory import (  # noqa: E501
             failure_mode_memory_enabled,
         )
-        # Whitespace == unset == default == False (Slice 1)
-        assert failure_mode_memory_enabled() is False
+        # Whitespace == unset == graduated default == True (Slice 5)
+        assert failure_mode_memory_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -613,9 +616,10 @@ class TestAuthorityInvariants:
 
 
 class TestPublicExports:
-    def test_all_lists_slices_1_through_4_public_names(self):
+    def test_all_lists_slices_1_through_5_public_names(self):
         """Slice 1 (6) + Slice 2 (10) + Slice 3 (5) + Slice 4 (3)
-        = 24 public exports. Future slices append; never remove."""
+        + Slice 5 (3) = 27 public exports. Future slices append;
+        never remove."""
         from backend.core.ouroboros.governance import failure_mode_memory  # noqa: E501
         expected = sorted([
             # Slice 1 — primitive
@@ -646,6 +650,10 @@ class TestPublicExports:
             "DEFAULT_PROMPT_SECTION_BUDGET",
             "classify_situation_from_ctx",
             "compose_failure_modes_section",
+            # Slice 5 — graduation operator surfaces
+            "clear_failure_mode_history",
+            "find_failure_mode_by_signature",
+            "publish_failure_mode_recalled",
         ])
         assert sorted(failure_mode_memory.__all__) == expected
 

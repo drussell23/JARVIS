@@ -4206,6 +4206,14 @@ class SerpentREPL:
                             line, "quorum",
                         )
                         continue
+                    if line in ("failures", "/failures") or (
+                        line.startswith("failures ")
+                        or line.startswith("/failures ")
+                    ):
+                        self._print_observability_verb(
+                            line, "failures",
+                        )
+                        continue
                     if line in (
                         "postmortems", "/postmortems",
                     ) or (
@@ -4749,6 +4757,10 @@ class SerpentREPL:
                 from backend.core.ouroboros.governance.quorum_repl import (  # noqa: E501
                     dispatch_quorum_command as _dispatch,
                 )
+            elif name == "failures":
+                from backend.core.ouroboros.governance.failures_repl import (  # noqa: E501
+                    dispatch_failures_command as _dispatch,
+                )
             else:
                 f.console.print(
                     f"[dim]/{name} surface unknown[/dim]"
@@ -4804,6 +4816,7 @@ class SerpentREPL:
             f"  [{_C['dim']}]/probe[/{_C['dim']}]            confidence-probe loop status (Move 5)",
             f"  [{_C['dim']}]/coherence[/{_C['dim']}]        coherence-auditor flags + audits (Priority #1)",
             f"  [{_C['dim']}]/quorum[/{_C['dim']}]           generative-quorum status + history (Move 6)",
+            f"  [{_C['dim']}]/failures[/{_C['dim']}]         failure-mode memory recurrences (Upgrade 3 / PRD §31.4)",
             f"  [{_C['dim']}]/postmortems[/{_C['dim']}]      recent postmortems + DAG (Priority #2)",
             f"  [{_C['dim']}]/lessons[/{_C['dim']}]          show session lesson buffer",
             f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]       cancel an in-flight operation",

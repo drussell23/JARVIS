@@ -405,8 +405,10 @@ class TestMitigationDerivation:
 
 class TestExtractFailureMode:
     def test_disabled_when_master_off(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_FAILURE_MODE_MEMORY_ENABLED", raising=False,
+        # Slice 5 graduated default-true; force off to test the
+        # disabled path explicitly.
+        monkeypatch.setenv(
+            "JARVIS_FAILURE_MODE_MEMORY_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.failure_mode_memory import (  # noqa: E501
             ExtractionOutcome,
@@ -600,6 +602,10 @@ class TestRecordFailureMode:
     def test_disabled_when_master_off(
         self, monkeypatch, tmp_path,
     ):
+        # Slice 5 graduated default-true; force off explicitly.
+        monkeypatch.setenv(
+            "JARVIS_FAILURE_MODE_MEMORY_ENABLED", "false",
+        )
         monkeypatch.setenv(
             "JARVIS_FAILURE_MODE_HISTORY_DIR", str(tmp_path),
         )
@@ -920,8 +926,10 @@ class TestRecordPostmortem:
     def test_disabled_propagates_through_composer(
         self, monkeypatch, tmp_path,
     ):
-        monkeypatch.delenv(
-            "JARVIS_FAILURE_MODE_MEMORY_ENABLED", raising=False,
+        # Slice 5 graduated default-true; force off to test the
+        # disabled path explicitly.
+        monkeypatch.setenv(
+            "JARVIS_FAILURE_MODE_MEMORY_ENABLED", "false",
         )
         monkeypatch.setenv(
             "JARVIS_FAILURE_MODE_HISTORY_DIR", str(tmp_path),

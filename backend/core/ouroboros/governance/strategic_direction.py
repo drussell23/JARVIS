@@ -212,6 +212,7 @@ class StrategicDirectionService:
                 DEFAULT_PROMPT_SECTION_BUDGET,
                 classify_situation_from_ctx,
                 compose_failure_modes_section,
+                publish_failure_mode_recalled,
                 retrieve_failure_modes,
             )
         except ImportError:
@@ -226,10 +227,29 @@ class StrategicDirectionService:
             )
             if not matches:
                 return ""
-            return compose_failure_modes_section(
+            section = compose_failure_modes_section(
                 matches,
                 max_chars=DEFAULT_PROMPT_SECTION_BUDGET,
             )
+            if not section:
+                return ""
+            # Slice 5 SSE — fires once per successful injection.
+            # Best-effort; failure to publish never breaks prompt
+            # composition. ``op_id`` is opaque here (called from
+            # the generic prompt composer); Slice 6 onward may
+            # propagate it via ctx.
+            try:
+                top = matches[0]
+                publish_failure_mode_recalled(
+                    op_id="",
+                    situation_kind=situation.value,
+                    match_count=len(matches),
+                    top_signature=top.record.signature_hash,
+                    top_weight=int(top.record.weight),
+                )
+            except Exception:  # noqa: BLE001 — fail-silent
+                pass
+            return section
         except Exception:  # noqa: BLE001 — fail-silent
             return ""
 

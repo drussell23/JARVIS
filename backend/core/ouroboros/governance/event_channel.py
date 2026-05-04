@@ -692,6 +692,45 @@ class EventChannelServer:
                     "wiring failed: %s", sb_exc,
                 )
 
+            # Upgrade 3 Slice 5 — Failure-Mode Memory at GENERATE
+            # observability routes (PRD §31.4). Mirrors the
+            # Slice 5b A-E blocks above structurally:
+            # loopback-asserted, rate-limited via shared
+            # IDEObservabilityRouter helper, CORS-aware, mount
+            # unconditional (per-request _gate() runs
+            # failure_mode_memory_enabled()). Producer side is
+            # the postmortem→extractor→persistence chain owned
+            # by the orchestrator's POSTMORTEM-failed path.
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+                    IDEObservabilityRouter as _IDEObsRouterFM,
+                    assert_loopback_only as _assert_loopback_fm,
+                )
+                from backend.core.ouroboros.governance.failure_mode_memory_observability import (  # noqa: E501
+                    register_failure_mode_routes,
+                )
+                _assert_loopback_fm(self._host)
+                _fm_helper = _IDEObsRouterFM()
+                register_failure_mode_routes(
+                    app,
+                    rate_limit_check=lambda req: (
+                        _fm_helper._check_rate_limit(
+                            _fm_helper._client_key(req),
+                        )
+                    ),
+                    cors_headers=_fm_helper._cors_headers,
+                )
+            except ValueError as fm_loopback_exc:
+                logger.warning(
+                    "[EventChannel] failure-mode observability "
+                    "refused: %s", fm_loopback_exc,
+                )
+            except Exception as fm_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] failure-mode observability "
+                    "wiring failed: %s", fm_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is

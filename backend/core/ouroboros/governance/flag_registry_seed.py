@@ -2989,6 +2989,107 @@ SEED_SPECS: list = [
         example="JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S=10.0",
         since="Defect #4 fix (2026-05-03)",
     ),
+
+    # ========================================================================
+    # Upgrade 3 — Failure-Mode Memory at GENERATE (PRD §31.4) — 5 flags
+    # Slice 5 graduation: master flips false → true; 4 supporting knobs
+    # surfaced for operator visibility into the recurrence-recall loop.
+    # ========================================================================
+    FlagSpec(
+        name="JARVIS_FAILURE_MODE_MEMORY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the Failure-Mode Memory subsystem. "
+            "Default TRUE post Slice 5 graduation (2026-05-04). "
+            "Pure-RAG: extractor uses regex over postmortem evidence "
+            "(zero LLM); retriever is deterministic enum-match + "
+            "Jaccard + log-scale weight + 14d half-life recency; "
+            "injection is markdown render with 3KB budget cap "
+            "amortized by Anthropic prompt cache. Per-op cost is "
+            "<= 3KB prompt bytes. Operator instant-revert via "
+            "explicit env false."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/failure_mode_memory.py"
+        ),
+        example="true",
+        since="Upgrade 3 Slice 5 (graduated PRD §31.4, 2026-05-04)",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_FAILURE_MODE_HISTORY_MAX_RECORDS",
+        type=FlagType.INT, default=5000,
+        description=(
+            "Bounded ring-buffer cap for the JSONL store at "
+            ".jarvis/failure_mode_memory/failure_modes.jsonl. "
+            "Default 5000 (~300KB at ~60B/record per PRD §31.4.3 "
+            "cost contract). Clamped [50, 100000]. Truncation is "
+            "tail-keep-most-recent under flock'd critical section."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/failure_mode_memory.py"
+        ),
+        example="5000",
+        since="Upgrade 3 Slice 2 (2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_FAILURE_MODE_DEDUP_WINDOW_DAYS",
+        type=FlagType.INT, default=30,
+        description=(
+            "Recurrence dedup window. Records sharing a "
+            "signature_hash within this window are merged "
+            "(weight++) instead of appended. Default 30 (PRD "
+            "§31.4.6). Clamped [1, 365]. The min-weight=2 "
+            "first-attempt-injection gate (memory pollution "
+            "defense) operates within this window."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/failure_mode_memory.py"
+        ),
+        example="30",
+        since="Upgrade 3 Slice 2 (2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_FAILURE_MODE_TOP_K",
+        type=FlagType.INT, default=3,
+        description=(
+            "Maximum number of matches the retriever returns at "
+            "first-attempt GENERATE. PRD §31.4.6 default 3 — "
+            "diversity-deduped per Coherence Auditor pattern "
+            "(at most one match per attempted_action_kind). "
+            "Clamped [1, 10]. Higher values inflate the prompt; "
+            "lower values reduce diversity coverage."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/failure_mode_memory.py"
+        ),
+        example="3",
+        since="Upgrade 3 Slice 3 (2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_FAILURE_MODE_MIN_WEIGHT",
+        type=FlagType.INT, default=2,
+        description=(
+            "Memory pollution defense (PRD §31.4.6). Records with "
+            "``weight < N`` are filtered before retrieval — only "
+            "signatures that have recurred at least N times in "
+            "the dedup window are eligible for first-attempt "
+            "prompt injection. Default 2; one-off failures stay "
+            "in retry-context recall (PostmortemRecall) but never "
+            "pollute first-attempt prompts. Clamped [1, 100]."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/failure_mode_memory.py"
+        ),
+        example="2",
+        since="Upgrade 3 Slice 3 (2026-05-04)",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
 ]
 
 

@@ -2398,6 +2398,166 @@ def validate_all() -> Tuple[InvariantViolation, ...]:
     return tuple(out)
 
 
+# ---------------------------------------------------------------------------
+# Upgrade 3 — Failure-Mode Memory at GENERATE (PRD §31.4) — 4 pins
+# ---------------------------------------------------------------------------
+
+
+def _validate_failure_mode_memory_no_authority_imports(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """Upgrade 3 Slice 5 — failure_mode_memory.py must NOT import
+    orchestrator-tier modules. The whole 5-slice arc is a
+    pure-RAG substrate: extractor (regex-only), retriever
+    (deterministic enum + Jaccard + log-scale weight), injection
+    (markdown render). Zero LLM calls structurally guaranteed by
+    the absence of provider imports.
+
+    NEVER raises."""
+    forbidden = (
+        "orchestrator", "iron_gate", "policy", "change_engine",
+        "candidate_generator", "providers", "doubleword_provider",
+        "urgency_router", "auto_action_router",
+        "subagent_scheduler", "tool_executor", "phase_runners",
+        "semantic_guardian", "semantic_firewall", "risk_engine",
+        # Slice 1 docstring contract: the dependency direction is
+        # strategic_direction -> failure_mode_memory, NEVER the
+        # reverse. Pin this asymmetry structurally.
+        "strategic_direction",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        module = (
+            node.module if isinstance(node, ast.ImportFrom)
+            else (node.names[0].name if node.names else "")
+        )
+        module = module or ""
+        for f in forbidden:
+            if f in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden authority import "
+                    f"contains {f!r}: {module}"
+                )
+    return tuple(violations)
+
+
+def _validate_failure_mode_observability_read_only(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """Upgrade 3 Slice 5 — the HTTP observability layer is
+    read-only by contract. It MUST NOT call mutation surfaces
+    (record_failure_mode / clear_failure_mode_history /
+    record_postmortem). The /failures REPL's ``clear`` subcommand
+    is the only operator-mutating surface; HTTP routes never
+    mutate.
+
+    NEVER raises."""
+    forbidden_calls = (
+        "record_failure_mode",
+        "record_postmortem",
+        "clear_failure_mode_history",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            target = ""
+            if isinstance(node.func, ast.Name):
+                target = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                target = node.func.attr
+            for f in forbidden_calls:
+                if target == f:
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: failure_mode_memory_-"
+                        f"observability is read-only — found "
+                        f"call to {f}() (mutating surface)"
+                    )
+    return tuple(violations)
+
+
+def _validate_failure_mode_memory_master_default_true(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """Upgrade 3 Slice 5 — bytes-pin the graduated default-true
+    contract (PRD §31.4). If a future refactor flips the default
+    back to False, this pin trips immediately.
+
+    Mirrors the established discipline from
+    coherence_auditor_enabled / cigw_enabled / quorum_enabled
+    graduated flags.
+
+    NEVER raises."""
+    violations: List[str] = []
+    # The graduated default-true contract is pinned by these two
+    # adjacent literal markers in failure_mode_memory_enabled():
+    #   if raw == "":
+    #       return True  # Slice 5 graduated default
+    if "Slice 5 graduated default" not in source:
+        violations.append(
+            "failure_mode_memory.py dropped its 'Slice 5 "
+            "graduated default' marker — graduation contract "
+            "may have regressed (master flipped back to false?)"
+        )
+    if "graduated PRD §31.4 Slice 5" not in source:
+        violations.append(
+            "failure_mode_memory_enabled() docstring no longer "
+            "states the PRD §31.4 graduation — graduation "
+            "documentation may have regressed"
+        )
+    return tuple(violations)
+
+
+def _validate_failure_mode_injection_via_strategic_direction(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """Upgrade 3 Slice 5 — strategic_direction.py is the SOLE
+    first-attempt injection surface for failure-mode memory
+    (PRD §31.4). The lazy import + render method together form
+    the structural injection point; refactors that move the
+    injection elsewhere (or break the lazy-import discipline)
+    trip this pin.
+
+    Pinned by required tokens:
+      * ``_render_failure_modes_section`` — the canonical render
+        method must exist
+      * ``compose_failure_modes_section`` — the lazy import must
+        consume the rendering primitive
+      * ``classify_situation_from_ctx`` — the lazy import must
+        consume the forward-direction classifier
+      * ``publish_failure_mode_recalled`` — the SSE publish hook
+        must remain wired (Slice 5 observability contract)
+
+    NEVER raises."""
+    required = (
+        ("_render_failure_modes_section",
+         "render method dropped — failure-mode injection point "
+         "may have moved out of strategic_direction"),
+        ("compose_failure_modes_section",
+         "lazy import of compose_failure_modes_section dropped "
+         "— Slice 4 rendering contract may have regressed"),
+        ("classify_situation_from_ctx",
+         "lazy import of classify_situation_from_ctx dropped "
+         "— forward-direction classifier no longer wired"),
+        ("publish_failure_mode_recalled",
+         "lazy import of publish_failure_mode_recalled dropped "
+         "— Slice 5 SSE observability hook may have regressed"),
+    )
+    violations: List[str] = []
+    for token, reason in required:
+        if token not in source:
+            violations.append(
+                f"strategic_direction.py dropped {token!r} — "
+                f"{reason}"
+            )
+    return tuple(violations)
+
+
 def _validate_confidence_threshold_tightener(
     tree: ast.AST, source: str,
 ) -> Tuple[str, ...]:
@@ -2931,6 +3091,106 @@ def _register_seed_invariants() -> None:
                 "threshold=1 single-roll consensus)."
             ),
             validate=_validate_quorum_cap_structure_pinned,
+        ),
+    )
+    # ----------------------------------------------------------------
+    # Upgrade 3 — Failure-Mode Memory at GENERATE (PRD §31.4) — 4 pins
+    # Closes the recurrence-degradation loop the operator described
+    # ("relearns the same lesson 100x") via cross-op pattern
+    # accumulation. Slice 5 graduation flips master default-true.
+    # ----------------------------------------------------------------
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "failure_mode_memory_no_authority_imports"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "failure_mode_memory.py"
+            ),
+            description=(
+                "Failure-Mode Memory module MUST NOT import "
+                "orchestrator / iron_gate / providers / "
+                "candidate_generator / urgency_router / "
+                "tool_executor / strategic_direction (the "
+                "dependency asymmetry: strategic_direction -> "
+                "failure_mode_memory, NEVER the reverse). Zero "
+                "LLM call paths structurally guaranteed by the "
+                "absence of provider imports."
+            ),
+            validate=(
+                _validate_failure_mode_memory_no_authority_imports
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "failure_mode_observability_read_only"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "failure_mode_memory_observability.py"
+            ),
+            description=(
+                "HTTP observability layer is read-only by "
+                "contract. MUST NOT call record_failure_mode / "
+                "record_postmortem / clear_failure_mode_history. "
+                "The /failures REPL's clear subcommand is the "
+                "only operator-mutating surface; HTTP routes "
+                "never mutate."
+            ),
+            validate=(
+                _validate_failure_mode_observability_read_only
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "failure_mode_memory_master_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "failure_mode_memory.py"
+            ),
+            description=(
+                "Slice 5 graduation contract: master flag "
+                "JARVIS_FAILURE_MODE_MEMORY_ENABLED defaults "
+                "TRUE on unset env. If a future refactor flips "
+                "this back to False, this pin trips so the "
+                "regression is caught structurally before "
+                "shipping. Mirrors graduated default-true "
+                "discipline from coherence / cigw / quorum."
+            ),
+            validate=(
+                _validate_failure_mode_memory_master_default_true
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "failure_mode_injection_via_strategic_direction"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "strategic_direction.py"
+            ),
+            description=(
+                "strategic_direction.py is the SOLE first-attempt "
+                "injection surface for failure-mode memory "
+                "(PRD §31.4 Slice 4). Pins the canonical "
+                "_render_failure_modes_section method + lazy "
+                "imports of compose_failure_modes_section / "
+                "classify_situation_from_ctx / "
+                "publish_failure_mode_recalled. Catches refactors "
+                "that move the injection elsewhere or break the "
+                "lazy-import (ImportError-safe) discipline."
+            ),
+            validate=(
+                _validate_failure_mode_injection_via_strategic_direction
+            ),
         ),
     )
     # Priority #1 Slice 5 — Coherence Auditor graduation pins.
