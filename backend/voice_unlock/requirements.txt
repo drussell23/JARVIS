@@ -16,7 +16,7 @@ psutil>=5.9.0
 matplotlib>=3.5.0
 
 # Bluetooth for Apple Watch
-bleak>=0.20.0  # Cross-platform Bluetooth LE
+bleak>=3.0.2  # Cross-platform Bluetooth LE
 # pyobjc-framework-CoreBluetooth>=8.0  # macOS only (optional)
 
 # API dependencies
