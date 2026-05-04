@@ -1,7 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.10 (2026-05-04 — **§31 Critical Path Systemic Upgrades v3 added** — operator-prompted; 3 cross-cutting epistemic-loop closures composing existing substrate (Bounded Epistemic Loop / DecisionRecord Causality Graph / Failure-Mode Memory at GENERATE-prompt-construction); each ~5–9d, ~5-slice arcs; sequencing interleaved with §30 ASCO arcs per §31.6 (Failure-Mode Memory first / DecisionRecord precedes ArchitectureProposer / Bounded Epistemic Loop precedes CuriosityGradient); estimated 6–8 weeks for all three + §30 M9–M11; see also v2.9 entry below for §30 ASCO Mapping.)
+**Version**: 2.11 (2026-05-04 — **§32 added** — three-way operator-prompted recon: (1) `graduation_orchestrator.py` 1,137-line dead-code bit-rot assessment — imports aren't dead, but architecture is stale vs 12 modern cage components; verdict: salvage *design* (15-phase FSM + AdaptiveThreshold + H1–H6 + 5-layer validation), archive *code*; (2) M10 ArchitectureProposer slice plan refined per §32.4 — supersedes §30.5.2 with battle-tested design template inheritance; M10 estimate stays ~7–10d, content sharper; cleanup arc (~1d) lands post-M10-graduation; (3) targeted Venom enhancements (V1 per-tool hooks + V2 permission callbacks + V3 async outputs + V4 regex matchers) — adopted FROM Agent SDK architecture without migrating Venom to `@tool()`; plus 2 patterns from `anthropics/claude-code` GitHub recon (Operation Modes `plan/analyze/apply/auto` + Component Tool Scope) as standalone arcs; 5 SDK/repo patterns explicitly skipped (`@tool()`, `ClaudeSDKClient`, dynamic context injection, settings hierarchy, plugin marketplace). Updated §31.6 sequencing now spans 11 strict-ordered items + 6 parallel-executable; estimated calendar to "earned ASCO + closed epistemic loops + Venom-enhanced + cleanup-complete" 8–10 weeks. See v2.10 below for §31 Critical Path Systemic Upgrades v3.)
+**Version (prior)**: 2.10 (2026-05-04 — **§31 Critical Path Systemic Upgrades v3 added** — operator-prompted; 3 cross-cutting epistemic-loop closures composing existing substrate (Bounded Epistemic Loop / DecisionRecord Causality Graph / Failure-Mode Memory at GENERATE-prompt-construction); each ~5–9d, ~5-slice arcs; sequencing interleaved with §30 ASCO arcs per §31.6 (Failure-Mode Memory first / DecisionRecord precedes ArchitectureProposer / Bounded Epistemic Loop precedes CuriosityGradient); estimated 6–8 weeks for all three + §30 M9–M11; see also v2.9 entry below for §30 ASCO Mapping.)
 **Version (prior)**: 2.9 (2026-05-04 — **§30 ASCO Mapping added** — operator-prompted file:line-anchored honesty audit of the "Autonomous Self-developing Cognitive Organism" framing. Structural truth on 4 of 8 sub-axes today (proactive initiation, self-modification, state continuity, governance cage); 3 buildable arcs scoped (M9 `CuriosityGradient` ~5–7d, M10 `ArchitectureProposer` ~7–10d, M11 `ActionOutcomeMemory` ~5–7d) closing intrinsic-motivation, weak-ontogeny, in-context-grounding gaps via existing substrate (`ProphecyEngine`/`SensorGovernor`/`CapabilityGapSensor`/`OpportunityMinerSensor`/`GenerativeQuorum`/`SemanticIndex`/`PostmortemRecallService`/`MemoryEngine`/`ConversationBridge`) — zero new external dependencies; 1 long-horizon arc (M12 `JPrimeLoRA`, 6–12 month, operator-gated) closes in-weight learning; canonical phrasing recommended: **"proactive, self-modifying, governance-bounded autonomous substrate"**; CLI UI/UX article ports identified (`PrincipleManifest` + `SerpentFlowSnapshotter` + `CLIStyleGuide.md`); Playwright-style visual diff explicitly NOT worth porting; sequencing M11→M9→M10 + parallel CLI ports recommended. Prior §29 (Post-Priority-#2 Brutal Review) remains canonical critical-path reference for current authorized work. CC2 follow-ups landed same-day as §30 — `ClaudeStyleTransport` Protocol-conformant + `Update(<path>:<line>)` diff blocks + multi-line cwd/mode/posture REPL prompt + `serpent_flow_repl_prompt_helper_present` AST pin (37→38 invariants); 1562/1562 governance sweep green.)
 **Author**: Derek J. Russell (vision) · Claude Opus 4.7 (PRD synthesis)
 **Audience**: Operator (decision authority), JARVIS engineers, future-self (resuming after context loss)
@@ -9,6 +10,7 @@
 **Latest review**: **§29 (post-Priority-#2, 2026-05-01)** — operator-driven post-Priority-#2-closure brutal review; structural=A, empirical=A−. Supersedes §28 v9 on grade + critical path. §28 retained for historical narrative + file:line evidence.
 **Latest section addition**: **§30 (ASCO Mapping, 2026-05-04)** — operator-prompted truth audit of the ASCO label + 3 buildable arcs (M9/M10/M11) + long-horizon M12 J-Prime LoRA + CLI UX ports from operator-supplied article. §30 does NOT supersede §29 on critical path — Priority #3 Counterfactual Replay remains the authorized next work; M9–M11 are *post*-Priority-#3+Slice-5b.
 **Newest section addition**: **§31 (Critical Path Systemic Upgrades v3, 2026-05-04)** — operator-prompted; 3 cross-cutting epistemic-loop closures (Bounded Epistemic Loop / DecisionRecord Causality Graph / Failure-Mode Memory at GENERATE-prompt-construction). Composes with §30 arcs; sequencing per §31.6 interleaves with §30 (Failure-Mode Memory at item 3 / Bounded Epistemic Loop at item 5 / DecisionRecord Causality Graph at item 7). §31 does NOT supersede §29 on critical path either — Priority #3 + Slice 5b remain items 1+2.
+**Latest section addition**: **§32 (`graduation_orchestrator.py` Salvage + M10 Refinement + Venom Enhancements + GitHub Recon, 2026-05-04)** — three-way operator-prompted recon. **§32.4 supersedes §30.5.2** as the canonical M10 ArchitectureProposer slice plan (inheriting 15-phase FSM + Bayesian AdaptiveThreshold + H1–H6 hardening + 5-layer validation from the dead `graduation_orchestrator.py` *design*, not its *code*). §32.5 adds a 1-day cleanup arc post-M10-graduation. §32.6 adds 4 targeted Venom enhancements (V1–V4) without SDK migration. §32.7 adds 2 standalone arcs from `anthropics/claude-code` repo recon (Operation Modes + Component Tool Scope). §32.8 updates §31.6 sequencing to 11 strict-ordered + 6 parallel-executable items. **§32 does NOT supersede §29 on critical path** — Priority #3 + Slice 5b remain items 1+2.
 
 ---
 
@@ -118,6 +120,17 @@
     - [31.7 What Each Upgrade Does NOT Do (Anti-Goals)](#317-what-each-upgrade-does-not-do-anti-goals)
     - [31.8 Cross-References](#318-cross-references)
     - [31.9 Summary — Why These Three (and Why Now)](#319-summary--why-these-three-and-why-now)
+32. [`graduation_orchestrator.py` Salvage + M10 Refinement + Targeted Venom Enhancements + GitHub Recon (2026-05-04)](#32-graduation_orchestratorpy-salvage--m10-refinement--targeted-venom-enhancements--github-recon-2026-05-04) *(latest section)*
+    - [32.1 Why this section exists](#321-why-this-section-exists)
+    - [32.2 `graduation_orchestrator.py` — Bit-Rot Assessment](#322-graduation_orchestratorpy--bit-rot-assessment)
+    - [32.3 Verdict — Design Reference, Not Direct Integration](#323-verdict--design-reference-not-direct-integration)
+    - [32.4 M10 ArchitectureProposer — Refined Slice Plan (Supersedes §30.5.2)](#324-m10-architectureproposer--refined-slice-plan-supersedes-3052)
+    - [32.5 Cleanup Arc — `graduation_orchestrator.py` Removal](#325-cleanup-arc--graduation_orchestratorpy-removal)
+    - [32.6 Targeted Venom Enhancements — Agent SDK Architecture, NOT Migration](#326-targeted-venom-enhancements--agent-sdk-architecture-not-migration)
+    - [32.7 `anthropics/claude-code` GitHub Repo Recon — 3 Patterns Worth Porting](#327-anthropicsclaude-code-github-repo-recon--3-patterns-worth-porting)
+    - [32.8 Sequencing — Where §32 Fits in §31.6 (Updated 11-Item Operator-Binding Order)](#328-sequencing--where-32-fits-in-316-updated-10-item-operator-binding-order)
+    - [32.9 Cross-References](#329-cross-references)
+    - [32.10 Summary — Three Investigations, One Architectural Conclusion](#3210-summary--three-investigations-one-architectural-conclusion)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -303,6 +316,24 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
 - [ ] **U3 — Failure-Mode Memory at GENERATE-prompt-construction** (~5 slices, ~5–7 days): post-VERIFY-failed extractor derives `(situation_signature, failure_mode, mitigation)` triplet (pure stdlib + ast — no LLM); retriever surfaces matching prior failures into first-attempt GENERATE prompt via `StrategicDirection` injection. Symmetric negative-evidence pair to §30 M11 ActionOutcomeMemory's positive-evidence triplets. Reuses `adaptive_learning.py` + `governance/postmortem_recall.py` + `governance/strategic_direction.py` + `governance/semantic_index.py` + `governance/conversation_bridge.py` + `adaptation/_file_lock.py`. Min weight=2 (signature must recur ≥2× in 30d) before first-attempt injection. Master flag `JARVIS_FAILURE_MODE_MEMORY_ENABLED` default-true at graduation. **Sequenced 3rd** per §31.6 (highest immediate quality lift on the recurrence-degradation loop).
 
 **Phase 12 ANTI-GOALS (per §31.7)**: U1 does NOT solve cross-op degradation or non-determinism. U2 does NOT prevent bad decisions — it records them. U3 does NOT solve novel failures (the first time you fail at something, no memory exists).
+
+**Phase 13 — Targeted Venom Enhancements (V1+V2+V3+V4) + Operation Modes + Component Tool Scope** *(NEW 2026-05-04 — derived from §32.6 + §32.7)*: status — **NOT STARTED, parallel-executable with Phases 11+12** per §32.8. Selectively adopts 4 Agent-SDK architectural patterns FROM the SDK without migrating Venom to `@tool()` (operator decision recorded in §32.6.1) + 2 patterns from `anthropics/claude-code` GitHub repo recon. All cost-contract zero-LLM by construction.
+- [ ] **V1 — Per-tool-call hook granularity** (~3 slices, ~400 LOC, ~30 tests): closes phase-only-hook gap. Extends `LifecycleHookRegistry` with 6-value `ToolHookEvent` closed enum (`PRE_TOOL_USE / POST_TOOL_USE / PRE_TOOL_USE_FAILURE / POST_TOOL_USE_FAILURE / SUBAGENT_START / SUBAGENT_STOP`) wired into `tool_executor.py` round-loop boundaries. Hooks are read-only by construction. Master flag `JARVIS_VENOM_TOOL_HOOKS_ENABLED` default-false → graduation.
+- [ ] **V2 — Per-tool permission callbacks** (~2 slices, ~250 LOC, ~25 tests): closes static-permissions gap. `ToolPermissionDecision` 4-value enum (`ALLOW / DENY / ASK / DEFER`) + `PermissionRegistry` composable callback chain. `tool_executor.py` consults registry BEFORE V1 hooks. `ASK` routes through existing `InlineApprovalProvider`. **Sequenced after V1** (composes with V1's hook event types). Master flag `JARVIS_VENOM_TOOL_PERMISSIONS_ENABLED` default-false → graduation.
+- [ ] **V3 — Async hook outputs (fire-and-forget)** (~2 slices, ~200 LOC, ~20 tests): closes slow-hook-blocks-phase gap. Extends `HookCallback` Protocol with optional `is_async: bool` (default `False` = backward-compat); async hooks scheduled via `asyncio.create_task`; result discarded; exception logged. Master flag `JARVIS_HOOK_ASYNC_ENABLED` default-true at graduation (zero behavioral change when no async hooks registered).
+- [ ] **V4 — Tool-name regex matchers + closed-enum event types** (~1 slice, ~150 LOC, ~18 tests): closes exact-string-match-only gap. `HookMatcher` extends to `(event, tool_name_pattern)`; regex pre-compiled at registration; AST-pinned no-runtime-`re.compile`-in-hot-path. **Sequenced after V1**. Master flag `JARVIS_HOOK_REGEX_MATCHERS_ENABLED` default-true (matchers default `None` = match-all = backward-compat).
+- [ ] **Operation Modes (`plan/analyze/apply/auto`)** *(GitHub recon Pattern B)* (~1 slice, ~120 LOC, ~10 tests): closes "no dry-run / analyze-only mode" gap. `OperationMode` 4-value enum + `JARVIS_OPERATION_MODE` env knob (default `auto` = backward-compat); `tool_executor.py` consults mode before tool dispatch. `PLAN` denies all mutations; `ANALYZE` denies commits + push; `APPLY`/`AUTO` = status quo. Master flag `JARVIS_OPERATION_MODE_ENABLED` default-true at graduation.
+- [ ] **Component Tool Scope (per-sensor / per-subagent `allowed_tools`)** *(GitHub recon Pattern C)* (~2 slices, ~180 LOC, ~18 tests): closes "no per-component invocation scope" gap. Extends sensor/subagent metadata in `FlagRegistry` with optional `allowed_tools: tuple[str, ...]` regex patterns (default `None` = unrestricted = backward-compat). `tool_executor.py` consults active component's `allowed_tools` at dispatch (composes with V2 `PermissionRegistry`). `/help components` REPL verb shows per-component scope. **Sequenced after V2**. Master flag `JARVIS_COMPONENT_TOOL_SCOPE_ENABLED` default-false → graduation.
+
+**Phase 13 NOT-WORTH-PORTING (honest list per §32.6.6 + §32.7.4)**: Agent SDK `@tool()` decorator (operator decision; Venom mature), `ClaudeSDKClient` multi-turn class (Venom already does multi-turn), `query()` one-off helper (O+V is autonomous-substrate not interactive-CLI), `McpServerConfig` registration helpers (O+V already supports MCP via `mcp_tool_client.py`), streaming response builder (O+V has `stream_renderer.py` composing with `RenderConductor`), extended thinking config sugar (already configured via `JARVIS_THINKING_BUDGET_*`), session listing/tagging APIs (O+V has session JSONLs + `LastSessionSummary`), Dynamic Skill `!\`command\`` context injection (25–50ms hot-path latency cost; O+V's CONTEXT_EXPANSION is async-by-design), Subagent skills manifest preload (Phase B subagents are fork-bound), settings precedence hierarchy with managed policy (Trinity deployment doesn't have managed-settings-server paradigm), plugin namespace isolation + marketplace distribution (orthogonal infrastructure; revisit post-graduation), `/help` REPL discoverability extensions (already have `help_dispatcher.py`).
+
+**Phase 14 — `graduation_orchestrator.py` Cleanup Arc** *(NEW 2026-05-04 — derived from §32.5)*: status — **NOT STARTED, sequenced as item #9 in §32.8 — lands immediately after M10 (item #8) graduates default-true post-30+ proposal-acceptance audit**. Closes the dead-code orphan honestly, with provenance preserved.
+- [ ] **Move `graduation_orchestrator.py` to `archive/legacy/graduation_orchestrator_2026_04_06.py`** (preservable for historical reference; not deleted outright — design ancestor)
+- [ ] **Delete `tests/governance/test_graduation_orchestrator.py`** (301 lines; tests apply to archived code)
+- [ ] **Close TODO at `jarvis_intelligence.py:447`** by replacing `capabilities_graduated=0` with read from M10's `M10ProposalRecord` ledger
+- [ ] **Add archive note to `archive/legacy/README.md`** explaining the salvage history (M10 inherited the 15-phase FSM + Bayesian AdaptiveThreshold + H1–H6 hardening + 5-layer validation pipeline design)
+- [ ] **Add AST pin `graduation_orchestrator_archived_only`** in `shipped_code_invariants` asserting the module is NOT importable from production code (`backend/core/ouroboros/`, `backend/neural_mesh/`)
+- [ ] **PRD §32.5.2 update** with completion date + commit SHA
 
 **CC2 follow-ups (CLI parity)** *(landed 2026-05-04 — same-day as §30 addition)*: `ClaudeStyleTransport` Protocol-conformant (`name`/`notify`/`flush`/`shutdown`); ACTIVE_OP + TASK_LIST `StatusField` extension (9→11 members, AST-pinned); FILE_REF event handler renders `Update(<path>:<line>)` + N-added/M-removed + 5-line color-coded diff preview (matches CC's tool-call idiom); multi-line REPL prompt with cwd/mode/posture context + operator override via `JARVIS_PROMPT_TEMPLATE`; new AST pin `serpent_flow_repl_prompt_helper_present` (37→38 invariants); 35 new regression pins in `tests/governance/test_cc2_followups.py`; 1562/1562 governance sweep green.
 
@@ -4520,10 +4551,428 @@ The three upgrades aren't picked from a feature backlog. Each addresses a struct
 
 ---
 
+## 32. `graduation_orchestrator.py` Salvage + M10 Refinement + Targeted Venom Enhancements + GitHub Recon (2026-05-04)
+
+> Operator-prompted three-way recon: (1) is the dead-code `graduation_orchestrator.py` (1,137 lines) salvageable as the foundation for §30 M10 ArchitectureProposer? (2) what can we lift from the Claude Agent SDK architecture to enhance Venom *without* migrating to the SDK's `@tool()` decorator? (3) anything in the public `anthropics/claude-code` GitHub repo worth porting?
+> The mandate (verbatim): *"solve the root problem directly — without workarounds, brute force, or shortcut solutions"* + *"leverage the existing files and architecture within the codebase so we avoid duplication."*
+> This section answers all three honestly and folds the answers into the §31.6 sequencing.
+
+### 32.1 Why this section exists
+
+Three operator-prompted investigations converged on a single architectural conclusion: **leverage the design, refactor away from the dead code, port boundary-layer patterns selectively**. Each investigation:
+
+| Investigation | Outcome | Artifact in this section |
+|---|---|---|
+| Is `graduation_orchestrator.py` salvageable wholesale? | **No.** Imports aren't dead, but architecturally it predates 8 modern cage components | §32.2 + §32.3 |
+| Can M10 ArchitectureProposer inherit the salvageable design? | **Yes.** 15-phase FSM + Bayesian adaptive threshold + H1–H6 hardening + 5-layer validation are all worth lifting | §32.4 |
+| Should we delete the original? | **Yes, post-M10 lands.** Move to `archive/` first; close TODO at `jarvis_intelligence.py:447` by wiring to M10 | §32.5 |
+| Should Venom migrate to Agent SDK `@tool()`? | **No.** Operator preference confirmed. But selectively port 4 Agent-SDK architectural patterns into Venom without migration | §32.6 |
+| Does `anthropics/claude-code` have anything worth porting? | **Yes — 3 boundary-layer patterns** (hook matchers + async deferred / operation modes / component-level permission scoping). Plus 5 patterns explicitly skipped | §32.7 |
+
+### 32.2 `graduation_orchestrator.py` — Bit-Rot Assessment
+
+#### 32.2.1 Module overview
+
+| Property | Value |
+|---|---|
+| Path | `backend/core/ouroboros/governance/graduation_orchestrator.py` |
+| Lines | 1,137 |
+| Last modified | 2026-04-06 |
+| Test file | `tests/governance/test_graduation_orchestrator.py` (301 lines) |
+| Last 5 commits | `feat(rsi): wire adaptive threshold into EphemeralUsageTracker` → `feat(rsi): add Bayesian adaptive graduation threshold` → 3 unrelated commits before |
+| Production callers | **Zero.** Confirmed via grep across `backend/core/ouroboros/governance/`, `intake/`, `battle_test/`, `consciousness/`, `core_contexts/`, `subagent_scheduler.py`, `tool_executor.py`, `orchestrator.py` |
+| Exported via `__init__.py` | **No** |
+| Smoking-gun evidence | `backend/core/ouroboros/governance/jarvis_intelligence.py:447` — `capabilities_graduated=0,  # TODO: wire to GraduationOrchestrator` |
+
+The module's stated purpose (line 1–7): *"Self-programming loop that converts ephemeral tools into permanent agents. The final manifestation of the Ouroboros cycle: the snake eating its tail. When a synthesized ephemeral tool proves its value through repeated use, the Graduation Orchestrator drives J-Prime to produce a permanent agent, validates it through ShadowHarness, commits it to the correct repo on an isolated worktree branch, and with human approval pushes a PR to GitHub."*
+
+This is **structurally identical** to §30.5.2 M10 ArchitectureProposer's stated purpose: detect recurring patterns no existing sensor catches → propose new sensor classes → APPROVAL_REQUIRED-tier route through OrangePRReviewer.
+
+#### 32.2.2 Dependency audit — the surprising finding
+
+Bit-rot in the literal sense (broken imports) is **minimal**. Every external symbol the module imports still exists in the current codebase:
+
+| Imported symbol | Path | Status |
+|---|---|---|
+| `BrainSelector` | `governance/brain_selector.py` | ✅ exists |
+| `PrimeClient` | `core/prime_client.py` | ✅ exists |
+| `ResourceSnapshot` | `governance/resource_monitor.py` | ✅ exists |
+| `lifecycle_narrator.get_lifecycle_narrator` | `core/supervisor/lifecycle_narrator.py` | ✅ exists |
+| `topology_map.CapabilityNode` | `core/topology/topology_map.py` | ✅ exists |
+| `domain_trust_ledger.DomainTrustLedger` | `neural_mesh/synthesis/domain_trust_ledger.py` | ✅ exists |
+| `telemetry_contract.TelemetryEnvelope` | `core/telemetry_contract.py` | ✅ exists |
+| `shadow_harness.SideEffectFirewall` | `governance/shadow_harness.py` | ✅ exists |
+| `coding_council.safety.ast_validator.ASTValidator` | `core/coding_council/safety/ast_validator.py` | ✅ exists |
+| `coding_council.safety.security_scanner.SecurityScanner` | `core/coding_council/safety/security_scanner.py` | ✅ exists |
+| `BaseNeuralMeshAgent` | `neural_mesh/base/base_neural_mesh_agent.py` | ✅ exists |
+
+That's the rare case: **the bit-rot is architectural, not literal.**
+
+#### 32.2.3 Architectural staleness — what the module ignores from the modern cage
+
+| Cage component | Used by `graduation_orchestrator`? | Modern equivalent it ignores | Severity |
+|---|---|---|---|
+| `SemanticGuardian` (10 patterns) | ❌ **0 references** (verified via grep) | Layer 3 uses `ASTValidator` only — misses post-2026-04 patterns (`removed_import_still_referenced`, `function_body_collapsed`, `credential_shape_introduced`, `test_assertion_inverted`, `permission_loosened`, etc.) | HIGH |
+| `RenderConductor` (RenderEvent + EventKind taxonomy) | ❌ **0 references** | Telemetry routes through legacy `TelemetryBus` only — bypasses CC2-era render substrate | HIGH |
+| `IronGate` (exploration-first + ASCII gates) | ❌ no integration | Validation pipeline is parallel to, not composed with, Iron Gate's exploration ledger | HIGH |
+| `RiskTierFloor` (4-tier strictest-wins) | ❌ no integration | `AWAITING_APPROVAL` is hardcoded as a phase, not derived from risk tier | HIGH |
+| `OrangePRReviewer` (async-PR review path) | ❌ no integration | Custom file-polling approval (`_request_human_approval`, lines 840–864) duplicates this exactly | HIGH |
+| `AutoCommitter` (O+V signature commits) | ❌ no integration | Custom `_commit_to_branch` (lines 820–836) duplicates this | MEDIUM |
+| `WorktreeManager` (governed L3 isolation) | ❌ no integration | Custom `_create_worktree` (lines 498–529) calls `git worktree add` directly — bypasses orphan reaping, branch collision detection | MEDIUM |
+| `FlagRegistry` (typed env flags + posture-relevance) | ❌ no integration | Raw `os.environ.get` for `JARVIS_GRADUATION_THRESHOLD`, `JARVIS_GRADUATION_APPROVAL_TIMEOUT_S`, `OUROBOROS_ADAPTIVE_GRAD_*` (lines 38–52) | MEDIUM |
+| `ShippedCodeInvariants` (AST pins) | ❌ no AST pins on the module itself | Cage rules are unenforced at the structural level | MEDIUM |
+| `CandidateGenerator` 3-tier failback (Claude → DW → Prime) | ❌ Prime-only via direct `_prime.generate` (lines 459–465, 583–589) | Misses §26.6 cost contract entirely | HIGH |
+| `posture` awareness | ❌ no integration | HARDEN posture should pause graduation; MAINTAIN should slow it | LOW |
+| `SensorGovernor` cost cap | ❌ has its own H6 metering | Doesn't compose with the 200-ops/hour weighted cap | LOW |
+
+**Net**: 12 modern cage components ignored. Wiring `graduation_orchestrator` *as-is* would create two parallel governance pipelines: the modern one (Iron Gate + SemanticGuardian + RiskTier + OrangePR) for everything else, and the orchestrator's bespoke one for self-spawning agents. That's exactly the kind of architectural fragmentation the operator's mandate forbids.
+
+#### 32.2.4 What's structurally sound — the salvageable design
+
+Despite the architectural staleness, **5 design patterns are genuinely worth preserving** and would otherwise be reinvented in M10:
+
+1. **15-phase FSM with first-class failure paths** (lines 88–104):
+   ```
+   TRACKING → EVALUATING → DECIDED_SKIP → WORKTREE_CREATING → GENERATING →
+   VALIDATING → COMMITTING → AWAITING_APPROVAL → PUSHING → PUSH_FAILED →
+   AWAITING_MERGE → REGISTERING → GRADUATED → FAILED → REJECTED → EXPIRED
+   ```
+   Failure modes (`DECIDED_SKIP`, `PUSH_FAILED`, `EXPIRED`) are first-class enum values, not exception flows. This is *exactly* what M10 needs.
+
+2. **`compute_adaptive_threshold` Beta posterior + diversity ratio** (lines 63–85):
+   ```python
+   p_success = (1 + successes) / (2 + successes + failures)
+   diversity = min(1.0, unique_goals / total_uses) if total_uses > 0 else 0.0
+   effective_p = p_success * (0.5 + 0.5 * diversity)
+   threshold = max(MIN, ceil(CONFIDENCE / effective_p))
+   ```
+   Genuinely elegant Bayesian pattern. M10 would re-derive this; better to lift the closed-form.
+
+3. **H1–H6 hardening checklist** (lines 9–15, baked into method docstrings):
+   - **H1**: Git cleanliness check before mutation (`git status --porcelain`)
+   - **H2**: Contract tests, not just pytest (`BaseNeuralMeshAgent` interface)
+   - **H3**: `PUSH_FAILED` is an explicit phase (code preserved locally)
+   - **H4**: Approval timeout → discard worktree + log (30min default)
+   - **H5**: Post-merge registration requires readiness probe
+   - **H6**: Cost metering per J-Prime call (accumulated on `GraduationRecord`)
+   M10 would need every one of these. The checklist is the architectural specification.
+
+4. **5-layer validation pipeline with parallel execution** (`_validate_in_shadow`, lines 623–717):
+   - Layer 1: `SideEffectFirewall` compile check (synchronous gate)
+   - Layer 2: H2 contract test (interface presence)
+   - Layer 3: `ASTValidator` — syntax, imports, dangerous patterns, complexity ┐
+   - Layer 4: `SecurityScanner` — OWASP, injection, secrets detection         ├ via `asyncio.gather`
+   - Layer 5: pytest execution in worktree                                     ┘
+   The parallel-via-gather pattern + hard-fail semantics (no soft-skip on `ImportError`) is the correct shape. M10 inherits this with Layer 3 swapped for `SemanticGuardian`.
+
+5. **Cost-metering hook at every model call site** (H6, lines 467–476, 591–600):
+   ```python
+   if hasattr(response, "cost_usd") and self._brain_selector is not None:
+       cost = getattr(response, "cost_usd", 0.0)
+       record.total_cost_usd += cost
+       try:
+           self._brain_selector.record_cost(task_profile or "gcp_prime", cost)
+       except Exception:
+           pass
+   ```
+   M10 needs this exact pattern, but routed through the modern `urgency_router` + `candidate_generator` chain rather than direct `_prime.generate`.
+
+#### 32.2.5 Three integration paths — honest comparison
+
+| Path | Effort | Risk | What you get |
+|---|---|---|---|
+| **A. Wire `graduation_orchestrator.py` as-is** | ~3 days | **HIGH** — duplicates 12 cage components; runs parallel to modern substrate; first failure mode the cage can't see | A working graduation pipeline that **bypasses** SemanticGuardian + IronGate + OrangePR + AutoCommitter + RiskTierFloor |
+| **B. Refactor `graduation_orchestrator.py` to compose with the cage** | ~6–8 days | MEDIUM — ~70% of code needs rewriting (validation layer, telemetry, worktree, approval, commit, generate-call routing) | A graduation pipeline that fits — but at ~70% rewrite, you've effectively built M10 with extra bookkeeping |
+| **C. Build M10 ArchitectureProposer fresh, citing `graduation_orchestrator.py` as design ancestor** | ~7–10 days (per §30.5.2 estimate) | LOW — composes with cage by construction; no parallel-pipeline drift | A purpose-built M10 that inherits the *good ideas* (15-phase FSM, AdaptiveThreshold, H1–H6) without architectural debt |
+
+### 32.3 Verdict — Design Reference, Not Direct Integration
+
+**`graduation_orchestrator.py` is a brittle workaround as direct integration, but a goldmine as design reference.**
+
+The operator's mandate applied honestly:
+- *"Solve the root problem directly"*: the root problem is M10 ArchitectureProposer, not "make the dead module work"
+- *"Without workarounds"*: paths A and B are workarounds (A = parallel pipeline; B = 70% rewrite badged as integration)
+- *"Leverage existing files and architecture"*: the *architecture* to leverage is the design (FSM + AdaptiveThreshold + H1–H6 + 5-layer validation), not the code
+- *"Avoid duplication"*: paths A and B duplicate 12 cage components; path C composes with them by construction
+
+**Decision**: Path C — build M10 fresh, lift the salvageable design, archive the original post-M10. This is what "leverage existing files and architecture within the codebase so we avoid duplication" *actually* means in this case.
+
+### 32.4 M10 ArchitectureProposer — Refined Slice Plan (Supersedes §30.5.2)
+
+This subsection **supersedes §30.5.2** with the salvaged design from `graduation_orchestrator.py` woven into the slice plan. The original §30.5.2 estimate (~5 slices, ~2,200 LOC, ~250 tests, ~7–10 days) stands; the *content* of each slice is sharper.
+
+#### 32.4.1 Inherited design contracts
+
+| Inherited from | New M10 substrate |
+|---|---|
+| `GraduationPhase` 15-value FSM | `M10ProposalPhase` (closed enum, identical states with renamed values: `DETECTING / EVALUATING / DECIDED_SKIP / WORKTREE_CREATING / GENERATING / VALIDATING / COMMITTING / AWAITING_APPROVAL / PUSHING / PUSH_FAILED / AWAITING_MERGE / REGISTERING / GRADUATED / FAILED / REJECTED / EXPIRED`) |
+| `compute_adaptive_threshold` (Beta posterior + diversity) | `M10AdaptiveThreshold` (frozen dataclass + pure function); replaces the placeholder "min weight=2" check from §30.5.2 |
+| H1 (git cleanliness check) | Composes with `WorktreeManager.create()` — already does this implicitly, but M10 makes the assertion explicit pre-worktree-creation |
+| H2 (contract tests, not just pytest) | M10 generates new sensor classes; "contract" = `IntakeSensor` Protocol presence (`scan_once` async method + `signal_kind` class attr) |
+| H3 (`PUSH_FAILED` is an explicit phase) | `M10ProposalPhase.PUSH_FAILED` preserves the proposed-sensor branch locally for retry |
+| H4 (approval timeout → discard worktree + log) | Composes with `OrangePRReviewer`'s existing 24h-default review window; M10 adds a configurable per-proposal timeout |
+| H5 (post-merge registration requires readiness probe) | After PR merges, M10 imports the new sensor module + verifies `IntakeSensor` Protocol conformance + registers with `UnifiedIntakeRouter` |
+| H6 (cost metering per call) | Routes every model call through `urgency_router` + `candidate_generator`; cost auto-accumulates via existing route ledger; **no parallel cost system** |
+| 5-layer validation pipeline | Layer 1 stays (`SideEffectFirewall`); Layer 2 extends to Protocol conformance check; **Layer 3 becomes `SemanticGuardian.check()`** (10 patterns) replacing `ASTValidator`; Layer 4 stays (`SecurityScanner`); Layer 5 stays (pytest in worktree); parallel-via-`asyncio.gather` for Layers 3+4 inherits |
+
+#### 32.4.2 5-slice plan (refined)
+
+- **Slice 1 — Primitives**:
+  - `M10ProposalPhase` enum (15 values, frozen)
+  - `M10AdaptiveThreshold` frozen dataclass + `compute_threshold()` pure function (lifted directly from `compute_adaptive_threshold`, lines 63–85)
+  - `M10ProposalRecord` frozen dataclass (analogous to `GraduationRecord` but using `OrangePRReviewer` references not file-polling paths)
+  - `ProposalKind` closed enum (5 values: `NEW_SENSOR / NEW_PHASE / NEW_OBSERVER / NEW_FLAG_FAMILY / DISABLED`) — extends graduation_orchestrator's "NEW_AGENT" single-purpose to M10's broader scope
+  - Stdlib only. Master flag `JARVIS_M10_ARCH_PROPOSER_ENABLED` default-false. ~400 LOC, ~50 tests.
+- **Slice 2 — `UnhandledPatternMiner` async observer**:
+  - Subscribes to `intake_router.jsonl` + `coherence_history.jsonl`
+  - Detects (a) signal source/op-kind tuples that recur but never produce a discrete op, (b) RECURRENCE_DRIFT clusters above threshold
+  - Emits `M10ProposalRecord` candidates via `M10AdaptiveThreshold` gate
+  - Reuses `CapabilityGapSensor` + `OpportunityMinerSensor` patterns (composes, doesn't duplicate)
+  - ~450 LOC, ~55 tests.
+- **Slice 3 — `ProposalSynthesizer`** (LLM-bound):
+  - STANDARD-route via `urgency_router` (NOT direct provider call); Quorum K=3 mandatory
+  - Inputs: unhandled-pattern bundle from Slice 2
+  - Outputs: sensor-class skeleton or phase-injection patch + AST pin for the new code (mandatory — M10 *cannot* propose code without a self-pinning invariant)
+  - All output runs through Iron Gate (exploration-first floor) + SemanticGuardian (10 patterns) + risk-tier-floor (forced to `APPROVAL_REQUIRED`)
+  - H6 cost metering via `record.total_cost_usd` accumulated through route ledger
+  - ~600 LOC, ~70 tests.
+- **Slice 4 — Validation pipeline + `OrangePRReviewer` integration**:
+  - 5-layer validation (per §32.4.1) with `asyncio.gather` for Layers 3+4
+  - Generated proposal commits to a worktree via `WorktreeManager` (NOT direct subprocess)
+  - Commit via `AutoCommitter` (NOT custom `_commit_to_branch`)
+  - PR via `OrangePRReviewer.queue()` (NOT custom file-polling approval)
+  - On `PUSH_FAILED`: branch preserved locally + telemetry emit
+  - On post-merge: `_register_after_merge` analog wires the new sensor into `UnifiedIntakeRouter` after readiness probe
+  - ~500 LOC, ~60 tests.
+- **Slice 5 — Graduation**:
+  - **Master flag stays default-false in production until 30+ proposal acceptance-rate audit** (per §30.5.2)
+  - 4 AST pins: (a) no-bypass-of-Quorum (Slice 3), (b) no-bypass-of-OrangePR (Slice 4), (c) risk-tier-floor pinned at APPROVAL_REQUIRED, (d) post-graduation re-pin
+  - 5 FlagRegistry seeds (master + adaptive threshold knobs from H6)
+  - SSE event `m10_proposal_emitted` + `GET /observability/m10/{proposals,proposal/{id}}`
+  - REPL: `/m10 {pending, show <id>, history, stats}` (read-only)
+  - ~250 LOC, ~30 tests.
+
+**Total: ~2,200 LOC, ~265 tests, ~7–10 days** (matches §30.5.2 estimate; sharper content).
+
+#### 32.4.3 Cost contract (preserved by composition, not by duplication)
+
+- All model calls route through `candidate_generator` 3-tier failback (Claude → DW → Prime)
+- STANDARD route × Quorum K=3 = 3 generations/proposal × ~$0.005/op average ≈ $0.015/proposal
+- Hard-capped at `JARVIS_M10_MAX_DAILY` (default 5 proposals/day) → ≤$0.075/day total
+- BACKGROUND/SPECULATIVE routes refused at gate via existing `COST_GATED_ROUTES` AST pin (Move 6 pattern)
+- H6 cost metering accumulates via existing route ledger — **no parallel cost system**
+
+#### 32.4.4 Edge cases & nuances (refined per graduation_orchestrator hard-won lessons)
+
+- *Recursive proposal explosion* (proposer proposes a "ProposalProposer"): banned by AST pin — recursion-cycle detector on `ProposalKind` source paths. Inherits Phase B GENERAL `ScopedToolBackend` mutation-budget pattern. (Preserved from §30.5.2.)
+- *Operator-fatigue from low-quality proposals*: `MetaAdaptationGovernor`-style `proposal_acceptance_rate` rolling metric; if <30% over last 20 proposals, auto-pause the miner for a posture cycle. (Preserved from §30.5.2; AdaptiveThreshold's diversity ratio gives early signal.)
+- *Quine-class proposal* (proposer drafts a sensor that just re-fires the same signal it was meant to handle): Quorum's `ast_canonical` consensus catches identical patterns; Coherence Auditor catches subsequent recurrence. (Preserved from §30.5.2.)
+- *PUSH_FAILED scenarios* (network partition, rate limit, GitHub API outage): explicit `M10ProposalPhase.PUSH_FAILED`, branch preserved locally, retry surface via `/m10 retry <id>` REPL verb. (NEW — H3 inheritance from graduation_orchestrator.)
+- *Approval timeout governance*: `JARVIS_M10_APPROVAL_TIMEOUT_S` (default 86400 = 24h). On timeout: phase → `EXPIRED`, worktree cleaned via `WorktreeManager.remove()`. (NEW — H4 inheritance.)
+- *Post-merge readiness probe failure* (merged module fails to import or doesn't satisfy `IntakeSensor` Protocol): phase → `FAILED` with explicit error; new sensor NOT registered with `UnifiedIntakeRouter`. (NEW — H5 inheritance.)
+- *Architecture extensions break invariants*: every M10 proposal must include an AST pin for itself (mandatory at Slice 3); rejected at Iron Gate if missing. (Preserved from §30.5.2.)
+- *Adaptive threshold cold-start* (first 10 proposals, no historical data): `M10AdaptiveThreshold` returns `INSUFFICIENT_DATA`; defaults to fixed threshold of 3 successes (graduation_orchestrator's `_GRADUATION_THRESHOLD` default). (NEW — Bayesian primitive defensive default.)
+
+### 32.5 Cleanup Arc — `graduation_orchestrator.py` Removal
+
+#### 32.5.1 Scope
+
+Once M10 lands and graduates default-true after the 30+ proposal acceptance-rate audit:
+
+1. **Move `graduation_orchestrator.py` to `archive/legacy/graduation_orchestrator_2026_04_06.py`** (preservable for historical reference; not deleted outright — design ancestor)
+2. **Delete `tests/governance/test_graduation_orchestrator.py`** (301 lines; tests apply to archived code)
+3. **Close TODO at `jarvis_intelligence.py:447`** by replacing `capabilities_graduated=0` with read from M10's `M10ProposalRecord` ledger
+4. **Add archive note to `archive/legacy/README.md`** explaining the salvage history (M10 inherited the design; this file is preserved as the reference document)
+5. **Add `shipped_code_invariants` AST pin** asserting `graduation_orchestrator` is NOT importable from production code (`backend/core/ouroboros/`, `backend/neural_mesh/`) — only from `archive/`
+6. **Append PRD note** in §32.5.2 marking the cleanup as complete (with date + commit SHA)
+
+Cleanup arc is ~1 slice, ~2 days, ~30 tests (mostly the AST pin + the TODO-closure regression). Sequenced to land **immediately after M10 Slice 5 graduates default-true**.
+
+#### 32.5.2 Cleanup status (live tracking)
+
+- [ ] `graduation_orchestrator.py` moved to `archive/legacy/`
+- [ ] `tests/governance/test_graduation_orchestrator.py` removed
+- [ ] `jarvis_intelligence.py:447` TODO closed
+- [ ] `archive/legacy/README.md` salvage-history entry added
+- [ ] AST pin `graduation_orchestrator_archived_only` registered in `shipped_code_invariants`
+- [ ] PRD note in this subsection updated with completion date + commit SHA
+
+### 32.6 Targeted Venom Enhancements — Agent SDK Architecture, NOT Migration
+
+#### 32.6.1 Operator decision (recorded)
+
+> *"i don't want to migrate from Venom to Agent SDK's `@tool()` because i like to keep the Venom but at the same if we can take some of the architecture of how they made it flawlessly to improve Venom, then let's add that"*
+
+**Decision ratified**: Venom remains the canonical multi-turn agentic tool loop (`tool_executor.py`). The Agent SDK's `@tool()` decorator + `ClaudeSDKClient` are **not adopted**. Selective adoption of 4 architectural patterns from the SDK applies *to* Venom without any structural migration.
+
+#### 32.6.2 V1 — Per-tool-call hook granularity
+
+**What it is**: Venom currently has phase-boundary hooks via `LifecycleHookRegistry` (5 phases: CLASSIFY/ROUTE/GENERATE/APPLY/COMPLETE). The Agent SDK exposes 6 *tool-call-scoped* events: `PreToolUse`, `PostToolUse`, `PreToolUseFailure`, `PostToolUseFailure`, `SubagentStart`, `SubagentStop`.
+
+**Gap O+V has**: No way to fire a hook *before* a single tool call (e.g., "audit-log this `bash` invocation before it runs"; "block this `edit_file` if path matches forbidden glob"). Today these checks live in `tool_executor.py` directly — adding a new check requires modifying the executor.
+
+**Slice plan** (~3 slices, ~400 LOC, ~30 tests):
+- **Slice 1** — Closed `ToolHookEvent` enum (6 values: `PRE_TOOL_USE / POST_TOOL_USE / PRE_TOOL_USE_FAILURE / POST_TOOL_USE_FAILURE / SUBAGENT_START / SUBAGENT_STOP`). Frozen `ToolHookContext` dataclass. Reuses `LifecycleHookRegistry`'s `HookCallback` Protocol.
+- **Slice 2** — `tool_executor.py` integration at the round-loop boundaries: pre-call `_fire_pre_tool_hooks(tool_name, args)`; post-call `_fire_post_tool_hooks(tool_name, args, result)`. Failure paths fire `*_FAILURE` variants. Hooks are read-only by construction (return value indicates `allow / block / defer`, not mutate).
+- **Slice 3** — Graduation: master flag `JARVIS_VENOM_TOOL_HOOKS_ENABLED` default-false → graduation; 3 AST pins (hooks-no-mutation, executor-fires-on-every-tool-call-when-enabled, post-graduation re-pin); 5 FlagRegistry seeds.
+
+**Cost contract**: zero LLM calls. Hook callbacks are user-provided functions (operator-controlled cost).
+
+#### 32.6.3 V2 — Per-tool permission callbacks
+
+**What it is**: Agent SDK exposes a `can_use_tool(tool_name, args, context) -> Decision` callback returning `allow / deny / ask / defer`. Lets operators define dynamic permission rules per tool call.
+
+**Gap O+V has**: Tool permissions today are static (allowed-tools list per route + risk-tier gates). No way to say *"allow `bash` in `/tmp/...` but deny `bash rm -rf` everywhere"* without modifying core code.
+
+**Slice plan** (~2 slices, ~250 LOC, ~25 tests):
+- **Slice 1** — `ToolPermissionDecision` closed enum (4 values: `ALLOW / DENY / ASK / DEFER`). `ToolPermissionCallback` Protocol. `PermissionRegistry` (composable callback chain — first non-`DEFER` wins).
+- **Slice 2** — `tool_executor.py` consults `PermissionRegistry.evaluate(tool_name, args)` *before* `_fire_pre_tool_hooks` (V1). `DENY` raises `ToolPermissionDeniedError` (terminates op via existing failure path); `ASK` routes through inline approval (existing `InlineApprovalProvider`); `ALLOW` proceeds; `DEFER` falls through to next callback. Master flag `JARVIS_VENOM_TOOL_PERMISSIONS_ENABLED` default-false → graduation.
+
+**Cost contract**: zero LLM calls.
+
+#### 32.6.4 V3 — Async hook outputs (fire-and-forget)
+
+**What it is**: Agent SDK supports async hooks that return without blocking the agent loop. Used for webhook integrations, audit-log shipping, telemetry forwarding.
+
+**Gap O+V has**: All `LifecycleHookRegistry` callbacks are synchronous; a slow hook (e.g., posting to Slack) blocks the phase boundary. Today operators avoid slow hooks; they shouldn't have to.
+
+**Slice plan** (~2 slices, ~200 LOC, ~20 tests):
+- **Slice 1** — Extend `HookCallback` Protocol with optional `is_async: bool` attribute (default `False` — backward-compatible). Async hooks scheduled via `asyncio.create_task(hook(...))`; result discarded; exception logged.
+- **Slice 2** — `tool_executor.py` + `LifecycleHookRegistry` both honor `is_async`. Master flag `JARVIS_HOOK_ASYNC_ENABLED` default-true at graduation (zero behavioral change when no async hooks registered).
+
+**Cost contract**: zero LLM calls. Async tasks bounded by Python's event loop (no unbounded fan-out).
+
+#### 32.6.5 V4 — Tool-name regex matchers + closed-enum event types
+
+**What it is**: Agent SDK's hook config supports regex matchers (e.g., `Bash.*` matches all `bash` variants; `^mcp__github_.*` matches all GitHub MCP tools). Combined with V1's closed event types, this gives precise hook scoping.
+
+**Gap O+V has**: `LifecycleHookRegistry` matchers are exact-string-match (phase name only). No regex / no tool-name scoping (today's hooks fire on *every* phase boundary regardless of which tool was called).
+
+**Slice plan** (~1 slice, ~150 LOC, ~18 tests):
+- **Slice 1** — `HookMatcher` extends to `(event: ToolHookEvent | LifecyclePhase, tool_name_pattern: re.Pattern | None = None)`. Compiled at registration; matched at fire time. AST-pinned: regex must be pre-compiled (no runtime `re.compile` in hot path). Master flag `JARVIS_HOOK_REGEX_MATCHERS_ENABLED` default-true (matchers default to `None` = match-all = backward-compatible).
+
+**Cost contract**: zero LLM calls. Regex evaluated in-process; bounded by registered hook count.
+
+#### 32.6.6 What NOT to port from Agent SDK (explicit anti-list)
+
+| Pattern | Why not |
+|---|---|
+| `@tool()` decorator | Operator decision (§32.6.1) — Venom's manual schema is mature; migration buys clarity, not capability |
+| `ClaudeSDKClient` multi-turn class | Venom's tool loop already does multi-turn; class wrapper adds no functionality |
+| `query()` one-off helper | O+V is autonomous-substrate not interactive-CLI; one-off queries are not the access pattern |
+| `McpServerConfig` registration helpers | O+V already supports MCP via `mcp_tool_client.py` Gap #7; SDK helpers duplicate |
+| Streaming response builder | O+V has `stream_renderer.py`; SDK builder doesn't compose with `RenderConductor` |
+| Extended thinking config sugar | O+V already configures via `JARVIS_THINKING_BUDGET_*` env knobs; SDK sugar adds zero value |
+| Session listing / tagging APIs | O+V has session JSONLs at `.jarvis/sessions/<id>/` + `LastSessionSummary`; SDK abstraction layer would duplicate |
+
+### 32.7 `anthropics/claude-code` GitHub Repo Recon — 3 Patterns Worth Porting
+
+#### 32.7.1 Pattern A — Hook matcher groups + async deferred execution (unifies with §32.6.5 V4 + §32.6.4 V3)
+
+**What it is**: Claude Code's hook config supports matcher *groups* (tool-class regex matchers like `Bash(pattern)`, `Edit(path)`, `mcp__server__tool` patterns) + conditional `if` syntax (`"if": "approved"`) + async flag + deferred-execution queue for non-blocking hooks.
+
+**Folds into**: §32.6.5 V4 (regex matchers) + §32.6.4 V3 (async outputs). The Agent SDK and `claude-code` repo agree on these patterns; lifting them in V3+V4 covers both.
+
+**Net**: V3+V4 already cover this pattern via §32.6. **No new arc needed.**
+
+#### 32.7.2 Pattern B — Operation modes (`plan / analyze / apply / auto`)
+
+**What it is**: Claude Code's `settings.json::defaultMode` supports 5 execution modes: `default` (asks per tool), `plan` (read-only analysis), `auto` (background safety checks), `acceptEdits` (auto-accept file changes), `dontAsk` (deny unless pre-approved).
+
+**Gap O+V has**: O+V has 4-tier risk escalation (SAFE_AUTO / NOTIFY_APPLY / APPROVAL_REQUIRED / BLOCKED) but doesn't distinguish *style* of automation. No way to run O+V in "plan-only" mode (exploration without mutation) for low-risk audit sessions, or "apply-only" mode (auto-accept Edit but block Bash) for refactor-heavy sessions.
+
+**New arc** (~1 slice, ~120 LOC, ~10 tests):
+- **Slice 1** — `OperationMode` closed enum (4 values: `PLAN / ANALYZE / APPLY / AUTO`). `JARVIS_OPERATION_MODE` env knob (default `auto` = backward-compatible). `tool_executor.py` consults mode before tool dispatch:
+  - `PLAN` → all mutations (`edit_file`, `write_file`, `bash` write commands) denied; reads + reporting allowed
+  - `ANALYZE` → reads + reporting allowed; commits + push denied; tests allowed but not auto-fixed
+  - `APPLY` → status quo (existing behavior)
+  - `AUTO` → status quo (alias for `APPLY`; reserved for future "fully autonomous" expansion)
+  - Master flag `JARVIS_OPERATION_MODE_ENABLED` default-true at graduation (mode defaults to `AUTO` = byte-identical to current behavior)
+
+**Cost contract**: zero LLM calls; mode check is a single dict lookup per tool dispatch.
+
+#### 32.7.3 Pattern C — Frontmatter component-level permission scoping
+
+**What it is**: Claude Code's skill manifests (`SKILL.md` frontmatter) declare `allowed-tools: [Bash(git *), Read]` per skill — pre-approved tool scopes prevent broad-Bash escapes.
+
+**Gap O+V has**: `FlagRegistry` (481+ flags) is global; no per-sensor / per-subagent invocation scope. Operators have no in-session view of "sensor X has broad Bash access".
+
+**New arc** (~2 slices, ~180 LOC, ~18 tests):
+- **Slice 1** — Extend sensor/subagent metadata with optional `allowed_tools: tuple[str, ...]` field (regex patterns). Default `None` = unrestricted (backward-compatible). Stored in `FlagRegistry` alongside other component metadata.
+- **Slice 2** — `tool_executor.py` consults the active component's `allowed_tools` at tool dispatch (composes with V2 `PermissionRegistry`). Component-level `DENY` raises before V2 chain evaluates (component scope wins). `/help components` REPL verb shows per-component tool scope. Master flag `JARVIS_COMPONENT_TOOL_SCOPE_ENABLED` default-false → graduation.
+
+**Cost contract**: zero LLM calls.
+
+#### 32.7.4 What was investigated and skipped (honest list)
+
+| Pattern | Why skipped |
+|---|---|
+| Dynamic Skill context injection (`!\`command\`` syntax) | Adds 25–50ms latency per skill; high expressiveness gain but O+V's CONTEXT_EXPANSION is async-by-design; doesn't fit hot path |
+| Subagent skills manifest preload | O+V's Phase B subagents are fork-bound with hardcoded responsibilities; declarative skills manifest is nice-to-have, not load-bearing |
+| Settings precedence hierarchy (managed > CLI > local-project > shared-project > user) | O+V's Trinity deployment doesn't have managed-settings-server paradigm; benefit (centralized policy override for multi-user orgs) doesn't map to current scope |
+| Plugin namespace isolation + marketplace distribution | Requires npm/pip distribution infrastructure orthogonal to O+V's core mandate; revisit post-graduation if multi-team deployment becomes a thing |
+| `/help` REPL discoverability extensions | O+V already has `/help` verb ecosystem (`help_dispatcher.py` graduated 2026-04-21); minor UX additions don't warrant an arc |
+
+### 32.8 Sequencing — Where §32 Fits in §31.6 (Updated 10-Item Operator-Binding Order)
+
+§32 introduces 4 new arcs (V1–V4 Venom enhancements + Operation Mode + Component Tool Scope + Cleanup arc) and refines 1 existing arc (M10). Updated sequencing:
+
+| Order | Item | Source | Reason |
+|---|---|---|---|
+| 1 | Priority #3 Counterfactual Replay | §29.7 | Already authorized; in-flight |
+| 2 | Slice 5b consolidation (4 arcs) | §29.7 | Already authorized; parallel with #1 |
+| 3 | Upgrade 3 — Failure-Mode Memory at GENERATE | §31.4 | Pure RAG; zero new failure modes; fastest quality lift |
+| 4 | M11 — `ActionOutcomeMemory` | §30.5.3 | Symmetric pair to Upgrade 3 |
+| 5 | Upgrade 1 — Bounded Epistemic Loop | §31.2 | Closes per-op loop |
+| 6 | M9 — `CuriosityGradient` | §30.5.1 | Composes with Upgrade 1 |
+| 7 | Upgrade 2 — DecisionRecord Causality Graph | §31.3 | Foundation for safe RSI; precedes M10 |
+| 8 | **M10 — `ArchitectureProposer` (refined per §32.4)** | **§32.4 supersedes §30.5.2** | Inherits 15-phase FSM + AdaptiveThreshold + H1–H6 + 5-layer validation from `graduation_orchestrator.py` |
+| 9 | **`graduation_orchestrator.py` cleanup arc** | §32.5 | Lands immediately after M10 graduates default-true; ~1 slice |
+| 10 | CLI ports (parallel) | §30.8.1 | Sliceable in parallel |
+| 11 | M12 — `JPrimeLoRA` (operator-gated) | §30.6 | Long-horizon, conditional |
+
+**Parallel-executable with the above** (do not require strict ordering):
+
+| Item | Source | When |
+|---|---|---|
+| **Venom V1 — Per-tool-call hooks** | §32.6.2 | Anytime; ~3 slices |
+| **Venom V2 — Per-tool permission callbacks** | §32.6.3 | After V1 (V2 composes with V1's hook event types); ~2 slices |
+| **Venom V3 — Async hook outputs** | §32.6.4 | Anytime; ~2 slices |
+| **Venom V4 — Tool-name regex matchers + closed enums** | §32.6.5 | After V1 (V4 extends V1's matcher); ~1 slice |
+| **GitHub recon Pattern B — Operation Modes** | §32.7.2 | Anytime; ~1 slice |
+| **GitHub recon Pattern C — Component Tool Scope** | §32.7.3 | After V2 (composes with V2's `PermissionRegistry`); ~2 slices |
+
+**Estimated calendar to "earned ASCO + closed epistemic loops + Venom-enhanced + cleanup-complete"**: 8–10 weeks for items 3–11 + Venom V1–V4 + GitHub Patterns B+C, at established cadence. Adds ~1–2 weeks vs §31.6's 6–8-week estimate (the V1–V4 + B + C arcs are mostly parallel; M10 refinement is content-shift, not effort-add).
+
+### 32.9 Cross-References
+
+- §23.6 — Anti-Venom (M10 is the spawning arm of Anti-Venom; §32 makes M10 inherit a battle-tested design)
+- §26.6 — Cost contract (M10 cost contract preserved by composition with `urgency_router` + `candidate_generator`, NOT by parallel system)
+- §30.5.2 — Original M10 ArchitectureProposer scope (**superseded by §32.4**)
+- §30.8 — CLI UI/UX article ports (parallel to §32.7 GitHub recon — both are CC-ecosystem ports; §30.8 is doc-derived, §32.7 is repo-derived)
+- §31 — 3 systemic upgrades (§32 sequencing interleaves with §31.6)
+- `backend/core/ouroboros/governance/graduation_orchestrator.py` — the source artifact for §32.2 + §32.4 design inheritance
+- `backend/core/ouroboros/governance/jarvis_intelligence.py:447` — the TODO that closes when §32.5 cleanup completes
+
+### 32.10 Summary — Three Investigations, One Architectural Conclusion
+
+| Investigation | Finding | PRD action |
+|---|---|---|
+| Salvage `graduation_orchestrator.py`? | Imports aren't dead; **architecture is stale** vs 12 modern cage components. Wholesale revival = brittle workaround | §32.4 — lift design (15-phase FSM + AdaptiveThreshold + H1–H6 + 5-layer validation) into M10; §32.5 — archive original post-M10 |
+| Venom migration to Agent SDK? | **No** (operator decision). But 4 architectural patterns worth lifting | §32.6 — V1 per-tool hooks + V2 permission callbacks + V3 async outputs + V4 regex matchers, all *to* Venom without migration |
+| `anthropics/claude-code` repo worth porting? | **3 patterns** (Hook matchers unify with V3+V4; Operation Modes; Component Tool Scope). 5 patterns explicitly skipped | §32.7 — Pattern B (Operation Modes) + Pattern C (Component Tool Scope) as standalone arcs; Pattern A folded into V3+V4 |
+
+**Architectural conclusion**: leverage the *design* embedded in legacy code (`graduation_orchestrator`'s 15-phase FSM + Bayesian threshold + H1–H6 checklist), but author against the current cage. Selectively port boundary-layer patterns (Venom hooks, permission callbacks, operation modes, component scoping) from external sources, but never wholesale migrations that would duplicate or bypass the 12 cage components O+V already invested in. *That's* what "leverage existing files and architecture so we avoid duplication" means in practice — distinguish leveraging *architecture* from copying *code*.
+
+Net outcome: M10 ships with a battle-tested design template instead of from-scratch invention; Venom gets per-tool granularity it didn't have; O+V gains operation-mode flexibility (`plan` / `analyze` / `apply` / `auto`); the dead-code orphan is honestly archived with provenance preserved; the §31.6 sequencing absorbs §32 with ~1–2 additional weeks.
+
+---
+
 ## Appendix D — Document History
 
 | Date | Version | Change | Author |
 |---|---|---|---|
+| 2026-05-04 | 2.11 | **§32 added — three-way operator-prompted recon: `graduation_orchestrator.py` salvage + M10 refinement + targeted Venom enhancements + `anthropics/claude-code` GitHub repo recon.** **(1) `graduation_orchestrator.py` 1,137-line dead-code bit-rot assessment** (§32.2): the surprising finding is that **imports aren't dead** (all 11 external symbols still exist in current codebase) — the bit-rot is **architectural**, not literal. Module ignores 12 modern cage components (SemanticGuardian, RenderConductor, IronGate, RiskTierFloor, OrangePRReviewer, AutoCommitter, WorktreeManager, FlagRegistry, ShippedCodeInvariants, CandidateGenerator 3-tier failback, posture awareness, SensorGovernor cost cap). Three integration paths compared — (A) wire as-is = brittle parallel pipeline, (B) refactor 70% to fit cage = effectively rebuilds M10 with extra bookkeeping, (C) build M10 fresh + lift design = honors operator mandate. **Verdict (§32.3): Path C — design reference, not direct integration.** **(2) M10 ArchitectureProposer refined slice plan (§32.4 SUPERSEDES §30.5.2)**: inherits 5 salvageable design contracts — 15-phase `M10ProposalPhase` FSM (with first-class failure paths `DECIDED_SKIP / PUSH_FAILED / EXPIRED`) + `M10AdaptiveThreshold` Bayesian primitive (Beta posterior + diversity ratio, lifted directly from graduation_orchestrator lines 63–85) + H1–H6 hardening checklist (git cleanliness / contract tests / PUSH_FAILED preserves work / approval timeout / readiness probe / cost metering) + 5-layer validation pipeline (Layer 1 SideEffectFirewall + Layer 2 Protocol conformance + **Layer 3 SemanticGuardian.check() replacing ASTValidator** + Layer 4 SecurityScanner + Layer 5 pytest, with Layers 3+4 parallel via `asyncio.gather`) + cost-metering hook at every model call site. M10 estimate stays ~5 slices / ~2,200 LOC / ~265 tests / ~7–10d (matches §30.5.2; content sharper). Cost contract preserved by composition with `urgency_router` + `candidate_generator` (NOT parallel system). **(3) Cleanup arc (§32.5)**: ~1 slice / ~2d / ~30 tests landing immediately after M10 Slice 5 graduates default-true post-30+ proposal-acceptance audit — moves `graduation_orchestrator.py` to `archive/legacy/` (preservable for historical reference, not deleted outright); deletes `tests/governance/test_graduation_orchestrator.py` (301 lines); closes TODO at `jarvis_intelligence.py:447`; adds AST pin `graduation_orchestrator_archived_only` enforcing import-ban from production code. **(4) Targeted Venom enhancements (§32.6) — operator decision: keep Venom; do not migrate to Agent SDK `@tool()`** (verbatim quote: *"i don't want to migrate from Venom to Agent SDK's @tool() because i like to keep the Venom but at the same if we can take some of the architecture of how they made it flawlessly to improve Venom, then let's add that"*). Selective adoption of 4 architectural patterns FROM the SDK applies *to* Venom without structural migration: **V1 per-tool-call hook granularity** (~3 slices, ~400 LOC, ~30 tests; closes phase-only-hook gap; 6-value `ToolHookEvent` closed enum: `PRE_TOOL_USE / POST_TOOL_USE / PRE_TOOL_USE_FAILURE / POST_TOOL_USE_FAILURE / SUBAGENT_START / SUBAGENT_STOP`); **V2 per-tool permission callbacks** (~2 slices, ~250 LOC, ~25 tests; 4-value `ToolPermissionDecision` enum `ALLOW/DENY/ASK/DEFER` + `PermissionRegistry` composable callback chain; ASK routes through existing `InlineApprovalProvider`; sequenced after V1); **V3 async hook outputs fire-and-forget** (~2 slices, ~200 LOC, ~20 tests; extends `HookCallback` Protocol with optional `is_async: bool` default-False = backward-compat; closes slow-hook-blocks-phase gap); **V4 tool-name regex matchers + closed-enum event types** (~1 slice, ~150 LOC, ~18 tests; AST-pinned no-runtime-`re.compile`-in-hot-path; sequenced after V1). **(5) `anthropics/claude-code` GitHub repo recon (§32.7)**: 3 boundary-layer patterns worth porting — **Pattern A (Hook matchers + async deferred)** unifies with V3+V4 (no new arc); **Pattern B Operation Modes** (`plan/analyze/apply/auto`) ~1 slice / ~120 LOC / ~10 tests as standalone arc; **Pattern C Component Tool Scope** (per-sensor / per-subagent `allowed_tools` regex patterns) ~2 slices / ~180 LOC / ~18 tests as standalone arc, sequenced after V2. **5 SDK/repo patterns explicitly skipped** with rationale: `@tool()` decorator (operator decision), `ClaudeSDKClient` (Venom already multi-turn), `query()` one-off (O+V is autonomous-substrate not interactive-CLI), `McpServerConfig` helpers (already have `mcp_tool_client.py`), streaming response builder (have `stream_renderer.py` + `RenderConductor`), extended thinking sugar (have `JARVIS_THINKING_BUDGET_*`), session listing/tagging (have JSONLs + `LastSessionSummary`), Dynamic Skill `!\`command\`` context injection (25-50ms hot-path latency cost), Subagent skills manifest preload (fork-bound subagents), settings precedence hierarchy with managed policy (no managed-settings-server paradigm), plugin namespace isolation + marketplace (orthogonal infra), `/help` REPL discoverability extensions (already have `help_dispatcher.py`). **§32.8 updated sequencing**: 11 strict-ordered items + 6 parallel-executable. **Estimated calendar to "earned ASCO + closed epistemic loops + Venom-enhanced + cleanup-complete"**: 8–10 weeks (was 6–8 in §31.6 — adds ~1–2 weeks for V1–V4 + Pattern B+C + cleanup, mostly parallel-executable). Phase 13 (Venom enhancements + Operation Modes + Component Tool Scope) and Phase 14 (cleanup arc) appended to live roadmap. Header bumped 2.10 → 2.11. TOC §32 entries (10 anchors) added. **Architectural conclusion**: leverage *design* embedded in legacy code, but author against current cage. Selectively port boundary-layer patterns from external sources, but never wholesale migrations that would duplicate or bypass the 12 cage components O+V already invested in. *That's* what "leverage existing files and architecture so we avoid duplication" means in practice — distinguish leveraging **architecture** from copying **code**. | Claude Opus 4.7 (1M context) (§32 + Phase 13 + Phase 14 roadmap) |
 | 2026-05-04 | 2.10 | **§31 Critical Path Systemic Upgrades v3 added — 3 cross-cutting epistemic-loop closures.** Operator-prompted; mirrors the §29.4 / §28.6 / §27.4 / §26.5 / §25.5 / §24.10 "top 3 systemic upgrades" pattern but distinct from §30 (which closes ASCO capability axes). §31 closes **epistemic loops**: per-op information adequacy + cross-session decision reproducibility + cross-op pattern accumulation. Each upgrade is **glue over substrate that already ships** — value comes from composition, not new primitives. **Upgrade 1 — Bounded Epistemic Loop** (~5 slices, ~6–8d): single per-op information budget checked at every Venom tool round; auto-engage `PROBE_ENVIRONMENT` on confidence drop; auto-escalate to `NOTIFY_APPLY` on budget exhaustion without convergence; removes both infinite curiosity AND silent fail-poor-quality. Reuses `confidence_monitor.py` (788 LOC) + `confidence_probe_runner.py` + `confidence_probe_bridge.py` + `probe_environment_executor.py` + `hypothesis_probe.py` + `speculative_branch*` + `risk_tier_floor.py` + `tool_executor.py`. Hard cost cap ≤20 LLM calls/op worst-case; BG/SPEC refused at gate (mirrors Move 6 `COST_GATED_ROUTES` AST pin). Master flag `JARVIS_EPISTEMIC_BUDGET_ENABLED` default-false → graduation. **Upgrade 2 — DecisionRecord Causality Graph** (~5 slices, ~7–9d): append-only `decisions.jsonl` per session at 8 known decision sites (`urgency_router.classify` / `iron_gate.evaluate` / `validators/*.run` / `risk_tier_floor.escalate` / `confidence_probe_bridge.trigger` / `speculative_branch.spawn` / `auto_action_router.propose` / `orange_pr_reviewer.queue`); nightly `scripts/replay_determinism.py --session <id>` asserts byte-equal output for same inputs; reports drift as `DriftReport` rows reusing Move 4 InvariantDriftAuditor's drift-report shape. Foundation for **time-travel debugging** AND for **RSI safety** (cannot let O+V rewrite itself if you cannot prove its decisions are reproducible — directly serves §30 M10 ArchitectureProposer cage rule). Reuses `determinism/decision_runtime.py` + `determinism/phase_capture.py` + `auto_action_router.py` + `coherence_window_store.py` flock pattern + `_file_lock.py`. Pure substrate; zero LLM. ~1MB/session disk; ≤30s replay wall-clock. **Upgrade 3 — Failure-Mode Memory at GENERATE-prompt-construction** (~5 slices, ~5–7d): every postmortem extracts `(situation_signature, failure_mode, mitigation)` triplet via pure-stdlib pattern-match extractor (no LLM); retriever surfaces matching prior failures into **first-attempt GENERATE prompt** via `StrategicDirection` injection — moves matched-postmortem injection from retry-context (existing `adaptive_learning.py` + Priority #2 `PostmortemRecallService`) to first-attempt; without this the system relearns the same lesson 100× (exactly the non-deterministic degradation we want to solve). Symmetric negative-evidence pair to §30 M11 `ActionOutcomeMemory`'s positive-evidence triplets. Closed enums `SituationKind` (≥6 values incl. MULTI_FILE_REFACTOR / DB_MIGRATION / ASYNC_RESTRUCTURE / NEW_TEST_FRAMEWORK_INTEGRATION / API_VERSION_BUMP / CROSS_REPO_DRIFT_FIX) + `FailureModeKind` (≥7 values incl. MISSING_IMPORT / TYPE_MISMATCH / ASSERT_INVERTED / CIRCULAR_DEP_INTRODUCED / BANNED_TOKEN_INTRODUCED / TEST_TIMEOUT_REGRESSED / OTHER). Min weight=2 (signature must recur ≥2× in 30d) before first-attempt injection — bounded by construction against memory pollution from one-off failures. Reuses `adaptive_learning.py` + `postmortem_recall.py` + `strategic_direction.py` + `semantic_index.py` + `conversation_bridge.py` + `_file_lock.py`. Zero LLM cost on extraction OR retrieval; +≤3KB to GENERATE prompt amortized by Anthropic prompt cache. **Sequencing per §31.6** (operator-binding, interleaved with §29.7 + §30.10): items 1+2 = §29.7 Priority #3 + Slice 5b (already authorized); item 3 = U3 Failure-Mode Memory; item 4 = M11 ActionOutcomeMemory (symmetric pair); item 5 = U1 Bounded Epistemic Loop; item 6 = M9 CuriosityGradient (composes with U1); item 7 = U2 DecisionRecord Causality Graph; item 8 = M10 ArchitectureProposer (depends on U2); items 9+10 = CLI ports (parallel) + M12 JPrimeLoRA (operator-gated). **Estimated calendar to "earned ASCO + closed epistemic loops"**: 6–8 weeks for items 3–9 at established cadence. **§31 explicitly does NOT supersede §29.7 critical-path** — Priority #3 + Slice 5b remain operator-binding next work; §31 upgrades are *post*-Priority-#3+Slice-5b. **Anti-goals (§31.7)**: U1 does NOT solve cross-op degradation (that's U3) or non-determinism (that's U2). U2 does NOT prevent bad decisions — it records them so they're auditable + replay-able. U3 does NOT solve novel failures (first-time-failures still depend on Iron Gate + SemanticGuardian + tests). **Net architectural effect (§31.5 + §31.9)**: combined with §30 M9–M11, O+V transitions from "right by accident, sometimes" to "structurally bounded, structurally reproducible, structurally cumulative" — the architectural minimum for the §23.6 Anti-Venom thesis to be true at scale, not just at single-op resolution. Header bumped 2.9 → 2.10; TOC §31 entries (10 anchors) added; Phase 12 entries appended to live roadmap status table. | Claude Opus 4.7 (1M context) (§31 + Phase 12 roadmap) |
 | 2026-05-04 | 2.9 | **§30 ASCO Mapping added — operator-prompted truth audit + 3 buildable arcs (M9/M10/M11) + 1 long-horizon arc (M12) + CLI UI/UX ports.** New §30 (12 subsections) does file:line-anchored audit of the "Autonomous Self-developing Cognitive Organism" (ASCO) framing the operator surfaced. **Honest verdict**: O+V is structurally true on 4 of 8 ASCO sub-axes today (proactive initiation, self-modification, state continuity, governance cage); 3 are buildable from existing substrate without research-grade investment (intrinsic motivation, weak ontogeny, in-context embodiment); 1 is provider-gated (in-weight learning — viable only on J-Prime tier we control end-to-end). Recommended canonical phrasing: **"proactive, self-modifying, governance-bounded autonomous substrate"** — survives a hostile review. ASCO label is *aspirational* today; *earnable* post M9+M10+M11 (~3–4 weeks at established cadence). Three new arcs scoped (each 5-slice, mirrors Move 4–6 / Priority #1–5 pattern): **M9 `CuriosityGradient`** (~5–7d, closes intrinsic-motivation; reuses `prophecy_engine.py` + `confidence_capture.py` + `confidence_monitor.py` + `sensor_governor.py` + `semantic_index.py`; pure substrate zero LLM cost on hot path); **M10 `ArchitectureProposer`** (~7–10d, closes weak-ontogeny; reuses `capability_gap_sensor.py` + `opportunity_miner_sensor.py` + `generative_quorum.py` + `coherence_auditor.py` + `orange_pr_reviewer.py`; STANDARD-route Quorum K=3 mandatory; ≤$0.075/day capped; **stays default-false in production until 30+ proposal-acceptance audit**); **M11 `ActionOutcomeMemory`** (~5–7d, closes in-context embodiment; reuses `op_context.py:834` session_lessons + `postmortem_recall.py` + `semantic_index.py` + `user_preference_memory.py` + `memory_engine.py` + `conversation_bridge.py`; zero LLM cost on retrieval hot path; +≤4KB to GENERATE prompt amortized by prompt cache). **Sequencing recommendation**: M11 first (highest immediate quality lift, lowest risk) → M9 (curiosity benefits from M11's outcome substrate) → M10 (depends on Coherence Auditor RECURRENCE_DRIFT being well-calibrated post-M11). **Long-horizon M12 `JPrimeLoRA`** (6–12 month, operator-gated): only credible path to in-weight learning given Claude/DW are inference-only; requires data-curation pipeline + GCP training harness + eval harness + route gating; corpus filter must exclude reverted commits + RECURRENCE_DRIFT-flagged + low-Priority-#1-confidence (the Coherence + Confidence + Recall trio gives curation signal). **Honest NOT-WORTH-BUILDING list** (§30.7): strong-form ontogeny via NAS over FSM (compromises auditable-topology property), real humanoid embodiment (out of scope), curiosity-gradient requiring provider retraining (provider-gated), autonomous PR-merging on architecture proposals (cost-of-being-wrong asymmetric), in-weight learning for Claude/DW (provider-gated), continuous online RL (provider-gated + reward-hacking failure modes). **CLI UI/UX article ports** (operator-supplied, §30.8.1 — 3 worth doing): `PrincipleManifest` (typed manifesto principles into StrategicDirection injection, ~1-slice), `SerpentFlowSnapshotter` (ANSI-stripped render snapshots at op boundaries to `.jarvis/sessions/<id>/render_snapshot.txt` for forensic inspection, ~2-slice), `CLIStyleGuide.md` (one-screen design rules lifted from `RenderConductor` closed taxonomies). **NOT worth porting** (§30.8.2): Playwright-style visual diff for CLI output (35-test CC2 spine catches structural regressions; visual flake is operator-caught), atomic-CSS analogy past composer (terminal grid isn't HTML/CSS — premature abstraction). **Updated capability matrix vs CC + ASCO** (§30.9): O+V already exceeds CC on every row where they differ; post M9–M11, O+V satisfies most ASCO criteria honestly. **Sequencing does NOT preempt §29.7's authorized work** — Priority #3 Counterfactual Replay + Slice 5b consolidation remain the next operator-binding work; M9–M11 are *post*-Priority-#3+Slice-5b. **CC2 follow-ups landed same-day** (CLI parity polish): `ClaudeStyleTransport` Protocol-conformant (`name`/`notify`/`flush`/`shutdown`) + ACTIVE_OP + TASK_LIST `StatusField` extension (9→11 closed-taxonomy members) + FILE_REF event renders `Update(<path>:<line>)` block + N-added/M-removed stats + 5-line color-coded diff preview (matches CC's tool-call idiom) + multi-line REPL prompt with cwd/mode/posture context + operator override via `JARVIS_PROMPT_TEMPLATE` env var (defensive fallback to legacy single-line on bad placeholder) + new AST pin `serpent_flow_repl_prompt_helper_present` (37→38 invariants) + 35 new regression pins in `tests/governance/test_cc2_followups.py` + 2 pre-existing `test_status_line_composer.py` tests updated for 11-member set + new ACTIVE_OP/TASK_LIST default field order. **1562/1562 governance sweep green** post-CC2-followups. | Claude Opus 4.7 (1M context) (§30 + CC2 follow-ups) |
 | 2026-05-01 | 2.8 | **§29 Brutal Architectural Review — post-Priority-#2-closure (third operator-driven review).** Single-session delivery: Tier 1 #1+#2+#3 (confidence drop SSE producer wiring + PostureObserver task-death detection + cross-process flock on ledgers — all 3 of v9's immediate priorities) + Move 5 Confidence-Aware Probe Loop (5-slice arc, 4th `ConfidenceCollapseAction.PROBE_ENVIRONMENT` outcome, K-call cap + monotonic-clock + sha256 diminishing-returns three-independent-termination guarantees, read-only tool allowlist AST-pinned) + Move 6 Generative Quorum (5-slice arc, master deliberately default-FALSE pending live verification, K-way parallel candidate generation with AST-normalized signature consensus, closes Test-shape gaming + Quine-class hallucination via independent-roll consensus, cost contract preserved by `COST_GATED_ROUTES` AST pin) + Priority #1 Coherence Auditor (5-slice arc, all 3 flags default-TRUE, cross-session BEHAVIORAL drift detection complementing Move 4's STRUCTURAL drift, closes gestalt-rotation blind spot, 6-value `BehavioralDriftKind` closed enum DISTINCT from Move 4's 9-value structural taxonomy, periodic posture-aware async observer with HARDEN 3h / DEFAULT 6h / MAINTAIN 12h cadence + adaptive vigilance + drift signature dedup) + Priority #2 PostmortemRecall (5-slice arc, all 4 flags default-TRUE, **closes the recurrence-prevention loop end-to-end** — activates Priority #1 Slice 4's previously-dormant `INJECT_POSTMORTEM_RECALL_HINT` advisory, cross-session prior-failure context injection at CONTEXT_EXPANSION via robust degradation contract NEVER raising into GENERATE pipeline, recurrence consumer stamps Phase C `MonotonicTighteningVerdict.PASSED` on every boost). **shipped_code_invariants 20→36 (+16, +80%)**. SSE event vocabulary +5 (probe_outcome / quorum_outcome / behavioral_drift_detected / postmortem_recall_injected / posture_observer_degraded). FlagRegistry seeds +20 (6 Move 6 + 8 Priority #1 + 6 Priority #2). **Letter grade adjusts UP from v9's "A− structural / B+ empirical" to "A structural / A− empirical"** — honest reflection of: (1) recurrence-prevention loop closed end-to-end via Priority #2 (the load-bearing missing piece flagged in §28); (2) +16 AST pins immune-system scaling; (3) Phase C universal cage rule integrated in 3 places (Move 6 + Priority #1 + Priority #2); (4) Tier 1's 3 immediate priorities all addressed; (5) cost contract structurally enforced everywhere via AST construction. New §29 (8 sub-sections) covering: (29.1) what closed since §28; (29.2) cognitive & epistemic delta — Priority #3 Counterfactual Replay identified as THE remaining big capability gap (substrate exists via Phase 1 Determinism + Causality DAG; policy-swap path missing); (29.3) brutal grade A/A− defended; (29.4) **Critical Path to A-Level RSI — top 3 systemic upgrades**: Priority #3 Counterfactual Replay Engine (5-slice arc scoped at `memory/project_priority_3_counterfactual_replay_scope.md`; replay-with-policy-swap engine using cached generation hashes for ZERO LLM cost; 5-value ReplayOutcome + 5-value BranchVerdict + 5-value DecisionOverrideKind closed enums; produces empirical recurrence-reduction baseline that retroactively justifies Move 6 master flag graduation; ~250 tests / ~2,500 LOC; 4 AST pins target 40 total post-Priority-3) + Slice 5b consolidation across 4 arcs (REPL + GET routes + production wiring for Move 5 + Move 6 + Priority #1 + Priority #2; operator-experience polish that converts structural primitives into operational reality; work-in-parallel candidate while implementer executes Priority #3) + Move 7 Cross-op Semantic Budget (substrate prepared by Priority #1's monotonic-tightening contract; Priority #2 produces integral signal; catches slow-boil drift compounding over 100+ cycles); (29.5) Reverse Russian Doll alignment — pin count 13→20→36 (+15 this session); SSE event vocabulary 10→57→62 (+5 this session); async observers 1→3→4 (+1 this session); bypass vectors closed: Test-shape gaming (Move 6) + Quine-class hallucination (Move 6) + Recurrence loop (Priority #2) + Long-horizon coherence drift (Priority #1); bypass vectors still open: plausible-but-vacuous test patterns (Move 9) + slow-boil compounded drift (Move 7); (29.6) **operator question direct answer**: STRUCTURALLY O+V already exceeds CC capability envelope; EMPIRICALLY near-parity-pending-verification; **realistic timeline to A-level empirical execution: 6–10 weeks** (Weeks 1-2: Priority #3 + Slice 5b in parallel → Weeks 3-6: live verification soak measuring recurrence-reduction baseline → Weeks 6-8: Move 6 graduation + Move 7 + Move 8 → Weeks 8-10: live RSI cycle proof — first true second-order doll completed); (29.7) operator next-actions list (Priority #3 → Slice 5b → soak → Move 6 graduation → Move 7 → Move 8); (29.8) summary direct answer to operator: A-level vision + A-level structural foundation + A−level execution on cognitive tasks + A−level execution on edge cases + path to A on empirical floor = Priority #3 + Slice 5b + soak (6-10 weeks); path to A+ = above + Move 7 + Move 8 + first live RSI cycle. Updates **§1 version line** bumped to 2.8 with Priority #2 closure marker + §29 latest-review pointer. Zero behavior change — doc-only update synthesizing this session's verified review. Closure memos: `memory/project_move_5_closure.md` + `memory/project_move_6_closure.md` + `memory/project_priority_1_coherence_auditor_closure.md` + `memory/project_priority_2_postmortem_recall_closure.md` + scope draft `memory/project_priority_3_counterfactual_replay_scope.md`. | Claude Opus 4.7 (post-Priority-#2-closure brutal review) |
