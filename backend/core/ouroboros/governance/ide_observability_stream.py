@@ -392,6 +392,19 @@ EVENT_TYPE_FAILURE_MODE_RECALLED_AT_GENERATE = (
 )
 
 # ----------------------------------------------------------------------
+# M11 Slice 4 — ActionOutcomeMemory recall at first-attempt GENERATE
+# (PRD §30.5.3). Symmetric positive-evidence pair to the Upgrade 3
+# event above. Fires from strategic_direction's render method when
+# the retriever returns >=1 match and the section is composed into
+# the prompt. Authority-free observability — the model already saw
+# the section before the event fires; SSE is for operator visibility,
+# not control flow.
+# ----------------------------------------------------------------------
+EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE = (
+    "action_outcome_recalled_at_generate"
+)
+
+# ----------------------------------------------------------------------
 # Deep Observability Gap #2 Slice 4 — Confidence-policy write surface.
 # ----------------------------------------------------------------------
 #
@@ -547,6 +560,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_BEHAVIORAL_DRIFT_DETECTED,         # Coherence Auditor (Priority #1)
     EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED,      # auto_action_router emit phase
     EVENT_TYPE_FAILURE_MODE_RECALLED_AT_GENERATE,  # Upgrade 3 Slice 5 (PRD §31.4)
+    EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE,  # M11 Slice 4 (PRD §30.5.3)
 })
 
 

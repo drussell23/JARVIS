@@ -175,6 +175,19 @@ class StrategicDirectionService:
         )
         if failure_modes_block:
             body = f"{body}\n\n{failure_modes_block}"
+        # M11 Slice 4 — ActionOutcomeMemory at first-attempt
+        # GENERATE. Symmetric positive-evidence pair to Upgrade 3
+        # above. Region-keyed (target_files only; no plan needed
+        # since recall is region-keyed not situation-keyed).
+        # Appended LAST so the most actionable prior-outcome
+        # context sits closest to the model's first-attempt
+        # generation point — recency-of-attention favors what
+        # comes last in the prompt.
+        action_outcomes_block = self._render_action_outcomes_section(
+            target_files=target_files,
+        )
+        if action_outcomes_block:
+            body = f"{body}\n\n{action_outcomes_block}"
         return body
 
     @staticmethod
@@ -244,6 +257,79 @@ class StrategicDirectionService:
                     op_id="",
                     situation_kind=situation.value,
                     match_count=len(matches),
+                    top_signature=top.record.signature_hash,
+                    top_weight=int(top.record.weight),
+                )
+            except Exception:  # noqa: BLE001 — fail-silent
+                pass
+            return section
+        except Exception:  # noqa: BLE001 — fail-silent
+            return ""
+
+    @staticmethod
+    def _render_action_outcomes_section(
+        *,
+        target_files: Optional[Sequence[str]],
+    ) -> str:
+        """Compose the optional ``## Recent Region Outcomes``
+        block (M11 Slice 4 / PRD §30.5.3).
+
+        Discipline (load-bearing — mirrors failure-modes / posture
+        / codebase-character):
+          * Caller passes None for target_files → empty.
+          * ImportError-safe — action_outcome_memory absent →
+            empty.
+          * Master flag check (per-request, lives inside
+            :func:`recall_for_region`).
+          * Empty match set → empty (no empty headers per PRD
+            §30.5.3).
+          * Char budget capped at
+            :data:`DEFAULT_ACTION_OUTCOME_PROMPT_BUDGET` (4000).
+          * Authority-free — section explicitly disclaims
+            execution authority (Iron Gate / SemanticGuardian /
+            risk tier still gate every patch post-generation;
+            this is *prior context only*).
+          * Fail-silent on any exception — never break prompt
+            composition.
+
+        Differs from :meth:`_render_failure_modes_section` only
+        in: (a) ctx requirements (target_files alone, no plan;
+        recall is region-keyed not situation-keyed),
+        (b) module + budget (4KB vs 3KB — outcome lines carry
+        richer per-line context).
+        """
+        if target_files is None:
+            return ""
+        try:
+            from backend.core.ouroboros.governance.action_outcome_memory import (  # noqa: E501
+                DEFAULT_ACTION_OUTCOME_PROMPT_BUDGET,
+                compose_action_outcomes_section,
+                publish_action_outcome_recalled,
+                recall_for_region,
+            )
+        except ImportError:
+            return ""
+        try:
+            matches = recall_for_region(
+                target_files=target_files,
+            )
+            if not matches:
+                return ""
+            section = compose_action_outcomes_section(
+                matches,
+                max_chars=DEFAULT_ACTION_OUTCOME_PROMPT_BUDGET,
+            )
+            if not section:
+                return ""
+            # M11 Slice 4 SSE — fires once per successful
+            # injection. Best-effort; failure to publish never
+            # breaks prompt composition.
+            try:
+                top = matches[0]
+                publish_action_outcome_recalled(
+                    op_id="",
+                    match_count=len(matches),
+                    top_outcome_kind=top.record.outcome_kind.value,
                     top_signature=top.record.signature_hash,
                     top_weight=int(top.record.weight),
                 )

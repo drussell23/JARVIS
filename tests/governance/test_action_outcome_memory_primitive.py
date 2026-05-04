@@ -663,9 +663,9 @@ class TestAuthorityInvariants:
 
 
 class TestPublicExports:
-    def test_all_lists_slices_1_through_3_public_names(self):
-        """Slice 1 (5) + Slice 2 (9) + Slice 3 (6) = 20 public
-        exports. Future slices append; never remove."""
+    def test_all_lists_slices_1_through_4_public_names(self):
+        """Slice 1 (5) + Slice 2 (9) + Slice 3 (6) + Slice 4 (3)
+        = 23 public exports. Future slices append; never remove."""
         from backend.core.ouroboros.governance import action_outcome_memory  # noqa: E501
         expected = sorted([
             # Slice 1 — primitive
@@ -691,6 +691,10 @@ class TestPublicExports:
             "action_outcome_recency_halflife_days",
             "action_outcome_top_k",
             "recall_for_region",
+            # Slice 4 — prompt-section composer
+            "DEFAULT_ACTION_OUTCOME_PROMPT_BUDGET",
+            "compose_action_outcomes_section",
+            "publish_action_outcome_recalled",
         ])
         assert sorted(action_outcome_memory.__all__) == expected
 

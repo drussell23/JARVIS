@@ -1499,10 +1499,201 @@ def recall_for_region(
         return tuple()
 
 
+# ===========================================================================
+# Slice 4 — Prompt-section composer + SSE publisher (PRD §30.5.3 Slice 4)
+#
+# StrategicDirection injection at first-attempt GENERATE. New
+# ``## Recent Region Outcomes`` block — the symmetric positive-
+# evidence pair to Upgrade 3's ``## Prior Failure Modes for This
+# Situation``. Bounded character budget (4KB max per PRD §30.5.3)
+# vs Upgrade 3's 3KB cap — outcome lines carry richer per-line
+# context (4 score components vs 2) so the larger budget keeps
+# top_k=3 fully renderable.
+#
+# Mirrors Upgrade 3 Slice 4 architectural pattern exactly:
+# pure render-only function colocated with the data layer; the
+# StrategicDirection consumer (separate edit) lazy-imports this
+# composer + the retriever. Authority direction:
+# strategic_direction → action_outcome_memory, NEVER the reverse
+# (AST-pinned by Slice 1 + Slice 5 graduation pins).
+# ===========================================================================
+
+
+# PRD §30.5.3 cost contract: <=4KB to GENERATE prompt amortized by
+# Anthropic 5-min cache. The renderer hard-caps so even a
+# pathological retrieval result cannot blow past it.
+DEFAULT_ACTION_OUTCOME_PROMPT_BUDGET: int = 4000
+
+_SECTION_HEADER: str = "## Recent Region Outcomes"
+
+
+def _format_outcome_match_line(match: "ActionOutcomeMatch") -> str:
+    """Render one match as a 2-line bullet entry. Format is
+    skimmable + parseable + bounded. Surfaces all 4 score
+    components so the model sees WHY each was surfaced
+    (operator-explainability discipline mirrors Upgrade 3
+    Slice 4 + Slice 3 ``ActionOutcomeMatch.to_dict``)."""
+    rec = match.record
+    sig_short = (rec.signature_hash or "")[:12]
+    outcome = rec.outcome_kind.value
+    attempt = rec.attempted_action_kind or "unspecified"
+    summary = (rec.summary or "").strip()
+    if len(summary) > 200:
+        summary = summary[:197] + "..."
+    # Optional commit-hash provenance for APPLIED_VERIFIED only —
+    # other dispositions don't have a stable commit ref.
+    commit_seg = ""
+    if rec.commit_hash:
+        commit_short = rec.commit_hash[:12]
+        commit_seg = f" commit=`{commit_short}`"
+    return (
+        f"- **{outcome}** / `{attempt}` "
+        f"(weight={rec.weight}, recency={match.recency_score:.2f}, "
+        f"polarity={match.polarity_score:.2f}, "
+        f"sig=`{sig_short}`{commit_seg}):\n"
+        f"  {summary}"
+    )
+
+
+def compose_action_outcomes_section(
+    matches: Iterable["ActionOutcomeMatch"],
+    *,
+    max_chars: int = DEFAULT_ACTION_OUTCOME_PROMPT_BUDGET,
+) -> str:
+    """Render top-K matches as a markdown section suitable for
+    direct injection into the GENERATE prompt.
+
+    Returns empty string when:
+      * matches iterable is empty (no empty headers per PRD
+        §30.5.3)
+      * max_chars is non-positive
+      * rendering raises (defensive — strategic_direction must
+        never break on a render fault)
+
+    Truncation policy: lines added in score-descending order;
+    stops adding when the next line would exceed ``max_chars``.
+    Header + intro fit by construction (~600 chars). If the
+    budget is too small to fit even one match line, returns
+    empty (no header without content). NEVER raises."""
+    try:
+        items = list(matches)
+        if not items:
+            return ""
+        if max_chars <= 0:
+            return ""
+
+        intro = (
+            "The system has previously attempted similar work in "
+            "this region. The matches below are surfaced from the "
+            "cross-op action-outcome memory (PRD §30.5.3); each "
+            "represents a prior outcome scored by recency * "
+            "region-overlap * weight * outcome-polarity. Outcome "
+            "kinds: APPLIED_VERIFIED (worked + tests passed), "
+            "APPLIED_REVERTED (worked then was rolled back), "
+            "REJECTED (caught at gate), DEFERRED (operator "
+            "declined to apply). Read these BEFORE generating; "
+            "prefer attempts whose past outcome was VERIFIED "
+            "unless context has changed."
+        )
+        lines: list = [_SECTION_HEADER, "", intro, ""]
+        used = sum(len(line) + 1 for line in lines)
+
+        rendered_any = False
+        for m in items:
+            try:
+                line = _format_outcome_match_line(m)
+            except Exception:  # noqa: BLE001 — defensive per-line
+                continue
+            line_cost = len(line) + 1
+            if used + line_cost > max_chars:
+                break
+            lines.append(line)
+            used += line_cost
+            rendered_any = True
+
+        if not rendered_any:
+            # Header + intro fit but not a single match — emit no
+            # section (no empty headers per PRD).
+            return ""
+
+        return "\n".join(lines)
+    except Exception as exc:  # noqa: BLE001 — last-resort defensive
+        logger.debug(
+            "[action_outcome_memory] "
+            "compose_action_outcomes_section raised: %s", exc,
+        )
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# SSE publisher — fires on first-attempt match injection
+# ---------------------------------------------------------------------------
+
+
+def publish_action_outcome_recalled(
+    *,
+    op_id: str,
+    match_count: int,
+    top_outcome_kind: Optional[str] = None,
+    top_signature: Optional[str] = None,
+    top_weight: int = 0,
+) -> Optional[str]:
+    """Fire ``EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE`` for
+    one M11 Slice 4 prompt-section injection. Lazy
+    ``ide_observability_stream`` import + best-effort publish +
+    never-raise contract — mirrors Upgrade 3's
+    :func:`failure_mode_memory.publish_failure_mode_recalled`
+    discipline.
+
+    Returns the broker frame_id on publish, ``None`` on
+    suppression/failure (master-off / broker-missing /
+    publish-error). NEVER raises."""
+    if not action_outcome_memory_enabled():
+        return None
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE,
+            get_default_broker,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        broker = get_default_broker()
+        return broker.publish(
+            event_type=(
+                EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE
+            ),
+            op_id=str(op_id or ""),
+            payload={
+                "schema_version": (
+                    ACTION_OUTCOME_MEMORY_SCHEMA_VERSION
+                ),
+                "op_id": str(op_id or ""),
+                "match_count": int(match_count),
+                "top_outcome_kind": (
+                    str(top_outcome_kind)
+                    if top_outcome_kind is not None else None
+                ),
+                "top_signature": (
+                    str(top_signature)[:64]
+                    if top_signature is not None else None
+                ),
+                "top_weight": int(top_weight),
+            },
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[action_outcome_memory] SSE publish swallowed",
+            exc_info=True,
+        )
+        return None
+
+
 __all__ = [
     "ACTION_OUTCOME_MEMORY_SCHEMA_VERSION",
     "ActionOutcomeMatch",
     "ActionOutcomeRecord",
+    "DEFAULT_ACTION_OUTCOME_PROMPT_BUDGET",
     "OutcomeKind",
     "RecordOutcome",
     "action_outcome_memory_enabled",
@@ -1512,10 +1703,12 @@ __all__ = [
     "action_outcome_top_k",
     "clear_action_outcomes",
     "cluster_jsonl_path",
+    "compose_action_outcomes_section",
     "compute_outcome_signature",
     "dedup_window_days",
     "history_dir",
     "max_records_per_cluster",
+    "publish_action_outcome_recalled",
     "read_action_outcomes_for_cluster",
     "read_all_action_outcomes",
     "recall_for_region",
