@@ -18,7 +18,7 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,12 @@ class StrategicDirectionService:
     def is_loaded(self) -> bool:
         return self._loaded
 
-    def format_for_prompt(self) -> str:
+    def format_for_prompt(
+        self,
+        *,
+        target_files: Optional[Sequence[str]] = None,
+        plan: Optional[Any] = None,
+    ) -> str:
         """Format the digest for injection into strategic_memory_prompt.
 
         Appends the current ``StrategicPosture`` section when
@@ -128,6 +133,15 @@ class StrategicDirectionService:
         ``JARVIS_POSTURE_PROMPT_INJECTION_ENABLED`` are both on and the
         PostureStore has a current reading. Advisory-only — the posture
         block never carries execution authority (§1 Boundary Principle).
+
+        Optional kwargs ``target_files`` and ``plan`` enable the
+        Upgrade 3 Slice 4 first-attempt failure-mode injection (PRD
+        §31.4). When both are present + the master flag is on +
+        :func:`failure_mode_memory.retrieve_failure_modes` returns
+        non-empty matches, a ``## Prior Failure Modes for This
+        Situation`` block is appended (3KB budget cap). Existing
+        callers that do not pass these kwargs are byte-identical
+        to pre-Slice-4 behavior.
         """
         if not self._digest:
             return ""
@@ -151,7 +165,73 @@ class StrategicDirectionService:
         codebase_char_block = self._render_codebase_character_section()
         if codebase_char_block:
             body = f"{body}\n\n{codebase_char_block}"
+        # Upgrade 3 Slice 4 — Failure-Mode Memory at first-attempt
+        # GENERATE. Only fires when caller passes ctx (target_files
+        # + plan); existing call sites without ctx are unchanged.
+        # Same fail-silent / ImportError-safe / advisory-only
+        # discipline as the posture + codebase-character blocks.
+        failure_modes_block = self._render_failure_modes_section(
+            target_files=target_files, plan=plan,
+        )
+        if failure_modes_block:
+            body = f"{body}\n\n{failure_modes_block}"
         return body
+
+    @staticmethod
+    def _render_failure_modes_section(
+        *,
+        target_files: Optional[Sequence[str]],
+        plan: Optional[Any],
+    ) -> str:
+        """Compose the optional ``## Prior Failure Modes for This
+        Situation`` block (Upgrade 3 Slice 4 / PRD §31.4).
+
+        Discipline (load-bearing — mirrors codebase-character):
+          * Caller passes None for either kwarg → empty (no
+            forward-direction signal yet).
+          * ImportError-safe — failure_mode_memory absent → empty.
+          * Master flag check (per-request, lives inside
+            :func:`retrieve_failure_modes`).
+          * Forward-direction classification via
+            :func:`classify_situation_from_ctx` (UNKNOWN → empty
+            via the retriever's contract).
+          * Empty match set → empty (no empty headers per PRD).
+          * Char budget capped at
+            :data:`DEFAULT_PROMPT_SECTION_BUDGET` (3000).
+          * Authority-free — section explicitly disclaims
+            execution authority over Iron Gate / SemanticGuardian
+            / risk tier / FORBIDDEN_PATH (those gates run
+            post-generation; this is *prior context only*).
+          * Fail-silent on any exception — never break prompt
+            composition.
+        """
+        if target_files is None or plan is None:
+            return ""
+        try:
+            from backend.core.ouroboros.governance.failure_mode_memory import (  # noqa: E501
+                DEFAULT_PROMPT_SECTION_BUDGET,
+                classify_situation_from_ctx,
+                compose_failure_modes_section,
+                retrieve_failure_modes,
+            )
+        except ImportError:
+            return ""
+        try:
+            situation = classify_situation_from_ctx(
+                target_files=target_files, plan=plan,
+            )
+            matches = retrieve_failure_modes(
+                situation_kind=situation,
+                target_files=target_files,
+            )
+            if not matches:
+                return ""
+            return compose_failure_modes_section(
+                matches,
+                max_chars=DEFAULT_PROMPT_SECTION_BUDGET,
+            )
+        except Exception:  # noqa: BLE001 — fail-silent
+            return ""
 
     @staticmethod
     def _render_posture_section() -> str:

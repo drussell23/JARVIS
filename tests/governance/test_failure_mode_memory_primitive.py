@@ -613,9 +613,9 @@ class TestAuthorityInvariants:
 
 
 class TestPublicExports:
-    def test_all_lists_slices_1_through_3_public_names(self):
-        """Slice 1 (6) + Slice 2 (10) + Slice 3 (5) = 21 public
-        exports. Future slices append; never remove."""
+    def test_all_lists_slices_1_through_4_public_names(self):
+        """Slice 1 (6) + Slice 2 (10) + Slice 3 (5) + Slice 4 (3)
+        = 24 public exports. Future slices append; never remove."""
         from backend.core.ouroboros.governance import failure_mode_memory  # noqa: E501
         expected = sorted([
             # Slice 1 — primitive
@@ -642,6 +642,10 @@ class TestPublicExports:
             "failure_mode_recency_halflife_days",
             "failure_mode_top_k",
             "retrieve_failure_modes",
+            # Slice 4 — prompt-section composer
+            "DEFAULT_PROMPT_SECTION_BUDGET",
+            "classify_situation_from_ctx",
+            "compose_failure_modes_section",
         ])
         assert sorted(failure_mode_memory.__all__) == expected
 

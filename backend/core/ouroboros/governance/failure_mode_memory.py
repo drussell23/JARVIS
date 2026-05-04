@@ -1851,7 +1851,167 @@ def retrieve_failure_modes(
         return tuple()
 
 
+# ===========================================================================
+# Slice 4 — Prompt-section composer (forward-direction interface)
+#
+# PRD §31.4.2 Slice 4 spec:
+#   "StrategicDirection injection at first-attempt GENERATE: new
+#    `## Prior Failure Modes for This Situation` block. Bounded
+#    character budget (3KB max via existing budget system).
+#    Disabled when retriever returns no matches (no empty
+#    headers). Master flag JARVIS_FAILURE_MODE_MEMORY_ENABLED."
+#
+# Design: render-only function, colocated with the data layer.
+# Mirrors :meth:`codebase_character.CodebaseCharacterSnapshot.
+# to_prompt_section(max_chars=...)` so the prompt-shaped output
+# lives next to the source data — strategic_direction calls
+# :func:`compose_failure_modes_section` and stitches the result
+# into ``format_for_prompt``.
+#
+# Forward-direction interface: callers at first-attempt GENERATE
+# do not yet have a postmortem. They have ``(plan, target_files)``
+# from ctx. The Slice 2 ``_classify_situation`` chain takes
+# exactly those inputs and returns a SituationKind — perfect
+# reuse for the forward direction. Exposed via
+# :func:`classify_situation_from_ctx` so strategic_direction
+# never needs the underscored helper.
+# ===========================================================================
+
+
+def classify_situation_from_ctx(
+    *,
+    target_files: Iterable[str] = (),
+    plan: Optional[Any] = None,
+    diff: str = "",
+) -> SituationKind:
+    """Forward-direction classifier — given current-op ctx
+    (plan + target_files + optional diff), return the matching
+    :class:`SituationKind`. Reuses the Slice 2 chain-of-
+    responsibility classifier set, so retrieval-time and
+    extraction-time classifications converge on the same enum
+    for the same inputs.
+
+    Returns :attr:`SituationKind.UNKNOWN` when no classifier
+    matches. NEVER raises."""
+    try:
+        files_tuple = tuple(
+            str(f) for f in target_files if f
+        )
+        plan_text = _plan_text_for_classification(plan)
+        return _classify_situation(
+            target_files=files_tuple,
+            diff=diff or "",
+            plan_text=plan_text,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[failure_mode_memory] classify_situation_from_ctx "
+            "raised: %s", exc,
+        )
+        return SituationKind.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Section rendering — pure function over matches; bounded char budget
+# ---------------------------------------------------------------------------
+
+
+# PRD §31.4.3 cost contract: <= 3KB to GENERATE prompt amortized by
+# Anthropic 5-min cache. The renderer hard-caps at this budget so
+# even a pathological retrieval result cannot blow past it.
+DEFAULT_PROMPT_SECTION_BUDGET: int = 3000
+
+_SECTION_HEADER: str = "## Prior Failure Modes for This Situation"
+
+
+def _format_match_line(match: "FailureModeMatch") -> str:
+    """Render one match as a single bullet-list line. Format
+    chosen to be skimmable + parseable + bounded. Includes the
+    per-component scores so the model sees WHY each was surfaced
+    (matches the operator-explainability discipline from Slice 3
+    FailureModeMatch.to_dict)."""
+    rec = match.record
+    sig_short = (rec.signature_hash or "")[:12]
+    situation = rec.situation_kind.value
+    attempt = rec.attempted_action_kind or "unspecified"
+    mode = rec.failure_mode_kind.value
+    mitigation = (rec.mitigation_summary or "").strip()
+    if len(mitigation) > 200:
+        mitigation = mitigation[:197] + "..."
+    return (
+        f"- **{situation}** / `{attempt}` failed via `{mode}` "
+        f"(weight={rec.weight}, recency={match.recency_score:.2f}, "
+        f"sig=`{sig_short}`):\n"
+        f"  Mitigation: {mitigation}"
+    )
+
+
+def compose_failure_modes_section(
+    matches: Iterable["FailureModeMatch"],
+    *,
+    max_chars: int = DEFAULT_PROMPT_SECTION_BUDGET,
+) -> str:
+    """Render top-K matches as a markdown section suitable for
+    direct injection into the GENERATE prompt.
+
+    Returns empty string when:
+      * matches iterable is empty (no empty headers per PRD)
+      * max_chars is non-positive
+      * rendering raises (defensive — strategic_direction must
+        never break on a render fault)
+
+    Truncation policy: lines added in order; stops adding when
+    the next line would exceed ``max_chars``. The header always
+    fits (header is ~70 chars). If the budget is too small to fit
+    the header + one line, returns empty. NEVER raises."""
+    try:
+        items = list(matches)
+        if not items:
+            return ""
+        if max_chars <= 0:
+            return ""
+
+        intro = (
+            "The system has previously attempted similar work in "
+            "this situation. The matches below are surfaced from "
+            "the cross-op failure-mode memory (PRD §31.4); each "
+            "represents a recurring failure pattern with weight "
+            ">= 2 (recurred at least twice in the dedup window). "
+            "Read these mitigations BEFORE generating; do not "
+            "repeat the same attempt unless context has changed."
+        )
+        lines: list = [_SECTION_HEADER, "", intro, ""]
+        used = sum(len(line) + 1 for line in lines)
+
+        rendered_any = False
+        for m in items:
+            try:
+                line = _format_match_line(m)
+            except Exception:  # noqa: BLE001 — defensive per-line
+                continue
+            line_cost = len(line) + 1  # +1 for joining newline
+            if used + line_cost > max_chars:
+                break
+            lines.append(line)
+            used += line_cost
+            rendered_any = True
+
+        if not rendered_any:
+            # Header + intro fit but not a single match — better
+            # to emit no section than a header with no content.
+            return ""
+
+        return "\n".join(lines)
+    except Exception as exc:  # noqa: BLE001 — last-resort defensive
+        logger.debug(
+            "[failure_mode_memory] compose_failure_modes_section "
+            "raised: %s", exc,
+        )
+        return ""
+
+
 __all__ = [
+    "DEFAULT_PROMPT_SECTION_BUDGET",
     "FAILURE_MODE_MEMORY_SCHEMA_VERSION",
     "ExtractionOutcome",
     "FailureModeKind",
@@ -1859,6 +2019,8 @@ __all__ = [
     "FailureModeRecord",
     "RecordOutcome",
     "SituationKind",
+    "classify_situation_from_ctx",
+    "compose_failure_modes_section",
     "compute_signature_hash",
     "dedup_window_days",
     "extract_failure_mode",
