@@ -27,16 +27,17 @@ import pytest
 
 
 class TestMasterFlag:
-    def test_default_is_false_pre_graduation(self, monkeypatch):
-        """Slice 1 default is FALSE; Slice 5 graduation will flip
-        this to TRUE."""
+    def test_default_is_true_post_graduation(self, monkeypatch):
+        """Slice 5 graduation: ``JARVIS_ACTION_OUTCOME_MEMORY_-
+        ENABLED`` flips false → true (PRD §30.5.3). Operator
+        instant-revert via explicit env false."""
         monkeypatch.delenv(
             "JARVIS_ACTION_OUTCOME_MEMORY_ENABLED", raising=False,
         )
         from backend.core.ouroboros.governance.action_outcome_memory import (  # noqa: E501
             action_outcome_memory_enabled,
         )
-        assert action_outcome_memory_enabled() is False
+        assert action_outcome_memory_enabled() is True
 
     @pytest.mark.parametrize(
         "v", ["1", "true", "yes", "on", "TRUE", "Yes"],
@@ -70,8 +71,8 @@ class TestMasterFlag:
         from backend.core.ouroboros.governance.action_outcome_memory import (  # noqa: E501
             action_outcome_memory_enabled,
         )
-        # Whitespace == unset == default == False (Slice 1)
-        assert action_outcome_memory_enabled() is False
+        # Whitespace == unset == graduated default == True (Slice 5)
+        assert action_outcome_memory_enabled() is True
 
     def test_garbage_value_is_off(self, monkeypatch):
         """Asymmetric semantics: anything not in the truthy set
@@ -695,6 +696,8 @@ class TestPublicExports:
             "DEFAULT_ACTION_OUTCOME_PROMPT_BUDGET",
             "compose_action_outcomes_section",
             "publish_action_outcome_recalled",
+            # Slice 5 — graduation operator surfaces
+            "find_action_outcome_by_signature",
         ])
         assert sorted(action_outcome_memory.__all__) == expected
 
@@ -763,21 +766,25 @@ class TestCrossArcSymmetry:
         )
         assert len(sig_m11) == len(sig_u3) == 64
 
-    def test_master_flag_default_false_pre_graduation(
+    def test_master_flag_default_true_post_graduation(
         self, monkeypatch,
     ):
-        """Both modules ship default-FALSE in their primitive
-        slice (Slice 1) — graduate at Slice 5. The shape of the
-        graduation transition must be identical."""
+        """Both modules graduated default-TRUE at Slice 5
+        (Upgrade 3 + M11). The shape of the graduation
+        transition is identical: same env name shape, same
+        asymmetric semantics, same instant-revert idiom."""
         monkeypatch.delenv(
             "JARVIS_ACTION_OUTCOME_MEMORY_ENABLED", raising=False,
         )
         from backend.core.ouroboros.governance.action_outcome_memory import (  # noqa: E501
             action_outcome_memory_enabled,
         )
-        # M11 Slice 1 default-FALSE; Slice 5 graduation will flip
-        # this to TRUE matching Upgrade 3's post-graduation state.
-        assert action_outcome_memory_enabled() is False
+        from backend.core.ouroboros.governance.failure_mode_memory import (  # noqa: E501
+            failure_mode_memory_enabled,
+        )
+        # Both graduated to default-TRUE
+        assert action_outcome_memory_enabled() is True
+        assert failure_mode_memory_enabled() is True
 
 
 # ---------------------------------------------------------------------------

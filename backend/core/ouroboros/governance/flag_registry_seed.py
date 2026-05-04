@@ -3090,6 +3090,116 @@ SEED_SPECS: list = [
         since="Upgrade 3 Slice 3 (2026-05-04)",
         posture_relevance=_HARDEN_AND_CONSOLIDATE,
     ),
+
+    # ========================================================================
+    # M11 — ActionOutcomeMemory at GENERATE (PRD §30.5.3) — 5 flags
+    # Slice 5 graduation: master flips false → true; symmetric positive-
+    # evidence pair to Upgrade 3. Closes the in-context embodiment ASCO axis.
+    # ========================================================================
+    FlagSpec(
+        name="JARVIS_ACTION_OUTCOME_MEMORY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the ActionOutcomeMemory subsystem. "
+            "Default TRUE post Slice 5 graduation (2026-05-04). "
+            "Symmetric positive-evidence pair to Upgrade 3's "
+            "JARVIS_FAILURE_MODE_MEMORY_ENABLED. Pure-RAG: per-"
+            "cluster JSONL persistence (Decision A3 SemanticIndex-"
+            "optional with global-fallback graceful degradation); "
+            "deterministic enum-match + Jaccard + log-scale weight "
+            "+ 14d half-life recency + outcome-polarity scoring; "
+            "markdown-render injection with 4KB budget cap. "
+            "Per-op cost is ≤4KB prompt bytes. Operator instant-"
+            "revert via explicit env false."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/action_outcome_memory.py"
+        ),
+        example="true",
+        since="M11 Slice 5 (graduated PRD §30.5.3, 2026-05-04)",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_ACTION_OUTCOME_MAX_RECORDS_PER_CLUSTER",
+        type=FlagType.INT, default=1000,
+        description=(
+            "Bounded ring-buffer cap PER cluster JSONL file under "
+            ".jarvis/action_outcomes/{cluster_id}.jsonl. Default "
+            "1000 (PRD §30.5.3 storage estimate: 50 clusters × "
+            "1000 records × 500B ≈ 25MB total). Clamped "
+            "[50, 100000]. Truncation is tail-keep-most-recent "
+            "under flock'd critical section."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/action_outcome_memory.py"
+        ),
+        example="1000",
+        since="M11 Slice 2 (2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_ACTION_OUTCOME_DEDUP_WINDOW_DAYS",
+        type=FlagType.INT, default=30,
+        description=(
+            "Recurrence dedup window. Records sharing a "
+            "signature within this window merge (weight++). "
+            "Outcome is part of the dedup tuple, so two records "
+            "with same situation+region+attempt but DIFFERENT "
+            "outcomes coexist (M11 distinction from Upgrade 3). "
+            "Default 30 (parity with Upgrade 3). Clamped "
+            "[1, 365]."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/action_outcome_memory.py"
+        ),
+        example="30",
+        since="M11 Slice 2 (2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_ACTION_OUTCOME_TOP_K",
+        type=FlagType.INT, default=3,
+        description=(
+            "Maximum number of matches the retriever returns at "
+            "first-attempt GENERATE. PRD §30.5.3 default 3 — "
+            "diversity-deduped on outcome_kind so the model gets "
+            "a balanced palette (one VERIFIED + one REVERTED + "
+            "one REJECTED rather than three VERIFIED). Clamped "
+            "[1, 10]. Higher inflates the prompt; lower reduces "
+            "outcome-disposition diversity."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/action_outcome_memory.py"
+        ),
+        example="3",
+        since="M11 Slice 3 (2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_ACTION_OUTCOME_POLARITY_MODE",
+        type=FlagType.STR, default="balanced",
+        description=(
+            "Closed-set preset selector for outcome-polarity "
+            "weighting in retrieval scoring. Three modes: "
+            "``balanced`` (default — VERIFIED=1.0, REVERTED=0.7, "
+            "REJECTED=0.5, DEFERRED=0.3); ``favor_positive`` "
+            "(wider gap — VERIFIED=1.0, REVERTED=0.5, "
+            "REJECTED=0.3, DEFERRED=0.2); ``all_equal`` (4 "
+            "actionable kinds = 1.0; only DISABLED = 0.0). "
+            "Unknown values fall back to ``balanced``. Polarity "
+            "RANKING is a semantic choice, not a tunable "
+            "threshold — preset modes encode operator intent at "
+            "appropriate granularity."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/action_outcome_memory.py"
+        ),
+        example="balanced",
+        since="M11 Slice 3 (2026-05-04)",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
 ]
 
 

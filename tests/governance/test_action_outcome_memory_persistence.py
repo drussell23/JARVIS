@@ -644,7 +644,10 @@ class TestClearActionOutcomes:
     def test_clear_disabled_when_master_off(
         self, monkeypatch, tmp_path,
     ):
-        # Don't enable master flag
+        # Slice 5 graduated default-true; force off explicitly.
+        monkeypatch.setenv(
+            "JARVIS_ACTION_OUTCOME_MEMORY_ENABLED", "false",
+        )
         monkeypatch.setenv(
             "JARVIS_ACTION_OUTCOME_HISTORY_DIR", str(tmp_path),
         )

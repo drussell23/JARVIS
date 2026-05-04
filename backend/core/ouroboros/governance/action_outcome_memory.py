@@ -130,23 +130,42 @@ ACTION_OUTCOME_MEMORY_SCHEMA_VERSION: str = "action_outcome_memory.1"
 
 
 def action_outcome_memory_enabled() -> bool:
-    """``JARVIS_ACTION_OUTCOME_MEMORY_ENABLED`` (default ``false``
-    until Slice 5 graduation per PRD §30.5.3).
+    """``JARVIS_ACTION_OUTCOME_MEMORY_ENABLED`` (default ``true`` —
+    graduated PRD §30.5.3 Slice 5).
 
-    Asymmetric env semantics — empty/whitespace = unset = current
-    default (false for Slice 1); explicit ``1``/``true``/``yes``/
-    ``on`` flips on. Same shape as
-    :func:`failure_mode_memory_enabled` /
+    Asymmetric env semantics — empty/whitespace = unset = graduated
+    default (true post-Slice-5); explicit ``0``/``false``/``no``/
+    ``off`` evaluates false; explicit truthy values evaluate true.
+    Same shape as :func:`failure_mode_memory_enabled` /
     :func:`coherence_auditor_enabled` / :func:`cigw_enabled` /
-    :func:`quorum_enabled` graduated flags so the Slice 5
-    graduation flip is a one-character edit.
+    :func:`quorum_enabled` graduated flags so the operator
+    instant-revert idiom is consistent across the governance
+    surface.
 
-    Re-read on every call so flips hot-revert without restart."""
+    Re-read on every call so flips hot-revert without restart.
+
+    Cost contract preserved by construction: graduating default-
+    true is appropriate because the entire 5-slice arc is
+    **zero LLM** end-to-end:
+
+      * Persistence (Slice 2) — flock'd JSONL with cluster-bucketing
+        via SemanticIndex (graceful Decision A3 fallback)
+      * Retriever (Slice 3) — deterministic enum-match + Jaccard +
+        log-scale weight + 14d half-life recency + outcome polarity
+      * Injection (Slice 4) — pure markdown render; bounded 4KB
+        char budget amortized by Anthropic 5-min prompt cache
+      * Disk: ~25MB total (50 clusters × 1000 records × 500B per
+        PRD §30.5.3 storage estimate)
+
+    Operator instant-revert: ``JARVIS_ACTION_OUTCOME_MEMORY_-
+    ENABLED=false`` flips the master off; the next call to
+    :func:`action_outcome_memory_enabled` re-reads + every public
+    surface short-circuits to its disabled outcome."""
     raw = os.environ.get(
         "JARVIS_ACTION_OUTCOME_MEMORY_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 1 default; flips to True at Slice 5
+        return True  # Slice 5 graduated default (PRD §30.5.3)
     return raw in ("1", "true", "yes", "on")
 
 
@@ -1630,6 +1649,37 @@ def compose_action_outcomes_section(
 # ---------------------------------------------------------------------------
 
 
+def find_action_outcome_by_signature(
+    signature_hash: str,
+) -> Optional[ActionOutcomeRecord]:
+    """Return the (single) record matching ``signature_hash``.
+    Persistence guarantees at most one record per signature
+    within the dedup window; sliding-window semantics may produce
+    multiple outside-window records — most recent wins. NEVER
+    raises. Walks all cluster files via
+    :func:`read_all_action_outcomes`."""
+    try:
+        sig = (signature_hash or "").strip().lower()
+        if not sig:
+            return None
+        records = read_all_action_outcomes()
+        match = None
+        for rec in records:
+            if (rec.signature_hash or "").lower() == sig:
+                if (
+                    match is None
+                    or rec.observed_at_unix > match.observed_at_unix
+                ):
+                    match = rec
+        return match
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[action_outcome_memory] "
+            "find_action_outcome_by_signature raised: %s", exc,
+        )
+        return None
+
+
 def publish_action_outcome_recalled(
     *,
     op_id: str,
@@ -1706,6 +1756,7 @@ __all__ = [
     "compose_action_outcomes_section",
     "compute_outcome_signature",
     "dedup_window_days",
+    "find_action_outcome_by_signature",
     "history_dir",
     "max_records_per_cluster",
     "publish_action_outcome_recalled",

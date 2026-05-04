@@ -509,14 +509,18 @@ class TestDependencyDirection:
 
 
 class TestSSEPublishHook:
-    def test_sse_publisher_signature(self):
-        """publish_action_outcome_recalled is exposed + callable
-        with the expected kwargs."""
+    def test_sse_publisher_master_off_returns_none(
+        self, monkeypatch,
+    ):
+        """Slice 5 graduated default-true; force off to test the
+        master-off short-circuit path. publish returns None
+        silently when master is off."""
+        monkeypatch.setenv(
+            "JARVIS_ACTION_OUTCOME_MEMORY_ENABLED", "false",
+        )
         from backend.core.ouroboros.governance.action_outcome_memory import (  # noqa: E501
             publish_action_outcome_recalled,
         )
-        # Master-off: returns None silently (no SSE broker
-        # imported, no exception).
         result = publish_action_outcome_recalled(
             op_id="op-test",
             match_count=3,
