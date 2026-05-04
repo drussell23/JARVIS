@@ -134,6 +134,13 @@ EVENT_TYPE_GOVERNOR_THROTTLE_APPLIED = "governor_throttle_applied"
 EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE = "governor_emergency_brake"
 EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 
+# Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 vocabulary.
+# Single event covering all 7 BudgetOutcome branches — payload
+# carries outcome string + reason + per-op snapshot. Operators
+# subscribe to one event and route on payload.outcome (matches
+# the posture_changed / governor_throttle_applied pattern).
+EVENT_TYPE_BUDGET_ACTION_TAKEN = "budget_action_taken"
+
 # Priority 1 Slice 4 — confidence-aware execution event vocabulary
 # (PRD §26.5.1). Severity-tiered: P1 = breaker fired (above-floor abort),
 # P2 = approaching floor (early warning), P3 = sustained low-confidence
@@ -2097,6 +2104,56 @@ def publish_memory_pressure_event(
         )
     except Exception:  # noqa: BLE001
         logger.debug("[Stream] pressure publish exception", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 publisher
+# ---------------------------------------------------------------------------
+
+
+def publish_budget_action_event(
+    *,
+    outcome: str,
+    reason: str,
+    op_id: str,
+    budget_snapshot: Optional[Dict[str, Any]] = None,
+    new_risk_tier: Optional[str] = None,
+    extra_telemetry: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Best-effort publisher for ``budget_action_taken`` frames.
+
+    Single event for all 7 BudgetOutcome branches — operators
+    subscribe once and route on ``payload.outcome``. Pattern
+    matches :func:`publish_governor_throttle_event` /
+    :func:`publish_posture_event`.
+
+    NEVER raises; returns the published event id or None on
+    master-flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        payload: Dict[str, Any] = {
+            "outcome": outcome,
+            "reason": reason,
+            "op_id": op_id or "",
+        }
+        if budget_snapshot is not None:
+            payload["budget"] = budget_snapshot
+        if new_risk_tier is not None:
+            payload["new_risk_tier"] = new_risk_tier
+        if extra_telemetry:
+            payload["telemetry"] = dict(extra_telemetry)
+        return get_default_broker().publish(
+            EVENT_TYPE_BUDGET_ACTION_TAKEN,
+            op_id or "epistemic_budget",
+            payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] budget action publish exception",
+            exc_info=True,
+        )
         return None
 
 

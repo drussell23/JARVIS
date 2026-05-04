@@ -503,6 +503,89 @@ class EpistemicBudget:
             "notify_apply", "approval_required", "blocked",
         )
 
+    # ---- Slice 4 observability projection -------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Sanitized JSON-safe projection for
+        ``GET /observability/budget`` + REPL rendering. Includes
+        derived fields (rounds_remaining / probe_calls_remaining /
+        branch_calls_remaining) so consumers don't recompute. NEVER
+        raises."""
+        try:
+            return {
+                "schema_version": self.schema_version,
+                "op_id": self.op_id,
+                "route": self.route,
+                "risk_tier": self.risk_tier,
+                "rounds_consumed": int(self.rounds_consumed),
+                "max_rounds": int(self.max_rounds),
+                "rounds_remaining": max(
+                    0,
+                    int(self.max_rounds)
+                    - int(self.rounds_consumed),
+                ),
+                "probe_calls_consumed": int(
+                    self.probe_calls_consumed,
+                ),
+                "probe_call_cap": int(self.probe_call_cap),
+                "probe_calls_remaining": max(
+                    0,
+                    int(self.probe_call_cap)
+                    - int(self.probe_calls_consumed),
+                ),
+                "branch_calls_consumed": int(
+                    self.branch_calls_consumed,
+                ),
+                "sbt_branch_cap": int(self.sbt_branch_cap),
+                "branch_calls_remaining": max(
+                    0,
+                    int(self.sbt_branch_cap)
+                    - int(self.branch_calls_consumed),
+                ),
+                "confidence_drop_threshold": float(
+                    self.confidence_drop_threshold,
+                ),
+                "last_probe_verdict": self.last_probe_verdict,
+                "last_sbt_verdict": self.last_sbt_verdict,
+                "is_route_cost_gated": (
+                    self.is_route_cost_gated()
+                ),
+                "is_rounds_exhausted": (
+                    self.is_rounds_exhausted()
+                ),
+                "is_at_or_above_notify_apply": (
+                    self.is_at_or_above_notify_apply()
+                ),
+                "created_at_unix": float(self.created_at_unix),
+                "last_updated_at_unix": float(
+                    self.last_updated_at_unix,
+                ),
+                "trajectory": {
+                    "size": len(
+                        self.confidence_trajectory.samples,
+                    ),
+                    "peak": (
+                        self.confidence_trajectory.peak
+                    ),
+                    "nadir": (
+                        self.confidence_trajectory.nadir
+                    ),
+                    "latest": (
+                        self.confidence_trajectory.latest
+                    ),
+                    "dropped_in_window": (
+                        self.confidence_trajectory
+                        .dropped_in_window
+                    ),
+                },
+            }
+        except Exception:  # noqa: BLE001 — defensive
+            return {
+                "schema_version": self.schema_version,
+                "op_id": self.op_id,
+                "error": "projection_failed",
+            }
+
 
 # ---------------------------------------------------------------------------
 # BudgetAction — authoritative result shape
@@ -1223,6 +1306,16 @@ class EpistemicBudgetTracker:
         try:
             with self._lock:
                 return tuple(self._budgets.keys())
+        except Exception:  # noqa: BLE001 — defensive
+            return tuple()
+
+    def snapshot_all(self) -> Tuple[EpistemicBudget, ...]:
+        """Snapshot of all currently-tracked budgets — frozen
+        instances safe to project / serialize without holding the
+        lock. Slice 4 observability projection. NEVER raises."""
+        try:
+            with self._lock:
+                return tuple(self._budgets.values())
         except Exception:  # noqa: BLE001 — defensive
             return tuple()
 
