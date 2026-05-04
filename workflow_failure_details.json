@@ -1,12 +1,12 @@
 {
-  "workflow_name": "pip in /backend - Update #1346969964",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25314243120",
-  "branch": "main",
-  "commit_sha": "4e844c9",
-  "run_number": 137,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/25317291244",
+  "branch": "fix/ci/pip-in-backend-update-1346969964-run137-20260504-114905",
+  "commit_sha": "8bba39a",
+  "run_number": 53209,
   "failed_count": 1,
-  "fix_branch": "fix/ci/pip-in-backend-update-1346969964-run137-20260504-114905",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: pip in /backend - Update #1346969964 (Run #137)",
+  "fix_branch": "fix/ci/pr-automation-validation-run53209-20260504-115505",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #53209)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,64 +14,16 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 77,
-              "content": "2026-05-04T10:39:35.9917781Z Dependabot encountered '1' error(s) during execution, please check the logs for more details.",
+              "line_number": 30,
+              "content": "2026-05-04T11:51:04.5770163Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 81,
-              "content": "2026-05-04T10:39:35.9919580Z | Dependency   | Error Type    | Error Details |",
+              "line_number": 42,
+              "content": "2026-05-04T11:51:05.0081711Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: pip in /backend - Update #1346969964 (Run #137)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
-            },
-            {
-              "line_number": 83,
-              "content": "2026-05-04T10:39:35.9920539Z | transformers | unknown_error | null          |",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 85,
-              "content": "2026-05-04T10:39:36.1514508Z Failure running container 64a89722ec09056394c431470d9edd89ee907394fc66c019de5b2a2816be2e8b: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 90,
-              "content": "2026-05-04T10:39:37.2180795Z ##[error]Dependabot encountered an error performing the update",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 92,
-              "content": "Error: The updater encountered one or more errors.",
-              "severity": "high",
-              "emoji": "\u274c"
-            },
-            {
-              "line_number": 95,
-              "content": "2026-05-04T10:39:37.2190297Z \ud83e\udd16 ~ finished: error reported to Dependabot ~",
-              "severity": "high",
-              "emoji": "\u274c"
-            }
-          ],
-          "count": 7
-        },
-        {
-          "pattern": "FAIL|Failed|failed",
-          "matches": [
-            {
-              "line_number": 79,
-              "content": "2026-05-04T10:39:35.9918797Z |        Dependencies failed to update         |",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            },
-            {
-              "line_number": 85,
-              "content": "2026-05-04T10:39:36.1514508Z Failure running container 64a89722ec09056394c431470d9edd89ee907394fc66c019de5b2a2816be2e8b: Error: Command failed with exit code 1: /bin/sh -c $DEPENDABOT_HOME/dependabot-updater/bin/run update_files",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
             }
           ],
           "count": 2
@@ -80,22 +32,35 @@
           "pattern": "WARN|Warning|warning",
           "matches": [
             {
-              "line_number": 98,
-              "content": "2026-05-04T10:39:37.4279450Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: github/dependabot-action@main. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
+              "line_number": 58,
+              "content": "2026-05-04T11:51:05.0556153Z ##[warning]Node.js 20 actions are deprecated. The following actions are running on Node.js 20 and may not work as expected: amannn/action-semantic-pull-request@v5. Actions will be forced to run with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will be removed from the runner on September 16th, 2026. Please check if updated versions of these actions are available that support Node.js 24. To opt into Node.js 24 now, set the FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true environment variable on the runner or in your workflow file. Once Node.js 24 becomes the default, you can temporarily opt out by setting ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/",
               "severity": "medium",
               "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 34,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
             }
           ],
           "count": 1
         }
       ],
       "suggested_fixes": [
-        "Review the logs above for specific error messages"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "permission_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-05-04T11:49:05.457047"
+  "timestamp": "2026-05-04T11:55:05.853140"
 }
