@@ -514,6 +514,10 @@ class TestAuthorityInvariantsFinal:
             "backend.core.ouroboros.governance.verification.generative_quorum",
             "backend.core.ouroboros.governance.verification.ast_canonical",
             "backend.core.ouroboros.governance.ide_observability_stream",
+            # Slice 5b C — lazy bounded-JSONL recorder import.
+            # Read-only consumer of QuorumRunResult; never mutates
+            # runner state. Authority floor preserved.
+            "backend.core.ouroboros.governance.verification.generative_quorum_observer",
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):

@@ -449,12 +449,31 @@ async def run_quorum(
             canonical_signature=verdict.canonical_signature,
         )
 
-        return QuorumRunResult(
+        run_result = QuorumRunResult(
             verdict=verdict,
             rolls=tuple(rolls),
             failed_roll_ids=tuple(failed),
             elapsed_seconds=elapsed,
         )
+
+        # Step 7 (Slice 5b C) — persist non-DISABLED runs to the
+        # bounded JSONL ring buffer. Best-effort; never raises.
+        # DISABLED outcomes are filtered inside record_quorum_run
+        # (zero noise floor when consensus is master-off). Lazy
+        # import keeps the runner import-graph minimal when the
+        # observer module is replaced or absent in a test fixture.
+        try:
+            from backend.core.ouroboros.governance.verification.generative_quorum_observer import (  # noqa: E501
+                record_quorum_run,
+            )
+            record_quorum_run(run_result, op_id=op_id)
+        except Exception as record_exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[QuorumRunner] record_quorum_run swallowed: %s",
+                record_exc,
+            )
+
+        return run_result
     except asyncio.CancelledError:
         # Surface cancellation — caller is shutting down
         raise

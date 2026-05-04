@@ -575,6 +575,48 @@ class EventChannelServer:
                     "wiring failed: %s", co_exc,
                 )
 
+            # Move 6 Slice 5b — Generative Quorum observability GET
+            # routes. Mirrors the Move 5 / Priority #1 blocks above:
+            # loopback-asserted, rate-limited via the shared
+            # IDEObservabilityRouter helper, CORS-aware, mount is
+            # unconditional (per-request _gate() runs
+            # quorum_enabled() so operators can live-toggle the
+            # master flag). Producer side (run_quorum + recorder)
+            # is invoked per-op from candidate_generator and
+            # persists to the bounded JSONL ring under
+            # ``.jarvis/quorum_history/quorum.jsonl``. Per-arc fresh
+            # IDEObservabilityRouter preserves Move 4's per-arc
+            # rate-limit bucket convention.
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+                    IDEObservabilityRouter as _IDEObsRouterGQ,
+                    assert_loopback_only as _assert_loopback_gq,
+                )
+                from backend.core.ouroboros.governance.verification.generative_quorum_observability import (  # noqa: E501
+                    register_quorum_routes,
+                )
+                _assert_loopback_gq(self._host)
+                _gq_helper = _IDEObsRouterGQ()
+                register_quorum_routes(
+                    app,
+                    rate_limit_check=lambda req: (
+                        _gq_helper._check_rate_limit(
+                            _gq_helper._client_key(req),
+                        )
+                    ),
+                    cors_headers=_gq_helper._cors_headers,
+                )
+            except ValueError as gq_loopback_exc:
+                logger.warning(
+                    "[EventChannel] quorum observability "
+                    "refused: %s", gq_loopback_exc,
+                )
+            except Exception as gq_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] quorum observability "
+                    "wiring failed: %s", gq_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is
