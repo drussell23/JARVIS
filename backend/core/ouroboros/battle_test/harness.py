@@ -4046,50 +4046,131 @@ class BattleTestHarness:
         stop_event = threading.Event()
         self._wall_clock_hard_deadline_stop = stop_event
 
+        # Layer 3 escalation grace — if the event-set in Layer 2 doesn't
+        # cause the asyncio race to fire within this window (loop wedged,
+        # call_soon_threadsafe queue not draining), the thread sends
+        # SIGTERM to itself which the harness signal handler catches and
+        # writes a partial summary. Env-tunable; floor 10s.
+        try:
+            raw_l3 = os.environ.get(
+                "JARVIS_WALL_CLOCK_ESCALATION_SIGTERM_S", "",
+            ).strip()
+            escalation_sigterm_s = max(
+                10.0, min(300.0, float(raw_l3) if raw_l3 else 60.0),
+            )
+        except (TypeError, ValueError):
+            escalation_sigterm_s = 60.0
+        # Layer 4 escalation — if even SIGTERM doesn't terminate the
+        # process within this further window (signal handler wedged,
+        # asyncio cleanup path stuck), the thread does os._exit() to
+        # forcibly kill the process. Last line of defense.
+        try:
+            raw_l4 = os.environ.get(
+                "JARVIS_WALL_CLOCK_ESCALATION_EXIT_S", "",
+            ).strip()
+            escalation_exit_s = max(
+                10.0, min(300.0, float(raw_l4) if raw_l4 else 60.0),
+            )
+        except (TypeError, ValueError):
+            escalation_exit_s = 60.0
+
         def _watch() -> None:
+            import logging as _logging
+            _wd_log = _logging.getLogger(
+                "backend.core.ouroboros.battle_test.harness"
+            )
             try:
+                _wd_log.info(
+                    "[WallClockWatchdog] hard-deadline thread alive: "
+                    "cap=%.0fs grace=%.0fs sigterm=%.0fs exit=%.0fs",
+                    cap_s, grace_s, escalation_sigterm_s,
+                    escalation_exit_s,
+                )
+            except Exception:
+                pass
+            try:
+                # ── Layer 2: fire the asyncio event at cap + grace ──
                 while not stop_event.is_set():
                     now = time.monotonic()
                     remaining = deadline_monotonic - now
                     if remaining <= 0:
-                        # Deadline reached. Fire the asyncio event from
-                        # this thread via call_soon_threadsafe so the
-                        # async race in run() picks it up. If the loop
-                        # is wedged AND call_soon_threadsafe doesn't
-                        # process, the BoundedShutdownWatchdog (which
-                        # the asyncio path arms when it eventually
-                        # fires) is the next layer; failing that,
-                        # the OS-level signal handler is the last layer.
                         try:
                             loop.call_soon_threadsafe(
                                 self._wall_clock_event.set,
                             )
                         except Exception:  # noqa: BLE001 -- defensive
                             pass
-                        # Also stamp stop_reason if not already set
-                        # (mirror the asyncio path's discipline).
                         if self._stop_reason in ("unknown", "", None):
                             self._stop_reason = "wall_clock_cap"
                         try:
-                            import logging as _logging
-                            _logging.getLogger(
-                                "backend.core.ouroboros.battle_test.harness"
-                            ).warning(
+                            _wd_log.warning(
                                 "[WallClockWatchdog] HARD DEADLINE "
-                                "thread fired: monotonic elapsed "
-                                "%.0fs >= cap %.0fs + grace %.0fs "
-                                "(asyncio path was wedged or already "
-                                "fired).",
+                                "thread fired (Layer 2): monotonic "
+                                "elapsed %.0fs >= cap %.0fs + grace "
+                                "%.0fs (asyncio path was wedged or "
+                                "already fired).",
                                 time.monotonic() - anchor_monotonic,
                                 cap_s, grace_s,
                             )
                         except Exception:  # noqa: BLE001
                             pass
-                        return
-                    # Sleep at most 5s OR remaining-to-deadline.
-                    # Bounds wake-up so stop_event.set() from the
-                    # asyncio path takes effect within 5s rather than
-                    # waiting for the full remaining duration.
+                        break
+                    stop_event.wait(timeout=min(5.0, remaining))
+                # ── Layer 3: SIGTERM self if event-set didn't work ──
+                # Reach here either via Layer 2 fire OR
+                # stop_event.set() from clean shutdown path. If clean
+                # shutdown path wins, stop_event is set → loop won't
+                # iterate, exit gracefully.
+                if stop_event.is_set():
+                    return
+                escalation_anchor = time.monotonic()
+                while not stop_event.is_set():
+                    elapsed = time.monotonic() - escalation_anchor
+                    remaining = escalation_sigterm_s - elapsed
+                    if remaining <= 0:
+                        try:
+                            _wd_log.error(
+                                "[WallClockWatchdog] LAYER 3 "
+                                "ESCALATION: SIGTERM self "
+                                "(elapsed=%.0fs since Layer 2 fired; "
+                                "asyncio race didn't honor the event "
+                                "— loop wedged). PID=%d",
+                                elapsed, os.getpid(),
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            import signal as _signal
+                            os.kill(os.getpid(), _signal.SIGTERM)
+                        except Exception:
+                            pass
+                        break
+                    stop_event.wait(timeout=min(5.0, remaining))
+                # ── Layer 4: os._exit if even SIGTERM didn't kill ──
+                if stop_event.is_set():
+                    return
+                exit_anchor = time.monotonic()
+                while not stop_event.is_set():
+                    elapsed = time.monotonic() - exit_anchor
+                    remaining = escalation_exit_s - elapsed
+                    if remaining <= 0:
+                        try:
+                            _wd_log.error(
+                                "[WallClockWatchdog] LAYER 4 "
+                                "ESCALATION: os._exit(75) "
+                                "(elapsed=%.0fs since Layer 3 SIGTERM; "
+                                "process didn't terminate — signal "
+                                "handler wedged or shutdown path "
+                                "stuck). LAST LINE OF DEFENSE.",
+                                elapsed,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            os._exit(75)  # EX_TEMPFAIL — try again
+                        except Exception:
+                            pass
+                        break
                     stop_event.wait(timeout=min(5.0, remaining))
             except Exception:  # noqa: BLE001 -- contract: never crash
                 pass
@@ -4151,12 +4232,45 @@ class BattleTestHarness:
             )
         except (TypeError, ValueError):
             check_interval_s = 5.0
+        # Diagnostic — confirm the task actually started running.
+        # Without this, a silently-cancelled task is invisible
+        # (the previous Defect #1 regression hid behind exactly
+        # this gap — the 'armed' log fires before ensure_future
+        # even returns; the task itself never logged).
+        logger.info(
+            "[WallClockWatchdog] async monitor task alive: "
+            "cap=%.0fs check_interval=%.0fs",
+            cap_s, check_interval_s,
+        )
+        # Heartbeat every Nth iteration so an operator tailing the
+        # log can confirm the task is still running. Default: every
+        # 12th tick (60s at default 5s interval). Off when explicitly
+        # 0.
+        try:
+            hb_every = int(os.environ.get(
+                "JARVIS_WALL_CLOCK_HEARTBEAT_EVERY", "12",
+            ).strip() or "12")
+        except (TypeError, ValueError):
+            hb_every = 12
+        _tick = 0
         while True:
             try:
                 await asyncio.sleep(check_interval_s)
             except asyncio.CancelledError:
+                logger.info(
+                    "[WallClockWatchdog] async monitor task cancelled "
+                    "after %.0fs (NEVER fired)",
+                    time.monotonic() - anchor_monotonic,
+                )
                 return
+            _tick += 1
             elapsed = time.monotonic() - anchor_monotonic
+            if hb_every > 0 and _tick % hb_every == 0:
+                logger.debug(
+                    "[WallClockWatchdog] heartbeat: tick=%d elapsed=%.0fs "
+                    "remaining=%.0fs",
+                    _tick, elapsed, max(0.0, cap_s - elapsed),
+                )
             if elapsed >= cap_s:
                 break
             # Loop continues; next sleep will wake at +check_interval_s.

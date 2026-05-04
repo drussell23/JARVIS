@@ -243,6 +243,19 @@ EVENT_TYPE_PRODUCTION_ORACLE_SIGNAL = "production_oracle_signal_observed"
 # JARVIS_AUTO_ACTION_ENFORCE=false (the only state the arc ships in).
 EVENT_TYPE_AUTO_ACTION_PROPOSAL = "auto_action_proposal"
 
+# Stream-validator constants (2026-05-03) — these were defined as
+# raw string literals in their respective publisher modules and got
+# silently dropped by the stream broker because the validator's
+# frozenset didn't know them. Lifting them to constants HERE keeps
+# the publisher modules canonical (no duplication of the literal)
+# while making the stream module the single source of truth for
+# "valid event types". Cross-module publishers (Move 4 InvariantDrift
+# Auditor, Coherence Auditor, auto_action_router emit phase) reference
+# these constants now.
+EVENT_TYPE_INVARIANT_DRIFT_DETECTED = "invariant_drift_detected"
+EVENT_TYPE_BEHAVIORAL_DRIFT_DETECTED = "behavioral_drift_detected"
+EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED = "auto_action_proposal_emitted"
+
 
 # W3(7) Slice 6 — cancel-origin SSE event (additive). Payload schema per
 # scope doc §6.3: ``{"event": "cancel_origin_emitted", "data":
@@ -516,6 +529,11 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CODEBASE_CHARACTER_INJECTED,       # CodebaseCharDigest Slice 3
     EVENT_TYPE_AUTO_ACTION_PROPOSAL,              # auto_action_router (Move 3)
     EVENT_TYPE_PRODUCTION_ORACLE_SIGNAL,          # Production Oracle (Tier 2 #6)
+    EVENT_TYPE_SEMANTIC_EMBEDDER_FALLBACK,        # SemanticIndex stdlib fallback
+    EVENT_TYPE_GOAL_INFERENCE_BUILT,              # MissionInferrer (Tier 2 #5)
+    EVENT_TYPE_INVARIANT_DRIFT_DETECTED,          # Move 4 InvariantDriftAuditor
+    EVENT_TYPE_BEHAVIORAL_DRIFT_DETECTED,         # Coherence Auditor (Priority #1)
+    EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED,      # auto_action_router emit phase
 })
 
 
