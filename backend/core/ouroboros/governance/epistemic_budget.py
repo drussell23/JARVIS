@@ -125,25 +125,25 @@ EPISTEMIC_BUDGET_SCHEMA_VERSION: str = "epistemic_budget.1"
 
 
 def epistemic_budget_enabled() -> bool:
-    """``JARVIS_EPISTEMIC_BUDGET_ENABLED`` (default ``false``
-    until Slice 5 graduation per PRD §31.2).
+    """``JARVIS_EPISTEMIC_BUDGET_ENABLED`` (graduated default-
+    ``true`` 2026-05-04 per PRD §31.2 Slice 5 — instant revert
+    via explicit ``"false"``).
 
     Asymmetric env semantics — empty/whitespace = unset = current
-    default (false for Slice 1); explicit ``1``/``true``/``yes``/
-    ``on`` flips on. Same shape as
+    default (true post-graduation); explicit ``0``/``false``/
+    ``no``/``off`` flips off. Same shape as
     :func:`failure_mode_memory_enabled` /
     :func:`action_outcome_memory_enabled` /
     :func:`coherence_auditor_enabled` / :func:`cigw_enabled` /
-    :func:`quorum_enabled` graduated flags so the Slice 5
-    graduation flip is a one-character edit.
+    :func:`quorum_enabled` graduated flags.
 
     Re-read on every call so flips hot-revert without restart."""
     raw = os.environ.get(
         "JARVIS_EPISTEMIC_BUDGET_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 1 default; flips to True at Slice 5
-    return raw in ("1", "true", "yes", "on")
+        return True  # Graduated default 2026-05-04 (Slice 5)
+    return raw not in ("0", "false", "no", "off")
 
 
 # ---------------------------------------------------------------------------

@@ -146,8 +146,8 @@ class TestObservabilityHandlers:
     async def test_overview_disabled_returns_503(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.epistemic_budget_observability import (  # noqa: E501
             _EpistemicBudgetRoutesHandler,
@@ -310,8 +310,8 @@ class TestObservabilityHandlers:
 
 class TestBudgetREPL:
     def test_help_works_when_disabled(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.budget_repl import (  # noqa: E501
             dispatch_budget_command,
@@ -324,8 +324,8 @@ class TestBudgetREPL:
     def test_disabled_returns_friendly_message(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.budget_repl import (  # noqa: E501
             dispatch_budget_command,
@@ -470,8 +470,8 @@ class TestProviderBridge:
     async def test_disabled_returns_none_callback(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.epistemic_budget_provider_bridge import (  # noqa: E501
             attach_to_provider_run,

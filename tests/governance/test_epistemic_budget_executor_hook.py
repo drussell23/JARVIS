@@ -86,8 +86,8 @@ class TestMasterFlagGate:
     async def test_disabled_returns_disabled_outcome(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.epistemic_budget import (  # noqa: E501
             BudgetOutcome,
@@ -108,8 +108,8 @@ class TestMasterFlagGate:
     def test_open_op_tracker_returns_false_when_disabled(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.epistemic_budget import (  # noqa: E501
             EpistemicBudgetTracker,
@@ -174,8 +174,8 @@ class TestConvenienceHelpers:
     def test_note_round_complete_silently_no_op_when_disabled(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.epistemic_budget import (  # noqa: E501
             EpistemicBudgetTracker,

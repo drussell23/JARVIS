@@ -4270,16 +4270,49 @@ class PrimeProvider:
                 time.monotonic()
                 + max(0.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
             )
-            raw, tool_records_list = await self._tool_loop.run(
-                prompt=prompt,
-                generate_fn=_generate_raw,
-                parse_fn=_parse_tool_call_response,
-                repo=getattr(context, "primary_repo", "jarvis"),
-                op_id=getattr(context, "op_id", ""),
-                deadline=deadline_mono,
-                risk_tier=getattr(context, "risk_tier", None),
-                is_read_only=_is_read_only,
-            )
+            # ── Upgrade 1 (PRD §31.2) Slice 5 wire-up ──
+            # Lazy-imported per-call so the budget infra is dormant unless
+            # the master flag is on. Bridge returns None when disabled →
+            # tool_loop.run() per_round_observer=None path is byte-identical
+            # to pre-graduation behavior.
+            _eb_op_id = getattr(context, "op_id", "")
+            _eb_observer = None
+            try:
+                from backend.core.ouroboros.governance.epistemic_budget_provider_bridge import (
+                    attach_to_provider_run as _eb_attach,
+                )
+                _eb_observer = _eb_attach(
+                    op_id=_eb_op_id,
+                    route=(
+                        getattr(context, "provider_route", "") or "standard"
+                    ),
+                    risk_tier=str(
+                        getattr(context, "risk_tier", None) or ""
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                _eb_observer = None
+            try:
+                raw, tool_records_list = await self._tool_loop.run(
+                    prompt=prompt,
+                    generate_fn=_generate_raw,
+                    parse_fn=_parse_tool_call_response,
+                    repo=getattr(context, "primary_repo", "jarvis"),
+                    op_id=_eb_op_id,
+                    deadline=deadline_mono,
+                    risk_tier=getattr(context, "risk_tier", None),
+                    is_read_only=_is_read_only,
+                    per_round_observer=_eb_observer,
+                )
+            finally:
+                # Idempotent close — no-op when master flag off.
+                try:
+                    from backend.core.ouroboros.governance.epistemic_budget_provider_bridge import (
+                        close_op as _eb_close,
+                    )
+                    _eb_close(op_id=_eb_op_id)
+                except Exception:  # noqa: BLE001 — defensive
+                    pass
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
             # Venom mutation audit — captured from per-op ToolExecutor at

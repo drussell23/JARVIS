@@ -1640,16 +1640,51 @@ class DoublewordProvider:
                 (deadline - datetime.now(tz=timezone.utc)).total_seconds()
                 if deadline else 120.0,
             )
-            raw, tool_records_list = await self._tool_loop.run(
-                prompt=prompt,
-                generate_fn=_generate_raw,
-                parse_fn=_parse_tool_call_response,
-                repo=getattr(context, "primary_repo", "jarvis"),
-                op_id=getattr(context, "operation_id", f"dw-rt-{int(time.time())}"),
-                deadline=deadline_mono,
-                risk_tier=getattr(context, "risk_tier", None),
-                is_read_only=bool(getattr(context, "is_read_only", False)),
+            # ── Upgrade 1 (PRD §31.2) Slice 5 wire-up ──
+            # Lazy import; bridge returns None when master flag off →
+            # per_round_observer=None preserves byte-identical pre-graduation
+            # behavior.
+            _eb_op_id = getattr(
+                context, "operation_id",
+                f"dw-rt-{int(time.time())}",
             )
+            _eb_observer = None
+            try:
+                from backend.core.ouroboros.governance.epistemic_budget_provider_bridge import (
+                    attach_to_provider_run as _eb_attach,
+                )
+                _eb_observer = _eb_attach(
+                    op_id=_eb_op_id,
+                    route=(
+                        getattr(context, "provider_route", "")
+                        or "standard"
+                    ),
+                    risk_tier=str(
+                        getattr(context, "risk_tier", None) or ""
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                _eb_observer = None
+            try:
+                raw, tool_records_list = await self._tool_loop.run(
+                    prompt=prompt,
+                    generate_fn=_generate_raw,
+                    parse_fn=_parse_tool_call_response,
+                    repo=getattr(context, "primary_repo", "jarvis"),
+                    op_id=_eb_op_id,
+                    deadline=deadline_mono,
+                    risk_tier=getattr(context, "risk_tier", None),
+                    is_read_only=bool(getattr(context, "is_read_only", False)),
+                    per_round_observer=_eb_observer,
+                )
+            finally:
+                try:
+                    from backend.core.ouroboros.governance.epistemic_budget_provider_bridge import (
+                        close_op as _eb_close,
+                    )
+                    _eb_close(op_id=_eb_op_id)
+                except Exception:  # noqa: BLE001 — defensive
+                    pass
             tool_records = tuple(tool_records_list)
             # Venom mutation audit — captured from per-op ToolExecutor at
             # run() exit. Empty when no edit/write/delete tools fired.

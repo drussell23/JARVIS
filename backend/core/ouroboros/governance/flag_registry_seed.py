@@ -3200,6 +3200,115 @@ SEED_SPECS: list = [
         since="M11 Slice 3 (2026-05-04)",
         posture_relevance=_HARDEN_AND_CONSOLIDATE,
     ),
+    # ========================================================================
+    # Upgrade 1 — Bounded Epistemic Loop (PRD §31.2) — 5 flags
+    # Slice 5 graduation: master flips false → true. Composes Confidence-
+    # Monitor + ConfidenceProbeRunner + HypothesisProbe + SBT + RiskTier-
+    # Floor + tool_executor as a glue arc; one authoritative per-op budget
+    # consulted at every Venom tool-round boundary.
+    # ========================================================================
+    FlagSpec(
+        name="JARVIS_EPISTEMIC_BUDGET_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the Bounded Epistemic Loop "
+            "subsystem. Default TRUE post Slice 5 graduation "
+            "(2026-05-04). Composes ConfidenceMonitor + "
+            "ConfidenceProbeRunner + HypothesisProbe + "
+            "SpeculativeBranchTree + RiskTierFloor + tool_"
+            "executor as a glue arc — one authoritative per-op "
+            "budget consulted at every Venom tool-round "
+            "boundary via :func:`epistemic_budget_provider_"
+            "bridge.attach_to_provider_run`. Cost-gated routes "
+            "(BG/SPEC) refuse PROBE/SBT structurally. "
+            "Operator instant-revert via explicit env false."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/epistemic_budget.py"
+        ),
+        example="true",
+        since="Upgrade 1 Slice 5 (graduated PRD §31.2, 2026-05-04)",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_EPISTEMIC_MAX_ROUNDS",
+        type=FlagType.INT, default=12,
+        description=(
+            "Per-op cap on Venom tool rounds before the budget "
+            "is exhausted. Default 12. Clamped [1, 100]. When "
+            "rounds_consumed >= max_rounds, the dispatch routes "
+            "to EXHAUSTED_NOTIFY_APPLY (when below notify_apply "
+            "tier) or EXHAUSTED_APPROVAL_REQUIRED (when at or "
+            "above) — both fire the budget_action_taken SSE + "
+            "escalate the risk tier. Captured at op-start so "
+            "env changes mid-op don't shift the cap."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/epistemic_budget.py"
+        ),
+        example="12",
+        since="Upgrade 1 Slice 1 (PRD §31.2, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_EPISTEMIC_CONFIDENCE_DROP_THRESHOLD",
+        type=FlagType.FLOAT, default=0.25,
+        description=(
+            "Drop magnitude (peak − latest in the bounded "
+            "trajectory window) that triggers PROBE_TRIGGERED. "
+            "Default 0.25. Clamped [0.01, 1.0]. When the drop "
+            "exceeds threshold AND probe_calls_remaining > 0, "
+            "the round-boundary dispatch invokes the injected "
+            "ConfidenceProbeRunner synchronously (Decision B1: "
+            "no background probes) — bounded by HypothesisProbe "
+            "three-termination contract."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/epistemic_budget.py"
+        ),
+        example="0.25",
+        since="Upgrade 1 Slice 1 (PRD §31.2, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_EPISTEMIC_SBT_BRANCH_CAP",
+        type=FlagType.INT, default=3,
+        description=(
+            "Per-op cap on SpeculativeBranchTree branch "
+            "invocations. Default 3. Clamped [1, 10]. SBT "
+            "fires only when (a) probe verdict is "
+            "INCONCLUSIVE_*, (b) risk_tier >= notify_apply "
+            "(SBT cost-gate), and (c) branch_calls_remaining "
+            "> 0. Captured at op-start for stability."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/epistemic_budget.py"
+        ),
+        example="3",
+        since="Upgrade 1 Slice 1 (PRD §31.2, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_EPISTEMIC_TRACKER_TTL_S",
+        type=FlagType.INT, default=3600,
+        description=(
+            "TTL (seconds) for orphan tracker entries. Default "
+            "3600 (1h). Clamped [60, 86400]. "
+            ":meth:`EpistemicBudgetTracker.reap_orphans` walks "
+            "the per-op_id dict and drops entries whose "
+            "last_updated_at_unix is older than now - ttl_s. "
+            "Lifecycle A1: providers call close_op() in their "
+            "finally block; reap_orphans is a safety net for "
+            "hard kills."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/epistemic_budget.py"
+        ),
+        example="3600",
+        since="Upgrade 1 Slice 2 (PRD §31.2, 2026-05-04)",
+    ),
 ]
 
 

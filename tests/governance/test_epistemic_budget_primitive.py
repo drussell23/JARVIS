@@ -36,11 +36,24 @@ import pytest
 
 
 class TestMasterFlag:
-    def test_default_is_false_pre_graduation(self, monkeypatch):
-        """Slice 1 default is FALSE; Slice 5 graduation flips to
-        TRUE. Mirrors Upgrade 3 + M11 pre-graduation pattern."""
+    def test_default_is_true_post_graduation(self, monkeypatch):
+        """Slice 5 graduated 2026-05-04 — default-TRUE.
+        Mirrors Upgrade 3 + M11 + Move 6 graduated pattern."""
         monkeypatch.delenv(
             "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        )
+        from backend.core.ouroboros.governance.epistemic_budget import (  # noqa: E501
+            epistemic_budget_enabled,
+        )
+        assert epistemic_budget_enabled() is True
+
+    @pytest.mark.parametrize(
+        "v", ["0", "false", "no", "off", "FALSE"],
+    )
+    def test_falsy_variants_flip_off(self, monkeypatch, v):
+        """Post-graduation revert path."""
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", v,
         )
         from backend.core.ouroboros.governance.epistemic_budget import (  # noqa: E501
             epistemic_budget_enabled,
@@ -468,8 +481,10 @@ def _trajectory(
 
 class TestComputeBudgetActionDecisionTree:
     def test_disabled_when_master_off(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_EPISTEMIC_BUDGET_ENABLED", raising=False,
+        # Post-graduation: explicit "false" disables (default
+        # is True per Slice 5 flip 2026-05-04).
+        monkeypatch.setenv(
+            "JARVIS_EPISTEMIC_BUDGET_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.epistemic_budget import (  # noqa: E501
             BudgetOutcome,

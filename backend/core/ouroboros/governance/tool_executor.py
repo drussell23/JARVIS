@@ -4454,6 +4454,13 @@ class ToolLoopCoordinator:
         deadline: float,
         risk_tier: Optional[Any] = None,  # Optional[RiskTier] for ask_human gating
         is_read_only: bool = False,  # forwarded from ctx.is_read_only — gates mutation tools
+        per_round_observer: Optional[Callable[[int], Awaitable[Any]]] = None,
+        # Upgrade 1 (PRD §31.2) Slice 5: pure-observer hook fired after each
+        # completed round body (post-compaction, pre-iteration). Default
+        # ``None`` preserves existing behavior. Production wires
+        # :func:`epistemic_budget_provider_bridge.attach_to_provider_run`'s
+        # callback. Return value is ignored; exceptions are swallowed (never
+        # propagate into the round loop).
     ) -> Tuple[str, List[ToolExecutionRecord]]:
         """Multi-turn tool loop with parallel execution support.
 
@@ -4995,6 +5002,23 @@ class ToolLoopCoordinator:
                 else:
                     self._finalize_run(op_id)
                     raise RuntimeError(f"tool_loop_context_overflow:{len(current_prompt)}")
+
+            # ── Upgrade 1 (PRD §31.2) per-round budget observer ──
+            # Fires AFTER round body + compaction + force-truncate guard,
+            # at the natural round-boundary just before the loop iterates.
+            # Pure observer: return value discarded, exceptions swallowed
+            # (never destabilize the round loop). Production wires
+            # epistemic_budget_provider_bridge.attach_to_provider_run.
+            if per_round_observer is not None:
+                try:
+                    await per_round_observer(round_index)
+                except Exception:  # noqa: BLE001 — defensive isolation
+                    logger.debug(
+                        "[ToolLoop] per_round_observer raised at "
+                        "op=%s round=%d (swallowed)",
+                        op_id[:12] if op_id else "?", round_index,
+                        exc_info=True,
+                    )
 
         # Unreachable: the loop above either returns on a final answer,
         # raises ``tool_loop_deadline_exceeded``, raises
