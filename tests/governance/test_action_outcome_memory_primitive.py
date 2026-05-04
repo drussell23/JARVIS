@@ -663,9 +663,9 @@ class TestAuthorityInvariants:
 
 
 class TestPublicExports:
-    def test_all_lists_slice_1_and_slice_2_public_names(self):
-        """Slice 1 (5) + Slice 2 (9) = 14 public exports. Future
-        slices append; never remove."""
+    def test_all_lists_slices_1_through_3_public_names(self):
+        """Slice 1 (5) + Slice 2 (9) + Slice 3 (6) = 20 public
+        exports. Future slices append; never remove."""
         from backend.core.ouroboros.governance import action_outcome_memory  # noqa: E501
         expected = sorted([
             # Slice 1 — primitive
@@ -684,6 +684,13 @@ class TestPublicExports:
             "read_action_outcomes_for_cluster",
             "read_all_action_outcomes",
             "record_action_outcome",
+            # Slice 3 — RAG retriever
+            "ActionOutcomeMatch",
+            "action_outcome_min_weight",
+            "action_outcome_polarity_mode",
+            "action_outcome_recency_halflife_days",
+            "action_outcome_top_k",
+            "recall_for_region",
         ])
         assert sorted(action_outcome_memory.__all__) == expected
 
@@ -700,6 +707,10 @@ class TestPublicExports:
             "_read_existing_records",
             "_within_dedup_window",
             "_GLOBAL_FALLBACK_STEM",
+            # Slice 3
+            "_outcome_polarity_weight",
+            "_polarity_presets",
+            "_POLARITY_PRESETS",
         ):
             assert name not in action_outcome_memory.__all__
             assert hasattr(action_outcome_memory, name)

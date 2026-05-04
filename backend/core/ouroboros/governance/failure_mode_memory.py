@@ -1635,8 +1635,23 @@ class FailureModeMatch:
 
 
 # ---------------------------------------------------------------------------
-# Pure-function scoring primitives
+# Pure-function scoring primitives — delegated to the shared module
+# (M11 Slice 3 / Decision C2). The underscore-prefixed local names are
+# preserved so existing callers + tests that grep for them continue
+# to work; they are thin wrappers over :mod:`_scoring_primitives`.
+# Future arcs (Upgrade 1 / M9) import directly from the shared module.
 # ---------------------------------------------------------------------------
+
+
+from backend.core.ouroboros.governance import _scoring_primitives  # noqa: E501
+
+
+# Reference floor for log-scale weight saturation — Upgrade 3
+# semantics: weight=2 (PRD min) yields ~0.46, weight=10 saturates
+# near 1.0. Pinned in tests to lock the curve shape.
+_WEIGHT_SATURATION_REFERENCE: int = (
+    _scoring_primitives.DEFAULT_WEIGHT_SATURATION_REFERENCE
+)
 
 
 def _recency_weight(
@@ -1644,64 +1659,39 @@ def _recency_weight(
 ) -> float:
     """``0.5 ** (age_days / halflife_days)``. Clamped to [0, 1].
 
-    Literal parity with :func:`coherence_auditor._recency_weight`
-    and :func:`semantic_index._recency_weight` — pinned by tests
-    so any future divergence trips immediately. NEVER raises."""
-    try:
-        if halflife_days <= 0 or age_seconds < 0:
-            return 1.0
-        age_days = age_seconds / 86400.0
-        return float(0.5 ** (age_days / halflife_days))
-    except Exception:  # noqa: BLE001 — defensive
-        return 0.0
+    Delegates to :func:`_scoring_primitives.recency_weight`.
+    Pinned by tests for literal-formula parity with
+    :func:`coherence_auditor._recency_weight` and
+    :func:`semantic_index._recency_weight`. NEVER raises."""
+    return _scoring_primitives.recency_weight(
+        age_seconds, halflife_days,
+    )
 
 
 def _jaccard_similarity(
     a: Iterable[str], b: Iterable[str],
 ) -> float:
-    """``|a ∩ b| / |a ∪ b|`` — 1.0 when both sets are empty
-    (degenerate exact-match), 0.0 when union is otherwise empty.
-    Defensive against non-iterables. NEVER raises."""
-    try:
-        sa = set(str(x) for x in a if x)
-        sb = set(str(x) for x in b if x)
-    except (TypeError, ValueError):
-        return 0.0
-    if not sa and not sb:
-        # Both empty — treat as full match (situation alone matched).
-        return 1.0
-    union = sa | sb
-    if not union:
-        return 0.0
-    inter = sa & sb
-    return float(len(inter)) / float(len(union))
+    """``|a ∩ b| / |a ∪ b|`` — 1.0 when both sets are empty.
 
-
-# Reference floor for log-scale weight saturation — picked so
-# weight=2 (the PRD min) yields ~0.4, weight=10 saturates near 1.0.
-# Pinned in tests to lock the curve shape.
-_WEIGHT_SATURATION_REFERENCE: int = 10
+    Delegates to :func:`_scoring_primitives.jaccard_similarity`.
+    NEVER raises."""
+    return _scoring_primitives.jaccard_similarity(a, b)
 
 
 def _weight_score(weight: int) -> float:
     """Bounded, non-linear weight scoring. ``log1p(weight) /
-    log1p(N)`` capped at 1.0. Linear weight would let one
-    50-recurrence outlier dominate the top-K; log1p compresses
-    the tail so multiple medium-weight matches can still surface.
-    NEVER raises."""
-    try:
-        w = max(0, int(weight))
-        ref = max(1, _WEIGHT_SATURATION_REFERENCE)
-        denom = math.log1p(ref)
-        if denom <= 0:
-            return 0.0
-        return min(1.0, math.log1p(w) / denom)
-    except Exception:  # noqa: BLE001 — defensive
-        return 0.0
+    log1p(N)`` capped at 1.0.
+
+    Delegates to :func:`_scoring_primitives.weight_score` with the
+    Upgrade-3-tuned reference (10). NEVER raises."""
+    return _scoring_primitives.weight_score(
+        weight, reference=_WEIGHT_SATURATION_REFERENCE,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Diversity dedup — Coherence Auditor pattern
+# Diversity dedup — keyed on attempted_action_kind for Upgrade 3
+# (M11 keys on outcome_kind via the same shared primitive)
 # ---------------------------------------------------------------------------
 
 
@@ -1711,28 +1701,20 @@ def _diversity_dedup(
     top_k: int,
 ) -> Tuple["FailureModeMatch", ...]:
     """Walk matches in score-descending order; preserve at most
-    one per ``attempted_action_kind`` until top_k filled. If pool
-    exhausted before top_k filled, fall through and accept
-    same-attempt-kind matches in score order. NEVER raises."""
-    if top_k < 1:
-        return tuple()
-    primary: list = []
-    seen_kinds: set = set()
-    overflow: list = []
-    for m in matches:
-        kind = (m.record.attempted_action_kind or "").strip().lower()
-        if kind not in seen_kinds:
-            primary.append(m)
-            seen_kinds.add(kind)
-            if len(primary) >= top_k:
-                break
-        else:
-            overflow.append(m)
-    if len(primary) >= top_k:
-        return tuple(primary[:top_k])
-    # Fill remaining slots from overflow (already score-sorted).
-    remaining = top_k - len(primary)
-    return tuple(primary + overflow[:remaining])
+    one per ``attempted_action_kind`` until top_k filled.
+
+    Delegates to :func:`_scoring_primitives.diversity_dedup` with
+    a key_fn that extracts ``attempted_action_kind`` from each
+    match's record. M11's retriever uses the same shared primitive
+    with a different key_fn (``outcome_kind.value``) for balanced-
+    palette diversity. NEVER raises."""
+    return _scoring_primitives.diversity_dedup(
+        matches,
+        top_k=top_k,
+        key_fn=lambda m: (
+            m.record.attempted_action_kind or ""
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

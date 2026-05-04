@@ -1118,12 +1118,398 @@ def clear_action_outcomes(
         return False
 
 
+# ===========================================================================
+# Slice 3 — ActionOutcomeRetriever (RAG layer, PRD §30.5.3 Slice 3)
+#
+# ``recall_for_region(target_files, ...)`` returns top-K matching
+# prior outcomes via Coherence-style diversity-weighted scoring:
+#
+#   combined = recency × jaccard × weight × outcome_polarity
+#
+# Decision C2 (M11 Slice 3 scope): scoring primitives lifted into
+# the shared :mod:`_scoring_primitives` module. M11 imports
+# ``recency_weight`` / ``jaccard_similarity`` / ``weight_score`` /
+# ``diversity_dedup`` directly from there. Upgrade 3 underscore-
+# prefixed names are now thin delegates over the same primitives —
+# zero duplication, single source of truth, both arcs rank
+# correctly.
+#
+# Outcome polarity weighting (M11-specific dimension Upgrade 3
+# doesn't have): APPLIED_VERIFIED records score higher than
+# REVERTED higher than REJECTED higher than DEFERRED. The model
+# wants "what worked" prioritized but should still see "what
+# failed at the gate" as context. Operators tune via
+# ``JARVIS_ACTION_OUTCOME_POLARITY_MODE`` (3 closed-set presets:
+# ``balanced`` (default) / ``favor_positive`` / ``all_equal``) —
+# no individual-weight env knobs exposed (intentional: the
+# polarity ranking is a SEMANTIC choice, not a tunable threshold;
+# preset mode encodes operator intent at appropriate granularity).
+#
+# Cluster-scoped retrieval (Decision A3 from scope continued):
+# given target_files, _resolve_cluster_id picks the best-effort
+# cluster. The retriever reads (cluster + global fallback) when
+# resolution succeeds; falls back to read_all_action_outcomes
+# when SemanticIndex is unavailable. CORRECTNESS NEVER depends on
+# clustering — clustering is a STORAGE OPTIMIZATION.
+# ===========================================================================
+
+
+# Slice 3 dependency on the shared scoring module:
+from backend.core.ouroboros.governance import _scoring_primitives  # noqa: E501
+
+
+# ---------------------------------------------------------------------------
+# Retriever env knobs
+# ---------------------------------------------------------------------------
+
+
+def _read_float_knob(
+    name: str, default: float, floor: float, ceiling: float,
+) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+        if v < floor:
+            return floor
+        if v > ceiling:
+            return ceiling
+        return v
+    except (TypeError, ValueError):
+        return default
+
+
+def action_outcome_top_k() -> int:
+    """``JARVIS_ACTION_OUTCOME_TOP_K`` — default 3 (PRD §30.5.3
+    Slice 3 default). Clamped [1, 10]."""
+    return _read_int_knob(
+        "JARVIS_ACTION_OUTCOME_TOP_K", 3, 1, 10,
+    )
+
+
+def action_outcome_min_weight() -> int:
+    """``JARVIS_ACTION_OUTCOME_MIN_WEIGHT`` — default **1**
+    (positive evidence is more actionable than negative; a single
+    APPLIED_VERIFIED is already strong signal, unlike Upgrade 3
+    where weight=2 gates first-attempt injection of failures).
+    Clamped [1, 100]."""
+    return _read_int_knob(
+        "JARVIS_ACTION_OUTCOME_MIN_WEIGHT", 1, 1, 100,
+    )
+
+
+def action_outcome_recency_halflife_days() -> float:
+    """``JARVIS_ACTION_OUTCOME_RECENCY_HALFLIFE_DAYS`` — default
+    14.0 (parity with :mod:`semantic_index` commit half-life and
+    Upgrade 3 retrieval). Clamped [1.0, 365.0]."""
+    return _read_float_knob(
+        "JARVIS_ACTION_OUTCOME_RECENCY_HALFLIFE_DAYS",
+        14.0, 1.0, 365.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Outcome polarity weights — closed-set preset modes
+# ---------------------------------------------------------------------------
+
+
+# Three preset modes — caller-tunable via env. The polarity
+# RANKING is a semantic choice, not an arbitrary threshold;
+# operators picking a mode encode their intent ("I want to see
+# what worked" vs "balanced palette" vs "treat all dispositions
+# equally") at the appropriate level of abstraction.
+_POLARITY_PRESETS: Dict[str, Dict["OutcomeKind", float]] = {
+    "balanced": {
+        # Default — model gets a balanced view but VERIFIED
+        # records carry the strongest signal.
+    },  # filled below after OutcomeKind is in scope (lookup-time)
+    "favor_positive": {
+    },
+    "all_equal": {
+    },
+}
+
+
+def _polarity_presets() -> Dict[
+    str, Dict["OutcomeKind", float]
+]:
+    """Lazy-construct the polarity-preset table once OutcomeKind
+    is in scope. Module-level construction would race with
+    OutcomeKind definition order. Cached after first call."""
+    if _POLARITY_PRESETS["balanced"]:
+        return _POLARITY_PRESETS
+    _POLARITY_PRESETS["balanced"] = {
+        OutcomeKind.APPLIED_VERIFIED: 1.0,
+        OutcomeKind.APPLIED_REVERTED: 0.7,
+        OutcomeKind.REJECTED: 0.5,
+        OutcomeKind.DEFERRED: 0.3,
+        OutcomeKind.DISABLED: 0.0,
+    }
+    _POLARITY_PRESETS["favor_positive"] = {
+        OutcomeKind.APPLIED_VERIFIED: 1.0,
+        OutcomeKind.APPLIED_REVERTED: 0.5,
+        OutcomeKind.REJECTED: 0.3,
+        OutcomeKind.DEFERRED: 0.2,
+        OutcomeKind.DISABLED: 0.0,
+    }
+    _POLARITY_PRESETS["all_equal"] = {
+        OutcomeKind.APPLIED_VERIFIED: 1.0,
+        OutcomeKind.APPLIED_REVERTED: 1.0,
+        OutcomeKind.REJECTED: 1.0,
+        OutcomeKind.DEFERRED: 1.0,
+        OutcomeKind.DISABLED: 0.0,
+    }
+    return _POLARITY_PRESETS
+
+
+def action_outcome_polarity_mode() -> str:
+    """``JARVIS_ACTION_OUTCOME_POLARITY_MODE`` — closed-set
+    preset selector. Default ``"balanced"``. Valid: ``balanced``
+    / ``favor_positive`` / ``all_equal``. Unknown values fall
+    back to ``balanced``. NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_ACTION_OUTCOME_POLARITY_MODE", "",
+    ).strip().lower()
+    if raw in _polarity_presets():
+        return raw
+    return "balanced"
+
+
+def _outcome_polarity_weight(outcome: OutcomeKind) -> float:
+    """Map an :class:`OutcomeKind` to its polarity weight under
+    the active preset. ``DISABLED`` always 0.0 (defensive — the
+    persistence layer rejects DISABLED-outcome records, but the
+    retriever filters them too)."""
+    try:
+        mode = action_outcome_polarity_mode()
+        weights = _polarity_presets().get(mode, {})
+        return float(weights.get(outcome, 0.0))
+    except Exception:  # noqa: BLE001 — defensive
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Match dataclass — frozen, exposes per-component scores
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ActionOutcomeMatch:
+    """One scored match returned by :func:`recall_for_region`.
+    Frozen for safe propagation. Per-component scores surfaced
+    for operator-explainability (Slice 4's prompt injection +
+    Slice 5's HTTP/REPL surfaces consume these directly to render
+    "matched via 0.78 recency + 0.5 polarity = 0.39 combined")."""
+
+    record: ActionOutcomeRecord
+    recency_score: float
+    """``0.5 ** (age_days / halflife_days)`` — 1.0 at observation,
+    0.5 at one half-life, 0.25 at two half-lives."""
+
+    jaccard_score: float
+    """``|files ∩| / |files ∪|`` — 1.0 when both sets empty
+    (degenerate; cluster + situation alone matched); 0.0 when
+    disjoint."""
+
+    weight_score: float
+    """Bounded log-scale weight via shared primitive."""
+
+    polarity_score: float
+    """**M11-specific dimension** Upgrade 3 doesn't have.
+    APPLIED_VERIFIED → 1.0 (balanced mode); REVERTED → 0.7;
+    REJECTED → 0.5; DEFERRED → 0.3; DISABLED → 0.0 (filtered
+    pre-scoring). Operator-tunable via
+    ``JARVIS_ACTION_OUTCOME_POLARITY_MODE``."""
+
+    combined_score: float
+    """``recency × jaccard × weight × polarity`` — canonical
+    ranking key. All four multiplicands are bounded [0, 1];
+    combined is too."""
+
+    schema_version: str = field(
+        default=ACTION_OUTCOME_MEMORY_SCHEMA_VERSION,
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "record": self.record.to_dict(),
+            "recency_score": float(self.recency_score),
+            "jaccard_score": float(self.jaccard_score),
+            "weight_score": float(self.weight_score),
+            "polarity_score": float(self.polarity_score),
+            "combined_score": float(self.combined_score),
+            "schema_version": self.schema_version,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Public retriever
+# ---------------------------------------------------------------------------
+
+
+def recall_for_region(
+    *,
+    target_files: Iterable[str] = (),
+    top_k: Optional[int] = None,
+    min_weight: Optional[int] = None,
+    halflife_days: Optional[float] = None,
+    enabled_override: Optional[bool] = None,
+    now_ts: Optional[float] = None,
+    cluster_id_override: Optional[str] = None,
+) -> Tuple[ActionOutcomeMatch, ...]:
+    """Return the top-K prior :class:`ActionOutcomeRecord`
+    instances most relevant to the current op's
+    ``target_files``.
+
+    Decision tree:
+
+      1. Master-flag gate (``enabled_override`` OR
+         :func:`action_outcome_memory_enabled`) — empty tuple
+         when off.
+      2. Resolve eff_top_k / eff_min_weight / eff_halflife from
+         caller args + env knobs.
+      3. Resolve cluster_id (Decision A3 graceful fallback).
+      4. Read candidates: cluster JSONL + global fallback when
+         cluster_id resolves; all-cluster aggregate when not.
+      5. For each candidate:
+           - skip if outcome_kind is DISABLED (defensive — the
+             persistence layer should already filter, but a
+             corrupt JSONL could carry one through)
+           - skip if weight < eff_min_weight
+           - score: recency × jaccard × weight × polarity
+           - skip if combined <= 0
+      6. Sort descending by combined.
+      7. Diversity dedup by ``outcome_kind`` (balanced palette).
+      8. Tail-clamp at eff_top_k.
+
+    Returns frozen :class:`ActionOutcomeMatch` tuple (possibly
+    empty). NEVER raises."""
+    try:
+        if enabled_override is False:
+            return tuple()
+        if enabled_override is None:
+            if not action_outcome_memory_enabled():
+                return tuple()
+
+        eff_top_k = (
+            int(top_k) if top_k is not None
+            else action_outcome_top_k()
+        )
+        if eff_top_k < 1:
+            return tuple()
+        eff_min_weight = (
+            int(min_weight) if min_weight is not None
+            else action_outcome_min_weight()
+        )
+        eff_halflife = (
+            float(halflife_days)
+            if halflife_days is not None
+            else action_outcome_recency_halflife_days()
+        )
+        if eff_halflife <= 0.0:
+            eff_halflife = (
+                action_outcome_recency_halflife_days()
+            )
+
+        now = float(now_ts if now_ts is not None else time.time())
+        candidate_files = tuple(
+            str(f) for f in target_files if f
+        )
+
+        # Resolve cluster_id (Decision A3 graceful)
+        cluster_id = _resolve_cluster_id(
+            candidate_files,
+            cluster_id_override=cluster_id_override,
+        )
+
+        # Read candidates: cluster + global when resolved; all
+        # when not. Storage clustering is an OPTIMIZATION; the
+        # union covers all records that could match.
+        if cluster_id:
+            cluster_records = read_action_outcomes_for_cluster(
+                cluster_id,
+            )
+            global_records = read_action_outcomes_for_cluster("")
+            history = cluster_records + global_records
+        else:
+            history = read_all_action_outcomes()
+
+        if not history:
+            return tuple()
+
+        matches: list = []
+        for record in history:
+            # Defensive: persistence rejects DISABLED outcomes,
+            # but a corrupt JSONL could carry one through. Filter
+            # at retrieval time too.
+            if record.outcome_kind is OutcomeKind.DISABLED:
+                continue
+            if int(record.weight) < eff_min_weight:
+                continue
+            age_s = max(
+                0.0,
+                now - float(record.observed_at_unix),
+            )
+            recency = _scoring_primitives.recency_weight(
+                age_s, eff_halflife,
+            )
+            jaccard = _scoring_primitives.jaccard_similarity(
+                candidate_files, record.target_files,
+            )
+            weight_s = _scoring_primitives.weight_score(
+                record.weight,
+            )
+            polarity = _outcome_polarity_weight(
+                record.outcome_kind,
+            )
+            combined = recency * jaccard * weight_s * polarity
+            if combined <= 0.0:
+                continue
+            matches.append(
+                ActionOutcomeMatch(
+                    record=record,
+                    recency_score=recency,
+                    jaccard_score=jaccard,
+                    weight_score=weight_s,
+                    polarity_score=polarity,
+                    combined_score=combined,
+                ),
+            )
+
+        if not matches:
+            return tuple()
+
+        matches.sort(
+            key=lambda m: m.combined_score, reverse=True,
+        )
+        # Diversity dedup keyed on outcome_kind so the model gets
+        # a balanced palette (one VERIFIED + one REVERTED + one
+        # REJECTED is more useful than three VERIFIED).
+        return _scoring_primitives.diversity_dedup(
+            matches,
+            top_k=eff_top_k,
+            key_fn=lambda m: m.record.outcome_kind.value,
+        )
+    except Exception as exc:  # noqa: BLE001 — last-resort defensive
+        logger.debug(
+            "[action_outcome_memory] recall_for_region "
+            "raised: %s", exc,
+        )
+        return tuple()
+
+
 __all__ = [
     "ACTION_OUTCOME_MEMORY_SCHEMA_VERSION",
+    "ActionOutcomeMatch",
     "ActionOutcomeRecord",
     "OutcomeKind",
     "RecordOutcome",
     "action_outcome_memory_enabled",
+    "action_outcome_min_weight",
+    "action_outcome_polarity_mode",
+    "action_outcome_recency_halflife_days",
+    "action_outcome_top_k",
     "clear_action_outcomes",
     "cluster_jsonl_path",
     "compute_outcome_signature",
@@ -1132,5 +1518,6 @@ __all__ = [
     "max_records_per_cluster",
     "read_action_outcomes_for_cluster",
     "read_all_action_outcomes",
+    "recall_for_region",
     "record_action_outcome",
 ]
