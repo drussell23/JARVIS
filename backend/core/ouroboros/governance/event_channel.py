@@ -534,6 +534,47 @@ class EventChannelServer:
                     "wiring failed: %s", cp_exc,
                 )
 
+            # Priority #1 Slice 5b — Coherence Auditor observability
+            # GET routes. Mirrors the Move 5 confidence-probe block
+            # above: loopback-asserted, rate-limited via the shared
+            # IDEObservabilityRouter helper, CORS-aware, mount is
+            # unconditional (per-request _gate() runs
+            # coherence_auditor_enabled() so operators can live-toggle
+            # the master flag). Producer side (CoherenceObserver +
+            # window store + action bridge) is owned by
+            # governed_loop_service.py boot. Per-arc fresh
+            # IDEObservabilityRouter preserves Move 4's per-arc
+            # rate-limit bucket convention.
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+                    IDEObservabilityRouter as _IDEObsRouterCO,
+                    assert_loopback_only as _assert_loopback_co,
+                )
+                from backend.core.ouroboros.governance.verification.coherence_observability import (  # noqa: E501
+                    register_coherence_routes,
+                )
+                _assert_loopback_co(self._host)
+                _co_helper = _IDEObsRouterCO()
+                register_coherence_routes(
+                    app,
+                    rate_limit_check=lambda req: (
+                        _co_helper._check_rate_limit(
+                            _co_helper._client_key(req),
+                        )
+                    ),
+                    cors_headers=_co_helper._cors_headers,
+                )
+            except ValueError as co_loopback_exc:
+                logger.warning(
+                    "[EventChannel] coherence observability "
+                    "refused: %s", co_loopback_exc,
+                )
+            except Exception as co_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] coherence observability "
+                    "wiring failed: %s", co_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is
