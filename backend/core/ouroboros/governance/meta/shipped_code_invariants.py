@@ -2558,6 +2558,147 @@ def _validate_failure_mode_injection_via_strategic_direction(
     return tuple(violations)
 
 
+# ---------------------------------------------------------------------------
+# M11 — ActionOutcomeMemory at GENERATE (PRD §30.5.3) — 4 pins
+# ---------------------------------------------------------------------------
+
+
+def _validate_action_outcome_memory_no_authority_imports(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """M11 Slice 5 — action_outcome_memory.py must NOT import
+    orchestrator-tier modules. Symmetric pair to Upgrade 3's
+    no-authority pin. M11 may import semantic_index (Slice 2 for
+    cluster lookup), cross_process_jsonl (flock), and the
+    SituationKind enum from failure_mode_memory (zero-duplication
+    reuse). NEVER raises."""
+    forbidden = (
+        "orchestrator", "iron_gate", "policy", "change_engine",
+        "candidate_generator", "providers", "doubleword_provider",
+        "urgency_router", "auto_action_router",
+        "subagent_scheduler", "tool_executor", "phase_runners",
+        "semantic_guardian", "semantic_firewall", "risk_engine",
+        # Authority asymmetry: strategic_direction lazy-imports
+        # action_outcome_memory; reverse direction is forbidden.
+        "strategic_direction",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        module = (
+            node.module if isinstance(node, ast.ImportFrom)
+            else (node.names[0].name if node.names else "")
+        )
+        module = module or ""
+        for f in forbidden:
+            if f in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden authority import "
+                    f"contains {f!r}: {module}"
+                )
+    return tuple(violations)
+
+
+def _validate_action_outcome_observability_read_only(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """M11 Slice 5 — the HTTP observability layer is read-only by
+    contract. MUST NOT call mutation surfaces
+    (record_action_outcome / clear_action_outcomes). The
+    /outcomes REPL's ``clear`` subcommand is the only operator-
+    mutating surface; HTTP routes never mutate.
+
+    NEVER raises."""
+    forbidden_calls = (
+        "record_action_outcome",
+        "clear_action_outcomes",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            target = ""
+            if isinstance(node.func, ast.Name):
+                target = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                target = node.func.attr
+            for f in forbidden_calls:
+                if target == f:
+                    lineno = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"line {lineno}: action_outcome_memory_-"
+                        f"observability is read-only — found "
+                        f"call to {f}() (mutating surface)"
+                    )
+    return tuple(violations)
+
+
+def _validate_action_outcome_memory_master_default_true(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """M11 Slice 5 — bytes-pin the graduated default-true
+    contract (PRD §30.5.3). Mirrors the corresponding Upgrade 3
+    pin discipline.
+
+    NEVER raises."""
+    violations: List[str] = []
+    if "Slice 5 graduated default" not in source:
+        violations.append(
+            "action_outcome_memory.py dropped its 'Slice 5 "
+            "graduated default' marker — graduation contract "
+            "may have regressed (master flipped back to false?)"
+        )
+    if "graduated PRD §30.5.3 Slice 5" not in source:
+        violations.append(
+            "action_outcome_memory_enabled() docstring no "
+            "longer states the PRD §30.5.3 graduation — "
+            "graduation documentation may have regressed"
+        )
+    return tuple(violations)
+
+
+def _validate_action_outcome_injection_via_strategic_direction(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """M11 Slice 5 — strategic_direction.py is the SOLE
+    first-attempt injection surface for action-outcome memory
+    (PRD §30.5.3 Slice 4). Pinned by required tokens:
+      * ``_render_action_outcomes_section`` — canonical render
+        method
+      * ``compose_action_outcomes_section`` — Slice 4 rendering
+        primitive (lazy import)
+      * ``recall_for_region`` — Slice 3 retriever (lazy import)
+      * ``publish_action_outcome_recalled`` — Slice 5 SSE hook
+        (lazy import)
+
+    NEVER raises."""
+    required = (
+        ("_render_action_outcomes_section",
+         "render method dropped — action-outcome injection point "
+         "may have moved out of strategic_direction"),
+        ("compose_action_outcomes_section",
+         "lazy import of compose_action_outcomes_section dropped "
+         "— Slice 4 rendering contract may have regressed"),
+        ("recall_for_region",
+         "lazy import of recall_for_region dropped — Slice 3 "
+         "retriever no longer wired"),
+        ("publish_action_outcome_recalled",
+         "lazy import of publish_action_outcome_recalled dropped "
+         "— Slice 5 SSE observability hook may have regressed"),
+    )
+    violations: List[str] = []
+    for token, reason in required:
+        if token not in source:
+            violations.append(
+                f"strategic_direction.py dropped {token!r} — "
+                f"{reason}"
+            )
+    return tuple(violations)
+
+
 def _validate_confidence_threshold_tightener(
     tree: ast.AST, source: str,
 ) -> Tuple[str, ...]:
@@ -3190,6 +3331,109 @@ def _register_seed_invariants() -> None:
             ),
             validate=(
                 _validate_failure_mode_injection_via_strategic_direction
+            ),
+        ),
+    )
+    # ----------------------------------------------------------------
+    # M11 — ActionOutcomeMemory at GENERATE (PRD §30.5.3) — 4 pins
+    # Symmetric positive-evidence pair to Upgrade 3 above. Slice 5
+    # graduation flips master default-true. Closes the in-context
+    # embodiment ASCO axis.
+    # ----------------------------------------------------------------
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "action_outcome_memory_no_authority_imports"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "action_outcome_memory.py"
+            ),
+            description=(
+                "ActionOutcomeMemory module MUST NOT import "
+                "orchestrator / iron_gate / providers / "
+                "candidate_generator / urgency_router / "
+                "tool_executor / strategic_direction (the "
+                "dependency asymmetry: strategic_direction -> "
+                "action_outcome_memory, NEVER the reverse). "
+                "M11-allowed imports: stdlib + cross_process_jsonl "
+                "(flock) + semantic_index (cluster lookup) + "
+                "SituationKind enum from failure_mode_memory "
+                "(zero-duplication reuse)."
+            ),
+            validate=(
+                _validate_action_outcome_memory_no_authority_imports
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "action_outcome_observability_read_only"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "action_outcome_memory_observability.py"
+            ),
+            description=(
+                "HTTP observability layer is read-only by "
+                "contract. MUST NOT call record_action_outcome / "
+                "clear_action_outcomes. The /outcomes REPL's "
+                "clear subcommand is the only operator-mutating "
+                "surface; HTTP routes never mutate."
+            ),
+            validate=(
+                _validate_action_outcome_observability_read_only
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "action_outcome_memory_master_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "action_outcome_memory.py"
+            ),
+            description=(
+                "Slice 5 graduation contract: master flag "
+                "JARVIS_ACTION_OUTCOME_MEMORY_ENABLED defaults "
+                "TRUE on unset env. If a future refactor flips "
+                "this back to False, this pin trips so the "
+                "regression is caught structurally before "
+                "shipping. Mirrors graduated default-true "
+                "discipline from coherence / cigw / quorum / "
+                "failure_mode_memory."
+            ),
+            validate=(
+                _validate_action_outcome_memory_master_default_true
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "action_outcome_injection_via_strategic_direction"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "strategic_direction.py"
+            ),
+            description=(
+                "strategic_direction.py is the SOLE first-attempt "
+                "injection surface for action-outcome memory "
+                "(PRD §30.5.3 Slice 4). Pins the canonical "
+                "_render_action_outcomes_section method + lazy "
+                "imports of compose_action_outcomes_section / "
+                "recall_for_region / "
+                "publish_action_outcome_recalled. Catches "
+                "refactors that move the injection elsewhere or "
+                "break the lazy-import (ImportError-safe) "
+                "discipline."
+            ),
+            validate=(
+                _validate_action_outcome_injection_via_strategic_direction
             ),
         ),
     )

@@ -320,7 +320,17 @@ class SuccessPatternStore:
         provider: str,
         approach_summary: str = "",
     ) -> None:
-        """Record a successful operation pattern. Deterministic write."""
+        """Record a successful operation pattern. Deterministic write.
+
+        M11 Slice 5.E façade: additively forwards to
+        :func:`action_outcome_memory.record_action_outcome` so the
+        positive-evidence stream feeds BOTH the legacy local pattern
+        store (existing orchestrator consumers via
+        :meth:`get_similar_successes`) AND the M11 cross-op
+        recall pipeline (PRD §30.5.3 — Slice 4 first-attempt
+        injection). Best-effort + lazy import + never-raises;
+        legacy consumers see byte-identical local-store behavior.
+        """
         pattern = SuccessPattern(
             domain_key=domain_key,
             description=description,
@@ -335,6 +345,59 @@ class SuccessPatternStore:
             self._patterns[domain_key] = self._patterns[domain_key][-20:]
 
         self._persist()
+
+        # M11 Slice 5.E façade — additively forward to M11
+        # ActionOutcomeMemory. Mapping discipline:
+        #   * outcome_kind = APPLIED_VERIFIED (every record_success
+        #     call is by definition a verified success)
+        #   * situation_kind = UNKNOWN (SuccessPatternStore's free-
+        #     form domain_key has no canonical mapping to the M11
+        #     closed-enum SituationKind; UNKNOWN records persist
+        #     for analysis but don't surface in first-attempt
+        #     retrieval, which intentionally requires a closed-
+        #     enum match)
+        #   * attempted_action_kind = approach_summary (normalized)
+        #   * commit_hash = "" (SuccessPatternStore doesn't track
+        #     commits)
+        # Failure to forward NEVER affects the legacy local-store
+        # contract.
+        try:
+            from backend.core.ouroboros.governance.action_outcome_memory import (  # noqa: E501
+                ActionOutcomeRecord,
+                OutcomeKind,
+                compute_outcome_signature,
+                record_action_outcome,
+            )
+            from backend.core.ouroboros.governance.failure_mode_memory import (  # noqa: E501
+                SituationKind,
+            )
+            attempt = (
+                (approach_summary or f"succeeded_via_{provider}")
+                [:64].strip().lower().replace(" ", "_")
+            ) or "unspecified"
+            sig = compute_outcome_signature(
+                situation_kind=SituationKind.UNKNOWN,
+                attempted_action_kind=attempt,
+                outcome_kind=OutcomeKind.APPLIED_VERIFIED,
+                target_files=target_files,
+            )
+            record_action_outcome(
+                ActionOutcomeRecord(
+                    signature_hash=sig,
+                    situation_kind=SituationKind.UNKNOWN,
+                    attempted_action_kind=attempt,
+                    outcome_kind=OutcomeKind.APPLIED_VERIFIED,
+                    target_files=tuple(target_files),
+                    commit_hash="",
+                    summary=(description or "")[:200],
+                    observed_at_unix=time.time(),
+                    op_id="",
+                    cluster_id="",
+                    weight=1,
+                ),
+            )
+        except Exception:  # noqa: BLE001 — façade fail-silent
+            pass
 
     def get_similar_successes(
         self, domain_key: str, target_files: Tuple[str, ...], limit: int = 3
