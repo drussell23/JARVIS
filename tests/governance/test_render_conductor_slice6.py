@@ -417,7 +417,11 @@ class TestPagination:
 
 
 class TestMasterFlagGate:
-    def test_resolve_empty_when_master_off(self, fresh_registry):
+    def test_resolve_empty_when_master_off(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        # Hot-revert: explicit env=false (post-Slice-7-fu#4 default true)
+        monkeypatch.setenv("JARVIS_CONTEXTUAL_HELP_ENABLED", "false")
         resolver = rh.ContextualHelpResolver()
         page = resolver.resolve(query="anything")
         assert page.total == 0
@@ -468,8 +472,12 @@ class TestPublishHelpPanel:
 
 
 class TestKeyActionBinding:
-    def test_binding_returns_false_when_master_off(self, fresh_registry):
-        # Master off → no binding even if Slice 4 controller exists
+    def test_binding_returns_false_when_master_off(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        # Master off → no binding even if Slice 4 controller exists.
+        # Post-Slice-7-fu#4 default is true; explicit env=false reverts.
+        monkeypatch.setenv("JARVIS_CONTEXTUAL_HELP_ENABLED", "false")
         from backend.core.ouroboros.governance import key_input as ki
         ctrl = ki.InputController()
         ki.register_input_controller(ctrl)

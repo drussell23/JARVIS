@@ -394,14 +394,22 @@ class TestKeyBusConcurrency:
 
 
 class TestKeyBusGate:
-    def test_publish_no_op_when_master_off(self, fresh_registry):
+    def test_publish_no_op_when_master_off(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        # Hot-revert: explicit env=false drops events even though
+        # post-Slice-7-fu#4 default is true
+        monkeypatch.setenv("JARVIS_INPUT_CONTROLLER_ENABLED", "false")
         bus = ki.KeyBus()
         received = []
         bus.subscribe(ki.KeyName.ESC, lambda e: received.append(e))
         bus.publish(ki.KeyEvent(key=ki.KeyName.ESC))
         assert received == []
 
-    def test_subscribe_succeeds_when_master_off(self, fresh_registry):
+    def test_subscribe_succeeds_when_master_off(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        monkeypatch.setenv("JARVIS_INPUT_CONTROLLER_ENABLED", "false")
         bus = ki.KeyBus()
         sub = bus.subscribe(ki.KeyName.ESC, lambda e: None)
         # Subscribe is registry-local; only publish is gated.

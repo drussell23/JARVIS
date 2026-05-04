@@ -429,18 +429,28 @@ class TestReasoningStreamLifecycle:
 
 
 class TestReasoningStreamGates:
-    def test_master_flag_off_no_op_start(self, fresh_registry):
-        # No env override → default false
+    def test_master_flag_off_no_op_start(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        # Hot-revert: explicit env=false drops events even though
+        # post-Slice-7-fu#4 default is true
+        monkeypatch.setenv("JARVIS_REASONING_STREAM_ENABLED", "false")
         rs = rp.ReasoningStream()
         assert rs.start("op-1") is False
         assert rs.active is False
 
-    def test_master_flag_off_no_op_token(self, fresh_registry):
+    def test_master_flag_off_no_op_token(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        monkeypatch.setenv("JARVIS_REASONING_STREAM_ENABLED", "false")
         rs = rp.ReasoningStream()
         rs._active = True  # bypass gate to confirm token still gated
         assert rs.on_token("x") is False
 
-    def test_master_flag_off_no_op_end(self, fresh_registry):
+    def test_master_flag_off_no_op_end(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        monkeypatch.setenv("JARVIS_REASONING_STREAM_ENABLED", "false")
         rs = rp.ReasoningStream()
         rs._active = True
         assert rs.end() is False
@@ -588,13 +598,14 @@ class TestRegisterFlags:
         count = rp.register_flags(reg)
         assert count == 2
 
-    def test_master_flag_default_false(self):
+    def test_master_flag_default_true_post_slice7_fu4(self):
+        # Graduated default true at Slice 7 follow-up #4
         from backend.core.ouroboros.governance import flag_registry as fr
         reg = fr.FlagRegistry()
         rp.register_flags(reg)
         spec = reg.get_spec("JARVIS_REASONING_STREAM_ENABLED")
         assert spec is not None
-        assert spec.default is False
+        assert spec.default is True
         assert spec.category is fr.Category.SAFETY
 
     def test_hyperlink_flag_default_true(self):

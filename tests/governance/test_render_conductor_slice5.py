@@ -437,7 +437,11 @@ class TestThreadObserverLifecycle:
         # Should not unregister twice
         assert len(bridge.unregistered) == 1
 
-    def test_start_master_off_returns_false(self, fresh_registry):
+    def test_start_master_off_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        # Hot-revert: explicit env=false (post-Slice-7-fu#4 default true)
+        monkeypatch.setenv("JARVIS_THREAD_OBSERVER_ENABLED", "false")
         bridge = _StubBridge()
         obs = rt.ThreadObserver()
         assert obs.start(bridge=bridge) is False
@@ -556,10 +560,12 @@ class TestThreadObserverDefensive:
 
 
 class TestMasterFlagGate:
-    def test_observer_inactive_when_master_off(self, fresh_registry):
+    def test_observer_inactive_when_master_off(
+        self, monkeypatch: pytest.MonkeyPatch, fresh_registry,
+    ):
+        monkeypatch.setenv("JARVIS_THREAD_OBSERVER_ENABLED", "false")
         bridge = _StubBridge()
         obs = rt.ThreadObserver()
-        # No env override → default false
         assert obs.start(bridge=bridge) is False
         assert obs.active is False
 

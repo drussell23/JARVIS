@@ -799,6 +799,88 @@ def _validate_harness_wiring_present(
     return ()
 
 
+# ---------------------------------------------------------------------------
+# Slice 7 follow-up #5: AST pins on the 4 producer-side flag defaults.
+# Each pin reads the per-slice register_flags source and verifies the
+# FlagSpec for the named producer flag has default=True. Catches a
+# refactor that flips a default back to False without coordinated
+# accessor + test update.
+# ---------------------------------------------------------------------------
+
+
+def _flag_spec_default_in_source(
+    source: str, flag_name: str,
+) -> Optional[bool]:
+    """Parse the source bytes for a ``FlagSpec(...)`` block whose
+    ``name=`` argument is ``flag_name``, return its ``default=``
+    value as a bool. Returns ``None`` when the spec block can't be
+    located. Pure string scan — robust against field-order variations.
+
+    Substrate convention: each module declares
+    ``_FLAG_REASONING_STREAM_ENABLED = "JARVIS_REASONING_STREAM_ENABLED"``
+    at module top, then references the constant in the FlagSpec via
+    ``name=_FLAG_REASONING_STREAM_ENABLED``. We search for the
+    ``= "JARVIS_..."`` constant assignment first; if found, we
+    extract the constant name and search for ``name=<constant>``."""
+    # Match the constant assignment: ``_FLAG_X = "JARVIS_X_ENABLED"``
+    # The constant name precedes the ``=`` and ``"JARVIS_..."`` follows.
+    quoted = f'"{flag_name}"'
+    apos = f"'{flag_name}'"
+    constant_name: Optional[str] = None
+    for needle in (quoted, apos):
+        idx = source.find(needle)
+        if idx < 0:
+            continue
+        # Walk back to find the constant name. Stop at newline.
+        line_start = source.rfind("\n", 0, idx) + 1
+        line = source[line_start:idx]
+        # Expected shape: ``_FLAG_<NAME> = ``
+        if "=" in line:
+            constant_name = line.split("=", 1)[0].strip()
+            break
+    # Locate the FlagSpec(name=<constant>) block.
+    needle_start = -1
+    if constant_name:
+        needle_start = source.find(f"name={constant_name}")
+    if needle_start < 0:
+        # Fallback: literal name= form.
+        needle_start = source.find(f"name={quoted}")
+    if needle_start < 0:
+        needle_start = source.find(f"name={apos}")
+    if needle_start < 0:
+        return None
+    # Bound the search to a small window after the name= line.
+    window = source[needle_start: needle_start + 800]
+    if "default=True" in window:
+        return True
+    if "default=False" in window:
+        return False
+    return None
+
+
+def _make_producer_default_validator(
+    flag_name: str,
+) -> Any:
+    """Build a closure-validator that checks the producer flag's
+    default is True in the target source bytes. The actual flag
+    name is captured in the closure; the function signature matches
+    ``ShippedCodeValidator``."""
+    def _validator(tree: Any, source: str) -> tuple:
+        del tree
+        default = _flag_spec_default_in_source(source, flag_name)
+        if default is None:
+            return (
+                f"FlagSpec for {flag_name!r} not located in source",
+            )
+        if default is False:
+            return (
+                f"FlagSpec for {flag_name!r} has default=False; "
+                f"Slice 7 follow-up #4 graduated this to True",
+            )
+        return ()
+    return _validator
+
+
 def _validate_streamrenderer_protocol_conformance(
     tree: Any, source: str,
 ) -> tuple:
@@ -929,6 +1011,82 @@ def register_shipped_invariants() -> List:
                 "would orphan even with the substrate flag on."
             ),
             validate=_validate_harness_wiring_present,
+        ),
+        # Slice 7 follow-up #5 — pin each producer-flag default to
+        # True. Each FlagSpec lives in its own file; cross-file
+        # invariants pinned from one auditable spot.
+        ShippedCodeInvariant(
+            invariant_name=(
+                "render_primitives_reasoning_stream_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/render_primitives.py"
+            ),
+            description=(
+                "Slice 7 follow-up #4 graduated "
+                "JARVIS_REASONING_STREAM_ENABLED default true. The "
+                "FlagSpec MUST carry default=True; a future patch "
+                "reverting it to False would silently disable the "
+                "ReasoningStream producer wiring in providers.py."
+            ),
+            validate=_make_producer_default_validator(
+                "JARVIS_REASONING_STREAM_ENABLED",
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "key_input_input_controller_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/key_input.py"
+            ),
+            description=(
+                "Slice 7 follow-up #4 graduated "
+                "JARVIS_INPUT_CONTROLLER_ENABLED default true. The "
+                "FlagSpec MUST carry default=True; a future patch "
+                "reverting it to False would silently disable the "
+                "Esc-mid-token interrupt + ?-help binding."
+            ),
+            validate=_make_producer_default_validator(
+                "JARVIS_INPUT_CONTROLLER_ENABLED",
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "render_thread_thread_observer_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/render_thread.py"
+            ),
+            description=(
+                "Slice 7 follow-up #4 graduated "
+                "JARVIS_THREAD_OBSERVER_ENABLED default true. The "
+                "FlagSpec MUST carry default=True; a future patch "
+                "reverting it to False would silently disable the "
+                "ConversationBridge → conductor pump."
+            ),
+            validate=_make_producer_default_validator(
+                "JARVIS_THREAD_OBSERVER_ENABLED",
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "render_help_contextual_help_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/render_help.py"
+            ),
+            description=(
+                "Slice 7 follow-up #4 graduated "
+                "JARVIS_CONTEXTUAL_HELP_ENABLED default true. The "
+                "FlagSpec MUST carry default=True; a future patch "
+                "reverting it to False would silently disable the "
+                "ContextualHelpResolver ranking + MODAL_PROMPT "
+                "publish path."
+            ),
+            validate=_make_producer_default_validator(
+                "JARVIS_CONTEXTUAL_HELP_ENABLED",
+            ),
         ),
     ]
 
