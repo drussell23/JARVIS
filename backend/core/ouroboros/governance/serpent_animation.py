@@ -145,8 +145,17 @@ class OuroborosSerpent:
         self._use_compact = not (sys.stderr.isatty() and _ENABLED)
 
     async def start(self, phase: str = "CLASSIFY") -> None:
-        """Start the serpent animation in a background task."""
+        """Start the serpent animation in a background task.
+
+        Idempotent: a second ``start()`` while already running updates
+        the phase label without restarting (preserves the original
+        ``_start_time`` so elapsed remains meaningful)."""
         if not _ENABLED or _SUPPRESSED:
+            return
+        if self._running:
+            # Already running — just refresh phase, don't reset
+            # _start_time (preserves elapsed-since-actual-start).
+            self._phase = phase
             return
         self._phase = phase
         self._running = True
@@ -161,7 +170,32 @@ class OuroborosSerpent:
         self._phase = phase
 
     async def stop(self, success: bool = True) -> None:
-        """Stop the animation and show final status."""
+        """Stop the animation and show final status.
+
+        Skips the terminal emit (the ``[ OUROBOROS ] in Xs`` line)
+        in three cases \u2014 each documented because they're the
+        regression vectors that produced the boot-time
+        "FAILED [ OUROBOROS ] in 673361.3s" UX bug:
+
+          1. ``_ENABLED`` is False (animation globally disabled).
+          2. ``_SUPPRESSED`` is True (host renderer like SerpentFlow
+             owns the operator surface; the serpent's emit would be
+             redundant noise on top of the per-op render).
+          3. ``_start_time <= 0.0`` (no paired ``start()`` was called
+             this cycle \u2014 common during boot recovery and early-
+             failure paths). Without this guard, ``elapsed =
+             time.monotonic() - 0.0`` returns the entire process
+             uptime in seconds, which displays as garbage like
+             "in 673361.3s" (\u22487.8 days = the user's Mac uptime).
+
+        ``_start_time`` is reset to ``0.0`` after every stop attempt
+        (emit or skip) so the next ``start()`` cycle gets a clean
+        baseline.
+
+        ``elapsed`` is clamped to ``[0.0, 86400.0]`` (24 hours) \u2014 any
+        value outside that range is a clock issue or stale state
+        and would just display as garbage to the operator.
+        """
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -170,16 +204,27 @@ class OuroborosSerpent:
             except asyncio.CancelledError:
                 pass
 
-        if not _ENABLED:
-            return
-
-        elapsed = time.monotonic() - self._start_time
-        icon = "\U0001F40D COMPLETE \u2705" if success else "\U0001F40D FAILED \u274C"
-        _clear_line()
-        sys.stderr.write(
-            f"\r{icon} [ OUROBOROS ] in {elapsed:.1f}s\n"
-        )
-        sys.stderr.flush()
+        # Three guards, all documented above. Reset _start_time on
+        # every exit path so the next cycle is clean.
+        try:
+            if not _ENABLED or _SUPPRESSED or self._start_time <= 0.0:
+                return
+            elapsed_raw = time.monotonic() - self._start_time
+            # Clamp to 24h sanity ceiling \u2014 anything beyond that
+            # signals stale state, not a real op duration.
+            elapsed = max(0.0, min(elapsed_raw, 86400.0))
+            icon = (
+                "\U0001F40D COMPLETE \u2705" if success
+                else "\U0001F40D FAILED \u274C"
+            )
+            _clear_line()
+            sys.stderr.write(
+                f"\r{icon} [ OUROBOROS ] in {elapsed:.1f}s\n"
+            )
+            sys.stderr.flush()
+        finally:
+            # Reset for next cycle regardless of which guard fired.
+            self._start_time = 0.0
 
     async def _animate(self) -> None:
         """Background animation loop."""

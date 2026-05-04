@@ -946,6 +946,31 @@ def _validate_harness_wiring_present(
     return ()
 
 
+def _validate_serpent_animation_stop_guards(
+    tree: Any, source: str,
+) -> tuple:
+    """serpent_animation.stop() body MUST contain BOTH ``_SUPPRESSED``
+    AND ``_start_time`` token references. The two-guard combo
+    prevents the boot-time "FAILED [ OUROBOROS ] in 673361.3s"
+    bug — a stop() called without a paired start() would otherwise
+    show ``time.monotonic() - 0.0`` (process uptime in seconds) as
+    the elapsed.
+
+    Catches a future refactor that strips one guard. The pin walks
+    the source for the literal tokens; works regardless of how the
+    guards are structured (single ``if not X or Y or Z`` line vs
+    nested early returns)."""
+    del tree
+    required_tokens = ("_SUPPRESSED", "_start_time")
+    missing = [t for t in required_tokens if t not in source]
+    if missing:
+        return (
+            f"serpent_animation.py missing stop() guard tokens: "
+            f"{missing} — boot-time UX bug will return",
+        )
+    return ()
+
+
 def _validate_help_dispatcher_verb_discovery(
     tree: Any, source: str,
 ) -> tuple:
@@ -1261,6 +1286,23 @@ def register_shipped_invariants() -> List:
             validate=_make_producer_default_validator(
                 "JARVIS_CONTEXTUAL_HELP_ENABLED",
             ),
+        ),
+        # D2 — serpent_animation stop() guards (boot-time UX fix).
+        ShippedCodeInvariant(
+            invariant_name=(
+                "serpent_animation_stop_guards_present"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/serpent_animation.py"
+            ),
+            description=(
+                "serpent_animation.py stop() MUST guard against "
+                "_SUPPRESSED + _start_time<=0 to prevent the boot-"
+                "time 'FAILED [ OUROBOROS ] in 673361.3s' bug. The "
+                "pin checks for both token literals — refactors that "
+                "strip either guard will be caught at boot."
+            ),
+            validate=_validate_serpent_animation_stop_guards,
         ),
         # Backlog #2 — verb discovery hook in help_dispatcher.
         ShippedCodeInvariant(

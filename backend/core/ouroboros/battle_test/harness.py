@@ -489,6 +489,33 @@ class BattleTestHarness:
         """Main lifecycle method: boot, wait for stop signal, shutdown, report."""
         self._started_at = time.time()
 
+        # D1 silent boot — route INFO/DEBUG to session_dir/debug.log,
+        # leave terminal clean for the banner. Must be the FIRST thing
+        # in run() so all subsequent lazy imports' init logs land in
+        # the file, not on the operator's screen. Master flag
+        # JARVIS_SILENT_BOOT_ENABLED default true; hot-revert via
+        # =false restores legacy behavior. NEVER raises (boot is not
+        # blocked by logging glue).
+        try:
+            from backend.core.ouroboros.governance.silent_boot import (
+                configure_silent_boot,
+            )
+            _silent_boot_handler = configure_silent_boot(
+                session_dir=(
+                    self._config.repo_path / ".ouroboros"
+                    / "sessions" / self._session_id
+                ),
+            )
+            if _silent_boot_handler is not None:
+                # Retain reference so the harness can close it
+                # explicitly on shutdown (Slice 7 follow-up #4 path).
+                self._log_file_path = _silent_boot_handler.baseFilename
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[harness] silent_boot setup failed; falling back "
+                "to legacy redirect path", exc_info=True,
+            )
+
         # Asyncio loop-level exception handler — global safety net for
         # the entire session lifetime (2026-05-03 audit). Replaces both
         # asyncio's default handler (which formats with no message,
