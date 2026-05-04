@@ -613,9 +613,9 @@ class TestAuthorityInvariants:
 
 
 class TestPublicExports:
-    def test_all_lists_slice_1_and_slice_2_public_names(self):
-        """Slice 1 surface (6 names) + Slice 2 surface (10 names) =
-        16 public exports. Future slices append; never remove."""
+    def test_all_lists_slices_1_through_3_public_names(self):
+        """Slice 1 (6) + Slice 2 (10) + Slice 3 (5) = 21 public
+        exports. Future slices append; never remove."""
         from backend.core.ouroboros.governance import failure_mode_memory  # noqa: E501
         expected = sorted([
             # Slice 1 — primitive
@@ -636,14 +636,19 @@ class TestPublicExports:
             "read_failure_mode_history",
             "record_failure_mode",
             "record_postmortem",
+            # Slice 3 — RAG retriever
+            "FailureModeMatch",
+            "failure_mode_min_weight",
+            "failure_mode_recency_halflife_days",
+            "failure_mode_top_k",
+            "retrieve_failure_modes",
         ])
         assert sorted(failure_mode_memory.__all__) == expected
 
     def test_helpers_are_underscore_prefixed(self):
         """Internal helpers are NOT in __all__ — they're
-        implementation, not API. Slice 2 adds more internal
-        helpers (classifiers, mitigation derivation, etc.) — pin
-        a representative set."""
+        implementation, not API. Slice 2 + Slice 3 add more
+        internal helpers — pin a representative set."""
         from backend.core.ouroboros.governance import failure_mode_memory  # noqa: E501
         for name in (
             # Slice 1
@@ -660,6 +665,11 @@ class TestPublicExports:
             "_within_dedup_window",
             "_postmortem_field",
             "_plan_text_for_classification",
+            # Slice 3
+            "_recency_weight",
+            "_jaccard_similarity",
+            "_weight_score",
+            "_diversity_dedup",
         ):
             assert name not in failure_mode_memory.__all__
             assert hasattr(failure_mode_memory, name)

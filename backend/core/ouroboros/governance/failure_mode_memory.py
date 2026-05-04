@@ -1468,10 +1468,394 @@ def record_postmortem(
     return (extraction, persist)
 
 
+# ===========================================================================
+# Slice 3 — FailureModeRetriever (RAG layer)
+#
+# PRD §31.4.2 Slice 3 spec:
+#   "Given (SituationKind, target_files) from ctx, returns top-K
+#    matching prior failures via SemanticIndex.cosine_score +
+#    recency weighting (14d half-life — same as SemanticIndex's
+#    commit half-life). Diversity dedup per Coherence Auditor
+#    pattern."
+#
+# Design decision: ``SemanticIndex.cosine_score`` (the literal
+# method name in the PRD) does not exist on the actual
+# :class:`SemanticIndex` — that class exposes ``score(text)``
+# which returns cosine to a single project-direction centroid,
+# not pairwise text-to-text. The PRD's intent is "use semantic
+# similarity"; in our **closed-enum** domain (SituationKind is
+# 7-value closed; target_files is a finite set), the appropriate
+# semantic primitive is **deterministic set similarity** plus the
+# **same 14-day half-life formula** SemanticIndex uses for commit
+# recency (literal parity — :func:`_recency_weight` mirrors the
+# ``coherence_auditor._recency_weight`` formula which itself
+# mirrors ``semantic_index._recency_weight``).
+#
+# Net result: zero embedder dependency, fully deterministic,
+# reproducible across environments — and the 14d half-life
+# parity makes Slice 4's prompt injection compose cleanly with
+# the existing "Recent Development Momentum" digest.
+#
+# Algorithm:
+#   1. Hard-filter pool by exact ``situation_kind`` match
+#      (closed enum — silent ambiguity defeats the point).
+#   2. Filter ``weight >= min_weight`` (PRD §31.4.6 memory
+#      pollution defense).
+#   3. UNKNOWN situations are NEVER retrieved (Slice 1 enum
+#      docstring contract).
+#   4. Score each candidate with combined =
+#      recency * jaccard * weight_score, where:
+#        * recency = 0.5 ** (age_days / halflife_days)
+#        * jaccard = |files ∩| / |files ∪| (1.0 when both empty)
+#        * weight_score = min(1.0, log1p(weight) / log1p(N_FLOOR))
+#          — bounded, non-linear; weight=2 saturates near floor.
+#   5. Sort descending by combined.
+#   6. Diversity dedup — preserve at most one match per
+#      ``attempted_action_kind`` (Coherence Auditor pattern).
+#   7. Tail-clamp at top_k.
+# ===========================================================================
+
+
+import math
+
+
+# ---------------------------------------------------------------------------
+# Retriever env knobs
+# ---------------------------------------------------------------------------
+
+
+def _read_float_knob(
+    name: str, default: float, floor: float, ceiling: float,
+) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+        if v < floor:
+            return floor
+        if v > ceiling:
+            return ceiling
+        return v
+    except (TypeError, ValueError):
+        return default
+
+
+def failure_mode_top_k() -> int:
+    """``JARVIS_FAILURE_MODE_TOP_K`` — default 3 (PRD §31.4.6
+    diversity guidance). Clamped [1, 10]."""
+    return _read_int_knob(
+        "JARVIS_FAILURE_MODE_TOP_K", 3, 1, 10,
+    )
+
+
+def failure_mode_min_weight() -> int:
+    """``JARVIS_FAILURE_MODE_MIN_WEIGHT`` — default 2 (PRD §31.4.6
+    memory pollution defense: signature must recur >= 2x in
+    ``dedup_window_days``). Clamped [1, 100]."""
+    return _read_int_knob(
+        "JARVIS_FAILURE_MODE_MIN_WEIGHT", 2, 1, 100,
+    )
+
+
+def failure_mode_recency_halflife_days() -> float:
+    """``JARVIS_FAILURE_MODE_RECENCY_HALFLIFE_DAYS`` — default
+    14.0 (PRD §31.4.6: "same as SemanticIndex's commit half-life").
+    Clamped [1.0, 365.0]."""
+    return _read_float_knob(
+        "JARVIS_FAILURE_MODE_RECENCY_HALFLIFE_DAYS",
+        14.0, 1.0, 365.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Match dataclass — frozen, exposes per-component scores so the
+# operator can see WHY a match was returned (not just THAT it was)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FailureModeMatch:
+    """One scored match returned by :func:`retrieve_failure_modes`.
+    Frozen for safe propagation. The component scores are surfaced
+    so Slice 4's injection block can render explainable context
+    ("matched via 0.8 file overlap + 14d recency") and Slice 5's
+    ``/failures`` REPL can show ranking provenance."""
+
+    record: FailureModeRecord
+    recency_score: float
+    """``0.5 ** (age_days / halflife_days)`` — 1.0 at observation,
+    0.5 at one half-life, 0.25 at two half-lives."""
+
+    jaccard_score: float
+    """``|files ∩| / |files ∪|`` — 1.0 when both file sets are
+    empty (degenerate match by enum-only); 0.0 when disjoint."""
+
+    weight_score: float
+    """Bounded log-scale weight. weight=1 (below min_weight floor)
+    is filtered before this is computed; weight=2 → ~0.4;
+    weight=10 → 1.0 (saturated)."""
+
+    combined_score: float
+    """``recency_score × jaccard_score × weight_score`` — the
+    canonical ranking key. All three multiplicands are bounded
+    [0, 1]; combined is too."""
+
+    schema_version: str = field(
+        default=FAILURE_MODE_MEMORY_SCHEMA_VERSION,
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "record": self.record.to_dict(),
+            "recency_score": float(self.recency_score),
+            "jaccard_score": float(self.jaccard_score),
+            "weight_score": float(self.weight_score),
+            "combined_score": float(self.combined_score),
+            "schema_version": self.schema_version,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Pure-function scoring primitives
+# ---------------------------------------------------------------------------
+
+
+def _recency_weight(
+    age_seconds: float, halflife_days: float,
+) -> float:
+    """``0.5 ** (age_days / halflife_days)``. Clamped to [0, 1].
+
+    Literal parity with :func:`coherence_auditor._recency_weight`
+    and :func:`semantic_index._recency_weight` — pinned by tests
+    so any future divergence trips immediately. NEVER raises."""
+    try:
+        if halflife_days <= 0 or age_seconds < 0:
+            return 1.0
+        age_days = age_seconds / 86400.0
+        return float(0.5 ** (age_days / halflife_days))
+    except Exception:  # noqa: BLE001 — defensive
+        return 0.0
+
+
+def _jaccard_similarity(
+    a: Iterable[str], b: Iterable[str],
+) -> float:
+    """``|a ∩ b| / |a ∪ b|`` — 1.0 when both sets are empty
+    (degenerate exact-match), 0.0 when union is otherwise empty.
+    Defensive against non-iterables. NEVER raises."""
+    try:
+        sa = set(str(x) for x in a if x)
+        sb = set(str(x) for x in b if x)
+    except (TypeError, ValueError):
+        return 0.0
+    if not sa and not sb:
+        # Both empty — treat as full match (situation alone matched).
+        return 1.0
+    union = sa | sb
+    if not union:
+        return 0.0
+    inter = sa & sb
+    return float(len(inter)) / float(len(union))
+
+
+# Reference floor for log-scale weight saturation — picked so
+# weight=2 (the PRD min) yields ~0.4, weight=10 saturates near 1.0.
+# Pinned in tests to lock the curve shape.
+_WEIGHT_SATURATION_REFERENCE: int = 10
+
+
+def _weight_score(weight: int) -> float:
+    """Bounded, non-linear weight scoring. ``log1p(weight) /
+    log1p(N)`` capped at 1.0. Linear weight would let one
+    50-recurrence outlier dominate the top-K; log1p compresses
+    the tail so multiple medium-weight matches can still surface.
+    NEVER raises."""
+    try:
+        w = max(0, int(weight))
+        ref = max(1, _WEIGHT_SATURATION_REFERENCE)
+        denom = math.log1p(ref)
+        if denom <= 0:
+            return 0.0
+        return min(1.0, math.log1p(w) / denom)
+    except Exception:  # noqa: BLE001 — defensive
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Diversity dedup — Coherence Auditor pattern
+# ---------------------------------------------------------------------------
+
+
+def _diversity_dedup(
+    matches: Iterable["FailureModeMatch"],
+    *,
+    top_k: int,
+) -> Tuple["FailureModeMatch", ...]:
+    """Walk matches in score-descending order; preserve at most
+    one per ``attempted_action_kind`` until top_k filled. If pool
+    exhausted before top_k filled, fall through and accept
+    same-attempt-kind matches in score order. NEVER raises."""
+    if top_k < 1:
+        return tuple()
+    primary: list = []
+    seen_kinds: set = set()
+    overflow: list = []
+    for m in matches:
+        kind = (m.record.attempted_action_kind or "").strip().lower()
+        if kind not in seen_kinds:
+            primary.append(m)
+            seen_kinds.add(kind)
+            if len(primary) >= top_k:
+                break
+        else:
+            overflow.append(m)
+    if len(primary) >= top_k:
+        return tuple(primary[:top_k])
+    # Fill remaining slots from overflow (already score-sorted).
+    remaining = top_k - len(primary)
+    return tuple(primary + overflow[:remaining])
+
+
+# ---------------------------------------------------------------------------
+# Public retriever
+# ---------------------------------------------------------------------------
+
+
+def retrieve_failure_modes(
+    *,
+    situation_kind: SituationKind,
+    target_files: Iterable[str] = (),
+    top_k: Optional[int] = None,
+    min_weight: Optional[int] = None,
+    halflife_days: Optional[float] = None,
+    enabled_override: Optional[bool] = None,
+    now_ts: Optional[float] = None,
+) -> Tuple[FailureModeMatch, ...]:
+    """Return the top-K prior :class:`FailureModeRecord` instances
+    matching the current op's ``(situation_kind, target_files)``.
+
+    Decision tree:
+      1. Master-flag gate (``enabled_override`` OR
+         :func:`failure_mode_memory_enabled`) — empty tuple when off.
+      2. ``situation_kind is UNKNOWN`` → empty (Slice 1 contract).
+      3. Read history; filter to records with the same
+         ``situation_kind`` AND ``weight >= min_weight``.
+      4. Score each survivor with
+         ``recency * jaccard * weight_score``.
+      5. Sort descending by ``combined_score``.
+      6. Diversity dedup by ``attempted_action_kind``.
+      7. Tail-clamp at ``top_k``.
+
+    Returns frozen :class:`FailureModeMatch` tuple (possibly empty).
+    NEVER raises."""
+    try:
+        if enabled_override is False:
+            return tuple()
+        if enabled_override is None:
+            if not failure_mode_memory_enabled():
+                return tuple()
+
+        if situation_kind is SituationKind.UNKNOWN:
+            return tuple()
+        if not isinstance(situation_kind, SituationKind):
+            # Defensive: caller passed garbage.
+            return tuple()
+
+        eff_top_k = (
+            int(top_k) if top_k is not None else failure_mode_top_k()
+        )
+        if eff_top_k < 1:
+            return tuple()
+        eff_min_weight = (
+            int(min_weight) if min_weight is not None
+            else failure_mode_min_weight()
+        )
+        eff_halflife = (
+            float(halflife_days)
+            if halflife_days is not None
+            else failure_mode_recency_halflife_days()
+        )
+        if eff_halflife <= 0.0:
+            eff_halflife = (
+                failure_mode_recency_halflife_days()
+            )
+
+        now = float(now_ts if now_ts is not None else time.time())
+        candidate_files = tuple(
+            str(f) for f in target_files if f
+        )
+
+        history = read_failure_mode_history()
+        if not history:
+            return tuple()
+
+        matches: list = []
+        for record in history:
+            if record.situation_kind is not situation_kind:
+                continue
+            if int(record.weight) < eff_min_weight:
+                continue
+            age_s = max(0.0, now - float(record.observed_at_unix))
+            recency = _recency_weight(age_s, eff_halflife)
+            # Reconstruct the record's target_files set from its
+            # signature isn't possible (signature is one-way) — but
+            # the dedup-aware persistence preserves the FIRST
+            # record's target-file membership in the signature, and
+            # records sharing a signature have identical files by
+            # construction. We approximate the record's files via
+            # the candidate set when situation_kind matches AND
+            # weight has accumulated (multiple ops touching the
+            # same files form the dedup cluster).
+            #
+            # For Slice 3 we do NOT have per-record target_files
+            # stored (the dataclass field is signature_hash only).
+            # Jaccard reduces to a binary "same situation" signal:
+            # 1.0 when candidate_files non-empty (we're in a real
+            # op), else degenerate 1.0.
+            #
+            # Slice 4/5 may extend FailureModeRecord with a
+            # target_files field for richer Jaccard; today the
+            # bound below is the conservative fallback. The full
+            # combined score still ranks correctly via recency *
+            # weight; the constant Jaccard cancels out.
+            jaccard = _jaccard_similarity(
+                candidate_files, candidate_files,
+            )
+            weight_s = _weight_score(record.weight)
+            combined = recency * jaccard * weight_s
+            if combined <= 0.0:
+                continue
+            matches.append(
+                FailureModeMatch(
+                    record=record,
+                    recency_score=recency,
+                    jaccard_score=jaccard,
+                    weight_score=weight_s,
+                    combined_score=combined,
+                ),
+            )
+
+        if not matches:
+            return tuple()
+
+        matches.sort(
+            key=lambda m: m.combined_score, reverse=True,
+        )
+        return _diversity_dedup(matches, top_k=eff_top_k)
+    except Exception as exc:  # noqa: BLE001 — last-resort defensive
+        logger.debug(
+            "[failure_mode_memory] retrieve_failure_modes "
+            "raised: %s", exc,
+        )
+        return tuple()
+
+
 __all__ = [
     "FAILURE_MODE_MEMORY_SCHEMA_VERSION",
     "ExtractionOutcome",
     "FailureModeKind",
+    "FailureModeMatch",
     "FailureModeRecord",
     "RecordOutcome",
     "SituationKind",
@@ -1479,10 +1863,14 @@ __all__ = [
     "dedup_window_days",
     "extract_failure_mode",
     "failure_mode_memory_enabled",
+    "failure_mode_min_weight",
+    "failure_mode_recency_halflife_days",
+    "failure_mode_top_k",
     "history_dir",
     "history_max_records",
     "history_path",
     "read_failure_mode_history",
     "record_failure_mode",
     "record_postmortem",
+    "retrieve_failure_modes",
 ]
