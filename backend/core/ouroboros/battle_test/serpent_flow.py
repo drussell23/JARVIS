@@ -512,6 +512,18 @@ class SerpentFlow:
         self._route_costs: Dict[str, Dict[str, Any]] = {}
         self._op_starts: Dict[str, float] = {}
         self._streaming_active: bool = False
+        # Per-op streaming-start dedup (2026-05-03). Both the legacy
+        # SerpentREPL._dispatch_event path AND the RenderConductor
+        # SerpentFlowBackend (Slice 2) call show_streaming_start for
+        # the same op_id; without dedup the operator sees duplicate
+        # "🧬 synthesizing via Claude" lines (sometimes unprefixed
+        # when the op was momentarily not in _active_ops). Idempotency
+        # lives here on the receiving method, not at either caller —
+        # single source of truth so the dedup keeps working as new
+        # render paths are wired in. Cleared per-op in
+        # show_streaming_end so re-streams of the same op (tool-loop
+        # rounds with reset state) work correctly.
+        self._streaming_started_ops: set = set()
 
         # Op block tracking — set of op_ids with visually open blocks
         self._active_ops: set = set()
@@ -1000,6 +1012,12 @@ class SerpentFlow:
         if self._lens_mode == "manual" and self._focused_op_id == op_id:
             self._focused_op_id = None
             self._lens_mode = "auto"
+        # Per-op streaming-start dedup cleanup (2026-05-03). Removes
+        # this op_id from the dedup set so a future op with the same
+        # id (rare but possible across long-lived sessions) can stream
+        # again without being silently no-op'd. Defensive — discard
+        # is idempotent on missing keys.
+        self._streaming_started_ops.discard(op_id)
         if not was_focused:
             return
         short = _short_id(op_id)
@@ -1150,7 +1168,20 @@ class SerpentFlow:
         Token tallies + provider remain visible during streaming via
         the spinner label so the operator can see the system is
         productive without the fixed-region cost.
+
+        Idempotent per op_id (2026-05-03): both the legacy
+        SerpentREPL._dispatch_event path AND the RenderConductor
+        SerpentFlowBackend (Slice 2) call this for the same op.
+        Dedup lives here on the receiving method so all callers can
+        call freely; only the first call per op_id has visible
+        effect. Cleared in show_streaming_end. When op_id is empty
+        (legacy callers, defensive), behavior is unchanged — fires
+        every time, since there's no key to dedup on.
         """
+        if op_id and op_id in self._streaming_started_ops:
+            return
+        if op_id:
+            self._streaming_started_ops.add(op_id)
         self._streaming_active = True
         self._stream_buffer = ""
         self._stream_token_count = 0

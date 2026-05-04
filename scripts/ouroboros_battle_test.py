@@ -80,6 +80,20 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # workaround. setdefault honors any operator override.
 os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
 
+# REPL UX fix (2026-05-03) — prompt_toolkit CPR (Cursor Position
+# Request) bypass. Some terminals don't respond to CPR escape
+# sequences; prompt_toolkit then prints "WARNING: your terminal
+# doesn't support cursor position requests (CPR)." DIRECTLY to
+# stderr (bypassing patch_stdout) AND falls into a degraded
+# rendering codepath where input characters may not display.
+# PROMPT_TOOLKIT_NO_CPR=1 is the library's documented escape
+# hatch — it skips the CPR query entirely, uses static-size
+# detection, and uses the safe non-CPR rendering path that always
+# shows typed input. Reference:
+#   prompt_toolkit/output/vt100.py:Vt100_Output.responds_to_cpr
+# setdefault honors any operator override.
+os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
+
 # Ensure the project root is importable regardless of cwd.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:

@@ -514,6 +514,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TERMINATION_HOOK_DISPATCHED,       # TermHook Slice 4
     EVENT_TYPE_ADMISSION_DECISION_EMITTED,        # AdmissionGate Slice 3
     EVENT_TYPE_CODEBASE_CHARACTER_INJECTED,       # CodebaseCharDigest Slice 3
+    EVENT_TYPE_AUTO_ACTION_PROPOSAL,              # auto_action_router (Move 3)
+    EVENT_TYPE_PRODUCTION_ORACLE_SIGNAL,          # Production Oracle (Tier 2 #6)
 })
 
 

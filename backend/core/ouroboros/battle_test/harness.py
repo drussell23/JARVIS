@@ -857,8 +857,13 @@ class BattleTestHarness:
                     production_oracle_enabled as _po_enabled,
                 )
                 if _po_enabled():
+                    # HarnessConfig exposes the repo root as `repo_path`
+                    # (not `project_root`); every other caller in this
+                    # file uses `self._config.repo_path`. The observer's
+                    # kwarg is named `project_root` — keep that, pull
+                    # from the actual source attribute.
                     _observer = _po_get_observer(
-                        project_root=self._config.project_root,
+                        project_root=self._config.repo_path,
                     )
 
                     def _posture_provider() -> str:
