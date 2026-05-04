@@ -481,8 +481,16 @@ class TestSingletonAndSeed:
     def test_ensure_seeded_installs_specs(self):
         reset_default_registry()
         r = ensure_seeded()
-        # All seed specs present
-        assert len(r.list_all()) == len(SEED_SPECS)
+        # All seed specs present. Use >= because seed_default_registry
+        # also runs _discover_module_provided_flags (added after the
+        # original SEED_SPECS-only contract); the static seed list is
+        # the floor, not the ceiling.
+        assert len(r.list_all()) >= len(SEED_SPECS)
+        # And every static seed spec name MUST be in the registry —
+        # discovery never silently drops a SEED_SPECS entry.
+        seed_names = {s.name for s in SEED_SPECS}
+        registry_names = {s.name for s in r.list_all()}
+        assert seed_names.issubset(registry_names)
 
     def test_ensure_seeded_idempotent(self):
         reset_default_registry()

@@ -2905,6 +2905,90 @@ SEED_SPECS: list = [
         since="Tier 2 #6 follow-up Arc 1 (graduated 2026-05-03)",
         posture_relevance=_ALL_POSTURES_CRITICAL,
     ),
+
+    # ====================================================================
+    # WallClockWatchdog Defect #1 fix (2026-05-03)
+    # ====================================================================
+    # Soak v5 (bt-2026-05-03-060330) fired the wall-clock watchdog
+    # 22 minutes AFTER the cap was hit -- the original implementation
+    # used a single ``asyncio.sleep(cap_s)`` for the entire duration
+    # which is vulnerable to event-loop starvation by long-running
+    # coroutines doing blocking I/O. The fix: periodic check loop
+    # using monotonic clock + parallel thread-based hard-deadline
+    # safety net. Two env knobs control the behavior.
+    FlagSpec(
+        name="JARVIS_WALL_CLOCK_CHECK_INTERVAL_S",
+        type=FlagType.FLOAT, default=5.0,
+        description=(
+            "Periodic-check tick for the WallClockWatchdog asyncio "
+            "loop. Floor 1.0s (avoid busy-loop), ceiling 60.0s "
+            "(cap fire delay under sane configs). Default 5s gives "
+            "<=5s overshoot under normal asyncio scheduling. Lower "
+            "values give tighter fire timing at modest CPU cost. "
+            "Defect #1 fix (2026-05-03): replaces the original "
+            "single-asyncio.sleep(cap_s) pattern that fired 22 min "
+            "late in soak v5."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/battle_test/harness.py"
+        ),
+        example="JARVIS_WALL_CLOCK_CHECK_INTERVAL_S=2.0",
+        since="Defect #1 fix (2026-05-03)",
+    ),
+    FlagSpec(
+        name="JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S",
+        type=FlagType.FLOAT, default=30.0,
+        description=(
+            "Grace window after max_wall_seconds before the thread-"
+            "based hard-deadline safety net fires. The asyncio path "
+            "fires at cap_s; the thread fires at cap_s + grace. "
+            "Under normal conditions the asyncio path always wins "
+            "first. The thread is the backstop for cases where "
+            "the asyncio loop is wedged (the soak v5 pathology). "
+            "Floor 5s, ceiling 600s. Default 30s aligns with "
+            "BoundedShutdownWatchdog's 30s grace."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/battle_test/harness.py"
+        ),
+        example="JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S=60.0",
+        since="Defect #1 fix (2026-05-03)",
+    ),
+
+    # ====================================================================
+    # CandidateGenerator Defect #4 fix (2026-05-03)
+    # ====================================================================
+    # Soak v5 saw 3 EXHAUSTION events with remaining_s=0.0 + 4 unhandled
+    # asyncio task exceptions. Fix: pre-fallback budget short-circuit
+    # raises a clean cause when remaining budget < min_viable, instead
+    # of attempting a doomed fallback call that gets CancelledError'd
+    # mid-flight. Slice A's task-leak callback consumes any straggler
+    # exceptions from shielded background tasks.
+    FlagSpec(
+        name="JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S",
+        type=FlagType.FLOAT, default=5.0,
+        description=(
+            "Pre-fallback budget short-circuit threshold. When "
+            "remaining deadline budget at _call_fallback entry is "
+            "less than this many seconds, raise "
+            "deadline_exhausted_pre_fallback (clean cause) instead "
+            "of attempting a fallback call that will be CancelledError'd "
+            "mid-flight. Floor 1s, ceiling 60s. Default 5s -- safer "
+            "to skip than to attempt a doomed call. Soak v5's 3 "
+            "EXHAUSTION events with remaining_s=0.0 + the 4 "
+            "unhandled asyncio task exceptions pattern is "
+            "structurally fixed by this short-circuit (Defect #4 "
+            "Slice B 2026-05-03)."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/governance/candidate_generator.py"
+        ),
+        example="JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S=10.0",
+        since="Defect #4 fix (2026-05-03)",
+    ),
 ]
 
 

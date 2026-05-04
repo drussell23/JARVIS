@@ -61,6 +61,39 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 
+# REPL UX fix (2026-05-03) — silence the per-fork tokenizers warning at its
+# source. The warning prints to OS-level stderr from forked subprocesses,
+# which bypasses prompt_toolkit's patch_stdout entirely and clobbers the
+# REPL prompt line on every sensor fork. The huggingface library itself
+# tells you to set this env var; we honor any operator override via
+# setdefault so it isn't hardcoded.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# macOS fork-safety fix (2026-05-03) — Apple's libdispatch / Objective-C
+# runtime aborts (SIGABRT, "multi-threaded process forked / crashed on
+# child side of fork pre-exec") when fork() is called after threads
+# have started. The harness goes multi-threaded at boot (asyncio +
+# sensors + embedding service), and downstream subprocess.Popen calls
+# (git, pytest, model downloads) use fork+exec on macOS. Apple ships
+# this env var EXPLICITLY for the fork+exec case where the child
+# replaces its image immediately — it is the documented fix, not a
+# workaround. setdefault honors any operator override.
+os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+
+# REPL UX fix (2026-05-03) — prompt_toolkit CPR (Cursor Position
+# Request) bypass. Some terminals don't respond to CPR escape
+# sequences; prompt_toolkit then prints "WARNING: your terminal
+# doesn't support cursor position requests (CPR)." DIRECTLY to
+# stderr (bypassing patch_stdout) AND falls into a degraded
+# rendering codepath where input characters may not display.
+# PROMPT_TOOLKIT_NO_CPR=1 is the library's documented escape
+# hatch — it skips the CPR query entirely, uses static-size
+# detection, and uses the safe non-CPR rendering path that always
+# shows typed input. Reference:
+#   prompt_toolkit/output/vt100.py:Vt100_Output.responds_to_cpr
+# setdefault honors any operator override.
+os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
+
 # Ensure the project root is importable regardless of cwd.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -121,7 +154,7 @@ def _check_env_val(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
-def _reap_zombies() -> int:
+def _reap_zombies() -> "set[int]":
     """Detect and reap any lingering ouroboros_battle_test.py processes.
 
     A terminal disconnect or crashed session can leave the battle test
@@ -135,12 +168,19 @@ def _reap_zombies() -> int:
       • owned by the current UID
       • that are not this process
 
-    Returns the number of zombies reaped.
+    Returns the set of PIDs that were targeted (and either terminated
+    or SIGKILLed). The caller passes this to
+    ``_cleanup_stale_router_lock`` so the lock cleanup trusts this
+    authoritative knowledge instead of re-probing via ``os.kill(pid, 0)``
+    — that probe is racy on macOS because the kernel can recycle a
+    PID between SIGKILL and the probe, making a just-killed PID look
+    "alive" again under a fresh unrelated occupant. Closes the boot
+    coordination gap between reaper and lock cleanup (2026-05-03).
     """
     try:
         import psutil  # type: ignore[import-untyped]
     except ImportError:
-        return 0  # Silently skip; psutil is in requirements.txt but not hard-required
+        return set()  # Silently skip; psutil is in requirements.txt but not hard-required
 
     my_pid = os.getpid()
     my_ppid = os.getppid() if hasattr(os, "getppid") else None
@@ -189,7 +229,9 @@ def _reap_zombies() -> int:
             continue
 
     if not victims:
-        return 0
+        return set()
+
+    reaped_pids: "set[int]" = {p.pid for p in victims}
 
     print(f"\n{_BOLD}{_YELLOW}  Zombie Reaper{_RESET}")
     print(f"{_DIM}  {'─' * 52}{_RESET}")
@@ -220,16 +262,30 @@ def _reap_zombies() -> int:
     count = len(victims)
     plural = "s" if count != 1 else ""
     print(f"  {_GREEN}✓ reaped {count} zombie{plural}{_RESET}\n")
-    return count
+    return reaped_pids
 
 
-def _cleanup_stale_router_lock() -> None:
+def _cleanup_stale_router_lock(
+    reaped_pids: "set[int] | None" = None,
+) -> None:
     """Remove a stale ``.jarvis/intake_router.lock`` left by a crashed session.
 
-    The lock file carries ``{"pid": ..., "ts": ...}`` metadata. If the PID
-    is dead (or the file is corrupt), the intake router would already clean
-    it on startup — but doing it here first avoids a noisy retry and makes
-    the reaper banner tell the whole story in one place.
+    The lock file carries ``{"pid": ..., "ts": ...}`` metadata.
+
+    If ``reaped_pids`` is supplied and the lock's PID is in that set,
+    the lock is removed unconditionally — the reaper just killed that
+    PID, so its claim is definitively void. This bypasses the
+    ``os.kill(pid, 0)`` existence probe, which is racy on macOS:
+    between SIGKILL and the probe, the kernel can recycle the PID to
+    a fresh unrelated process (zsh, terminal subprocess, etc.),
+    making the just-killed PID appear "alive" and letting the stale
+    lock survive into the single-flight check (which then rejects
+    the new launch). Trust the reaper's authoritative knowledge.
+
+    Otherwise (or for locks held by PIDs the reaper didn't touch),
+    fall back to the existence-probe path — the intake router would
+    also clean a dead-PID lock at startup, but doing it here first
+    avoids a noisy retry and keeps the reaper banner coherent.
     """
     lock_path = _PROJECT_ROOT / ".jarvis" / "intake_router.lock"
     if not lock_path.exists():
@@ -246,6 +302,16 @@ def _cleanup_stale_router_lock() -> None:
         return
     pid = int(data.get("pid", 0) or 0)
     if pid <= 0:
+        return
+    if reaped_pids is not None and pid in reaped_pids:
+        try:
+            lock_path.unlink()
+            print(
+                f"  {_DIM}  cleaned stale intake_router.lock "
+                f"(reaped PID {pid}){_RESET}"
+            )
+        except OSError:
+            pass
         return
     try:
         os.kill(pid, 0)  # existence probe — no signal delivered
@@ -952,8 +1018,8 @@ def main() -> None:
     # router lock. Opt-out with JARVIS_BATTLE_REAP_ZOMBIES=false.
     # ------------------------------------------------------------------
     if os.environ.get("JARVIS_BATTLE_REAP_ZOMBIES", "true").lower() not in ("false", "0", "no", "off"):
-        _reap_zombies()
-        _cleanup_stale_router_lock()
+        _reaped = _reap_zombies()
+        _cleanup_stale_router_lock(reaped_pids=_reaped)
 
     # ------------------------------------------------------------------
     # Harness Epic Slice 2 — single-flight preflight.

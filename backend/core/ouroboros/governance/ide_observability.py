@@ -390,6 +390,14 @@ class IDEObservabilityRouter:
             "/observability/firing-telemetry",
             self._handle_firing_telemetry,
         )
+        # RenderConductor arc (Wave 4 #1) Slice 7 follow-up #3 — IDE
+        # introspection of the render substrate. Symmetric with
+        # /render REPL verb (render_repl.py); both surface the same
+        # state via different channels.
+        app.router.add_get(
+            "/observability/render",
+            self._handle_render_substrate,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -2552,6 +2560,266 @@ class IDEObservabilityRouter:
                 request, 500,
                 "ide_observability.firing_telemetry_error",
             )
+
+    # ----------------------------------------------------------------------
+    # RenderConductor arc (Wave 4 #1) Slice 7 follow-up #3 — substrate
+    # introspection. Symmetric with /render REPL verb (render_repl.py).
+    # ----------------------------------------------------------------------
+
+    async def _handle_render_substrate(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/render`` — bounded read-only projection
+        of the RenderConductor substrate state.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "master_enabled": true,
+              "producer_flags": {
+                "JARVIS_REASONING_STREAM_ENABLED": false,
+                "JARVIS_INPUT_CONTROLLER_ENABLED": false,
+                "JARVIS_THREAD_OBSERVER_ENABLED": false,
+                "JARVIS_CONTEXTUAL_HELP_ENABLED": false
+              },
+              "conductor": {
+                "registered": true,
+                "backend_count": 2,
+                "backends": [
+                  {"name": "stream_renderer", "kind_partition": null},
+                  {"name": "serpent_flow",
+                   "handled": ["FILE_REF", "MODAL_PROMPT", ...],
+                   "no_op": ["BACKEND_RESET"]}
+                ],
+                "active_density": "NORMAL" | null,
+                "active_theme": "default" | null
+              },
+              "observers": {
+                "input_controller": {"registered": true,
+                                     "active": false,
+                                     "actions": ["NO_OP", "CANCEL_CURRENT_OP",
+                                                 "HELP_OPEN", ...]},
+                "thread_observer":  {"registered": true,
+                                     "active": false, "turn_count": 0},
+                "help_resolver":    {"registered": true,
+                                     "enabled": false,
+                                     "page_size": 10}
+              },
+              "arc_flags_total": 15,
+              "arc_invariants_total": 39
+            }
+
+        Returns 403 ``ide_observability.disabled`` when the IDE
+        observability master flag is off (port-scanner discipline —
+        consistent with sibling routes). Returns 200 even when the
+        conductor / observers aren't registered yet — the projection
+        surfaces "(not registered)" cleanly so IDE clients can render
+        an empty-state UI rather than failing the call.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+
+        # Master + producer flags via FlagRegistry (defensive — degraded
+        # to false on registry unavailability).
+        def _bool(name: str, default: bool) -> bool:
+            try:
+                from backend.core.ouroboros.governance import (
+                    flag_registry as _fr,
+                )
+                reg = _fr.ensure_seeded()
+                return bool(reg.get_bool(name, default=default))
+            except Exception:  # noqa: BLE001 — defensive
+                return default
+
+        master_enabled = _bool(
+            "JARVIS_RENDER_CONDUCTOR_ENABLED", True,
+        )
+        producer_flags = {
+            "JARVIS_REASONING_STREAM_ENABLED": _bool(
+                "JARVIS_REASONING_STREAM_ENABLED", False,
+            ),
+            "JARVIS_INPUT_CONTROLLER_ENABLED": _bool(
+                "JARVIS_INPUT_CONTROLLER_ENABLED", False,
+            ),
+            "JARVIS_THREAD_OBSERVER_ENABLED": _bool(
+                "JARVIS_THREAD_OBSERVER_ENABLED", False,
+            ),
+            "JARVIS_CONTEXTUAL_HELP_ENABLED": _bool(
+                "JARVIS_CONTEXTUAL_HELP_ENABLED", False,
+            ),
+        }
+
+        # Conductor projection — defensive against missing module
+        # (test isolation) and unregistered singleton.
+        conductor_proj: Dict[str, Any] = {"registered": False}
+        try:
+            from backend.core.ouroboros.governance.render_conductor import (
+                get_render_conductor,
+            )
+            conductor = get_render_conductor()
+        except Exception:  # noqa: BLE001 — defensive
+            conductor = None
+        if conductor is not None:
+            backends = conductor.backends()
+            backend_dicts: List[Dict[str, Any]] = []
+            for b in backends:
+                name = getattr(b, "name", "?")
+                handled = getattr(b, "_HANDLED_KINDS", None)
+                no_op = getattr(b, "_NO_OP_KINDS", None)
+                if handled is None:
+                    backend_dicts.append({
+                        "name": name, "kind_partition": None,
+                    })
+                else:
+                    backend_dicts.append({
+                        "name": name,
+                        "handled": sorted(handled),
+                        "no_op": sorted(no_op or ()),
+                    })
+            density: Optional[str] = None
+            theme: Optional[str] = None
+            try:
+                density = conductor.active_density().value
+            except Exception:  # noqa: BLE001 — defensive
+                density = None
+            try:
+                theme = conductor.active_theme().name
+            except Exception:  # noqa: BLE001 — defensive
+                theme = None
+            conductor_proj = {
+                "registered": True,
+                "backend_count": len(backends),
+                "backends": backend_dicts,
+                "active_density": density,
+                "active_theme": theme,
+            }
+
+        # Observer projections — each defensive in isolation so a
+        # missing module doesn't break sibling projections.
+        observers: Dict[str, Any] = {}
+        try:
+            from backend.core.ouroboros.governance import key_input as _ki
+            ctrl = _ki.get_input_controller()
+            if ctrl is None:
+                observers["input_controller"] = {"registered": False}
+            else:
+                try:
+                    actions = sorted(a.value for a in ctrl.registry.actions())
+                except Exception:  # noqa: BLE001 — defensive
+                    actions = []
+                observers["input_controller"] = {
+                    "registered": True,
+                    "active": bool(ctrl.active),
+                    "actions": actions,
+                }
+        except Exception:  # noqa: BLE001 — defensive
+            observers["input_controller"] = {
+                "registered": False, "import_failed": True,
+            }
+        try:
+            from backend.core.ouroboros.governance import (
+                render_thread as _rt,
+            )
+            obs = _rt.get_thread_observer()
+            if obs is None:
+                observers["thread_observer"] = {"registered": False}
+            else:
+                observers["thread_observer"] = {
+                    "registered": True,
+                    "active": bool(obs.active),
+                    "turn_count": int(obs.turn_count),
+                }
+        except Exception:  # noqa: BLE001 — defensive
+            observers["thread_observer"] = {
+                "registered": False, "import_failed": True,
+            }
+        try:
+            from backend.core.ouroboros.governance import render_help as _rh
+            resolver = _rh.get_help_resolver()
+            if resolver is None:
+                observers["help_resolver"] = {"registered": False}
+            else:
+                try:
+                    page_size = int(_rh.default_page_size())
+                except Exception:  # noqa: BLE001 — defensive
+                    page_size = -1
+                observers["help_resolver"] = {
+                    "registered": True,
+                    "enabled": bool(_rh.is_enabled()),
+                    "page_size": page_size,
+                }
+        except Exception:  # noqa: BLE001 — defensive
+            observers["help_resolver"] = {
+                "registered": False, "import_failed": True,
+            }
+
+        # Arc totals — sourced from FlagRegistry + ShippedCodeInvariants
+        # to give IDE clients a stable health-summary number.
+        arc_flag_count = 0
+        arc_invariant_count = 0
+        try:
+            from backend.core.ouroboros.governance import (
+                flag_registry as _fr,
+            )
+            reg = _fr.ensure_seeded()
+            arc_flag_prefixes = (
+                "JARVIS_RENDER_CONDUCTOR_",
+                "JARVIS_REASONING_STREAM_",
+                "JARVIS_FILE_REF_",
+                "JARVIS_INPUT_CONTROLLER_",
+                "JARVIS_KEY_BINDINGS",
+                "JARVIS_THREAD_OBSERVER_",
+                "JARVIS_THREAD_SPEAKER_",
+                "JARVIS_CONTEXTUAL_HELP_",
+                "JARVIS_HELP_RANKING_",
+                "JARVIS_HELP_PAGE_",
+            )
+            arc_flag_count = sum(
+                1 for s in reg.list_all()
+                if any(s.name.startswith(p) for p in arc_flag_prefixes)
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            arc_flag_count = 0
+        try:
+            from backend.core.ouroboros.governance.meta import (
+                shipped_code_invariants as _sci,
+            )
+            arc_inv_prefixes = (
+                "render_conductor_", "render_backends_",
+                "render_primitives_", "render_thread_",
+                "render_help_", "render_repl_",
+                "key_input_", "streamrenderer_",
+                "harness_wires_",
+            )
+            arc_invariant_count = sum(
+                1 for i in _sci.list_shipped_code_invariants()
+                if any(
+                    i.invariant_name.startswith(p)
+                    for p in arc_inv_prefixes
+                )
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            arc_invariant_count = 0
+
+        return self._json_response(
+            request, 200,
+            {
+                "schema_version": "1.0",
+                "master_enabled": master_enabled,
+                "producer_flags": producer_flags,
+                "conductor": conductor_proj,
+                "observers": observers,
+                "arc_flags_total": arc_flag_count,
+                "arc_invariants_total": arc_invariant_count,
+            },
+        )
 
     # ----------------------------------------------------------------------
     # Production Oracle (Tier 2 #6) Slice D — observer projection

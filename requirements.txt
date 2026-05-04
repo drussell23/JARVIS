@@ -85,6 +85,11 @@
 # [Ouroboros] Modified by Ouroboros (op=op-019ddc74-) at 2026-04-30 03:37 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019deb52-3914-715c-98b1-0f40854aca39-cau) at 2026-04-30 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-019deb52-) at 2026-05-03 00:56 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019df081-c7fe-720b-b25b-fc134a11b2d8-cau) at 2026-05-03 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-019df081-) at 2026-05-04 01:03 UTC
+# Reason: transformers is 17 minor versions behind (installed: 4.57.6, latest: 5.7.0)
+
+# Reason: transformers is 17 minor versions behind (installed: 4.57.6, latest: 5.7.0) -- bumped upper bound to <6 and floor to >=4.57.6
 # Reason: torch is 6 minor versions behind (installed: 2.5.1, latest: 2.11.0)
 
 # Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
@@ -243,7 +248,7 @@ tomli==2.3.0
 torch==2.11.0
 torchaudio==2.11.0
 tqdm==4.67.1
-transformers>=4.36.0,<5
+transformers>=4.57.6,<6
 typer==0.20.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0

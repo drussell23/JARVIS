@@ -76,6 +76,22 @@ class SyncStatus(Enum):
     ERROR = "error"
 
 
+class PersistentIntelligenceHealth(str, Enum):
+    """Closed-5 health vocabulary for the manager (Defect #3 Slice B,
+    2026-05-03). Consumed by the PersistentIntelligenceHealthOracle
+    adapter (Slice C) which surfaces health via the existing
+    Production Oracle observer + GET /observability/production-oracle
+    + SSE production_oracle_signal_observed. No parallel observability
+    surface -- leverages the substrate already shipped in Tier 2 #6.
+    """
+
+    HEALTHY = "healthy"                       # init+checkpoint OK
+    DEGRADED_READONLY = "degraded_readonly"   # readonly DB / WAL fail
+    DEGRADED_DISK_FULL = "degraded_disk_full" # ENOSPC / disk full
+    DEGRADED_OTHER = "degraded_other"         # unrecognized failure
+    DISABLED = "disabled"                     # never initialized
+
+
 class StateCategory(Enum):
     """Categories of persistent state."""
     AGENT = "agent"  # Agent-specific state
@@ -249,11 +265,44 @@ class PersistentIntelligenceManager:
         # Cross-repo sync
         self._cross_repo_enabled = os.getenv("CROSS_REPO_SYNC", "true").lower() == "true"
 
+        # Defect #3 Slice B (2026-05-03) — health state + circuit
+        # breaker tracking. Health starts DISABLED; transitions to
+        # HEALTHY after _init_local_db succeeds. Checkpoint failures
+        # update health + accumulate consecutive-failure count; after
+        # JARVIS_PERSISTENT_INTELLIGENCE_FAIL_THRESHOLD failures (default
+        # 3) the checkpoint loop suspends to avoid log spam against
+        # a permanently-degraded path.
+        self._health: PersistentIntelligenceHealth = (
+            PersistentIntelligenceHealth.DISABLED
+        )
+        self._consecutive_checkpoint_failures: int = 0
+        self._checkpoint_suspended: bool = False
+
         logger.info(
             f"[PERSISTENT-INTELLIGENCE] Initialized with "
             f"local_db={self.LOCAL_DB_PATH}, "
             f"cloud_enabled={self.CLOUD_ENABLED}"
         )
+
+    @property
+    def health(self) -> "PersistentIntelligenceHealth":
+        """Current health state (Defect #3 Slice B). Read by the
+        PersistentIntelligenceHealthOracle adapter to project into
+        the Production Oracle observer's signal stream."""
+        return self._health
+
+    @property
+    def effective_db_path(self) -> str:
+        """The path actually in use after fallback-chain resolution
+        (Defect #3 Slice A). Differs from ``LOCAL_DB_PATH`` when the
+        configured default is non-writable."""
+        return getattr(self, "_effective_db_path", self.LOCAL_DB_PATH)
+
+    @property
+    def checkpoint_suspended(self) -> bool:
+        """True when the checkpoint loop has been suspended due to
+        consecutive failures (Defect #3 Slice B circuit breaker)."""
+        return self._checkpoint_suspended
 
     @classmethod
     async def create(cls) -> "PersistentIntelligenceManager":
@@ -295,9 +344,106 @@ class PersistentIntelligenceManager:
 
         logger.info("[PERSISTENT-INTELLIGENCE] Initialization complete")
 
+    def _resolve_writable_db_path(self) -> str:
+        """Defect #3 Slice A (2026-05-03) — probe write capability +
+        fall through a chain of fallbacks until a writable location
+        is found.
+
+        Resolution chain (first writable wins):
+          1. ``JARVIS_STATE_DB`` env (operator-explicit override)
+          2. ``JARVIS_STATE_DIR`` env (operator-explicit dir override)
+          3. ``<cwd>/.jarvis/state/persistent_intelligence.db``
+             (project-local fallback)
+          4. ``tempfile.gettempdir()/jarvis_state/persistent_intelligence.db``
+             (last resort, ephemeral)
+
+        Probe is a single ``touch`` test on the parent directory --
+        SQLite's WAL/journal write requires directory write
+        permission, not just file write permission, so a
+        directory-level probe catches the soak v5 readonly-DB
+        pathology even when the .db file itself appears writable.
+
+        Logs WARNING on every fallback transition so operators see
+        why the chosen path differs from the configured default.
+        Returns the chosen path; NEVER raises (the last-resort
+        tempdir is always writable on a working system)."""
+        import tempfile
+
+        def _can_write(parent: Path) -> bool:
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+                probe = parent / f"_writetest_{os.getpid()}_{id(self)}"
+                try:
+                    probe.touch()
+                    probe.unlink(missing_ok=True)
+                    return True
+                except (OSError, PermissionError):
+                    return False
+            except (OSError, PermissionError):
+                return False
+
+        candidates: List[tuple] = [
+            (self.LOCAL_DB_PATH, "configured (LOCAL_DB_PATH)"),
+            (
+                str(Path(self.STATE_DIR) / "persistent_intelligence.db"),
+                "STATE_DIR-derived",
+            ),
+            (
+                str(
+                    Path.cwd() / ".jarvis" / "state"
+                    / "persistent_intelligence.db"
+                ),
+                "project-local cwd fallback",
+            ),
+            (
+                str(
+                    Path(tempfile.gettempdir()) / "jarvis_state"
+                    / "persistent_intelligence.db"
+                ),
+                "tempdir last-resort fallback",
+            ),
+        ]
+        first_path = candidates[0][0]
+        for path_str, label in candidates:
+            parent = Path(path_str).parent
+            if _can_write(parent):
+                if path_str != first_path:
+                    logger.warning(
+                        "[PERSISTENT-INTELLIGENCE] DB path fallback: "
+                        "configured=%s (non-writable) -> chosen=%s "
+                        "(%s). Defect #3 fix 2026-05-03 -- write-"
+                        "permission probe at init avoids checkpoint-"
+                        "loop log spam against a readonly path.",
+                        first_path, path_str, label,
+                    )
+                return path_str
+        # Should never reach here on a working system, but if EVERY
+        # candidate fails, return the last one and let aiosqlite
+        # raise informatively at connect time.
+        logger.error(
+            "[PERSISTENT-INTELLIGENCE] all DB-path candidates non-"
+            "writable: %s",
+            [c[0] for c in candidates],
+        )
+        return candidates[-1][0]
+
     async def _init_local_db(self) -> None:
-        """Initialize SQLite database."""
-        self._db = await aiosqlite.connect(self.LOCAL_DB_PATH)
+        """Initialize SQLite database. Defect #3 fix (2026-05-03) --
+        resolves writable path via fallback chain BEFORE connecting
+        so a readonly default location triggers a graceful fall-
+        through instead of permanent checkpoint-loop log spam.
+
+        On successful connection + table creation, flips
+        ``self._health`` from DISABLED to HEALTHY. On connection
+        failure, leaves DISABLED so the oracle adapter surfaces the
+        DISABLED verdict to operators."""
+        self._effective_db_path: str = self._resolve_writable_db_path()
+        try:
+            self._db = await aiosqlite.connect(self._effective_db_path)
+            self._health = PersistentIntelligenceHealth.HEALTHY
+        except Exception:  # noqa: BLE001 -- defensive
+            self._health = PersistentIntelligenceHealth.DISABLED
+            raise
 
         # Create tables
         await self._db.executescript("""
@@ -897,16 +1043,99 @@ class PersistentIntelligenceManager:
                 logger.exception(f"[PERSISTENT-INTELLIGENCE] Sync loop error: {e}")
 
     async def _checkpoint_loop(self) -> None:
-        """Background checkpoint loop."""
+        """Background checkpoint loop. Defect #3 Slice B fix
+        (2026-05-03): circuit breaker on consecutive failures.
+
+        After ``JARVIS_PERSISTENT_INTELLIGENCE_FAIL_THRESHOLD``
+        consecutive failures (default 3), the loop suspends further
+        checkpointing. Operators see ONE summary log + the health
+        state transitions to DEGRADED_* (read by the oracle adapter
+        for SSE / GET surfacing). Loop continues running so it can
+        be re-armed if operators clear the underlying issue, but no
+        further checkpoint attempts fire while suspended.
+
+        Exponential backoff between failures (300s -> 600s -> 1200s)
+        gives transient issues a chance to resolve before tripping
+        the circuit. Successful checkpoint resets failure count +
+        flips health back to HEALTHY."""
+        try:
+            fail_threshold = max(
+                1, int(os.getenv(
+                    "JARVIS_PERSISTENT_INTELLIGENCE_FAIL_THRESHOLD",
+                    "3",
+                )),
+            )
+        except (TypeError, ValueError):
+            fail_threshold = 3
+        base_interval = self.CHECKPOINT_INTERVAL_SECONDS
         while self._running:
             try:
-                await asyncio.sleep(self.CHECKPOINT_INTERVAL_SECONDS)
+                # Exponential backoff between failures: 1x, 2x, 4x.
+                # Capped at fail_threshold attempts before suspension.
+                if self._consecutive_checkpoint_failures > 0:
+                    backoff_factor = min(
+                        4, 2 ** (self._consecutive_checkpoint_failures - 1),
+                    )
+                    interval = base_interval * backoff_factor
+                else:
+                    interval = base_interval
+                await asyncio.sleep(interval)
+                if self._checkpoint_suspended:
+                    # Suspended: no checkpoint attempts. Loop continues
+                    # to keep the cancellation contract intact.
+                    continue
                 await self.create_checkpoint()
-
+                # Success: reset failure count + restore health.
+                if self._consecutive_checkpoint_failures > 0:
+                    logger.info(
+                        "[PERSISTENT-INTELLIGENCE] checkpoint recovered "
+                        "after %d consecutive failures",
+                        self._consecutive_checkpoint_failures,
+                    )
+                self._consecutive_checkpoint_failures = 0
+                self._health = (
+                    PersistentIntelligenceHealth.HEALTHY
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception(f"[PERSISTENT-INTELLIGENCE] Checkpoint error: {e}")
+                self._consecutive_checkpoint_failures += 1
+                # Classify failure into health enum (Slice B).
+                emsg = str(e).lower()
+                if "readonly" in emsg or "read-only" in emsg:
+                    self._health = (
+                        PersistentIntelligenceHealth.DEGRADED_READONLY
+                    )
+                elif "no space" in emsg or "disk full" in emsg or "ENOSPC" in str(e):
+                    self._health = (
+                        PersistentIntelligenceHealth.DEGRADED_DISK_FULL
+                    )
+                else:
+                    self._health = (
+                        PersistentIntelligenceHealth.DEGRADED_OTHER
+                    )
+                if self._consecutive_checkpoint_failures < fail_threshold:
+                    logger.warning(
+                        "[PERSISTENT-INTELLIGENCE] checkpoint failed "
+                        "(%d/%d before circuit-breaker suspension): %s",
+                        self._consecutive_checkpoint_failures,
+                        fail_threshold, e,
+                    )
+                else:
+                    if not self._checkpoint_suspended:
+                        self._checkpoint_suspended = True
+                        logger.error(
+                            "[PERSISTENT-INTELLIGENCE] CIRCUIT BREAKER "
+                            "TRIPPED: %d consecutive checkpoint "
+                            "failures; suspending further checkpoint "
+                            "attempts. Health=%s. Last error: %s. "
+                            "Operators clear by fixing the underlying "
+                            "issue + restarting; oracle adapter will "
+                            "surface this state via the Production "
+                            "Oracle observer.",
+                            self._consecutive_checkpoint_failures,
+                            self._health.value, e,
+                        )
 
     async def create_checkpoint(self, checkpoint_type: str = "auto") -> str:
         """

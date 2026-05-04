@@ -19,6 +19,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -487,6 +488,88 @@ class BattleTestHarness:
     async def run(self) -> None:
         """Main lifecycle method: boot, wait for stop signal, shutdown, report."""
         self._started_at = time.time()
+
+        # D1 silent boot — route INFO/DEBUG to session_dir/debug.log,
+        # leave terminal clean for the banner. Must be the FIRST thing
+        # in run() so all subsequent lazy imports' init logs land in
+        # the file, not on the operator's screen. Master flag
+        # JARVIS_SILENT_BOOT_ENABLED default true; hot-revert via
+        # =false restores legacy behavior. NEVER raises (boot is not
+        # blocked by logging glue).
+        try:
+            from backend.core.ouroboros.governance.silent_boot import (
+                configure_silent_boot,
+            )
+            _silent_boot_handler = configure_silent_boot(
+                session_dir=(
+                    self._config.repo_path / ".ouroboros"
+                    / "sessions" / self._session_id
+                ),
+            )
+            if _silent_boot_handler is not None:
+                # Retain reference so the harness can close it
+                # explicitly on shutdown (Slice 7 follow-up #4 path).
+                self._log_file_path = _silent_boot_handler.baseFilename
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[harness] silent_boot setup failed; falling back "
+                "to legacy redirect path", exc_info=True,
+            )
+
+        # Asyncio loop-level exception handler — global safety net for
+        # the entire session lifetime (2026-05-03 audit). Replaces both
+        # asyncio's default handler (which formats with no message,
+        # producing the "Unhandled exception in event loop" stderr noise
+        # that bypasses patch_stdout) AND prompt_toolkit's handler
+        # (which prints + blocks on "Press ENTER to continue...").
+        #
+        # Architectural intent: 182+ ensure_future/create_task spawn
+        # sites exist across the repo. Per-callsite add_done_callback
+        # consumers (Defect #4 pattern) remain best-practice but
+        # cannot scale to every callsite without ongoing audit churn.
+        # The loop handler is the structural safety net — every leaked
+        # exception lands in debug.log with full classification, no
+        # terminal pollution, no operator-visible chatter. Per-callsite
+        # callbacks remain valuable as DEBUG-classified swallowers
+        # (silent on expected patterns); this handler catches the rest.
+        #
+        # Reuses _EXPECTED_BACKGROUND_EXC_PATTERNS from candidate_generator
+        # for classification — single source of truth.
+        try:
+            from backend.core.ouroboros.governance.candidate_generator import (
+                _EXPECTED_BACKGROUND_EXC_PATTERNS,
+            )
+        except Exception:
+            _EXPECTED_BACKGROUND_EXC_PATTERNS = ()
+        _async_leak_logger = logging.getLogger("asyncio.leak")
+        _running_loop = asyncio.get_event_loop()
+
+        def _harness_loop_exception_handler(loop_, ctx_):
+            msg = ctx_.get("message", "Unhandled exception in event loop")
+            exc = ctx_.get("exception")
+            extras = " | ".join(
+                f"{k}={ctx_[k]!r}"
+                for k in sorted(ctx_)
+                if k not in ("message", "exception")
+            )
+            full = f"[asyncio leak] {msg}" + (f" | {extras}" if extras else "")
+            if exc is None:
+                _async_leak_logger.warning(full)
+                return
+            if isinstance(exc, asyncio.CancelledError):
+                _async_leak_logger.debug(full, exc_info=exc)
+                return
+            err_str = str(exc)
+            if any(p in err_str for p in _EXPECTED_BACKGROUND_EXC_PATTERNS):
+                _async_leak_logger.debug(full, exc_info=exc)
+                return
+            _async_leak_logger.warning(full, exc_info=exc)
+
+        try:
+            _running_loop.set_exception_handler(_harness_loop_exception_handler)
+        except Exception:
+            logger.debug("Failed to install harness asyncio exception handler", exc_info=True)
+
         # Create events inside the running loop (Python 3.9 compat)
         self._shutdown_event = asyncio.Event()
         self._cost_tracker.budget_event = asyncio.Event()
@@ -749,11 +832,24 @@ class BattleTestHarness:
             # signal so retry storms cannot hijack termination. Only spawned
             # when max_wall_seconds_s is a positive float.
             self._wall_clock_monitor_task: Optional[asyncio.Future] = None
+            self._wall_clock_hard_deadline_thread: Optional[
+                threading.Thread
+            ] = None
+            self._wall_clock_hard_deadline_stop: Optional[
+                threading.Event
+            ] = None
             _wall_cap = self._config.max_wall_seconds_s
             if _wall_cap is not None and _wall_cap > 0:
                 self._wall_clock_monitor_task = asyncio.ensure_future(
                     self._monitor_wall_clock(_wall_cap)
                 )
+                # Defect #1 Slice B (2026-05-03) — thread-based safety
+                # net immune to asyncio starvation. The asyncio task
+                # above is the primary path (handles normal termination
+                # cleanly). The thread is the backstop: if the loop is
+                # wedged for longer than the grace window, the thread
+                # fires the event via call_soon_threadsafe.
+                self._start_wall_clock_hard_deadline_thread(_wall_cap)
                 logger.info(
                     "[WallClockWatchdog] armed: max_wall_seconds=%.0fs — session will "
                     "terminate with stop_reason=wall_clock_cap if not already stopped.",
@@ -765,6 +861,75 @@ class BattleTestHarness:
             self._restart_monitor_task = asyncio.ensure_future(
                 self._monitor_restart_pending()
             )
+
+            # Defect #2 fix (2026-05-03) — Production Oracle observer
+            # boot wire-up. The substrate's ``run_periodic`` was never
+            # scheduled by any caller, so the observer's history ring
+            # buffer stayed empty across all soaks (verified in
+            # bt-2026-05-03-060330: production_oracle_observer_tick=0).
+            # Without this boot wire-up, the GET /observability/
+            # production-oracle endpoint returns empty AND the
+            # auto_action_router's oracle veto rule (Rule 1.5) reads
+            # current()=None and falls through to existing rules. The
+            # whole Tier 2 #6 substrate is empirically dead until this
+            # task starts. Master flag JARVIS_PRODUCTION_ORACLE_ENABLED
+            # gates the entire boot path; cancelled on shutdown like
+            # the other monitor tasks.
+            self._production_oracle_monitor_task: Optional[
+                asyncio.Future
+            ] = None
+            try:
+                from backend.core.ouroboros.governance.production_oracle_observer import (  # noqa: E501
+                    get_default_observer as _po_get_observer,
+                    production_oracle_enabled as _po_enabled,
+                )
+                if _po_enabled():
+                    # HarnessConfig exposes the repo root as `repo_path`
+                    # (not `project_root`); every other caller in this
+                    # file uses `self._config.repo_path`. The observer's
+                    # kwarg is named `project_root` — keep that, pull
+                    # from the actual source attribute.
+                    _observer = _po_get_observer(
+                        project_root=self._config.repo_path,
+                    )
+
+                    def _posture_provider() -> str:
+                        """Adaptive cadence input: read current posture
+                        from the posture observer's persistent store.
+                        Returns ``"EXPLORE"`` (most conservative
+                        cadence) on any failure -- defensive default
+                        keeps the observer ticking under degraded
+                        posture-store conditions."""
+                        try:
+                            from backend.core.ouroboros.governance.posture_observer import (  # noqa: E501
+                                get_default_store as _ps_get_store,
+                            )
+                            store = _ps_get_store()
+                            reading = store.load_current()
+                            if reading is None:
+                                return "EXPLORE"
+                            return str(reading.posture.value)
+                        except Exception:  # noqa: BLE001
+                            return "EXPLORE"
+
+                    self._production_oracle_monitor_task = (
+                        asyncio.ensure_future(
+                            _observer.run_periodic(
+                                posture_provider=_posture_provider,
+                            )
+                        )
+                    )
+                    logger.info(
+                        "[ProductionOracleObserver] boot wire-up "
+                        "complete — adapters=%d (Defect #2 fix "
+                        "2026-05-03)",
+                        _observer.adapter_count,
+                    )
+            except Exception as _po_exc:  # noqa: BLE001 -- defensive
+                logger.debug(
+                    "[ProductionOracleObserver] boot wire-up degraded: "
+                    "%s", _po_exc, exc_info=True,
+                )
 
             # Register signal handlers
             try:
@@ -928,10 +1093,43 @@ class BattleTestHarness:
                     repo_path=self._config.repo_path,
                 )
                 self._serpent_flow.set_plan_review_mode(self._plan_before_execute)
-                _serpent_transport = SerpentTransport(flow=self._serpent_flow)
+
+                # CC1 — operator-selectable per-op rendering. Default
+                # CLAUDE: terse one-line-per-op idiom matching Claude
+                # Code's tool-call visual model. Hot-revert via
+                # JARVIS_RENDER_MODE=SERPENT restores the legacy
+                # multi-line per-op blocks.
+                _render_mode_label = "serpent"
+                _chosen_transport: Any = None
+                try:
+                    from backend.core.ouroboros.governance.claude_style_transport import (  # noqa: E501
+                        ClaudeStyleTransport,
+                        RenderMode,
+                        resolve_render_mode,
+                    )
+                    if resolve_render_mode() is RenderMode.CLAUDE:
+                        _chosen_transport = ClaudeStyleTransport(
+                            console=self._serpent_flow.console,
+                        )
+                        _render_mode_label = "claude"
+                except Exception as _crm_exc:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[harness] claude_style_transport selection "
+                        "failed: %s — falling back to SerpentTransport",
+                        _crm_exc,
+                    )
+                if _chosen_transport is None:
+                    _chosen_transport = SerpentTransport(flow=self._serpent_flow)
+                    _render_mode_label = "serpent"
+
                 if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
-                    self._governance_stack.comm._transports.append(_serpent_transport)
-                    logger.info("SerpentFlow wired (flowing organism CLI)")
+                    self._governance_stack.comm._transports.append(
+                        _chosen_transport,
+                    )
+                    logger.info(
+                        "Per-op transport wired (mode=%s)",
+                        _render_mode_label,
+                    )
                 # Suppress raw stdout streaming — SerpentFlow handles it via CommProtocol
                 try:
                     from backend.core.ouroboros.governance.serpent_animation import suppress as _suppress_serpent
@@ -992,6 +1190,153 @@ class BattleTestHarness:
                             self._governance_stack.comm._transports.append(diff_transport)
                     except Exception:
                         pass
+
+            # RenderConductor Slice 2 — wire whichever renderers are alive
+            # as backends. Master flag (JARVIS_RENDER_CONDUCTOR_ENABLED)
+            # graduated default-true at Slice 7. Producer-side flags
+            # (REASONING_STREAM / INPUT_CONTROLLER / THREAD_OBSERVER /
+            # CONTEXTUAL_HELP) stay default-false so each surface opts
+            # in independently; substrate is alive at default but no
+            # producer emits events until those flags flip. NEVER
+            # raises; boot is not blocked by rendering glue.
+            try:
+                from backend.core.ouroboros.governance.render_backends import (
+                    wire_render_conductor,
+                )
+                from backend.core.ouroboros.battle_test.stream_renderer import (
+                    get_stream_renderer,
+                )
+
+                def _posture_provider() -> Optional[str]:
+                    try:
+                        from backend.core.ouroboros.governance.posture_store import (
+                            PostureStore,
+                        )
+                        store = PostureStore(
+                            base_dir=self._config.repo_path / ".jarvis",
+                        )
+                        reading = store.load_current()
+                        if reading is None:
+                            return None
+                        return reading.posture.value
+                    except Exception:  # noqa: BLE001 — defensive
+                        return None
+
+                wire_render_conductor(
+                    stream_renderer=get_stream_renderer(),
+                    serpent_flow=self._serpent_flow,
+                    ouroboros_console=getattr(self, "_tui_console", None),
+                    posture_provider=_posture_provider,
+                )
+            except Exception as _wire_exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[harness] render conductor wire failed: %s",
+                    _wire_exc,
+                )
+
+            # RenderConductor Slice 7 — graduation wiring. Constructs
+            # the producer-side observers (InputController / ThreadObserver
+            # / ContextualHelpResolver) and registers them as process
+            # singletons. Each is gated by its own master flag (default
+            # false) so default behavior is unchanged. Operators opt-in
+            # per surface. SerpentFlow's existing _handle_cancel(op_id,
+            # immediate=True) is registered into KeyActionRegistry under
+            # CANCEL_CURRENT_OP — the Esc-mid-token wire (Gap #5).
+            # NEVER raises; boot is not blocked by render glue.
+            try:
+                from backend.core.ouroboros.governance import key_input as _ki
+                from backend.core.ouroboros.governance import (
+                    render_thread as _rt,
+                )
+                from backend.core.ouroboros.governance import (
+                    render_help as _rh,
+                )
+
+                # InputController — raw-stdin reader. Construction is
+                # cheap; .start() short-circuits per its own gates
+                # (master flag / TTY / REPL active).
+                _input_ctrl = _ki.InputController()
+                _ki.register_input_controller(_input_ctrl)
+
+                # Wire SerpentFlow._handle_cancel into the action
+                # registry. The handler is async; KeyActionRegistry
+                # schedules it via asyncio.ensure_future when a loop
+                # is running, else closes the coroutine cleanly.
+                _flow_for_cancel = self._serpent_flow
+                if _flow_for_cancel is not None and hasattr(
+                    _flow_for_cancel, "_handle_cancel",
+                ):
+                    def _cancel_current_op_via_flow(_event: Any) -> Any:
+                        try:
+                            gls = getattr(_flow_for_cancel, "_gls", None)
+                            op_id = ""
+                            if gls is not None and hasattr(
+                                gls, "current_generating_op_id",
+                            ):
+                                try:
+                                    op_id = (
+                                        gls.current_generating_op_id() or ""
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    op_id = ""
+                            if not op_id:
+                                return None
+                            return _flow_for_cancel._handle_cancel(
+                                op_id, immediate=True,
+                            )
+                        except Exception:  # noqa: BLE001 — defensive
+                            return None
+                    _input_ctrl.registry.register(
+                        _ki.KeyAction.CANCEL_CURRENT_OP,
+                        _cancel_current_op_via_flow,
+                    )
+
+                # ThreadObserver — sync bridge → conductor pump.
+                # .start() is no-op when its master flag is off; bridge
+                # remains alive for its CONTEXT_EXPANSION consumer.
+                _thread_obs = _rt.ThreadObserver()
+                _rt.register_thread_observer(_thread_obs)
+                _thread_obs.start()
+
+                # ContextualHelpResolver — read-only ranking surface.
+                _help_resolver = _rh.ContextualHelpResolver()
+                _rh.register_help_resolver(_help_resolver)
+                _rh.register_help_action_handlers(
+                    _help_resolver,
+                    posture_provider=_posture_provider,
+                )
+
+                # InputController.start() — actually begin reading
+                # stdin if all gates pass. Async — schedule + forget.
+                try:
+                    _ic_start = _input_ctrl.start()
+                    if asyncio.iscoroutine(_ic_start):
+                        try:
+                            _loop = asyncio.get_running_loop()
+                            _loop.create_task(_ic_start)
+                        except RuntimeError:
+                            try:
+                                _ic_start.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[harness] InputController start scheduling failed",
+                        exc_info=True,
+                    )
+
+                logger.info(
+                    "[harness] Slice 7 graduation wired: input_controller=%s "
+                    "thread_observer=%s help_resolver=%s",
+                    "registered" if _ki.get_input_controller() else "off",
+                    "active" if _thread_obs.active else "inactive",
+                    "registered" if _rh.get_help_resolver() else "off",
+                )
+            except Exception as _grad_exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[harness] Slice 7 graduation wire failed: %s",
+                    _grad_exc,
+                )
 
             logger.info("Governance stack booted")
         except Exception as exc:
@@ -3724,6 +4069,180 @@ class BattleTestHarness:
     # Hot-reload Restart Monitor
     # ------------------------------------------------------------------
 
+    def _start_wall_clock_hard_deadline_thread(
+        self, cap_s: float,
+    ) -> None:
+        """Defect #1 Slice B (2026-05-03) — thread-based safety net
+        immune to asyncio starvation.
+
+        The asyncio :meth:`_monitor_wall_clock` is the primary fire
+        path. This thread runs in parallel and fires the SAME
+        ``self._wall_clock_event`` (via ``loop.call_soon_threadsafe``)
+        if the asyncio path is wedged for longer than ``cap_s + grace``.
+
+        Grace defaults to 2 * check_interval_s so under normal
+        conditions the asyncio path always wins (no double-firing).
+        Env-tunable via ``JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S``;
+        floor 5s, ceiling 600s.
+
+        Daemonic thread — process exit kills it cleanly. Stop event
+        signals graceful exit when the asyncio path fired first.
+        NEVER raises into the host loop.
+        """
+        try:
+            raw_grace = os.environ.get(
+                "JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S", "",
+            ).strip()
+            grace_s = max(
+                5.0, min(600.0, float(raw_grace) if raw_grace else 30.0),
+            )
+        except (TypeError, ValueError):
+            grace_s = 30.0
+        # Anchor on monotonic clock — same discipline as the asyncio
+        # path; immune to NTP adjustments mid-soak.
+        anchor_monotonic = time.monotonic()
+        deadline_monotonic = anchor_monotonic + cap_s + grace_s
+        loop = asyncio.get_event_loop()
+        stop_event = threading.Event()
+        self._wall_clock_hard_deadline_stop = stop_event
+
+        # Layer 3 escalation grace — if the event-set in Layer 2 doesn't
+        # cause the asyncio race to fire within this window (loop wedged,
+        # call_soon_threadsafe queue not draining), the thread sends
+        # SIGTERM to itself which the harness signal handler catches and
+        # writes a partial summary. Env-tunable; floor 10s.
+        try:
+            raw_l3 = os.environ.get(
+                "JARVIS_WALL_CLOCK_ESCALATION_SIGTERM_S", "",
+            ).strip()
+            escalation_sigterm_s = max(
+                10.0, min(300.0, float(raw_l3) if raw_l3 else 60.0),
+            )
+        except (TypeError, ValueError):
+            escalation_sigterm_s = 60.0
+        # Layer 4 escalation — if even SIGTERM doesn't terminate the
+        # process within this further window (signal handler wedged,
+        # asyncio cleanup path stuck), the thread does os._exit() to
+        # forcibly kill the process. Last line of defense.
+        try:
+            raw_l4 = os.environ.get(
+                "JARVIS_WALL_CLOCK_ESCALATION_EXIT_S", "",
+            ).strip()
+            escalation_exit_s = max(
+                10.0, min(300.0, float(raw_l4) if raw_l4 else 60.0),
+            )
+        except (TypeError, ValueError):
+            escalation_exit_s = 60.0
+
+        def _watch() -> None:
+            import logging as _logging
+            _wd_log = _logging.getLogger(
+                "backend.core.ouroboros.battle_test.harness"
+            )
+            try:
+                _wd_log.info(
+                    "[WallClockWatchdog] hard-deadline thread alive: "
+                    "cap=%.0fs grace=%.0fs sigterm=%.0fs exit=%.0fs",
+                    cap_s, grace_s, escalation_sigterm_s,
+                    escalation_exit_s,
+                )
+            except Exception:
+                pass
+            try:
+                # ── Layer 2: fire the asyncio event at cap + grace ──
+                while not stop_event.is_set():
+                    now = time.monotonic()
+                    remaining = deadline_monotonic - now
+                    if remaining <= 0:
+                        try:
+                            loop.call_soon_threadsafe(
+                                self._wall_clock_event.set,
+                            )
+                        except Exception:  # noqa: BLE001 -- defensive
+                            pass
+                        if self._stop_reason in ("unknown", "", None):
+                            self._stop_reason = "wall_clock_cap"
+                        try:
+                            _wd_log.warning(
+                                "[WallClockWatchdog] HARD DEADLINE "
+                                "thread fired (Layer 2): monotonic "
+                                "elapsed %.0fs >= cap %.0fs + grace "
+                                "%.0fs (asyncio path was wedged or "
+                                "already fired).",
+                                time.monotonic() - anchor_monotonic,
+                                cap_s, grace_s,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        break
+                    stop_event.wait(timeout=min(5.0, remaining))
+                # ── Layer 3: SIGTERM self if event-set didn't work ──
+                # Reach here either via Layer 2 fire OR
+                # stop_event.set() from clean shutdown path. If clean
+                # shutdown path wins, stop_event is set → loop won't
+                # iterate, exit gracefully.
+                if stop_event.is_set():
+                    return
+                escalation_anchor = time.monotonic()
+                while not stop_event.is_set():
+                    elapsed = time.monotonic() - escalation_anchor
+                    remaining = escalation_sigterm_s - elapsed
+                    if remaining <= 0:
+                        try:
+                            _wd_log.error(
+                                "[WallClockWatchdog] LAYER 3 "
+                                "ESCALATION: SIGTERM self "
+                                "(elapsed=%.0fs since Layer 2 fired; "
+                                "asyncio race didn't honor the event "
+                                "— loop wedged). PID=%d",
+                                elapsed, os.getpid(),
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            import signal as _signal
+                            os.kill(os.getpid(), _signal.SIGTERM)
+                        except Exception:
+                            pass
+                        break
+                    stop_event.wait(timeout=min(5.0, remaining))
+                # ── Layer 4: os._exit if even SIGTERM didn't kill ──
+                if stop_event.is_set():
+                    return
+                exit_anchor = time.monotonic()
+                while not stop_event.is_set():
+                    elapsed = time.monotonic() - exit_anchor
+                    remaining = escalation_exit_s - elapsed
+                    if remaining <= 0:
+                        try:
+                            _wd_log.error(
+                                "[WallClockWatchdog] LAYER 4 "
+                                "ESCALATION: os._exit(75) "
+                                "(elapsed=%.0fs since Layer 3 SIGTERM; "
+                                "process didn't terminate — signal "
+                                "handler wedged or shutdown path "
+                                "stuck). LAST LINE OF DEFENSE.",
+                                elapsed,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            os._exit(75)  # EX_TEMPFAIL — try again
+                        except Exception:
+                            pass
+                        break
+                    stop_event.wait(timeout=min(5.0, remaining))
+            except Exception:  # noqa: BLE001 -- contract: never crash
+                pass
+
+        thread = threading.Thread(
+            target=_watch,
+            daemon=True,
+            name="WallClockHardDeadlineThread",
+        )
+        self._wall_clock_hard_deadline_thread = thread
+        thread.start()
+
     async def _monitor_wall_clock(self, cap_s: float) -> None:
         """Ticket A Guard 2 — hard wall-clock watchdog.
 
@@ -3738,14 +4257,83 @@ class BattleTestHarness:
         which joins the FIRST_COMPLETED race in ``run()`` alongside shutdown /
         budget / idle waiters and routes to ``stop_reason="wall_clock_cap"``.
 
+        Defect #1 fix (2026-05-03): the original implementation issued a
+        single ``asyncio.sleep(cap_s)`` for the entire cap duration. When
+        the event loop was starved by long-running coroutines (e.g. 200+s
+        background ops doing blocking I/O), the sleep callback waited its
+        turn — observed soak v5 firing 22 minutes after the cap was hit.
+        Defense-in-depth fix:
+
+          1. Periodic check loop using monotonic clock — wakes every
+             ``JARVIS_WALL_CLOCK_CHECK_INTERVAL_S`` seconds (default 5s,
+             floor 1s), checks elapsed against cap_s. Caps fire delay at
+             one tick interval under normal conditions.
+          2. Thread-based hard deadline (Slice B) — runs in parallel,
+             immune to asyncio starvation entirely; fires at
+             ``cap_s + JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S`` if the
+             asyncio path is wedged.
+
         Per the harness-class footnote in the graduation matrix,
         ``wall_clock_cap`` is treated equivalent to ``idle_timeout`` for
         clean-bar purposes — both are orderly graceful-shutdown paths.
         """
+        # Capture monotonic anchor at task entry — immune to NTP
+        # adjustments during the soak (wall-clock time.time() can jump
+        # backwards or forwards; monotonic cannot).
+        anchor_monotonic = time.monotonic()
+        # Env-tunable check interval (no hardcoding; floor 1s to avoid
+        # busy-loop; ceiling 60s to cap fire delay under sane configs).
         try:
-            await asyncio.sleep(cap_s)
-        except asyncio.CancelledError:
-            return
+            raw = os.environ.get(
+                "JARVIS_WALL_CLOCK_CHECK_INTERVAL_S", "",
+            ).strip()
+            check_interval_s = max(
+                1.0, min(60.0, float(raw) if raw else 5.0),
+            )
+        except (TypeError, ValueError):
+            check_interval_s = 5.0
+        # Diagnostic — confirm the task actually started running.
+        # Without this, a silently-cancelled task is invisible
+        # (the previous Defect #1 regression hid behind exactly
+        # this gap — the 'armed' log fires before ensure_future
+        # even returns; the task itself never logged).
+        logger.info(
+            "[WallClockWatchdog] async monitor task alive: "
+            "cap=%.0fs check_interval=%.0fs",
+            cap_s, check_interval_s,
+        )
+        # Heartbeat every Nth iteration so an operator tailing the
+        # log can confirm the task is still running. Default: every
+        # 12th tick (60s at default 5s interval). Off when explicitly
+        # 0.
+        try:
+            hb_every = int(os.environ.get(
+                "JARVIS_WALL_CLOCK_HEARTBEAT_EVERY", "12",
+            ).strip() or "12")
+        except (TypeError, ValueError):
+            hb_every = 12
+        _tick = 0
+        while True:
+            try:
+                await asyncio.sleep(check_interval_s)
+            except asyncio.CancelledError:
+                logger.info(
+                    "[WallClockWatchdog] async monitor task cancelled "
+                    "after %.0fs (NEVER fired)",
+                    time.monotonic() - anchor_monotonic,
+                )
+                return
+            _tick += 1
+            elapsed = time.monotonic() - anchor_monotonic
+            if hb_every > 0 and _tick % hb_every == 0:
+                logger.debug(
+                    "[WallClockWatchdog] heartbeat: tick=%d elapsed=%.0fs "
+                    "remaining=%.0fs",
+                    _tick, elapsed, max(0.0, cap_s - elapsed),
+                )
+            if elapsed >= cap_s:
+                break
+            # Loop continues; next sleep will wake at +check_interval_s.
         # If another waiter already fired and the shutdown path is in progress,
         # this is a no-op — set() on an already-set event is idempotent, and
         # the FIRST_COMPLETED race has already picked its winner.
@@ -3809,6 +4397,17 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             pass
         self._wall_clock_event.set()
+        # Defect #1 Slice B (2026-05-03) — signal the thread-based
+        # safety net to exit cleanly. Without this, the daemon thread
+        # would keep ticking until process exit (harmless but noisy).
+        try:
+            stop_evt = getattr(
+                self, "_wall_clock_hard_deadline_stop", None,
+            )
+            if stop_evt is not None:
+                stop_evt.set()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _monitor_restart_pending(self) -> None:
         """Background task: poll the orchestrator's hot-reloader for a
@@ -3911,6 +4510,20 @@ class BattleTestHarness:
                 self._restart_monitor_task.cancel()
                 try:
                     await self._restart_monitor_task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
+
+        # 0d2. Production Oracle observer (Defect #2 fix 2026-05-03)
+        try:
+            if (
+                hasattr(self, "_production_oracle_monitor_task")
+                and self._production_oracle_monitor_task
+            ):
+                self._production_oracle_monitor_task.cancel()
+                try:
+                    await self._production_oracle_monitor_task
                 except asyncio.CancelledError:
                     pass
         except Exception:
@@ -4255,3 +4868,123 @@ class BattleTestHarness:
             reset_ops_digest_observer()
         except Exception:
             logger.debug("reset_ops_digest_observer(clear) failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Defect #1 fix (2026-05-03) — WallClockWatchdog AST pin
+# ---------------------------------------------------------------------------
+#
+# Substrate pin enforcing the periodic-loop + thread-safety-net pattern
+# that replaced the original single-asyncio.sleep(cap_s) implementation.
+# Without this pin, a future edit could silently regress to the
+# starvation-vulnerable single-sleep pattern that fired 22 minutes
+# late in soak v5 (bt-2026-05-03-060330).
+
+
+def register_shipped_invariants() -> list:
+    """WallClockWatchdog substrate invariants. Pins:
+
+      * ``_monitor_wall_clock`` async method present.
+      * ``_start_wall_clock_hard_deadline_thread`` method present.
+      * ``_monitor_wall_clock`` body uses a periodic check loop
+        (must contain ``while True`` AND must NOT contain a top-level
+        ``asyncio.sleep(cap_s)`` call as the only sleep).
+      * ``JARVIS_WALL_CLOCK_CHECK_INTERVAL_S`` env var referenced
+        somewhere in the module (the periodic-check tick env knob).
+      * ``JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S`` env var referenced
+        (the thread-safety-net grace env knob).
+      * ``WallClockHardDeadlineThread`` thread name referenced
+        (proves the thread is actually spawned).
+      * No exec/eval/compile.
+    """
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    REQUIRED_FUNCS = (
+        "_monitor_wall_clock",
+        "_start_wall_clock_hard_deadline_thread",
+    )
+    REQUIRED_LITERALS = (
+        "JARVIS_WALL_CLOCK_CHECK_INTERVAL_S",
+        "JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S",
+        "WallClockHardDeadlineThread",
+        # Defect #2 fix (2026-05-03) — boot wire-up for the Production
+        # Oracle observer's run_periodic loop. Without these markers,
+        # the observer is constructed but never starts, leaving its
+        # history ring buffer empty and the auto_action_router's
+        # oracle veto rule (Rule 1.5) reading current()=None.
+        "_production_oracle_monitor_task",
+        "production_oracle_observer",
+        "run_periodic",
+    )
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        seen_funcs: set = set()
+        wall_clock_node: Optional[_ast.AsyncFunctionDef] = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AsyncFunctionDef):
+                seen_funcs.add(node.name)
+                if node.name == "_monitor_wall_clock":
+                    wall_clock_node = node
+            elif isinstance(node, _ast.FunctionDef):
+                seen_funcs.add(node.name)
+            elif isinstance(node, _ast.Call):
+                if isinstance(node.func, _ast.Name):
+                    if node.func.id in ("exec", "eval", "compile"):
+                        violations.append(
+                            f"line {getattr(node, 'lineno', '?')}: "
+                            f"harness MUST NOT call {node.func.id}"
+                        )
+        for fn in REQUIRED_FUNCS:
+            if fn not in seen_funcs:
+                violations.append(f"missing function {fn!r}")
+        for lit in REQUIRED_LITERALS:
+            if lit not in source:
+                violations.append(
+                    f"missing string literal {lit!r}"
+                )
+        # Periodic-loop check: _monitor_wall_clock body MUST contain
+        # ``while True`` to enforce the periodic-check pattern; the
+        # original starvation-vulnerable design had only the
+        # ``await asyncio.sleep(cap_s)`` single-call.
+        if wall_clock_node is not None:
+            saw_while_true = False
+            for sub in _ast.walk(wall_clock_node):
+                if isinstance(sub, _ast.While):
+                    if (
+                        isinstance(sub.test, _ast.Constant)
+                        and sub.test.value is True
+                    ):
+                        saw_while_true = True
+                        break
+            if not saw_while_true:
+                violations.append(
+                    "_monitor_wall_clock MUST contain a 'while True' "
+                    "periodic-check loop (the Defect #1 fix); single-"
+                    "sleep regressions caused 22-min fire delay in "
+                    "soak v5"
+                )
+        return tuple(violations)
+
+    target = "backend/core/ouroboros/battle_test/harness.py"
+    return [
+        ShippedCodeInvariant(
+            invariant_name="wall_clock_watchdog_substrate",
+            target_file=target,
+            description=(
+                "WallClockWatchdog: periodic-check asyncio loop + "
+                "thread-based hard-deadline safety net + env-knob "
+                "references; protects against single-sleep "
+                "starvation regression (Defect #1, 2026-05-03)."
+            ),
+            validate=_validate,
+        ),
+    ]

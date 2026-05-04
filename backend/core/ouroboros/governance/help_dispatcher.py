@@ -169,6 +169,14 @@ def get_default_verb_registry() -> VerbRegistry:
         if _default_verbs is None:
             _default_verbs = VerbRegistry()
             _seed_builtin_verbs(_default_verbs)
+            # Module-owned discovery (mirrors flag_registry's
+            # _discover_module_provided_flags + shipped_code_invariants's
+            # _discover_module_provided_invariants pattern). Modules
+            # add a verb co-located with their REPL surface by exposing
+            # ``register_verbs(registry) -> int``; the discovery loop
+            # finds and invokes it. Adding a new verb requires zero
+            # edits to this seed function.
+            _discover_module_provided_verbs(_default_verbs)
         return _default_verbs
 
 
@@ -248,6 +256,85 @@ def _seed_builtin_verbs(registry: VerbRegistry) -> None:
             ),
         ),
     ])
+
+
+# ---------------------------------------------------------------------------
+# Module-owned verb discovery (mirrors flag_registry / shipped_code_invariants
+# discovery pattern). Modules co-locate verb declarations with their REPL
+# surface; the loop finds them at first ``get_default_verb_registry`` call.
+# ---------------------------------------------------------------------------
+
+
+# Curated list of provider PACKAGES whose direct submodules may
+# contribute verbs via ``register_verbs(registry)``. Adding a verb
+# inside an existing module requires zero edits here. Adding a verb
+# in a NEW package requires one entry. Same architectural pattern
+# as flag_registry_seed._FLAG_PROVIDER_PACKAGES.
+_VERB_PROVIDER_PACKAGES: tuple = (
+    "backend.core.ouroboros.governance",
+    "backend.core.ouroboros.battle_test",
+)
+
+
+def _discover_module_provided_verbs(registry: VerbRegistry) -> int:
+    """Walk every package in ``_VERB_PROVIDER_PACKAGES`` for direct
+    submodules exposing ``register_verbs(registry) -> int``.
+
+    Each matching module installs its own VerbSpecs into the registry
+    + returns the count installed. Per-module failures are logged
+    and skipped — boot is never blocked by one misconfigured module.
+
+    Architecture: instead of editing this file every time a new REPL
+    surface ships, the consuming module declares its verb co-located
+    with its dispatch logic (``render_repl.register_verbs``,
+    ``posture_repl.register_verbs``, etc.). Same auto-discovery
+    mechanism that already protects FlagRegistry + ShippedCodeInvariants
+    from drift.
+
+    NEVER raises. Returns total verbs registered."""
+    discovered = 0
+    try:
+        from importlib import import_module
+        import pkgutil
+        for pkg_name in _VERB_PROVIDER_PACKAGES:
+            try:
+                pkg_mod = import_module(pkg_name)
+                pkg_path = getattr(pkg_mod, "__path__", None)
+                if not pkg_path:
+                    continue
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[HelpDispatcher] verb provider package %s "
+                    "unavailable: %s", pkg_name, exc,
+                )
+                continue
+            for _, name, _ispkg in pkgutil.iter_modules(pkg_path):
+                full_name = f"{pkg_name}.{name}"
+                if full_name == __name__:
+                    continue
+                try:
+                    mod = import_module(full_name)
+                    fn = getattr(mod, "register_verbs", None)
+                    if not callable(fn):
+                        continue
+                    count = fn(registry)
+                    if isinstance(count, int) and count > 0:
+                        discovered += count
+                        logger.debug(
+                            "[HelpDispatcher] %s registered %d verb(s)",
+                            full_name, count,
+                        )
+                except Exception as exc:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[HelpDispatcher] verb discovery skipped %s: %s",
+                        full_name, exc,
+                    )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[HelpDispatcher] _discover_module_provided_verbs exc: %s",
+            exc,
+        )
+    return discovered
 
 
 # ---------------------------------------------------------------------------

@@ -361,6 +361,9 @@ def get_default_observer(
         SENTRY_AUTH_TOKEN + JARVIS_SENTRY_ORG)
       * DatadogOracle (Tier 2 #6 follow-up Arc 2; requires
         DD_API_KEY + DD_APP_KEY)
+      * PersistentIntelligenceHealthOracle (Defect #3 Slice C,
+        2026-05-03; reads PersistentIntelligenceManager.health
+        property; reports DISABLED when manager not yet constructed)
     """
     global _DEFAULT_OBSERVER
     if _DEFAULT_OBSERVER is not None:
@@ -377,12 +380,16 @@ def get_default_observer(
     from backend.core.ouroboros.governance.datadog_oracle import (
         DatadogOracle,
     )
+    from backend.core.ouroboros.governance.persistent_intelligence_health_oracle import (  # noqa: E501
+        PersistentIntelligenceHealthOracle,
+    )
     obs = ProductionOracleObserver(
         adapters=[
             StdlibSelfHealthOracle(project_root=project_root),
             HTTPHealthCheckOracle(),
             SentryOracle(),
             DatadogOracle(),
+            PersistentIntelligenceHealthOracle(),
         ],
     )
     _DEFAULT_OBSERVER = obs

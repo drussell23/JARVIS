@@ -66,23 +66,93 @@ from rich.syntax import Syntax
 # multi-line frames — single-line ephemeral inline spinner only.
 _OUROBOROS_SPINNER_NAME = "ouroboros"
 
+_OUROBOROS_FRAMES = (
+    "🐍·····○",
+    "🐍····○",
+    "🐍···○",
+    "🐍··○",
+    "🐍·○",
+    "🐍◯",       # bite — eating own tail
+    "🐍·○",       # cycle resumes
+    "🐍··○",
+    "🐍···○",
+    "🐍····○",
+    "🐍·····○",
+)
+_OUROBOROS_FRAME_INTERVAL_S = 0.10  # 100ms per frame, named (not hardcoded)
+_REPL_REFRESH_INTERVAL_S = 0.10     # bottom_toolbar refresh cadence
+
 if _OUROBOROS_SPINNER_NAME not in SPINNERS:
     SPINNERS[_OUROBOROS_SPINNER_NAME] = {
-        "interval": 100,
-        "frames": [
-            "🐍·····○",
-            "🐍····○",
-            "🐍···○",
-            "🐍··○",
-            "🐍·○",
-            "🐍◯",       # bite — eating own tail
-            "🐍·○",       # cycle resumes
-            "🐍··○",
-            "🐍···○",
-            "🐍····○",
-            "🐍·····○",
-        ],
+        "interval": int(_OUROBOROS_FRAME_INTERVAL_S * 1000),
+        "frames": list(_OUROBOROS_FRAMES),
     }
+
+
+# ══════════════════════════════════════════════════════════════
+# Spinner state (2026-05-03 refactor)
+# ══════════════════════════════════════════════════════════════
+# Plain dataclass holding the live spinner state — read by the
+# prompt_toolkit bottom_toolbar callable in SerpentREPL._loop on
+# each refresh tick. Replaces the Rich.Status / Rich.Live widgets
+# that used to bypass patch_stdout via direct cursor manipulation.
+#
+# Architectural intent: the spinner becomes a renderable component
+# in prompt_toolkit's layout tree (bottom_toolbar reads this state),
+# not a parallel terminal-writing process. All animation, refresh,
+# and visibility coordination flows through prompt_toolkit's render
+# cycle. No raw bypass writes.
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class _SpinnerState:
+    active: bool = False
+    message: str = ""        # e.g. "🧬 synthesizing via Claude"
+    token_count: int = 0     # streaming-specific; 0 when not streaming
+    provider: str = ""       # streaming-specific (e.g. "Claude")
+
+
+# ══════════════════════════════════════════════════════════════
+# Swarm lens — multiplexed REPL paradigm (2026-05-03)
+# ══════════════════════════════════════════════════════════════
+# The Body runs 16 sensors + 3 workers + governance pipeline in
+# parallel. Rendering all of them inline produces a wall of
+# interleaved fragments that no human can read. The lens collapses
+# all background swarm activity into a single bottom_toolbar
+# digest, while the main viewport renders only the operator's
+# current focus op (auto-locked to most recent IMMEDIATE-route
+# op, or manually pinned via /follow <id>).
+#
+# Invariant: every op's event still updates _swarm_snapshots so
+# the digest stays accurate and /show <id> can dump recent events
+# for any background op on demand. Lens controls *visibility*,
+# not *recording* — the shadow stream remains complete in
+# debug.log + the snapshot ring buffer.
+@_dataclass
+class _OpSnapshot:
+    op_id: str = ""
+    short_id: str = ""
+    sensor: str = ""           # e.g. "TestFailure", "TodoScanner"
+    route: str = ""            # "immediate" / "standard" / "background" / etc.
+    last_event: str = ""       # short text of the most recent event
+    started_monotonic: float = 0.0
+    recent_events: tuple = ()  # last N events for /show <id>
+
+
+_LENS_RECENT_EVENTS_PER_OP = 12  # bounded ring per op
+_LENS_AUTO_ROUTES = frozenset({"immediate"})  # auto-focus targets
+
+
+def _frame_for_now() -> str:
+    """Pick the current Ouroboros frame from monotonic time.
+
+    Animation is a pure function of time — no internal counter, no
+    per-frame state. Lets multiple readers (REPL bottom_toolbar +
+    any future consumer) see the same frame without coordination.
+    """
+    idx = int(time.monotonic() / _OUROBOROS_FRAME_INTERVAL_S) % len(_OUROBOROS_FRAMES)
+    return _OUROBOROS_FRAMES[idx]
 
 
 def _active_spinner_name() -> str:
@@ -100,6 +170,32 @@ def _active_spinner_name() -> str:
     if raw in ("1", "true", "yes", "on"):
         return _OUROBOROS_SPINNER_NAME
     return "dots"
+
+
+# ══════════════════════════════════════════════════════════════
+# REPL-active flag (2026-05-03)
+# ══════════════════════════════════════════════════════════════
+# Toggled True while a SerpentREPL is running. Read by spinner
+# start-sites (rich.Status / rich.Live) so they can degrade to
+# log-only output when the REPL is active. Rich's Status and Live
+# widgets bypass prompt_toolkit's ``patch_stdout`` via direct
+# cursor manipulation, which clobbers the input prompt under
+# concurrent output. The mirror of the existing ``sys.stdout.isatty()``
+# gate in ``stream_renderer.py``: same architectural pattern,
+# different reason to take the log-only branch.
+_REPL_ACTIVE: bool = False
+
+
+def is_repl_active() -> bool:
+    """True while a SerpentREPL is running.
+
+    Spinner / Live-widget call sites should consult this and
+    fall through to ``console.print``-only output when True so
+    ``patch_stdout`` can coordinate the line with the prompt
+    redraw. Public accessor (no leading underscore) so callers
+    in sibling modules — e.g. ``stream_renderer.py`` — can
+    import and test the same flag without poking the private."""
+    return _REPL_ACTIVE
 
 # ══════════════════════════════════════════════════════════════
 # Color palette (organism theme)
@@ -290,6 +386,14 @@ def _visible_len(text: str) -> int:
     return len(_MARKUP_RE.sub("", text))
 
 
+def _strip_markup_short(text: str) -> str:
+    """Strip Rich markup and truncate to a swarm-snapshot-safe length.
+    Used by the lens recorder to keep _OpSnapshot.last_event compact
+    in the bottom_toolbar digest."""
+    plain = _MARKUP_RE.sub("", text or "")
+    return plain.strip()[:80]
+
+
 def _sparkline(values: List[float]) -> str:
     """Compact unicode sparkline for recent spend deltas."""
     if not values:
@@ -408,6 +512,18 @@ class SerpentFlow:
         self._route_costs: Dict[str, Dict[str, Any]] = {}
         self._op_starts: Dict[str, float] = {}
         self._streaming_active: bool = False
+        # Per-op streaming-start dedup (2026-05-03). Both the legacy
+        # SerpentREPL._dispatch_event path AND the RenderConductor
+        # SerpentFlowBackend (Slice 2) call show_streaming_start for
+        # the same op_id; without dedup the operator sees duplicate
+        # "🧬 synthesizing via Claude" lines (sometimes unprefixed
+        # when the op was momentarily not in _active_ops). Idempotency
+        # lives here on the receiving method, not at either caller —
+        # single source of truth so the dedup keeps working as new
+        # render paths are wired in. Cleared per-op in
+        # show_streaming_end so re-streams of the same op (tool-loop
+        # rounds with reset state) work correctly.
+        self._streaming_started_ops: set = set()
 
         # Op block tracking — set of op_ids with visually open blocks
         self._active_ops: set = set()
@@ -428,8 +544,28 @@ class SerpentFlow:
         # as non-terminal and falls back to plain text.
         self.console = Console(emoji=True, highlight=False, force_terminal=True)
 
-        # Execution masking (rich.Status)
-        self._active_status: Optional[Status] = None
+        # Live spinner state — refactored 2026-05-03 from rich.Status
+        # widget (which bypassed patch_stdout via direct cursor writes)
+        # to a plain dataclass read by the prompt_toolkit bottom_toolbar
+        # callable each refresh tick. See _SpinnerState + _frame_for_now.
+        self._spinner_state: _SpinnerState = _SpinnerState()
+        self._active_status: Optional[Status] = None  # retained for back-compat with any external readers; no longer driven by spinner code
+
+        # Swarm lens (2026-05-03) — multiplexed REPL paradigm.
+        # _lens_mode: "auto" (focus IMMEDIATE-route ops),
+        #             "manual" (focus a specific op_id),
+        #             "all"    (render everything — legacy noise),
+        #             "none"   (render nothing — pure digest mode)
+        # _focused_op_id: full op_id under manual lens; None otherwise
+        # _swarm_snapshots: per-op state for the digest + /show
+        # _swarm_completed_count / _swarm_failed_count: rolling tally
+        # _swarm_last_completed: short text of most recent terminal event
+        self._lens_mode: str = "auto"
+        self._focused_op_id: Optional[str] = None
+        self._swarm_snapshots: Dict[str, _OpSnapshot] = {}
+        self._swarm_completed_count: int = 0
+        self._swarm_failed_count: int = 0
+        self._swarm_last_completed: str = ""
 
         # Streaming state — UI Slice 7 (2026-04-30) replaced the
         # Rich Live(Syntax) fixed region with an ephemeral spinner
@@ -619,11 +755,142 @@ class SerpentFlow:
         """Max width for block borders."""
         return min(self.console.width - 2, 70)
 
+    # ── Swarm lens (2026-05-03) — multiplexed paradigm helpers ──
+
+    def _is_focused(self, op_id: str) -> bool:
+        """Return True iff this op should render to the main viewport.
+
+        Lens modes:
+          - "manual": only the explicitly pinned op_id renders
+          - "auto":   focus the most-recently-opened ACTIVE op,
+                      preferring IMMEDIATE-route ops when their
+                      route has been stamped on the snapshot
+          - "all":    legacy mode — every op renders (noisy)
+          - "none":   nothing renders to viewport — pure digest mode
+
+        Note: route is stamped on the snapshot only after ROUTE
+        phase logs the route text. AUTO uses recency as the
+        primary signal so the lens activates immediately on op
+        open, then naturally tracks IMMEDIATE ops (which complete
+        fastest) once they exist.
+        """
+        mode = self._lens_mode
+        if mode == "all":
+            return True
+        if mode == "none":
+            return False
+        if mode == "manual":
+            return bool(op_id) and op_id == self._focused_op_id
+        # AUTO: pick a focus once, render only that op
+        live = [
+            snap for snap in self._swarm_snapshots.values()
+            if snap.op_id in self._active_ops
+        ]
+        if not live:
+            return False
+        # Prefer IMMEDIATE-route ops once route is stamped; else most-recent
+        immediate = [s for s in live if s.route in _LENS_AUTO_ROUTES]
+        pool = immediate if immediate else live
+        target = max(pool, key=lambda s: s.started_monotonic)
+        return target.op_id == op_id
+
+    def _record_swarm_event(
+        self, op_id: str, event_text: str,
+        sensor: Optional[str] = None,
+        route: Optional[str] = None,
+    ) -> None:
+        """Update the swarm snapshot for op_id. Bounded ring per op
+        so the digest stays accurate without unbounded growth."""
+        if not op_id:
+            return
+        snap = self._swarm_snapshots.get(op_id)
+        if snap is None:
+            snap = _OpSnapshot(
+                op_id=op_id,
+                short_id=_short_id(op_id),
+                sensor=sensor or self._op_sensors.get(op_id, ""),
+                route=route or "",
+                started_monotonic=time.monotonic(),
+            )
+            self._swarm_snapshots[op_id] = snap
+        if sensor and not snap.sensor:
+            snap.sensor = sensor
+        if route and not snap.route:
+            snap.route = route
+        snap.last_event = event_text[:80]
+        snap.recent_events = (
+            snap.recent_events + (event_text,)
+        )[-_LENS_RECENT_EVENTS_PER_OP:]
+
+    def set_lens(self, target: str) -> str:
+        """Operator-facing lens setter. Returns a status string for echo.
+
+        Accepts:
+          - "auto"   → AUTO mode (focus IMMEDIATE ops)
+          - "all"    → render everything (legacy)
+          - "none"   → render nothing (digest only)
+          - "off"    → alias for "none"
+          - <op_id>  → manual focus on that op (full or short id ok)
+        """
+        target = (target or "").strip().lower()
+        if target in ("auto",):
+            self._lens_mode = "auto"
+            self._focused_op_id = None
+            return "lens=auto (focus IMMEDIATE ops)"
+        if target in ("all",):
+            self._lens_mode = "all"
+            self._focused_op_id = None
+            return "lens=all (render every op — noisy)"
+        if target in ("none", "off"):
+            self._lens_mode = "none"
+            self._focused_op_id = None
+            return "lens=none (digest only)"
+        # Treat as op_id (full or short prefix)
+        match = None
+        for full_id in self._swarm_snapshots:
+            if full_id == target or full_id.startswith(target) or _short_id(full_id) == target:
+                match = full_id
+                break
+        if match is None:
+            return f"lens unchanged — no active op matches '{target}'"
+        self._lens_mode = "manual"
+        self._focused_op_id = match
+        return f"lens=manual focus={_short_id(match)}"
+
+    def lens_show(self, target: str) -> str:
+        """One-shot dump of recent events for a specific op. Returns
+        the formatted string the REPL handler should print."""
+        target = (target or "").strip()
+        match = None
+        for full_id, snap in self._swarm_snapshots.items():
+            if full_id == target or full_id.startswith(target) or snap.short_id == target:
+                match = snap
+                break
+        if match is None:
+            return f"no active op matches '{target}'"
+        events = "\n  ".join(match.recent_events) if match.recent_events else "(no recorded events)"
+        return (
+            f"  op {match.short_id} · {match.sensor or '?'} · route={match.route or '?'}\n"
+            f"  {events}"
+        )
+
     def _open_op_block(self, op_id: str, sensor: str) -> None:
-        """Print the top border of an op block and register it as active."""
+        """Print the top border of an op block and register it as active.
+
+        Refactored 2026-05-03: snapshot is recorded for the swarm
+        digest unconditionally; the visible header only prints when
+        the lens is focused on this op.
+        """
         self._active_ops.add(op_id)
-        short = _short_id(op_id)
         self._op_sensors[op_id] = sensor
+        # Pull route from context if available (set elsewhere on op_id)
+        # Snapshot record always happens; rendering is gated.
+        self._record_swarm_event(
+            op_id, f"opened: {sensor}", sensor=sensor,
+        )
+        if not self._is_focused(op_id):
+            return
+        short = _short_id(op_id)
         w = self._block_w()
         label = f" {short} ── {sensor} "
         pad = max(2, w - len(label) - 2)
@@ -723,19 +990,44 @@ class SerpentFlow:
         )
 
     def _close_op_block(self, op_id: str) -> None:
-        """Print the bottom border of an op block with running stats."""
+        """Print the bottom border of an op block with running stats.
+
+        Refactored 2026-05-03: swarm tally + last_completed are
+        updated unconditionally; the visible footer only prints
+        when the lens is focused on this op. The closed op is
+        retained in _swarm_snapshots for /show <id> until evicted
+        by the bounded ring.
+        """
+        was_focused = self._is_focused(op_id)
         self._active_ops.discard(op_id)
         self._op_sensors.pop(op_id, None)
+        # Update swarm tally + last_completed for the digest
+        snap = self._swarm_snapshots.get(op_id)
+        if snap is not None:
+            self._swarm_last_completed = (
+                f"{snap.short_id}·{snap.sensor or '?'}"
+            )
+            self._record_swarm_event(op_id, "closed")
+        # Auto-release manual focus if the focused op closed
+        if self._lens_mode == "manual" and self._focused_op_id == op_id:
+            self._focused_op_id = None
+            self._lens_mode = "auto"
+        # Per-op streaming-start dedup cleanup (2026-05-03). Removes
+        # this op_id from the dedup set so a future op with the same
+        # id (rare but possible across long-lived sessions) can stream
+        # again without being silently no-op'd. Defensive — discard
+        # is idempotent on missing keys.
+        self._streaming_started_ops.discard(op_id)
+        if not was_focused:
+            return
         short = _short_id(op_id)
         w = self._block_w()
-
         stats = (
             f"🐍 [green]✅ {self._completed}[/green]  "
             f"[red]💀 {self._failed}[/red] [dim]│[/dim] "
             f"💰 ${self._cost_total:.4f}/${self._cost_cap:.2f}"
         )
         label = f" {short} ── {stats} "
-        # Approximate visible length (strip markup)
         vis = _visible_len(label)
         pad = max(2, w - vis - 2)
         self.console.print(
@@ -747,22 +1039,23 @@ class SerpentFlow:
     def _op_line(self, op_id: str, text: str) -> None:
         """Print a line within an active op block, prefixed with │.
 
-        When multiple ops are active simultaneously, adds the short
-        op_id for disambiguation.
+        Refactored 2026-05-03: snapshot is recorded for the swarm
+        digest unconditionally; the visible line only prints when
+        the lens is focused on this op. Under the lens, only ONE
+        op is rendered at a time, so the per-line short-id
+        disambiguation prefix is no longer needed — clean palette.
         """
+        # Always update swarm so the digest stays accurate
+        self._record_swarm_event(op_id, _strip_markup_short(text))
         if op_id and op_id in self._active_ops:
-            if len(self._active_ops) > 1:
-                short = _short_id(op_id)
-                self.console.print(
-                    f"  [{_C['border']}]│ {short}[/{_C['border']}] {text}",
-                    highlight=False,
-                )
-            else:
-                self.console.print(
-                    f"  [{_C['border']}]│[/{_C['border']}]  {text}",
-                    highlight=False,
-                )
+            if not self._is_focused(op_id):
+                return
+            self.console.print(
+                f"  [{_C['border']}]│[/{_C['border']}]  {text}",
+                highlight=False,
+            )
         else:
+            # Out-of-band lines (system messages, banners) — always render
             self.console.print(f"  {text}", highlight=False)
 
     def _op_blank(self, op_id: str) -> None:
@@ -820,28 +1113,38 @@ class SerpentFlow:
         is called, leaving only the final artifact printed by the
         caller.
 
-        UI Slice 8: when ``spinner`` is None the active glyph is
-        resolved at call time via ``_active_spinner_name()`` —
-        defaults to the Ouroboros snake-eating-tail glyph; falls
-        back to Rich ``"dots"`` when ``JARVIS_UI_OUROBOROS_SPINNER=false``.
+        Refactored 2026-05-03: spinner state is now stored on
+        ``self._spinner_state`` (plain dataclass) and rendered by
+        the prompt_toolkit ``bottom_toolbar`` callable inside
+        ``SerpentREPL._loop``. No more Rich.Status, no more
+        ``patch_stdout`` bypass. The animated glyph cycles via the
+        bottom_toolbar's refresh tick using ``_frame_for_now()``.
+
+        Headless / non-REPL fallback: emit a single ``console.print``
+        marker so operators still see the status was set (no
+        animation possible without an active prompt session).
         """
-        self._stop_status()
-        _spinner_name = (
-            spinner if spinner is not None else _active_spinner_name()
-        )
-        self._active_status = self.console.status(
-            message, spinner=_spinner_name, spinner_style=_C["neural"],
-        )
-        self._active_status.start()
+        self._spinner_state.active = True
+        self._spinner_state.message = message
+        self._spinner_state.token_count = 0
+        self._spinner_state.provider = ""
+        if not is_repl_active():
+            self.console.print(f"  {message}", highlight=False)
 
     def _stop_status(self) -> None:
-        """Stop the current spinner (if any) — leaves a clean terminal."""
-        if self._active_status is not None:
-            try:
-                self._active_status.stop()
-            except Exception:
-                pass
-            self._active_status = None
+        """Clear the spinner state — bottom_toolbar shows nothing on
+        the next refresh tick.
+
+        Refactored 2026-05-03: pure state mutation. No Rich.Status
+        teardown needed (the widget was retired). Leaves
+        ``self._active_status`` untouched so any external reader
+        that still inspects the field sees ``None`` (initialized in
+        __init__) and behaves correctly.
+        """
+        self._spinner_state.active = False
+        self._spinner_state.message = ""
+        self._spinner_state.token_count = 0
+        self._spinner_state.provider = ""
 
     # ══════════════════════════════════════════════════════════
     # Live syntax-highlighted streaming (rich.Live + rich.Syntax)
@@ -865,7 +1168,20 @@ class SerpentFlow:
         Token tallies + provider remain visible during streaming via
         the spinner label so the operator can see the system is
         productive without the fixed-region cost.
+
+        Idempotent per op_id (2026-05-03): both the legacy
+        SerpentREPL._dispatch_event path AND the RenderConductor
+        SerpentFlowBackend (Slice 2) call this for the same op.
+        Dedup lives here on the receiving method so all callers can
+        call freely; only the first call per op_id has visible
+        effect. Cleared in show_streaming_end. When op_id is empty
+        (legacy callers, defensive), behavior is unchanged — fires
+        every time, since there's no key to dedup on.
         """
+        if op_id and op_id in self._streaming_started_ops:
+            return
+        if op_id:
+            self._streaming_started_ops.add(op_id)
         self._streaming_active = True
         self._stream_buffer = ""
         self._stream_token_count = 0
@@ -882,25 +1198,37 @@ class SerpentFlow:
             f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
             if prov else ""
         )
-        self._op_line(
-            op_id,
-            f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}]{via_str}",
-        )
-
-        # Ephemeral inline spinner — CC-style. Replaces the prior
-        # Live(Syntax) fixed region. ``rich.Status`` is the existing
-        # ephemeral primitive: appears, animates, vanishes when
-        # ``stop()`` is called.
-        self._stop_status()
-        self._active_status = self.console.status(
-            self._streaming_spinner_label(),
-            spinner=_active_spinner_name(),
-            spinner_style=_C["neural"],
-        )
+        # D3 emit-tier wire: TERTIARY only. The "synthesizing" tick is
+        # a per-stream-start status indicator that adds noise at
+        # default density. The bottom_toolbar spinner already shows
+        # streaming state; this line is redundant for NORMAL operators.
         try:
-            self._active_status.start()
-        except Exception:
-            self._active_status = None
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            _emit_synthesizing = should_emit("show_streaming_start")
+        except Exception:  # noqa: BLE001 — defensive
+            _emit_synthesizing = True  # gate failure → emit
+        if _emit_synthesizing:
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}]{via_str}",
+            )
+
+        # Refactored 2026-05-03: drive the prompt_toolkit
+        # bottom_toolbar via _spinner_state. No Rich.Live, no
+        # patch_stdout bypass. The header line above already
+        # printed the start marker via _op_line (which goes through
+        # console.print → patch_stdout). The bottom_toolbar then
+        # animates the running token count until show_streaming_end
+        # clears the state.
+        prov_plain = _prov(provider) if provider else ""
+        self._spinner_state.active = True
+        self._spinner_state.message = (
+            f"Streaming via {prov_plain}" if prov_plain else "Streaming"
+        )
+        self._spinner_state.token_count = 0
+        self._spinner_state.provider = prov_plain
 
     def _streaming_spinner_label(self) -> str:
         """Compose the ephemeral spinner label (refreshed on each
@@ -923,18 +1251,20 @@ class SerpentFlow:
         existing ⏺ Update / show_diff path renders the resolved code).
         The visible feedback during streaming is the ephemeral
         spinner with a live token count — no fixed terminal region.
+
+        REPL coordination (2026-05-03): when no Status spinner is
+        active (typical under an active SerpentREPL — see
+        ``show_streaming_start``), skip the per-token spinner relabel
+        entirely. The buffer + token count still accumulate for the
+        end-of-stream receipt and any downstream consumer.
         """
         if not token:
             return
         self._stream_buffer += token
         self._stream_token_count += 1
-        if self._active_status is not None:
-            try:
-                self._active_status.update(
-                    self._streaming_spinner_label(),
-                )
-            except Exception:
-                pass
+        # Bottom_toolbar reads token_count on its next refresh tick.
+        # Pure state mutation — no per-token render overhead.
+        self._spinner_state.token_count = self._stream_token_count
 
     def show_streaming_end(self) -> None:
         """Finalize the ephemeral stream — vanish the spinner and
@@ -944,8 +1274,8 @@ class SerpentFlow:
         """
         token_count = self._stream_token_count
         prov = _prov(self._stream_provider) if self._stream_provider else ""
-        # Stop the spinner first so the receipt line writes cleanly
-        # below.
+        # Clear spinner state first so the bottom_toolbar disappears
+        # before the receipt line prints below it.
         self._stop_status()
         if token_count > 0:
             via_seg = (
@@ -1068,7 +1398,18 @@ class SerpentFlow:
                 f"[{_C['neural']}]🗺️  planned[/{_C['neural']}]   {detail}",
             )
         else:
-            # Plan phase starting
+            # Plan phase starting — D3 emit-tier wire: TERTIARY only.
+            # The "reasoning about implementation strategy..." line is
+            # internal model thinking; operators at NORMAL density
+            # don't need to see it per op.
+            try:
+                from backend.core.ouroboros.governance.render_emit_tier import (
+                    should_emit,
+                )
+                if not should_emit("_render_plan_phase"):
+                    return
+            except Exception:  # noqa: BLE001 — defensive
+                pass  # gate failure → emit (default-visible)
             self._op_line(
                 op_id,
                 f"[{_C['neural']}]🗺️  planning[/{_C['neural']}]  "
@@ -1174,8 +1515,27 @@ class SerpentFlow:
     # ── Provider routing ──────────────────────────────────────
 
     def op_provider(self, op_id: str, provider: str) -> None:
-        """Provider was selected for this operation."""
+        """Provider was selected for this operation.
+
+        D3 emit-tier wire: this method is TERTIARY (deep-debug only).
+        At default density (NORMAL), the line is suppressed because
+        ``set_op_route`` already emits the route info — this would
+        be a redundant ``⚡ routing`` tick. The provider mapping is
+        still tracked in ``self._op_providers`` regardless of
+        visibility (that state is consumed by ``op_completed``)."""
+        # State tracking: always update the providers dict — downstream
+        # callers depend on it for the resolution receipt.
         self._op_providers[op_id] = provider
+        # Visibility gate: skip the emit when tier-gating is on and
+        # this method's tier is hidden at the current density.
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            if not should_emit("op_provider"):
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass  # gate failure → emit (default-visible)
         prov = _prov(provider)
         self._op_line(
             op_id,
@@ -2034,7 +2394,37 @@ class SerpentFlow:
     # ══════════════════════════════════════════════════════════
 
     def update_intent_discovery(self, cycle: int, submitted: int) -> None:
-        """IntentDiscoverySensor found something."""
+        """IntentDiscoverySensor found something.
+
+        D4 wire: when StatusLineComposer is registered + enabled,
+        feed the composed status line via update_field() instead of
+        emitting a separate console line. Falls back to legacy
+        console.print when composer is unavailable (defensive)."""
+        # D4 composer feed — tries composer first; falls back to
+        # legacy emit if composer not registered or disabled.
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+                get_status_line_composer,
+            )
+            if get_status_line_composer() is not None:
+                update_field(
+                    StatusField.INTENT_DISCOVERY,
+                    {"cycle": cycle, "submitted": submitted},
+                )
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        # Legacy direct emit (fallback when composer not wired)
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            if not should_emit("update_intent_discovery"):
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         self.console.print(
             f"  [{_C['neural']}]🧬 discovery[/{_C['neural']}]  "
             f"cycle {cycle} — {submitted} intent{'s' if submitted != 1 else ''} submitted",
@@ -2043,6 +2433,28 @@ class SerpentFlow:
 
     def update_dream_engine(self, blueprints: int, title: str = "") -> None:
         """DreamEngine produced a blueprint."""
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+                get_status_line_composer,
+            )
+            if get_status_line_composer() is not None:
+                update_field(
+                    StatusField.DREAM_ENGINE,
+                    {"blueprints": blueprints, "title": title},
+                )
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            if not should_emit("update_dream_engine"):
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         title_str = f'  "{title[:40]}"' if title else ""
         self.console.print(
             f"  [{_C['neural']}]💭 dreaming[/{_C['neural']}]   "
@@ -2052,6 +2464,28 @@ class SerpentFlow:
 
     def update_learning(self, rules: int, trend: str = "→") -> None:
         """Learning consolidation update."""
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+                get_status_line_composer,
+            )
+            if get_status_line_composer() is not None:
+                update_field(
+                    StatusField.LEARNING,
+                    {"rules": rules, "trend": trend},
+                )
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        try:
+            from backend.core.ouroboros.governance.render_emit_tier import (
+                should_emit,
+            )
+            if not should_emit("update_learning"):
+                return
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         self.console.print(
             f"  [{_C['neural']}]📖 learning[/{_C['neural']}]   "
             f"{rules} rules consolidated  trend: {trend}",
@@ -2117,8 +2551,20 @@ class SerpentFlow:
     def update_cost(
         self, total: float, remaining: float, breakdown: Dict[str, float],
     ) -> None:
-        """Cost tick — shown periodically between operations."""
+        """Cost tick — shown periodically between operations.
+
+        D4 wire: feed the composer (state-only update; no separate
+        emit). State attr ``self._cost_total`` preserved for any
+        downstream consumers that read it directly."""
         self._cost_total = total
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+            )
+            update_field(StatusField.COST, total)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     def set_op_route(
         self,
@@ -2214,12 +2660,32 @@ class SerpentFlow:
         self._plan_review_mode = enabled
 
     def update_sensors(self, count: int) -> None:
-        """Update active sensor count (tracked for status bar)."""
+        """Update active sensor count (tracked for status bar).
+
+        D4 wire: feed the composer alongside state-only update."""
         self._sensors_active = count
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+            )
+            update_field(StatusField.SENSORS, count)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     def update_provider_chain(self, chain: str) -> None:
-        """Show the provider chain (displayed in boot banner, not inline)."""
-        pass  # Handled by boot_banner now
+        """Show the provider chain (displayed in boot banner, not inline).
+
+        D4 wire: feed the composer (chain shows in composed status
+        line when composer is enabled). Boot banner emit unchanged."""
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (
+                StatusField,
+                update_field,
+            )
+            update_field(StatusField.PROVIDER_CHAIN, chain)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     # ══════════════════════════════════════════════════════════
     # Proactive event interruptions
@@ -3321,6 +3787,112 @@ class SerpentApprovalProvider:
 # ══════════════════════════════════════════════════════════════
 
 
+# ══════════════════════════════════════════════════════════════
+# CC2.4 — multi-line context-aware prompt template
+# ══════════════════════════════════════════════════════════════
+#
+# Renders a Claude-Code-style multi-line REPL prompt with cwd +
+# render mode + posture context. Operator-overrideable via
+# JARVIS_PROMPT_TEMPLATE env var. Template uses Python str.format
+# placeholders — {cwd} {mode} {posture} {sensors} {fallback}.
+# Defensive — every accessor returns a degraded fallback rather
+# than raising; the legacy single-line prompt always resolves.
+
+_DEFAULT_PROMPT_TEMPLATE = (
+    "\n  <ansigreen>{cwd}</ansigreen>"
+    "  <ansicyan>({mode} · {posture})</ansicyan>\n"
+    "<b>{fallback}</b>"
+)
+
+
+def _build_repl_prompt_html(fallback: str) -> Any:
+    """Render the multi-line REPL prompt as prompt_toolkit HTML.
+
+    Reads JARVIS_PROMPT_TEMPLATE env var (default in-code). Template
+    placeholders ({cwd}, {mode}, {posture}, {sensors}, {fallback})
+    resolved defensively — each accessor returns "?" on failure
+    rather than raising. The {fallback} placeholder always carries
+    the legacy single-line prompt string so operators who set a
+    minimal template still get a working prompt.
+
+    Returns prompt_toolkit ``HTML`` instance ready for
+    ``prompt_async(message=...)``.
+    """
+    template = os.environ.get(
+        "JARVIS_PROMPT_TEMPLATE", _DEFAULT_PROMPT_TEMPLATE,
+    ) or _DEFAULT_PROMPT_TEMPLATE
+
+    # Resolve each placeholder defensively.
+    def _cwd() -> str:
+        try:
+            cwd = os.getcwd()
+            home = os.path.expanduser("~")
+            if cwd.startswith(home):
+                cwd = "~" + cwd[len(home):]
+            # Truncate long paths .../parent/dir
+            if len(cwd) > 50:
+                parts = cwd.split(os.sep)
+                cwd = ".../" + os.sep.join(parts[-2:])
+            return cwd
+        except Exception:
+            return "?"
+
+    def _mode() -> str:
+        try:
+            from backend.core.ouroboros.governance.claude_style_transport import (  # noqa: E501
+                resolve_render_mode,
+            )
+            return resolve_render_mode().value.lower()
+        except Exception:
+            return "?"
+
+    def _posture() -> str:
+        try:
+            from backend.core.ouroboros.governance.posture_store import (
+                PostureStore,
+            )
+            from pathlib import Path
+            store = PostureStore(base_dir=Path(".jarvis"))
+            reading = store.load_current()
+            return reading.posture.value if reading else "?"
+        except Exception:
+            return "?"
+
+    def _sensors() -> str:
+        # Reuses status_line_composer state if registered
+        try:
+            from backend.core.ouroboros.governance.status_line_composer import (  # noqa: E501
+                get_status_line_composer,
+                StatusField,
+            )
+            comp = get_status_line_composer()
+            if comp is not None:
+                snap = comp.snapshot()
+                count = snap.get(StatusField.SENSORS, 0)
+                return str(int(count) if count else 0)
+            return "?"
+        except Exception:
+            return "?"
+
+    try:
+        rendered = template.format(
+            cwd=_cwd(),
+            mode=_mode(),
+            posture=_posture(),
+            sensors=_sensors(),
+            fallback=fallback,
+        )
+    except (KeyError, IndexError, ValueError):
+        # Operator typo'd template — fall back to legacy single-line
+        rendered = f"<b>{fallback}</b>"
+
+    # Lazy HTML import (mirrors SerpentREPL pattern — prompt_toolkit
+    # is an optional runtime dep we never want to require at module
+    # import time).
+    from prompt_toolkit.formatted_text import HTML as _HTML
+    return _HTML(rendered)
+
+
 class SerpentREPL:
     """Non-blocking REPL with persistent status bar (Zone 2 + Zone 3).
 
@@ -3385,6 +3957,7 @@ class SerpentREPL:
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.formatted_text import HTML
+            from prompt_toolkit.key_binding import KeyBindings
             from prompt_toolkit.patch_stdout import patch_stdout
         except ImportError:
             self._flow.console.print(
@@ -3393,14 +3966,183 @@ class SerpentREPL:
             )
             return
 
-        # No bottom_toolbar, no refresh_interval — pure flowing CLI.
-        self._session = PromptSession()
+        # Claude-Code-parity REPL (2026-05-03 refactor):
+        #
+        # multiline=True + bracketed paste + Enter-submits binding gives
+        # the input behavior operators expect from CC: paste a multi-line
+        # block, see the entire buffer, press Enter once to submit. The
+        # default ``PromptSession()`` is multiline=False, which makes
+        # bracketed paste split at the first newline and submit each line
+        # separately — pasting a task block shreds it into fragments.
+        #
+        # Rendering hints minimize per-keystroke redraws (auto_suggest,
+        # complete_while_typing, history search all off) so prompt redraws
+        # stay quick under concurrent sensor output.
+        #
+        # The companion fix is the spinner gate: ``rich.Status`` and
+        # ``rich.Live`` writers (which bypass ``patch_stdout`` via direct
+        # cursor manipulation) consult ``is_repl_active()`` and degrade
+        # to ``console.print``-only output while the REPL runs. That
+        # eliminates the prompt-clobber root cause structurally — both
+        # input handling and output coordination land in this commit.
+        _repl_bindings = KeyBindings()
+
+        @_repl_bindings.add("enter")
+        def _on_enter(event: Any) -> None:
+            event.current_buffer.validate_and_handle()
+
+        @_repl_bindings.add("escape", "enter")
+        def _on_alt_enter(event: Any) -> None:
+            event.current_buffer.insert_text("\n")
+
+        def _continuation(width: int, line_number: int, is_soft_wrap: bool) -> str:
+            return " " * max(width - 2, 0) + "│ "
+
+        # Bottom_toolbar — renders the live spinner state through
+        # prompt_toolkit's layout tree (the structural replacement
+        # for Rich.Status / Rich.Live which used to bypass
+        # patch_stdout). State is on flow._spinner_state; animation
+        # frame is a pure function of monotonic time
+        # (_frame_for_now). No internal counter, no per-component
+        # state, no shared mutable timer.
+        from prompt_toolkit.formatted_text import ANSI
+
+        def _bottom_toolbar():
+            """Multiplexed swarm digest. Layout:
+              [glyph] swarm:N · lens:MODE · focused:ID · last_event
+                            ^ digest of all background ops
+                                       ^ current viewport target
+                                                   ^ last event of focus
+            Renders the spinner state when an op is streaming, OR
+            the swarm summary when the lens is idle. One layout
+            primitive — no parallel dispatchers.
+            """
+            f = self._flow
+            sw = f._swarm_snapshots
+            n_active = sum(1 for o in sw if o in f._active_ops)
+            glyph = _frame_for_now() if (sw or f._spinner_state.active) else "🐍"
+            mode = f._lens_mode
+            focused = f._focused_op_id
+            parts = [f"swarm:{n_active}"]
+            if mode != "auto":
+                parts.append(f"lens:{mode}")
+            if focused:
+                snap = sw.get(focused)
+                if snap is not None:
+                    tail = (
+                        f"·{f._spinner_state.token_count}tk"
+                        if f._spinner_state.active and f._spinner_state.token_count > 0
+                        else ""
+                    )
+                    parts.append(
+                        f"focus:{snap.short_id}·{snap.last_event[:24]}{tail}"
+                    )
+            else:
+                # Auto mode — surface the most recent event in any active op
+                live = [
+                    s for s in sw.values()
+                    if s.op_id in f._active_ops
+                ]
+                if live:
+                    latest = max(live, key=lambda s: s.started_monotonic)
+                    parts.append(
+                        f"last:{latest.short_id}·{latest.sensor or '?'}"
+                    )
+                elif f._swarm_last_completed:
+                    parts.append(f"prev:{f._swarm_last_completed}")
+            return ANSI(f"  \033[36m{glyph}\033[0m " + " · ".join(parts))
+
+        self._session = PromptSession(
+            multiline=True,
+            key_bindings=_repl_bindings,
+            wrap_lines=True,
+            complete_while_typing=False,
+            enable_history_search=False,
+            auto_suggest=None,
+            prompt_continuation=_continuation,
+            bottom_toolbar=_bottom_toolbar,
+            refresh_interval=_REPL_REFRESH_INTERVAL_S,
+        )
+
+        # raw=True preserves Rich's ANSI escape codes (raw=False would
+        # escape them to literal "?[2m" text). With the spinner gate
+        # above silencing the bypass writers, raw=True now coexists
+        # cleanly with the REPL prompt redraw.
+        #
+        # Toggle the module-level _REPL_ACTIVE flag so spinner start
+        # sites in this file (and Live-widget start in stream_renderer)
+        # consult is_repl_active() and degrade to log-only mode while
+        # the REPL is alive. Safe-failure: if an exception escapes the
+        # with-block, the flag stays True — that keeps spinners
+        # suppressed (the safe direction — they only re-enable on a
+        # clean REPL exit).
+        global _REPL_ACTIVE
+        _REPL_ACTIVE = True
+
+        # Asyncio loop-level exception handler (2026-05-03):
+        # prompt_toolkit's Application installs its own handler that
+        # PRINTS the traceback directly to the terminal (bypassing
+        # patch_stdout) and then BLOCKS waiting for ENTER ("Press ENTER
+        # to continue..."). Both behaviors clobber the REPL prompt and
+        # halt sensor activity. We install our own handler that routes
+        # everything through Python's logger — no terminal print, no
+        # ENTER pager — and pass set_exception_handler=False below so
+        # prompt_toolkit doesn't override us.
+        #
+        # Classification reuses the EXPECTED_BACKGROUND_EXC_PATTERNS
+        # tuple from candidate_generator (Defect #4 single source of
+        # truth for "expected leaked exceptions"): expected → DEBUG,
+        # everything else → WARNING with full traceback.
+        import logging as _logging
+        try:
+            from backend.core.ouroboros.governance.candidate_generator import (
+                _EXPECTED_BACKGROUND_EXC_PATTERNS,
+            )
+        except Exception:
+            _EXPECTED_BACKGROUND_EXC_PATTERNS = ()
+        _asyncio_logger = _logging.getLogger("asyncio.unhandled")
+        _running_loop = asyncio.get_event_loop()
+        _previous_exc_handler = _running_loop.get_exception_handler()
+
+        def _repl_loop_exception_handler(loop_, ctx_):
+            msg = ctx_.get("message", "Unhandled exception in event loop")
+            exc = ctx_.get("exception")
+            extras = " | ".join(
+                f"{k}={ctx_[k]!r}"
+                for k in sorted(ctx_)
+                if k not in ("message", "exception")
+            )
+            full = f"[asyncio leak] {msg}" + (f" | {extras}" if extras else "")
+            if exc is None:
+                _asyncio_logger.warning(full)
+                return
+            if isinstance(exc, (asyncio.CancelledError,)):
+                _asyncio_logger.debug(full, exc_info=exc)
+                return
+            err_str = str(exc)
+            if any(p in err_str for p in _EXPECTED_BACKGROUND_EXC_PATTERNS):
+                _asyncio_logger.debug(full, exc_info=exc)
+                return
+            _asyncio_logger.warning(full, exc_info=exc)
+
+        _running_loop.set_exception_handler(_repl_loop_exception_handler)
 
         with patch_stdout(raw=True):
             while self._running:
                 try:
+                    # CC2.4 — multi-line context-aware prompt. Operator-
+                    # overrideable via JARVIS_PROMPT_TEMPLATE. Falls
+                    # back to the legacy single-line prompt when the
+                    # template renderer fails (defensive).
+                    try:
+                        prompt_html = _build_repl_prompt_html(
+                            self._prompt_str,
+                        )
+                    except Exception:
+                        prompt_html = HTML(f"<b>{self._prompt_str}</b>")
                     line = await self._session.prompt_async(
-                        HTML(f"<b>{self._prompt_str}</b>"),
+                        prompt_html,
+                        set_exception_handler=False,
                     )
                     line = line.strip()
                     if not line:
@@ -3506,6 +4248,27 @@ class SerpentREPL:
                     if line in ("/verify-undemote", "verify-undemote"):
                         self._handle_verify_undemote()
                         continue
+                    # Swarm lens commands (2026-05-03)
+                    if line.startswith("/follow") or line.startswith("follow "):
+                        _arg = line.split(None, 1)
+                        _target = _arg[1].strip() if len(_arg) > 1 else "auto"
+                        _result = self._flow.set_lens(_target)
+                        self._flow.console.print(
+                            f"  [{_C['dim']}]{_result}[/{_C['dim']}]",
+                            highlight=False,
+                        )
+                        continue
+                    if line.startswith("/show") or line.startswith("show "):
+                        _arg = line.split(None, 1)
+                        if len(_arg) < 2:
+                            self._flow.console.print(
+                                f"  [{_C['dim']}]usage: /show <op_id|short_id>[/{_C['dim']}]",
+                                highlight=False,
+                            )
+                        else:
+                            _result = self._flow.lens_show(_arg[1].strip())
+                            self._flow.console.print(_result, highlight=False)
+                        continue
                     if line.startswith("/attach") or line.startswith("attach "):
                         await self._handle_attach(line)
                         continue
@@ -3599,6 +4362,18 @@ class SerpentREPL:
                     continue
                 except asyncio.CancelledError:
                     break
+        # Clean exit — clear the REPL flag so any subsequent
+        # non-REPL caller (one-shot scripts, headless harnesses)
+        # gets normal spinner behavior. See is_repl_active().
+        _REPL_ACTIVE = False
+        # Restore whatever asyncio exception handler was installed
+        # before the REPL took over (mirrors prompt_toolkit's own
+        # set_exception_handler_ctx pattern). Defensive: if the loop
+        # is already closed by this point, ignore.
+        try:
+            _running_loop.set_exception_handler(_previous_exc_handler)
+        except Exception:
+            pass
 
     def _print_status(self) -> None:
         """Print detailed organism status as inline scrollable output.

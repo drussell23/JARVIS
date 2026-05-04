@@ -5982,6 +5982,7 @@ class ClaudeProvider:
             if self._tool_loop is not None:
                 _tool_cb = getattr(self._tool_loop, "on_token", None)
             _render_cb = None
+            _reasoning_end_cb = None  # Slice 7 ReasoningStream cleanup hook
             try:
                 from backend.core.ouroboros.battle_test.stream_renderer import (
                     get_stream_renderer,
@@ -5991,6 +5992,34 @@ class ClaudeProvider:
                     _render_cb = _renderer.on_token
             except Exception:
                 _render_cb = None
+
+            # Slice 7 graduation: when JARVIS_REASONING_STREAM_ENABLED
+            # is true AND a RenderConductor is registered, route tokens
+            # through ReasoningStream → conductor → backends instead of
+            # direct stream_renderer.on_token. The conductor's
+            # stream_renderer-backend handles rendering — single sink,
+            # no double-fire on the legacy direct path. Default false:
+            # behavior is byte-identical to pre-Slice-7. Lazy import
+            # keeps the producers free of a hard ReasoningStream
+            # dependency at import time.
+            try:
+                from backend.core.ouroboros.governance.render_primitives import (
+                    get_reasoning_stream_callback,
+                )
+                _rs_cb = get_reasoning_stream_callback(
+                    op_id=getattr(self, "_current_op_id", "") or "op",
+                    provider="claude",
+                )
+                if _rs_cb is not None:
+                    # Suppress legacy direct render path — conductor's
+                    # stream_renderer backend will receive the token
+                    # via REASONING_TOKEN events and on_token internally.
+                    _render_cb = _rs_cb
+                    _reasoning_end_cb = getattr(
+                        _rs_cb, "end_callback", None,
+                    )
+            except Exception:  # noqa: BLE001 — defensive fallback
+                pass
 
             if _tool_cb is not None and _render_cb is not None:
                 def _stream_fanout(text: str) -> None:
@@ -6007,6 +6036,9 @@ class ClaudeProvider:
                 _stream_callback = _tool_cb
             elif _render_cb is not None:
                 _stream_callback = _render_cb
+            # _reasoning_end_cb is captured for caller-side cleanup;
+            # generate_runner.py invokes it at end-of-stream when
+            # ReasoningStream is the active producer (Slice 7+).
 
             # Assistant prefill: force JSON-first output by seeding the
             # assistant turn with an opening brace. Benefit: eliminates the
