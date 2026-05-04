@@ -617,6 +617,81 @@ class EventChannelServer:
                     "wiring failed: %s", gq_exc,
                 )
 
+            # Priority #5 Slice 5b — CIGW (Continuous Invariant
+            # Gradient Watcher) observability GET routes. Mirrors
+            # Slice 5b A/B/C blocks above: loopback-asserted, rate-
+            # limited via shared IDEObservabilityRouter helper,
+            # CORS-aware, mount unconditional (per-request _gate()
+            # runs cigw_enabled() so operators can live-toggle the
+            # master flag). Producer side (CIGWObserver + recorder)
+            # is owned by governed_loop_service.py boot. Per-arc
+            # fresh helper preserves Move 4's per-arc rate-limit
+            # bucket convention.
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+                    IDEObservabilityRouter as _IDEObsRouterCG,
+                    assert_loopback_only as _assert_loopback_cg,
+                )
+                from backend.core.ouroboros.governance.verification.gradient_observability import (  # noqa: E501
+                    register_gradient_routes,
+                )
+                _assert_loopback_cg(self._host)
+                _cg_helper = _IDEObsRouterCG()
+                register_gradient_routes(
+                    app,
+                    rate_limit_check=lambda req: (
+                        _cg_helper._check_rate_limit(
+                            _cg_helper._client_key(req),
+                        )
+                    ),
+                    cors_headers=_cg_helper._cors_headers,
+                )
+            except ValueError as cg_loopback_exc:
+                logger.warning(
+                    "[EventChannel] gradient observability "
+                    "refused: %s", cg_loopback_exc,
+                )
+            except Exception as cg_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] gradient observability "
+                    "wiring failed: %s", cg_exc,
+                )
+
+            # Priority #4 Slice 5b — SBT (Speculative Branch Tree)
+            # observability GET routes. Mirrors the gradient block
+            # above structurally: same gate / helper / try-except
+            # discipline. Producer side (SBTObserver + recorder) is
+            # owned by governed_loop_service.py boot.
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+                    IDEObservabilityRouter as _IDEObsRouterSB,
+                    assert_loopback_only as _assert_loopback_sb,
+                )
+                from backend.core.ouroboros.governance.verification.speculative_branch_observability import (  # noqa: E501
+                    register_sbt_routes,
+                )
+                _assert_loopback_sb(self._host)
+                _sb_helper = _IDEObsRouterSB()
+                register_sbt_routes(
+                    app,
+                    rate_limit_check=lambda req: (
+                        _sb_helper._check_rate_limit(
+                            _sb_helper._client_key(req),
+                        )
+                    ),
+                    cors_headers=_sb_helper._cors_headers,
+                )
+            except ValueError as sb_loopback_exc:
+                logger.warning(
+                    "[EventChannel] sbt observability "
+                    "refused: %s", sb_loopback_exc,
+                )
+            except Exception as sb_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] sbt observability "
+                    "wiring failed: %s", sb_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is
