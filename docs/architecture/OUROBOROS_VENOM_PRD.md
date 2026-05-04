@@ -1,7 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.11 (2026-05-04 — **§32 added** — three-way operator-prompted recon: (1) `graduation_orchestrator.py` 1,137-line dead-code bit-rot assessment — imports aren't dead, but architecture is stale vs 12 modern cage components; verdict: salvage *design* (15-phase FSM + AdaptiveThreshold + H1–H6 + 5-layer validation), archive *code*; (2) M10 ArchitectureProposer slice plan refined per §32.4 — supersedes §30.5.2 with battle-tested design template inheritance; M10 estimate stays ~7–10d, content sharper; cleanup arc (~1d) lands post-M10-graduation; (3) targeted Venom enhancements (V1 per-tool hooks + V2 permission callbacks + V3 async outputs + V4 regex matchers) — adopted FROM Agent SDK architecture without migrating Venom to `@tool()`; plus 2 patterns from `anthropics/claude-code` GitHub recon (Operation Modes `plan/analyze/apply/auto` + Component Tool Scope) as standalone arcs; 5 SDK/repo patterns explicitly skipped (`@tool()`, `ClaudeSDKClient`, dynamic context injection, settings hierarchy, plugin marketplace). Updated §31.6 sequencing now spans 11 strict-ordered items + 6 parallel-executable; estimated calendar to "earned ASCO + closed epistemic loops + Venom-enhanced + cleanup-complete" 8–10 weeks. See v2.10 below for §31 Critical Path Systemic Upgrades v3.)
+**Version**: 2.12 (2026-05-04 — **§32.8 sequencing refresh — items 1–5 graduated default-true single-day burst**: (1) Priority #3 Counterfactual Replay closed; (2) Slice 5b consolidation (5 sub-arcs A–E) + Move 6 master-flag graduation closed; (3) Upgrade 3 Failure-Mode Memory at GENERATE — full 5-slice arc graduated, per-cluster JSONL + recall scoring + injection at GENERATE, `JARVIS_FAILURE_MODE_MEMORY_ENABLED` default-TRUE, 4 AST pins + 5 FlagRegistry seeds; (4) M11 ActionOutcomeMemory — full 5-slice arc graduated, symmetric positive-evidence pair to Upgrade 3, OutcomeKind 5-value closed enum, outcome-polarity scoring (`balanced`/`favor_positive`/`all_equal`), shared `_scoring_primitives.py` extracted (Decision C2 refactor), `JARVIS_ACTION_OUTCOME_MEMORY_ENABLED` default-TRUE, 4 AST pins + 5 FlagRegistry seeds; (5) Upgrade 1 Bounded Epistemic Loop — full 5-slice glue arc graduated (172/172 tests green), composes ConfidenceMonitor + ConfidenceProbeRunner + HypothesisProbe + SpeculativeBranchTree + RiskTierFloor + tool_executor through one authoritative per-op budget, `tool_executor.run()` extended with `per_round_observer` parameter, Claude+DW providers wired via lazy-import bridge with `attach_to_provider_run()`+`close_op()` finally, `EVENT_TYPE_BUDGET_ACTION_TAKEN` SSE, `/budget` REPL + `GET /observability/budget[/{op_id}]`, Decision B1 synchronous probe await, Decision C1 escalation via canonical primitives (`apply_floor_to_name`+`get_active_tier_order`), `JARVIS_EPISTEMIC_BUDGET_ENABLED` default-TRUE, 4 AST pins + 5 FlagRegistry seeds. Three architectural axes closed simultaneously: (a) failure-mode + action-outcome form symmetric in-context embodiment ASCO axis; (b) bounded epistemic loop closes per-op information-economy contract structurally (cost-gated routes refuse PROBE/SBT); (c) Slice 5b consolidation graduated cognitive substrate that Upgrade 1 then composed. ~290 new tests landed across the four arcs. Estimated calendar to remaining items 6–11 + Venom V1–V4 + GitHub Patterns B+C: 5–7 weeks (reduced from v2.11's 8–10-week estimate by the four single-day closures). **NEXT (per §32.8 v3 sequencing)**: M9 CuriosityGradient → Upgrade 2 DecisionRecord Causality Graph → M10 ArchitectureProposer (refined per §32.4). See v2.11 below for §32 Venom enhancements + GitHub recon.)
+**Version (prior)**: 2.11 (2026-05-04 — **§32 added** — three-way operator-prompted recon: (1) `graduation_orchestrator.py` 1,137-line dead-code bit-rot assessment — imports aren't dead, but architecture is stale vs 12 modern cage components; verdict: salvage *design* (15-phase FSM + AdaptiveThreshold + H1–H6 + 5-layer validation), archive *code*; (2) M10 ArchitectureProposer slice plan refined per §32.4 — supersedes §30.5.2 with battle-tested design template inheritance; M10 estimate stays ~7–10d, content sharper; cleanup arc (~1d) lands post-M10-graduation; (3) targeted Venom enhancements (V1 per-tool hooks + V2 permission callbacks + V3 async outputs + V4 regex matchers) — adopted FROM Agent SDK architecture without migrating Venom to `@tool()`; plus 2 patterns from `anthropics/claude-code` GitHub recon (Operation Modes `plan/analyze/apply/auto` + Component Tool Scope) as standalone arcs; 5 SDK/repo patterns explicitly skipped (`@tool()`, `ClaudeSDKClient`, dynamic context injection, settings hierarchy, plugin marketplace). Updated §31.6 sequencing now spans 11 strict-ordered items + 6 parallel-executable; estimated calendar to "earned ASCO + closed epistemic loops + Venom-enhanced + cleanup-complete" 8–10 weeks. See v2.10 below for §31 Critical Path Systemic Upgrades v3.)
 **Version (prior)**: 2.10 (2026-05-04 — **§31 Critical Path Systemic Upgrades v3 added** — operator-prompted; 3 cross-cutting epistemic-loop closures composing existing substrate (Bounded Epistemic Loop / DecisionRecord Causality Graph / Failure-Mode Memory at GENERATE-prompt-construction); each ~5–9d, ~5-slice arcs; sequencing interleaved with §30 ASCO arcs per §31.6 (Failure-Mode Memory first / DecisionRecord precedes ArchitectureProposer / Bounded Epistemic Loop precedes CuriosityGradient); estimated 6–8 weeks for all three + §30 M9–M11; see also v2.9 entry below for §30 ASCO Mapping.)
 **Version (prior)**: 2.9 (2026-05-04 — **§30 ASCO Mapping added** — operator-prompted file:line-anchored honesty audit of the "Autonomous Self-developing Cognitive Organism" framing. Structural truth on 4 of 8 sub-axes today (proactive initiation, self-modification, state continuity, governance cage); 3 buildable arcs scoped (M9 `CuriosityGradient` ~5–7d, M10 `ArchitectureProposer` ~7–10d, M11 `ActionOutcomeMemory` ~5–7d) closing intrinsic-motivation, weak-ontogeny, in-context-grounding gaps via existing substrate (`ProphecyEngine`/`SensorGovernor`/`CapabilityGapSensor`/`OpportunityMinerSensor`/`GenerativeQuorum`/`SemanticIndex`/`PostmortemRecallService`/`MemoryEngine`/`ConversationBridge`) — zero new external dependencies; 1 long-horizon arc (M12 `JPrimeLoRA`, 6–12 month, operator-gated) closes in-weight learning; canonical phrasing recommended: **"proactive, self-modifying, governance-bounded autonomous substrate"**; CLI UI/UX article ports identified (`PrincipleManifest` + `SerpentFlowSnapshotter` + `CLIStyleGuide.md`); Playwright-style visual diff explicitly NOT worth porting; sequencing M11→M9→M10 + parallel CLI ports recommended. Prior §29 (Post-Priority-#2 Brutal Review) remains canonical critical-path reference for current authorized work. CC2 follow-ups landed same-day as §30 — `ClaudeStyleTransport` Protocol-conformant + `Update(<path>:<line>)` diff blocks + multi-line cwd/mode/posture REPL prompt + `serpent_flow_repl_prompt_helper_present` AST pin (37→38 invariants); 1562/1562 governance sweep green.)
 **Author**: Derek J. Russell (vision) · Claude Opus 4.7 (PRD synthesis)
@@ -4171,9 +4172,11 @@ Each arc satisfies the manifesto: solve the root problem directly, leverage exis
 **Buildable?** **Yes — medium-term, ~7–10 days.** Higher risk than M9 because of recursive failure modes; safety scaffolding mostly exists already.
 **Worth building?** **Yes, but stays default-false longer than M9.** Single highest-impact move toward earned ASCO status. Operator-gated graduation by design.
 
-#### 30.5.3 Arc M11 — `ActionOutcomeMemory` (closes weak-form embodiment gap)
+#### 30.5.3 Arc M11 — `ActionOutcomeMemory` (closes weak-form embodiment gap) ✅ CLOSED 2026-05-04
 
-**Goal**: Every (intent, action, outcome) triplet — read: (op_id, applied patch, VERIFY result + commit hash) — becomes retrievable evidence surfaced into the next GENERATE prompt for *similar* regions. Not weight-level grounding; in-context grounding via RAG. Strengthens the embodied-cognition claim from "we have session_lessons" to "every patch's outcome shapes the next patch in the same region."
+**Status**: Full 5-slice arc graduated default-true 2026-05-04. `JARVIS_ACTION_OUTCOME_MEMORY_ENABLED` default-TRUE; explicit `false` for instant revert. OutcomeKind 5-value closed enum (`APPLIED_VERIFIED` / `APPLIED_REVERTED` / `REJECTED` / `DEFERRED` / `DISABLED`). Per-cluster JSONL persistence at `.jarvis/action_outcomes/{cluster_id}.jsonl` (Decision A3 SemanticIndex-optional with global-fallback graceful degradation). Deterministic enum-match + Jaccard + log-scale weight + 14d half-life recency + outcome-polarity scoring (`balanced` / `favor_positive` / `all_equal` modes). Markdown-render injection at `strategic_direction.py` GENERATE-prompt-construction with 4KB budget cap. Shared `_scoring_primitives.py` (~210 LOC) extracted as Decision C2 refactor — Upgrade 3 + M11 + future Upgrade 1/M9 reuse the math. SuccessPatternStore façade migration (Decision B3) — both legacy local store AND M11 store updated atomically. 4 AST shipped-code-invariants pins + 5 FlagRegistry seeds. **Closure summary in §32.8 row 4.** See `memory/project_m11_action_outcome_memory.md` for per-slice details.
+
+**Goal** (preserved for change-log integrity): Every (intent, action, outcome) triplet — read: (op_id, applied patch, VERIFY result + commit hash) — becomes retrievable evidence surfaced into the next GENERATE prompt for *similar* regions. Not weight-level grounding; in-context grounding via RAG. Strengthens the embodied-cognition claim from "we have session_lessons" to "every patch's outcome shapes the next patch in the same region."
 
 **Substrate already shipping (zero duplication)**:
 | Module | File | Role for M11 |
@@ -4348,9 +4351,11 @@ Each of the three upgrades below is a **glue layer** over substrate that already
 
 The risk of *not* doing these: O+V's per-op cognition is correct but **non-determinable**, **non-repeatable**, and **non-cumulative** at the loop level. Each op gets smarter; the *system between ops* doesn't.
 
-### 31.2 Upgrade 1 — Bounded Epistemic Loop
+### 31.2 Upgrade 1 — Bounded Epistemic Loop ✅ CLOSED 2026-05-04
 
-**Goal**: per-op information budget enforced at every Venom tool round. Auto-engage `PROBE_ENVIRONMENT` on confidence drop. Auto-escalate to `NOTIFY_APPLY` on budget exhaustion without convergence. Removes both **infinite curiosity** (probe loops that won't terminate) AND **silent fail-poor-quality** (op completes with low confidence without escalating).
+**Status**: Full 5-slice arc graduated default-true 2026-05-04. 172/172 tests green. `JARVIS_EPISTEMIC_BUDGET_ENABLED` default-TRUE; explicit `false` for instant revert. Production wire-up live in Claude (`providers.py:4273`) + DW (`doubleword_provider.py:1643`) — both call `attach_to_provider_run()` lazy-import + pass `per_round_observer` to `tool_loop.run()` + `close_op()` in `finally`. `EVENT_TYPE_BUDGET_ACTION_TAKEN` SSE fires on every non-WITHIN_BUDGET / non-DISABLED dispatch. `/budget {status,op,config,help}` REPL + `GET /observability/budget[/{op_id}]` HTTP routes live. **Closure summary in §32.8 row 5.** See `memory/project_upgrade_1_bounded_epistemic_loop.md` for per-slice details.
+
+**Goal** (preserved for change-log integrity): per-op information budget enforced at every Venom tool round. Auto-engage `PROBE_ENVIRONMENT` on confidence drop. Auto-escalate to `NOTIFY_APPLY` on budget exhaustion without convergence. Removes both **infinite curiosity** (probe loops that won't terminate) AND **silent fail-poor-quality** (op completes with low confidence without escalating).
 
 #### 31.2.1 Substrate inventory (file:line)
 
@@ -4454,9 +4459,11 @@ Pure substrate. Zero LLM calls. Disk: ~1KB/decision × ~50 decisions/op × ~20 o
 - RSI safety gate ("can we prove this proposed self-modification doesn't change decision determinism?") — directly serves the §30 M10 ArchitectureProposer cage rule
 - Postmortem evidence ("the gate failed because input state was X")
 
-### 31.4 Upgrade 3 — Failure-Mode Memory at GENERATE-prompt-construction
+### 31.4 Upgrade 3 — Failure-Mode Memory at GENERATE-prompt-construction ✅ CLOSED 2026-05-04
 
-**Goal**: every postmortem extracts `(situation_signature, failure_mode, mitigation)` triplet into a queryable store. Before any GENERATE, query the store for matching situations and inject *"previously failed via X; try Y instead"* into the prompt. Existing `adaptive_learning.py` + `PostmortemRecallService` (Priority #2) do this at *retry-context*, not at *first-attempt*. **Move it earlier.** Without this, the system relearns the same lesson 100× — exactly the non-deterministic degradation we want to solve.
+**Status**: Full 5-slice arc graduated default-true 2026-05-04. `JARVIS_FAILURE_MODE_MEMORY_ENABLED` default-TRUE; explicit `false` for instant revert. Per-cluster JSONL persistence at `.jarvis/failure_modes/{cluster_id}.jsonl` via `cross_process_jsonl.flock_critical_section`. SituationKind (7 values) + FailureModeKind (7 values) closed enums. Recall + injection live at `strategic_direction.py` first-attempt GENERATE site (canonical render method `_render_failure_modes_section`, lazy imports of `compose_failure_modes_section` + `recall_for_region` + `publish_failure_mode_recalled`). 4 AST shipped-code-invariants pins + 5 FlagRegistry seeds. **Closure summary in §32.8 row 3.** See `memory/project_upgrade_3_failure_mode_memory.md` for per-slice details.
+
+**Goal** (preserved for change-log integrity): every postmortem extracts `(situation_signature, failure_mode, mitigation)` triplet into a queryable store. Before any GENERATE, query the store for matching situations and inject *"previously failed via X; try Y instead"* into the prompt. Existing `adaptive_learning.py` + `PostmortemRecallService` (Priority #2) do this at *retry-context*, not at *first-attempt*. **Move it earlier.** Without this, the system relearns the same lesson 100× — exactly the non-deterministic degradation we want to solve.
 
 #### 31.4.1 Substrate inventory (file:line)
 
@@ -4504,24 +4511,24 @@ Zero LLM calls in extractor (pattern-match) OR retriever (RAG). +≤3KB to GENER
 
 **Net architectural effect**: the three upgrades close the **inner**, **session-spanning**, and **cross-session** epistemic loops respectively. Combined with §30's M9–M11 (which close ASCO capability axes), O+V graduates from "self-modifying substrate with state continuity" to "self-modifying substrate with reproducible cognition + accumulated lesson memory." That's the architectural delta between an *autonomous AGI substrate* and an *autonomous AGI substrate that learns from itself*.
 
-### 31.6 Sequencing Recommendation (operator-binding)
+### 31.6 Sequencing Recommendation (operator-binding) — SUPERSEDED by §32.8
 
-§31 upgrades fit **between** the §30 ASCO arcs and the §29 critical-path sequencing as follows:
+**Status note (2026-05-04)**: §32.8 supersedes this section with the live status table. Items 1–5 of the original §31.6 sequencing **all graduated default-true on 2026-05-04** (Priority #3 + Slice 5b consolidation + Upgrade 3 + M11 + Upgrade 1). See §32.8 for the current sequencing + status. The table below is preserved for cross-reference + change-log integrity.
 
-| Order | Item | Source | Reason |
-|---|---|---|---|
-| 1 | Priority #3 Counterfactual Replay | §29.7 | Already authorized; in-flight |
-| 2 | Slice 5b consolidation (4 arcs) | §29.7 | Already authorized; parallel with #1 |
-| 3 | **Upgrade 3 — Failure-Mode Memory at GENERATE** | §31.4 | Pure RAG; zero new failure modes; fastest quality lift |
-| 4 | M11 — `ActionOutcomeMemory` | §30.5.3 | Symmetric pair to Upgrade 3 (positive evidence) |
-| 5 | **Upgrade 1 — Bounded Epistemic Loop** | §31.2 | Closes per-op loop; benefits from M11's outcome substrate |
-| 6 | M9 — `CuriosityGradient` | §30.5.1 | Composes with Upgrade 1 (curiosity drives the budget) |
-| 7 | **Upgrade 2 — DecisionRecord Causality Graph** | §31.3 | Foundation for safe RSI; precedes any architecture-mutation capability |
-| 8 | M10 — `ArchitectureProposer` | §30.5.2 | Depends on Upgrade 2's determinism guarantee |
-| 9 | CLI ports (parallel) | §30.8.1 | Sliceable in parallel |
-| 10 | M12 — `JPrimeLoRA` (operator-gated) | §30.6 | Long-horizon, conditional |
+| Order | Item | Source | Reason | Status (2026-05-04) |
+|---|---|---|---|---|
+| 1 | Priority #3 Counterfactual Replay | §29.7 | Already authorized; in-flight | **CLOSED** |
+| 2 | Slice 5b consolidation (4 arcs → grew to 5 sub-arcs A–E) | §29.7 | Already authorized; parallel with #1 | **CLOSED** |
+| 3 | **Upgrade 3 — Failure-Mode Memory at GENERATE** | §31.4 | Pure RAG; zero new failure modes; fastest quality lift | **CLOSED** |
+| 4 | M11 — `ActionOutcomeMemory` | §30.5.3 | Symmetric pair to Upgrade 3 (positive evidence) | **CLOSED** |
+| 5 | **Upgrade 1 — Bounded Epistemic Loop** | §31.2 | Closes per-op loop; benefits from M11's outcome substrate | **CLOSED** |
+| 6 | M9 — `CuriosityGradient` | §30.5.1 | Composes with Upgrade 1 (curiosity drives the budget) | **NEXT** |
+| 7 | **Upgrade 2 — DecisionRecord Causality Graph** | §31.3 | Foundation for safe RSI; precedes any architecture-mutation capability | Pending |
+| 8 | M10 — `ArchitectureProposer` (refined per §32.4) | §30.5.2 (superseded by §32.4) | Depends on Upgrade 2's determinism guarantee | Pending |
+| 9 | CLI ports (parallel) | §30.8.1 | Sliceable in parallel | Pending |
+| 10 | M12 — `JPrimeLoRA` (operator-gated) | §30.6 | Long-horizon, conditional | Pending |
 
-**Estimated calendar to "earned ASCO + closed epistemic loops"**: 6–8 weeks for items 3–9 at established cadence (each is a 5-slice arc; some parallel-executable).
+**Original calendar estimate**: "earned ASCO + closed epistemic loops" 6–8 weeks for items 3–9. **Realized burn-down (2026-05-04)**: items 3–5 closed single-day in one operator session (~290 new tests; symmetric in-context embodiment ASCO axis closed via Upgrade 3 ⊕ M11; per-op information-economy contract closed via Upgrade 1). Remaining items 6–10 + Venom V1–V4 + GitHub Patterns B+C: 5–7 weeks per §32.8.
 
 ### 31.7 What Each Upgrade Does NOT Do (Anti-Goals)
 
@@ -4913,36 +4920,41 @@ Cleanup arc is ~1 slice, ~2 days, ~30 tests (mostly the AST pin + the TODO-closu
 | Plugin namespace isolation + marketplace distribution | Requires npm/pip distribution infrastructure orthogonal to O+V's core mandate; revisit post-graduation if multi-team deployment becomes a thing |
 | `/help` REPL discoverability extensions | O+V already has `/help` verb ecosystem (`help_dispatcher.py` graduated 2026-04-21); minor UX additions don't warrant an arc |
 
-### 32.8 Sequencing — Where §32 Fits in §31.6 (Updated 10-Item Operator-Binding Order)
+### 32.8 Sequencing — Where §32 Fits in §31.6 (Updated 11-Item Operator-Binding Order)
 
 §32 introduces 4 new arcs (V1–V4 Venom enhancements + Operation Mode + Component Tool Scope + Cleanup arc) and refines 1 existing arc (M10). Updated sequencing:
 
-| Order | Item | Source | Reason |
-|---|---|---|---|
-| 1 | Priority #3 Counterfactual Replay | §29.7 | Already authorized; in-flight |
-| 2 | Slice 5b consolidation (4 arcs) | §29.7 | Already authorized; parallel with #1 |
-| 3 | Upgrade 3 — Failure-Mode Memory at GENERATE | §31.4 | Pure RAG; zero new failure modes; fastest quality lift |
-| 4 | M11 — `ActionOutcomeMemory` | §30.5.3 | Symmetric pair to Upgrade 3 |
-| 5 | Upgrade 1 — Bounded Epistemic Loop | §31.2 | Closes per-op loop |
-| 6 | M9 — `CuriosityGradient` | §30.5.1 | Composes with Upgrade 1 |
-| 7 | Upgrade 2 — DecisionRecord Causality Graph | §31.3 | Foundation for safe RSI; precedes M10 |
-| 8 | **M10 — `ArchitectureProposer` (refined per §32.4)** | **§32.4 supersedes §30.5.2** | Inherits 15-phase FSM + AdaptiveThreshold + H1–H6 + 5-layer validation from `graduation_orchestrator.py` |
-| 9 | **`graduation_orchestrator.py` cleanup arc** | §32.5 | Lands immediately after M10 graduates default-true; ~1 slice |
-| 10 | CLI ports (parallel) | §30.8.1 | Sliceable in parallel |
-| 11 | M12 — `JPrimeLoRA` (operator-gated) | §30.6 | Long-horizon, conditional |
+| Order | Item | Source | Status | Reason |
+|---|---|---|---|---|
+| 1 | Priority #3 Counterfactual Replay | §29.7 | **CLOSED 2026-04-30** | Substrate + observer + 5b consolidation Arc D landed |
+| 2 | Slice 5b consolidation (5 arcs A–E) + Move 6 master-flag graduation | §29.7 | **CLOSED 2026-05-04** | All 5 sub-arcs (probe / coherence / quorum / gradient+SBT / REPL verbs) graduated; Move 6 `JARVIS_GENERATIVE_QUORUM_ENABLED` flipped default-TRUE |
+| 3 | Upgrade 3 — Failure-Mode Memory at GENERATE | §31.4 | **CLOSED 2026-05-04** | Full 5-slice arc graduated; per-cluster JSONL + recall scoring + injection at GENERATE; `JARVIS_FAILURE_MODE_MEMORY_ENABLED` default-TRUE; 4 AST pins + 5 FlagRegistry seeds |
+| 4 | M11 — `ActionOutcomeMemory` | §30.5.3 | **CLOSED 2026-05-04** | Full 5-slice arc graduated; symmetric positive-evidence pair to Upgrade 3; OutcomeKind 5-value closed enum; outcome-polarity scoring (`balanced` / `favor_positive` / `all_equal` modes); shared `_scoring_primitives.py` extracted (Decision C2 refactor); `JARVIS_ACTION_OUTCOME_MEMORY_ENABLED` default-TRUE; 4 AST pins + 5 FlagRegistry seeds |
+| 5 | Upgrade 1 — Bounded Epistemic Loop | §31.2 | **CLOSED 2026-05-04** | Full 5-slice glue arc graduated (172/172 tests green); composes ConfidenceMonitor + ConfidenceProbeRunner + HypothesisProbe + SpeculativeBranchTree + RiskTierFloor + tool_executor through one authoritative per-op budget; `tool_executor.run()` extended with `per_round_observer` parameter; Claude + DW providers wired via lazy-import bridge with `attach_to_provider_run()` + `close_op()` finally; `EVENT_TYPE_BUDGET_ACTION_TAKEN` SSE; `/budget` REPL + `GET /observability/budget[/{op_id}]`; Decision B1 synchronous probe await; Decision C1 escalation via canonical primitives (`apply_floor_to_name` + `get_active_tier_order`); `JARVIS_EPISTEMIC_BUDGET_ENABLED` default-TRUE; 4 AST pins + 5 FlagRegistry seeds |
+| 6 | M9 — `CuriosityGradient` | §30.5.1 | **NEXT** | Composes with Upgrade 1 — surfaces gradient signal that the bounded loop can consume; ConfidenceMonitor's per-op trajectory feeds the gradient |
+| 7 | Upgrade 2 — DecisionRecord Causality Graph | §31.3 | Pending | Foundation for safe RSI; precedes M10 |
+| 8 | **M10 — `ArchitectureProposer` (refined per §32.4)** | **§32.4 supersedes §30.5.2** | Pending | Inherits 15-phase FSM + AdaptiveThreshold + H1–H6 + 5-layer validation from `graduation_orchestrator.py` |
+| 9 | **`graduation_orchestrator.py` cleanup arc** | §32.5 | Pending | Lands immediately after M10 graduates default-true; ~1 slice |
+| 10 | CLI ports (parallel) | §30.8.1 | Pending | Sliceable in parallel |
+| 11 | M12 — `JPrimeLoRA` (operator-gated) | §30.6 | Pending | Long-horizon, conditional |
 
 **Parallel-executable with the above** (do not require strict ordering):
 
-| Item | Source | When |
-|---|---|---|
-| **Venom V1 — Per-tool-call hooks** | §32.6.2 | Anytime; ~3 slices |
-| **Venom V2 — Per-tool permission callbacks** | §32.6.3 | After V1 (V2 composes with V1's hook event types); ~2 slices |
-| **Venom V3 — Async hook outputs** | §32.6.4 | Anytime; ~2 slices |
-| **Venom V4 — Tool-name regex matchers + closed enums** | §32.6.5 | After V1 (V4 extends V1's matcher); ~1 slice |
-| **GitHub recon Pattern B — Operation Modes** | §32.7.2 | Anytime; ~1 slice |
-| **GitHub recon Pattern C — Component Tool Scope** | §32.7.3 | After V2 (composes with V2's `PermissionRegistry`); ~2 slices |
+| Item | Source | When | Status |
+|---|---|---|---|
+| **Venom V1 — Per-tool-call hooks** | §32.6.2 | Anytime; ~3 slices | Pending |
+| **Venom V2 — Per-tool permission callbacks** | §32.6.3 | After V1 (V2 composes with V1's hook event types); ~2 slices | Pending |
+| **Venom V3 — Async hook outputs** | §32.6.4 | Anytime; ~2 slices | Pending |
+| **Venom V4 — Tool-name regex matchers + closed enums** | §32.6.5 | After V1 (V4 extends V1's matcher); ~1 slice | Pending |
+| **GitHub recon Pattern B — Operation Modes** | §32.7.2 | Anytime; ~1 slice | Pending |
+| **GitHub recon Pattern C — Component Tool Scope** | §32.7.3 | After V2 (composes with V2's `PermissionRegistry`); ~2 slices | Pending |
 
-**Estimated calendar to "earned ASCO + closed epistemic loops + Venom-enhanced + cleanup-complete"**: 8–10 weeks for items 3–11 + Venom V1–V4 + GitHub Patterns B+C, at established cadence. Adds ~1–2 weeks vs §31.6's 6–8-week estimate (the V1–V4 + B + C arcs are mostly parallel; M10 refinement is content-shift, not effort-add).
+**2026-05-04 single-day burst** — items 2–5 (Slice 5b consolidation + Upgrade 3 + M11 + Upgrade 1) all graduated default-true within one operator session. Combined regression spine: ~290 new tests across the four arcs (Upgrade 3: ~80, M11: ~72, shared `_scoring_primitives.py`: ~20, Upgrade 1: 172). Closed three architectural axes simultaneously:
+1. **Failure-mode memory** (negative evidence at GENERATE — Upgrade 3) + **action-outcome memory** (positive evidence at GENERATE — M11) form a symmetric in-context embodiment ASCO axis.
+2. **Bounded epistemic loop** (Upgrade 1) closes the per-op information-economy contract — every Venom round consults one authoritative budget; cost-gated routes (BG/SPEC) refuse PROBE/SBT structurally.
+3. **Slice 5b consolidation** (5 sub-arcs) graduated the cognitive substrate (probe / coherence / quorum / gradient+SBT / REPL verbs) that Upgrade 1 then composed.
+
+**Estimated calendar to "earned ASCO + closed epistemic loops + Venom-enhanced + cleanup-complete"** (remaining items 6–11 + Venom V1–V4 + GitHub Patterns B+C): 5–7 weeks at established cadence. Reduced from §32.8 v2's 8–10-week estimate by the four single-day closures.
 
 ### 32.9 Cross-References
 

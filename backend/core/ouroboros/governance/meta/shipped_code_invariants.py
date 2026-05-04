@@ -2753,6 +2753,118 @@ def _validate_confidence_threshold_tightener(
 
 
 # ---------------------------------------------------------------------------
+# Upgrade 1 — Bounded Epistemic Loop (PRD §31.2) — 4 pins
+# ---------------------------------------------------------------------------
+
+
+def _validate_epistemic_budget_no_authority_imports(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """Upgrade 1 Slice 5 — epistemic_budget.py is a pure
+    primitive layer. MUST NOT import orchestrator-tier modules.
+    Allowed: stdlib + hypothesis_probe (probe-cap defer) +
+    cost_contract_assertion (COST_GATED_ROUTES symbol). NEVER
+    raises."""
+    forbidden = (
+        "orchestrator", "iron_gate", "policy", "change_engine",
+        "candidate_generator", "providers", "doubleword_provider",
+        "urgency_router", "auto_action_router",
+        "subagent_scheduler", "tool_executor", "phase_runners",
+        "semantic_guardian", "semantic_firewall",
+        "strategic_direction",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        module = (
+            node.module if isinstance(node, ast.ImportFrom)
+            else (node.names[0].name if node.names else "")
+        )
+        module = module or ""
+        for f in forbidden:
+            if f in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden authority import "
+                    f"contains {f!r}: {module}"
+                )
+    return tuple(violations)
+
+
+def _validate_epistemic_budget_master_default_true(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """Upgrade 1 Slice 5 — bytes-pin the graduated default-true
+    contract (PRD §31.2). Mirrors M11 / Upgrade 3 graduated
+    pin discipline. NEVER raises."""
+    violations: List[str] = []
+    if "Graduated default 2026-05-04" not in source:
+        violations.append(
+            "epistemic_budget.py dropped its 'Graduated "
+            "default 2026-05-04' marker — graduation contract "
+            "may have regressed (master flipped back to false?)"
+        )
+    if "graduated default-" not in source:
+        violations.append(
+            "epistemic_budget_enabled() docstring no longer "
+            "states the graduation — graduation documentation "
+            "may have regressed"
+        )
+    return tuple(violations)
+
+
+def _validate_epistemic_budget_probe_cap_no_duplication(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """Upgrade 1 Slice 5 — operator mandate: probe call cap
+    MUST defer to hypothesis_probe.get_max_calls_per_probe.
+    Pins the symbol presence + the deferral idiom. NEVER
+    raises."""
+    violations: List[str] = []
+    if "get_max_calls_per_probe" not in source:
+        violations.append(
+            "epistemic_budget.py dropped the "
+            "get_max_calls_per_probe deferral — the probe-cap "
+            "contract must NOT be duplicated (operator mandate)"
+        )
+    if "MAX_CALLS_PER_PROBE_DEFAULT" not in source:
+        violations.append(
+            "epistemic_budget.py dropped the "
+            "MAX_CALLS_PER_PROBE_DEFAULT re-export — symmetric "
+            "constant for downstream readers"
+        )
+    return tuple(violations)
+
+
+def _validate_tool_executor_per_round_observer_wired(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """Upgrade 1 Slice 5 — tool_executor.run() exposes the
+    per_round_observer parameter and invokes it at the
+    round-boundary. Pins the integration point so a future
+    refactor can't drop the observer hook silently. NEVER
+    raises."""
+    violations: List[str] = []
+    if "per_round_observer" not in source:
+        violations.append(
+            "tool_executor.py dropped the per_round_observer "
+            "parameter — Upgrade 1 round-boundary observer "
+            "hook may have regressed"
+        )
+    if "await per_round_observer(" not in source:
+        violations.append(
+            "tool_executor.py no longer awaits "
+            "per_round_observer at the round boundary — "
+            "Upgrade 1 PRD §31.2 contract regressed"
+        )
+    return tuple(violations)
+
+
+# ---------------------------------------------------------------------------
 # Seed registration
 # ---------------------------------------------------------------------------
 
@@ -3434,6 +3546,101 @@ def _register_seed_invariants() -> None:
             ),
             validate=(
                 _validate_action_outcome_injection_via_strategic_direction
+            ),
+        ),
+    )
+    # ----------------------------------------------------------------
+    # Upgrade 1 — Bounded Epistemic Loop (PRD §31.2) — 4 pins
+    # Slice 5 graduation: master flag default-true; structural pins
+    # protect the no-authority floor + probe-cap-no-duplication
+    # operator mandate + per_round_observer integration in
+    # tool_executor.
+    # ----------------------------------------------------------------
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "epistemic_budget_no_authority_imports"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "epistemic_budget.py"
+            ),
+            description=(
+                "epistemic_budget.py is a pure primitive layer. "
+                "MUST NOT import orchestrator / iron_gate / "
+                "providers / candidate_generator / urgency_router "
+                "/ tool_executor / strategic_direction. Allowed "
+                "imports: stdlib + hypothesis_probe (probe-cap "
+                "defer) + cost_contract_assertion "
+                "(COST_GATED_ROUTES symbol)."
+            ),
+            validate=(
+                _validate_epistemic_budget_no_authority_imports
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "epistemic_budget_master_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "epistemic_budget.py"
+            ),
+            description=(
+                "Slice 5 graduation contract: master flag "
+                "JARVIS_EPISTEMIC_BUDGET_ENABLED defaults TRUE "
+                "on unset env. If a future refactor flips this "
+                "back to False, this pin trips so the regression "
+                "is caught structurally before shipping."
+            ),
+            validate=(
+                _validate_epistemic_budget_master_default_true
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "epistemic_budget_probe_cap_no_duplication"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "epistemic_budget.py"
+            ),
+            description=(
+                "Operator mandate: probe call cap MUST defer to "
+                "hypothesis_probe.get_max_calls_per_probe — "
+                "Upgrade 1 NEVER duplicates the cap. Pins the "
+                "symbol presence + MAX_CALLS_PER_PROBE_DEFAULT "
+                "re-export to catch refactors that fork the "
+                "cap into a parallel definition."
+            ),
+            validate=(
+                _validate_epistemic_budget_probe_cap_no_duplication
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "tool_executor_per_round_observer_wired"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "tool_executor.py"
+            ),
+            description=(
+                "Upgrade 1 PRD §31.2 — tool_executor.run() must "
+                "expose the per_round_observer parameter AND "
+                "invoke it at the round boundary "
+                "(`await per_round_observer(round_index)`). "
+                "Catches refactors that drop the integration "
+                "point silently."
+            ),
+            validate=(
+                _validate_tool_executor_per_round_observer_wired
             ),
         ),
     )
