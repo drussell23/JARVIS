@@ -3826,6 +3826,72 @@ SEED_SPECS: list = [
         example="14400",
         since="Move 8 Slice 1 (PRD §29.7, 2026-05-05)",
     ),
+    # ====================================================================
+    # Move 8 — Proactive Curiosity Loop Slice 3 graduation contract
+    # — 3 flags. Harness master is default-TRUE per §33.1
+    # (operator-binding lives on Slice 1's flag).
+    # ====================================================================
+    FlagSpec(
+        name=(
+            "JARVIS_PROACTIVE_CURIOSITY_GRADUATION_"
+            "CONTRACT_ENABLED"
+        ),
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the Move 8 Proactive "
+            "Curiosity Loop graduation contract harness "
+            "(PRD §29.7 / §33.1). When false, "
+            "is_ready_for_graduation() always returns "
+            "CuriosityGraduationVerdict.DISABLED so the master "
+            "flag flip (JARVIS_PROACTIVE_CURIOSITY_READER_"
+            "ENABLED) is structurally blocked from any "
+            "automated harness. Production should leave this "
+            "on; intended for operator troubleshooting only."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "proactive_curiosity_loop_graduation_contract.py"
+        ),
+        example="true",
+        since="Move 8 Slice 3 (PRD §29.7, 2026-05-05)",
+    ),
+    FlagSpec(
+        name="JARVIS_PROACTIVE_CURIOSITY_REQUIRED_EMISSIONS",
+        type=FlagType.INT, default=12,
+        description=(
+            "Minimum surfaced emissions required before "
+            "READY_FOR_GRADUATION verdict. Default 12 (3× "
+            "across each of 4 postures, plus headroom). "
+            "Clamped [3, 1000]."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "proactive_curiosity_loop_graduation_contract.py"
+        ),
+        example="12",
+        since="Move 8 Slice 3 (PRD §29.7, 2026-05-05)",
+    ),
+    FlagSpec(
+        name=(
+            "JARVIS_PROACTIVE_CURIOSITY_MAX_GOVERNOR_THROTTLES"
+        ),
+        type=FlagType.INT, default=0,
+        description=(
+            "Maximum SensorGovernor cap-hit observations "
+            "tolerable before EXCESSIVE_THROTTLES verdict. "
+            "Default 0 (the contract is 'the loop integrates "
+            "cleanly'). Clamped [0, 100]."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "proactive_curiosity_loop_graduation_contract.py"
+        ),
+        example="0",
+        since="Move 8 Slice 3 (PRD §29.7, 2026-05-05)",
+    ),
     FlagSpec(
         name="JARVIS_REPL_DISPATCH_AUTODISCOVERY_ENABLED",
         type=FlagType.BOOL, default=True,

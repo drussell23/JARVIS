@@ -732,18 +732,17 @@ def test_flag_registry_has_4_move_8_seeds():
         SEED_SPECS,
     )
     seeds = SEED_SPECS
-    move_8 = [
-        s for s in seeds
-        if s.name.startswith("JARVIS_PROACTIVE_CURIOSITY_")
-    ]
-    assert len(move_8) == 4
-    names = {s.name for s in move_8}
-    assert names == {
+    slice_1_names = {
         "JARVIS_PROACTIVE_CURIOSITY_READER_ENABLED",
         "JARVIS_PROACTIVE_CURIOSITY_TOP_K",
         "JARVIS_PROACTIVE_CURIOSITY_MAGNITUDE_FLOOR",
         "JARVIS_PROACTIVE_CURIOSITY_COOLDOWN_S",
     }
+    move_8_slice_1 = [
+        s for s in seeds if s.name in slice_1_names
+    ]
+    assert len(move_8_slice_1) == 4
+    assert {s.name for s in move_8_slice_1} == slice_1_names
 
 
 def test_flag_registry_master_default_false():
