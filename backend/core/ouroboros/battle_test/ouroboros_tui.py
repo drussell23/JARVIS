@@ -170,7 +170,42 @@ class OuroborosConsole:
         duration_ms: float = 0.0,
         status: str = "success",
     ) -> None:
-        """Show a Venom tool call with optional result preview."""
+        """Show a Venom tool call with optional result preview.
+
+        Two render paths (mirrors :meth:`SerpentFlow.op_tool_call`):
+
+          * **Registry path** (Gap #2 Slice 4) — gated by
+            ``JARVIS_TOOL_RENDER_REGISTRY_ENABLED``. Replaces the
+            hardcoded ``8/20``-line caps + per-tool ``if/elif`` chain
+            below with adaptive descriptor + density resolution.
+          * **Legacy path** — preserved verbatim below the guard for
+            byte-identical fallback when the master flag is off.
+        """
+        # ── Gap #2 Slice 4: registry-driven path (master-flag-gated) ──
+        try:
+            from backend.core.ouroboros.battle_test.tool_render_view import (
+                compose_if_enabled, store_for_view,
+            )
+            composed = compose_if_enabled(
+                tool_name, args_summary, result_preview,
+                status=status, duration_ms=duration_ms,
+                op_id=op_id, round_index=round_index,
+                store=store_for_view(),
+            )
+        except Exception:  # noqa: BLE001 — never crash the render path
+            composed = None
+        if composed is not None:
+            if composed.header_markup:
+                self._console.print(f"  {composed.header_markup}")
+            if composed.summary_markup:
+                self._console.print(f"     {composed.summary_markup}")
+            for line in composed.body_lines_markup:
+                self._console.print(f"     {line}")
+            if composed.expansion_hint:
+                self._console.print(composed.expansion_hint)
+            return
+
+        # ── Legacy path (master flag off) ──
         icon = _TOOL_ICONS.get(tool_name, "\U0001f527")
         short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
         args_display = f"  [dim]{args_summary[:80]}[/dim]" if args_summary else ""

@@ -3526,6 +3526,98 @@ SEED_SPECS: list = [
         example="1000",
         since="Upgrade 2 Slice 3 (PRD §31.3, 2026-05-04)",
     ),
+    # ====================================================================
+    # M10 ArchitectureProposer (PRD §32.4) — 5 flags (Slice 5)
+    # Master is OPERATOR-PINNED default-FALSE per §30.5.2 — does NOT
+    # graduate default-true at Slice 5; flips only after 30+
+    # proposal-acceptance audit. AST-pinned at Slice 5.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_M10_ARCH_PROPOSER_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master kill switch for the M10 ArchitectureProposer "
+            "(PRD §32.4). When false the UnhandledPatternMiner / "
+            "ProposalSynthesizer / ProposalLifecycleOrchestrator + "
+            "/m10 REPL + GET /observability/m10 + SSE "
+            "m10_proposal_emitted all revert in lockstep. "
+            "OPERATOR-PINNED default-FALSE per §30.5.2 — does NOT "
+            "graduate default-true at Slice 5; flips only after a "
+            "30+ proposal-acceptance audit."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/m10/primitives.py"
+        ),
+        example="false",
+        since="M10 Slice 5 (PRD §32.4, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_M10_ADAPTIVE_MIN_THRESHOLD",
+        type=FlagType.INT, default=2,
+        description=(
+            "Minimum recurrence count below which the Bayesian "
+            "adaptive threshold cannot drop. Default 2; clamped "
+            "[1, 100]. Provides a structural floor on the "
+            "miner's emit gate even when posterior + diversity "
+            "would otherwise produce a sub-2 threshold."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/m10/primitives.py"
+        ),
+        example="2",
+        since="M10 Slice 5 (PRD §32.4, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_M10_ADAPTIVE_CONFIDENCE",
+        type=FlagType.FLOAT, default=2.0,
+        description=(
+            "Bayesian confidence multiplier on the Beta(1+s, 1+f) "
+            "posterior used by ``compute_threshold``. Default 2.0; "
+            "clamped [0.1, 100.0]. Higher values demand more "
+            "evidence (inflates threshold); lower values relax it."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/m10/primitives.py"
+        ),
+        example="2.0",
+        since="M10 Slice 5 (PRD §32.4, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_M10_MAX_DAILY",
+        type=FlagType.INT, default=5,
+        description=(
+            "Hard cap on M10 proposals emitted per UTC day. "
+            "Default 5; clamped [1, 100]. Composes with the "
+            "STANDARD-route × Quorum-K=3 cost contract to bound "
+            "spend at ≤$0.075/day max. UnhandledPatternMiner "
+            "returns DAILY_CAP_REACHED beyond this."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/m10/primitives.py"
+        ),
+        example="5",
+        since="M10 Slice 5 (PRD §32.4, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_M10_APPROVAL_TIMEOUT_S",
+        type=FlagType.FLOAT, default=86_400.0,
+        description=(
+            "Approval timeout in seconds for M10 proposals "
+            "sitting in AWAITING_APPROVAL phase. Default 86400 "
+            "(24h); proposals beyond this transition to EXPIRED. "
+            "Clamped [60, 7 days]."
+        ),
+        category=Category.TIMING,
+        source_file=(
+            "backend/core/ouroboros/governance/m10/primitives.py"
+        ),
+        example="86400",
+        since="M10 Slice 5 (PRD §32.4, 2026-05-04)",
+    ),
 ]
 
 

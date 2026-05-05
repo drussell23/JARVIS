@@ -1636,12 +1636,45 @@ class SerpentFlow:
     ) -> None:
         """Venom tool call completed — stop spinner, print artifact.
 
-        Write tools (edit_file, write_file) render CC-style
-        ``⏺ Update(path)`` / ``⏺ Write(path)`` blocks.
-        Read tools show a compact one-liner.
+        Two render paths:
+
+          * **Registry path** (Gap #2 Slice 4) — when
+            ``JARVIS_TOOL_RENDER_REGISTRY_ENABLED`` is on. Routes
+            through ``tool_render_view.compose`` for adaptive
+            descriptor + density + body-park + Rich markup. Replaces
+            the legacy hardcoded ``if/elif`` chain + ``tool_icons``
+            dict. Default-on after Slice 5 graduation.
+          * **Legacy path** — preserved verbatim below the guard so
+            an operator can flip the master flag off and get the
+            old behavior byte-identical.
         """
         self._stop_status()
 
+        # ── Gap #2 Slice 4: registry-driven path (master-flag-gated) ──
+        try:
+            from backend.core.ouroboros.battle_test.tool_render_view import (
+                compose_if_enabled, store_for_view,
+            )
+            composed = compose_if_enabled(
+                tool_name, args_summary, result_preview,
+                status=status, duration_ms=duration_ms,
+                op_id=op_id, round_index=round_index,
+                palette=_C, store=store_for_view(),
+            )
+        except Exception:  # noqa: BLE001 — never crash the render path
+            composed = None
+        if composed is not None:
+            if composed.header_markup:
+                self._op_line(op_id, composed.header_markup)
+            if composed.summary_markup:
+                self._op_line(op_id, composed.summary_markup)
+            for line in composed.body_lines_markup:
+                self._op_line(op_id, line)
+            if composed.expansion_hint:
+                self._op_line(op_id, composed.expansion_hint)
+            return
+
+        # ── Legacy path (master flag off) ──
         tool_icons = {
             "read_file": "📄", "search_code": "🔍", "run_tests": "🧪",
             "bash": "💻", "web_search": "🌐", "web_fetch": "🌐",
