@@ -78,10 +78,15 @@ MASTER_FLAG_ENV_VAR: str = "JARVIS_TOOL_RENDER_REGISTRY_ENABLED"
 
 
 def is_master_flag_enabled() -> bool:
-    """Read the Slice 4 master flag. Default ``false`` until Slice 5
-    graduation. NEVER raises."""
-    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "")
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    """Read the master flag. **Default ``true``** post Slice 5
+    graduation (2026-05-04). Operators flip ``=false`` for instant
+    rollback to the legacy hardcoded render paths preserved in
+    ``serpent_flow.op_tool_call`` + ``ouroboros_tui.show_tool_call``.
+
+    Re-read on every call — flips take effect immediately for the
+    next tool render without restart. NEVER raises."""
+    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 # ===========================================================================
@@ -515,5 +520,281 @@ __all__ = [
     "compose",
     "compose_if_enabled",
     "is_master_flag_enabled",
+    "register_flags",
+    "register_shipped_invariants",
     "store_for_view",
 ]
+
+
+# ===========================================================================
+# Slice 5 — FlagRegistry self-registration (auto-discovered via the
+# battle_test entry in ``_FLAG_PROVIDER_PACKAGES``)
+# ===========================================================================
+
+
+def register_flags(registry) -> int:
+    """Module-owned FlagRegistry registration. Returns count of
+    FlagSpecs added. NEVER raises — graduation soak path is fail-open."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+
+    specs = [
+        FlagSpec(
+            name=MASTER_FLAG_ENV_VAR,
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for the ToolRenderRegistry "
+                "rendering path (Gap #2). When false, both "
+                "``serpent_flow.op_tool_call`` and "
+                "``ouroboros_tui.show_tool_call`` fall through to "
+                "the legacy hardcoded ``if/elif`` chains preserved "
+                "below the master-flag guards. Default TRUE post "
+                "graduation 2026-05-04. Re-read on every render — "
+                "flips take effect immediately for the next tool "
+                "call without restart."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/battle_test/tool_render_view.py"
+            ),
+            example="true",
+            since="Gap #2 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_TOOL_RENDER_DENSITY",
+            type=FlagType.STR,
+            default="",
+            description=(
+                "Operator override for adaptive density resolution. "
+                "When set to ``compact`` / ``balanced`` / ``verbose``, "
+                "skips the (Posture × LayoutKind) table lookup and "
+                "applies the named level directly. Unrecognized / "
+                "blank values are silently ignored (table lookup "
+                "applies). Useful for screen-recording sessions "
+                "(``verbose``) or stabilization sprints (``compact``)."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/tool_render_policy.py"
+            ),
+            example="balanced",
+            since="Gap #2 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_TOOL_RENDER_STORE_SIZE",
+            type=FlagType.INT,
+            default=50,
+            description=(
+                "Capacity of the BoundedBodyStore (Slice 3) — the "
+                "session-scoped ring of full tool-result bodies "
+                "parked behind ``/expand <ref>`` recovery hints. "
+                "Drop-oldest eviction; clamped to [1, 10_000]. "
+                "Increase for deep-explore sessions, decrease for "
+                "memory-tight environments."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/tool_render_store.py"
+            ),
+            example="50",
+            since="Gap #2 Slice 5 (2026-05-04)",
+        ),
+    ]
+
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[ToolRenderView] flag registration failed for %s",
+                getattr(spec, "name", "?"), exc_info=True,
+            )
+    return count
+
+
+# ===========================================================================
+# Slice 5 — shipped_code_invariants self-registration (auto-discovered
+# via the battle_test entry in ``_INVARIANT_PROVIDER_PACKAGES``)
+# ===========================================================================
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code AST pins. Three structural
+    invariants that lock in Gap #2's correctness-critical surfaces:
+
+      1. ``tool_render_view_public_surface`` — the load-bearing
+         exports (``compose``, ``compose_if_enabled``,
+         ``is_master_flag_enabled``) MUST remain present. Renaming
+         any of them silently breaks the call-site wiring.
+      2. ``tool_render_registry_descriptor_completeness`` — the
+         ``_DESCRIPTORS`` dict MUST contain entries for every Venom
+         tool that production callers can render through. This is
+         the structural guarantee behind "no hardcoded ``if/elif``
+         chains downstream" — missing a descriptor would silently
+         route the tool through the default fallback and lose its
+         CC-style verb formatting.
+      3. ``tool_render_policy_di_cage`` — ``tool_render_policy.py``
+         MUST NOT top-level-import the stateful posture surfaces
+         (``posture_observer``, ``posture_store``, ``posture_health``).
+         Lazy imports inside ``Default*Provider`` methods are
+         allowed; top-level imports would defeat the layered
+         design and create import-time circular-dependency risk.
+
+    NEVER raises (returns ``[]`` on import failure). Per house style.
+    """
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    import ast as _ast
+
+    # ---- Pin 1: public surface of tool_render_view -----------------------
+
+    _REQUIRED_VIEW_EXPORTS = (
+        "compose", "compose_if_enabled", "is_master_flag_enabled",
+    )
+
+    def _validate_view_public_surface(tree, _source) -> tuple:
+        del _source
+        seen: set = set()
+        for node in tree.body:
+            if isinstance(node, _ast.FunctionDef):
+                seen.add(node.name)
+        missing = [
+            name for name in _REQUIRED_VIEW_EXPORTS if name not in seen
+        ]
+        if missing:
+            return (
+                f"tool_render_view.py missing required public "
+                f"functions: {missing} — call sites in serpent_flow "
+                "+ ouroboros_tui depend on these exact names",
+            )
+        return ()
+
+    # ---- Pin 2: descriptor completeness in tool_render_registry ----------
+
+    _REQUIRED_DESCRIPTORS = frozenset({
+        "read_file", "list_symbols", "search_code", "run_tests",
+        "get_callers", "glob_files", "list_dir", "git_log", "git_diff",
+        "git_blame", "bash", "edit_file", "write_file", "delete_file",
+        "type_check", "web_fetch", "web_search", "ask_human",
+    })
+
+    def _validate_descriptor_completeness(tree, _source) -> tuple:
+        del _source
+        # Walk for ``_DESCRIPTORS`` assignment (Mapping[str, ...] dict literal).
+        descriptor_keys: set = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AnnAssign) or isinstance(node, _ast.Assign):
+                targets = (
+                    [node.target]
+                    if isinstance(node, _ast.AnnAssign)
+                    else node.targets
+                )
+                for tgt in targets:
+                    if (
+                        isinstance(tgt, _ast.Name)
+                        and tgt.id == "_DESCRIPTORS"
+                    ):
+                        value = node.value
+                        if isinstance(value, _ast.Dict):
+                            for key_node in value.keys:
+                                if isinstance(key_node, _ast.Constant) and isinstance(
+                                    key_node.value, str,
+                                ):
+                                    descriptor_keys.add(key_node.value)
+        missing = _REQUIRED_DESCRIPTORS - descriptor_keys
+        if missing:
+            return (
+                f"_DESCRIPTORS missing entries for: {sorted(missing)} — "
+                "every Venom tool kind must have an explicit descriptor "
+                "(Gap #2 Slice 1 contract)",
+            )
+        return ()
+
+    # ---- Pin 3: DI cage on tool_render_policy ----------------------------
+
+    _FORBIDDEN_TOP_LEVEL_IMPORTS = frozenset({
+        "backend.core.ouroboros.governance.posture_observer",
+        "backend.core.ouroboros.governance.posture_store",
+        "backend.core.ouroboros.governance.posture_health",
+    })
+
+    def _validate_policy_di_cage(tree, _source) -> tuple:
+        del _source
+        violations = []
+        # Only inspect TOP-LEVEL import statements; ignore those inside
+        # function bodies (lazy imports are intentional and required).
+        for node in tree.body:
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ""
+                if module in _FORBIDDEN_TOP_LEVEL_IMPORTS:
+                    violations.append(
+                        f"top-level ``from {module} import ...`` "
+                        "violates the DI cage — use a lazy import "
+                        "inside Default*Provider.current() instead"
+                    )
+            elif isinstance(node, _ast.Import):
+                for alias in node.names:
+                    if alias.name in _FORBIDDEN_TOP_LEVEL_IMPORTS:
+                        violations.append(
+                            f"top-level ``import {alias.name}`` "
+                            "violates the DI cage"
+                        )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="tool_render_view_public_surface",
+            target_file=(
+                "backend/core/ouroboros/battle_test/tool_render_view.py"
+            ),
+            description=(
+                "tool_render_view.py must expose the load-bearing "
+                "compose / compose_if_enabled / is_master_flag_enabled "
+                "functions. Renaming any of them silently breaks the "
+                "lazy-imported call-site wiring in serpent_flow + "
+                "ouroboros_tui."
+            ),
+            validate=_validate_view_public_surface,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="tool_render_registry_descriptor_completeness",
+            target_file=(
+                "backend/core/ouroboros/battle_test/tool_render_registry.py"
+            ),
+            description=(
+                "_DESCRIPTORS must cover every Venom tool kind. "
+                "Missing a descriptor silently routes that tool "
+                "through the default fallback and loses CC-verb "
+                "formatting — defeats Gap #2's 'no hardcoded "
+                "if/elif chains downstream' contract."
+            ),
+            validate=_validate_descriptor_completeness,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="tool_render_policy_di_cage",
+            target_file=(
+                "backend/core/ouroboros/battle_test/tool_render_policy.py"
+            ),
+            description=(
+                "tool_render_policy.py must NOT top-level-import "
+                "the stateful posture surfaces "
+                "(posture_observer / posture_store / posture_health). "
+                "Lazy imports inside Default*Provider methods are "
+                "allowed; top-level imports defeat the layered "
+                "design and create circular-dependency risk."
+            ),
+            validate=_validate_policy_di_cage,
+        ),
+    ]

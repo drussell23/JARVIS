@@ -76,20 +76,33 @@ def test_schema_version_pinned():
     assert TOOL_RENDER_VIEW_SCHEMA_VERSION == "tool_render_view.v1"
 
 
-def test_master_flag_off_by_default():
-    """Slice 5 graduation will flip this; Slice 4 ships default-off."""
-    assert is_master_flag_enabled() is False
+def test_master_flag_on_by_default_post_graduation():
+    """Slice 5 graduation flipped this default-true (2026-05-04).
+    Operators opt OUT via ``=false`` / ``=0`` / ``=off``."""
+    assert is_master_flag_enabled() is True
 
 
 @pytest.mark.parametrize("raw,expected", [
+    # Empty / unset → default ON post-graduation
+    ("", True),
+    # Truthy values
     ("true", True), ("True", True), ("TRUE", True),
     ("1", True), ("yes", True), ("on", True),
-    ("false", False), ("0", False), ("", False),
-    ("garbage", False),
+    # Garbage that isn't a recognized off-token → default ON
+    ("garbage", True), ("maybe", True),
+    # Off-tokens
+    ("false", False), ("False", False),
+    ("0", False), ("no", False), ("off", False),
 ])
 def test_master_flag_parsing(monkeypatch, raw, expected):
     monkeypatch.setenv(MASTER_FLAG_ENV_VAR, raw)
     assert is_master_flag_enabled() is expected
+
+
+def test_master_flag_unset_is_on():
+    """Defensive: unset (env var not present at all) → default ON."""
+    # The autouse fixture deletes the env var before this test.
+    assert is_master_flag_enabled() is True
 
 
 # ===========================================================================
@@ -414,7 +427,10 @@ def test_compose_escapes_brackets_in_body_lines():
 # ===========================================================================
 
 
-def test_compose_if_enabled_returns_none_when_flag_off():
+def test_compose_if_enabled_returns_none_when_flag_off(monkeypatch):
+    """Post-graduation default is ON — operators must explicitly
+    set ``=false`` to disable."""
+    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "false")
     out = compose_if_enabled(
         "read_file", "foo.py", "x",
         explicit_density=_density(),
@@ -422,8 +438,8 @@ def test_compose_if_enabled_returns_none_when_flag_off():
     assert out is None
 
 
-def test_compose_if_enabled_returns_render_when_flag_on(monkeypatch):
-    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "true")
+def test_compose_if_enabled_returns_render_when_flag_on():
+    # No monkeypatch — default-on after graduation.
     out = compose_if_enabled(
         "read_file", "foo.py", "x",
         explicit_density=_density(),

@@ -308,7 +308,6 @@ class BattleTestHarness:
         self._branch_name: Optional[str] = None
         self._intake_service: Any = None
         self._intake_paused: bool = False
-        self._graduation_orchestrator: Any = None
         self._plan_before_execute: bool = (
             os.environ.get("JARVIS_SHOW_PLAN_BEFORE_EXECUTE", "").strip().lower()
             in _TRUTHY
@@ -625,7 +624,6 @@ class BattleTestHarness:
             await self.boot_jarvis_tiers()
             self._branch_name = await self.create_branch()
             await self.boot_intake()
-            await self.boot_graduation()
 
             # Wire SerpentApprovalProvider — wraps the inner CLIApprovalProvider
             # with diff preview + interactive [Y/n] Iron Gate prompt when
@@ -1667,18 +1665,6 @@ class BattleTestHarness:
             logger.info("IntakeLayerService booted")
         except Exception as exc:
             logger.warning("IntakeLayerService failed to boot: %s", exc)
-
-    async def boot_graduation(self) -> None:
-        """Create GraduationOrchestrator."""
-        try:
-            from backend.core.ouroboros.governance.graduation_orchestrator import (
-                GraduationOrchestrator,
-            )
-
-            self._graduation_orchestrator = GraduationOrchestrator()
-            logger.info("GraduationOrchestrator booted")
-        except Exception as exc:
-            logger.warning("GraduationOrchestrator failed to boot: %s", exc)
 
     # ------------------------------------------------------------------
     # REPL command handler
