@@ -701,7 +701,17 @@ class LiveFireSoakHarness:
         session_id = str(summary.get("session_id") or "unknown")
         cost_total = _safe_float(summary.get("cost_total"))
         duration_s = _safe_float(summary.get("duration_s"))
-        ops_count = _safe_int(summary.get("ops_count"))
+        # Slice 4 latent-bug fix (2026-05-05): summary.json schema
+        # does NOT emit a top-level ``ops_count`` field; canonical
+        # count lives at ``strategic_drift.total_ops``. Compose the
+        # graduation_contract canonical reader so the evidence row
+        # and the contract predicate read THE SAME source-of-truth.
+        # Lazy-imported to avoid a startup cycle (graduation_contract
+        # is in the same package and may import sibling modules).
+        from backend.core.ouroboros.governance.graduation.graduation_contract import (  # noqa: E501
+            _session_ops_count,
+        )
+        ops_count = _session_ops_count(summary)
         failure_counts_raw = summary.get("failure_class_counts") or {}
         failure_counts = self._truncate_failure_counts(failure_counts_raw)
         evidence = EvidenceRow(

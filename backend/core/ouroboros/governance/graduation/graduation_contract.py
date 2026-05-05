@@ -114,6 +114,55 @@ def default_clean_predicate(summary: Mapping[str, Any]) -> bool:
     return True
 
 
+def _session_ops_count(summary: Mapping[str, Any]) -> int:
+    """Canonical reader for "how many ops did this session run."
+
+    Slice 4 latent-bug fix (2026-05-05): the battle-test
+    ``summary.json`` schema does NOT emit a top-level
+    ``ops_count`` field. The canonical session-level op count
+    lives at ``summary.strategic_drift.total_ops`` (computed by
+    ``GoalActivityLedger.compute_drift`` in ``harness.py``). Both
+    pre-existing predicates were reading the non-existent
+    top-level ``ops_count`` key, silently zeroing every Phase 9
+    soak's evidence and masking real op activity (verified via
+    debug.log on bt-2026-05-05-224545: 16 ops fired including 3
+    cadence_synthetic; ``strategic_drift.total_ops=16`` but the
+    legacy reader returned 0 → contract downgraded CLEAN→RUNNER
+    forever).
+
+    Reuse-before-inventing: ``strategic_drift.total_ops`` is the
+    canonical authoritative count; this helper composes it with
+    a top-level ``ops_count`` read for forward-compat (when the
+    harness's ``save_summary`` path eventually emits ops_count
+    explicitly, the helper will pick it up first; until then the
+    fallback closes the gap).
+
+    Pure function. NEVER raises. Returns 0 on any malformed
+    input.
+    """
+    if not isinstance(summary, dict):
+        return 0
+    # Forward-compat: top-level ``ops_count`` if/when the harness
+    # emits it. Today (2026-05-05) this returns 0 for every
+    # session; the fallback below carries the load.
+    try:
+        top = int(summary.get("ops_count", 0))
+        if top > 0:
+            return top
+    except (TypeError, ValueError):
+        pass
+    # Canonical fallback: strategic_drift.total_ops. This is the
+    # field the harness ACTUALLY emits for the "how many ops did
+    # this session run" question.
+    drift = summary.get("strategic_drift")
+    if isinstance(drift, dict):
+        try:
+            return max(0, int(drift.get("total_ops", 0)))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def predicate_requires_decision_trace_rows(
     summary: Mapping[str, Any],
 ) -> bool:
@@ -122,17 +171,16 @@ def predicate_requires_decision_trace_rows(
     session (i.e., the substrate ACTUALLY fired, not just had its
     flag set).
 
-    Reads ``ops_count`` as a coarse proxy for "the session generated
-    SOME decisions to record." A more precise variant would inspect
+    Reads the canonical session ops count via
+    :func:`_session_ops_count` (which composes
+    ``strategic_drift.total_ops`` per the Slice 4 latent-bug fix).
+    A more precise variant would inspect
     ``.jarvis/decision_trace.jsonl`` — deferred to P9.5 producer
     wiring; for now the proxy is good enough for graduation.
     """
     if not default_clean_predicate(summary):
         return False
-    try:
-        return int(summary.get("ops_count", 0)) >= 1
-    except (TypeError, ValueError):
-        return False
+    return _session_ops_count(summary) >= 1
 
 
 def predicate_requires_curiosity_hypothesis(
@@ -143,8 +191,8 @@ def predicate_requires_curiosity_hypothesis(
 
     Reads ``curiosity_hypotheses_generated`` from summary.json
     (populated by the engine's per-cycle counter). Falls back to
-    ``ops_count`` proxy if absent (defends against pre-instrumentation
-    sessions)."""
+    the canonical ops-count proxy via :func:`_session_ops_count`
+    if absent (defends against pre-instrumentation sessions)."""
     if not default_clean_predicate(summary):
         return False
     h_count = summary.get("curiosity_hypotheses_generated")
@@ -155,10 +203,7 @@ def predicate_requires_curiosity_hypothesis(
             return False
     # Pre-instrumentation fallback: any non-zero ops session is
     # plausibly hypothesis-eligible.
-    try:
-        return int(summary.get("ops_count", 0)) >= 1
-    except (TypeError, ValueError):
-        return False
+    return _session_ops_count(summary) >= 1
 
 
 # ---------------------------------------------------------------------------
