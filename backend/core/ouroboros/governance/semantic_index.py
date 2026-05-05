@@ -2586,6 +2586,19 @@ class SemanticIndex:
     # Diagnostics
     # ------------------------------------------------------------------
 
+    def snapshot_global_centroid(self) -> Tuple[float, ...]:
+        """Read-only snapshot of the recency-weighted global
+        centroid. Returns an empty tuple when the index is
+        empty / not yet built. Used by Move 7 Cross-op Semantic
+        Budget recorder (PRD §29.4 Slice 2, 2026-05-05) to
+        capture the codebase semantic state at COMPLETE phase
+        boundary for cross-op drift integration. NEVER raises."""
+        try:
+            with self._lock:
+                return tuple(self._centroid)
+        except Exception:  # noqa: BLE001 — defensive
+            return tuple()
+
     def stats(self) -> IndexStats:
         """Snapshot of counters. Never contains content or vectors."""
         with self._lock:

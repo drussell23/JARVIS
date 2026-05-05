@@ -176,6 +176,14 @@ EVENT_TYPE_DECISION_DRIFT_DETECTED = "decision_drift_detected"
 # phases (VALIDATING / COMMITTING / etc.) — chatter suppression.
 EVENT_TYPE_M10_PROPOSAL_EMITTED = "m10_proposal_emitted"
 
+# Move 7 — Cross-op Semantic Budget (PRD §29.4) Slice 3 vocabulary.
+# Fired by `CrossOpSemanticBudgetObserver` at verdict-ladder
+# TRANSITIONS only (chatter-suppressed; same-verdict ticks are
+# silent). Payload carries verdict + prev_verdict + integrated_drift
+# + threshold + approaching_band + centroids_seen + ts_unix.
+# Operators subscribe once and route on payload.verdict.
+EVENT_TYPE_SEMANTIC_BUDGET_CHANGED = "semantic_budget_changed"
+
 # Priority 1 Slice 4 — confidence-aware execution event vocabulary
 # (PRD §26.5.1). Severity-tiered: P1 = breaker fired (above-floor abort),
 # P2 = approaching floor (early warning), P3 = sustained low-confidence
@@ -2156,6 +2164,49 @@ def publish_memory_pressure_event(
 # ---------------------------------------------------------------------------
 # Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 publisher
 # ---------------------------------------------------------------------------
+
+
+def publish_semantic_budget_event(
+    *,
+    verdict: str,
+    prev_verdict: str,
+    integrated_drift: float,
+    threshold: float,
+    approaching_band: float,
+    centroids_seen: int,
+    ts_unix: float,
+) -> Optional[str]:
+    """Best-effort publisher for ``semantic_budget_changed``
+    frames (PRD §29.4 Move 7 Slice 3, 2026-05-05). Fired by
+    :class:`CrossOpSemanticBudgetObserver` at verdict-ladder
+    transitions only — chatter-suppressed (same-verdict ticks
+    are silent).
+
+    NEVER raises; returns the published event id or None on
+    master-flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        payload: Dict[str, Any] = {
+            "verdict": verdict or "",
+            "prev_verdict": prev_verdict or "",
+            "integrated_drift": float(integrated_drift),
+            "threshold": float(threshold),
+            "approaching_band": float(approaching_band),
+            "centroids_seen": int(centroids_seen),
+            "ts_unix": float(ts_unix),
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_SEMANTIC_BUDGET_CHANGED,
+            "semantic_budget",
+            payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] semantic_budget_changed publish "
+            "exception", exc_info=True,
+        )
+        return None
 
 
 def publish_m10_proposal_event(
