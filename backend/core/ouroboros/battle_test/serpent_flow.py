@@ -1765,11 +1765,14 @@ class SerpentFlow:
         # is fallback-only (model-emitted preambles win); when the model
         # didn't emit one, we render a deterministic per-tool template.
         # NEVER raises — failures pass through with empty preamble.
+        # Default-TRUE post Slice 5 graduation (2026-05-04). Operators
+        # disable per-tool narration via ``=false`` or via
+        # ``/narrate off``.
         if not preamble:
             try:
                 _fallback_on = os.environ.get(
-                    "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED", "",
-                ).strip().lower() in ("1", "true", "yes", "on")
+                    "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED", "true",
+                ).strip().lower() not in ("0", "false", "no", "off")
                 if _fallback_on:
                     from backend.core.ouroboros.governance.tool_preamble_synthesizer import (
                         synthesize_preamble,
@@ -4511,9 +4514,14 @@ class SerpentREPL:
                     # dispatches by ref prefix:
                     #   t-N → tool result body (Gap #2 BoundedBodyStore)
                     #   d-N → diff archive entry (Gap #4 DiffArchive)
-                    #   o-N → op block buffer (this slice)
+                    #   o-N → op block buffer (Gap #3)
+                    #   n-N → narrative frame (Gap #6 Slice 4)
                     if line.startswith("/expand") or line.startswith("expand "):
                         self._handle_expand(line)
+                        continue
+                    # Gap #6 Slice 4 — /narrate density control
+                    if line.startswith("/narrate") or line.startswith("narrate "):
+                        self._handle_narrate(line)
                         continue
 
                     # Runtime configuration commands
@@ -5627,6 +5635,105 @@ class SerpentREPL:
             return
         # Pick the most recent (last in oldest→newest tuple)
         self._expand_op_block(matches[-1].ref)
+
+    def _expand_narrative_frame(self, ref: str) -> None:
+        """Gap #6 Slice 4 — re-render an archived narrative frame
+        (kind=INTENT/PLAN_PROSE/TOOL_PREAMBLE/THINKING/L2/POSTMORTEM)
+        with the strict visual hierarchy from
+        :func:`narrative_renderer.compose`."""
+        try:
+            from backend.core.ouroboros.battle_test.narrative_channel import (
+                get_default_channel,
+            )
+            from backend.core.ouroboros.battle_test.narrative_renderer import (
+                render_to_console,
+            )
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/expand narrative unavailable: "
+                f"{exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        frame = get_default_channel().lookup(ref)
+        if frame is None:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No narrative frame for {ref}[/{_C['heal']}]",
+                highlight=False,
+            )
+            return
+        self._flow.console.print(
+            f"  [{_C['neural']}]⏺ Narrative[/{_C['neural']}] "
+            f"[{_C['dim']}]{ref} · {frame.op_id} · {frame.kind.value} · "
+            f"{frame.state.value}[/{_C['dim']}]",
+            highlight=False,
+        )
+        render_to_console(
+            frame, self._flow.console,
+            op_active=frame.op_id in self._flow._active_ops,
+            max_chars_per_line=80,
+        )
+
+    # ── Gap #6 Slice 4 — /narrate REPL verb ─────────────────────
+
+    _NARRATE_DENSITIES = ("off", "preambles", "on", "verbose")
+
+    def _handle_narrate(self, line: str) -> None:
+        """``/narrate {off|preambles|on|verbose}`` controls density:
+
+          * ``off``       — silent: no model voice surfaced
+          * ``preambles`` — only synthesized 🗣 tool preambles
+          * ``on``        — preambles + intent + plan prose (default
+                            after Slice 5 graduation)
+          * ``verbose``   — adds extended-thinking 🤔 streams
+
+        Sets ``JARVIS_NARRATIVE_DENSITY`` so subsystem readers see
+        consistent state. NEVER raises.
+        """
+        parts = line.replace("/narrate", "narrate", 1).split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            current = os.environ.get(
+                "JARVIS_NARRATIVE_DENSITY", "(unset — defaults to 'on')",
+            )
+            self._flow.console.print(
+                f"  [{_C['neural']}]Narrative density:[/{_C['neural']}] {current}\n"
+                f"  [{_C['dim']}]Usage: /narrate "
+                f"{' | '.join(self._NARRATE_DENSITIES)}[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        density = parts[1].strip().lower()
+        if density not in self._NARRATE_DENSITIES:
+            self._flow.console.print(
+                f"  [{_C['death']}]Invalid density {density!r}. "
+                f"Choose: {', '.join(self._NARRATE_DENSITIES)}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        os.environ["JARVIS_NARRATIVE_DENSITY"] = density
+        # Compose the per-density env state. The downstream subsystems
+        # (intent_prompter / preamble synthesizer / channel) read these
+        # individual flags so the operator can tune via /narrate without
+        # touching env vars manually.
+        if density == "off":
+            os.environ["JARVIS_NARRATIVE_INTENT_ENABLED"] = "false"
+            os.environ["JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"] = "false"
+        elif density == "preambles":
+            os.environ["JARVIS_NARRATIVE_INTENT_ENABLED"] = "false"
+            os.environ["JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"] = "true"
+        elif density == "on":
+            os.environ["JARVIS_NARRATIVE_INTENT_ENABLED"] = "true"
+            os.environ["JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"] = "true"
+        elif density == "verbose":
+            os.environ["JARVIS_NARRATIVE_INTENT_ENABLED"] = "true"
+            os.environ["JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED"] = "true"
+            # Verbose enables extended-thinking surfacing too (read by
+            # provider-side wiring when present)
+            os.environ["JARVIS_NARRATIVE_THINKING_VERBOSE"] = "true"
+        self._flow.console.print(
+            f"  [{_C['evolved']}]Narrative density set to {density}[/{_C['evolved']}]",
+            highlight=False,
+        )
 
     # ── Gap #4 Slice 4 — IDE-native review verbs ────────────────
 

@@ -88,10 +88,11 @@ _MAX_MAX_TOKENS: int = 200
 
 
 def is_master_flag_enabled() -> bool:
-    """``JARVIS_NARRATIVE_INTENT_ENABLED``. Default false during slice;
-    Slice 5 graduates to true. NEVER raises."""
-    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "")
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    """``JARVIS_NARRATIVE_INTENT_ENABLED``. **Default true** post Slice 5
+    graduation (2026-05-04). Operators set ``=false`` to suppress the
+    intent prompt's micro-LLM call at op_started. NEVER raises."""
+    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def read_timeout_s() -> float:

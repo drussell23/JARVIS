@@ -169,13 +169,18 @@ def test_intent_schema_version():
     assert INTENT_PROMPTER_SCHEMA_VERSION == "intent_prompter.v1"
 
 
-def test_intent_master_flag_default_off():
-    assert is_master_flag_enabled() is False
+def test_intent_master_flag_default_on_post_graduation():
+    """Slice 5 graduation flipped this default-true (2026-05-04)."""
+    assert is_master_flag_enabled() is True
 
 
 @pytest.mark.parametrize("raw,expected", [
+    # Empty / unset → default ON post-graduation
+    ("", True),
     ("true", True), ("1", True), ("on", True), ("yes", True),
-    ("false", False), ("", False), ("garbage", False),
+    ("garbage", True),  # not in off-token set → ON
+    # Off-tokens
+    ("false", False), ("0", False), ("no", False), ("off", False),
 ])
 def test_intent_master_flag_parsing(monkeypatch, raw, expected):
     monkeypatch.setenv(MASTER_FLAG_ENV_VAR, raw)
