@@ -3668,6 +3668,45 @@ class GovernedOrchestrator:
                 # l2 escape / iron gate failure / etc.)
                 return _generate_result.next_ctx
             ctx = _generate_result.next_ctx
+            # ── M9 Slice 5b — feed logprob-entropy producer ──
+            # Convert ConfidenceMonitor's rolling-mean margin into an
+            # entropy-shaped signal: high margin → confident model →
+            # low entropy; low margin → uncertain → high entropy.
+            # ``entropy_normalized = clamp(1.0 - margin, 0, 1)`` is the
+            # cheap-and-honest mapping (not Shannon entropy, but
+            # monotonic in the same direction). Feeds M9's
+            # CuriosityCollector once per target_file via the
+            # producer bridge — lazy-imported, master-flag-gated,
+            # exception-isolated. NEVER raises out.
+            try:
+                from backend.core.ouroboros.governance.curiosity_producer_bridge import (  # noqa: E501
+                    feed_logprob_entropy as _m9_feed_entropy,
+                )
+                _m9_monitor = (
+                    ctx.artifacts.get("confidence_monitor")
+                    if hasattr(ctx, "artifacts") else None
+                )
+                if _m9_monitor is not None:
+                    _m9_margin = _m9_monitor.current_margin()
+                    if _m9_margin is not None:
+                        _m9_entropy = max(
+                            0.0, min(1.0, 1.0 - float(_m9_margin)),
+                        )
+                        _m9_targets = (
+                            tuple(ctx.target_files)
+                            if getattr(ctx, "target_files", None)
+                            else ("_global",)
+                        )
+                        for _m9_target in _m9_targets:
+                            _m9_feed_entropy(
+                                region_or_path=str(_m9_target),
+                                entropy_normalized=_m9_entropy,
+                                op_id=str(
+                                    getattr(ctx, "op_id", ""),
+                                ),
+                            )
+            except Exception:  # noqa: BLE001 — defensive
+                pass
         else:
             if _serpent: _serpent.update_phase("GENERATE")
             # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
@@ -7495,6 +7534,55 @@ class GovernedOrchestrator:
                 except Exception:
                     logger.debug(
                         "[Orchestrator] cluster cascade observer call failed",
+                        exc_info=True,
+                    )
+
+                # ── M9 Slice 5b — feed prophecy-error producer ──
+                # Read ProphecyEngine's cached per-file risk scores
+                # (set at CLASSIFY via consciousness_bridge.assess_-
+                # regression_risk) and feed (predicted_risk,
+                # verify_passed) tuples to M9 via the producer
+                # bridge. Bridge computes ``error_magnitude =
+                # abs(predicted_risk - actual_outcome_indicator)`` —
+                # high when Prophecy was wrong → high curiosity for
+                # that file's cluster. Lazy-imported, master-flag-
+                # gated, exception-isolated. NEVER raises out.
+                try:
+                    from backend.core.ouroboros.governance.curiosity_producer_bridge import (  # noqa: E501
+                        feed_prophecy_error as _m9_feed_prophecy,
+                    )
+                    _m9_prophecy_engine = None
+                    _m9_gls = getattr(
+                        self._stack, "governed_loop_service", None,
+                    )
+                    if _m9_gls is not None:
+                        _m9_cb = getattr(
+                            _m9_gls, "_consciousness_bridge", None,
+                        )
+                        if _m9_cb is not None:
+                            _m9_prophecy_engine = getattr(
+                                _m9_cb, "_prophecy_engine", None,
+                            ) or getattr(
+                                _m9_cb, "prophecy_engine", None,
+                            )
+                    if _m9_prophecy_engine is not None:
+                        _m9_risk_scores = (
+                            _m9_prophecy_engine.get_risk_scores()
+                        )
+                        for _m9_path, _m9_risk in (
+                            _m9_risk_scores or {}
+                        ).items():
+                            _m9_feed_prophecy(
+                                region_or_path=str(_m9_path),
+                                predicted_risk=float(_m9_risk),
+                                verify_passed=bool(
+                                    _verify_test_passed,
+                                ),
+                                op_id=str(ctx.op_id),
+                            )
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] M9 prophecy-error feed failed",
                         exc_info=True,
                     )
 
