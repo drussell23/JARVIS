@@ -3628,6 +3628,30 @@ SEED_SPECS: list = [
         since="Slice 5b Slice 2 (PRD §32.5, 2026-05-04)",
     ),
     FlagSpec(
+        name="JARVIS_OBSERVABILITY_AUTODISCOVERY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the observability route "
+            "auto-discovery substrate (PRD §32.5 / §32.11 "
+            "Slice 5b consolidation Slice 3). When true (the "
+            "default), event_channel boot calls "
+            "discover_and_mount_observability_routes which "
+            "auto-mounts every module-level register_routes "
+            "across the curated provider packages — closing "
+            "5+ dormant observability surfaces structurally. "
+            "When false, the legacy explicit register_routes "
+            "blocks in event_channel.py carry the load "
+            "(preserved for instant rollback)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "observability_route_registry.py"
+        ),
+        example="true",
+        since="Slice 5b Slice 3 (PRD §32.5, 2026-05-04)",
+    ),
+    FlagSpec(
         name="JARVIS_M10_APPROVAL_TIMEOUT_S",
         type=FlagType.FLOAT, default=86_400.0,
         description=(

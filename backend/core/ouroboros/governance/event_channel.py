@@ -770,6 +770,61 @@ class EventChannelServer:
                     "wiring failed: %s", ao_exc,
                 )
 
+            # Slice 5b consolidation Slice 3 — observability route
+            # auto-discovery (PRD §32.5 / §32.11). Walks the curated
+            # provider packages for module-level
+            # ``register_routes(app, **kwargs)`` callables and mounts
+            # each. Idempotent at module-name granularity, so the
+            # explicit blocks above are NOT double-mounted (they
+            # short-circuit on already_mounted). Gates on
+            # ``JARVIS_OBSERVABILITY_AUTODISCOVERY_ENABLED`` (default
+            # true). When master flag is off, the legacy explicit
+            # blocks above carry the load (instant rollback).
+            try:
+                from backend.core.ouroboros.governance.ide_observability import (  # noqa: E501
+                    IDEObservabilityRouter as _IDEObsRouterAuto,
+                    assert_loopback_only as _assert_loopback_auto,
+                )
+                from backend.core.ouroboros.governance.observability_route_registry import (  # noqa: E501
+                    discover_and_mount_observability_routes,
+                    observability_autodiscovery_enabled,
+                )
+                if observability_autodiscovery_enabled():
+                    _assert_loopback_auto(self._host)
+                    _auto_helper = _IDEObsRouterAuto()
+                    auto_report = (
+                        discover_and_mount_observability_routes(
+                            app,
+                            rate_limit_check=lambda req: (
+                                _auto_helper._check_rate_limit(
+                                    _auto_helper._client_key(req),
+                                )
+                            ),
+                            cors_headers=_auto_helper._cors_headers,
+                        )
+                    )
+                    logger.info(
+                        "[EventChannel] auto-mounted %d "
+                        "observability surface(s) via registry "
+                        "(skipped: %d already-mounted, "
+                        "%d signature-rejected, "
+                        "%d handler-failed)",
+                        auto_report.mounted_count,
+                        auto_report.already_mounted,
+                        auto_report.signature_rejected,
+                        auto_report.handler_failed,
+                    )
+            except ValueError as auto_loopback_exc:
+                logger.warning(
+                    "[EventChannel] observability auto-discovery "
+                    "refused: %s", auto_loopback_exc,
+                )
+            except Exception as auto_exc:  # noqa: BLE001
+                logger.warning(
+                    "[EventChannel] observability auto-discovery "
+                    "failed: %s", auto_exc,
+                )
+
             # Inline Permission Slice 5 — observability router + bridge.
             # Loopback + CORS invariants mirror the existing IDE surface;
             # authority invariant (no orchestrator / gate imports) is

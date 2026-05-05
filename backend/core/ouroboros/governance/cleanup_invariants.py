@@ -262,6 +262,50 @@ def _validate_archive_provenance(
 # ---------------------------------------------------------------------------
 
 
+def _validate_observability_module_exposes_register_routes(
+    tree: "ast.Module", source: str,  # noqa: ARG001
+) -> tuple:
+    """Slice 3 (Slice 5b consolidation arc) — every module
+    whose filename ends in ``_observability.py`` MUST expose a
+    module-level ``register_routes`` callable so the auto-mount
+    registry can pick it up by naming convention.
+
+    Module-level requirement only — class methods named
+    ``register_routes`` (Pattern B) don't satisfy this pin
+    because the auto-discovery path is for stateless functions.
+    Pre-existing class-based router modules are excluded by
+    naming (their files don't end in ``_observability.py`` —
+    they end in ``_router.py`` etc.).
+    """
+    violations: list = []
+    has_module_level_register_routes = False
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "register_routes":
+                has_module_level_register_routes = True
+                break
+        elif isinstance(node, ast.Assign):
+            # Allow alias declarations like
+            # ``register_routes = register_action_outcome_routes``
+            for tgt in node.targets:
+                if (
+                    isinstance(tgt, ast.Name)
+                    and tgt.id == "register_routes"
+                ):
+                    has_module_level_register_routes = True
+                    break
+            if has_module_level_register_routes:
+                break
+    if not has_module_level_register_routes:
+        violations.append(
+            "module-level ``register_routes`` callable missing "
+            "— required by §32.11 Slice 3 naming convention so "
+            "the observability_route_registry auto-discovery "
+            "can mount this surface"
+        )
+    return tuple(violations)
+
+
 def _validate_consumer_uses_primitive(
     tree: "ast.Module", source: str,
 ) -> tuple:
@@ -445,6 +489,118 @@ def register_shipped_invariants() -> list:
                 "MUST delegate to module_discovery."
                 "discover_module_provided_callable (no parallel "
                 "walker). Slice 5b consolidation Slice 2."
+            ),
+            validate=_validate_consumer_uses_primitive,
+        ),
+        # ----------------------------------------------------
+        # Slice 5b consolidation Slice 3 — every
+        # ``*_observability.py`` MUST expose canonical
+        # ``register_routes`` so auto-discovery picks it up.
+        # ----------------------------------------------------
+        ShippedCodeInvariant(
+            invariant_name=(
+                "observability_module_exposes_register_routes_"
+                "decisions"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "decisions_observability.py"
+            ),
+            description=(
+                "decisions_observability.py MUST expose a "
+                "module-level ``register_routes`` callable for "
+                "observability_route_registry auto-mount "
+                "(§32.11 Slice 3)."
+            ),
+            validate=(
+                _validate_observability_module_exposes_register_routes  # noqa: E501
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "observability_module_exposes_register_routes_"
+                "curiosity"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "curiosity_observability.py"
+            ),
+            description=(
+                "curiosity_observability.py MUST expose a "
+                "module-level ``register_routes`` callable "
+                "(§32.11 Slice 3)."
+            ),
+            validate=(
+                _validate_observability_module_exposes_register_routes  # noqa: E501
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "observability_module_exposes_register_routes_"
+                "epistemic_budget"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "epistemic_budget_observability.py"
+            ),
+            description=(
+                "epistemic_budget_observability.py MUST expose "
+                "a module-level ``register_routes`` callable "
+                "(§32.11 Slice 3)."
+            ),
+            validate=(
+                _validate_observability_module_exposes_register_routes  # noqa: E501
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "observability_module_exposes_register_routes_"
+                "action_outcome"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "action_outcome_memory_observability.py"
+            ),
+            description=(
+                "action_outcome_memory_observability.py MUST "
+                "expose a module-level ``register_routes`` "
+                "callable (alias of register_action_outcome_-"
+                "routes is acceptable; §32.11 Slice 3)."
+            ),
+            validate=(
+                _validate_observability_module_exposes_register_routes  # noqa: E501
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "observability_module_exposes_register_routes_m10"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/m10/"
+                "observability.py"
+            ),
+            description=(
+                "m10/observability.py MUST expose a "
+                "module-level ``register_routes`` callable "
+                "(§32.11 Slice 3)."
+            ),
+            validate=(
+                _validate_observability_module_exposes_register_routes  # noqa: E501
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "observability_route_registry_uses_primitive"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "observability_route_registry.py"
+            ),
+            description=(
+                "observability_route_registry.py MUST delegate "
+                "to module_discovery.discover_module_provided_-"
+                "callable (no parallel walker). Slice 5b "
+                "consolidation Slice 3."
             ),
             validate=_validate_consumer_uses_primitive,
         ),

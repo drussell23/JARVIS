@@ -111,9 +111,11 @@ def test_walks_real_governance_for_register_shipped_invariants():
     cleanup_pins = captured.get(
         "backend.core.ouroboros.governance.cleanup_invariants", [],
     )
-    # 4 archive-only pins + 3 consumer-uses-primitive pins
-    assert len(cleanup_pins) == 7
-    assert report.discovered_count >= 15
+    # 4 archive-only + 3 consumer-uses-primitive
+    # + 5 observability-module-exposes-register_routes
+    # + 1 observability_route_registry_uses_primitive = 13
+    assert len(cleanup_pins) == 13
+    assert report.discovered_count >= 20
     assert report.modules_scanned >= 2
     assert report.elapsed_s > 0.0
 

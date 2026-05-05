@@ -266,7 +266,7 @@ class _ActionOutcomeRoutesHandler:
 # ---------------------------------------------------------------------------
 
 
-def register_action_outcome_routes(
+def register_routes(
     app: Any,
     *,
     rate_limit_check: Optional[Callable[[Any], bool]] = None,
@@ -279,6 +279,14 @@ def register_action_outcome_routes(
       * ``GET /observability/action-outcomes`` — overview + recent
       * ``GET /observability/action-outcomes/cluster/{id}`` —
         per-cluster lookup
+
+    Renamed from ``register_action_outcome_routes`` to the
+    canonical ``register_routes`` convention in Slice 5b
+    consolidation Slice 3 (PRD §32.5) so the
+    :mod:`observability_route_registry` auto-discovery surface
+    can pick it up by naming convention. Backward-compatible
+    alias retained below for callers that still reference the
+    old name.
     """
     handler = _ActionOutcomeRoutesHandler(
         rate_limit_check=rate_limit_check,
@@ -294,6 +302,13 @@ def register_action_outcome_routes(
     )
 
 
+# Backward-compatible alias — keeps existing callers working
+# during the auto-discovery transition. New code MUST use
+# ``register_routes``.
+register_action_outcome_routes = register_routes
+
+
 __all__ = [
     "register_action_outcome_routes",
+    "register_routes",
 ]
