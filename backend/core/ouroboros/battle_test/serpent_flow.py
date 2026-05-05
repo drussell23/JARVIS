@@ -1234,6 +1234,17 @@ class SerpentFlow:
             set_terminal_title(title)
         except Exception:
             pass  # never blocks the lifecycle path
+        # Typing-responsiveness fix: with refresh_interval=None, the
+        # toolbar only redraws on input events + explicit invalidate.
+        # State transitions where cost / phase / op-id change must
+        # fire invalidate so operators see fresh state immediately.
+        try:
+            from backend.core.ouroboros.battle_test.live_status_line import (
+                invalidate_app,
+            )
+            invalidate_app()
+        except Exception:
+            pass
 
     # ── Gap #6 Slice 4: intent-prompt fire-and-forget helper ──────
 
@@ -4300,6 +4311,14 @@ class SerpentREPL:
     async def stop(self) -> None:
         """Gracefully shut down the REPL."""
         self._running = False
+        # Stop the spinner invalidator first so its task doesn't
+        # outlive the REPL session.
+        try:
+            invalidator = getattr(self, "_spinner_invalidator", None)
+            if invalidator is not None:
+                invalidator.stop()
+        except Exception:
+            pass
         if self._task is not None:
             self._task.cancel()
             try:
@@ -4535,6 +4554,28 @@ class SerpentREPL:
         except Exception:
             pass  # fail-closed — REPL still works without completion
 
+        # Typing-responsiveness fix Slice 2 (2026-05-05): switch to
+        # event-driven invalidation. Setting refresh_interval=None
+        # eliminates the per-100ms background redraw that contended
+        # with key events. Spinner animation is restored by the
+        # SpinnerInvalidator task started below — fires invalidate()
+        # only while a spinner is active, so idle typing has zero
+        # background tick overhead. Operators set
+        # JARVIS_REPL_AUTO_REFRESH_ENABLED=true to restore the
+        # legacy refresh_interval model if a downstream mechanic
+        # breaks under event-driven mode.
+        try:
+            from backend.core.ouroboros.battle_test.live_status_line import (
+                is_auto_refresh_enabled,
+            )
+            _refresh_interval_kwarg = (
+                _REPL_REFRESH_INTERVAL_S
+                if is_auto_refresh_enabled()
+                else None
+            )
+        except Exception:
+            _refresh_interval_kwarg = _REPL_REFRESH_INTERVAL_S
+
         self._session = PromptSession(
             multiline=True,
             key_bindings=_repl_bindings,
@@ -4542,9 +4583,34 @@ class SerpentREPL:
             auto_suggest=None,
             prompt_continuation=_continuation,
             bottom_toolbar=_live_bottom_toolbar,
-            refresh_interval=_REPL_REFRESH_INTERVAL_S,
+            refresh_interval=_refresh_interval_kwarg,
             **_completion_kwargs,
         )
+
+        # Spinner invalidator — fires invalidate() at frame cadence
+        # WHILE the spinner is active, no-op while idle. Replaces the
+        # refresh_interval-driven animation without contending with
+        # key events. Best-effort: no invalidator runs when
+        # prompt_toolkit isn't installed.
+        try:
+            from backend.core.ouroboros.battle_test.live_status_line import (
+                SpinnerInvalidator,
+            )
+            _flow_for_spinner = self._flow
+
+            def _spinner_active() -> bool:
+                try:
+                    return bool(_flow_for_spinner._spinner_state.active)
+                except Exception:
+                    return False
+
+            self._spinner_invalidator: Any = SpinnerInvalidator(
+                get_active=_spinner_active,
+                cadence_s=_OUROBOROS_FRAME_INTERVAL_S,
+            )
+            self._spinner_invalidator.start()
+        except Exception:
+            self._spinner_invalidator = None
 
         # raw=True preserves Rich's ANSI escape codes (raw=False would
         # escape them to literal "?[2m" text). With the spinner gate

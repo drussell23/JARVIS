@@ -829,63 +829,31 @@ def discover_module_provided_hooks(
     a ``register_termination_hooks`` callable co-located with
     the consuming code — no edits to this module required.
 
-    NEVER raises. Per-module failures logged + skipped — the
-    discovery loop must not break boot when one module's
-    registration shape is wrong.
+    NEVER raises. Per-module failures logged + skipped.
 
-    Idempotency: if a module's ``register_termination_hooks``
-    is itself idempotent (most aren't — first call registers,
-    second raises ``DuplicateHookNameError``), the discovery
-    loop swallows the second failure. Operators should call
-    once at harness boot."""
-    discovered = 0
+    Implementation: delegates to
+    :func:`module_discovery.discover_module_provided_callable`
+    (Slice 5b consolidation Slice 2, PRD §32.5). Single source of
+    truth for the walk pattern (AST-pinned)."""
     try:
-        from importlib import import_module
-        import pkgutil
-        for pkg_name in _TERMINATION_HOOK_PROVIDER_PACKAGES:
-            try:
-                pkg_mod = import_module(pkg_name)
-                pkg_path = getattr(pkg_mod, "__path__", None)
-                if not pkg_path:
-                    continue
-            except Exception as exc:  # noqa: BLE001 — defensive
-                logger.debug(
-                    "[TerminationHookRegistry] provider package "
-                    "%s unavailable: %s", pkg_name, exc,
-                )
-                continue
-            for _, name, _ispkg in pkgutil.iter_modules(pkg_path):
-                full_name = f"{pkg_name}.{name}"
-                # Skip self to avoid recursion.
-                if full_name == __name__:
-                    continue
-                try:
-                    mod = import_module(full_name)
-                    fn = getattr(
-                        mod, "register_termination_hooks", None,
-                    )
-                    if not callable(fn):
-                        continue
-                    count = fn(registry)
-                    if isinstance(count, int) and count > 0:
-                        discovered += count
-                        logger.debug(
-                            "[TerminationHookRegistry] %s "
-                            "registered %d hook(s)",
-                            full_name, count,
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "[TerminationHookRegistry] discover "
-                        "skipped %s: %s",
-                        full_name, exc,
-                    )
+        from backend.core.ouroboros.governance.meta.module_discovery import (  # noqa: E501
+            discover_module_provided_callable,
+            make_registry_handler,
+        )
     except Exception as exc:  # noqa: BLE001 — defensive
         logger.debug(
-            "[TerminationHookRegistry] "
-            "discover_module_provided_hooks exc: %s", exc,
+            "[TerminationHookRegistry] module_discovery primitive "
+            "unavailable: %s", exc,
         )
-    return discovered
+        return 0
+    report = discover_module_provided_callable(
+        packages=_TERMINATION_HOOK_PROVIDER_PACKAGES,
+        attr_name="register_termination_hooks",
+        handler=make_registry_handler(registry=registry),
+        excluded_modules=(__name__,),
+        log_prefix="TerminationHookRegistry",
+    )
+    return report.discovered_count
 
 
 def discover_and_register_default() -> int:
