@@ -1121,9 +1121,27 @@ def main() -> None:
         pass  # fail-closed: legacy verbose output if suppression fails
 
     # ------------------------------------------------------------------
+    # Boot timing — instrument the heavy phases so optimization is
+    # data-driven (not guesswork). Fires only when verbose mode is on
+    # to keep non-debug runs silent.
+    # ------------------------------------------------------------------
+    try:
+        from backend.core.ouroboros.battle_test.boot_timing import (
+            get_default_timer,
+        )
+        _boot_timer = get_default_timer()
+        _boot_timer.mark("script_logging_configured")
+    except Exception:
+        _boot_timer = None
+
+    # ------------------------------------------------------------------
     # Build config + harness
     # ------------------------------------------------------------------
+    if _boot_timer is not None:
+        _boot_timer.begin("harness_module_import")
     from backend.core.ouroboros.battle_test.harness import BattleTestHarness, HarnessConfig
+    if _boot_timer is not None:
+        _boot_timer.end("harness_module_import")
 
     # Ticket C: when CLI did not specify --headless/--no-headless (args.headless
     # is None), fall back to the env var OUROBOROS_BATTLE_HEADLESS via
@@ -1145,7 +1163,11 @@ def main() -> None:
         branch_prefix=args.branch_prefix,
     )
 
-    harness = BattleTestHarness(config)
+    if _boot_timer is not None:
+        with _boot_timer.phase("harness_construct"):
+            harness = BattleTestHarness(config)
+    else:
+        harness = BattleTestHarness(config)
 
     # ------------------------------------------------------------------
     # Signal handlers
@@ -1161,6 +1183,27 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
+    if _boot_timer is not None:
+        _boot_timer.mark("harness_run_started")
+
+    # Print boot-timing summary on console once subsystems have booted
+    # (best effort — fires after the REPL banner is up). Verbose mode
+    # only — non-verbose runs stay silent.
+    if args.verbose and _boot_timer is not None:
+        async def _emit_boot_timing_after_settle():
+            # Wait briefly for subsystem boot to settle (the harness
+            # boots most layers within ~2s). After that, print the
+            # summary so operators see what was slow.
+            await asyncio.sleep(2.5)
+            try:
+                from rich.console import Console as _C
+                _boot_timer.emit_summary(
+                    console=_C(force_terminal=True), threshold_ms=10.0,
+                )
+            except Exception:
+                pass
+        loop.create_task(_emit_boot_timing_after_settle())
+
     interrupted = False
     try:
         loop.run_until_complete(harness.run())

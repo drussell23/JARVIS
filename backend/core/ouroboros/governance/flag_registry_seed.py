@@ -3628,6 +3628,45 @@ SEED_SPECS: list = [
         since="Slice 5b Slice 2 (PRD §32.5, 2026-05-04)",
     ),
     FlagSpec(
+        name="JARVIS_PHASE10_GRADUATION_CONTRACT_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the Phase 10 graduation "
+            "contract harness (PRD §9 / §32.8.1 / §1610). "
+            "When false, is_ready_for_purge() always returns "
+            "ContractVerdict.DISABLED so the master flag flip "
+            "(JARVIS_TOPOLOGY_SENTINEL_ENABLED) is structurally "
+            "blocked. Production should leave this on; intended "
+            "for operator troubleshooting only."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "phase10_graduation_contract.py"
+        ),
+        example="true",
+        since="Phase 10 Slice 5 (PRD §32.8.1, 2026-05-05)",
+    ),
+    FlagSpec(
+        name="JARVIS_PHASE10_REQUIRED_CLEAN_SESSIONS",
+        type=FlagType.INT, default=3,
+        description=(
+            "Number of consecutive forced-clean once-proofs "
+            "required before the Phase 10 graduation contract "
+            "reports READY_FOR_PURGE. Default 3 per PRD §1612; "
+            "clamped [1, 10]. Lowering below 3 violates "
+            "operator binding and SHOULD NOT be used outside "
+            "test fixtures."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "phase10_graduation_contract.py"
+        ),
+        example="3",
+        since="Phase 10 Slice 5 (PRD §32.8.1, 2026-05-05)",
+    ),
+    FlagSpec(
         name="JARVIS_REPL_DISPATCH_AUTODISCOVERY_ENABLED",
         type=FlagType.BOOL, default=True,
         description=(
