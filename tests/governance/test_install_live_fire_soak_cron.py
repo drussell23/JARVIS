@@ -185,3 +185,81 @@ def test_dry_run_only_one_set_of_cron_env_flags():
             f"flag {flag!r} appeared {count}× in dry-run; expected 1 "
             "(cron line only)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Single-source-of-truth contract — Phase 9 env vars MUST stay in
+# sync across ALL entry points (Wave 3 hygiene 2026-05-05 follow-up).
+# Closes the residual crack: the cron-generator was tested for the
+# 4-var ordering, but the new wrapper script + crontab example were
+# not. This pin asserts ALL entry points carry ALL 4 vars.
+# ---------------------------------------------------------------------------
+
+
+_REQUIRED_PHASE9_ENV_VARS = (
+    "JARVIS_GRADUATION_LEDGER_ENABLED",
+    "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED",
+    "JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT",
+    "JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED",
+)
+
+
+def _read_repo_text(rel_path):
+    base = Path(__file__).resolve().parents[2]
+    return (base / rel_path).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("rel_path", [
+    "scripts/run_live_fire_graduation_soak.sh",
+    "scripts/install_live_fire_soak_cron.sh",
+    "scripts/crontab-live-fire.example",
+])
+def test_phase9_env_vars_present_in_every_entry_point(rel_path):
+    """All 4 Phase 9 env vars MUST appear in every entry point
+    (cron generator + --once + wrapper + crontab example).
+    Adding a 5th env var requires updating ALL files — the
+    operator binding is structural, not documentation-only."""
+    text = _read_repo_text(rel_path)
+    for var in _REQUIRED_PHASE9_ENV_VARS:
+        assert var in text, (
+            f"{rel_path} missing required Phase 9 env var "
+            f"{var!r} — entry points MUST stay in sync per "
+            f"the single-source-of-truth contract"
+        )
+
+
+def test_phase9_wrapper_script_exports_all_four_vars():
+    """The wrapper script `run_live_fire_graduation_soak.sh` MUST
+    `export` (not just inline) all 4 vars so subprocesses
+    inherit them — the parent harness process needs the ledger
+    flag for `GraduationLedger.record_session()` writes."""
+    text = _read_repo_text(
+        "scripts/run_live_fire_graduation_soak.sh",
+    )
+    for var in _REQUIRED_PHASE9_ENV_VARS:
+        assert f"export {var}=true" in text, (
+            f"wrapper MUST `export {var}=true` (parent harness "
+            f"propagation), got just inline assignment"
+        )
+
+
+def test_phase9_crontab_example_uses_inline_per_entry():
+    """The crontab example uses inline `VAR=true VAR=true ...
+    cmd` syntax (no `export`) since cron entries are evaluated
+    fresh per fire. All 4 vars must precede the python invocation
+    on the SAME line so the subprocess inherits them."""
+    text = _read_repo_text("scripts/crontab-live-fire.example")
+    # Find the cron line containing the python3 invocation.
+    cron_lines = [
+        line for line in text.split("\n")
+        if "python3" in line
+        and "live_fire_graduation_soak.py" in line
+    ]
+    assert cron_lines, (
+        "crontab example missing the python3 invocation line"
+    )
+    for line in cron_lines:
+        for var in _REQUIRED_PHASE9_ENV_VARS:
+            assert f"{var}=true" in line, (
+                f"cron line missing {var}=true: {line[:120]}"
+            )
