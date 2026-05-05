@@ -35,6 +35,58 @@ logger = logging.getLogger(__name__)
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
+def _boot_mark(name: str) -> None:
+    """Defensive boot-timing mark. NEVER raises into boot path.
+
+    Lazy imports the timer to keep this module importable when the
+    timing module is unavailable. Marks are zero-duration timestamps
+    that let us compute deltas between adjacent marks.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.boot_timing import (
+            get_default_timer,
+        )
+        get_default_timer().mark(name)
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+
+
+class _BootPhase:
+    """Context manager wrapping ``BootTimer.phase()`` with full
+    defensive isolation. NEVER raises."""
+
+    __slots__ = ("_name", "_timer")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._timer = None
+
+    def __enter__(self) -> "_BootPhase":
+        try:
+            from backend.core.ouroboros.battle_test.boot_timing import (
+                get_default_timer,
+            )
+            self._timer = get_default_timer()
+            self._timer.begin(self._name)
+        except Exception:  # noqa: BLE001
+            self._timer = None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        try:
+            if self._timer is not None:
+                self._timer.end(self._name)
+        except Exception:  # noqa: BLE001
+            pass
+        return False  # don't swallow exceptions
+
+    async def __aenter__(self) -> "_BootPhase":
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        return self.__exit__(exc_type, exc_val, exc_tb)
+
+
 # ---------------------------------------------------------------------------
 # Memory-type decoration (used by /memory Rich renderers)
 # ---------------------------------------------------------------------------
@@ -616,14 +668,22 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             logger.debug("register_ops_digest_observer(boot) failed", exc_info=True)
 
+        _boot_mark("harness_run_pre_boot_done")
         try:
-            # Boot sequence
-            await self.boot_oracle()
-            await self.boot_governance_stack()
-            await self.boot_governed_loop_service()
-            await self.boot_jarvis_tiers()
-            self._branch_name = await self.create_branch()
-            await self.boot_intake()
+            # Boot sequence — each phase wrapped for boot-timing visibility
+            with _BootPhase("boot_oracle"):
+                await self.boot_oracle()
+            with _BootPhase("boot_governance_stack"):
+                await self.boot_governance_stack()
+            with _BootPhase("boot_governed_loop_service"):
+                await self.boot_governed_loop_service()
+            with _BootPhase("boot_jarvis_tiers"):
+                await self.boot_jarvis_tiers()
+            with _BootPhase("create_branch"):
+                self._branch_name = await self.create_branch()
+            with _BootPhase("boot_intake"):
+                await self.boot_intake()
+            _boot_mark("harness_boot_sequence_done")
 
             # Wire SerpentApprovalProvider — wraps the inner CLIApprovalProvider
             # with diff preview + interactive [Y/n] Iron Gate prompt when
@@ -936,6 +996,7 @@ class BattleTestHarness:
             except Exception:  # noqa: BLE001
                 pass
 
+            _boot_mark("harness_main_loop_entered")
             # Wait for first stop signal
             shutdown_waiter = asyncio.ensure_future(self._shutdown_event.wait())
             budget_waiter = asyncio.ensure_future(self._cost_tracker.budget_event.wait())
