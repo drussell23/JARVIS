@@ -11,9 +11,15 @@
 #   JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED — allow forked battle test
 #   JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT — block false CLEAN (0-op, etc.)
 #   JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED — clean DW-topology reject path
+#   OUROBOROS_BATTLE_SEED_INTENTS=3 — Phase 9 Slice 3 synthetic workload
+#       injection so headless cadence soaks actually exercise the FSM
+#       (closes ops_count=0 → P9.2 contract downgrade-to-RUNNER blocker).
+#       Routes through canonical UnifiedIntakeRouter; envelopes carry
+#       source="cadence_synthetic" so observability never confuses test
+#       load with real signal traffic.
 #
 # Log directory is created by install_live_fire_soak_cron.sh; for a manual
 # one-liner, mkdir -p the log dir first.
 
 # LOG_DIR=/ABSOLUTE/PATH/TO/JARVIS-AI-Agent/.jarvis/live_fire_soak_logs
-# 0 */8 * * * cd /ABSOLUTE/PATH/TO/JARVIS-AI-Agent && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true /usr/bin/env python3 scripts/live_fire_graduation_soak.py run --cost-cap 0.50 --max-wall-seconds 2400 --timeout 3600 >> .jarvis/live_fire_soak_logs/cron.log 2>&1
+# 0 */8 * * * cd /ABSOLUTE/PATH/TO/JARVIS-AI-Agent && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true OUROBOROS_BATTLE_SEED_INTENTS=3 /usr/bin/env python3 scripts/live_fire_graduation_soak.py run --cost-cap 0.50 --max-wall-seconds 2400 --timeout 3600 >> .jarvis/live_fire_soak_logs/cron.log 2>&1

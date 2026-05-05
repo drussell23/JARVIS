@@ -168,6 +168,16 @@ class HarnessConfig:
     branch_prefix: str = "ouroboros/battle-test"
     session_dir: Optional[Path] = None
     notebook_output_dir: Optional[Path] = None
+    # Phase 9 Slice 2 — synthetic workload injection count.
+    # Default 0 = zero behavior change for non-cadence runs (production
+    # default). Only the cadence wrapper (and its cron entry) sets this
+    # to N >= 1. Hard-capped at module level via
+    # ``phase_9_synthetic_workload.seed_intents_max()`` (default 16,
+    # clamped [1, 64]) so misconfiguration cannot spam ops.
+    # Injection runs ONLY when headless is True (resolved); production
+    # interactive sessions never inject synthetic load — the operator's
+    # real workload IS the workload.
+    seed_intents: int = 0
 
     @classmethod
     def from_env(cls) -> HarnessConfig:
@@ -689,6 +699,14 @@ class BattleTestHarness:
                 self._branch_name = await self.create_branch()
             with _BootPhase("boot_intake"):
                 await self.boot_intake()
+            # Phase 9 Slice 2 — synthetic workload injection.
+            # Composes the canonical UnifiedIntakeRouter pipeline via
+            # IntakeLayerService.ingest_envelope. Headless-only +
+            # config-gated + hard-capped + transparency-tagged. Per
+            # operator binding 2026-05-05: single pipeline, honest
+            # source token, defaults safe, no dilution of P9.2
+            # graduation contract.
+            await self._inject_phase_9_synthetic_workload()
             _boot_mark("harness_boot_sequence_done")
 
             # Wire SerpentApprovalProvider — wraps the inner CLIApprovalProvider
@@ -1811,6 +1829,102 @@ class BattleTestHarness:
             logger.info("IntakeLayerService booted")
         except Exception as exc:
             logger.warning("IntakeLayerService failed to boot: %s", exc)
+
+    async def _inject_phase_9_synthetic_workload(self) -> None:
+        """Phase 9 cadence synthetic workload injection.
+
+        Operator binding 2026-05-05 — closes the headless-cadence
+        zero-ops blocker WITHOUT diluting the P9.2 graduation
+        contract:
+
+          * **Single pipeline**: envelopes built via the canonical
+            ``make_envelope`` factory + routed via the canonical
+            ``UnifiedIntakeRouter`` (delegated through
+            ``IntakeLayerService.ingest_envelope``). No second
+            router. No direct decision-trace writes.
+          * **Honest source token**: ``source="cadence_synthetic"``
+            + ``evidence.category="cadence_synthetic"`` +
+            ``evidence.sensor="Phase9SyntheticSeeder"``. Operators
+            filter cadence load from real load by token.
+          * **Defaults / safety**: skipped entirely when
+            ``config.seed_intents <= 0`` (production default) OR
+            when not headless (interactive sessions never inject).
+            Hard cap via ``phase_9_synthetic_workload.seed_intents_max()``
+            (env-clamped [1, 64]).
+          * **Proof not vibes**: routes through Iron Gate / risk
+            tier / SemanticGuardian like any other envelope. The
+            P9.2 contract still demands ``ops_count >= 1`` from
+            real FSM execution; this method just ensures the FSM
+            actually has something to execute.
+          * **NEVER raises** — defensive at every layer.
+        """
+        n = int(getattr(self._config, "seed_intents", 0) or 0)
+        if n <= 0:
+            return
+        if not self._config.resolve_headless():
+            logger.debug(
+                "[Phase9Seeder] non-headless mode — skipping "
+                "synthetic workload injection (operator's real "
+                "workload IS the workload)",
+            )
+            return
+        if self._intake_service is None:
+            logger.warning(
+                "[Phase9Seeder] intake service not booted — "
+                "cannot inject synthetic workload",
+            )
+            return
+        try:
+            from backend.core.ouroboros.governance.graduation.phase_9_synthetic_workload import (  # noqa: E501
+                build_synthetic_envelopes,
+            )
+        except ImportError:
+            logger.debug(
+                "[Phase9Seeder] factory unavailable — skipping",
+                exc_info=True,
+            )
+            return
+        repo_str = str(self._config.repo_path)
+        envelopes = build_synthetic_envelopes(
+            n=n,
+            repo=repo_str,
+            project_root=self._config.repo_path,
+        )
+        if not envelopes:
+            logger.warning(
+                "[Phase9Seeder] factory returned 0 envelopes "
+                "for n=%d — check JARVIS_PHASE9_SEED_INTENTS_MAX",
+                n,
+            )
+            return
+        accepted = 0
+        rejected = 0
+        for envelope in envelopes:
+            try:
+                ok = await self._intake_service.ingest_envelope(
+                    envelope,
+                )
+                if ok:
+                    accepted += 1
+                else:
+                    rejected += 1
+            except Exception:  # noqa: BLE001 -- defensive
+                # Single bad envelope cannot poison the whole
+                # injection path. The intake_service.ingest_envelope
+                # already swallows exceptions; this is belt-and-
+                # braces for robustness.
+                rejected += 1
+                logger.debug(
+                    "[Phase9Seeder] ingest_envelope raised — "
+                    "continuing with remaining envelopes",
+                    exc_info=True,
+                )
+                continue
+        logger.info(
+            "[Phase9Seeder] injected n=%d/%d synthetic envelopes "
+            "(accepted=%d rejected=%d source=cadence_synthetic)",
+            accepted, len(envelopes), accepted, rejected,
+        )
 
     # ------------------------------------------------------------------
     # REPL command handler

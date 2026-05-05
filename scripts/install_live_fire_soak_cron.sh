@@ -124,7 +124,7 @@ $BEGIN_MARKER
 # Contract consultation (P9.2) blocks 0-op false-graduation.
 # Circuit breaker (Option C) keeps logs mathematically pure on DW topology block.
 # Graduation ledger enabled so parent harness persists clean counts.
-$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
+$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true OUROBOROS_BATTLE_SEED_INTENTS=3 /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
 $END_MARKER
 EOF
 }
@@ -212,6 +212,7 @@ run_once() {
         JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true \
         JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true \
         JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true \
+        OUROBOROS_BATTLE_SEED_INTENTS=3 \
         python3 "$HARNESS_SCRIPT" run \
         --cost-cap "$COST_CAP" \
         --max-wall-seconds "$WALL_CAP" \

@@ -88,6 +88,14 @@ MAX_FAILURE_CLASS_COUNT_KEYS: int = 32
 DEFAULT_COST_CAP_USD: float = 0.50
 DEFAULT_MAX_WALL_SECONDS: int = 2400  # 40 minutes
 DEFAULT_SUBPROCESS_TIMEOUT_S: int = 3600  # 60-minute kill cap
+# Phase 9 Slice 3 — synthetic workload injection count for cadence
+# soaks. Default 3 closes the headless zero-ops blocker without
+# spamming intake (each envelope is BACKGROUND-routed via the
+# canonical UnifiedIntakeRouter; cost contract preserved). Operator
+# can override via ``OUROBOROS_BATTLE_SEED_INTENTS=N`` env var on
+# the same line as the wrapper / cron entry. Hard-capped by the
+# factory's ``seed_intents_max()`` (default 16, clamped [1, 64]).
+DEFAULT_SEED_INTENTS_PER_SOAK: int = 3
 
 # Battle-test entry script path (relative to project root).
 BATTLE_TEST_SCRIPT_REL = Path("scripts") / "ouroboros_battle_test.py"
@@ -812,6 +820,20 @@ class LiveFireSoakHarness:
         # the canonical record_session call inside the harness's
         # post-subprocess phase succeeds.
         env["JARVIS_GRADUATION_LEDGER_ENABLED"] = "true"
+        # Phase 9 Slice 3 — synthetic workload injection. Closes the
+        # headless cadence zero-ops blocker (2026-05-05): without
+        # synthesized envelopes, the cognitive loop has no signals
+        # to consume → ops_count=0 → P9.2 contract correctly
+        # downgrades CLEAN to RUNNER → soak's evidence wasted.
+        # The cadence harness sets this env var so the subprocess's
+        # battle-test CLI auto-picks up --seed-intents N. Operator
+        # override path: setting ``OUROBOROS_BATTLE_SEED_INTENTS=N``
+        # in the parent env preserves through to subprocess (operator
+        # wins; default applied only when unset).
+        if "OUROBOROS_BATTLE_SEED_INTENTS" not in env:
+            env["OUROBOROS_BATTLE_SEED_INTENTS"] = str(
+                DEFAULT_SEED_INTENTS_PER_SOAK,
+            )
         # Explicit sentinel env propagation (Slice 3.5). Re-asserts
         # the parent's value (or absence) for every sentinel-related
         # env var. If the parent set JARVIS_TOPOLOGY_SENTINEL_ENABLED=true,

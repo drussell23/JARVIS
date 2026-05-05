@@ -946,6 +946,33 @@ def main() -> None:
             "ON when stdout is a TTY)."
         ),
     )
+    # Phase 9 Slice 2 — synthetic workload injection for cadence soaks.
+    # Default 0 = zero behavior change for non-cadence runs. Only the
+    # cadence wrapper (run_live_fire_graduation_soak.sh + cron entry)
+    # sets this to N >= 1. Operator binding 2026-05-05: composes
+    # canonical UnifiedIntakeRouter pipeline + honest source token
+    # ("cadence_synthetic") + transparent observability markers.
+    # See docs/architecture/OUROBOROS_VENOM_PRD.md §36.5 priority #1.
+    parser.add_argument(
+        "--seed-intents",
+        type=int,
+        default=int(os.environ.get(
+            "OUROBOROS_BATTLE_SEED_INTENTS", "0",
+        )),
+        metavar="N",
+        help=(
+            "Phase 9 cadence: inject N synthetic IntentEnvelopes "
+            "via the canonical UnifiedIntakeRouter at boot to "
+            "exercise the FSM (closes the headless-cadence "
+            "zero-ops blocker). Default 0 = no injection. Hard-"
+            "capped via JARVIS_PHASE9_SEED_INTENTS_MAX (default "
+            "16, clamped [1, 64]). Headless-only — interactive "
+            "sessions never inject. Envelopes carry "
+            "source='cadence_synthetic' so operators can "
+            "filter cadence load from real signal traffic. Env: "
+            "OUROBOROS_BATTLE_SEED_INTENTS."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1161,6 +1188,7 @@ def main() -> None:
         max_wall_seconds_s=args.max_wall_seconds or None,
         headless=args.headless,
         branch_prefix=args.branch_prefix,
+        seed_intents=int(args.seed_intents or 0),
     )
 
     if _boot_timer is not None:

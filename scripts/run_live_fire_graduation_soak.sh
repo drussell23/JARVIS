@@ -25,6 +25,13 @@ export JARVIS_GRADUATION_LEDGER_ENABLED=true
 export JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true
 export JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true
 export JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true
+# Phase 9 Slice 3 — synthetic workload injection for cadence soaks.
+# Closes the headless zero-ops blocker. The harness's
+# `_build_env_for_flag` defaults this to 3 when unset; setting it
+# explicitly here is documentation + lets the operator override via
+# `OUROBOROS_BATTLE_SEED_INTENTS=N bash run_live_fire_graduation_soak.sh`
+# (operator value wins; harness default applied only when unset).
+export OUROBOROS_BATTLE_SEED_INTENTS="${OUROBOROS_BATTLE_SEED_INTENTS:-3}"
 
 HARNESS="$REPO_ROOT/scripts/live_fire_graduation_soak.py"
 if [[ ! -f "$HARNESS" ]]; then

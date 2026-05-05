@@ -321,6 +321,38 @@ class IntakeLayerService:
         self._state = IntakeServiceState.INACTIVE
         logger.info("[IntakeLayer] Stopped.")
 
+    async def ingest_envelope(self, envelope: Any) -> bool:
+        """Public delegation to the underlying ``UnifiedIntakeRouter``.
+
+        Lets external callers (Phase 9 cadence synthetic workload
+        injection — and any future test-load surface) hand envelopes
+        to the canonical router without reaching into ``self._router``
+        directly. The router is the single ingestion authority;
+        sensors call it via ``router.ingest()``, and external callers
+        compose this delegation.
+
+        Returns ``True`` on accept, ``False`` if router is not ready
+        or ingest fails. NEVER raises (mirrors the router's
+        defensive contract).
+
+        Architecturally distinct from the sensor pattern: sensors
+        are constructed with a router reference at boot time and
+        own their lifecycle; external callers are one-shot test
+        injectors that don't hold a router reference and shouldn't
+        need to know the internal layout.
+        """
+        if self._router is None:
+            return False
+        try:
+            await self._router.ingest(envelope)
+            return True
+        except Exception:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[IntakeLayer] ingest_envelope failed",
+                exc_info=True,
+            )
+            return False
+
     def health(self) -> Dict[str, Any]:
         """Return health metrics for supervisor health checks."""
         queue_depth = 0
