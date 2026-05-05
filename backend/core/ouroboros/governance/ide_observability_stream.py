@@ -167,6 +167,14 @@ EVENT_TYPE_TRAJECTORY_DRIFT_DETECTED = "trajectory_drift_detected"
 # once and route on payload.drift_kind.
 EVENT_TYPE_DECISION_DRIFT_DETECTED = "decision_drift_detected"
 
+# M10 ArchitectureProposer (PRD §32.4) Slice 5 vocabulary.
+# Fired by lifecycle.advance() at every phase transition into
+# AWAITING_APPROVAL / PUSH_FAILED / FAILED / DECIDED_SKIP /
+# REJECTED / EXPIRED / GRADUATED. Single event — operators
+# route on payload.terminal_phase. NOT fired at intermediate
+# phases (VALIDATING / COMMITTING / etc.) — chatter suppression.
+EVENT_TYPE_M10_PROPOSAL_EMITTED = "m10_proposal_emitted"
+
 # Priority 1 Slice 4 — confidence-aware execution event vocabulary
 # (PRD §26.5.1). Severity-tiered: P1 = breaker fired (above-floor abort),
 # P2 = approaching floor (early warning), P3 = sustained low-confidence
@@ -2136,6 +2144,55 @@ def publish_memory_pressure_event(
 # ---------------------------------------------------------------------------
 # Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 publisher
 # ---------------------------------------------------------------------------
+
+
+def publish_m10_proposal_event(
+    *,
+    proposal_id: str,
+    kind: str,
+    terminal_phase: str,
+    pr_url: str = "",
+    pr_branch: str = "",
+    failure_reason: str = "",
+    cost_usd: float = 0.0,
+    ts_unix: float,
+) -> Optional[str]:
+    """Best-effort publisher for ``m10_proposal_emitted``
+    frames (PRD §32.4 Slice 5). Fired at every terminal-or-
+    awaiting phase transition by
+    :class:`ProposalLifecycleOrchestrator.advance`.
+
+    Single event covers all terminal+awaiting phases; operators
+    route on ``payload.terminal_phase``. Chatter-suppressed
+    intermediate phases (VALIDATING / COMMITTING / PUSHING)
+    do NOT publish.
+
+    NEVER raises; returns the published event id or None on
+    master-flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        payload: Dict[str, Any] = {
+            "proposal_id": proposal_id or "",
+            "kind": kind or "",
+            "terminal_phase": terminal_phase or "",
+            "pr_url": pr_url or "",
+            "pr_branch": pr_branch or "",
+            "failure_reason": failure_reason or "",
+            "cost_usd": float(cost_usd),
+            "ts_unix": float(ts_unix),
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_M10_PROPOSAL_EMITTED,
+            proposal_id or "m10_proposal",
+            payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] m10_proposal_emitted publish exception",
+            exc_info=True,
+        )
+        return None
 
 
 def publish_decision_drift_event(
