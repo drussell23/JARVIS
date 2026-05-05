@@ -568,6 +568,40 @@ def replay_session_consistency(
             f"all {verified} record(s) round-trip clean",
         )
 
+    # Slice 4 — best-effort SSE publication for each drift
+    # entry. Lazy-imported + master-flag-gated by the broker
+    # itself (returns None silently when stream disabled).
+    # NEVER raises — replay job's exit code remains
+    # authoritative; SSE is observability sugar.
+    if drift:
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                publish_decision_drift_event,
+            )
+            now_ts = _time.time()
+            for entry in drift:
+                try:
+                    # Use to_dict() for byte-bound truncation
+                    # (256-char cap per field) so SSE frames
+                    # stay small under runaway diffs.
+                    proj = entry.to_dict()
+                    publish_decision_drift_event(
+                        session_id=sid,
+                        record_index=int(entry.record_index),
+                        drift_kind=entry.kind.value,
+                        record_id=entry.record_id or "",
+                        expected=str(proj.get("expected", "")),
+                        actual=str(proj.get("actual", "")),
+                        detail=str(proj.get("detail", "")),
+                        ts_unix=now_ts,
+                    )
+                except Exception:  # noqa: BLE001 — defensive
+                    continue
+        except Exception:  # noqa: BLE001 — defensive
+            # ImportError or broker absent — no SSE; replay
+            # result still reported via return value + CLI
+            pass
+
     return ReplaySummary(
         session_id=sid,
         decisions_path=str(decisions_path),

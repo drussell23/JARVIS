@@ -158,6 +158,15 @@ EVENT_TYPE_CURIOSITY_CHANGED = "curiosity_changed"
 # silent (chatter suppression by construction).
 EVENT_TYPE_TRAJECTORY_DRIFT_DETECTED = "trajectory_drift_detected"
 
+# Upgrade 2 DecisionRecord Causality Graph (PRD §31.3) Slice 4
+# vocabulary. Single event covering all 4 actionable
+# ReplayDriftKind values (NONE is silent — chatter suppression).
+# Payload carries session_id + record_index + drift_kind
+# (string from closed enum) + record_id + expected_hash +
+# actual_hash + detail (bounded) + ts_unix. Operators subscribe
+# once and route on payload.drift_kind.
+EVENT_TYPE_DECISION_DRIFT_DETECTED = "decision_drift_detected"
+
 # Priority 1 Slice 4 — confidence-aware execution event vocabulary
 # (PRD §26.5.1). Severity-tiered: P1 = breaker fired (above-floor abort),
 # P2 = approaching floor (early warning), P3 = sustained low-confidence
@@ -2127,6 +2136,59 @@ def publish_memory_pressure_event(
 # ---------------------------------------------------------------------------
 # Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 publisher
 # ---------------------------------------------------------------------------
+
+
+def publish_decision_drift_event(
+    *,
+    session_id: str,
+    record_index: int,
+    drift_kind: str,
+    record_id: str,
+    expected: str,
+    actual: str,
+    detail: str,
+    ts_unix: float,
+) -> Optional[str]:
+    """Best-effort publisher for ``decision_drift_detected``
+    frames. Fired by :func:`replay_session_consistency` per
+    detected drift entry (PRD §31.3 Slice 4).
+
+    Single event for all 4 actionable :class:`ReplayDriftKind`
+    values — operators subscribe once and route on
+    ``payload.drift_kind``. Pattern matches
+    :func:`publish_trajectory_drift_event` /
+    :func:`publish_curiosity_event` /
+    :func:`publish_budget_action_event`.
+
+    Bounded payload — ``expected`` / ``actual`` / ``detail``
+    are pre-truncated by :meth:`ReplayDriftReport.to_dict` to
+    keep SSE frames small (256-char cap per field). NEVER
+    raises; returns the published event id or None on master-
+    flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        payload: Dict[str, Any] = {
+            "session_id": session_id or "",
+            "record_index": int(record_index),
+            "drift_kind": drift_kind,
+            "record_id": record_id or "",
+            "expected": expected or "",
+            "actual": actual or "",
+            "detail": detail or "",
+            "ts_unix": float(ts_unix),
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_DECISION_DRIFT_DETECTED,
+            session_id or "decision_drift",
+            payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] decision drift event publish exception",
+            exc_info=True,
+        )
+        return None
 
 
 def publish_trajectory_drift_event(
