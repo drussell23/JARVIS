@@ -88,8 +88,8 @@ class TestCuriosityMultiplierFor:
         multiplier=1.0 + cluster_id=cid still passed back for
         operator-explainability. Defensive — even M9 off should
         give a well-formed (1.0, cid) tuple."""
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.sensor_governor import (
             _curiosity_multiplier_for,
@@ -337,8 +337,8 @@ class TestPreGraduationByteIdentity:
         """When M9 master flag is OFF, even a curiosity-aware
         sensor with cluster_id must see multiplier=1.0."""
         _enable_governor(monkeypatch)
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.sensor_governor import (
             SensorBudgetSpec, SensorGovernor, Urgency,

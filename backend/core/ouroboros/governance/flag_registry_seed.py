@@ -3309,6 +3309,135 @@ SEED_SPECS: list = [
         example="3600",
         since="Upgrade 1 Slice 2 (PRD §31.2, 2026-05-04)",
     ),
+    # ========================================================================
+    # M9 — CuriosityGradient (PRD §30.5.1) — 6 flags
+    # Slice 5 graduation: master flips false → true. Per-cluster
+    # prediction-error scoring (logprob entropy + Prophecy error +
+    # postmortem recurrence) biases SensorGovernor weighted_cap
+    # toward high-curiosity regions. Bounded multiplier
+    # [floor, ceiling] structurally cannot bypass global cap.
+    # ========================================================================
+    FlagSpec(
+        name="JARVIS_CURIOSITY_GRADIENT_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the CuriosityGradient subsystem. "
+            "Default TRUE post Slice 5 graduation (2026-05-04). "
+            "Composes ConfidenceMonitor logprob entropy + "
+            "ProphecyEngine prediction error + Coherence "
+            "Auditor RECURRENCE_DRIFT into a per-cluster "
+            "curiosity score; SensorGovernor lazy-imports the "
+            "score (Decision X) for opt-in curiosity_aware "
+            "sensors. Bounded multiplier "
+            "[curiosity_multiplier_floor, "
+            "curiosity_multiplier_ceiling] cannot bypass the "
+            "global emission cap. Operator instant-revert via "
+            "explicit env false."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "curiosity_gradient.py"
+        ),
+        example="true",
+        since="M9 Slice 5 (graduated PRD §30.5.1, 2026-05-04)",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_CURIOSITY_HALFLIFE_DAYS",
+        type=FlagType.FLOAT, default=14.0,
+        description=(
+            "Recency-decay halflife for observation samples. "
+            "Default 14.0 days. Clamped [0.1, 365.0]. Defers "
+            "to :func:`_scoring_primitives.recency_weight` — "
+            "M9 NEVER duplicates the decay formula (Decision "
+            "E1 AST-pinned). Captured at score-compute time "
+            "for stability — env changes mid-window don't "
+            "reshape past samples."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "curiosity_gradient.py"
+        ),
+        example="14.0",
+        since="M9 Slice 1 (PRD §30.5.1, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_CURIOSITY_MIN_SAMPLES",
+        type=FlagType.INT, default=8,
+        description=(
+            "Cold-start gate. When a region has fewer than "
+            "this many observations, compute_curiosity returns "
+            "INSUFFICIENT_DATA and downstream consumers default "
+            "multiplier to 1.0 (no bias). Default 8; clamped "
+            "[1, 1000]. Prevents random-walk-on-boot pathology."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "curiosity_gradient.py"
+        ),
+        example="8",
+        since="M9 Slice 1 (PRD §30.5.1, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_CURIOSITY_STALE_FOCUS_HOURS",
+        type=FlagType.INT, default=24,
+        description=(
+            "Auto-decay window. When a cluster's score has "
+            "been at peak beyond this many hours without new "
+            "observations, decay_reason flips to STALE_FOCUS "
+            "and the consumer multiplier rebases to 1.0. "
+            "Default 24; clamped [1, 720]. Prevents "
+            "locked-on-degenerate-region pathology."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "curiosity_gradient.py"
+        ),
+        example="24",
+        since="M9 Slice 1 (PRD §30.5.1, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_CURIOSITY_MULTIPLIER_FLOOR",
+        type=FlagType.FLOAT, default=0.5,
+        description=(
+            "Lower bound for the curiosity multiplier. Default "
+            "0.5; clamped [0.0, 1.0]. Floor < 1.0 means "
+            "low-curiosity regions can be actively de-"
+            "prioritized; floor = 1.0 means curiosity only "
+            "boosts (never throttles). Operator choice. "
+            "Bounded by construction so SensorGovernor's "
+            "global cap is structurally never bypassed."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "curiosity_gradient.py"
+        ),
+        example="0.5",
+        since="M9 Slice 1 (PRD §30.5.1, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_CURIOSITY_MULTIPLIER_CEILING",
+        type=FlagType.FLOAT, default=2.0,
+        description=(
+            "Upper bound for the curiosity multiplier. Default "
+            "2.0; clamped [1.0, 10.0]. Ceiling × global cap = "
+            "max emission to a single high-curiosity cluster "
+            "— bounded by construction so SensorGovernor's "
+            "global cap is structurally never bypassed."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "curiosity_gradient.py"
+        ),
+        example="2.0",
+        since="M9 Slice 1 (PRD §30.5.1, 2026-05-04)",
+    ),
 ]
 
 

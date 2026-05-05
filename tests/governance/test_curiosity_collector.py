@@ -46,8 +46,8 @@ class TestMasterFlagGate:
     def test_record_returns_none_when_master_off(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.curiosity_collector import (  # noqa: E501
             CuriosityCollector,
@@ -61,8 +61,8 @@ class TestMasterFlagGate:
     def test_score_for_cluster_returns_disabled_when_off(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.curiosity_collector import (  # noqa: E501
             CuriosityCollector,
@@ -601,8 +601,8 @@ class TestOperatorReset:
     def test_reset_returns_false_when_master_off(
         self, monkeypatch, tmp_path,
     ):
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.curiosity_collector import (  # noqa: E501
             CuriosityCollector,

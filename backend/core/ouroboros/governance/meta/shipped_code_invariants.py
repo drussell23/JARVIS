@@ -2865,6 +2865,172 @@ def _validate_tool_executor_per_round_observer_wired(
 
 
 # ---------------------------------------------------------------------------
+# M9 — CuriosityGradient (PRD §30.5.1) — 5 pins
+# ---------------------------------------------------------------------------
+
+
+def _validate_curiosity_gradient_no_authority_imports(
+    tree: ast.Module, source: str,  # noqa: ARG001 — interface
+) -> Tuple[str, ...]:
+    """M9 Slice 5 — curiosity_gradient.py is a pure primitive
+    layer. Allowed: stdlib + ``_scoring_primitives``. NEVER
+    raises."""
+    forbidden = (
+        "orchestrator", "iron_gate", "policy", "change_engine",
+        "candidate_generator", "providers", "doubleword_provider",
+        "urgency_router", "auto_action_router",
+        "subagent_scheduler", "tool_executor", "phase_runners",
+        "semantic_guardian", "semantic_firewall",
+        "strategic_direction", "sensor_governor",
+    )
+    violations: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        module = (
+            node.module if isinstance(node, ast.ImportFrom)
+            else (node.names[0].name if node.names else "")
+        )
+        module = module or ""
+        for f in forbidden:
+            if f in module:
+                lineno = getattr(node, "lineno", "?")
+                violations.append(
+                    f"line {lineno}: forbidden authority import "
+                    f"contains {f!r}: {module}"
+                )
+    return tuple(violations)
+
+
+def _validate_curiosity_gradient_master_default_true(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """M9 Slice 5 — bytes-pin the graduated default-true
+    contract (PRD §30.5.1). NEVER raises."""
+    violations: List[str] = []
+    if "Graduated default 2026-05-04" not in source:
+        violations.append(
+            "curiosity_gradient.py dropped its 'Graduated "
+            "default 2026-05-04' marker — graduation contract "
+            "may have regressed (master flipped back to false?)"
+        )
+    if "graduated default-" not in source:
+        violations.append(
+            "curiosity_gradient_enabled() docstring no longer "
+            "states the graduation — graduation documentation "
+            "may have regressed"
+        )
+    return tuple(violations)
+
+
+def _validate_curiosity_decay_via_shared_primitives(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """M9 Slice 5 — Decision E1: curiosity_gradient.py MUST
+    defer to :func:`_scoring_primitives.recency_weight`. If a
+    refactor inlines the decay formula or imports a parallel
+    implementation, this pin trips. NEVER raises."""
+    violations: List[str] = []
+    if "recency_weight" not in source:
+        violations.append(
+            "curiosity_gradient.py dropped the recency_weight "
+            "import — decay math has been duplicated in "
+            "violation of Decision E1"
+        )
+    # Guard against parallel implementation
+    if "def recency_weight" in source:
+        violations.append(
+            "curiosity_gradient.py defines its own "
+            "recency_weight — must defer to "
+            "_scoring_primitives (Decision E1 zero-duplication)"
+        )
+    if "def _recency_weight" in source:
+        violations.append(
+            "curiosity_gradient.py defines a private "
+            "_recency_weight — must defer to "
+            "_scoring_primitives (Decision E1 zero-duplication)"
+        )
+    return tuple(violations)
+
+
+def _validate_sensor_governor_curiosity_lazy_imported(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """M9 Slice 5 — SensorGovernor must lazy-import M9 modules
+    inside _curiosity_multiplier_for, NEVER at top-of-file.
+    Pinned by source-grep so a refactor that moves the import
+    to module level trips immediately. NEVER raises."""
+    violations: List[str] = []
+    # M9 imports MUST be present (helper exists)
+    if "_curiosity_multiplier_for" not in source:
+        violations.append(
+            "sensor_governor.py dropped the "
+            "_curiosity_multiplier_for helper — M9 Slice 3 "
+            "consumer wire-up may have regressed"
+        )
+    if "from backend.core.ouroboros.governance.curiosity_collector" not in source:
+        violations.append(
+            "sensor_governor.py dropped the "
+            "curiosity_collector lazy import — M9 Slice 3 "
+            "consumer wire-up may have regressed"
+        )
+    if "from backend.core.ouroboros.governance.curiosity_gradient" not in source:
+        violations.append(
+            "sensor_governor.py dropped the "
+            "curiosity_gradient lazy import — M9 Slice 3 "
+            "consumer wire-up may have regressed"
+        )
+    # And NOT at module level — lazy-import discipline
+    for line in source.splitlines():
+        if line.startswith(
+            "from backend.core.ouroboros.governance"
+            ".curiosity_gradient",
+        ):
+            violations.append(
+                "sensor_governor.py imports curiosity_gradient "
+                "at module level — must be lazy-imported "
+                "(Decision X / M9 Slice 3 contract)"
+            )
+        if line.startswith(
+            "from backend.core.ouroboros.governance"
+            ".curiosity_collector",
+        ):
+            violations.append(
+                "sensor_governor.py imports curiosity_collector "
+                "at module level — must be lazy-imported "
+                "(Decision X / M9 Slice 3 contract)"
+            )
+    return tuple(violations)
+
+
+def _validate_curiosity_collector_uses_flock(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """M9 Slice 5 — Decision A1: curiosity_collector.py MUST
+    use ``cross_process_jsonl.flock_*`` for persistence. Direct
+    file I/O bypasses the cross-process safety contract. NEVER
+    raises."""
+    violations: List[str] = []
+    if "flock_append_line" not in source:
+        violations.append(
+            "curiosity_collector.py dropped the "
+            "flock_append_line import — persistence may bypass "
+            "the cross-process locking contract (Decision A1)"
+        )
+    if "flock_critical_section" not in source:
+        violations.append(
+            "curiosity_collector.py dropped the "
+            "flock_critical_section import — JSONL replay may "
+            "race with concurrent writers (Decision A1)"
+        )
+    return tuple(violations)
+
+
+# ---------------------------------------------------------------------------
 # Seed registration
 # ---------------------------------------------------------------------------
 
@@ -3641,6 +3807,122 @@ def _register_seed_invariants() -> None:
             ),
             validate=(
                 _validate_tool_executor_per_round_observer_wired
+            ),
+        ),
+    )
+    # ----------------------------------------------------------------
+    # M9 — CuriosityGradient (PRD §30.5.1) — 5 pins
+    # Slice 5 graduation: master flag default-true; structural pins
+    # protect (1) primitive's no-authority-imports floor, (2) master
+    # default-true marker, (3) Decision E1 zero-duplication of decay
+    # math via shared _scoring_primitives, (4) governor's lazy-import
+    # discipline (Decision X), (5) collector's flock'd persistence
+    # (Decision A1).
+    # ----------------------------------------------------------------
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "curiosity_gradient_no_authority_imports"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "curiosity_gradient.py"
+            ),
+            description=(
+                "curiosity_gradient.py is a pure primitive layer. "
+                "MUST NOT import orchestrator / iron_gate / "
+                "providers / candidate_generator / urgency_router "
+                "/ tool_executor / strategic_direction / "
+                "sensor_governor. Allowed: stdlib + "
+                "_scoring_primitives (Decision E1)."
+            ),
+            validate=(
+                _validate_curiosity_gradient_no_authority_imports
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "curiosity_gradient_master_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "curiosity_gradient.py"
+            ),
+            description=(
+                "Slice 5 graduation contract: master flag "
+                "JARVIS_CURIOSITY_GRADIENT_ENABLED defaults TRUE "
+                "on unset env. If a future refactor flips this "
+                "back to False, this pin trips so the regression "
+                "is caught structurally before shipping."
+            ),
+            validate=(
+                _validate_curiosity_gradient_master_default_true
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "curiosity_decay_via_shared_primitives"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "curiosity_gradient.py"
+            ),
+            description=(
+                "Decision E1: decay math defers to "
+                "_scoring_primitives.recency_weight — M9 NEVER "
+                "duplicates the formula. Catches refactors that "
+                "inline the decay formula or define a parallel "
+                "implementation."
+            ),
+            validate=(
+                _validate_curiosity_decay_via_shared_primitives
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "sensor_governor_curiosity_lazy_imported"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "sensor_governor.py"
+            ),
+            description=(
+                "Decision X (M9 Slice 3): SensorGovernor must "
+                "lazy-import curiosity_gradient + "
+                "curiosity_collector inside "
+                "_curiosity_multiplier_for, NEVER at top-of-"
+                "file. Keeps M9 dormant when not graduated and "
+                "decouples governor from M9 ImportError paths."
+            ),
+            validate=(
+                _validate_sensor_governor_curiosity_lazy_imported
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "curiosity_collector_uses_flock"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "curiosity_collector.py"
+            ),
+            description=(
+                "Decision A1: per-cluster JSONL persistence MUST "
+                "use cross_process_jsonl.flock_append_line + "
+                "flock_critical_section. Direct file I/O would "
+                "bypass cross-process locking and race with "
+                "concurrent writers."
+            ),
+            validate=(
+                _validate_curiosity_collector_uses_flock
             ),
         ),
     )

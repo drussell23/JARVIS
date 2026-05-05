@@ -1081,6 +1081,21 @@ def compute_behavioral_drift(
                         prev_signature_id=prev_id,
                         curr_signature_id=curr_id,
                     ))
+                    # M9 Slice 5 — feed RECURRENCE_DRIFT into
+                    # CuriosityCollector so the failure_class
+                    # cluster gets prediction-error-driven
+                    # bias. Lazy-imported + master-flag-gated;
+                    # no-op when M9 disabled.
+                    try:
+                        from backend.core.ouroboros.governance.curiosity_producer_bridge import (  # noqa: E501
+                            feed_recurrence_drift,
+                        )
+                        feed_recurrence_drift(
+                            region_or_path=str(failure_class),
+                            recurrence_count=int(count),
+                        )
+                    except Exception:  # noqa: BLE001 — defensive
+                        pass
         except Exception:  # noqa: BLE001 — defensive
             pass
 

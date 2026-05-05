@@ -104,9 +104,8 @@ class TestObservabilityHandlers:
     async def test_overview_disabled_returns_503(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED",
-            raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.curiosity_observability import (  # noqa: E501
             _CuriosityRoutesHandler,
@@ -290,9 +289,8 @@ class TestRegisterRoutes:
 
 class TestCuriosityREPL:
     def test_help_works_when_disabled(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED",
-            raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.curiosity_repl import (  # noqa: E501
             dispatch_curiosity_command,
@@ -305,9 +303,8 @@ class TestCuriosityREPL:
     def test_disabled_returns_friendly_message(
         self, monkeypatch,
     ):
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED",
-            raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.curiosity_repl import (  # noqa: E501
             dispatch_curiosity_command,

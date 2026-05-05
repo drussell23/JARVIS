@@ -105,23 +105,24 @@ CURIOSITY_GRADIENT_SCHEMA_VERSION: str = "curiosity_gradient.1"
 
 
 def curiosity_gradient_enabled() -> bool:
-    """``JARVIS_CURIOSITY_GRADIENT_ENABLED`` (default ``false``
-    until Slice 5 graduation per PRD §30.5.1).
+    """``JARVIS_CURIOSITY_GRADIENT_ENABLED`` (graduated default-
+    ``true`` 2026-05-04 per PRD §30.5.1 Slice 5 — instant revert
+    via explicit ``"false"``).
 
     Asymmetric env semantics — empty/whitespace = unset = current
-    default (false for Slice 1); explicit ``1``/``true``/``yes``/
-    ``on`` flips on. Same shape as :func:`epistemic_budget_enabled`
-    /:func:`action_outcome_memory_enabled` /:func:`failure_mode_-
-    memory_enabled` graduated flags so the Slice 5 graduation flip
-    is a one-character edit.
+    default (true post-graduation); explicit ``0``/``false``/
+    ``no``/``off`` flips off. Same shape as
+    :func:`epistemic_budget_enabled` /
+    :func:`action_outcome_memory_enabled` /
+    :func:`failure_mode_memory_enabled` graduated flags.
 
     Re-read on every call so flips hot-revert without restart."""
     raw = os.environ.get(
         "JARVIS_CURIOSITY_GRADIENT_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # Slice 1 default; flips to True at Slice 5
-    return raw in ("1", "true", "yes", "on")
+        return True  # Graduated default 2026-05-04 (Slice 5)
+    return raw not in ("0", "false", "no", "off")
 
 
 # ---------------------------------------------------------------------------

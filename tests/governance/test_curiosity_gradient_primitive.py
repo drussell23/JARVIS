@@ -26,12 +26,24 @@ import pytest
 
 
 class TestMasterFlag:
-    def test_default_is_false_pre_graduation(self, monkeypatch):
-        """Slice 1 default is FALSE; Slice 5 graduation flips
-        to TRUE. Mirrors Upgrade 3 + M11 + Upgrade 1 pre-
-        graduation pattern."""
+    def test_default_is_true_post_graduation(self, monkeypatch):
+        """Slice 5 graduated 2026-05-04 — default-TRUE.
+        Mirrors Upgrade 3 + M11 + Upgrade 1 graduated pattern."""
         monkeypatch.delenv(
             "JARVIS_CURIOSITY_GRADIENT_ENABLED", raising=False,
+        )
+        from backend.core.ouroboros.governance.curiosity_gradient import (  # noqa: E501
+            curiosity_gradient_enabled,
+        )
+        assert curiosity_gradient_enabled() is True
+
+    @pytest.mark.parametrize(
+        "v", ["0", "false", "no", "off", "FALSE"],
+    )
+    def test_falsy_variants_flip_off(self, monkeypatch, v):
+        """Post-graduation revert path."""
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", v,
         )
         from backend.core.ouroboros.governance.curiosity_gradient import (  # noqa: E501
             curiosity_gradient_enabled,
@@ -50,17 +62,11 @@ class TestMasterFlag:
         )
         assert curiosity_gradient_enabled() is True
 
-    @pytest.mark.parametrize(
-        "v", ["0", "false", "off", "no", "garbage"],
-    )
-    def test_falsy_variants_stay_off(self, monkeypatch, v):
-        monkeypatch.setenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED", v,
-        )
-        from backend.core.ouroboros.governance.curiosity_gradient import (  # noqa: E501
-            curiosity_gradient_enabled,
-        )
-        assert curiosity_gradient_enabled() is False
+    # Note: post-graduation, "garbage" / unknown values resolve
+    # to TRUE (asymmetric semantics — only explicit falsy reverts).
+    # Old "test_falsy_variants_stay_off[garbage]" removed; the
+    # canonical falsy revert path lives in
+    # `test_falsy_variants_flip_off` above.
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +330,8 @@ def _obs(source, value, at_unix, *, cluster_id="c1"):
 
 class TestComputeCuriosityDecisionTree:
     def test_disabled_when_master_off(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_CURIOSITY_GRADIENT_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_CURIOSITY_GRADIENT_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.curiosity_gradient import (  # noqa: E501
             CuriosityDecayReason,
