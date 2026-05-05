@@ -135,6 +135,71 @@ def cmd_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ready(args: argparse.Namespace) -> int:
+    """Render only the flags that are ready to flip — composes the
+    existing ``GraduationLedger.eligible_flags()`` primitive so the
+    operator can answer 'which flags should I flip now?' in one
+    command instead of scanning the full ``queue`` output. Phase 9
+    hardening 2026-05-05 — closes the operator-UX gap that wasted
+    an estimated ~30s/glance × 12+ flags × 36+ soaks of cognitive
+    load."""
+    from backend.core.ouroboros.governance.adaptation.graduation_ledger import (  # noqa: E501
+        get_default_ledger,
+    )
+    from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
+        get_default_harness,
+    )
+    ledger = get_default_ledger()
+    eligible = ledger.eligible_flags()
+    rows = get_default_harness().queue_view()
+    n_total = len(rows)
+    n_graduated = sum(1 for r in rows if r["graduated"])
+    n_ready = len(eligible)
+    print(
+        f"\n{_BOLD}{_CYAN}Live-Fire Ready-to-Flip Queue{_RESET}  "
+        f"{_DIM}({n_total} flags total){_RESET}"
+    )
+    print(
+        f"  {_GREEN}graduated={n_graduated}{_RESET}  "
+        f"{_GREEN}{_BOLD}ready_to_flip={n_ready}{_RESET}\n"
+    )
+    if not eligible:
+        print(
+            f"  {_DIM}No flags ready to flip yet — accumulate "
+            f"more clean evidence (run `bash scripts/"
+            f"run_live_fire_graduation_soak.sh`).{_RESET}\n"
+        )
+        return 0
+    rows_by_flag = {r["flag_name"]: r for r in rows}
+    for flag in eligible:
+        row = rows_by_flag.get(flag)
+        if row is None:
+            print(f"  {_GREEN}{flag}{_RESET}")
+            continue
+        progress = ledger.progress(flag)
+        clean = progress["clean"]
+        required = progress["required"]
+        deps = row.get("deps_satisfied", True)
+        deps_marker = (
+            f"{_GREEN}deps=ok{_RESET}" if deps
+            else f"{_RED}deps=BLOCKED{_RESET}"
+        )
+        print(
+            f"  {_GREEN}{_BOLD}{flag}{_RESET}\n"
+            f"    {_DIM}clean={clean}/{required}  "
+            f"runner=0  {deps_marker}{_RESET}\n"
+            f"    {_DIM}{row.get('description', '')}{_RESET}"
+        )
+    print(
+        f"\n  {_BOLD}Next steps:{_RESET}\n"
+        f"  {_DIM}1. Flip the flag(s) above to default-true in "
+        f"flag_registry_seed.py + helper functions{_RESET}\n"
+        f"  {_DIM}2. Land the change; ledger automatically marks "
+        f"as graduated on next read{_RESET}\n"
+    )
+    return 0
+
+
 def cmd_evidence(args: argparse.Namespace) -> int:
     """Show all evidence rows for one flag."""
     from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
@@ -299,6 +364,7 @@ def main() -> int:
 
         {_BOLD}Subcommands:{_RESET}
           {_CYAN}queue{_RESET}      list flags with pending/blocked/graduated state
+          {_CYAN}ready{_RESET}      list ONLY flags ready to flip (Phase 9 hardening)
           {_CYAN}evidence{_RESET}   show evidence rows for a flag
           {_CYAN}run{_RESET}        fire a single soak (next pickable, or specified)
           {_CYAN}status{_RESET}     one-line per-flag summary
@@ -308,6 +374,7 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("queue")
+    sub.add_parser("ready")
     sub.add_parser("status")
     sub.add_parser("pause")
     sub.add_parser("resume")
@@ -337,6 +404,7 @@ def main() -> int:
     args = parser.parse_args()
     handlers = {
         "queue": cmd_queue,
+        "ready": cmd_ready,
         "evidence": cmd_evidence,
         "run": cmd_run,
         "status": cmd_status,

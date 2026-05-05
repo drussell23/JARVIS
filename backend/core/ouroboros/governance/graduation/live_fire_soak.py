@@ -1052,6 +1052,15 @@ class LiveFireSoakHarness:
 # ---------------------------------------------------------------------------
 
 
+# Defensive grace window for session-detection — absorbs reasonable
+# backward NTP skew during subprocess execution. The session mtime is
+# set by the OS at write-time; ``start_wall_anchor - _SESSION_DETECTION_GRACE_S``
+# is the load-bearing reference point captured BEFORE fork. Forward
+# clock jumps after fork cannot move this anchor; backward jumps are
+# absorbed by the grace.
+_SESSION_DETECTION_GRACE_S: float = 60.0
+
+
 def _run_battle_test_subprocess(
     *,
     env: Dict[str, str],
@@ -1067,6 +1076,13 @@ def _run_battle_test_subprocess(
 
     NEVER raises into caller; returns ``(exit_code, {}, "")`` on any
     parse failure (caller maps to SUMMARY_PARSE_FAILED).
+
+    Wall-clock-skew safety (Phase 9 hardening 2026-05-05): the
+    session-detection anchor is captured BEFORE ``subprocess.run``
+    so a forward NTP correction during the subprocess cannot move
+    the reference window away from the session this call wrote.
+    A small grace (``_SESSION_DETECTION_GRACE_S``) absorbs reasonable
+    backward skew during execution.
     """
     script_path = project_root / BATTLE_TEST_SCRIPT_REL
     if not script_path.exists():
@@ -1085,6 +1101,10 @@ def _run_battle_test_subprocess(
     logger.info(
         "[LiveFireSoak] launching subprocess cmd=%s", cmd,
     )
+    # Capture wall-clock anchor BEFORE fork — load-bearing reference.
+    # Forward NTP skew during subprocess cannot move this; backward
+    # skew is absorbed by _SESSION_DETECTION_GRACE_S below.
+    start_wall_anchor = time.time()
     proc = subprocess.run(
         cmd,
         cwd=str(project_root),
@@ -1094,10 +1114,10 @@ def _run_battle_test_subprocess(
         timeout=timeout_s,
         check=False,
     )
-    # Locate the most-recent session dir written by this subprocess.
     sessions_root = project_root / ".ouroboros" / "sessions"
     summary, debug_tail = _read_most_recent_session(
-        sessions_root, after_epoch=time.time() - timeout_s - 60,
+        sessions_root,
+        after_epoch=start_wall_anchor - _SESSION_DETECTION_GRACE_S,
     )
     return (proc.returncode, summary, debug_tail)
 
@@ -1106,24 +1126,41 @@ def _read_most_recent_session(
     sessions_root: Path, *, after_epoch: float,
 ) -> Tuple[Dict[str, Any], str]:
     """Return ``(summary_dict, debug_log_tail)`` for the most-recent
-    session dir created after ``after_epoch``. NEVER raises."""
+    session dir whose mtime is ≥ ``after_epoch``. NEVER raises.
+
+    Defense-in-depth (Phase 9 hardening 2026-05-05): candidates are
+    sorted by mtime DESCENDING (not name lexicographic) so a
+    naming-convention drift cannot mask the most-recent session.
+    The first candidate with a parseable ``summary.json`` wins.
+    """
     try:
         if not sessions_root.exists():
             return ({}, "")
     except OSError:
         return ({}, "")
     try:
-        candidates = sorted(
-            sessions_root.iterdir(), reverse=True,
-        )
+        # Sort by mtime descending. Robust to naming drift; matches
+        # the actual semantic of "most recent."
+        candidates_with_mtime: List[Tuple[float, Path]] = []
+        for d in sessions_root.iterdir():
+            try:
+                if not d.is_dir():
+                    continue
+                candidates_with_mtime.append(
+                    (d.stat().st_mtime, d),
+                )
+            except OSError:
+                continue
+        candidates_with_mtime.sort(reverse=True)
+        candidates = [d for _mtime, d in candidates_with_mtime]
     except OSError:
         return ({}, "")
     for d in candidates:
         try:
-            if not d.is_dir():
-                continue
             if d.stat().st_mtime < after_epoch:
-                continue
+                # Sorted descending — once we drop below the
+                # anchor, all remaining are older. Stop scanning.
+                break
         except OSError:
             continue
         summary_path = d / "summary.json"
