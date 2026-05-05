@@ -3627,6 +3627,84 @@ SEED_SPECS: list = [
         example="true",
         since="Slice 5b Slice 2 (PRD §32.5, 2026-05-04)",
     ),
+    # ====================================================================
+    # Move 7 — Cross-op Semantic Budget (PRD §29.4) Slice 1 — 4 flags
+    # Master is OPERATOR-PINNED default-FALSE per §33.1 graduation
+    # contract pattern; flips only after empirical Phase 9 baseline.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CROSS_OP_SEMANTIC_BUDGET_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master kill switch for Move 7 Cross-op Semantic "
+            "Budget (PRD §29.4). When false (the default), "
+            "compute_semantic_budget() returns DISABLED and "
+            "the upstream observer / SSE / REPL surfaces "
+            "(Slices 2-4, deferred) revert in lockstep. "
+            "OPERATOR-PINNED default-FALSE per §33.1 — flips "
+            "only after empirical Phase 9 baseline establishes "
+            "the per-op drift envelope for this codebase."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "cross_op_semantic_budget.py"
+        ),
+        example="false",
+        since="Move 7 Slice 1 (PRD §29.4, 2026-05-05)",
+    ),
+    FlagSpec(
+        name="JARVIS_CROSS_OP_SEMANTIC_WINDOW_SIZE",
+        type=FlagType.INT, default=50,
+        description=(
+            "Number of most-recent op centroids the rolling-"
+            "window primitive integrates over. Default 50 "
+            "(≈ a couple hours of normal operation; large "
+            "enough to surface 1%/op compounding without "
+            "hyper-noise). Clamped [2, 10000]."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "cross_op_semantic_budget.py"
+        ),
+        example="50",
+        since="Move 7 Slice 1 (PRD §29.4, 2026-05-05)",
+    ),
+    FlagSpec(
+        name="JARVIS_CROSS_OP_SEMANTIC_THRESHOLD",
+        type=FlagType.FLOAT, default=0.30,
+        description=(
+            "Operator budget knob — integrated cosine-distance "
+            "summed over the window MUST NOT exceed this "
+            "fraction. Default 0.30 (30% — calibrated for the "
+            "§29.4 \"1%/op compounding over 100 cycles\" "
+            "framing). Clamped (0, 100]."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "cross_op_semantic_budget.py"
+        ),
+        example="0.30",
+        since="Move 7 Slice 1 (PRD §29.4, 2026-05-05)",
+    ),
+    FlagSpec(
+        name="JARVIS_CROSS_OP_SEMANTIC_APPROACHING_RATIO",
+        type=FlagType.FLOAT, default=0.8,
+        description=(
+            "Fraction of threshold above which the verdict "
+            "ladder transitions to APPROACHING. Default 0.8 "
+            "(warn at 80% of budget). Clamped [0.1, 1.0]."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "cross_op_semantic_budget.py"
+        ),
+        example="0.8",
+        since="Move 7 Slice 1 (PRD §29.4, 2026-05-05)",
+    ),
     FlagSpec(
         name="JARVIS_PHASE10_GRADUATION_CONTRACT_ENABLED",
         type=FlagType.BOOL, default=True,
