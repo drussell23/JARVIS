@@ -83,11 +83,25 @@ def _enable(monkeypatch, tmp_path):
 
 
 class TestMasterFlag:
-    def test_default_is_false_pre_graduation(
+    def test_default_is_true_post_graduation(
         self, monkeypatch,
     ):
+        """Slice 5 graduated 2026-05-04 — default-TRUE."""
         monkeypatch.delenv(
             "JARVIS_DETERMINISM_REPLAY_ENABLED", raising=False,
+        )
+        from backend.core.ouroboros.governance.determinism.replay_determinism import (  # noqa: E501
+            replay_determinism_enabled,
+        )
+        assert replay_determinism_enabled() is True
+
+    @pytest.mark.parametrize(
+        "v", ["0", "false", "no", "off", "FALSE"],
+    )
+    def test_falsy_flips_off(self, monkeypatch, v):
+        """Post-graduation revert path."""
+        monkeypatch.setenv(
+            "JARVIS_DETERMINISM_REPLAY_ENABLED", v,
         )
         from backend.core.ouroboros.governance.determinism.replay_determinism import (  # noqa: E501
             replay_determinism_enabled,
@@ -184,8 +198,8 @@ class TestFrozenDataclasses:
 
 class TestReplaySessionConsistency:
     def test_master_off_returns_exit_2(self, monkeypatch):
-        monkeypatch.delenv(
-            "JARVIS_DETERMINISM_REPLAY_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_DETERMINISM_REPLAY_ENABLED", "false",
         )
         from backend.core.ouroboros.governance.determinism.replay_determinism import (  # noqa: E501
             replay_session_consistency,
@@ -492,8 +506,8 @@ class TestCLIEntry:
     ):
         """--allow-disabled lets pre-graduation operator runs
         engage the replay even when env flag is off."""
-        monkeypatch.delenv(
-            "JARVIS_DETERMINISM_REPLAY_ENABLED", raising=False,
+        monkeypatch.setenv(
+            "JARVIS_DETERMINISM_REPLAY_ENABLED", "false",
         )
         monkeypatch.setenv(
             "JARVIS_DETERMINISM_LEDGER_DIR",

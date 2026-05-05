@@ -3031,6 +3031,123 @@ def _validate_curiosity_collector_uses_flock(
 
 
 # ---------------------------------------------------------------------------
+# Upgrade 2 — DecisionRecord Causality Graph (PRD §31.3) — 4 pins
+# ---------------------------------------------------------------------------
+
+
+def _validate_replay_determinism_master_default_true(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """Upgrade 2 Slice 5 — bytes-pin the graduated default-true
+    contract on JARVIS_DETERMINISM_REPLAY_ENABLED. NEVER raises."""
+    violations: List[str] = []
+    if "Graduated default 2026-05-04 (Slice 5)" not in source:
+        violations.append(
+            "replay_determinism.py dropped its 'Graduated "
+            "default 2026-05-04 (Slice 5)' marker — graduation "
+            "contract may have regressed (master flipped back "
+            "to false?)"
+        )
+    if "graduated default-" not in source:
+        violations.append(
+            "replay_determinism_enabled() docstring no longer "
+            "states the graduation — graduation documentation "
+            "may have regressed"
+        )
+    return tuple(violations)
+
+
+def _validate_decision_kind_closed_enum(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """Upgrade 2 Slice 5 — DecisionKind closed taxonomy must
+    contain all 12 values verbatim (no silent removal of a
+    decision-site kind). Pinned by required-string check.
+    NEVER raises."""
+    required = (
+        "ROUTE_SELECTION",
+        "GATE_PASS",
+        "GATE_FAIL",
+        "VALIDATOR_PASS",
+        "VALIDATOR_FAIL",
+        "RISK_ESCALATION",
+        "PROBE_TRIGGER",
+        "SBT_TRIGGER",
+        "AUTO_ACTION_PROPOSAL",
+        "APPROVAL_REQUEST",
+        "PHASE_TRANSITION",
+        "DISABLED",
+    )
+    violations: List[str] = []
+    for name in required:
+        if name not in source:
+            violations.append(
+                f"decision_kinds.py dropped {name} — closed-"
+                f"taxonomy member missing"
+            )
+    if "class DecisionKind" not in source:
+        violations.append(
+            "decision_kinds.py dropped the DecisionKind "
+            "enum class entirely"
+        )
+    return tuple(violations)
+
+
+def _validate_decisions_observability_read_only(
+    tree: ast.Module, source: str,  # noqa: ARG001
+) -> Tuple[str, ...]:
+    """Upgrade 2 Slice 5 — observability + REPL + reader must
+    be read-only: no DecisionRuntime( / .record( / mutation
+    surface tokens. NEVER raises."""
+    forbidden_calls = (
+        "DecisionRuntime(",
+        ".record(",
+        "_persist_history",
+    )
+    violations: List[str] = []
+    for forbidden in forbidden_calls:
+        if forbidden in source:
+            violations.append(
+                f"read-only contract violated — found "
+                f"mutation token {forbidden!r}"
+            )
+    return tuple(violations)
+
+
+def _validate_replay_lazy_imports_sse_publisher(
+    tree: ast.AST,  # noqa: ARG001 — interface
+    source: str,
+) -> Tuple[str, ...]:
+    """Upgrade 2 Slice 5 — replay_determinism.py must
+    lazy-import the SSE publisher. Pinned by source-grep so a
+    refactor that moves the import to module top trips. NEVER
+    raises."""
+    violations: List[str] = []
+    # The publisher symbol MUST be present (replay fires SSE)
+    if "publish_decision_drift_event" not in source:
+        violations.append(
+            "replay_determinism.py dropped the "
+            "publish_decision_drift_event reference — Slice 4 "
+            "SSE wire-up regressed"
+        )
+    # AND ide_observability_stream import MUST NOT be at module
+    # level (lazy-only)
+    for line in source.splitlines():
+        if line.startswith(
+            "from backend.core.ouroboros.governance"
+            ".ide_observability_stream",
+        ):
+            violations.append(
+                "replay_determinism.py imports "
+                "ide_observability_stream at module level — "
+                "must be lazy-imported (Slice 4 contract)"
+            )
+    return tuple(violations)
+
+
+# ---------------------------------------------------------------------------
 # Seed registration
 # ---------------------------------------------------------------------------
 
@@ -3923,6 +4040,99 @@ def _register_seed_invariants() -> None:
             ),
             validate=(
                 _validate_curiosity_collector_uses_flock
+            ),
+        ),
+    )
+    # ----------------------------------------------------------------
+    # Upgrade 2 — DecisionRecord Causality Graph (PRD §31.3) — 4 pins
+    # Slice 5 graduation: replay master flag default-true; structural
+    # pins protect (1) replay master default-true marker, (2) Decision-
+    # Kind 12-value closed-taxonomy integrity, (3) observability+REPL+
+    # reader read-only contract, (4) replay's lazy-import discipline
+    # for the SSE publisher.
+    # ----------------------------------------------------------------
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "replay_determinism_master_default_true"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "determinism/replay_determinism.py"
+            ),
+            description=(
+                "Slice 5 graduation contract: master flag "
+                "JARVIS_DETERMINISM_REPLAY_ENABLED defaults TRUE "
+                "on unset env. If a future refactor flips this "
+                "back to False, this pin trips so the regression "
+                "is caught structurally before shipping."
+            ),
+            validate=(
+                _validate_replay_determinism_master_default_true
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "decision_kind_closed_enum_intact"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "determinism/decision_kinds.py"
+            ),
+            description=(
+                "DecisionKind closed taxonomy must contain all "
+                "12 enum members verbatim — no silent removal of "
+                "a decision-site kind. Catches refactors that "
+                "drop a value (which would silently break "
+                "downstream replay + observability without a "
+                "clean test failure)."
+            ),
+            validate=(
+                _validate_decision_kind_closed_enum
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "decisions_observability_read_only"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "decisions_observability.py"
+            ),
+            description=(
+                "HTTP observability layer is read-only by "
+                "contract — no DecisionRuntime() / .record() / "
+                "_persist_history calls. Mutation surfaces are "
+                "explicitly out of scope for the GET endpoints."
+            ),
+            validate=(
+                _validate_decisions_observability_read_only
+            ),
+        ),
+    )
+    register_shipped_code_invariant(
+        ShippedCodeInvariant(
+            invariant_name=(
+                "replay_lazy_imports_sse_publisher"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "determinism/replay_determinism.py"
+            ),
+            description=(
+                "Slice 4 SSE wire-up contract: replay job must "
+                "lazy-import publish_decision_drift_event "
+                "INSIDE the function body, NEVER at module top. "
+                "Keeps the broker out of replay's import graph "
+                "at module load + decouples replay from broker "
+                "ImportError paths."
+            ),
+            validate=(
+                _validate_replay_lazy_imports_sse_publisher
             ),
         ),
     )

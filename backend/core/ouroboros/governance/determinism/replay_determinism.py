@@ -75,18 +75,22 @@ REPLAY_DETERMINISM_SCHEMA_VERSION: str = (
 
 
 def replay_determinism_enabled() -> bool:
-    """``JARVIS_DETERMINISM_REPLAY_ENABLED`` (default ``false``
-    until Slice 5 graduation per PRD §31.3).
+    """``JARVIS_DETERMINISM_REPLAY_ENABLED`` (graduated default-
+    ``true`` 2026-05-04 per PRD §31.3 Slice 5 — instant revert
+    via explicit ``"false"``).
 
     The CLI itself is opt-in by argument anyway — this flag is
-    a defense-in-depth gate for cron / CI invocations. Flips
-    to ``true`` at Slice 5 graduation."""
+    a defense-in-depth gate for cron / CI invocations.
+    Asymmetric env semantics: empty/whitespace = unset =
+    graduated default-true; explicit ``0``/``false``/``no``/
+    ``off`` flips off. Re-read on every call so flips
+    hot-revert without restart."""
     raw = os.environ.get(
         "JARVIS_DETERMINISM_REPLAY_ENABLED", "",
     ).strip().lower()
     if raw == "":
-        return False  # default-false until Slice 5
-    return raw in ("1", "true", "yes", "on")
+        return True  # Graduated default 2026-05-04 (Slice 5)
+    return raw not in ("0", "false", "no", "off")
 
 
 # ---------------------------------------------------------------------------

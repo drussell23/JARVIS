@@ -3438,6 +3438,94 @@ SEED_SPECS: list = [
         example="2.0",
         since="M9 Slice 1 (PRD §30.5.1, 2026-05-04)",
     ),
+    # ========================================================================
+    # Upgrade 2 — DecisionRecord Causality Graph (PRD §31.3) — 4 flags
+    # Slice 5 graduation: replay master flips false → true. Builds on
+    # Phase 1 Slice 1.4's already-graduated DecisionRuntime substrate
+    # (JARVIS_DETERMINISM_LEDGER_ENABLED) + Priority 2's CausalityDAG
+    # (JARVIS_CAUSALITY_DAG_SCHEMA_ENABLED) — those flags stay
+    # owned by their respective slices; Upgrade 2 graduates the
+    # replay-as-determinism-test surface.
+    # ========================================================================
+    FlagSpec(
+        name="JARVIS_DETERMINISM_REPLAY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master switch for the replay-as-determinism-test "
+            "surface. Default TRUE post Slice 5 graduation "
+            "(2026-05-04). Gates ``replay_session_consistency`` "
+            "+ ``scripts/replay_determinism.py --session <id>`` "
+            "+ the ``decision_drift_detected`` SSE producer in "
+            "the replay job. Operator instant-revert via "
+            "explicit env false. Leaves Phase 1's "
+            "JARVIS_DETERMINISM_LEDGER_ENABLED untouched (the "
+            "ledger writer is already graduated)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "determinism/replay_determinism.py"
+        ),
+        example="true",
+        since="Upgrade 2 Slice 5 (graduated PRD §31.3, 2026-05-04)",
+        posture_relevance=_HARDEN_AND_CONSOLIDATE,
+    ),
+    FlagSpec(
+        name="JARVIS_DECISIONS_READER_DEFAULT_LIMIT",
+        type=FlagType.INT, default=100,
+        description=(
+            "Default records-per-query when caller doesn't "
+            "supply a limit on the decisions_reader read API "
+            "(``read_records_for_session`` / "
+            "``recent_records_across_sessions``). Default 100; "
+            "clamped [1, 10000]. Consumed by both the "
+            "``/decisions`` REPL + ``GET /observability/"
+            "decisions[/session/{id}]`` HTTP routes."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "determinism/decisions_reader.py"
+        ),
+        example="100",
+        since="Upgrade 2 Slice 3 (PRD §31.3, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_DECISIONS_READER_MAX_RECORDS",
+        type=FlagType.INT, default=10_000,
+        description=(
+            "Hard ceiling on per-session record count returned "
+            "by the decisions_reader read API. Default 10000; "
+            "clamped [100, 1000000]. Bounds memory under "
+            "operator-supplied ?limit query parameters that "
+            "exceed sane size."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "determinism/decisions_reader.py"
+        ),
+        example="10000",
+        since="Upgrade 2 Slice 3 (PRD §31.3, 2026-05-04)",
+    ),
+    FlagSpec(
+        name="JARVIS_DECISIONS_READER_MAX_SESSIONS",
+        type=FlagType.INT, default=1_000,
+        description=(
+            "Hard ceiling on session-list size returned by "
+            "``list_available_sessions``. Default 1000; clamped "
+            "[10, 100000]. Bounds the cross-session aggregation "
+            "in ``recent_records_across_sessions`` + the "
+            "``/decisions sessions`` REPL surface."
+        ),
+        category=Category.CAPACITY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "determinism/decisions_reader.py"
+        ),
+        example="1000",
+        since="Upgrade 2 Slice 3 (PRD §31.3, 2026-05-04)",
+    ),
 ]
 
 
