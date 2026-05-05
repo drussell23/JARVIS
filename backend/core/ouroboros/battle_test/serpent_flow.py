@@ -1113,6 +1113,90 @@ class SerpentFlow:
         except Exception:
             pass
 
+    # ── Gap #6 Slice 4: intent-prompt fire-and-forget helper ──────
+
+    def _maybe_fire_intent_prompt(
+        self, op_id: str, goal: str, target_files: List[str],
+        risk_tier: str,
+    ) -> None:
+        """Fire a fire-and-forget intent prompt at op_started.
+
+        Schedules an async task that:
+          1. Calls :func:`intent_prompter.request_intent_and_emit` —
+             does the bounded LLM call + records to NarrativeChannel
+          2. On success, renders the intent frame to console with
+             the strict visual hierarchy (💭 bright_blue italic)
+
+        NEVER blocks op_started. NEVER raises. Master flag
+        ``JARVIS_NARRATIVE_INTENT_ENABLED`` (default false during
+        slice; Slice 5 graduates true). When off, the helper exits
+        immediately without scheduling any task.
+        """
+        try:
+            from backend.core.ouroboros.governance.intent_prompter import (
+                is_master_flag_enabled,
+            )
+            if not is_master_flag_enabled():
+                return
+        except Exception:
+            return
+
+        # Build the request synchronously, schedule the call async.
+        try:
+            from backend.core.ouroboros.governance.intent_prompter import (
+                IntentRequest, request_intent_and_emit,
+            )
+            from backend.core.ouroboros.battle_test.narrative_channel import (
+                NarrativeKind,
+            )
+            from backend.core.ouroboros.battle_test.narrative_renderer import (
+                render_to_console,
+            )
+        except Exception:
+            return
+
+        req = IntentRequest(
+            op_id=op_id,
+            goal=goal or "",
+            risk_tier=risk_tier or "",
+            target_files=tuple(target_files[:5]) if target_files else (),
+        )
+
+        async def _run() -> None:
+            try:
+                result = await request_intent_and_emit(
+                    req, phase="OP_STARTED",
+                )
+                if result.succeeded:
+                    # Render the frame visually under the active op
+                    # block. Find the most recent INTENT frame for
+                    # this op and pass it to the renderer.
+                    try:
+                        from backend.core.ouroboros.battle_test.narrative_channel import (
+                            get_default_channel,
+                        )
+                        channel = get_default_channel()
+                        for frame in reversed(channel.find_by_op_id(op_id)):
+                            if frame.kind is NarrativeKind.INTENT:
+                                render_to_console(
+                                    frame, self.console,
+                                    op_active=op_id in self._active_ops,
+                                    max_chars_per_line=80,
+                                )
+                                break
+                    except Exception:
+                        pass
+            except Exception:
+                pass  # fire-and-forget: NEVER propagate
+
+        try:
+            import asyncio as _asyncio
+            loop = _asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_run())
+        except Exception:
+            pass  # no event loop / sync context — skip silently
+
     def _op_blank(self, op_id: str) -> None:
         """Print a blank line with the op border (visual breathing room)."""
         if op_id and op_id in self._active_ops:
@@ -1361,6 +1445,12 @@ class SerpentFlow:
         self._op_starts[op_id] = time.time()
         # Gap #3 Slice 3 — start buffering (master-flag-gated, defensive)
         self._maybe_buffer_op_start(op_id)
+        # Gap #6 Slice 4 — fire-and-forget intent prompt. NEVER blocks
+        # op_started; the LLM call (or its short-circuit when master
+        # flag is off) runs as a background task and emits into the
+        # NarrativeChannel + renders to console when complete. Hard-
+        # bounded by JARVIS_NARRATIVE_INTENT_TIMEOUT_S (default 5s).
+        self._maybe_fire_intent_prompt(op_id, goal, target_files, risk_tier)
 
         # Determine sensor type from goal prefix or explicit param
         sensor_label = sensor or "Operation"
@@ -1651,6 +1741,14 @@ class SerpentFlow:
         spinner — Claude-Code-style narrator voice. The line is emitted
         once per (op_id, round_index) pair so a parallel batch doesn't
         print the same sentence for each tool.
+
+        Gap #6 Slice 4 — **Tool Transparency**: when the model omits a
+        preamble (common with fast read-only chains), we synthesize one
+        deterministically from ``tool_name`` + ``args_summary`` via
+        :func:`tool_preamble_synthesizer.synthesize_preamble`. Operators
+        always see a 🗣 line so the WHY of every tool call is legible.
+        Master flag ``JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED`` (default
+        false during slice; Slice 5 graduates to true).
         """
         tool_icons = {
             "read_file": "📄", "search_code": "🔍", "run_tests": "🧪",
@@ -1662,6 +1760,27 @@ class SerpentFlow:
 
         # Include │ prefix in spinner text so it aligns with the op block
         prefix = f"  │  " if op_id in self._active_ops else "  "
+
+        # Gap #6 Slice 4 — synthesized preamble fallback. The synthesizer
+        # is fallback-only (model-emitted preambles win); when the model
+        # didn't emit one, we render a deterministic per-tool template.
+        # NEVER raises — failures pass through with empty preamble.
+        if not preamble:
+            try:
+                _fallback_on = os.environ.get(
+                    "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED", "",
+                ).strip().lower() in ("1", "true", "yes", "on")
+                if _fallback_on:
+                    from backend.core.ouroboros.governance.tool_preamble_synthesizer import (
+                        synthesize_preamble,
+                    )
+                    preamble = synthesize_preamble(
+                        tool_name, args_summary,
+                        existing_preamble="",
+                        fallback_only=True,
+                    )
+            except Exception:
+                pass  # silent fallback per the §7 contract
 
         # Dim italic preamble line ABOVE the spinner — Ouroboros' narrator
         # voice. We dedupe on (op_id, round_index) so a 3-parallel tool
@@ -5341,6 +5460,9 @@ class SerpentREPL:
                 self._expand_diff(ref_or_op)
             elif ref_or_op.startswith("o-"):
                 self._expand_op_block(ref_or_op)
+            elif ref_or_op.startswith("n-"):
+                # Gap #6 Slice 4 — narrative frame retrieval
+                self._expand_narrative_frame(ref_or_op)
             else:
                 # Treat as op_id and find latest matching o-N
                 self._expand_op_block_by_op_id(ref_or_op)
