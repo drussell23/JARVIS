@@ -403,19 +403,48 @@ class AutonomousJudgmentFramework:
         except Exception:
             pass
 
-        # Identify improved/degraded domains
+        # Identify improved/degraded domains + count constraints
+        # learned (the LearningConsolidator's accumulated rules) in
+        # one pass.
         improved = []
         degraded = []
+        constraints_learned = 0
         try:
             from backend.core.ouroboros.governance.adaptive_learning import LearningConsolidator
             consolidator = LearningConsolidator()
             for domain_key, rules in consolidator._rules.items():
                 for rule in rules:
+                    constraints_learned += 1
                     if rule.rule_type == "common_failure":
                         if rule.confidence > 0.6:
                             degraded.append(domain_key)
                         elif rule.confidence < 0.3:
                             improved.append(domain_key)
+        except Exception:
+            pass
+
+        # Capabilities graduated — count of FlagRegistry seed
+        # entries that ship default-true bool flags. This is the
+        # honest, observable proxy for "how many capabilities has
+        # the organism graduated to default-on" — replaces the
+        # original TODO that pointed at the now-archived
+        # graduation_orchestrator. NEVER raises.
+        capabilities_graduated = 0
+        try:
+            from backend.core.ouroboros.governance.flag_registry_seed import (
+                SEED_SPECS,
+            )
+            for spec in SEED_SPECS:
+                try:
+                    type_value = (
+                        spec.type.value
+                        if hasattr(spec.type, "value")
+                        else str(spec.type)
+                    ).lower()
+                    if type_value == "bool" and spec.default is True:
+                        capabilities_graduated += 1
+                except Exception:
+                    continue
         except Exception:
             pass
 
@@ -444,8 +473,8 @@ class AutonomousJudgmentFramework:
             operations_succeeded=ops_succeeded,
             domains_improved=improved[:5],
             domains_degraded=degraded[:5],
-            capabilities_graduated=0,  # TODO: wire to GraduationOrchestrator
-            constraints_learned=0,
+            capabilities_graduated=capabilities_graduated,
+            constraints_learned=constraints_learned,
             total_cost_usd=0.0,
             verdict=verdict,
             focus_recommendation=focus,

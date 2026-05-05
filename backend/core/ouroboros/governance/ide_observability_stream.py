@@ -150,6 +150,14 @@ EVENT_TYPE_BUDGET_ACTION_TAKEN = "budget_action_taken"
 # budget_action_taken — no per-transition event type explosion.
 EVENT_TYPE_CURIOSITY_CHANGED = "curiosity_changed"
 
+# TrajectoryAuditor un-stranding (PRD §24.10.2 / §1 long-horizon
+# semantic stability gap closure 2026-05-04) — single event for
+# warning + critical drift verdicts. Payload carries verdict +
+# signals tuple + snapshot_hash + ts_unix + reason
+# ("boot" / "periodic"). Stable + growing transitions stay
+# silent (chatter suppression by construction).
+EVENT_TYPE_TRAJECTORY_DRIFT_DETECTED = "trajectory_drift_detected"
+
 # Priority 1 Slice 4 — confidence-aware execution event vocabulary
 # (PRD §26.5.1). Severity-tiered: P1 = breaker fired (above-floor abort),
 # P2 = approaching floor (early warning), P3 = sustained low-confidence
@@ -2119,6 +2127,44 @@ def publish_memory_pressure_event(
 # ---------------------------------------------------------------------------
 # Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 publisher
 # ---------------------------------------------------------------------------
+
+
+def publish_trajectory_drift_event(
+    *,
+    verdict: str,
+    signals: Tuple[Dict[str, Any], ...],
+    snapshot_hash: str,
+    ts_unix: float,
+    reason: str,
+) -> Optional[str]:
+    """Best-effort publisher for ``trajectory_drift_detected``
+    frames. Fired by :class:`TrajectoryAuditorObserver` on
+    warning / critical drift verdicts.
+
+    NEVER raises; returns the published event id or None on
+    master-flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        payload: Dict[str, Any] = {
+            "verdict": verdict,
+            "signals": list(signals or ()),
+            "snapshot_hash": snapshot_hash,
+            "ts_unix": float(ts_unix),
+            "reason": reason,
+            "signal_count": len(signals or ()),
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_TRAJECTORY_DRIFT_DETECTED,
+            "trajectory_auditor",
+            payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] trajectory drift event publish exception",
+            exc_info=True,
+        )
+        return None
 
 
 def publish_curiosity_event(

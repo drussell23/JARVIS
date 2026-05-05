@@ -1673,6 +1673,36 @@ class GovernedLoopService:
             )
             self._closure_loop_observer = None
 
+        # TrajectoryAuditorObserver (un-stranding 2026-05-04 —
+        # PRD §24.10.2 + §1 long-horizon semantic stability gap).
+        # Boot snapshot + 6h periodic tick (env-tunable). Pure
+        # stdlib codebase walk; SSE published only on warning /
+        # critical drift verdicts. Master flag default-true
+        # post-graduation.
+        self._trajectory_auditor_observer = None
+        try:
+            from backend.core.ouroboros.governance.observability.trajectory_auditor_observer import (  # noqa: E501
+                get_default_trajectory_observer,
+                trajectory_observer_enabled,
+            )
+            if trajectory_observer_enabled():
+                self._trajectory_auditor_observer = (
+                    get_default_trajectory_observer()
+                )
+                await self._trajectory_auditor_observer.start()
+                _incr_observer_boot("trajectory_auditor")
+                logger.info(
+                    "[GovernedLoop] TrajectoryAuditorObserver "
+                    "started (un-stranding)",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[GovernedLoop] TrajectoryAuditorObserver startup "
+                "failed (non-fatal)",
+                exc_info=True,
+            )
+            self._trajectory_auditor_observer = None
+
     async def _stop_governance_observers(self) -> None:
         """Stop the Tier 0.5 (batches 1+2) observers gracefully.
 
@@ -1687,6 +1717,7 @@ class GovernedLoopService:
             "_sbt_observer",
             "_replay_observer",
             "_closure_loop_observer",
+            "_trajectory_auditor_observer",
         ):
             observer = getattr(self, attr_name, None)
             if observer is None:
