@@ -706,6 +706,30 @@ def compute_curiosity(
                 v = 0.0
             per_source_mean[s] = v
 
+    # Defensive — if every observation underflowed recency_weight
+    # to 0.0 (e.g., samples are vastly older than the halflife
+    # window), per_source_mean ends up empty even though we had
+    # raw observations. Treat as INSUFFICIENT_DATA rather than
+    # raising on the empty max() below. Same shape as the no-
+    # contributing-source branch above.
+    if not per_source_mean:
+        return CuriosityScore(
+            cluster_id=cid,
+            samples_count=sample_count,
+            dominant_source=CuriositySource.INSUFFICIENT_DATA,
+            decay_reason=(
+                decay_reason_override
+                if decay_reason_override is not None
+                else CuriosityDecayReason.NONE
+            ),
+            last_updated_at_unix=(
+                max(
+                    (float(o.at_unix) for o in obs_list),
+                    default=0.0,
+                )
+            ),
+        )
+
     # Aggregate magnitude — mean of per-source means weighted by
     # operator-tunable source weights. This means turning off a
     # source via env (weight=0) structurally excludes it from
