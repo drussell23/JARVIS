@@ -437,7 +437,41 @@ def _single_flight_preflight() -> None:
 
 
 def _print_preflight() -> None:
-    """Print a preflight checklist showing what's enabled."""
+    """Print a preflight checklist showing what's enabled.
+
+    Gap #7 Slice 1 — when ``JARVIS_PRESENTATION_RESTRAINT_ENABLED``
+    is on, the verbose multi-line checklist is suppressed at boot.
+    Operators retrieve the same content on demand via the ``/preflight``
+    REPL verb. The deeper API-key fail-fast (no providers set at all)
+    still happens — that's a hard error operators MUST see.
+    """
+    # Restraint mode: skip the verbose render, but still enforce the
+    # API-key fail-fast (the script exits with code 1 below if neither
+    # provider is configured — that's not chrome, it's a hard error).
+    try:
+        from backend.core.ouroboros.battle_test.presentation_restraint import (
+            is_restraint_enabled, suppress_diagnostic_logs,
+        )
+        _restraint_on = is_restraint_enabled()
+    except Exception:
+        _restraint_on = False
+
+    if _restraint_on:
+        # Suppress the shutdown_diagnostics INFO leak too — same boot
+        # noise reduction.
+        try:
+            suppress_diagnostic_logs()
+        except Exception:
+            pass
+        # Hard-fail check still runs (API keys must be present).
+        has_dw = bool(os.environ.get("DOUBLEWORD_API_KEY"))
+        has_claude = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        if not has_dw and not has_claude:
+            print(f"\n  {_RED}{_BOLD}ERROR: No API keys set.{_RESET}")
+            print(f"  {_RED}Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY.{_RESET}\n")
+            sys.exit(1)
+        return
+
     print(f"\n{_BOLD}{_CYAN}  Preflight Checklist{_RESET}")
     print(f"{_DIM}  {'─' * 52}{_RESET}")
 

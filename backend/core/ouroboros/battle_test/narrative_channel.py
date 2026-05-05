@@ -614,5 +614,276 @@ __all__ = [
     "NarrativeKind",
     "REF_PREFIX",
     "get_default_channel",
+    "register_flags",
+    "register_shipped_invariants",
     "reset_default_channel_for_tests",
 ]
+
+
+# ===========================================================================
+# Slice 5 — FlagRegistry self-registration
+# ===========================================================================
+
+
+def register_flags(registry) -> int:
+    """Module-owned FlagRegistry registration for the Gap #6 arc.
+    Returns count of FlagSpecs added. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+
+    specs = [
+        FlagSpec(
+            name="JARVIS_NARRATIVE_INTENT_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for the op_started intent prompt "
+                "(Gap #6 Slice 2). Brief async LLM call (Tier 0 DW, "
+                "50-token cap, 5s timeout) that asks the model to "
+                "state its intent in 1 sentence. Default TRUE post "
+                "graduation 2026-05-04. Operators set =false to "
+                "disable the micro-LLM call (saves ~$0.0002 per op)."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/intent_prompter.py"
+            ),
+            example="true",
+            since="Gap #6 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for the synthesized tool-preamble "
+                "fallback (Gap #6 Slice 2). When the model omits a "
+                "preamble for a tool call, synthesize one "
+                "deterministically from tool_name + args via the "
+                "per-tool template registry. Tool Transparency: every "
+                "tool call gets a 🗣 line. Default TRUE post graduation."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/tool_preamble_synthesizer.py"
+            ),
+            example="true",
+            since="Gap #6 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_NARRATIVE_BUFFER_SIZE",
+            type=FlagType.INT,
+            default=200,
+            description=(
+                "Capacity of the NarrativeChannel ring (Gap #6 Slice 1). "
+                "Drop-oldest eviction; clamped to [1, 10_000]. Backs the "
+                "/expand n-N REPL recovery."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/narrative_channel.py"
+            ),
+            example="200",
+            since="Gap #6 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_NARRATIVE_INTENT_TIMEOUT_S",
+            type=FlagType.FLOAT,
+            default=5.0,
+            description=(
+                "Wall-clock timeout for the op_started intent prompt "
+                "LLM call. Clamped to [0.5, 30.0]. Hard cap to keep "
+                "op_started fast."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/intent_prompter.py"
+            ),
+            example="5.0",
+            since="Gap #6 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_NARRATIVE_INTENT_MAX_TOKENS",
+            type=FlagType.INT,
+            default=50,
+            description=(
+                "Max output tokens for the intent prompt. Clamped "
+                "[10, 200]. Cost-bound: structurally caps the per-op "
+                "intent micro-spend."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/governance/intent_prompter.py"
+            ),
+            example="50",
+            since="Gap #6 Slice 5 (2026-05-04)",
+        ),
+    ]
+
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[NarrativeChannel] flag registration failed for %s",
+                getattr(spec, "name", "?"), exc_info=True,
+            )
+    return count
+
+
+# ===========================================================================
+# Slice 5 — shipped_code_invariants self-registration
+# ===========================================================================
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code AST pins for the Gap #6 arc.
+
+    Four structural invariants:
+
+      1. ``narrative_kind_taxonomy_frozen`` — closed 6-value enum
+         is the source of truth for the renderer's dispatch table;
+         losing a value silently disables a model-voice channel.
+      2. ``narrative_renderer_visual_hierarchy`` — the renderer's
+         style table MUST cover every NarrativeKind explicitly
+         (Constraint 1: visual hierarchy).
+      3. ``op_tool_start_synthesizer_wired`` — the preamble
+         synthesizer fallback MUST be invoked from op_tool_start
+         (Constraint 2: tool transparency regression pin).
+      4. ``op_started_intent_prompt_wired`` — _maybe_fire_intent_prompt
+         MUST be called from op_started.
+
+    NEVER raises (returns ``[]`` on import failure)."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    import ast as _ast
+
+    def _validate_narrative_kind_frozen(tree, _source) -> tuple:
+        del _source
+        seen: set = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and node.name == "NarrativeKind":
+                for stmt in node.body:
+                    if isinstance(stmt, _ast.Assign):
+                        for target in stmt.targets:
+                            if isinstance(target, _ast.Name):
+                                seen.add(target.id)
+        required = {
+            "INTENT", "PLAN_PROSE", "TOOL_PREAMBLE",
+            "THINKING", "L2_REPAIR_PROSE", "POSTMORTEM_PROSE",
+        }
+        missing = required - seen
+        if missing:
+            return (
+                f"NarrativeKind lost values: {sorted(missing)} — "
+                "the closed taxonomy is frozen by Gap #6 Slice 5",
+            )
+        return ()
+
+    def _validate_renderer_covers_all_kinds(_tree, source) -> tuple:
+        """The renderer's _KIND_STYLES table MUST include every
+        NarrativeKind member literal. Pure source-grep — fast and
+        robust to AST shape changes."""
+        del _tree
+        violations = []
+        for kind in (
+            "INTENT", "PLAN_PROSE", "TOOL_PREAMBLE",
+            "THINKING", "L2_REPAIR_PROSE", "POSTMORTEM_PROSE",
+        ):
+            if f"NarrativeKind.{kind}" not in source:
+                violations.append(
+                    f"narrative_renderer.py missing style for "
+                    f"NarrativeKind.{kind} — visual-hierarchy "
+                    "constraint requires explicit per-kind style"
+                )
+        return tuple(violations)
+
+    def _validate_op_tool_start_synthesizer(tree, _source) -> tuple:
+        del _source
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.name == "op_tool_start":
+                    body = _ast.unparse(node)
+                    if "synthesize_preamble" not in body:
+                        return (
+                            "op_tool_start missing synthesize_preamble "
+                            "call — Tool Transparency constraint broken",
+                        )
+                    return ()
+        return ("op_tool_start method not found in serpent_flow.py",)
+
+    def _validate_op_started_intent_prompt(tree, _source) -> tuple:
+        del _source
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.name == "op_started":
+                    body = _ast.unparse(node)
+                    if "_maybe_fire_intent_prompt" not in body:
+                        return (
+                            "op_started missing _maybe_fire_intent_prompt "
+                            "call — intent prompt regressed",
+                        )
+                    return ()
+        return ("op_started method not found",)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="narrative_kind_taxonomy_frozen",
+            target_file=(
+                "backend/core/ouroboros/battle_test/narrative_channel.py"
+            ),
+            description=(
+                "NarrativeKind's 6-value closed taxonomy must remain "
+                "intact. Losing a kind silently disables a model-voice "
+                "channel."
+            ),
+            validate=_validate_narrative_kind_frozen,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="narrative_renderer_visual_hierarchy",
+            target_file=(
+                "backend/core/ouroboros/battle_test/narrative_renderer.py"
+            ),
+            description=(
+                "Constraint 1 (visual hierarchy): the renderer's style "
+                "table must include every NarrativeKind explicitly. "
+                "Operators rely on stable per-kind glyph + tint."
+            ),
+            validate=_validate_renderer_covers_all_kinds,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="op_tool_start_synthesizer_wired",
+            target_file=(
+                "backend/core/ouroboros/battle_test/serpent_flow.py"
+            ),
+            description=(
+                "Constraint 2 (Tool Transparency) BUG-FIX REGRESSION "
+                "PIN: op_tool_start must call synthesize_preamble so "
+                "every tool call gets a 🗣 line."
+            ),
+            validate=_validate_op_tool_start_synthesizer,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="op_started_intent_prompt_wired",
+            target_file=(
+                "backend/core/ouroboros/battle_test/serpent_flow.py"
+            ),
+            description=(
+                "BUG-FIX REGRESSION PIN: op_started must call "
+                "_maybe_fire_intent_prompt to surface the model's "
+                "intent at op start."
+            ),
+            validate=_validate_op_started_intent_prompt,
+        ),
+    ]

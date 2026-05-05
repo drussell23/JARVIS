@@ -267,8 +267,11 @@ def _req(**overrides) -> IntentRequest:
     return IntentRequest(**base)
 
 
-def test_request_intent_short_circuits_when_master_flag_off():
-    """Master flag off → returns empty result without LLM call."""
+def test_request_intent_short_circuits_when_master_flag_off(monkeypatch):
+    """When operator opts out via ``=false``, returns empty result
+    without LLM call (post-Slice-5 the default is ON, so we set
+    explicitly)."""
+    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "false")
     result = asyncio.get_event_loop().run_until_complete(
         request_intent(_req()),
     )
@@ -411,8 +414,9 @@ def test_intent_does_not_emit_on_failure(monkeypatch):
     assert channel.find_by_kind(NarrativeKind.INTENT) == ()
 
 
-def test_intent_emit_with_master_flag_off_no_channel_change():
+def test_intent_emit_with_master_flag_off_no_channel_change(monkeypatch):
     """Master flag off → no LLM call, no channel emission."""
+    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "false")
     channel = NarrativeChannel(capacity=10)
     asyncio.get_event_loop().run_until_complete(
         request_intent_and_emit(_req(), channel=channel),

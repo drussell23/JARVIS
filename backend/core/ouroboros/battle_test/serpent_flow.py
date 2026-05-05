@@ -636,6 +636,15 @@ class SerpentFlow:
         Code's flowing UX. No fixed terminal regions, no panel
         borders, no width clamping.
 
+        Gap #7 Slice 1 (2026-05-04): when
+        ``JARVIS_PRESENTATION_RESTRAINT_ENABLED`` is on, render the
+        CC-style minimal welcome panel instead of the dense multi-
+        section dashboard. The 6-layer state is captured into
+        :func:`presentation_restraint.set_captured_layers` so the
+        ``/organism`` REPL verb can re-render the same data on demand.
+        Legacy multi-section path preserved verbatim below the guard
+        for byte-identical rollback.
+
         Parameters
         ----------
         layers:
@@ -646,6 +655,57 @@ class SerpentFlow:
         log_path:
             Path to the debug log file (shown at the bottom).
         """
+        # ── Gap #7 Slice 1: presentation-restraint short-circuit ──
+        try:
+            from backend.core.ouroboros.battle_test.presentation_restraint import (
+                is_restraint_enabled,
+                render_minimal_welcome,
+                set_captured_layers,
+                suppress_diagnostic_logs,
+            )
+        except Exception:
+            is_restraint_enabled = lambda: False  # type: ignore[assignment]
+        if is_restraint_enabled():
+            try:
+                # Capture the harness-computed layers so /organism can
+                # re-render the same snapshot on demand.
+                set_captured_layers(layers)
+                # Suppress shutdown-diagnostics INFO leak (boot noise).
+                suppress_diagnostic_logs()
+                _mode = (
+                    "Governed + plan review before execute"
+                    if self._plan_review_mode
+                    else "Governed (SAFE_AUTO auto-apply)"
+                )
+                # Resolve cwd from the project root if available.
+                _cwd = ""
+                try:
+                    from pathlib import Path as _Path
+                    _cwd = str(_Path.cwd())
+                    home = str(_Path.home())
+                    if _cwd.startswith(home):
+                        _cwd = "~" + _cwd[len(home):]
+                except Exception:
+                    pass
+                render_minimal_welcome(
+                    self.console,
+                    session_id=self._session_id,
+                    branch=self._branch_name or "",
+                    cost_cap=self._cost_cap,
+                    idle_timeout_s=self._idle_timeout_s,
+                    mode_str=_mode,
+                    cwd_str=_cwd,
+                )
+                if log_path:
+                    self.console.print(f"  [dim]📝 {log_path}[/dim]")
+                    self.console.print()
+                return
+            except Exception:
+                # Restraint render failed → fall through to legacy
+                # so the operator still sees a usable boot screen.
+                pass
+
+        # ── Legacy multi-section dashboard (unchanged below) ──
         _on = "[bright_green]ON[/bright_green]"
         _off = "[dim]OFF[/dim]"
 
@@ -4524,6 +4584,14 @@ class SerpentREPL:
                         self._handle_narrate(line)
                         continue
 
+                    # Gap #7 Slice 1 — /preflight + /organism (moved boot content)
+                    if line in ("/preflight", "preflight"):
+                        self._handle_preflight()
+                        continue
+                    if line in ("/organism", "organism"):
+                        self._handle_organism()
+                        continue
+
                     # Runtime configuration commands
                     if line.startswith("/risk") or line.startswith("risk ") or line == "risk":
                         self._handle_risk(line)
@@ -5434,6 +5502,45 @@ class SerpentREPL:
             f"size={_size}B mime={_ATTACHMENT_EXT_TO_MIME[_ext]} verdict={verdict}[/{_C['evolved']}]",
             highlight=False,
         )
+
+    # ── Gap #7 Slice 1 — /preflight and /organism (moved boot content) ──
+
+    def _handle_preflight(self) -> None:
+        """``/preflight`` — render the preflight checklist on demand.
+
+        Replicates what the script's boot-time checklist showed, but
+        as an interactive verb. Pulls the current env state at call
+        time (not stale boot snapshot), so operators can verify their
+        flag changes.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.presentation_restraint import (
+                render_preflight,
+            )
+            render_preflight(self._flow.console)
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/preflight error: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+
+    def _handle_organism(self) -> None:
+        """``/organism`` — render the 6-Layer Organism status on demand.
+
+        Re-renders from the harness-captured snapshot (set during
+        boot via ``presentation_restraint.set_captured_layers``).
+        Avoids re-running expensive feature detection per call.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.presentation_restraint import (
+                render_organism,
+            )
+            render_organism(self._flow.console)
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/organism error: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
 
     # ── Gap #3 Slice 3 — unified /expand verb ───────────────────
 
