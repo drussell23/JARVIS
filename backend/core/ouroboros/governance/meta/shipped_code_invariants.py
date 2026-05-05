@@ -188,10 +188,19 @@ def list_shipped_code_invariants() -> Tuple[ShippedCodeInvariant, ...]:
 
 
 def reset_registry_for_tests() -> None:
-    """Test isolation."""
+    """Test isolation — clears the registry and rebuilds it from
+    BOTH the static seed invariants AND module-provided
+    invariants discovered via :func:`module_discovery`.
+
+    Pre-Slice-2 (Slice 5b consolidation arc) this only re-seeded
+    the static set, leaking any module-owned pins (M10's 8,
+    cleanup_invariants' 4, etc.) across test isolation. Now
+    rebuilds the full registry so post-reset state matches
+    boot-time state."""
     with _REGISTRY_LOCK:
         _REGISTRY.clear()
     _register_seed_invariants()
+    _discover_module_provided_invariants()
 
 
 # ---------------------------------------------------------------------------

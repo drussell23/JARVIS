@@ -262,19 +262,73 @@ def _validate_archive_provenance(
 # ---------------------------------------------------------------------------
 
 
+def _validate_consumer_uses_primitive(
+    tree: "ast.Module", source: str,
+) -> tuple:
+    """Slice 2 (Slice 5b consolidation arc) — every consumer
+    of the discovery pattern MUST delegate to
+    :func:`module_discovery.discover_module_provided_callable`
+    rather than reimplementing the walk. This pin enforces
+    that contract structurally on the three known consumers:
+    flag_registry_seed / shipped_code_invariants /
+    help_dispatcher.
+
+    Detection: source MUST import
+    ``discover_module_provided_callable`` AND MUST NOT contain
+    ``pkgutil.iter_modules`` outside import-statement context."""
+    violations: list = []
+    has_primitive_import = False
+    has_legacy_walk = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if "module_discovery" in module:
+                for alias in node.names:
+                    if (
+                        alias.name
+                        == "discover_module_provided_callable"
+                    ):
+                        has_primitive_import = True
+        if isinstance(node, ast.Attribute):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "pkgutil"
+                and node.attr == "iter_modules"
+            ):
+                has_legacy_walk = True
+    if not has_primitive_import:
+        violations.append(
+            "consumer MUST import "
+            "discover_module_provided_callable from "
+            "module_discovery (Slice 5b consolidation Slice 2 — "
+            "no parallel walkers)"
+        )
+    if has_legacy_walk:
+        violations.append(
+            "consumer MUST NOT call pkgutil.iter_modules "
+            "directly — delegate to module_discovery primitive"
+        )
+    return tuple(violations)
+
+
 def register_shipped_invariants() -> list:
     """Module-owned ShippedCodeInvariant contributions for §32.5
-    cleanup arc. Auto-discovered by
+    cleanup arc + Slice 5b consolidation Slice 2.
+    Auto-discovered by
     :func:`shipped_code_invariants._discover_module_provided_invariants`.
 
-    Returns 4 pins:
+    Returns 7 pins:
 
       1. ``graduation_orchestrator_archived_only_harness``
       2. ``graduation_orchestrator_archived_only_runtime_task``
       3. ``graduation_orchestrator_archived_only_governed_loop``
-      4. ``graduation_orchestrator_module_archived`` (sentinel —
-         targets this module itself; verifies archive integrity
-         + forbidden paths absent + provenance README present)
+      4. ``graduation_orchestrator_module_archived`` (sentinel)
+      5. ``module_discovery_consumer_flag_registry_seed`` —
+         enforces flag_registry_seed delegates to the primitive
+      6. ``module_discovery_consumer_shipped_code_invariants`` —
+         same for shipped_code_invariants
+      7. ``module_discovery_consumer_help_dispatcher`` —
+         same for help_dispatcher
     """
     try:
         from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
@@ -344,6 +398,55 @@ def register_shipped_invariants() -> list:
                 "(§32.5 cleanup integrity)."
             ),
             validate=_validate_archive_provenance,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "module_discovery_consumer_flag_registry_seed"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "flag_registry_seed.py"
+            ),
+            description=(
+                "flag_registry_seed._discover_module_provided_"
+                "flags MUST delegate to module_discovery."
+                "discover_module_provided_callable (no parallel "
+                "walker). Slice 5b consolidation Slice 2."
+            ),
+            validate=_validate_consumer_uses_primitive,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "module_discovery_consumer_shipped_code_invariants"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/meta/"
+                "shipped_code_invariants.py"
+            ),
+            description=(
+                "shipped_code_invariants._discover_module_-"
+                "provided_invariants MUST delegate to "
+                "module_discovery.discover_module_provided_-"
+                "callable (no parallel walker). Slice 5b "
+                "consolidation Slice 2."
+            ),
+            validate=_validate_consumer_uses_primitive,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "module_discovery_consumer_help_dispatcher"
+            ),
+            target_file=(
+                "backend/core/ouroboros/governance/"
+                "help_dispatcher.py"
+            ),
+            description=(
+                "help_dispatcher._discover_module_provided_verbs "
+                "MUST delegate to module_discovery."
+                "discover_module_provided_callable (no parallel "
+                "walker). Slice 5b consolidation Slice 2."
+            ),
+            validate=_validate_consumer_uses_primitive,
         ),
     ]
 

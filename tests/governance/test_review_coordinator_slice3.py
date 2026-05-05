@@ -155,10 +155,11 @@ def test_review_decision_implies_apply(
 
 
 def test_coordinate_skipped_when_master_flag_off(
-    coordinator: ReviewCoordinator,
+    monkeypatch, coordinator: ReviewCoordinator,
 ):
-    """Without the master flag, coordinator returns SKIPPED — caller
-    falls through to legacy auto-apply."""
+    """When operator opts out via ``=false``, coordinator returns
+    SKIPPED — caller falls through to legacy auto-apply."""
+    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "false")
     result = asyncio.get_event_loop().run_until_complete(
         coordinator.coordinate_review(
             "op-x", [("foo.py", "x\n")],

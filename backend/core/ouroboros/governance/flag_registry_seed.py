@@ -3602,6 +3602,31 @@ SEED_SPECS: list = [
         example="5",
         since="M10 Slice 5 (PRD §32.4, 2026-05-04)",
     ),
+    # ====================================================================
+    # Slice 5b consolidation Slice 2 — module_discovery substrate (1 flag)
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_MODULE_DISCOVERY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the module_discovery "
+            "substrate (PRD §32.5 / §32.11 Slice 5b "
+            "consolidation Slice 2). When false, discovery is "
+            "a fast no-op returning a zero-count "
+            "DiscoveryReport; consumers (flag_registry_seed / "
+            "shipped_code_invariants / help_dispatcher) fall "
+            "back to their static seed lists. Three consumers "
+            "delegate to this primitive — no parallel walkers "
+            "in production code (AST-pinned)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/meta/"
+            "module_discovery.py"
+        ),
+        example="true",
+        since="Slice 5b Slice 2 (PRD §32.5, 2026-05-04)",
+    ),
     FlagSpec(
         name="JARVIS_M10_APPROVAL_TIMEOUT_S",
         type=FlagType.FLOAT, default=86_400.0,

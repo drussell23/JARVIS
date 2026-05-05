@@ -668,5 +668,284 @@ __all__ = [
     "get_default_coordinator",
     "is_master_flag_enabled",
     "read_timeout_s",
+    "register_flags",
+    "register_shipped_invariants",
     "reset_default_coordinator_for_tests",
 ]
+
+
+# ===========================================================================
+# Slice 6 — FlagRegistry self-registration (auto-discovered via the
+# governance entry in ``_FLAG_PROVIDER_PACKAGES``)
+# ===========================================================================
+
+
+def register_flags(registry) -> int:
+    """Module-owned FlagRegistry registration for the Gap #4 arc.
+    Returns count of FlagSpecs added. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+
+    specs = [
+        FlagSpec(
+            name=MASTER_FLAG_ENV_VAR,
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for the IDE-native review-branch "
+                "flow (Gap #4). When false, ``orchestrator.py`` falls "
+                "through to the legacy 5s overlay → auto-apply path "
+                "preserved below the master-flag guard. Default TRUE "
+                "post graduation 2026-05-04. Re-read on every "
+                "coordination call — flips take effect immediately for "
+                "the next op without restart."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/review_coordinator.py"
+            ),
+            example="true",
+            since="Gap #4 Slice 6 (2026-05-04)",
+        ),
+        FlagSpec(
+            name=TIMEOUT_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=300.0,
+            description=(
+                "Wall-clock window (seconds) for operator decision on "
+                "a Yellow-tier review. ``=0`` opts out entirely "
+                "(legacy auto-apply behavior). Positive values cause "
+                "auto-EXPIRE → auto-REJECT after the window — operator "
+                "must explicitly accept. Negative / garbage falls back "
+                "to default."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/review_coordinator.py"
+            ),
+            example="300",
+            since="Gap #4 Slice 6 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_DIFF_ARCHIVE_SIZE",
+            type=FlagType.INT,
+            default=30,
+            description=(
+                "Capacity of the DiffArchive (Gap #4 Slice 1) — the "
+                "session-scoped ring of candidate diffs + lifecycle "
+                "outcomes. Drop-oldest eviction; clamped to [1, 1000]. "
+                "Backs the ``/diff list`` REPL and ``/observability/"
+                "diff-archive`` GET (Slice 4 follow-up)."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/diff_archive.py"
+            ),
+            example="30",
+            since="Gap #4 Slice 6 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_REVIEW_BRANCH_GIT_TIMEOUT_S",
+            type=FlagType.FLOAT,
+            default=15.0,
+            description=(
+                "Per-call timeout (seconds) for git subprocess "
+                "invocations inside :class:`ReviewBranchManager`. "
+                "Bounded so a hung git can't deadlock the orchestrator."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/review_branch_manager.py"
+            ),
+            example="15",
+            since="Gap #4 Slice 6 (2026-05-04)",
+        ),
+    ]
+
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[ReviewCoordinator] flag registration failed for %s",
+                getattr(spec, "name", "?"), exc_info=True,
+            )
+    return count
+
+
+# ===========================================================================
+# Slice 6 — shipped_code_invariants self-registration
+# ===========================================================================
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code AST pins for the Gap #4 arc.
+
+    Four structural invariants:
+
+      1. ``review_state_vocabulary_frozen`` — :class:`ReviewState`
+         closed 5-value taxonomy is pinned against silent expansion
+         (mirrors the ``TerminationCause`` + ``DiffOutcome`` patterns).
+      2. ``diff_outcome_vocabulary_frozen`` — :class:`DiffOutcome` 5-value
+         + :class:`VerifyOutcome` 4-value taxonomies pinned.
+      3. ``orchestrator_review_hook_present`` — the ``Gap #4 Slice 3``
+         marker comment + ``coordinate_review`` call MUST appear in
+         ``orchestrator.py``. THIS IS THE BUG-FIX REGRESSION PIN —
+         without it, a future refactor could silently revert IDE-native
+         review.
+      4. ``serpent_repl_review_handlers_present`` — ``_handle_accept``,
+         ``_handle_reject``, ``_handle_review`` MUST be defined on
+         ``SerpentREPL``; the dispatch loop MUST route ``/accept``,
+         ``/reject``, ``/review`` to them.
+
+    NEVER raises (returns ``[]`` on import failure)."""
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    import ast as _ast
+
+    def _validate_enum_vocab(
+        tree, _source, *, class_name: str, required: set,
+    ) -> tuple:
+        del _source
+        seen: set = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and node.name == class_name:
+                for stmt in node.body:
+                    if isinstance(stmt, _ast.Assign):
+                        for target in stmt.targets:
+                            if isinstance(target, _ast.Name):
+                                seen.add(target.id)
+        missing = required - seen
+        violations = []
+        if missing:
+            violations.append(
+                f"{class_name} lost values: {sorted(missing)} — "
+                "the closed taxonomy is frozen by Gap #4 Slice 6"
+            )
+        return tuple(violations)
+
+    def _validate_review_state_frozen(tree, source) -> tuple:
+        return _validate_enum_vocab(
+            tree, source,
+            class_name="ReviewState",
+            required={
+                "PENDING", "ACCEPTED", "REJECTED", "SUPERSEDED", "EXPIRED",
+            },
+        )
+
+    def _validate_diff_outcome_frozen(tree, source) -> tuple:
+        violations = list(_validate_enum_vocab(
+            tree, source,
+            class_name="DiffOutcome",
+            required={
+                "PENDING", "APPLIED", "REJECTED", "SUPERSEDED", "FAILED",
+            },
+        ))
+        violations.extend(_validate_enum_vocab(
+            tree, source,
+            class_name="VerifyOutcome",
+            required={"PENDING", "PASSED", "FAILED", "SKIPPED"},
+        ))
+        return tuple(violations)
+
+    def _validate_orchestrator_hook_present(_tree, source) -> tuple:
+        del _tree
+        violations = []
+        if "Gap #4 Slice 3" not in source:
+            violations.append(
+                "orchestrator.py missing 'Gap #4 Slice 3' marker comment "
+                "in NOTIFY_APPLY block — review-branch hook may have been "
+                "removed by a refactor"
+            )
+        if "coordinate_review" not in source:
+            violations.append(
+                "orchestrator.py does not invoke coordinator.coordinate_review "
+                "— IDE-native review flow is broken"
+            )
+        return tuple(violations)
+
+    def _validate_serpent_repl_handlers(tree, source) -> tuple:
+        # AST walk for the three handler methods + dispatch routes
+        method_names: set = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                method_names.add(node.name)
+        required_methods = {
+            "_handle_accept", "_handle_reject", "_handle_review",
+        }
+        missing = required_methods - method_names
+        violations = []
+        if missing:
+            violations.append(
+                f"SerpentREPL missing review handler methods: "
+                f"{sorted(missing)}"
+            )
+        # Source-level grep for dispatch routes (faster than full AST
+        # walk of the dispatch loop's elif chain).
+        for verb in ("/accept", "/reject"):
+            if f'line.startswith("{verb}")' not in source:
+                violations.append(
+                    f"SerpentREPL dispatch missing route for {verb!r}"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="review_state_vocabulary_frozen",
+            target_file=(
+                "backend/core/ouroboros/governance/review_branch_manager.py"
+            ),
+            description=(
+                "ReviewState's closed 5-value taxonomy must remain "
+                "intact. Adding a new state requires a slice."
+            ),
+            validate=_validate_review_state_frozen,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="diff_outcome_vocabulary_frozen",
+            target_file=(
+                "backend/core/ouroboros/battle_test/diff_archive.py"
+            ),
+            description=(
+                "DiffOutcome (5 values) + VerifyOutcome (4 values) "
+                "closed taxonomies must remain intact."
+            ),
+            validate=_validate_diff_outcome_frozen,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="orchestrator_review_hook_present",
+            target_file=(
+                "backend/core/ouroboros/governance/orchestrator.py"
+            ),
+            description=(
+                "BUG-FIX REGRESSION PIN: the Gap #4 Slice 3 hook (marker "
+                "comment + coordinate_review call) must remain at the "
+                "NOTIFY_APPLY site, otherwise IDE-native review silently "
+                "regresses."
+            ),
+            validate=_validate_orchestrator_hook_present,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="serpent_repl_review_handlers_present",
+            target_file=(
+                "backend/core/ouroboros/battle_test/serpent_flow.py"
+            ),
+            description=(
+                "SerpentREPL must define _handle_accept / _handle_reject / "
+                "_handle_review methods AND route /accept and /reject "
+                "lines to them. Operator review UX depends on this."
+            ),
+            validate=_validate_serpent_repl_handlers,
+        ),
+    ]
