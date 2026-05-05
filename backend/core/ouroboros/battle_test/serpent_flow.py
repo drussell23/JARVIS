@@ -1189,6 +1189,30 @@ class SerpentFlow:
         except Exception:
             pass
 
+    def _maybe_set_terminal_title(
+        self, *,
+        op_id: Optional[str] = None,
+        phase: Optional[str] = None,
+    ) -> None:
+        """Update the terminal window title via OSC 0 — Gap #7 Slice 4.
+
+        Pulls cost from the live tally so operators see budget burn
+        in their window list. NEVER raises into the lifecycle hooks.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.repl_input_polish import (
+                set_terminal_title, format_title,
+            )
+            title = format_title(
+                op_id=op_id,
+                phase=phase,
+                cost_used=getattr(self, "_cost_total", 0.0),
+                cost_budget=getattr(self, "_cost_cap", 0.0),
+            )
+            set_terminal_title(title)
+        except Exception:
+            pass  # never blocks the lifecycle path
+
     # ── Gap #6 Slice 4: intent-prompt fire-and-forget helper ──────
 
     def _maybe_fire_intent_prompt(
@@ -1527,6 +1551,8 @@ class SerpentFlow:
         # NarrativeChannel + renders to console when complete. Hard-
         # bounded by JARVIS_NARRATIVE_INTENT_TIMEOUT_S (default 5s).
         self._maybe_fire_intent_prompt(op_id, goal, target_files, risk_tier)
+        # Gap #7 Slice 4 — terminal title at phase transition
+        self._maybe_set_terminal_title(op_id=op_id, phase="STARTING")
 
         # Determine sensor type from goal prefix or explicit param
         sensor_label = sensor or "Operation"
@@ -2529,6 +2555,14 @@ class SerpentFlow:
             op_id,
             f"⏺ {files_str} evolved · ⏱ {elapsed:.1f}s · 💰 ${cost_usd:.4f}",
         )
+        # Gap #7 Slice 4 — clear the terminal title back to idle when
+        # no other ops are active (the resolver picks any remaining
+        # active op when there are concurrent ops in flight).
+        if not self._active_ops:
+            self._maybe_set_terminal_title()
+        else:
+            _next_active = next(iter(self._active_ops), None)
+            self._maybe_set_terminal_title(op_id=_next_active, phase="ACTIVE")
 
         # UI Slice 6 — grep-friendly inline receipt right after the
         # block close. Single line, ` · ` separators, plain ANSI.
@@ -2572,6 +2606,12 @@ class SerpentFlow:
             op_id,
             f"💀 shed · {reason[:60]} · ⏱ {elapsed:.1f}s",
         )
+        # Gap #7 Slice 4 — clear / refresh terminal title
+        if not self._active_ops:
+            self._maybe_set_terminal_title()
+        else:
+            _next_active = next(iter(self._active_ops), None)
+            self._maybe_set_terminal_title(op_id=_next_active, phase="ACTIVE")
 
         # UI Slice 6 — grep-friendly inline failure receipt.
         self._emit_op_receipt(
@@ -4298,6 +4338,20 @@ class SerpentREPL:
         def _on_alt_enter(event: Any) -> None:
             event.current_buffer.insert_text("\n")
 
+        # Gap #7 Slice 4: merge in the Esc-to-cancel binding (no-op
+        # when the polish master flag is off OR prompt_toolkit's
+        # filter primitives are unavailable).
+        try:
+            from backend.core.ouroboros.battle_test.repl_input_polish import (
+                make_esc_cancel_binding,
+            )
+            _esc_bindings = make_esc_cancel_binding(self, flow=self._flow)
+            if _esc_bindings is not None:
+                # KeyBindings supports add_bindings(other) for merging
+                _repl_bindings.add_bindings(_esc_bindings)
+        except Exception:
+            pass  # fail-closed: Ctrl+C still works for cancellation
+
         def _continuation(width: int, line_number: int, is_soft_wrap: bool) -> str:
             return " " * max(width - 2, 0) + "│ "
 
@@ -4370,16 +4424,40 @@ class SerpentREPL:
         except Exception:
             _live_bottom_toolbar = _bottom_toolbar  # safe fallback
 
+        # Gap #7 Slice 3: auto-discovered slash-command palette + tab
+        # completion + persistent history. NEVER raises into the boot
+        # path; when the master flag is off OR prompt_toolkit's
+        # completion modules are unavailable, the wiring returns Nones
+        # and PromptSession runs without a completer (legacy behavior).
+        # Defaults match legacy when wiring is empty.
+        _completion_kwargs = {
+            "complete_while_typing": False,
+            "enable_history_search": False,
+        }
+        try:
+            from backend.core.ouroboros.battle_test.repl_completion import (
+                build_completion_wiring,
+            )
+            _wiring = build_completion_wiring(self)
+            if _wiring.completer is not None:
+                _completion_kwargs["completer"] = _wiring.completer
+            if _wiring.history is not None:
+                _completion_kwargs["history"] = _wiring.history
+                _completion_kwargs["enable_history_search"] = (
+                    _wiring.enable_history_search
+                )
+        except Exception:
+            pass  # fail-closed — REPL still works without completion
+
         self._session = PromptSession(
             multiline=True,
             key_bindings=_repl_bindings,
             wrap_lines=True,
-            complete_while_typing=False,
-            enable_history_search=False,
             auto_suggest=None,
             prompt_continuation=_continuation,
             bottom_toolbar=_live_bottom_toolbar,
             refresh_interval=_REPL_REFRESH_INTERVAL_S,
+            **_completion_kwargs,
         )
 
         # raw=True preserves Rich's ANSI escape codes (raw=False would
@@ -4465,6 +4543,41 @@ class SerpentREPL:
                     line = line.strip()
                     if not line:
                         continue
+
+                    # Gap #7 Slice 4 — @filepath mention extraction.
+                    # Operators type ``@backend/auth.py do X`` and the
+                    # path is auto-attached via the existing /attach
+                    # mechanism. The cleaned line proceeds to normal
+                    # dispatch with mentions stripped. NEVER raises.
+                    try:
+                        from backend.core.ouroboros.battle_test.repl_input_polish import (
+                            extract_attachments,
+                            is_polish_enabled,
+                        )
+                        if is_polish_enabled():
+                            _extraction = extract_attachments(line)
+                            if _extraction.paths:
+                                # Fire one /attach per extracted path,
+                                # fire-and-forget. Each invocation
+                                # returns immediately; the actual
+                                # attachment work runs async.
+                                for _path in _extraction.paths:
+                                    try:
+                                        asyncio.create_task(
+                                            self._handle_attach(f"/attach {_path}")
+                                        )
+                                    except Exception:
+                                        pass
+                                # Continue with the cleaned line for
+                                # normal dispatch.
+                                line = _extraction.cleaned_line
+                                if not line:
+                                    # Pure-mention input ("@foo.py") —
+                                    # the attach is already firing;
+                                    # nothing else to dispatch.
+                                    continue
+                    except Exception:
+                        pass  # fail-closed — line proceeds untouched
 
                     # Built-in commands
                     if line in ("quit", "exit", "q"):

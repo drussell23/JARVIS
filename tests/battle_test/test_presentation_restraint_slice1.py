@@ -46,14 +46,17 @@ def test_schema_version_pinned():
     assert PRESENTATION_RESTRAINT_SCHEMA_VERSION == "presentation_restraint.v1"
 
 
-def test_master_flag_default_off():
-    """Slice 1 ships default-off. Slice 5 graduates to true."""
-    assert is_restraint_enabled() is False
+def test_master_flag_default_on_post_graduation():
+    """Slice 5 flipped this default-true (2026-05-04). Operators set
+    ``=false`` to opt back into legacy verbose dashboard."""
+    assert is_restraint_enabled() is True
 
 
 @pytest.mark.parametrize("raw,expected", [
+    ("", True),                  # unset → default ON
     ("true", True), ("1", True), ("yes", True), ("on", True),
-    ("false", False), ("", False), ("garbage", False),
+    ("garbage", True),           # not in off-token set → ON
+    ("false", False), ("0", False), ("no", False), ("off", False),
 ])
 def test_master_flag_parsing(monkeypatch, raw, expected):
     monkeypatch.setenv(MASTER_FLAG_ENV_VAR, raw)

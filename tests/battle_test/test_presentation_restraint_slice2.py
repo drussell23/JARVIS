@@ -39,22 +39,24 @@ def clean(monkeypatch: pytest.MonkeyPatch):
 # ===========================================================================
 
 
-def test_chrome_color_returns_default_when_restraint_off():
+def test_chrome_color_returns_default_when_restraint_off(monkeypatch):
+    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "false")
     assert chrome_color() == "bright_green"
 
 
-def test_chrome_color_returns_dim_under_restraint(monkeypatch):
-    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "true")
+def test_chrome_color_returns_dim_under_restraint():
+    """Post-graduation default-on; restraint default returns dim."""
     assert chrome_color() == "dim"
 
 
-def test_chrome_color_passes_through_custom_default():
+def test_chrome_color_passes_through_custom_default(monkeypatch):
     """Caller can pass any default — it's preserved when restraint off."""
+    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "false")
     assert chrome_color("yellow") == "yellow"
 
 
-def test_chrome_color_overrides_custom_default_under_restraint(monkeypatch):
-    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "true")
+def test_chrome_color_overrides_custom_default_under_restraint():
+    """Default-on; custom default overridden to dim."""
     assert chrome_color("yellow") == "dim"
 
 
@@ -219,8 +221,9 @@ def test_format_plain_idle_under_restraint_uses_breadcrumb(monkeypatch):
     assert "Cost:" not in out
 
 
-def test_format_plain_idle_legacy_when_restraint_off():
-    """No master flag → legacy verbose format preserved."""
+def test_format_plain_idle_legacy_when_restraint_off(monkeypatch):
+    """Explicit master-flag-off → legacy verbose format preserved."""
+    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "false")
     snap = StatusSnapshot(
         phase="IDLE",
         cost_spent_usd=0.04,

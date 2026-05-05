@@ -99,10 +99,11 @@ MASTER_FLAG_ENV_VAR: str = "JARVIS_PRESENTATION_RESTRAINT_ENABLED"
 
 
 def is_restraint_enabled() -> bool:
-    """``JARVIS_PRESENTATION_RESTRAINT_ENABLED``. Default false during
-    this slice. Slice 5 graduation flips to true. NEVER raises."""
-    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "")
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    """``JARVIS_PRESENTATION_RESTRAINT_ENABLED``. **Default true** post
+    Slice 5 graduation (2026-05-04). Operators flip ``=false`` for
+    instant rollback to the legacy verbose dashboard. NEVER raises."""
+    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 # ===========================================================================
@@ -545,6 +546,8 @@ __all__ = [
     "get_captured_layers",
     "is_restraint_enabled",
     "real_stdout_isatty",
+    "register_flags",
+    "register_shipped_invariants",
     "render_minimal_welcome",
     "render_organism",
     "render_preflight",
@@ -552,6 +555,355 @@ __all__ = [
     "set_captured_layers",
     "suppress_diagnostic_logs",
 ]
+
+
+# ===========================================================================
+# Slice 5 — FlagRegistry self-registration (umbrella for the Gap #7 arc)
+# ===========================================================================
+
+
+def register_flags(registry) -> int:
+    """Module-owned FlagRegistry registration for the Gap #7 arc.
+    Auto-discovered via the ``battle_test`` entry in
+    ``_FLAG_PROVIDER_PACKAGES``. Returns count of FlagSpecs added.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+
+    specs = [
+        # ── Slice 1+2: presentation restraint umbrella ────────────
+        FlagSpec(
+            name=MASTER_FLAG_ENV_VAR,  # JARVIS_PRESENTATION_RESTRAINT_ENABLED
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for the CC-style minimal boot + "
+                "color discipline (Gap #7 Slices 1+2). When false: "
+                "verbose multi-section dashboard returns; preflight + "
+                "shutdown-diagnostics + 6-layer block all render at "
+                "boot; chrome uses bright_green. Default TRUE post "
+                "graduation 2026-05-04."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/battle_test/presentation_restraint.py"
+            ),
+            example="true",
+            since="Gap #7 Slice 5 (2026-05-04)",
+        ),
+        # ── Slice 3: REPL completion ──────────────────────────────
+        FlagSpec(
+            name="JARVIS_REPL_COMPLETION_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for the auto-discovered slash-"
+                "command palette + tab completion (Gap #7 Slice 3). "
+                "When false: PromptSession runs without a completer "
+                "(operators must type full verb names from memory). "
+                "Default TRUE post graduation. Verbs are discovered "
+                "from SerpentREPL._handle_* methods at boot — "
+                "structurally automatic, no hardcoded list."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/battle_test/repl_completion.py"
+            ),
+            example="true",
+            since="Gap #7 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_REPL_HISTORY_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Persistent REPL history (↑/↓/Ctrl+R) across sessions. "
+                "Default TRUE — conventional shell behavior. Operators "
+                "set ``=false`` for confidentiality (no history file "
+                "on disk)."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/repl_completion.py"
+            ),
+            example="true",
+            since="Gap #7 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_REPL_HISTORY_FILE",
+            type=FlagType.STR,
+            default="",
+            description=(
+                "Override the REPL history file path. Empty (default) "
+                "means ``.jarvis/repl_history`` relative to cwd "
+                "(per-project history). Useful for shared history "
+                "across multiple O+V projects via an absolute path."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/repl_completion.py"
+            ),
+            example="~/.jarvis/repl_history",
+            since="Gap #7 Slice 5 (2026-05-04)",
+        ),
+        # ── Slice 4: input polish ─────────────────────────────────
+        FlagSpec(
+            name="JARVIS_REPL_INPUT_POLISH_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Master kill switch for input ergonomics (Gap #7 Slice "
+                "4): @filepath mention extraction + Esc-to-cancel + "
+                "terminal title updates. When false: operators must "
+                "use explicit /attach + Ctrl+C; terminal title stays "
+                "at the shell default. Default TRUE post graduation."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/battle_test/repl_input_polish.py"
+            ),
+            example="true",
+            since="Gap #7 Slice 5 (2026-05-04)",
+        ),
+        FlagSpec(
+            name="JARVIS_TERMINAL_TITLE_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Title bar updates (OSC 0). Inherits from "
+                "JARVIS_REPL_INPUT_POLISH_ENABLED when unset. "
+                "Operators on tmux / terminal multiplexers may "
+                "set ``=false`` to avoid title-fight contention."
+            ),
+            category=Category.TUNING,
+            source_file=(
+                "backend/core/ouroboros/battle_test/repl_input_polish.py"
+            ),
+            example="true",
+            since="Gap #7 Slice 5 (2026-05-04)",
+        ),
+    ]
+
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[PresentationRestraint] flag registration failed for %s",
+                getattr(spec, "name", "?"), exc_info=True,
+            )
+    return count
+
+
+# ===========================================================================
+# Slice 5 — shipped_code_invariants self-registration
+# ===========================================================================
+
+
+def register_shipped_invariants() -> list:
+    """Module-owned shipped-code AST pins for the Gap #7 arc.
+
+    Five structural invariants:
+
+      1. ``presentation_restraint_default_true`` — the master flag
+         must default to ``"true"`` (graduated). Without this pin a
+         future env-default-flip silently regresses operators back to
+         the verbose dashboard.
+      2. ``boot_banner_short_circuits_under_restraint`` — BUG-FIX
+         REGRESSION PIN: ``serpent_flow.boot_banner`` must check
+         ``is_restraint_enabled()`` and route to
+         ``render_minimal_welcome``. Without this, the minimal-welcome
+         path is dead code.
+      3. ``repl_loop_wires_completion_and_polish`` — the
+         ``SerpentREPL._loop`` method must invoke both
+         ``build_completion_wiring`` and the input-polish helpers
+         (extract_attachments, make_esc_cancel_binding). Single
+         regression pin covers both Slice 3 and Slice 4 wiring.
+      4. ``op_lifecycle_sets_terminal_title`` — op_started /
+         op_completed / op_failed must each call
+         ``_maybe_set_terminal_title``. Without this, terminal title
+         silently regresses to the shell default mid-op.
+      5. ``status_line_uses_real_stdout_isatty`` — the TTY gate
+         must use ``real_stdout_isatty`` (not raw
+         ``sys.stdout.isatty``) so the live status line surfaces
+         under ``patch_stdout``. Slice 2 fix that this pin guards.
+
+    NEVER raises (returns ``[]`` on import failure).
+    """
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    import ast as _ast
+
+    def _validate_default_true(_tree, source) -> tuple:
+        del _tree
+        # Look for the env get with "true" default
+        if 'os.environ.get(MASTER_FLAG_ENV_VAR, "true")' not in source:
+            return (
+                "is_restraint_enabled() must default to 'true' — "
+                "the env get's second argument (the default) is the "
+                "graduation marker. Reverting to '' or 'false' "
+                "silently regresses operators to the verbose "
+                "dashboard.",
+            )
+        return ()
+
+    def _validate_boot_banner_short_circuit(tree, _source) -> tuple:
+        del _source
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.name == "boot_banner":
+                    body = _ast.unparse(node)
+                    violations = []
+                    if "is_restraint_enabled" not in body:
+                        violations.append(
+                            "boot_banner missing is_restraint_enabled() "
+                            "check — minimal-welcome path is dead code"
+                        )
+                    if "render_minimal_welcome" not in body:
+                        violations.append(
+                            "boot_banner missing render_minimal_welcome "
+                            "call — Gap #7 Slice 1 hook regressed"
+                        )
+                    return tuple(violations)
+        return ("boot_banner method not found in serpent_flow.py",)
+
+    def _validate_repl_loop_wires_polish(tree, _source) -> tuple:
+        del _source
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.name == "_loop":
+                    body = _ast.unparse(node)
+                    violations = []
+                    if "build_completion_wiring" not in body:
+                        violations.append(
+                            "_loop missing build_completion_wiring call "
+                            "— Slice 3 palette + history regressed"
+                        )
+                    if "extract_attachments" not in body:
+                        violations.append(
+                            "_loop missing extract_attachments call — "
+                            "Slice 4 @filepath mention regressed"
+                        )
+                    if "make_esc_cancel_binding" not in body:
+                        violations.append(
+                            "_loop missing make_esc_cancel_binding call "
+                            "— Slice 4 Esc-to-cancel regressed"
+                        )
+                    return tuple(violations)
+        return ("_loop method not found in SerpentREPL",)
+
+    def _validate_op_lifecycle_title(tree, _source) -> tuple:
+        del _source
+        required = {"op_started", "op_completed", "op_failed"}
+        violations = []
+        seen: set = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.name in required:
+                    seen.add(node.name)
+                    body = _ast.unparse(node)
+                    if "_maybe_set_terminal_title" not in body:
+                        violations.append(
+                            f"{node.name} missing "
+                            "_maybe_set_terminal_title call — "
+                            "Slice 4 terminal title regressed"
+                        )
+        missing_methods = required - seen
+        if missing_methods:
+            violations.append(
+                f"missing methods: {sorted(missing_methods)}"
+            )
+        return tuple(violations)
+
+    def _validate_status_line_uses_real_stdout(tree, _source) -> tuple:
+        del _source
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef) and node.name == "should_render":
+                body = _ast.unparse(node)
+                if "real_stdout_isatty" not in body:
+                    return (
+                        "should_render() must use real_stdout_isatty "
+                        "(not direct sys.stdout.isatty) — Slice 2 TTY "
+                        "gate fix regressed; status line will silently "
+                        "stop appearing under patch_stdout",
+                    )
+                return ()
+        return ("should_render not found in status_line.py",)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name="presentation_restraint_default_true",
+            target_file=(
+                "backend/core/ouroboros/battle_test/presentation_restraint.py"
+            ),
+            description=(
+                "BUG-FIX REGRESSION PIN: the master flag's env-get "
+                "default must remain 'true' post graduation. Reverting "
+                "silently regresses operators to the verbose dashboard."
+            ),
+            validate=_validate_default_true,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="boot_banner_short_circuits_under_restraint",
+            target_file=(
+                "backend/core/ouroboros/battle_test/serpent_flow.py"
+            ),
+            description=(
+                "boot_banner must check is_restraint_enabled() and "
+                "route to render_minimal_welcome — without this the "
+                "Slice 1 minimal-welcome path is unreachable."
+            ),
+            validate=_validate_boot_banner_short_circuit,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="repl_loop_wires_completion_and_polish",
+            target_file=(
+                "backend/core/ouroboros/battle_test/serpent_flow.py"
+            ),
+            description=(
+                "SerpentREPL._loop must wire build_completion_wiring + "
+                "extract_attachments + make_esc_cancel_binding — these "
+                "are the operator-visible deliverables of Slices 3+4."
+            ),
+            validate=_validate_repl_loop_wires_polish,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="op_lifecycle_sets_terminal_title",
+            target_file=(
+                "backend/core/ouroboros/battle_test/serpent_flow.py"
+            ),
+            description=(
+                "op_started / op_completed / op_failed must each call "
+                "_maybe_set_terminal_title — Slice 4 terminal title "
+                "regression pin."
+            ),
+            validate=_validate_op_lifecycle_title,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="status_line_uses_real_stdout_isatty",
+            target_file=(
+                "backend/core/ouroboros/battle_test/status_line.py"
+            ),
+            description=(
+                "should_render() must use real_stdout_isatty — Slice 2 "
+                "TTY gate fix. Without this, the live status line "
+                "silently stops appearing under prompt_toolkit's "
+                "patch_stdout proxy."
+            ),
+            validate=_validate_status_line_uses_real_stdout,
+        ),
+    ]
 
 
 # ===========================================================================
