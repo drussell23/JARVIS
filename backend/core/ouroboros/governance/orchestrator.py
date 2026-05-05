@@ -6705,7 +6705,73 @@ class GovernedOrchestrator:
                     _cancel_check = lambda: self._is_cancel_requested(ctx.op_id)
                     _cancelled = False
 
-                    if _serpent is not None and hasattr(_serpent, "show_notify_apply_preview"):
+                    # ── Gap #4 Slice 3: review-branch coordinator ──
+                    # Master-flag-gated short-circuit. When enabled, route
+                    # the candidate through DiffArchive + ReviewBranchManager
+                    # for IDE-native diff review (VS Code source control
+                    # compares HEAD vs ouroboros/preview/{op-id}). Operator
+                    # decision (accept/reject/timeout) drives the cancellation
+                    # flag the same way the legacy preview's _cancel_check
+                    # does — so downstream APPLY routing is unchanged.
+                    # SKIPPED / FAILED outcomes fall through to the legacy
+                    # rich-preview / plain-sleep path below.
+                    _review_handled = False
+                    try:
+                        from backend.core.ouroboros.governance.review_coordinator import (
+                            get_default_coordinator,
+                            is_master_flag_enabled as _review_flag_on,
+                            ReviewDecision,
+                        )
+                        from backend.core.ouroboros.governance.review_branch_manager import (
+                            ReviewBranchManager,
+                        )
+                        if _review_flag_on() and _changes:
+                            _coordinator = get_default_coordinator()
+                            if _coordinator.branch_manager is None:
+                                _coordinator.attach_branch_manager(
+                                    ReviewBranchManager(self._config.project_root),
+                                )
+                            _files_for_review = [
+                                (c.path, c.new_content)
+                                for c in _changes
+                                if getattr(c, "status", "") != "deleted"
+                            ]
+                            if _files_for_review:
+                                _review = await _coordinator.coordinate_review(
+                                    ctx.op_id, _files_for_review,
+                                    risk_tier="notify_apply",
+                                    summary=_reason or "",
+                                    cancel_check=_cancel_check,
+                                )
+                                if _review.decision in (
+                                    ReviewDecision.ACCEPTED,
+                                    ReviewDecision.REJECTED,
+                                    ReviewDecision.EXPIRED,
+                                ):
+                                    _cancelled = not _review.decision.implies_apply
+                                    _review_handled = True
+                                    logger.info(
+                                        "[Orchestrator] review-branch decision "
+                                        "op=%s decision=%s elapsed=%.1fs",
+                                        ctx.op_id, _review.decision.value,
+                                        _review.elapsed_s,
+                                    )
+                    except Exception:
+                        logger.debug(
+                            "[Orchestrator] review_coordinator hook failed; "
+                            "falling through to legacy preview",
+                            exc_info=True,
+                        )
+                    # When _review_handled, the legacy preview branches
+                    # below short-circuit — see the elif chain. _cancelled
+                    # carries the operator decision either way.
+
+                    if _review_handled:
+                        # Review-branch flow already produced the
+                        # _cancelled decision — skip both legacy preview
+                        # paths.
+                        pass
+                    elif _serpent is not None and hasattr(_serpent, "show_notify_apply_preview"):
                         logger.info(
                             "[Orchestrator] NOTIFY_APPLY rich preview — op=%s "
                             "files=%d delay=%.1fs",
