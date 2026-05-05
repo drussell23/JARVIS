@@ -1044,9 +1044,18 @@ class SerpentFlow:
         the lens is focused on this op. Under the lens, only ONE
         op is rendered at a time, so the per-line short-id
         disambiguation prefix is no longer needed — clean palette.
+
+        Gap #3 Slice 3 (2026-05-04): when ``JARVIS_OP_COLLAPSE_ENABLED``
+        is on, every line is ALSO appended to the per-op buffer so
+        ``/expand <op-id>`` can re-render the full block later.
+        Non-disruptive parallel recording — existing console output
+        is unchanged.
         """
         # Always update swarm so the digest stays accurate
         self._record_swarm_event(op_id, _strip_markup_short(text))
+        # Gap #3 Slice 3 — parallel buffer record (master-flag-gated)
+        if op_id and op_id in self._active_ops:
+            self._maybe_buffer_op_line(op_id, text)
         if op_id and op_id in self._active_ops:
             if not self._is_focused(op_id):
                 return
@@ -1057,6 +1066,52 @@ class SerpentFlow:
         else:
             # Out-of-band lines (system messages, banners) — always render
             self.console.print(f"  {text}", highlight=False)
+
+    # ── Gap #3 Slice 3: op-block buffer integration helpers ──────
+
+    @staticmethod
+    def _op_collapse_enabled() -> bool:
+        """``JARVIS_OP_COLLAPSE_ENABLED`` master flag. **Default true**
+        post Slice 5 graduation (2026-05-04). Operators flip ``=false``
+        to disable per-op buffering / ``/expand`` recovery. Read on
+        every call — no caching."""
+        raw = os.environ.get("JARVIS_OP_COLLAPSE_ENABLED", "true")
+        return raw.strip().lower() not in ("0", "false", "no", "off")
+
+    def _maybe_buffer_op_line(self, op_id: str, text: str) -> None:
+        """Append ``text`` to the OpBlockBuffer when master flag is on.
+        NEVER raises into the render path."""
+        if not self._op_collapse_enabled():
+            return
+        try:
+            from backend.core.ouroboros.battle_test.op_block_buffer import (
+                get_default_buffer,
+            )
+            get_default_buffer().append(op_id, text)
+        except Exception:
+            pass  # best-effort — never crash the render
+
+    def _maybe_buffer_op_start(self, op_id: str) -> None:
+        if not self._op_collapse_enabled():
+            return
+        try:
+            from backend.core.ouroboros.battle_test.op_block_buffer import (
+                get_default_buffer,
+            )
+            get_default_buffer().start_op(op_id)
+        except Exception:
+            pass
+
+    def _maybe_buffer_op_commit(self, op_id: str, summary: str) -> None:
+        if not self._op_collapse_enabled():
+            return
+        try:
+            from backend.core.ouroboros.battle_test.op_block_buffer import (
+                get_default_buffer,
+            )
+            get_default_buffer().commit(op_id, summary)
+        except Exception:
+            pass
 
     def _op_blank(self, op_id: str) -> None:
         """Print a blank line with the op border (visual breathing room)."""
@@ -1304,6 +1359,8 @@ class SerpentFlow:
     ) -> None:
         """A new operation was sensed — open an op block."""
         self._op_starts[op_id] = time.time()
+        # Gap #3 Slice 3 — start buffering (master-flag-gated, defensive)
+        self._maybe_buffer_op_start(op_id)
 
         # Determine sensor type from goal prefix or explicit param
         sensor_label = sensor or "Operation"
@@ -2267,6 +2324,14 @@ class SerpentFlow:
         self._op_rationales.pop(op_id, None)
         self._close_op_block(op_id)
 
+        # Gap #3 Slice 3 — late-commit the buffered block with a
+        # collapsed summary line so /expand <op-id> can recover the
+        # full output later.
+        self._maybe_buffer_op_commit(
+            op_id,
+            f"⏺ {files_str} evolved · ⏱ {elapsed:.1f}s · 💰 ${cost_usd:.4f}",
+        )
+
         # UI Slice 6 — grep-friendly inline receipt right after the
         # block close. Single line, ` · ` separators, plain ANSI.
         self._emit_op_receipt(
@@ -2302,6 +2367,13 @@ class SerpentFlow:
 
         # Close the op block
         self._close_op_block(op_id)
+
+        # Gap #3 Slice 3 — late-commit the buffered block with a
+        # collapsed failure summary so /expand can recover the trail.
+        self._maybe_buffer_op_commit(
+            op_id,
+            f"💀 shed · {reason[:60]} · ⏱ {elapsed:.1f}s",
+        )
 
         # UI Slice 6 — grep-friendly inline failure receipt.
         self._emit_op_receipt(
@@ -4085,6 +4157,21 @@ class SerpentREPL:
                     parts.append(f"prev:{f._swarm_last_completed}")
             return ANSI(f"  \033[36m{glyph}\033[0m " + " · ".join(parts))
 
+        # Gap #1+5 Slice 1: wrap the swarm-digest-only ``_bottom_toolbar``
+        # with ``live_status_line.make_bottom_toolbar_callable`` so the
+        # registered ``StatusLineBuilder`` content (phase / cost / route /
+        # risk) surfaces as a second stacked line. Backwards-compat:
+        # when ``JARVIS_LIVE_STATUS_LINE_ENABLED`` is off OR no builder
+        # is registered, the wrapper passes ``_bottom_toolbar`` through
+        # byte-identically (legacy swarm-only display).
+        try:
+            from backend.core.ouroboros.battle_test.live_status_line import (
+                make_bottom_toolbar_callable,
+            )
+            _live_bottom_toolbar = make_bottom_toolbar_callable(_bottom_toolbar)
+        except Exception:
+            _live_bottom_toolbar = _bottom_toolbar  # safe fallback
+
         self._session = PromptSession(
             multiline=True,
             key_bindings=_repl_bindings,
@@ -4093,7 +4180,7 @@ class SerpentREPL:
             enable_history_search=False,
             auto_suggest=None,
             prompt_continuation=_continuation,
-            bottom_toolbar=_bottom_toolbar,
+            bottom_toolbar=_live_bottom_toolbar,
             refresh_interval=_REPL_REFRESH_INTERVAL_S,
         )
 
@@ -4299,6 +4386,15 @@ class SerpentREPL:
                         or line.startswith("review ")
                     ):
                         self._handle_review(line)
+                        continue
+
+                    # Gap #3 Slice 3 — unified /expand <ref> verb
+                    # dispatches by ref prefix:
+                    #   t-N → tool result body (Gap #2 BoundedBodyStore)
+                    #   d-N → diff archive entry (Gap #4 DiffArchive)
+                    #   o-N → op block buffer (this slice)
+                    if line.startswith("/expand") or line.startswith("expand "):
+                        self._handle_expand(line)
                         continue
 
                     # Runtime configuration commands
@@ -5211,6 +5307,204 @@ class SerpentREPL:
             f"size={_size}B mime={_ATTACHMENT_EXT_TO_MIME[_ext]} verdict={verdict}[/{_C['evolved']}]",
             highlight=False,
         )
+
+    # ── Gap #3 Slice 3 — unified /expand verb ───────────────────
+
+    def _handle_expand(self, line: str) -> None:
+        """``/expand <ref>`` — dispatches by ref prefix across the
+        three artifact substrates:
+
+          * ``t-N`` → :class:`BoundedBodyStore` (Gap #2): re-renders
+            the full tool result body via :func:`tool_render_view.compose`
+            with VERBOSE density.
+          * ``d-N`` → :class:`DiffArchive` (Gap #4): re-emits the
+            archived diff text via the existing :class:`DiffPreviewRenderer`.
+          * ``o-N`` → :class:`OpBlockBuffer` (Gap #3): re-emits the
+            buffered op-block lines.
+          * ``<op-id>`` (no prefix) → look up the matching ``o-N`` for
+            the most recent op with that id.
+
+        Empty arg → list recent refs across all three substrates.
+        NEVER raises — every lookup degrades to a friendly error line.
+        """
+        parts = line.replace("/expand", "expand", 1).split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._print_expand_summary()
+            return
+        ref_or_op = parts[1].strip()
+
+        # Prefix-routed dispatch
+        try:
+            if ref_or_op.startswith("t-"):
+                self._expand_tool_body(ref_or_op)
+            elif ref_or_op.startswith("d-"):
+                self._expand_diff(ref_or_op)
+            elif ref_or_op.startswith("o-"):
+                self._expand_op_block(ref_or_op)
+            else:
+                # Treat as op_id and find latest matching o-N
+                self._expand_op_block_by_op_id(ref_or_op)
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/expand error: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+
+    def _print_expand_summary(self) -> None:
+        """Print a one-screen overview of recent retrievable refs."""
+        try:
+            from backend.core.ouroboros.battle_test.op_block_buffer import (
+                get_default_buffer as _ob,
+            )
+            from backend.core.ouroboros.battle_test.tool_render_store import (
+                get_default_store as _ts,
+            )
+            from backend.core.ouroboros.battle_test.diff_archive import (
+                get_default_archive as _da,
+            )
+        except Exception:
+            self._flow.console.print(
+                f"  [{_C['dim']}]/expand: substrate not available[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        op_recent = _ob().list_recent(limit=5)
+        diff_recent = _da().list_recent(limit=5)
+        tool_refs = _ts().all_refs()[-5:]
+
+        self._flow.console.print(
+            f"  [{_C['neural']}]Recent retrievable refs:[/{_C['neural']}]",
+            highlight=False,
+        )
+        if op_recent:
+            self._flow.console.print(
+                f"    [{_C['dim']}]op blocks:[/{_C['dim']}]",
+                highlight=False,
+            )
+            for b in op_recent:
+                self._flow.console.print(
+                    f"      [{_C['evolved']}]{b.ref}[/{_C['evolved']}] "
+                    f"[{_C['dim']}]{b.op_id} · {b.line_count} lines · "
+                    f"{b.state.value}[/{_C['dim']}]",
+                    highlight=False,
+                )
+        if diff_recent:
+            self._flow.console.print(
+                f"    [{_C['dim']}]diffs:[/{_C['dim']}]",
+                highlight=False,
+            )
+            for d in diff_recent:
+                self._flow.console.print(
+                    f"      [{_C['evolved']}]{d.ref}[/{_C['evolved']}] "
+                    f"[{_C['dim']}]{d.op_id} · {len(d.file_paths)} file(s) · "
+                    f"{d.apply_outcome.value}[/{_C['dim']}]",
+                    highlight=False,
+                )
+        if tool_refs:
+            self._flow.console.print(
+                f"    [{_C['dim']}]tool bodies:[/{_C['dim']}] "
+                f"[{_C['evolved']}]{', '.join(tool_refs)}[/{_C['evolved']}]",
+                highlight=False,
+            )
+        if not op_recent and not diff_recent and not tool_refs:
+            self._flow.console.print(
+                f"  [{_C['dim']}]No retrievable refs yet[/{_C['dim']}]",
+                highlight=False,
+            )
+        self._flow.console.print(
+            f"  [{_C['dim']}]Usage: /expand <ref> | /expand <op-id>[/{_C['dim']}]",
+            highlight=False,
+        )
+
+    def _expand_tool_body(self, ref: str) -> None:
+        from backend.core.ouroboros.battle_test.tool_render_store import (
+            get_default_store,
+        )
+        stored = get_default_store().lookup(ref)
+        if stored is None:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No tool body for {ref}[/{_C['heal']}]",
+                highlight=False,
+            )
+            return
+        self._flow.console.print(
+            f"  [{_C['neural']}]⏺ {stored.tool_name}[/{_C['neural']}] "
+            f"[{_C['dim']}]{ref} · {stored.summary}[/{_C['dim']}]",
+            highlight=False,
+        )
+        for ln in stored.body.splitlines():
+            self._flow.console.print(
+                f"    [{_C['dim']}]{ln}[/{_C['dim']}]", highlight=False,
+            )
+
+    def _expand_diff(self, ref: str) -> None:
+        from backend.core.ouroboros.battle_test.diff_archive import (
+            get_default_archive,
+        )
+        archived = get_default_archive().lookup(ref)
+        if archived is None:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No diff for {ref}[/{_C['heal']}]",
+                highlight=False,
+            )
+            return
+        self._flow.console.print(
+            f"  [{_C['neural']}]⏺ Diff[/{_C['neural']}] "
+            f"[{_C['dim']}]{ref} · {archived.op_id} · "
+            f"{archived.apply_outcome.value}[/{_C['dim']}]",
+            highlight=False,
+        )
+        if archived.review_branch:
+            self._flow.console.print(
+                f"    [{_C['file']}]{archived.review_branch}[/{_C['file']}]",
+                highlight=False,
+            )
+        for ln in archived.diff_text.splitlines()[:200]:
+            self._flow.console.print(
+                f"    [{_C['dim']}]{ln}[/{_C['dim']}]", highlight=False,
+            )
+
+    def _expand_op_block(self, ref: str) -> None:
+        from backend.core.ouroboros.battle_test.op_block_buffer import (
+            get_default_buffer,
+        )
+        buf = get_default_buffer()
+        block = buf.lookup(ref)
+        if block is None:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No op block for {ref}[/{_C['heal']}]",
+                highlight=False,
+            )
+            return
+        buf.mark_expanded(ref)
+        self._flow.console.print(
+            f"  [{_C['neural']}]⏺ Op {block.op_id}[/{_C['neural']}] "
+            f"[{_C['dim']}]{ref} · {block.line_count} lines · "
+            f"{block.state.value}[/{_C['dim']}]",
+            highlight=False,
+        )
+        if block.summary_line:
+            self._flow.console.print(
+                f"    [{_C['dim']}]{block.summary_line}[/{_C['dim']}]",
+                highlight=False,
+            )
+        for ln in block.lines:
+            self._flow.console.print(f"    {ln}", highlight=False)
+
+    def _expand_op_block_by_op_id(self, op_id: str) -> None:
+        """Resolve op-id → most recent ``o-N`` and re-emit."""
+        from backend.core.ouroboros.battle_test.op_block_buffer import (
+            get_default_buffer,
+        )
+        matches = get_default_buffer().find_by_op_id(op_id)
+        if not matches:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No buffered block for {op_id}[/{_C['heal']}]",
+                highlight=False,
+            )
+            return
+        # Pick the most recent (last in oldest→newest tuple)
+        self._expand_op_block(matches[-1].ref)
 
     # ── Gap #4 Slice 4 — IDE-native review verbs ────────────────
 
