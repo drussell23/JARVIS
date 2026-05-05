@@ -1098,6 +1098,22 @@ def main() -> None:
     ):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
+    # Gap #7 follow-up: O+V's own boot-accounting loggers (module
+    # discovery, kernel init, graceful-shutdown, termination-hook
+    # registration) emit DEBUG/INFO during early boot that's pure
+    # forensic noise for operators. Suppress under restraint;
+    # operators debugging boot itself set JARVIS_BOOT_NOISE_VERBOSE=true
+    # to bypass. Single source of truth in
+    # ``presentation_restraint.BOOT_NOISE_LOGGER_NAMES``.
+    try:
+        from backend.core.ouroboros.battle_test.presentation_restraint import (
+            is_restraint_enabled, suppress_boot_noise_logs,
+        )
+        if is_restraint_enabled():
+            suppress_boot_noise_logs()
+    except Exception:
+        pass  # fail-closed: legacy verbose output if suppression fails
+
     # ------------------------------------------------------------------
     # Build config + harness
     # ------------------------------------------------------------------

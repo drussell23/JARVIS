@@ -203,6 +203,82 @@ def clear_captured_layers_for_tests() -> None:
 _diag_propagation_originally: Optional[bool] = None
 
 
+# ===========================================================================
+# Boot-noise logger suppression — operator-visible boot quietness
+# ===========================================================================
+#
+# These loggers fire DEBUG / INFO messages exclusively during boot:
+# module discovery, kernel package init, graceful-shutdown setup,
+# termination-hook registration. Operators don't need to see them on
+# every run — the messages are forensic-only and matter only when
+# debugging boot itself.
+
+
+BOOT_NOISE_LOGGER_NAMES: Tuple[str, ...] = (
+    "GracefulShutdown",
+    "backend.kernel",  # parent — submodules inherit unless explicit
+    "backend.core.ouroboros.battle_test.termination_hook_registry",
+    "backend.core.ouroboros.governance.meta.module_discovery",
+)
+
+
+BOOT_NOISE_VERBOSE_ENV_VAR: str = "JARVIS_BOOT_NOISE_VERBOSE"
+
+
+_boot_noise_levels_originally: dict = {}
+
+
+def is_boot_noise_verbose() -> bool:
+    """``JARVIS_BOOT_NOISE_VERBOSE``. Default false. Operators
+    debugging boot issues set ``=true`` to keep the noisy loggers
+    chatty even under restraint. NEVER raises."""
+    raw = os.environ.get(BOOT_NOISE_VERBOSE_ENV_VAR, "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def suppress_boot_noise_logs() -> int:
+    """Raise the boot-noise loggers to ``WARNING`` so their DEBUG /
+    INFO accounting doesn't litter the operator's boot screen.
+
+    Their original level is captured per-logger so
+    :func:`restore_boot_noise_logs_for_tests` can roll back. Skips
+    the suppression entirely when
+    :func:`is_boot_noise_verbose` is on (``JARVIS_BOOT_NOISE_VERBOSE``
+    escape hatch for boot-debugging operators).
+
+    Returns the count of loggers suppressed (0 when verbose mode is
+    on or all calls failed). NEVER raises.
+    """
+    global _boot_noise_levels_originally
+    if is_boot_noise_verbose():
+        return 0
+    suppressed = 0
+    for name in BOOT_NOISE_LOGGER_NAMES:
+        try:
+            log = logging.getLogger(name)
+            if name not in _boot_noise_levels_originally:
+                _boot_noise_levels_originally[name] = log.level
+            log.setLevel(logging.WARNING)
+            suppressed += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[PresentationRestraint] suppress_boot_noise(%s) failed",
+                name, exc_info=True,
+            )
+    return suppressed
+
+
+def restore_boot_noise_logs_for_tests() -> None:
+    """Test isolation: restore captured original levels."""
+    global _boot_noise_levels_originally
+    for name, level in list(_boot_noise_levels_originally.items()):
+        try:
+            logging.getLogger(name).setLevel(level)
+        except Exception:  # noqa: BLE001
+            pass
+    _boot_noise_levels_originally = {}
+
+
 def suppress_diagnostic_logs() -> bool:
     """Stop the ``jarvis.shutdown.diagnostics`` logger from propagating
     INFO messages to the root logger (which has a default StreamHandler
