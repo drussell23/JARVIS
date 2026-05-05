@@ -291,50 +291,31 @@ def _discover_module_provided_verbs(registry: VerbRegistry) -> int:
     mechanism that already protects FlagRegistry + ShippedCodeInvariants
     from drift.
 
-    NEVER raises. Returns total verbs registered."""
-    discovered = 0
+    NEVER raises. Returns total verbs registered.
+
+    Implementation: delegates to
+    :func:`module_discovery.discover_module_provided_callable`
+    (Slice 5b consolidation Slice 2, PRD §32.5). Single source of
+    truth for the walk pattern (AST-pinned)."""
     try:
-        from importlib import import_module
-        import pkgutil
-        for pkg_name in _VERB_PROVIDER_PACKAGES:
-            try:
-                pkg_mod = import_module(pkg_name)
-                pkg_path = getattr(pkg_mod, "__path__", None)
-                if not pkg_path:
-                    continue
-            except Exception as exc:  # noqa: BLE001 — defensive
-                logger.debug(
-                    "[HelpDispatcher] verb provider package %s "
-                    "unavailable: %s", pkg_name, exc,
-                )
-                continue
-            for _, name, _ispkg in pkgutil.iter_modules(pkg_path):
-                full_name = f"{pkg_name}.{name}"
-                if full_name == __name__:
-                    continue
-                try:
-                    mod = import_module(full_name)
-                    fn = getattr(mod, "register_verbs", None)
-                    if not callable(fn):
-                        continue
-                    count = fn(registry)
-                    if isinstance(count, int) and count > 0:
-                        discovered += count
-                        logger.debug(
-                            "[HelpDispatcher] %s registered %d verb(s)",
-                            full_name, count,
-                        )
-                except Exception as exc:  # noqa: BLE001 — defensive
-                    logger.debug(
-                        "[HelpDispatcher] verb discovery skipped %s: %s",
-                        full_name, exc,
-                    )
+        from backend.core.ouroboros.governance.meta.module_discovery import (  # noqa: E501
+            discover_module_provided_callable,
+            make_registry_handler,
+        )
     except Exception as exc:  # noqa: BLE001 — defensive
         logger.debug(
-            "[HelpDispatcher] _discover_module_provided_verbs exc: %s",
-            exc,
+            "[HelpDispatcher] module_discovery primitive "
+            "unavailable: %s", exc,
         )
-    return discovered
+        return 0
+    report = discover_module_provided_callable(
+        packages=_VERB_PROVIDER_PACKAGES,
+        attr_name="register_verbs",
+        handler=make_registry_handler(registry=registry),
+        excluded_modules=(__name__,),
+        log_prefix="HelpDispatcher",
+    )
+    return report.discovered_count
 
 
 # ---------------------------------------------------------------------------

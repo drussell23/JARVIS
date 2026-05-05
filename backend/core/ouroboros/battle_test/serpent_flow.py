@@ -4286,6 +4286,21 @@ class SerpentREPL:
                         await self._handle_cancel(_cancel_args, immediate=_immediate)
                         continue
 
+                    # Gap #4 Slice 4 — IDE-native review verbs
+                    if line.startswith("/accept") or line.startswith("accept "):
+                        await self._handle_accept(line)
+                        continue
+                    if line.startswith("/reject") or line.startswith("reject "):
+                        await self._handle_reject(line)
+                        continue
+                    if (
+                        line in ("/review", "review")
+                        or line.startswith("/review ")
+                        or line.startswith("review ")
+                    ):
+                        self._handle_review(line)
+                        continue
+
                     # Runtime configuration commands
                     if line.startswith("/risk") or line.startswith("risk ") or line == "risk":
                         self._handle_risk(line)
@@ -5194,6 +5209,156 @@ class SerpentREPL:
         self._flow.console.print(
             f"  [{_C['evolved']}]✓ /attach submitted: op={_env_id} path={os.path.basename(path)} "
             f"size={_size}B mime={_ATTACHMENT_EXT_TO_MIME[_ext]} verdict={verdict}[/{_C['evolved']}]",
+            highlight=False,
+        )
+
+    # ── Gap #4 Slice 4 — IDE-native review verbs ────────────────
+
+    async def _handle_accept(self, line: str) -> None:
+        """``/accept <op-id>`` — accept a pending Gap #4 review.
+
+        The coordinator's record_accept() signals the per-op
+        :class:`asyncio.Event` waiting inside ``coordinate_review``.
+        The orchestrator's APPLY phase then proceeds.
+        """
+        parts = line.replace("/accept", "accept", 1).split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._flow.console.print(
+                f"  [{_C['dim']}]Usage: /accept <op-id>[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        op_id = parts[1].strip()
+        try:
+            from backend.core.ouroboros.governance.review_coordinator import (
+                get_default_coordinator,
+            )
+            coordinator = get_default_coordinator()
+            ok = coordinator.record_accept(op_id)
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/accept error: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        if ok:
+            self._flow.console.print(
+                f"  [{_C['evolved']}]✓ Accepted {op_id} — APPLY proceeding[/{_C['evolved']}]",
+                highlight=False,
+            )
+        else:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No pending review for {op_id}[/{_C['heal']}]",
+                highlight=False,
+            )
+
+    async def _handle_reject(self, line: str) -> None:
+        """``/reject <op-id>`` — reject a pending Gap #4 review.
+
+        The coordinator marks the review REJECTED, the branch is
+        deleted, and the orchestrator skips APPLY (CANCELLED state).
+        """
+        parts = line.replace("/reject", "reject", 1).split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._flow.console.print(
+                f"  [{_C['dim']}]Usage: /reject <op-id>[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        op_id = parts[1].strip()
+        try:
+            from backend.core.ouroboros.governance.review_coordinator import (
+                get_default_coordinator,
+            )
+            coordinator = get_default_coordinator()
+            ok = coordinator.record_reject(op_id)
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/reject error: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        if ok:
+            self._flow.console.print(
+                f"  [{_C['heal']}]✗ Rejected {op_id} — APPLY cancelled[/{_C['heal']}]",
+                highlight=False,
+            )
+        else:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No pending review for {op_id}[/{_C['heal']}]",
+                highlight=False,
+            )
+
+    def _handle_review(self, line: str) -> None:
+        """``/review`` — list pending reviews.
+
+        ``/review <op-id>`` — show details for one review (branch name,
+        archive ref, file paths). VS Code operators can run
+        ``git diff main..<branch_name>`` to see the diff in their IDE,
+        or use the Slice 5 ``jarvis.openPendingReview`` command.
+        """
+        try:
+            from backend.core.ouroboros.governance.review_coordinator import (
+                get_default_coordinator,
+            )
+            coordinator = get_default_coordinator()
+        except Exception as exc:
+            self._flow.console.print(
+                f"  [{_C['death']}]/review error: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        manager = coordinator.branch_manager
+        if manager is None:
+            self._flow.console.print(
+                f"  [{_C['dim']}]Review system not yet initialized "
+                "(orchestrator hasn't booted the branch manager)[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        pending = manager.list_pending()
+        if not pending:
+            self._flow.console.print(
+                f"  [{_C['dim']}]No pending reviews[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        # Optional filter by op-id substring
+        parts = line.replace("/review", "review", 1).split(None, 1)
+        if len(parts) >= 2 and parts[1].strip():
+            needle = parts[1].strip().lower()
+            pending = tuple(
+                r for r in pending if needle in r.op_id.lower()
+            )
+            if not pending:
+                self._flow.console.print(
+                    f"  [{_C['dim']}]No pending reviews matching "
+                    f"{needle!r}[/{_C['dim']}]",
+                    highlight=False,
+                )
+                return
+        self._flow.console.print(
+            f"  [{_C['neural']}]Pending reviews ({len(pending)}):[/{_C['neural']}]",
+            highlight=False,
+        )
+        for r in pending:
+            file_summary = (
+                f"{len(r.file_paths)} file"
+                + ("s" if len(r.file_paths) != 1 else "")
+            )
+            ref_part = (
+                f"[{_C['dim']}]{r.diff_archive_ref}[/{_C['dim']}]"
+                if r.diff_archive_ref else ""
+            )
+            self._flow.console.print(
+                f"  [{_C['evolved']}]{r.op_id}[/{_C['evolved']}] "
+                f"{ref_part}  "
+                f"[{_C['file']}]{r.branch_name}[/{_C['file']}]  "
+                f"[{_C['dim']}]{file_summary} · {r.risk_tier}[/{_C['dim']}]",
+                highlight=False,
+            )
+        self._flow.console.print(
+            f"  [{_C['dim']}]/accept <op-id> · /reject <op-id>[/{_C['dim']}]",
             highlight=False,
         )
 

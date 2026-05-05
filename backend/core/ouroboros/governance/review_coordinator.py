@@ -94,10 +94,15 @@ _DEFAULT_TIMEOUT_S: float = 300.0
 
 
 def is_master_flag_enabled() -> bool:
-    """Read :data:`MASTER_FLAG_ENV_VAR`. Default false until Slice 6.
-    NEVER raises."""
-    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "")
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    """Read :data:`MASTER_FLAG_ENV_VAR`. **Default true** post Slice 6
+    graduation (2026-05-04). Operators flip ``=false`` for instant
+    rollback to the legacy 5s overlay → auto-apply path preserved
+    in ``orchestrator.py`` below the master-flag guard.
+
+    Re-read on every coordination call — flips take effect immediately
+    for the next op without restart. NEVER raises."""
+    raw = os.environ.get(MASTER_FLAG_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def read_timeout_s() -> float:
@@ -390,6 +395,14 @@ class ReviewCoordinator:
             self._op_to_branch[op_id] = branch_name
         # Stamp the branch onto the archive for /diff listings.
         self._archive.attach_review_branch(archived.ref, branch_name)
+        # Slice 4: fire SSE event so VS Code extension can surface
+        # a "Review in IDE" notification. Best-effort, never raises.
+        self._publish_state_event(
+            "pending", op_id,
+            branch=create_result.branch,
+            archive_ref=archived.ref,
+            risk_tier=risk_tier,
+        )
 
         # --- Step 4: register an event + wait for decision/timeout
         event = asyncio.Event()
@@ -544,18 +557,77 @@ class ReviewCoordinator:
                         "[ReviewCoordinator] accept failed: %s",
                         result.error,
                     )
+                self._publish_state_event(
+                    "accepted", op_id, branch=result.branch,
+                )
             elif decision is ReviewDecision.REJECTED:
-                await self._branch_manager.reject(
+                result = await self._branch_manager.reject(
                     op_id, reason="operator rejected",
                 )
+                self._publish_state_event(
+                    "rejected", op_id, branch=result.branch,
+                )
             elif decision is ReviewDecision.EXPIRED:
-                await self._branch_manager.expire(op_id)
+                result = await self._branch_manager.expire(op_id)
+                self._publish_state_event(
+                    "expired", op_id, branch=result.branch,
+                )
             # SKIPPED / FAILED — branch never created, nothing to do
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[ReviewCoordinator] _apply_decision raised for op=%s, "
                 "decision=%s",
                 op_id, decision.value, exc_info=True,
+            )
+
+    def _publish_state_event(
+        self, state: str, op_id: str,
+        *,
+        branch: Optional[object] = None,
+        archive_ref: Optional[str] = None,
+        risk_tier: Optional[str] = None,
+    ) -> None:
+        """Best-effort SSE publish. Defensive — never raises into the
+        coordinator hot path. Lazy import keeps the substrate decoupled
+        from the stream surface (callers can swap the broker in tests
+        without disturbing the coordinator's import graph)."""
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (
+                publish_review_branch_event,
+            )
+        except ImportError:
+            return
+        try:
+            kwargs: Dict[str, object] = {}
+            if branch is not None:
+                kwargs["branch_name"] = getattr(branch, "branch_name", None)
+                kwargs["base_sha"] = getattr(branch, "base_sha", None)
+                kwargs["tip_sha"] = getattr(branch, "tip_sha", None)
+                kwargs["file_paths"] = getattr(branch, "file_paths", None)
+                # Prefer branch's risk_tier when caller didn't supply one.
+                if risk_tier is None:
+                    kwargs["risk_tier"] = getattr(branch, "risk_tier", None)
+                else:
+                    kwargs["risk_tier"] = risk_tier
+                if archive_ref is None:
+                    kwargs["archive_ref"] = getattr(
+                        branch, "diff_archive_ref", None,
+                    )
+                else:
+                    kwargs["archive_ref"] = archive_ref
+                err = getattr(branch, "error", "")
+                if err:
+                    kwargs["error"] = err
+            else:
+                if risk_tier is not None:
+                    kwargs["risk_tier"] = risk_tier
+                if archive_ref is not None:
+                    kwargs["archive_ref"] = archive_ref
+            publish_review_branch_event(state, op_id, **kwargs)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[ReviewCoordinator] SSE publish failed for state=%s op=%s",
+                state, op_id, exc_info=True,
             )
 
 

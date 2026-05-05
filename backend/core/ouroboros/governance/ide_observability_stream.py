@@ -86,6 +86,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Tuple,
     TYPE_CHECKING,
 )
@@ -217,6 +218,17 @@ EVENT_TYPE_CONTEXT_PIN_EXPIRED = "context_pin_expired"
 # listeners onto the broker. Pure observability — no authority surface.
 EVENT_TYPE_SESSION_ADDED = "session_added"
 EVENT_TYPE_SESSION_RESCAN = "session_rescan"
+
+# Gap #4 Slice 4 — IDE-native diff review stream vocabulary.
+# Fired by ReviewCoordinator at every transition into a terminal
+# ReviewState (or at PENDING when the branch is freshly created).
+# Operators subscribe once and route on payload.state. The VS Code
+# extension's openPendingReview command consumes ``review_branch_created``
+# to surface a notification with a "Review in IDE" button (Slice 5).
+EVENT_TYPE_REVIEW_BRANCH_CREATED = "review_branch_created"
+EVENT_TYPE_REVIEW_BRANCH_ACCEPTED = "review_branch_accepted"
+EVENT_TYPE_REVIEW_BRANCH_REJECTED = "review_branch_rejected"
+EVENT_TYPE_REVIEW_BRANCH_EXPIRED = "review_branch_expired"
 EVENT_TYPE_SESSION_BOOKMARKED = "session_bookmarked"
 EVENT_TYPE_SESSION_UNBOOKMARKED = "session_unbookmarked"
 EVENT_TYPE_SESSION_PINNED = "session_pinned"
@@ -2526,6 +2538,77 @@ def publish_memory_fanout_decision_event(
     except Exception:  # noqa: BLE001
         logger.debug(
             "[Stream] publish_memory_fanout_decision_event exception",
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Gap #4 Slice 4 — review-branch lifecycle SSE publisher
+# ---------------------------------------------------------------------------
+
+
+_REVIEW_STATE_TO_EVENT_TYPE: Mapping[str, str] = {
+    "pending": EVENT_TYPE_REVIEW_BRANCH_CREATED,
+    "accepted": EVENT_TYPE_REVIEW_BRANCH_ACCEPTED,
+    "rejected": EVENT_TYPE_REVIEW_BRANCH_REJECTED,
+    "expired": EVENT_TYPE_REVIEW_BRANCH_EXPIRED,
+}
+
+
+def publish_review_branch_event(
+    state: str,
+    op_id: str,
+    *,
+    branch_name: Optional[str] = None,
+    archive_ref: Optional[str] = None,
+    file_paths: Optional[Sequence[str]] = None,
+    risk_tier: Optional[str] = None,
+    base_sha: Optional[str] = None,
+    tip_sha: Optional[str] = None,
+    error: str = "",
+) -> Optional[str]:
+    """Best-effort publisher for ``review_branch_*`` SSE frames.
+
+    Maps ReviewState string → event type via :data:`_REVIEW_STATE_TO_EVENT_TYPE`.
+    Returns the event_id on success or ``None`` if the stream is
+    disabled / state is unknown / publish raised. NEVER raises.
+
+    Slice 5's VS Code extension subscribes to all four event types
+    and surfaces:
+      * ``review_branch_created`` → notification with "Review in IDE" button
+      * ``review_branch_accepted`` → status bar tick + auto-dismiss
+      * ``review_branch_rejected`` → status bar warning + auto-dismiss
+      * ``review_branch_expired`` → status bar warning + 10s sticky
+    """
+    if not stream_enabled():
+        return None
+    event_type = _REVIEW_STATE_TO_EVENT_TYPE.get(state)
+    if event_type is None:
+        return None
+    try:
+        payload: Dict[str, Any] = {
+            "state": state,
+            "op_id": op_id,
+        }
+        if branch_name:
+            payload["branch_name"] = branch_name
+        if archive_ref:
+            payload["archive_ref"] = archive_ref
+        if file_paths:
+            payload["file_paths"] = list(file_paths)[:32]
+        if risk_tier:
+            payload["risk_tier"] = risk_tier
+        if base_sha:
+            payload["base_sha"] = base_sha
+        if tip_sha:
+            payload["tip_sha"] = tip_sha
+        if error:
+            payload["error"] = error[:200]
+        return get_default_broker().publish(event_type, op_id, payload)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] publish_review_branch_event exception",
             exc_info=True,
         )
         return None

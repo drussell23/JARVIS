@@ -3656,50 +3656,31 @@ def _discover_module_provided_flags(
     finds the new module's registrar and invokes it natively.
 
     NEVER raises. Per-module failures logged + skipped — boot is never
-    blocked by one misconfigured module."""
-    discovered = 0
+    blocked by one misconfigured module.
+
+    Implementation: delegates to
+    :func:`module_discovery.discover_module_provided_callable`
+    (Slice 5b consolidation Slice 2, PRD §32.5). Single source of
+    truth for the walk pattern (AST-pinned)."""
     try:
-        from importlib import import_module
-        import pkgutil
-        for pkg_name in _FLAG_PROVIDER_PACKAGES:
-            try:
-                pkg_mod = import_module(pkg_name)
-                pkg_path = getattr(pkg_mod, "__path__", None)
-                if not pkg_path:
-                    continue
-            except Exception as exc:  # noqa: BLE001 — defensive
-                _logger.debug(
-                    "[FlagRegistry] provider package %s unavailable: %s",
-                    pkg_name, exc,
-                )
-                continue
-            for _, name, _ispkg in pkgutil.iter_modules(pkg_path):
-                full_name = f"{pkg_name}.{name}"
-                # Skip the seed module itself (recursion guard).
-                if full_name == __name__:
-                    continue
-                try:
-                    mod = import_module(full_name)
-                    fn = getattr(mod, "register_flags", None)
-                    if callable(fn):
-                        count = fn(registry)
-                        if isinstance(count, int) and count > 0:
-                            discovered += count
-                            _logger.debug(
-                                "[FlagRegistry] %s registered %d flag(s)",
-                                full_name, count,
-                            )
-                except Exception as exc:  # noqa: BLE001 — defensive
-                    _logger.debug(
-                        "[FlagRegistry] dynamic discovery skipped %s: %s",
-                        full_name, exc,
-                    )
+        from backend.core.ouroboros.governance.meta.module_discovery import (  # noqa: E501
+            discover_module_provided_callable,
+            make_registry_handler,
+        )
     except Exception as exc:  # noqa: BLE001 — defensive
         _logger.debug(
-            "[FlagRegistry] _discover_module_provided_flags exc: %s",
-            exc,
+            "[FlagRegistry] module_discovery primitive "
+            "unavailable: %s", exc,
         )
-    return discovered
+        return 0
+    report = discover_module_provided_callable(
+        packages=_FLAG_PROVIDER_PACKAGES,
+        attr_name="register_flags",
+        handler=make_registry_handler(registry=registry),
+        excluded_modules=(__name__,),
+        log_prefix="FlagRegistry",
+    )
+    return report.discovered_count
 
 
 def seed_default_registry(registry: FlagRegistry) -> int:

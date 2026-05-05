@@ -89,13 +89,20 @@ def test_schema_version_pinned():
     assert REVIEW_COORDINATOR_SCHEMA_VERSION == "review_coordinator.v1"
 
 
-def test_master_flag_default_off():
-    assert is_master_flag_enabled() is False
+def test_master_flag_default_on_post_graduation():
+    """Slice 6 graduation flipped this default-true (2026-05-04).
+    Operators opt OUT via ``=false`` / ``=0`` / ``=off``."""
+    assert is_master_flag_enabled() is True
 
 
 @pytest.mark.parametrize("raw,expected", [
+    # Empty / unset → default ON post-graduation
+    ("", True),
     ("true", True), ("1", True), ("yes", True), ("on", True),
-    ("false", False), ("", False), ("garbage", False),
+    # Garbage that isn't a recognized off-token → default ON
+    ("garbage", True),
+    # Off-tokens
+    ("false", False), ("0", False), ("no", False), ("off", False),
 ])
 def test_master_flag_parsing(monkeypatch, raw, expected):
     monkeypatch.setenv(MASTER_FLAG_ENV_VAR, raw)

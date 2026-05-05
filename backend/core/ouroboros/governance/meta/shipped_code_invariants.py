@@ -4681,65 +4681,34 @@ def _discover_module_provided_invariants() -> int:
 
     NEVER raises. Per-module failures logged + skipped.
 
-    The immune system scales organically: when a new module owns
-    a new structural property, it owns the AST validation too."""
-    discovered = 0
+    Implementation: delegates to the canonical
+    :func:`module_discovery.discover_module_provided_callable`
+    primitive (Slice 5b consolidation Slice 2, PRD §32.5). Single
+    source of truth for the walk pattern — zero parallel walkers
+    in production code (AST-pinned)."""
     try:
-        from importlib import import_module
-        import pkgutil
-        for pkg_name in _INVARIANT_PROVIDER_PACKAGES:
-            try:
-                pkg_mod = import_module(pkg_name)
-                pkg_path = getattr(pkg_mod, "__path__", None)
-                if not pkg_path:
-                    continue
-            except Exception as exc:  # noqa: BLE001 — defensive
-                logger.debug(
-                    "[ShippedInvariants] provider package %s unavailable: %s",
-                    pkg_name, exc,
-                )
-                continue
-            for _, name, _ispkg in pkgutil.iter_modules(pkg_path):
-                full_name = f"{pkg_name}.{name}"
-                if full_name == __name__:
-                    continue
-                try:
-                    mod = import_module(full_name)
-                    fn = getattr(mod, "register_shipped_invariants", None)
-                    if not callable(fn):
-                        continue
-                    invariants = fn()
-                    # Defensive: registrar must return iterable;
-                    # garbage returns silently skipped.
-                    if not invariants:
-                        continue
-                    try:
-                        invariant_list = list(invariants)
-                    except TypeError:
-                        continue
-                    for inv in invariant_list:
-                        try:
-                            register_shipped_code_invariant(inv)
-                            discovered += 1
-                        except Exception as exc:  # noqa: BLE001 — defensive
-                            logger.debug(
-                                "[ShippedInvariants] register failed for "
-                                "%s/%s: %s",
-                                full_name,
-                                getattr(inv, "invariant_name", "?"),
-                                exc,
-                            )
-                except Exception as exc:  # noqa: BLE001 — defensive
-                    logger.debug(
-                        "[ShippedInvariants] discover skipped %s: %s",
-                        full_name, exc,
-                    )
-    except Exception as exc:  # noqa: BLE001 — defensive
-        logger.debug(
-            "[ShippedInvariants] _discover_module_provided_invariants "
-            "exc: %s", exc,
+        from backend.core.ouroboros.governance.meta.module_discovery import (  # noqa: E501
+            discover_module_provided_callable,
+            make_factory_handler,
         )
-    return discovered
+    except Exception as exc:  # noqa: BLE001 — defensive
+        # Master substrate unavailable — graceful degradation.
+        logger.debug(
+            "[ShippedInvariants] module_discovery primitive "
+            "unavailable: %s", exc,
+        )
+        return 0
+    handler = make_factory_handler(
+        register_one=register_shipped_code_invariant,
+    )
+    report = discover_module_provided_callable(
+        packages=_INVARIANT_PROVIDER_PACKAGES,
+        attr_name="register_shipped_invariants",
+        handler=handler,
+        excluded_modules=(__name__,),
+        log_prefix="ShippedInvariants",
+    )
+    return report.discovered_count
 
 
 _register_seed_invariants()
