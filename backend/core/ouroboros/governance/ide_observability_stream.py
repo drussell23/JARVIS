@@ -141,6 +141,15 @@ EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 # the posture_changed / governor_throttle_applied pattern).
 EVENT_TYPE_BUDGET_ACTION_TAKEN = "budget_action_taken"
 
+# M9 CuriosityGradient (PRD §30.5.1) Slice 4 vocabulary.
+# Single event covering all CuriosityScore transitions — payload
+# carries cluster_id + magnitude + dominant_source + decay_reason
+# + transition_kind ("threshold_crossed" / "decay_applied" /
+# "operator_reset"). Operators subscribe once and route on
+# payload.transition_kind. Same pattern as posture_changed /
+# budget_action_taken — no per-transition event type explosion.
+EVENT_TYPE_CURIOSITY_CHANGED = "curiosity_changed"
+
 # Priority 1 Slice 4 — confidence-aware execution event vocabulary
 # (PRD §26.5.1). Severity-tiered: P1 = breaker fired (above-floor abort),
 # P2 = approaching floor (early warning), P3 = sustained low-confidence
@@ -2110,6 +2119,65 @@ def publish_memory_pressure_event(
 # ---------------------------------------------------------------------------
 # Upgrade 1 Bounded Epistemic Loop (PRD §31.2) Slice 4 publisher
 # ---------------------------------------------------------------------------
+
+
+def publish_curiosity_event(
+    *,
+    cluster_id: str,
+    transition_kind: str,
+    magnitude: float,
+    confidence: float,
+    dominant_source: str,
+    decay_reason: str,
+    samples_count: int,
+    extra_telemetry: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Best-effort publisher for ``curiosity_changed`` frames.
+
+    Single event for all CuriosityScore transitions —
+    operators subscribe once and route on
+    ``payload.transition_kind``:
+
+      * ``threshold_crossed`` — score magnitude crossed a
+        consumer-relevant boundary (e.g., 0.5 — neutral pivot)
+      * ``decay_applied`` — STALE_FOCUS / RECURRENCE_LOOP
+        auto-decay engaged
+      * ``operator_reset`` — ``/curiosity reset <id>``
+        operator-explicit decay
+      * ``samples_milestone`` — cluster crossed
+        :func:`curiosity_min_samples` and exited cold-start
+
+    Pattern matches :func:`publish_posture_event` /
+    :func:`publish_budget_action_event` — single event, payload
+    routes.
+
+    NEVER raises; returns the published event id or None on
+    master-flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        payload: Dict[str, Any] = {
+            "cluster_id": cluster_id or "",
+            "transition_kind": transition_kind,
+            "magnitude": float(magnitude),
+            "confidence": float(confidence),
+            "dominant_source": dominant_source,
+            "decay_reason": decay_reason,
+            "samples_count": int(samples_count),
+        }
+        if extra_telemetry:
+            payload["telemetry"] = dict(extra_telemetry)
+        return get_default_broker().publish(
+            EVENT_TYPE_CURIOSITY_CHANGED,
+            cluster_id or "_global",
+            payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] curiosity event publish exception",
+            exc_info=True,
+        )
+        return None
 
 
 def publish_budget_action_event(

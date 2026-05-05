@@ -223,6 +223,15 @@ class SensorBudgetSpec:
     Missing posture → default multiplier 1.0. Same string-key pattern
     as FlagRegistry posture_relevance — we don't import the Posture
     enum to stay decoupled from Wave 1 #1's runtime surface.
+
+    M9 Slice 3 (PRD §30.5.1): ``curiosity_aware`` is the per-sensor
+    opt-in for CuriosityGradient bias. When True (and the M9 master
+    flag is on, and the caller supplies a ``cluster_id`` to
+    :meth:`SensorGovernor.request_budget`), the weighted-cap formula
+    composes a ``curiosity_multiplier`` from the
+    :mod:`curiosity_collector` snapshot. Default ``False`` keeps
+    every existing sensor byte-identical (zero behavior change for
+    Slice 5 graduation). Bias is opt-in, not blanket.
     """
 
     sensor_name: str
@@ -230,6 +239,7 @@ class SensorBudgetSpec:
     posture_weights: Mapping[str, float] = field(default_factory=dict)
     urgency_multipliers: Mapping[str, float] = field(default_factory=dict)
     description: str = ""
+    curiosity_aware: bool = False
 
     def weight_for_posture(self, posture: Optional[str]) -> float:
         if not posture:
@@ -266,6 +276,20 @@ class BudgetDecision:
     # consumers can distinguish "throttled by topology" from "throttled
     # by capacity".
     topology_blocked: bool = False
+    # M9 Slice 3 — curiosity multiplier applied to the weighted_cap
+    # via the CuriosityGradient consumer. ``1.0`` means no bias
+    # (sensor not curiosity-aware OR M9 master off OR cold-start
+    # OR collector unavailable). > 1.0 amplifies high-curiosity
+    # clusters; < 1.0 throttles low-curiosity ones. Bounded by
+    # construction at the M9 primitive layer
+    # (curiosity_multiplier_floor / ceiling clamps).
+    curiosity_multiplier: float = 1.0
+    # M9 Slice 3 — cluster_id consulted (when caller supplied one
+    # AND the sensor was curiosity-aware). ``None`` means no
+    # cluster context provided / no bias applied. Operator-
+    # explainability: SSE consumers can render
+    # "throttled toward cluster X via curiosity 0.7×".
+    curiosity_cluster_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -281,6 +305,8 @@ class BudgetDecision:
             "global_cap": self.global_cap,
             "global_count": self.global_count,
             "topology_blocked": self.topology_blocked,
+            "curiosity_multiplier": self.curiosity_multiplier,
+            "curiosity_cluster_id": self.curiosity_cluster_id,
         }
 
 
@@ -341,6 +367,51 @@ def _default_topology_state_fn() -> Tuple[str, ...]:
         return get_default_sentinel().list_blocked_endpoints()
     except Exception:  # noqa: BLE001
         return ()
+
+
+def _curiosity_multiplier_for(
+    cluster_id: Optional[str],
+) -> Tuple[float, Optional[str]]:
+    """M9 Slice 3 — lazy-import + query the CuriosityGradient
+    consumer (Decision X pattern from Upgrade 1's
+    epistemic_budget_provider_bridge).
+
+    Returns ``(multiplier, normalized_cluster_id)``. Defaults
+    cleanly to ``(1.0, None)`` when:
+
+      * ``cluster_id`` is None / empty
+      * The M9 module is not importable (Slice 1 isolation
+        before ``curiosity_gradient.py`` lands — should never
+        happen post-Slice 1 but defensive)
+      * The M9 master flag is off
+      * The collector is empty or returns INSUFFICIENT_DATA
+        (cold-start)
+      * The collector has decayed the cluster
+        (STALE_FOCUS / RECURRENCE_LOOP / OPERATOR_RESET)
+      * Score confidence is below the consumer threshold
+      * Any exception (broken collector, broken primitive, etc.)
+
+    Bounded by construction at the M9 primitive layer
+    (curiosity_multiplier_from_score clamps to [floor, ceiling]).
+    NEVER raises."""
+    if not cluster_id:
+        return (1.0, None)
+    try:
+        from backend.core.ouroboros.governance.curiosity_collector import (
+            get_default_collector,
+        )
+        from backend.core.ouroboros.governance.curiosity_gradient import (
+            curiosity_multiplier_from_score,
+        )
+    except Exception:  # noqa: BLE001 — defensive (M9 module absent)
+        return (1.0, None)
+    try:
+        collector = get_default_collector()
+        score = collector.score_for_cluster(cluster_id)
+        mult = curiosity_multiplier_from_score(score)
+        return (float(mult), score.cluster_id)
+    except Exception:  # noqa: BLE001 — defensive
+        return (1.0, None)
 
 
 # ---------------------------------------------------------------------------
@@ -474,11 +545,23 @@ class SensorGovernor:
         posture: Optional[str],
         brake: bool,
         topology_blocked: bool = False,
+        curiosity_multiplier: float = 1.0,
     ) -> int:
         base = spec.base_cap_per_hour
         posture_mult = spec.weight_for_posture(posture)
         urgency_mult = spec.urgency_mult(urgency)
         cap = base * posture_mult * urgency_mult
+        # M9 Slice 3 — curiosity multiplier composes BEFORE topology
+        # + brake so high-curiosity regions can be amplified within
+        # the same envelope that topology + brake would throttle.
+        # Bounded at the M9 primitive layer to [floor, ceiling]
+        # (defaults [0.5, 2.0]) — global cap structurally cannot be
+        # bypassed since the global cap is enforced separately in
+        # request_budget against gcap. ``1.0`` (default) is a no-op
+        # so existing behavior is byte-identical when no sensor
+        # opts in or M9 master flag is off.
+        if curiosity_multiplier != 1.0:
+            cap *= curiosity_multiplier
         # Slice 3c — topology backpressure factor applied BEFORE the
         # emergency brake so the two compose (DW blocked + cost-burn
         # high → 0.2 × 0.2 = 0.04× throttle on BG/SPEC).
@@ -495,12 +578,24 @@ class SensorGovernor:
         self,
         sensor_name: str,
         urgency: Urgency = Urgency.STANDARD,
+        *,
+        cluster_id: Optional[str] = None,
     ) -> BudgetDecision:
         """Query whether ``sensor_name`` may emit an op at this urgency.
 
         When the master flag is off, always returns allowed=True with
         reason_code='governor.disabled' so sensors fall through to the
         pre-governor path.
+
+        M9 Slice 3 (PRD §30.5.1): when ``cluster_id`` is supplied AND
+        the registered :class:`SensorBudgetSpec` has
+        ``curiosity_aware=True`` AND the M9 master flag is on, the
+        cap formula composes a ``curiosity_multiplier`` from the
+        :mod:`curiosity_collector` snapshot (lazy-imported via
+        :func:`_curiosity_multiplier_for`). All other cases collapse
+        to the pre-Slice-3 formula (multiplier=1.0). Decoupled by
+        design — governor never imports M9 at module load; the
+        lazy import keeps M9 dormant when not graduated.
         """
         if not is_enabled():
             return BudgetDecision(
@@ -530,9 +625,19 @@ class SensorGovernor:
 
             brake = self._emergency_brake_active()
             topology_blocked = self._topology_blocking(urgency)
+            # M9 Slice 3 — query CuriosityGradient consumer iff this
+            # sensor opted in. Decoupled by lazy-import; defaults to
+            # (1.0, None) on M9-off / cold-start / decay / error.
+            cur_mult: float = 1.0
+            cur_cid: Optional[str] = None
+            if spec.curiosity_aware and cluster_id is not None:
+                cur_mult, cur_cid = _curiosity_multiplier_for(
+                    cluster_id,
+                )
             weighted_cap = self._weighted_cap(
                 spec, urgency, posture, brake,
                 topology_blocked=topology_blocked,
+                curiosity_multiplier=cur_mult,
             )
             current = len(self._per_sensor.get(sensor_name, ()))
             remaining = max(0, weighted_cap - current)
@@ -557,6 +662,8 @@ class SensorGovernor:
                     reason_code="governor.global_cap_exhausted",
                     emergency_brake=brake, global_cap=gcap, global_count=gcount,
                     topology_blocked=topology_blocked,
+                    curiosity_multiplier=cur_mult,
+                    curiosity_cluster_id=cur_cid,
                 )
             elif remaining <= 0:
                 _reason = (
@@ -571,6 +678,8 @@ class SensorGovernor:
                     reason_code=_reason,
                     emergency_brake=brake, global_cap=gcap, global_count=gcount,
                     topology_blocked=topology_blocked,
+                    curiosity_multiplier=cur_mult,
+                    curiosity_cluster_id=cur_cid,
                 )
             else:
                 decision = BudgetDecision(
@@ -580,6 +689,8 @@ class SensorGovernor:
                     reason_code="governor.ok",
                     emergency_brake=brake, global_cap=gcap, global_count=gcount,
                     topology_blocked=topology_blocked,
+                    curiosity_multiplier=cur_mult,
+                    curiosity_cluster_id=cur_cid,
                 )
 
             self._decisions.append(decision)

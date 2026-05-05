@@ -63,17 +63,27 @@ SEED_SPECS: list = [
     ),
 
     # --- discovery sensors: favored in EXPLORE ---
+    # M9 Slice 3: OpportunityMiner / ProactiveExploration /
+    # CapabilityGap opt into curiosity-aware bias — these three
+    # benefit most from prediction-error redistribution because
+    # they're the discovery surface (high-curiosity regions →
+    # more discovery emission slots; low-curiosity regions →
+    # throttled to free up capacity for high-curiosity ones).
+    # When M9 master flag is OFF, curiosity_multiplier defaults
+    # to 1.0 → pre-graduation behavior byte-identical.
     SensorBudgetSpec(
         sensor_name="OpportunityMinerSensor",
         base_cap_per_hour=15,
         posture_weights=_DISCOVERY_WEIGHTS,
         description="Layered storm-guard; heavy EXPLORE weight.",
+        curiosity_aware=True,
     ),
     SensorBudgetSpec(
         sensor_name="ProactiveExplorationSensor",
         base_cap_per_hour=3,
         posture_weights=_DISCOVERY_WEIGHTS,
         description="7200s polling; strong EXPLORE preference.",
+        curiosity_aware=True,
     ),
     SensorBudgetSpec(
         sensor_name="IntentDiscoverySensor",
@@ -88,6 +98,7 @@ SEED_SPECS: list = [
         posture_weights={"EXPLORE": 1.3, "CONSOLIDATE": 1.0, "HARDEN": 0.8,
                          "MAINTAIN": 1.0},
         description="Entropy-driven capability discovery.",
+        curiosity_aware=True,
     ),
     SensorBudgetSpec(
         sensor_name="WebIntelligenceSensor",
