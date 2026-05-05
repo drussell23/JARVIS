@@ -163,6 +163,13 @@ class ChangePhase(enum.Enum):
 # ---------------------------------------------------------------------------
 
 
+# PRD §3.6.2 vector #8 closure (Wave 3 hygiene Item 6, 2026-05-05):
+# canonical schema-version constant for the RollbackArtifact contract.
+# Bump on field add/remove/rename so cross-runner readers can branch
+# at deserialization time. See `meta.versioned_artifact` §33.5 pattern.
+ROLLBACK_ARTIFACT_SCHEMA_VERSION: str = "rollback_artifact.1"
+
+
 @dataclass
 class RollbackArtifact:
     """Pre-captured snapshot for deterministic rollback.
@@ -188,11 +195,55 @@ class RollbackArtifact:
     autonomous multi-file generation attempt to reach APPLY phase,
     aborting the entire 4-file batch at progress=70% even though every
     upstream gate (ledger, L2, GATE, NOTIFY_APPLY) had already passed.
+
+    **Versioned artifact contract** (§33.5): ``schema_version`` carries
+    the canonical version string so future cross-runner consumers
+    (audit ledgers, replay determinism harness) can detect drift.
+    Currently in-process only; the field is a forward-compat
+    investment.
     """
 
     original_content: str
     snapshot_hash: str
     existed: bool = True
+    schema_version: str = ROLLBACK_ARTIFACT_SCHEMA_VERSION
+
+    def to_dict(self) -> dict:
+        """Project to dict for JSON serialization. Symmetric to
+        :meth:`from_dict` — round-trips preserve all fields."""
+        return {
+            "schema_version": self.schema_version,
+            "original_content": self.original_content,
+            "snapshot_hash": self.snapshot_hash,
+            "existed": self.existed,
+        }
+
+    @classmethod
+    def from_dict(
+        cls, raw: dict,
+    ) -> "Optional[RollbackArtifact]":
+        """Defensive parse — returns ``None`` on missing /
+        malformed fields. Caller verifies schema_version via
+        :func:`meta.versioned_artifact.verify_artifact_schema`
+        before invoking. NEVER raises."""
+        try:
+            if not isinstance(raw, dict):
+                return None
+            return cls(
+                original_content=str(
+                    raw.get("original_content", ""),
+                ),
+                snapshot_hash=str(raw.get("snapshot_hash", "")),
+                existed=bool(raw.get("existed", True)),
+                schema_version=str(
+                    raw.get(
+                        "schema_version",
+                        ROLLBACK_ARTIFACT_SCHEMA_VERSION,
+                    ),
+                ),
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return None
 
     @classmethod
     def capture(cls, file_path: Path) -> "RollbackArtifact":

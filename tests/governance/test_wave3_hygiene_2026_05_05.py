@@ -343,6 +343,241 @@ def test_auto_committer_commit_uses_async_flock():
 
 
 # ---------------------------------------------------------------------------
+# Item 6 — Vector #8 Versioned Artifact Contract
+# ---------------------------------------------------------------------------
+
+
+def test_versioned_artifact_substrate_authority_asymmetry():
+    """The substrate module MUST stay pure (stdlib + typing +
+    dataclasses ONLY)."""
+    target = (
+        _repo_root()
+        / "backend/core/ouroboros/governance/meta/"
+        "versioned_artifact.py"
+    )
+    tree = _ast.parse(target.read_text(encoding="utf-8"))
+    forbidden = (
+        "orchestrator", "iron_gate", "policy", "providers",
+        "candidate_generator", "urgency_router",
+        "change_engine", "semantic_guardian",
+    )
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.ImportFrom):
+            module = node.module or ""
+            for f in forbidden:
+                if f in module:
+                    pytest.fail(
+                        f"versioned_artifact.py MUST NOT "
+                        f"import {module!r}"
+                    )
+
+
+def test_verify_artifact_schema_accepts_match():
+    from backend.core.ouroboros.governance.meta.versioned_artifact import (  # noqa: E501
+        verify_artifact_schema,
+    )
+    payload = {"schema_version": "foo.1", "data": 42}
+    v = verify_artifact_schema(payload, expected_schema="foo.1")
+    assert v.accepted is True
+    assert v.actual_schema == "foo.1"
+    assert v.is_legacy is False
+
+
+def test_verify_artifact_schema_accepts_legacy():
+    from backend.core.ouroboros.governance.meta.versioned_artifact import (  # noqa: E501
+        verify_artifact_schema,
+    )
+    payload = {"schema_version": "foo.0"}
+    v = verify_artifact_schema(
+        payload,
+        expected_schema="foo.1",
+        allowed_legacy=["foo.0"],
+    )
+    assert v.accepted is True
+    assert v.is_legacy is True
+    assert "legacy_schema_accepted" in v.diagnostic
+
+
+def test_verify_artifact_schema_rejects_drift():
+    from backend.core.ouroboros.governance.meta.versioned_artifact import (  # noqa: E501
+        verify_artifact_schema,
+    )
+    payload = {"schema_version": "wrong.0"}
+    v = verify_artifact_schema(payload, expected_schema="foo.1")
+    assert v.accepted is False
+    assert "schema_drift" in v.diagnostic
+
+
+def test_verify_artifact_schema_missing():
+    from backend.core.ouroboros.governance.meta.versioned_artifact import (  # noqa: E501
+        verify_artifact_schema,
+    )
+    v = verify_artifact_schema({}, expected_schema="foo.1")
+    assert v.accepted is False
+    assert "missing" in v.diagnostic
+
+
+def test_verify_artifact_schema_object_attribute():
+    """Helper accepts objects with .schema_version attribute,
+    not just dicts."""
+    from backend.core.ouroboros.governance.meta.versioned_artifact import (  # noqa: E501
+        verify_artifact_schema,
+    )
+    class Stub:
+        schema_version = "foo.1"
+    v = verify_artifact_schema(Stub(), expected_schema="foo.1")
+    assert v.accepted is True
+
+
+def test_rollback_artifact_has_schema_version():
+    from backend.core.ouroboros.governance.change_engine import (
+        RollbackArtifact, ROLLBACK_ARTIFACT_SCHEMA_VERSION,
+    )
+    ra = RollbackArtifact(
+        original_content="x", snapshot_hash="h",
+    )
+    assert ra.schema_version == "rollback_artifact.1"
+    assert (
+        ROLLBACK_ARTIFACT_SCHEMA_VERSION == "rollback_artifact.1"
+    )
+
+
+def test_rollback_artifact_round_trip():
+    from backend.core.ouroboros.governance.change_engine import (
+        RollbackArtifact,
+    )
+    ra = RollbackArtifact(
+        original_content="hello\nworld",
+        snapshot_hash="sha256_abc",
+        existed=False,
+    )
+    d = ra.to_dict()
+    ra2 = RollbackArtifact.from_dict(d)
+    assert ra == ra2
+
+
+def test_rollback_artifact_from_dict_defensive():
+    from backend.core.ouroboros.governance.change_engine import (
+        RollbackArtifact,
+    )
+    # Garbage input → None, no exception.
+    assert RollbackArtifact.from_dict("not a dict") is None  # type: ignore
+    assert RollbackArtifact.from_dict(None) is None  # type: ignore
+
+
+def test_saga_ledger_artifact_has_schema_version():
+    from backend.core.ouroboros.governance.saga.saga_types import (
+        SagaLedgerArtifact,
+        SAGA_LEDGER_ARTIFACT_SCHEMA_VERSION,
+    )
+    sla = SagaLedgerArtifact(
+        saga_id="s", op_id="op", event="prepare", repo="*",
+        original_ref="HEAD", original_sha="aaa", base_sha="bbb",
+        saga_branch="b", promoted_sha="",
+        promote_order_index=-1, rollback_reason="",
+        partial_promote_boundary_repo="",
+        kept_forensics_branches=False,
+        skipped_no_diff=False, timestamp_ns=0,
+    )
+    assert (
+        sla.schema_version == "saga_ledger_artifact.1"
+    )
+    assert (
+        SAGA_LEDGER_ARTIFACT_SCHEMA_VERSION
+        == "saga_ledger_artifact.1"
+    )
+
+
+def test_saga_ledger_artifact_round_trip():
+    from backend.core.ouroboros.governance.saga.saga_types import (
+        SagaLedgerArtifact,
+    )
+    sla = SagaLedgerArtifact(
+        saga_id="s1", op_id="op1", event="apply_repo",
+        repo="r1", original_ref="HEAD", original_sha="a",
+        base_sha="b", saga_branch="branch", promoted_sha="c",
+        promote_order_index=0, rollback_reason="",
+        partial_promote_boundary_repo="",
+        kept_forensics_branches=True, skipped_no_diff=False,
+        timestamp_ns=12345,
+    )
+    d = sla.to_dict()
+    sla2 = SagaLedgerArtifact.from_dict(d)
+    assert sla == sla2
+
+
+def test_work_unit_ledger_artifact_round_trip():
+    from backend.core.ouroboros.governance.saga.saga_types import (
+        WorkUnitLedgerArtifact,
+        WORK_UNIT_LEDGER_ARTIFACT_SCHEMA_VERSION,
+    )
+    wula = WorkUnitLedgerArtifact(
+        graph_id="g", unit_id="u", repo="r", state="running",
+        barrier_id="b", causal_trace_id="t", timestamp_ns=1,
+    )
+    assert (
+        wula.schema_version == "work_unit_ledger_artifact.1"
+    )
+    assert (
+        WORK_UNIT_LEDGER_ARTIFACT_SCHEMA_VERSION
+        == "work_unit_ledger_artifact.1"
+    )
+    d = wula.to_dict()
+    wula2 = WorkUnitLedgerArtifact.from_dict(d)
+    assert wula == wula2
+
+
+def test_artifact_pins_auto_registered():
+    """The substrate module's authority-asymmetry pin auto-
+    discovers via register_shipped_invariants."""
+    from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+        list_shipped_code_invariants,
+    )
+    pin_names = {
+        inv.invariant_name
+        for inv in list_shipped_code_invariants()
+    }
+    assert (
+        "versioned_artifact_authority_asymmetry" in pin_names
+    )
+
+
+def test_three_artifacts_use_canonical_constants():
+    """All 3 *Artifact classes MUST reference their
+    module-level *_ARTIFACT_SCHEMA_VERSION constant via
+    field default — not inline literals — so future bumps
+    require a single edit."""
+    targets = (
+        (
+            _repo_root() / "backend/core/ouroboros/governance"
+            / "change_engine.py",
+            "ROLLBACK_ARTIFACT_SCHEMA_VERSION",
+        ),
+        (
+            _repo_root() / "backend/core/ouroboros/governance"
+            / "saga/saga_types.py",
+            "SAGA_LEDGER_ARTIFACT_SCHEMA_VERSION",
+        ),
+        (
+            _repo_root() / "backend/core/ouroboros/governance"
+            / "saga/saga_types.py",
+            "WORK_UNIT_LEDGER_ARTIFACT_SCHEMA_VERSION",
+        ),
+    )
+    for path, const_name in targets:
+        text = path.read_text(encoding="utf-8")
+        assert f"{const_name}:" in text or f"{const_name} =" in text, (
+            f"{path.name}: missing canonical constant "
+            f"{const_name}"
+        )
+        # Constant must appear as a default value somewhere.
+        assert text.count(const_name) >= 2, (
+            f"{path.name}: {const_name} should appear at "
+            f"least twice (constant declaration + field default)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Item 1 — Move 8 PRD reconciliation (no code change; documentation
 # pin)
 # ---------------------------------------------------------------------------
