@@ -228,6 +228,18 @@ class ProactiveExplorationSensor:
         cluster_explored = await self._emit_cluster_coverage_signals()
         explored.extend(cluster_explored)
 
+        # Move 8 Slice 2 — curiosity-driven exploration bias.
+        # Third independent signal source: composes M9 producer side
+        # (GENERATE logprob entropy / VERIFY prophecy error /
+        # CoherenceAuditor RECURRENCE_DRIFT) into IntentEnvelopes for
+        # high-curiosity clusters. Master-flag-gated at the reader
+        # (Slice 1's master flag default-FALSE per §33.1 graduation
+        # contract); when off, returns empty silently. Posture-aware
+        # suppression at HARDEN (the organism is stabilizing —
+        # exploration is the wrong reflex). NEVER raises.
+        curiosity_explored = await self._emit_curiosity_signals()
+        explored.extend(curiosity_explored)
+
         return explored
 
     async def _emit_cluster_coverage_signals(self) -> List[str]:
@@ -429,6 +441,204 @@ class ProactiveExplorationSensor:
                 "[ExplorationSensor] Cluster-coverage scan error",
                 exc_info=True,
             )
+        return emitted
+
+    async def _emit_curiosity_signals(self) -> List[str]:
+        """Move 8 Slice 2 — emit IntentEnvelopes for clusters
+        carrying high M9 curiosity-magnitude.
+
+        Composes the Slice 1 substrate
+        :func:`proactive_curiosity_reader.rank_curious_clusters`
+        — that pure-function reader pulls
+        :meth:`CuriosityCollector.snapshot_all` and ranks the
+        top-K curious clusters with cooldown / cold-start /
+        decay filtering. Reader is master-flag-gated default-
+        FALSE per §33.1, so this method is a no-op until the
+        Slice 3 graduation contract proves the loop respects
+        SensorGovernor caps.
+
+        Discipline:
+
+          * **NEVER raises** — the parent ``scan_once`` is
+            already exception-isolated, but this method is too,
+            for defense-in-depth. Producer side is best-effort.
+          * **ImportError-safe** — Slice 1 substrate may not be
+            present in some deployments (rollback paths). On
+            ``ImportError`` we silently return an empty list.
+          * **Posture-aware** — when current posture is HARDEN
+            ("organism is stabilizing — exploration is the
+            wrong reflex"), suppresses emission entirely. Reads
+            posture lazily; on read failure, defaults to "not
+            HARDEN" (fail-open — don't starve the loop on a
+            posture probe error).
+          * **Per-scan cap delegated** to Slice 1's
+            :func:`top_k` env knob — already enforced at the
+            reader, so this method emits at most K per scan.
+          * **Session dedup delegated** to Slice 1's in-process
+            cooldown ledger — re-emitting the same cluster_id
+            within :func:`cooldown_seconds` returns a COOLDOWN
+            decision (filtered out below).
+          * **Cost contract preserved** — zero LLM calls, zero
+            file I/O, zero git invocations on the sensor path.
+            Emits via the existing ``self._router.ingest`` path
+            (which itself routes through SensorGovernor).
+        """
+        emitted: List[str] = []
+        try:
+            from backend.core.ouroboros.governance.proactive_curiosity_reader import (  # noqa: E501
+                CuriosityRankingDecision,
+                proactive_curiosity_reader_enabled,
+                rank_curious_clusters,
+            )
+        except ImportError:
+            return emitted
+        if not proactive_curiosity_reader_enabled():
+            return emitted
+
+        # Posture-aware suppression — HARDEN means stabilize,
+        # not explore. Defensive: any posture-read failure
+        # defaults to "not HARDEN" so the loop isn't starved on
+        # an unrelated probe glitch.
+        try:
+            from backend.core.ouroboros.governance.posture_health import (  # noqa: E501
+                safe_load_posture_value,
+            )
+            from backend.core.ouroboros.governance.posture_observer import (  # noqa: E501
+                get_default_store,
+            )
+            current = safe_load_posture_value(
+                store=get_default_store(),
+            )
+            if current == "HARDEN":
+                logger.debug(
+                    "[ExplorationSensor] Curiosity emission "
+                    "suppressed — posture=HARDEN",
+                )
+                return emitted
+        except Exception:  # noqa: BLE001 -- defensive
+            # Fail-open on probe glitch; loop continues.
+            pass
+
+        try:
+            rankings = rank_curious_clusters()
+        except Exception:  # noqa: BLE001 -- defensive
+            logger.debug(
+                "[ExplorationSensor] rank_curious_clusters "
+                "raised — skipping curiosity emission",
+                exc_info=True,
+            )
+            return emitted
+
+        for ranking in rankings:
+            if ranking.decision is not (
+                CuriosityRankingDecision.SURFACED
+            ):
+                continue
+            try:
+                envelope = make_envelope(
+                    source="exploration",
+                    description=(
+                        f"Curiosity-driven exploration: cluster "
+                        f"'{ranking.cluster_id}' carries high M9 "
+                        f"curiosity (magnitude={ranking.magnitude:.2f}, "
+                        f"confidence={ranking.confidence:.2f}, "
+                        f"dominant_source={ranking.dominant_source}, "
+                        f"samples={ranking.samples_count}). "
+                        f"The model has been uncertain or "
+                        f"surprising in this region — explore "
+                        f"to consolidate understanding."
+                    ),
+                    # Cluster_id is opaque (M9 uses path or
+                    # SemanticIndex cluster sentinel); the
+                    # exploration prompt invites the model to
+                    # use its tool loop to discover representative
+                    # files — same convention as cluster_coverage's
+                    # project-root sentinel fallback.
+                    target_files=(".",),
+                    repo=self._repo,
+                    confidence=float(min(
+                        max(ranking.confidence, 0.0), 1.0,
+                    )),
+                    urgency="low",
+                    evidence={
+                        "category": "curiosity_driven",
+                        "cluster_id": ranking.cluster_id,
+                        "magnitude": float(ranking.magnitude),
+                        "confidence_m9": float(
+                            ranking.confidence,
+                        ),
+                        "dominant_source": (
+                            ranking.dominant_source
+                        ),
+                        "samples_count": int(
+                            ranking.samples_count,
+                        ),
+                        "rank": int(ranking.rank),
+                        "sensor": "ProactiveExplorationSensor",
+                    },
+                    requires_human_ack=False,
+                )
+                await self._router.ingest(envelope)
+                emitted.append(ranking.cluster_id)
+                # FiringTelemetry — fail-open by contract.
+                try:
+                    from backend.core.ouroboros.governance.firing_telemetry import (  # noqa: E501
+                        incr_fire_counter,
+                    )
+                    incr_fire_counter(
+                        "curiosity_driven_envelope_emit",
+                    )
+                    incr_fire_counter(
+                        f"curiosity_driven.source."
+                        f"{ranking.dominant_source}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.info(
+                    "[ExplorationSensor] Curiosity-driven emit "
+                    "cluster=%s magnitude=%.2f source=%s rank=%d",
+                    ranking.cluster_id,
+                    ranking.magnitude,
+                    ranking.dominant_source,
+                    ranking.rank,
+                )
+                # SSE publish — best-effort; preserves the
+                # established Move 7 / cluster-coverage pattern
+                # of "never break the scan on broker absence."
+                try:
+                    from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                        get_default_broker,
+                    )
+                    broker = get_default_broker()
+                    if broker is not None:
+                        broker.publish(
+                            event_type=(
+                                "curiosity_intent_emitted"
+                            ),
+                            op_id="",
+                            payload={
+                                "cluster_id": (
+                                    ranking.cluster_id
+                                ),
+                                "magnitude": float(
+                                    ranking.magnitude,
+                                ),
+                                "rank": int(ranking.rank),
+                                "dominant_source": (
+                                    ranking.dominant_source
+                                ),
+                            },
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001 -- defensive
+                logger.debug(
+                    "[ExplorationSensor] Curiosity emit failed "
+                    "for cluster=%s",
+                    ranking.cluster_id,
+                    exc_info=True,
+                )
+                continue
         return emitted
 
     def _infer_target_files(self, domain_key: str) -> Tuple[str, ...]:
