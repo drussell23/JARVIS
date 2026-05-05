@@ -539,9 +539,12 @@ __all__ = [
     "MASTER_FLAG_ENV_VAR",
     "MinimalWelcomePayload",
     "PRESENTATION_RESTRAINT_SCHEMA_VERSION",
+    "chrome_color",
     "clear_captured_layers_for_tests",
+    "format_idle_breadcrumb",
     "get_captured_layers",
     "is_restraint_enabled",
+    "real_stdout_isatty",
     "render_minimal_welcome",
     "render_organism",
     "render_preflight",
@@ -549,3 +552,96 @@ __all__ = [
     "set_captured_layers",
     "suppress_diagnostic_logs",
 ]
+
+
+# ===========================================================================
+# Slice 2 — chrome color discipline + idle status content + TTY gate fix
+# ===========================================================================
+
+
+def chrome_color(default: str = "bright_green") -> str:
+    """Return ``"dim"`` when presentation restraint is enabled,
+    otherwise ``default``.
+
+    **Rationale (Constraint: green = success outcomes only).** The
+    legacy palette uses ``bright_green`` (``_C['life']``) for both
+    *outcomes* (✨ evolved, ✓ test passed, 📝 committed) AND *chrome*
+    (event-stream activity ribbon, "🔋 Organism alive" line, section
+    headers). Operators can't distinguish "this op succeeded" from
+    "boot decoration" at a glance.
+
+    This helper lets callers thread a master-flag-aware color choice
+    into a single seam without changing the legacy palette dict (which
+    is shared across many other rendering paths). When restraint is
+    on: chrome turns dim; outcomes (which call sites pass their own
+    explicit color, not via this helper) stay bright_green.
+
+    NEVER raises.
+    """
+    if is_restraint_enabled():
+        return "dim"
+    return default
+
+
+def real_stdout_isatty() -> bool:
+    """Check the **unpatched** stdout's TTY status.
+
+    ``prompt_toolkit.patch_stdout`` replaces ``sys.stdout`` with a
+    non-TTY proxy during the REPL's lifetime. Code that checks
+    ``sys.stdout.isatty()`` during REPL operation gets ``False``
+    even on real interactive terminals — that's why the live status
+    line (Gap #1+5) never surfaced during normal use.
+
+    This helper checks ``sys.__stdout__`` (Python's saved reference
+    to the original stdout, untouched by patch_stdout). Falls back
+    to the patched ``sys.stdout`` only if ``__stdout__`` is ``None``
+    (rare: Windows pythonw, daemonized processes). NEVER raises.
+    """
+    import sys
+    primary = getattr(sys, "__stdout__", None)
+    if primary is not None:
+        try:
+            return bool(primary.isatty())
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def format_idle_breadcrumb(
+    *,
+    branch: str = "",
+    cost_spent: float = 0.0,
+    cost_budget: float = 0.0,
+    posture: str = "",
+    op_id: str = "",
+) -> str:
+    """One-line breadcrumb for the IDLE phase — replaces the silent
+    empty status line that today leaves operators wondering whether
+    O+V is alive.
+
+    Returns a plain text string the caller wraps with their own
+    Rich markup at the emission seam (matches ``status_line.py``'s
+    library-agnostic policy — the substrate produces strings, the
+    consumer applies styling).
+
+    Format: ``IDLE · main · $0.04/$0.50 · EXPLORE`` — only includes
+    fields the caller supplies. NEVER raises.
+    """
+    parts: List[str] = ["IDLE"]
+    if isinstance(branch, str) and branch:
+        parts.append(branch)
+    if cost_budget > 0.0:
+        parts.append(f"${cost_spent:.2f}/${cost_budget:.2f}")
+    elif cost_spent > 0.0:
+        parts.append(f"${cost_spent:.2f}")
+    if isinstance(posture, str) and posture:
+        parts.append(posture)
+    if isinstance(op_id, str) and op_id:
+        # Last-completed op tail (8 chars) so operators see "previous
+        # work" hint when scrolling away from the receipt
+        tail = op_id.split("-")[-1][:8] if "-" in op_id else op_id[:8]
+        parts.append(f"prev:{tail}")
+    return " · ".join(parts)

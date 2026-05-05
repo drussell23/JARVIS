@@ -764,11 +764,27 @@ class SerpentFlow:
     # ══════════════════════════════════════════════════════════
 
     async def start(self) -> None:
-        """Print the awakening banner (minimal — boot_banner handles the heavy lifting)."""
+        """Print the awakening banner (minimal — boot_banner handles the heavy lifting).
+
+        Gap #7 Slice 2: under presentation restraint, the activity
+        ribbon ("event stream active …") is *chrome*, not a success
+        outcome — bright_green muddies the visual hierarchy where green
+        should signal *evolved / committed / immune*. ``chrome_color()``
+        returns ``dim`` under the master flag so green stays reserved
+        for outcomes. Legacy ``bright_green`` preserved when flag off.
+        """
         c = self.console
+        # Resolve the chrome color via the restraint helper. NEVER raises.
+        try:
+            from backend.core.ouroboros.battle_test.presentation_restraint import (
+                chrome_color,
+            )
+            _ribbon_color = chrome_color(default=_C['life'])
+        except Exception:
+            _ribbon_color = _C['life']
         c.print()
         c.print(
-            f"  [{_C['life']}]🐍 ouroboros[/{_C['life']}] [dim]│[/dim] "
+            f"  [{_ribbon_color}]🐍 ouroboros[/{_ribbon_color}] [dim]│[/dim] "
             f"event stream active — sensing, synthesizing, evolving",
             highlight=False,
         )

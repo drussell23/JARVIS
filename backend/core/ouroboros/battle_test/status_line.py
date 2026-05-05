@@ -485,7 +485,33 @@ def _format_badge(route: str, provider: str) -> str:
 
 
 def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
-    """Plain-text rendering for tests / non-TTY logs."""
+    """Plain-text rendering for tests / non-TTY logs.
+
+    Gap #7 Slice 2 (2026-05-04): when phase is IDLE and presentation
+    restraint is enabled, return the compact breadcrumb format
+    (``IDLE · main · $0.04/$0.50 · EXPLORE``) instead of the verbose
+    ``Phase: IDLE · Cost: $0.00 / $0.50 · Idle: 0s / 0s``. Operators
+    always see at-a-glance state without the full label noise.
+    """
+    # Gap #7 Slice 2 — idle breadcrumb (master-flag-gated)
+    try:
+        from backend.core.ouroboros.battle_test.presentation_restraint import (
+            format_idle_breadcrumb,
+            is_restraint_enabled,
+        )
+        if (
+            is_restraint_enabled()
+            and isinstance(snap.phase, str)
+            and snap.phase.upper() in ("IDLE", "")
+        ):
+            return format_idle_breadcrumb(
+                cost_spent=snap.cost_spent_usd,
+                cost_budget=snap.cost_budget_usd,
+                op_id=snap.primary_op_id or "",
+            )
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+
     cost_fr = _cost_fraction(snap.cost_spent_usd, snap.cost_budget_usd)
     idle_fr = _idle_fraction(snap.idle_elapsed_s, snap.idle_timeout_s)
     parts: List[str] = []
@@ -534,13 +560,34 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
 
 
 def should_render() -> bool:
-    """Combined gate: env enabled + stdout is a real TTY."""
+    """Combined gate: env enabled + stdout is a real TTY.
+
+    Gap #7 Slice 2 fix (2026-05-04): check ``sys.__stdout__`` (the
+    unpatched original) instead of ``sys.stdout``.
+    ``prompt_toolkit.patch_stdout(raw=True)`` (active during the REPL
+    main loop) replaces ``sys.stdout`` with a non-TTY proxy — the
+    legacy isatty() check on the proxy returned False even on real
+    interactive terminals, which is why the Gap #1+5 live status line
+    never surfaced during normal operation. ``sys.__stdout__`` is
+    Python's saved reference to the original stdout, untouched by
+    patch_stdout. Falls back to ``sys.stdout`` only when ``__stdout__``
+    is None (rare: Windows pythonw, daemonized processes).
+    """
     if not status_line_enabled():
         return False
     try:
-        return bool(sys.stdout.isatty())
-    except Exception:  # noqa: BLE001
-        return False
+        from backend.core.ouroboros.battle_test.presentation_restraint import (
+            real_stdout_isatty,
+        )
+        return real_stdout_isatty()
+    except ImportError:
+        # Fallback to legacy behavior if presentation_restraint is
+        # somehow unavailable (e.g. partial install). Still better
+        # than crashing the render path.
+        try:
+            return bool(sys.stdout.isatty())
+        except Exception:  # noqa: BLE001
+            return False
 
 
 _DEFAULT_BUILDER: Optional[StatusLineBuilder] = None
