@@ -132,7 +132,9 @@ class ExplorationFleet:
         Spawns one ExplorationSubagent per scope, runs them in parallel,
         merges findings, and returns a unified report.
         """
-        t0 = time.time()
+        # Monotonic clock — elapsed-time measurement immune to NTP /
+        # DST jumps (PRD §3.6.2 vector #11; Wave 3 hygiene 2026-05-05).
+        t0 = time.monotonic()
 
         # Determine which repos to explore
         target_repos = repos or tuple(self._roots.keys())
@@ -229,7 +231,7 @@ class ExplorationFleet:
         # Synthesize
         synthesis = self._synthesize(goal, deduped, total_files, completed)
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         report = FleetReport(
             goal=goal,

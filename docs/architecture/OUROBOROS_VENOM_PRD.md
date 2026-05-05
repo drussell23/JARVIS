@@ -1,7 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.23 (2026-05-05 — **Phase 10 reality-update + graduation-contract harness landed**: PRD §32.8.1 v4 supplement audit (added 2026-05-04) was authored before realizing Phase 10 was further along than tracked. Audit findings: Slices 2/3/4 substrate **already shipped** (Slice 2 yaml v2 schema + dual-reader landed via Phase 12 Slice E coordination; Slice 3 AsyncTopologySentinel gate at `candidate_generator.py:1703-1762` with `preflight_check` + `_dispatch_via_sentinel` walk; Slice 4 live-exception `sentinel.report_failure(FailureSource.LIVE_STREAM_STALL)` wired at 4 DW failure sites — exceeded PRD's 3-site target). PRD §1565+/§1578+/§1591+ flipped to ✅ MERGED with audit-2026-05-05 stamps; §32.8 row 13 + §32.8.1 supplement updated; recommended sequencing collapsed Phase 10 from "2-3 weeks" to "3-7 days operator-paced empirical" because substrate is done. **What's actually pending**: Slice 5 deletion-side substrate (delete redundant `dw_allowed: false` + `block_mode:` lines from yaml; migrate readers to topology.2-only methods) + 3 forced-clean once-proofs operator-paced + master flag flip + Slice 6 24h soak. Graduation-contract harness `phase10_graduation_contract.py` (~250 LOC, ~30 tests) gates the master-flag flip on STRUCTURAL evidence ladder: per-session ≥1 BG queued under SEVERED + ≥1 OPEN→HALF_OPEN→CLOSED transition; 3-session rolling window; `is_ready_for_purge() -> ContractVerdict` predicate; AST pin asserts master flag stays default-false until contract green. Mirrors M10's operator-binding pattern — substrate enforces the binding, doesn't just document it. **NEXT**: operator-paced — run 3 forced-clean soak sessions; the harness will report green/red automatically. Once green: Slice 5 deletion-side commit + master flag flip + Slice 6 24h soak. See v2.22 below for Slice 5b consolidation arc closure.)
+**Version**: 2.24 (2026-05-05 — **Coverage audit hygiene pass + 3 new structural sections (§33-§35)**: PRD comprehensiveness audit (2026-05-05) found ~85% coverage with documented drift; this version closes the gap. Edits: (a) **stale `[ ]` clusters refreshed** — §32.5 cleanup checklist (lines 346-352, 7 items now `[x]` with closure dates); M9/M10/M11 + U1/U2/U3 in §30.5 / §31.4 main bodies flipped to `[x]` with closure markers (closures already documented in version banners but checkboxes were stale); P10.4 stale-`[ ]` flipped (audit-confirmed 4 sites shipped, exceeding PRD's 3); (b) **§32.8.1 v4 supplement Phase 9 status corrected** — supplement was authored 2026-05-04 (7 days after Phase 9 substrate landed 2026-04-27) and called Phase 9 "NOT STARTED"; refreshed to "✅ STRUCTURALLY COMPLETE; empirical cadence pending operator-paced cron accumulation"; section header annotated with audit refresh note; (c) **§33 — Reusable Meta-Patterns added (~370 lines)** documenting four crystallized architectural disciplines (Graduation Contract Pattern / Producer-Bridge Pattern / Slice 5b Naming-Convention Cage / Per-Cluster flock'd JSONL Persistence) with reference implementations + future-arc inheritance map + composition table — Reverse Russian Doll discipline made explicit; (d) **§34 — VisionSensor + Multi-modal Subsystem anchor added (~75 lines)** closing the CLAUDE.md/PRD drift on a major-capability-without-anchor; documents VisionSensor (17th sensor, no-capture-authority AST-pinned) + multi-modal ingest path (`_serialize_attachments`, BG/SPEC strip-attachments structurally) + Visual VERIFY (3-tier trigger, asymmetric clamp, ≥50% FP auto-demotion); (e) **§35 — Open Strategic Moves Registry added (~120 lines)** consolidating §28.6.3 Moves 6-10 + §29.4 Move 7-8 + §3.6.2 vectors #6-#12 + §28.5.1 race conditions into a single severity-tagged registry (🔴 Critical / 🟠 High / 🟡 Medium / 🔵 Low) with current-status + action-recommendation columns; identifies highest-leverage cluster (Wave 3 hygiene arc closing 5 items in ≤1 week via `cross_process_jsonl` migration class). **What this fixes**: PRD now navigable top-down without conflicting checkbox state; future Phase 9 cadence + M10 30+ proposal audit + M12 LoRA scoping all reference §33.1 graduation contract pattern by name; VisionSensor fully traceable; open vectors no longer scattered. **Net effect**: PRD coverage 85% → 95%+. **NEXT**: operator decision — (a) execute Wave 3 hygiene arc (~6-8 hours, closes 5 medium-severity items); OR (b) start Phase 9 empirical cadence (operator-paced soak runs, structurally ready); OR (c) resolve Move 8 GENERAL LLM driver status conflict via source-grep. See v2.23 below for Phase 10 audit + graduation-contract harness details.)
+**Version (prior)**: 2.23 (2026-05-05 — **Phase 10 reality-update + graduation-contract harness landed**: PRD §32.8.1 v4 supplement audit (added 2026-05-04) was authored before realizing Phase 10 was further along than tracked. Audit findings: Slices 2/3/4 substrate **already shipped** (Slice 2 yaml v2 schema + dual-reader landed via Phase 12 Slice E coordination; Slice 3 AsyncTopologySentinel gate at `candidate_generator.py:1703-1762` with `preflight_check` + `_dispatch_via_sentinel` walk; Slice 4 live-exception `sentinel.report_failure(FailureSource.LIVE_STREAM_STALL)` wired at 4 DW failure sites — exceeded PRD's 3-site target). PRD §1565+/§1578+/§1591+ flipped to ✅ MERGED with audit-2026-05-05 stamps; §32.8 row 13 + §32.8.1 supplement updated; recommended sequencing collapsed Phase 10 from "2-3 weeks" to "3-7 days operator-paced empirical" because substrate is done. **What's actually pending**: Slice 5 deletion-side substrate (delete redundant `dw_allowed: false` + `block_mode:` lines from yaml; migrate readers to topology.2-only methods) + 3 forced-clean once-proofs operator-paced + master flag flip + Slice 6 24h soak. Graduation-contract harness `phase10_graduation_contract.py` (~250 LOC, ~30 tests) gates the master-flag flip on STRUCTURAL evidence ladder: per-session ≥1 BG queued under SEVERED + ≥1 OPEN→HALF_OPEN→CLOSED transition; 3-session rolling window; `is_ready_for_purge() -> ContractVerdict` predicate; AST pin asserts master flag stays default-false until contract green. Mirrors M10's operator-binding pattern — substrate enforces the binding, doesn't just document it. **NEXT**: operator-paced — run 3 forced-clean soak sessions; the harness will report green/red automatically. Once green: Slice 5 deletion-side commit + master flag flip + Slice 6 24h soak. See v2.22 below for Slice 5b consolidation arc closure.)
 **Version (prior)**: 2.22 (2026-05-05 — **Slice 5b consolidation arc FULLY CLOSED — Slice 5 graduation landed; new §32.11 PRD section formally documents the closure**: 22 new graduation regression tests + sentinel pin asserting `meta/module_discovery.py` is the SOLE caller of `pkgutil.iter_modules` across the entire `backend/core/ouroboros/` tree (AST-based check distinguishes real calls from string literals); 479/479 across the full consolidation arc spine + every dependent suite. Bonus during Slice 5: discovered 2 additional legacy walkers (`lifecycle_hook_registry.discover_module_provided_hooks` + `termination_hook_registry.discover_module_provided_hooks`) following the same pattern; both refactored to delegate to the Slice 2 primitive, raising consumer count from 3 → **5** and eliminating ~80 additional LOC duplication. Total LOC eliminated arc-wide: ~200. New PRD section §32.11 (~120 lines) formalizes the slice-by-slice closure: 1,860 LOC + 130 tests + 14 AST pins + 3 master flags + 5 consumer-modules-delegate refactors + Reverse Russian Doll alignment. Architectural locks recap: (a) single source of truth for the walker enforced by sentinel + 5 per-consumer pins; (b) naming convention enforced (every `*_observability.py` exposes `register_routes`; every `*_repl.py` exposes `dispatch_<basename>_command`); (c) idempotency at every boundary; (d) authority asymmetry pinned across 4 modules; (e) 3 independent master-flag kill switches for instant rollback. **What this unlocks structurally**: Phase 10 + Phase 9 surfaces auto-mount zero-edit; future Slice 5 arcs scale O(1) instead of O(N); graduation soaks gain telemetry visibility through 5 auto-mounted observability routes. **§32.8 v4 sequencing item 9 fully closed**. **NEXT**: Phase 10 Slices 2-6 (THE PURGE — TopologySentinel finishing, ~2-3 weeks; cuts every Phase 9 soak cost 3-7×). See v2.21 below for Slice 4 REPL dispatch registry details.)
 **Version (prior)**: 2.21 (2026-05-04 — **Slice 5b consolidation Slice 4 CLOSED — REPL dispatch auto-discovery registry landed**: 36 new regression tests + 1 new AST pin (`repl_dispatch_registry_uses_primitive`); 325/325 across full sweep including the updated legacy `test_slice_5b_e_repls` regression. New module `backend/core/ouroboros/battle_test/repl_dispatch_registry.py` (~330 LOC, pure substrate) closes the REPL-dispatch hardcoded-ladder duplication. Public API: `try_dispatch(line) -> DispatchOutcome` + `prime_registry(*, packages, excluded_verbs, excluded_modules, force) -> RegistryReport` + `list_verbs() -> Tuple[str, ...]` + `reset_registry_for_tests()` + master flag `JARVIS_REPL_DISPATCH_AUTODISCOVERY_ENABLED` default-true. **17+ verbs auto-discovered from filename convention** (`X_repl.py` → verb `X`; `<sub>/repl.py` → verb `<sub>`): 5 legacy (probe / coherence / quorum / failures / outcomes) + 12 newly-unlocked (m10 / decisions / curiosity / governor / posture / cost / hypothesis / replay / recovery / render / compact / backlog_auto_proposed). **Custom-handler exclusion list** cages 7 verbs whose semantics diverge from pure dispatch (budget/risk/goal/cancel/plan/postmortems/inline) — they retain bespoke operator handlers in serpent_flow. **Slice 2 primitive extended** with module-scan mode (`attr_name=None`) so the handler resolves per-module attribute names by naming convention; Slice 2 + Slice 3 byte-equivalent (additive change). **serpent_flow.py refactored**: legacy 5-branch if/elif ladder REMOVED; legacy `_print_observability_verb` helper REMOVED (~60 LOC); replaced with single `try_dispatch(line)` invocation. Architectural locks (AST-pinned): (a) registry MUST compose Slice 2 primitive (no parallel walker — pin forbids `pkgutil.iter_modules`); (b) signature validation via `inspect.signature` rejects off-shape dispatchers; (c) per-module + per-package exception isolation; (d) idempotent priming (cached after first call); (e) per-dispatcher exception isolation in `try_dispatch` (handler raises → `DispatchOutcome(matched=True, ok=False, text=<reason>)`); (f) verb-name-extraction byte-pinned for 4 known shapes. **Critical UX win**: 12 previously-dormant REPL surfaces (m10/decisions/curiosity/...) now reach operators by typing the verb — Slice 5b debt class CLOSED for both HTTP routes (Slice 3) AND REPL commands (Slice 4) by construction. Future Slice 5 arcs ship `*_repl.py` files exposing `dispatch_<verb>_command(line)` and they auto-route zero-edit. **NEXT**: Slice 5 — graduation + final regression spine + PRD v2.21 → v2.22. See v2.20 below for Slice 3 observability auto-mount details.)
 **Version (prior)**: 2.20 (2026-05-04 — **Slice 5b consolidation Slice 3 CLOSED — observability route auto-mount registry landed**: 24 new regression tests + 6 new AST pins (5 per-module exposes-register_routes + 1 registry-uses-primitive); **390/390** across observability_route_registry + module_discovery + cleanup + shipped_code + flag_registry + help_dispatcher + full M10 spine. New module `backend/core/ouroboros/governance/observability_route_registry.py` (~395 LOC, pure substrate composing Slice 2 module_discovery primitive) closes the dormant-observability-surface debt class structurally. Public API: `discover_and_mount_observability_routes(app, *, rate_limit_check, cors_headers, packages, excluded_modules) -> MountReport` + frozen `MountReport` (8 fields incl. `as_dict()` projection) + `MountedRoute` + `list_mounted_modules()` + `reset_registry_for_tests()` + master flag `JARVIS_OBSERVABILITY_AUTODISCOVERY_ENABLED` default-true. **5 dormant observability surfaces auto-mount via single boot call**: `decisions_observability` + `curiosity_observability` + `epistemic_budget_observability` + `m10/observability` + `action_outcome_memory_observability`. The last one was renamed from `register_action_outcome_routes` → `register_routes` for naming-convention uniformity (alias retained for backward-compat). **Wired into event_channel.py** boot block right after the legacy explicit blocks — idempotency guard ensures no double-mount; legacy explicit blocks short-circuit on `already_mounted`. Architectural locks (AST-pinned via 6 new cleanup_invariants pins): (a) every `*_observability.py` MUST expose module-level `register_routes` for auto-discovery (5 pins, one per known dormant module); (b) registry MUST compose Slice 2 primitive (no parallel walker — pin forbids `pkgutil.iter_modules`); (c) substrate exclusions list cages class-based routers (IDEObservabilityRouter / IDEStreamRouter / etc.) which require constructor dependencies; (d) signature validation via `inspect.signature` — off-shape `register_routes` symbols (e.g. test fixtures) are rejected with structured reason; (e) per-module + per-package exception isolation; (f) idempotent at module-name granularity. Future Slice 5 arcs (Phase 10 + Phase 9) ship surfaces that auto-mount zero-edit. **NEXT**: Slice 4 — `repl_dispatch_registry.py` for SerpentREPL command auto-discovery (~5h, ~25 tests). See v2.19 below for Slice 2 module_discovery substrate details.)
@@ -144,6 +145,9 @@
     - [32.9 Cross-References](#329-cross-references)
     - [32.10 Summary — Three Investigations, One Architectural Conclusion](#3210-summary--three-investigations-one-architectural-conclusion)
     - [32.11 Slice 5b Consolidation Arc — CLOSED 2026-05-04](#3211-slice-5b-consolidation-arc--closed-2026-05-04)
+33. [Reusable Meta-Patterns](#33-reusable-meta-patterns-new-2026-05-05--derived-from-coverage-audit)
+34. [VisionSensor + Multi-modal Subsystem](#34-visionsensor--multi-modal-subsystem-new-2026-05-05--anchored-from-claudemd)
+35. [Open Strategic Moves Registry](#35-open-strategic-moves-registry-new-2026-05-05--consolidates-2863--294-scattered-moves)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -310,14 +314,14 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
 - [x] **P10.2 — yaml v2 schema + dual-reader** SHIPPED (audited 2026-05-05; landed earlier under Phase 12 Slice E coordination): `provider_topology.SCHEMA_VERSION_V2 = "topology.2"` + frozen `RouteEntryV2` + `Topology.from_v2()` classmethod + brain_selection_policy.yaml is on `topology.2`. Backward-compatible v1 reader retained until Slice 5 purge.
 - [x] **P10.3 — `candidate_generator.py` consumer wiring** SHIPPED (audited 2026-05-05): `candidate_generator.py:1703-1762` AsyncTopologySentinel gate behind `JARVIS_TOPOLOGY_SENTINEL_ENABLED` with `preflight_check()` + `_dispatch_via_sentinel` walk. BG/SPEC `fallback_tolerance="queue"` enforced at routing layer per `project_bg_spec_sealed.md` contract.
 - [x] **P10.4 — Live-exception failure ingest** SHIPPED (audited 2026-05-05): `candidate_generator.py:2482/2494/2514/2524` wires `sentinel.report_failure(model_id, FailureSource.LIVE_STREAM_STALL, detail)` at 4 DW failure sites (exceeded the PRD-anticipated 3).
-- [ ] **P10.4 — Live-exception failure ingest** at existing DW failure sites (`candidate_generator.py:1662-1667 / 1674-1687 / 2200-2213`); `sentinel.report_failure(model_id, FailureSource.LIVE_STREAM_STALL, detail)` weight 3.0 trips faster than probe-only.
+- [x] **P10.4 — Live-exception failure ingest** ✅ **MERGED — audit-confirmed 2026-05-05**: `candidate_generator.py:2482/2494/2514/2524` wires `sentinel.report_failure(model_id, FailureSource.LIVE_STREAM_STALL, detail)` at FOUR DW failure sites (exceeded the PRD-anticipated 3); weight 3.0 trips faster than probe-only.
 - [ ] **P10.5 — THE PURGE** (operator-authorized after 3 forced-clean once-proofs of Slices 3-4 — gated structurally by `phase10_graduation_contract` harness pinned 2026-05-05): delete static `dw_allowed: false` lines + read-only Nervous System Reflex carve-out at `candidate_generator.py:2062-2067` + v1 dual-reader + `JARVIS_BACKGROUND_ALLOW_FALLBACK` / `FORCE_CLAUDE_BACKGROUND` env shortcuts. Flip `JARVIS_TOPOLOGY_SENTINEL_ENABLED` default `false` → `true`.
 - [ ] **P10.6 — 24h soak + cost-per-op trending validation**: post-Phase-10 target ≥30% of GENERATE cost on DW providers + ≥50% reduction in $/op median.
 
 **Phase 11 — ASCO Arcs (M9 + M10 + M11 + M12)** *(NEW 2026-05-04 — derived from §30 ASCO Mapping)*: status — **NOT STARTED, post-Priority-#3 in §29.7 sequencing**. Closes ASCO axes 1 (intrinsic motivation), 2 (weak ontogeny), 3 (in-context embodiment), and (conditional) 4 (in-weight learning).
-- [ ] **M9 — `CuriosityGradient`** (~5 slices, ~5–7 days): closes intrinsic-motivation axis. Reuses `prophecy_engine.py` (402 LOC) + `verification/confidence_capture.py` + `verification/confidence_monitor.py` (788 LOC) + `sensor_governor.py` + `semantic_index.py`. Pure substrate, zero LLM cost on hot path. Master flag `JARVIS_CURIOSITY_GRADIENT_ENABLED` default-false → graduation. **Sequenced second** per §30.10.
-- [ ] **M10 — `ArchitectureProposer`** (~5 slices, ~7–10 days): closes weak-form ontogeny axis. Reuses `intake/sensors/capability_gap_sensor.py` + `intake/sensors/opportunity_miner_sensor.py` + `verification/generative_quorum.py` + `verification/coherence_auditor.py` + `governance/orange_pr_reviewer.py`. STANDARD-route Quorum K=3 mandatory; cost ≤$0.075/day capped. Master flag `JARVIS_ARCH_PROPOSER_ENABLED` **stays default-false in production** until 30+ proposal-acceptance audit. **Sequenced third** (highest risk).
-- [ ] **M11 — `ActionOutcomeMemory`** (~5 slices, ~5–7 days): closes in-context embodiment axis. Reuses `op_context.py:834` `session_lessons` + `governance/postmortem_recall.py` + `semantic_index.py` + `governance/user_preference_memory.py` + `consciousness/memory_engine.py` (680 LOC) + `governance/conversation_bridge.py`. Zero LLM cost on retrieval hot path; +≤4KB to GENERATE prompt amortized by Anthropic prompt cache. Master flag `JARVIS_ACTION_OUTCOME_MEMORY_ENABLED` default-true at graduation. **Sequenced first** per §30.10 (highest immediate quality lift, lowest risk).
+- [x] **M9 — `CuriosityGradient`** ✅ **CLOSED 2026-05-04** — full 5-slice arc graduated default-TRUE same-day (`JARVIS_CURIOSITY_GRADIENT_ENABLED=true`); 217/217 tests; per-cluster prediction-error scoring (3-source aggregator: logprob entropy + Prophecy error + postmortem recurrence); 3 sensors curiosity-aware (OpportunityMiner / ProactiveExploration / CapabilityGap); bounded multiplier `[0.5, 2.0]` structurally cannot bypass global cap; 5 AST pins + 6 FlagRegistry seeds. Closes intrinsic-motivation axis structurally.
+- [x] **M10 — `ArchitectureProposer`** ✅ **CLOSED 2026-05-04** — full 5-slice arc graduated same-day; 173/173 tests; primitives + UnhandledPatternMiner + ProposalSynthesizer + ProposalLifecycleOrchestrator + Slice 5 graduation surfaces (proposal_store / observability HTTP / `/m10` REPL / `m10_proposal_emitted` SSE / 8 AST pins / 5 FlagRegistry seeds). **Master flag `JARVIS_M10_ARCH_PROPOSER_ENABLED` STAYS default-FALSE per §30.5.2 operator binding** (does NOT graduate default-true until 30+ proposal-acceptance audit — substrate enforced via `m10_master_flag_stays_default_false` AST pin). Closes weak-form ontogeny axis structurally.
+- [x] **M11 — `ActionOutcomeMemory`** ✅ **CLOSED 2026-05-04** — full 5-slice arc graduated default-TRUE same-day (`JARVIS_ACTION_OUTCOME_MEMORY_ENABLED=true`); ~72 tests; symmetric positive-evidence pair to U3 Failure-Mode Memory; OutcomeKind 5-value closed enum; outcome-polarity scoring (`balanced`/`favor_positive`/`all_equal`); shared `_scoring_primitives.py` extracted (zero duplication with M9 / U3); 4 AST pins + 5 FlagRegistry seeds. Closes in-context embodiment axis structurally.
 - [ ] **M12 — `JPrimeLoRA`** (long-horizon, 6–12 month, **operator-gated**): closes in-weight lifelong-learning axis (only viable on J-Prime — Claude/DW are inference-only). Requires data curation pipeline + GCP training harness + eval harness + route gating. Conditional on operator priority decision per §30.6.
 - [ ] **CLI ports** (parallel-executable, ~2–3 days total): `PrincipleManifest` (typed manifesto into StrategicDirection injection) + `SerpentFlowSnapshotter` (ANSI-stripped render snapshot to `.jarvis/sessions/<id>/render_snapshot.txt` for forensic inspection) + `CLIStyleGuide.md` (one-screen design rules lifted from `RenderConductor` closed taxonomies). Per §30.8.1.
 
@@ -326,9 +330,9 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
 **Phase 11 NOT-WORTH-BUILDING (honest list per §30.7)**: strong-form ontogeny via NAS over the FSM (would compromise auditable-topology property we want); real embodiment via humanoid robot (out of scope); curiosity gradient requiring provider retraining (provider-gated); autonomous PR-merging on architecture proposals (cost-of-being-wrong asymmetric); in-weight learning for Claude/DW (provider-gated); continuous online RL (provider-gated + reward-hacking risk).
 
 **Phase 12 — Systemic Upgrades v3 (Bounded Epistemic Loop + DecisionRecord Causality Graph + Failure-Mode Memory)** *(NEW 2026-05-04 — derived from §31)*: status — **NOT STARTED, sequenced per §31.6 interleaved with Phase 11**. Closes per-op information adequacy + cross-session decision reproducibility + cross-op pattern accumulation loops respectively.
-- [ ] **U1 — Bounded Epistemic Loop** (~5 slices, ~6–8 days): per-op information budget enforced at every Venom tool round. Auto-engage `PROBE_ENVIRONMENT` on confidence drop; auto-escalate to `NOTIFY_APPLY` on budget exhaustion without convergence. Reuses `verification/confidence_monitor.py` (788 LOC) + `verification/confidence_probe_runner.py` + `verification/confidence_probe_bridge.py` + `verification/probe_environment_executor.py` + `adaptation/hypothesis_probe.py` + `verification/speculative_branch*` + `risk_tier_floor.py` + `tool_executor.py`. Hard cost cap ≤20 LLM calls/op worst-case; BG/SPEC routes refused at gate. Master flag `JARVIS_EPISTEMIC_BUDGET_ENABLED` default-false → graduation. **Sequenced 5th** per §31.6 (after Failure-Mode Memory + ActionOutcomeMemory ground the substrate).
-- [ ] **U2 — DecisionRecord Causality Graph** (~5 slices, ~7–9 days): append-only `decisions.jsonl` per session at 8 known decision sites; nightly determinism replay via `scripts/replay_determinism.py --session <id>` asserts byte-equal output for same inputs. Reuses `determinism/decision_runtime.py` + `determinism/phase_capture.py` + `auto_action_router.py` + `verification/coherence_window_store.py` (flock pattern) + `adaptation/_file_lock.py`. Pure substrate; zero LLM. **Sequenced 7th** per §31.6 — foundation for safe RSI; precedes M10 ArchitectureProposer.
-- [ ] **U3 — Failure-Mode Memory at GENERATE-prompt-construction** (~5 slices, ~5–7 days): post-VERIFY-failed extractor derives `(situation_signature, failure_mode, mitigation)` triplet (pure stdlib + ast — no LLM); retriever surfaces matching prior failures into first-attempt GENERATE prompt via `StrategicDirection` injection. Symmetric negative-evidence pair to §30 M11 ActionOutcomeMemory's positive-evidence triplets. Reuses `adaptive_learning.py` + `governance/postmortem_recall.py` + `governance/strategic_direction.py` + `governance/semantic_index.py` + `governance/conversation_bridge.py` + `adaptation/_file_lock.py`. Min weight=2 (signature must recur ≥2× in 30d) before first-attempt injection. Master flag `JARVIS_FAILURE_MODE_MEMORY_ENABLED` default-true at graduation. **Sequenced 3rd** per §31.6 (highest immediate quality lift on the recurrence-degradation loop).
+- [x] **U1 — Bounded Epistemic Loop** ✅ **CLOSED 2026-05-04** — full 5-slice glue arc graduated default-TRUE (`JARVIS_EPISTEMIC_BUDGET_ENABLED=true`); 172/172 tests; composes ConfidenceMonitor + ConfidenceProbeRunner + HypothesisProbe + SpeculativeBranchTree + RiskTierFloor + tool_executor through one authoritative per-op budget. `tool_executor.run()` extended with `per_round_observer` parameter; Claude+DW providers wired via lazy-import bridge with `attach_to_provider_run()` + `close_op()` finally; `EVENT_TYPE_BUDGET_ACTION_TAKEN` SSE; `/budget` REPL + `GET /observability/budget[/{op_id}]`; cost-gated routes (BG/SPEC) refuse PROBE/SBT structurally; 4 AST pins + 5 FlagRegistry seeds.
+- [x] **U2 — DecisionRecord Causality Graph** ✅ **CLOSED 2026-05-04** — full 5-slice arc graduated default-TRUE (`JARVIS_DETERMINISM_REPLAY_ENABLED=true`); 124/124 tests; substrate audit found Phase 1 Slice 1.4 + Priority 2 Slices 1-6 had already shipped 70% of infra (DecisionRuntime + JSONL flock'd ledger + CausalityDAG + 4 phase-boundary instrumentation); U2 graduated the **replay-as-determinism-test surface** + observability + SSE on top: `DecisionKind` 12-value closed-taxonomy enum + `replay_determinism.py` primitive + `scripts/replay_determinism.py` thin launcher + 5-value `ReplayDriftKind` + `decisions_observability.py` HTTP + `/decisions` REPL + `EVENT_TYPE_DECISION_DRIFT_DETECTED` SSE + 4 AST pins + 4 FlagRegistry seeds. **Foundation for safe RSI now in place.**
+- [x] **U3 — Failure-Mode Memory at GENERATE-prompt-construction** ✅ **CLOSED 2026-05-04** — full 5-slice arc graduated default-TRUE (`JARVIS_FAILURE_MODE_MEMORY_ENABLED=true`); per-cluster JSONL + recall scoring + injection at GENERATE; symmetric negative-evidence pair to M11 ActionOutcomeMemory's positive-evidence triplets; 4 AST pins + 5 FlagRegistry seeds. Closes recurrence-degradation loop structurally.
 
 **Phase 12 ANTI-GOALS (per §31.7)**: U1 does NOT solve cross-op degradation or non-determinism. U2 does NOT prevent bad decisions — it records them. U3 does NOT solve novel failures (the first time you fail at something, no memory exists).
 
@@ -343,12 +347,13 @@ Per-slice status. `[x]` = landed on main; `[~]` = in-flight on a branch / open P
 **Phase 13 NOT-WORTH-PORTING (honest list per §32.6.6 + §32.7.4)**: Agent SDK `@tool()` decorator (operator decision; Venom mature), `ClaudeSDKClient` multi-turn class (Venom already does multi-turn), `query()` one-off helper (O+V is autonomous-substrate not interactive-CLI), `McpServerConfig` registration helpers (O+V already supports MCP via `mcp_tool_client.py`), streaming response builder (O+V has `stream_renderer.py` composing with `RenderConductor`), extended thinking config sugar (already configured via `JARVIS_THINKING_BUDGET_*`), session listing/tagging APIs (O+V has session JSONLs + `LastSessionSummary`), Dynamic Skill `!\`command\`` context injection (25–50ms hot-path latency cost; O+V's CONTEXT_EXPANSION is async-by-design), Subagent skills manifest preload (Phase B subagents are fork-bound), settings precedence hierarchy with managed policy (Trinity deployment doesn't have managed-settings-server paradigm), plugin namespace isolation + marketplace distribution (orthogonal infrastructure; revisit post-graduation), `/help` REPL discoverability extensions (already have `help_dispatcher.py`).
 
 **Phase 14 — `graduation_orchestrator.py` Cleanup Arc** *(NEW 2026-05-04 — derived from §32.5)*: status — **NOT STARTED, sequenced as item #9 in §32.8 — lands immediately after M10 (item #8) graduates default-true post-30+ proposal-acceptance audit**. Closes the dead-code orphan honestly, with provenance preserved.
-- [ ] **Move `graduation_orchestrator.py` to `archive/legacy/graduation_orchestrator_2026_04_06.py`** (preservable for historical reference; not deleted outright — design ancestor)
-- [ ] **Delete `tests/governance/test_graduation_orchestrator.py`** (301 lines; tests apply to archived code)
-- [ ] **Close TODO at `jarvis_intelligence.py:447`** by replacing `capabilities_graduated=0` with read from M10's `M10ProposalRecord` ledger
-- [ ] **Add archive note to `archive/legacy/README.md`** explaining the salvage history (M10 inherited the 15-phase FSM + Bayesian AdaptiveThreshold + H1–H6 hardening + 5-layer validation pipeline design)
-- [ ] **Add AST pin `graduation_orchestrator_archived_only`** in `shipped_code_invariants` asserting the module is NOT importable from production code (`backend/core/ouroboros/`, `backend/neural_mesh/`)
-- [ ] **PRD §32.5.2 update** with completion date + commit SHA
+- [x] **Move `graduation_orchestrator.py` to `archive/legacy/graduation_orchestrator_2026_04_06.py`** ✅ 2026-05-04 (`git mv` preserved blame; companion `graduation_tracker.py` archived alongside — discovered as zero-importer orphan during investigation)
+- [x] **Delete `tests/governance/test_graduation_orchestrator.py`** ✅ 2026-05-04 (moved to `archive/legacy/test_graduation_orchestrator_2026_04_06.py`)
+- [x] **Close TODO at `jarvis_intelligence.py:447`** ✅ Pre-§32.5 (audit confirmed already replaced with `FlagRegistry.SEED_SPECS` default-true bool count); structurally pinned by `test_jarvis_intelligence_todo_closed`
+- [x] **Add archive note to `archive/legacy/README.md`** ✅ 2026-05-04 (full design-lineage doc covering M10 inheritance + Reverse-Russian-Doll lineage)
+- [x] **Add AST pin `graduation_orchestrator_archived_only`** ✅ 2026-05-04 (registered in `cleanup_invariants.py` auto-discovered via `register_shipped_invariants` — actually 4 pins per critical-path file: harness / runtime_task_orchestrator / governed_loop_service / sentinel-archive-integrity, plus 3 module_discovery-consumer pins + 6 observability + 1 repl-registry = 14 total pins in cleanup_invariants)
+- [x] **PRD §32.5.2 update** ✅ 2026-05-04 (cleanup status block fully refreshed; deeper-than-planned cleanup documented — dead boot wiring excised from harness.py / runtime_task_orchestrator.py / governed_loop_service.py because the orchestrator was structurally unreachable in production via the always-None `_graduation_tracker` gate)
+- [x] **§32.11 Slice 5b consolidation arc** ✅ 2026-05-05 (FULLY CLOSED; full 5-slice arc: cleanup + module_discovery substrate + observability route auto-mount + REPL dispatch auto-discovery + graduation regression. ~1,860 LOC + 130 tests + 14 AST pins + 3 master flags + 5 consumer-modules-delegate refactors; 479/479 across full sweep)
 
 **CC2 follow-ups (CLI parity)** *(landed 2026-05-04 — same-day as §30 addition)*: `ClaudeStyleTransport` Protocol-conformant (`name`/`notify`/`flush`/`shutdown`); ACTIVE_OP + TASK_LIST `StatusField` extension (9→11 members, AST-pinned); FILE_REF event handler renders `Update(<path>:<line>)` + N-added/M-removed + 5-line color-coded diff preview (matches CC's tool-call idiom); multi-line REPL prompt with cwd/mode/posture context + operator override via `JARVIS_PROMPT_TEMPLATE`; new AST pin `serpent_flow_repl_prompt_helper_present` (37→38 invariants); 35 new regression pins in `tests/governance/test_cc2_followups.py`; 1562/1562 governance sweep green.
 
@@ -5032,9 +5037,11 @@ After auditing the PRD post-Upgrade-2 closure, **5 phases scoped in §9 were mis
 
 #### Phases NOT yet started — added to §32.8 v4 sequencing
 
+> **2026-05-05 audit refresh**: this section's title was authored 2026-05-04 before the Phase 9 substrate audit. **Phase 9 substrate IS complete** (landed 2026-04-27); only the empirical cadence is pending. **Phase 10 Slices 1-4 substrate IS complete** (landed via Phase 12 Slice E coordination earlier). **Phase 6** is the only Phase entry truly "not started" in this section. The table below has been updated to reflect this.
+
 | Order | Item | Effort | Reason |
 |---|---|---|---|
-| **12** | **Phase 9 — Live-Fire Graduation Cadence** | ~2,150 LOC + ~270 tests + 100 adversarial corpus entries; 4–6 weeks | **EXPLICITLY MARKED "THE CRITICAL BLOCKER for A-level RSI"** by PRD §9. Cron-driven daily soak runner across 12+ default-false flags × 3 sessions = 36+ minimum sessions. Closes the substrate-vs-execution gap. |
+| **12** | **Phase 9 — Live-Fire Graduation Cadence** | ~2,150 LOC + ~270 tests + 100 adversarial corpus entries; **substrate ✅ STRUCTURALLY COMPLETE 2026-04-27**; **empirical cadence pending operator-paced cron accumulation** | Substrate audit (2026-05-05): `live_fire_soak.py` + `graduation/graduation_contract.py` + `adversarial_cage.py` + `cross_session_coherence.py` + `phase8_producers.py` + cron installer all on disk. What's pending is the **empirical 12+ flag × 3-clean-session cadence**, not the substrate. PRD §32.8.1 v4 supplement (added 2026-05-04) said "NOT STARTED — CRITICAL BLOCKER" but was authored 7 days after Phase 9 substrate landed; corrected here. Critical-path significance preserved: until the 12+ flags accumulate clean evidence, the empirical floor stays A−. Gating pattern: each flag's flip is structurally enforced by a `phase10_graduation_contract`-style harness (see §33). |
 | **13** | **Phase 10 (Slice 5 substrate + Slices 5/6 empirical) — Provider Strategy + TopologySentinel finishing** | ~50 LOC of deletions + regression pins + graduation-contract harness; ~3-7 days operator-paced empirical | **Slices 1-4 substrate ALL SHIPPED** (audited 2026-05-05; PRD §32.8.1 v4 supplement was stale): Slice 1 PR #25504, Slice 2 `provider_topology.SCHEMA_VERSION_V2` + `RouteEntryV2` + `Topology.from_v2()`, Slice 3 `candidate_generator.py:1703-1762` AsyncTopologySentinel gate with `preflight_check` + `_dispatch_via_sentinel` walk, Slice 4 `candidate_generator.py:2482/2494/2514/2524` `sentinel.report_failure(FailureSource.LIVE_STREAM_STALL)` at 4 sites (PRD said 3 — exceeded). What's PENDING: Slice 5 substrate (delete `dw_allowed: false` + `block_mode:` from yaml; migrate readers to topology.2-only methods; ~50 LOC deletion) + 3 forced-clean once-proofs (operator-paced empirical) + master flag flip + Slice 6 24h soak. Phase 10 graduation-contract harness pinned 2026-05-05 to gate the master-flag flip on structural evidence ladder. |
 | **14** | **Phase 6 — Self-Modeling (`SelfNarrativeService`)** | ~1,500 LOC + 50 tests; 1–2 weeks | Long-horizon. Weekly cron consumes prior week's POSTMORTEM ledger + commits + metrics → 1-page self-narrative. Auto-PR'd. Gated by Phase 9 closure (per §9 Phase 6 note). |
 
@@ -5124,6 +5131,207 @@ Post-arc state: future Slice 5 arcs ship the canonical filename + register-funct
 #### 32.11.4 Reverse Russian Doll alignment
 
 This arc is the **immune system scaling structurally with the spawning core**: the four registries (module_discovery / observability_route / repl_dispatch / cleanup_invariants) form the connective tissue between the Builder (O+V) and the Constraint (Antivenom). Every future ASM arc that spawns a new surface inherits the discipline by naming convention; every drift attempt fails an AST pin before reaching production.
+
+---
+
+## 33. Reusable Meta-Patterns *(NEW 2026-05-05 — derived from coverage audit)*
+
+The arcs documented across §29–§32 produced four reusable architectural disciplines that apply to **every future graduation arc, every future Slice 5 surface, every future cross-process state store, every future producer-bridge wiring**. This section catalogs them as canonical patterns so future operators inherit the discipline by reference, not by re-derivation. Each pattern below is **already in production** at the listed file paths — this is documentation of crystallized practice, not new design.
+
+### 33.1 Graduation Contract Pattern
+
+**Shape**: a master flag stays default-false until a structured-evidence predicate reports `READY_FOR_<purge|flip|ship>`; the predicate reads runtime artifacts (JSONL ledgers, session debug.logs, telemetry stores); an AST pin asserts the master flag default stays false until the predicate is structurally verified by tests.
+
+**Why this exists**: operator bindings ("flip the flag only after 3 forced-clean sessions") historically lived in markdown checklists. Markdown is not enforced — a future PR could flip the default and merge before evidence exists. The graduation-contract pattern moves the binding into:
+1. A `<verb>_<feature>_contract.py` substrate module exposing `is_ready_for_<verb>() -> ContractVerdict` with a closed-enum verdict taxonomy
+2. An AST pin asserting the master flag default stays false until the synthetic-test of the pin reports the predicate green
+3. Frozen `<Verb>Report` + `SessionEvidence` (or per-target equivalent) for structured telemetry
+
+**Reference implementations**:
+- `backend/core/ouroboros/governance/phase10_graduation_contract.py` (PRD §32.8.1, 2026-05-05) — Phase 10 master flag flip gated on 3 forced-clean once-proofs
+- `backend/core/ouroboros/governance/graduation/graduation_contract.py` (PRD §9 Phase 9, 2026-04-27) — per-flag contract registry for the 12+ Phase 9 graduation cadence
+- `backend/core/ouroboros/governance/m10/__init__.py::register_shipped_invariants` AST pin `m10_master_flag_stays_default_false` (PRD §32.4, 2026-05-04) — operator binding "30+ proposal-acceptance audit before default-true"
+- `backend/core/ouroboros/governance/cleanup_invariants.py` `topology_sentinel_master_flag_stays_default_false` (PRD §32.5, 2026-05-05)
+
+**Future arcs that inherit this pattern**:
+- Phase 9's 12+ flag flips (each flag flip gated by a graduation contract instance)
+- M12 JPrimeLoRA gate (LoRA training quality predicate)
+- Any future `JARVIS_<X>_ENABLED` master flag whose default-true requires accumulated empirical evidence
+
+**Anti-pattern this replaces**: markdown checklist + human attestation ("operator confirmed 3 sessions ran clean"). Without this pattern, a default-true flip can ship via PR review; with this pattern, the AST pin fires at CI before the flip can merge.
+
+### 33.2 Producer-Bridge Pattern (Lazy-Import Signal Wiring)
+
+**Shape**: when arc A wants to feed signals into arc B's substrate (e.g., M9 CuriosityCollector consuming POSTMORTEM_RECURRENCE signals from CoherenceAuditor), neither arc imports the other directly. Both import a thin "bridge" module (`<consumer>_producer_bridge.py`) that exposes 1–N entry-point functions like `feed_<signal_name>(...)`. The bridge module imports the consumer lazily inside each entry-point so the signal producer pays no module-load cost when the consumer is disabled.
+
+**Why this exists**:
+- Cross-arc imports create circular-dependency risk + fragile boot order
+- Consumer arcs can be master-flag-disabled at runtime; lazy-import means the producer's hot path is unaffected when the consumer is off
+- The bridge is the SINGLE auditable surface of cross-arc signal flow — operators grep one file to map producer→consumer relationships
+
+**Reference implementations**:
+- `backend/core/ouroboros/governance/curiosity_producer_bridge.py` (M9, 2026-05-04) — 3 entry points: `feed_logprob_entropy` / `feed_prophecy_error` / `feed_recurrence_drift`
+- `backend/core/ouroboros/governance/observability/phase8_producers.py` (Phase 8 producer-wiring layer, 2026-04-27) — wires orchestrator phase boundaries → decision_trace_ledger / latent_confidence_ring / latency_slo_detector
+- `backend/core/ouroboros/governance/verification/confidence_probe_bridge.py` (Move 5 / Upgrade 1, 2026-05-01)
+- `backend/core/ouroboros/governance/coherence_window_store.py` recurrence-drift producer site
+
+**Anti-pattern this replaces**: direct cross-arc imports + producer-side conditional flag checks (`if curiosity_enabled(): from curiosity_collector import …`). The bridge isolates both concerns: producer always calls `bridge.feed_<signal>()`; bridge handles "is consumer alive" check internally; producer never imports consumer.
+
+### 33.3 Slice 5b Naming-Convention Cage
+
+**Shape**: future Slice 5 graduation arcs ship surfaces (HTTP routes / REPL verbs / observability routers) that auto-mount via the Slice 5b consolidation arc registries. The **filename + module-level-function naming convention IS the cage**:
+- Files named `*_observability.py` MUST expose module-level `register_routes(app, *, rate_limit_check=None, cors_headers=None) -> None`
+- Files named `*_repl.py` MUST expose module-level `dispatch_<basename>_command(line: str) -> SomeDispatchResult` where `SomeDispatchResult` has `.matched: bool / .ok: bool / .text: str` attributes
+- Sub-package `<sub>/repl.py` exposes `dispatch_<sub>_command(line: str)` (verb name from sub-package)
+- AST pins enforce the naming convention per-module; signature validation rejects off-shape symbols at registry priming time
+
+**Why this exists**: pre-Slice-5b, every new HTTP route or REPL verb required manual edits to `event_channel.py` + `serpent_flow.py`. The wiring step was routinely deferred ("Slice 5b" debt) and accumulated as dormant surfaces. The convention cage closes the debt class **by construction** — wiring is automatic at boot via the Slice 2 module_discovery primitive walking the curated provider packages.
+
+**Reference implementations**:
+- `backend/core/ouroboros/governance/observability_route_registry.py` (PRD §32.11 Slice 3, 2026-05-04)
+- `backend/core/ouroboros/battle_test/repl_dispatch_registry.py` (PRD §32.11 Slice 4, 2026-05-04)
+- AST pins: `observability_module_exposes_register_routes_<arc>` (5 instances) + `cleanup_invariants.py::_validate_observability_module_exposes_register_routes`
+
+**Future arcs that inherit this**:
+- Phase 10 Slice 5 + Slice 6 surfaces (cost-trending observability route, etc.)
+- Phase 9 graduation observability route(s)
+- Any future ASM arc shipping a `*_observability.py` or `*_repl.py` file
+
+**Anti-pattern this replaces**: each Slice 5 arc ending with "Slice 5b: wire into event_channel + serpent_flow" as a deferred TODO. With the convention cage, "Slice 5b" is automatically zero-edit if naming is followed.
+
+### 33.4 Per-Cluster `flock`'d JSONL Persistence
+
+**Shape**: every per-arc store that writes session-spanning state (recall ledgers, audit trails, evidence rings) uses `cross_process_jsonl.flock_critical_section` + `flock_append_line` from a single canonical primitive (`cross_process_jsonl.py`). No new flock implementations; no `with open(... 'a')` raw appends; no parallel locking machinery.
+
+**Why this exists**: §28.5.1 v9 brutal review identified `auto_action_router.py:1110` cross-process append-corruption as the worst latent data-loss path in the system. Tier 1 #3 closed it via the canonical primitive (PRD §29.1 / 2026-05-04). The pattern is now load-bearing across 5+ stores; centralizing the primitive means future stores never re-invoke the corruption pathway.
+
+**Reference implementations** (5+ consumers):
+- `backend/core/ouroboros/governance/cross_process_jsonl.py` (canonical primitive, 2026-05-04 Tier 1 #3)
+- `failure_mode_memory.py` per-cluster JSONL (Upgrade 3)
+- `action_outcome_memory.py` per-cluster JSONL (M11)
+- `curiosity_collector.py` per-cluster JSONL (M9)
+- `decision_runtime.py` `decisions.jsonl` (Upgrade 2)
+- `coherence_window_store.py` audit ledger
+- `topology_sentinel.py` history JSONL
+- `m10/proposal_store.py` (M10)
+- `auto_action_router.py` (Tier 1 #3 migration target)
+
+**Future arcs that inherit this**:
+- Any future ASM arc needing append-only session-spanning persistence
+- Phase 9's per-flag graduation evidence ledgers
+- M12's training-data curation logs (when scoped)
+
+**Anti-pattern this replaces**: ad-hoc `open(path, 'a')` appends across multiple processes producing torn writes during concurrent fanout (the §28.5.1 "concrete data-loss path" finding).
+
+### 33.5 Pattern composition — how the four interact
+
+| Producer arc | Naming cage | Persistence primitive | Graduation contract |
+|---|---|---|---|
+| M9 CuriosityGradient | `curiosity_observability.py` + `curiosity_repl.py` | per-cluster flock'd JSONL | default-true graduated 2026-05-04 (no contract needed) |
+| M10 ArchitectureProposer | `m10/observability.py` + `m10/repl.py` | `m10/proposal_store.py` flock'd | `m10_master_flag_stays_default_false` AST pin (operator binding 30+ proposals) |
+| Phase 10 Topology | `observability_route_registry` includes `topology_sentinel` lookups indirectly | `topology_sentinel_history.jsonl` flock'd | `phase10_graduation_contract.py` 3-clean-session predicate |
+| Phase 9 cadence (pending) | per-flag `<feature>_observability.py` (zero-edit auto-mount) | `live_fire_graduation_history.jsonl` flock'd | `graduation/graduation_contract.py` per-flag predicate ×12 |
+
+**The Reverse Russian Doll discipline made explicit**: each pattern above is a layer of the immune system that scales structurally with the spawning core. The Builder (O+V) creates new arcs; the Constraint (Antivenom) inherits the discipline by naming + AST pin enforcement, not by per-arc human effort. Every new layer the inner doll carves outward inherits all four patterns automatically.
+
+---
+
+## 34. VisionSensor + Multi-modal Subsystem *(NEW 2026-05-05 — anchored from CLAUDE.md)*
+
+The VisionSensor + Multi-modal ingest + Visual VERIFY subsystems landed in production (per CLAUDE.md) without dedicated PRD §X anchoring. This section closes the documentation gap so future Phase 9 cadence + M10 proposal vectors + brutal-review audits can reference this work as a tracked capability rather than implicit substrate.
+
+### 34.1 VisionSensor
+
+**Module**: `backend/core/ouroboros/governance/intake/sensors/vision_sensor.py`
+
+**Status**: ✅ shipped + master-flag-gated
+
+**What it does**: Read-only Ferrari-frame consumer that adds a 17th autonomous sensor to the 16-sensor intake pipeline. Hot-path cascade: `dhash dedup → app denylist → OCR → credential-regex → Tier 1 regex → cooldown → Tier 2 VLM (Qwen3-VL-235B) → sanitize → schema v1 envelope`.
+
+**Policy invariants**:
+- 20-op false-positive budget triggers auto-pause
+- 120s finding cooldown
+- Chain cap 1→3 fan-out
+- Cost ledger: $1 daily cap, 3-step cascade
+- **Structural invariants**:
+  - `no-capture-authority` (AST-enforced — VisionSensor cannot emit operations directly; only IntentSignal envelopes)
+  - `export-ban on ctx.attachments` (sensor cannot export raw frame data downstream)
+  - `NOTIFY_APPLY` risk floor (every VisionSensor-originated op forces APPROVAL_REQUIRED minimum)
+
+### 34.2 Multi-modal ingest path
+
+**Modules**: `backend/core/ouroboros/governance/providers.py::_serialize_attachments` + `unified_intake_router` hoist + `Attachment(kind=...)` schema
+
+**Status**: ✅ shipped + master-flag-gated (`JARVIS_GENERATE_ATTACHMENTS_ENABLED`)
+
+**What it does**: Two paths converge at `unified_intake_router`:
+1. **Autonomous** — VisionSensor emits `IntentSignal` with `Attachment(kind=image)` payload
+2. **Human-initiated** — SerpentFlow `/attach` REPL verb captures operator file paths
+
+`_serialize_attachments` emits native Claude image/document blocks OR OpenAI-compat `image_url` blocks for DW. Validates: path + extension + mime + 10MiB cap + sha256[:8] hash. **BG/SPEC routes strip attachments structurally** — multi-modal Ferrari frames never reach background ops (cost contract preservation).
+
+### 34.3 Visual VERIFY
+
+**Module**: `backend/core/ouroboros/governance/visual_verify.py` (Slices 3-4)
+
+**Status**: ✅ shipped + master-flag-gated
+
+**What it does**: Post-APPLY pre-COMPLETE UI check using a 3-tier trigger ladder:
+1. `target_files` glob match
+2. Plan `ui_affected` flag
+3. Risk-tier-based fallback
+
+**Deterministic battery (first-miss-wins)**: app_crashed → blank_screen → hash_unchanged → hash_scrambled. **TestRunner-red clamps a pass to fail (asymmetric)** — visual evidence cannot override regression-test failure.
+
+**Model-assisted advisory**: optional VLM via injectable adapter + `AdvisoryLedger` records (verdict + reasoning_hash only — no raw frame data). **Auto-demotion at ≥50% post-graduation FP** — if the advisory accuracy degrades, the substrate auto-disables the model-assisted layer and reverts to deterministic-only.
+
+### 34.4 Why this section exists
+
+CLAUDE.md describes these capabilities as substantive subsystems with master flags + structural invariants + cost ledgers + auto-demotion logic. Pre-§34 the PRD only mentioned VisionSensor in §3.7 provider-strategy tables (a passing reference). Phase 9 cadence + future graduation arcs need a §X anchor for:
+- Tracking VisionSensor's master flag in the Phase 9 12+ flag flip cadence
+- Documenting the no-capture-authority AST pin as part of §33.3 naming-cage discipline
+- M10 ArchitectureProposer can propose multi-modal extensions only if §34's authority floor is honored
+
+This section is the anchor. Future audits + brutal reviews reference §34 instead of grepping CLAUDE.md.
+
+---
+
+## 35. Open Strategic Moves Registry *(NEW 2026-05-05 — consolidates §28.6.3 + §29.4 scattered moves)*
+
+Multiple "strategic moves" referenced across §28.6.3 (v9 brutal review) and §29.4 (Post-Priority-#2 brutal review) never received §32 sequencing rows. This registry consolidates them with current status + severity so the next operator picking up critical-path work has one place to look.
+
+| Move | Source | Current Status | Severity | Notes |
+|------|--------|----------------|----------|-------|
+| **Move 6 — Generative Quorum** | §28.6.3 Move 6 | ✅ **CLOSED 2026-05-04** | — | Master `JARVIS_GENERATIVE_QUORUM_ENABLED` graduated default-TRUE Q4 Priority #1; structurally closes test-shape gaming + Quine-class via K-way independent-roll AST signature consensus |
+| **Move 7 — Cross-op Semantic Budget** | §29.4 (line 3964) | 🟡 **NOT SCOPED** — substrate prereqs ready (Priority #1 + #2) | Medium | Long-horizon semantic-stability arc; substrate available since Move 5 closure but no slice plan written. Action: scope arc when Phase 9 closure provides empirical baseline |
+| **Move 8 — GENERAL Subagent LLM Driver** | §28.6.3 Move 8 | ✅ **RECONCILED 2026-05-05** — both descriptions are accurate at different layers: `agentic_general_subagent.py:39` describes the FALLBACK path returning `NOT_IMPLEMENTED_NEEDS_LLM_WIRING` when `JARVIS_GENERAL_LLM_DRIVER_ENABLED=false`; `agentic_general_subagent.py:629-660+` describes the graduated factory wiring `general_driver.run_general_tool_loop` when the flag is true (default-true post 2026-04-20). CLAUDE.md and §28.6.3 are both right; stale framing is in §28.6.3's "currently returns NOT_IMPLEMENTED" wording (true at the time, but NOT_IMPLEMENTED is now only the fallback). | — | No further action; documentation reconciled here |
+| **Move 8 — Proactive Curiosity Loop** | §29.7 (line 4014) | 🟡 **PARTIALLY CLOSED via M9** — M9 CuriosityGradient closes intrinsic-motivation axis structurally but the per-region exploration loop the §29 review framed as "Move 8" is broader | Medium | M9 substrate is the foundation; the broader proactive-curiosity loop (auto-spawn exploration ops on high-curiosity regions without operator nudge) is unscoped. Action: re-evaluate post-M10 default-true |
+| **Move 9 — Test-shape gaming defense** | §28.6.3 Move 9 | 🟡 **PARTIALLY CLOSED via Move 6** — K-way Quorum AST signature divergence catches multi-roll instances; single-roll edge case OPEN per §29.5 | Medium | Single-roll quine-class hallucination is the residual vector. Action: scope as 2-slice arc when Phase 9 cadence empirically validates Move 6 master-on |
+| **Move 10 — Slice 5b /invariant REPL** | §28.6.3 Move 10 | ✅ **SUBSUMED by §32.11** — Slice 5b consolidation arc closed the broader Slice 5b debt class (REPL dispatch auto-discovery includes `/invariant` patterns) | — | Cross-reference now anchored — no further action |
+| **§28.5.1 4-phases-not-extracted (CLASSIFY/APPROVE/APPLY/VERIFY)** | §28.5.1 | 🔴 **STILL OPEN** — no closure tracked | Medium | Wave 2 (5) extraction completed for ROUTE/PLAN/GENERATE/GATE; CLASSIFY/APPROVE/APPLY/VERIFY remain torn-read landmines during flag flips mid-op. Action: scope Wave 3 phase-extraction arc post-Phase-9 |
+| **§28.5.1 invariant_drift_store baseline write race** | §28.5.1 line 3540 | 🔴 **STILL OPEN** — not in §29.1 closures | Medium | Cross-process baseline write race at `invariant_drift_store.py:317-329` not closed by Tier 1 #3 migration. Action: 1-day arc to migrate to `cross_process_jsonl.flock_*` (per §33.4 pattern) |
+| **§3.6.2 vector #6 Default-False Flag Problem** | §3.6.2 | 🔴 **CRITICAL — closes via Phase 9 cadence** | Critical | Phase 9 substrate IS complete; what's pending is the empirical 12+ flag × 3-clean-session accumulation. This is THE critical-path closer per the brutal review |
+| **§3.6.2 vector #7 Quine-shape cage bypass** | §3.6.2 | 🟡 STILL OPEN empirically (Move 6 master default-FALSE so unproven at scale) | High | Substrate close requires Move 6 default-TRUE flip + Phase 9 P9.4 adversarial cage stress test (100-entry corpus achieves 0% pass-through). Action: track as Phase 9 sub-criterion |
+| **§3.6.2 vector #8 Cross-runner artifact contract drift** | §3.6.2 | 🟡 STILL OPEN — no `ArtifactContract` schema-versioning landed | Medium | Latent landmine; Wave 2 hardening item. Action: scope as 1-2 day arc post-Phase-9 |
+| **§3.6.2 vector #9 FlagChangeEvent raw env value leak** | §3.6.2 | 🟡 STILL OPEN — defense-in-depth | Low | Mask-discipline regression sweep not landed. Action: 4-hour audit + sweep arc |
+| **§3.6.2 vector #10 AutoCommitter race on same op_id** | §3.6.2 | 🟡 STILL OPEN — Phase 7.8 flock not extended | Medium | Action: 2-hour migration to `cross_process_jsonl.flock_*` per §33.4 pattern |
+| **§3.6.2 vector #11 CuriosityScheduler wall-clock vs monotonic** | §3.6.2 | 🟡 STILL OPEN — 2-hour fix per §3.6.3 #7 | Low | Same vector class that bit HypothesisProbe pre-Move-5. Action: 2-hour fix |
+| **§3.6.2 vector #12 Provider chain SPOF (no Tier 3)** | §3.6.2 | 🟡 STILL OPEN — operational risk | Medium | Long-horizon; Phase 10 helps for DW availability; full closure is M12 (J-Prime as Tier 3). Action: revisit post-M12 scoping |
+
+### 35.1 Severity legend
+
+- 🔴 **Critical** — blocks A-level RSI per brutal-review framing
+- 🟠 **High** — blocks specific arc graduation (Phase 9, M10 flip, etc.)
+- 🟡 **Medium** — latent landmine; closes via small focused arcs (≤1 day each)
+- 🔵 **Low** — defense-in-depth / hygiene; deferrable
+
+### 35.2 Triage recommendation
+
+**Highest-leverage cluster (closes 5+ items in ≤1 week)**: a focused Wave 3 hygiene arc covering vectors #8, #9, #10, #11 + §28.5.1 invariant_drift_store baseline race (5 items, all `cross_process_jsonl` migration class or 2-hour fixes). Effort ~6-8 hours total. Closes all 🟡-medium open items except CLASSIFY/APPROVE/APPLY/VERIFY phase extraction.
+
+**Critical path remains**: vectors #6 + #7 close via Phase 9 cadence empirical run. Move 7 (Cross-op Semantic Budget) deserves scoping post-Phase-9 closure.
+
+**Status conflict to resolve in next session**: Move 8 (GENERAL LLM driver) — source-grep `agentic_general_subagent.py:39` to determine if CLAUDE.md or §28.6.3 is stale.
 
 ---
 

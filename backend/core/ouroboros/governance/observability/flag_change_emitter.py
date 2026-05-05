@@ -68,6 +68,45 @@ MAX_VALUE_CHARS: int = 4096
 # Prefix that scopes the emitter to JARVIS-relevant flags only.
 TRACKED_PREFIX: str = "JARVIS_"
 
+# Sensitive-value masking patterns (PRD §3.6.2 vector #9 — Wave 3
+# hygiene 2026-05-05). When a flag name matches any of these
+# substrings (case-insensitive), the persisted/projected value is
+# replaced with a sha256 prefix + length so SSE consumers + audit
+# ledgers never see raw secrets. Bytes-pinned: changing this list
+# without updating the regression suite fails the AST authority
+# pin in cleanup_invariants.py.
+_SENSITIVE_NAME_TOKENS: FrozenSet[str] = frozenset({
+    "key", "token", "secret", "password", "passwd",
+    "pwd", "credential", "private", "auth", "session_id",
+})
+
+
+def _is_sensitive_flag(flag_name: str) -> bool:
+    """True iff the flag's name suggests a credential / secret.
+    Case-insensitive substring match against
+    :data:`_SENSITIVE_NAME_TOKENS`."""
+    if not flag_name:
+        return False
+    lowered = flag_name.lower()
+    for token in _SENSITIVE_NAME_TOKENS:
+        if token in lowered:
+            return True
+    return False
+
+
+def _mask_value(value: Optional[str]) -> Optional[str]:
+    """Replace a sensitive value with ``<MASKED:sha256[:8]:len=N>``.
+    None passes through unchanged so add/remove transitions stay
+    distinguishable from set-to-empty."""
+    if value is None:
+        return None
+    try:
+        import hashlib
+        h = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+        return f"<MASKED:{h}:len={len(value)}>"
+    except Exception:  # noqa: BLE001 — defensive
+        return "<MASKED>"
+
 
 def is_emitter_enabled() -> bool:
     """Master flag — ``JARVIS_FLAG_CHANGE_EMITTER_ENABLED``
@@ -103,14 +142,29 @@ class FlagChangeEvent:
         )
 
     def to_dict(self) -> Dict[str, Any]:
+        """Project to dict for SSE / observability ledger
+        emission. Values for credential-shaped flag names are
+        masked via sha256[:8] + length token (PRD §3.6.2 vector
+        #9 — defense-in-depth against accidental secret leak
+        through the audit trail)."""
+        sensitive = _is_sensitive_flag(self.flag_name)
+        prev_v = (
+            _mask_value(self.prev_value)
+            if sensitive else self.prev_value
+        )
+        next_v = (
+            _mask_value(self.next_value)
+            if sensitive else self.next_value
+        )
         return {
             "flag_name": self.flag_name,
-            "prev_value": self.prev_value,
-            "next_value": self.next_value,
+            "prev_value": prev_v,
+            "next_value": next_v,
             "ts_epoch": self.ts_epoch,
             "is_added": self.is_added,
             "is_removed": self.is_removed,
             "is_changed": self.is_changed,
+            "value_masked": sensitive,
         }
 
 

@@ -367,7 +367,8 @@ def _run_with_cache(
 
     Returns (result, cache_hits, cache_misses).
     """
-    started = time.time()
+    # Monotonic — global-timeout elapsed measurement (PRD §3.6.2 #11).
+    started = time.monotonic()
     # Catalog — parse + enumerate or pull from cache.
     sut_hash, cached_mutants = MC.get_catalog(sut_path)
     if cached_mutants is None:
@@ -387,7 +388,7 @@ def _run_with_cache(
     per_to = per_timeout_s()
     global_to = global_timeout_s()
     for idx, m in enumerate(mutants):
-        elapsed = time.time() - started
+        elapsed = time.monotonic() - started
         if elapsed >= global_to:
             logger.warning(
                 "[MutationGate] global timeout reached at mutant %d/%d",
@@ -672,7 +673,8 @@ def prewarm_allowlist(
     warmed: List[str] = []
     failed: List[str] = []
     total_mutants = 0
-    t0 = time.time()
+    # Monotonic — wall-clock-immune elapsed measurement (§3.6.2 #11).
+    t0 = time.monotonic()
     for entry in allowlist:
         abs_path = root / entry
         if not abs_path.is_file():

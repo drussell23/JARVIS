@@ -246,7 +246,7 @@ class RecursiveExplorationAgent:
         Recursive: if a subdirectory has high complexity, spawn a child
         agent to explore it in detail. Depth-limited + memory-guarded.
         """
-        t0 = time.time()
+        t0 = time.monotonic()
 
         # Base exploration
         explorer = ExplorationSubagent(self._root)
@@ -326,7 +326,7 @@ class RecursiveExplorationAgent:
                 except Exception:
                     logger.debug("[RecursiveAgent] Child %s failed", child_id)
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         return RecursiveAgentResult(
             agent_id=self._id,
@@ -423,7 +423,7 @@ class UnlimitedFleetOrchestrator:
         max_agents: int = _MAX_TOTAL_AGENTS,
     ) -> Dict[str, Any]:
         """Deploy unlimited recursive fleet across Trinity repos."""
-        t0 = time.time()
+        t0 = time.monotonic()
 
         # Reset global counter
         async with RecursiveExplorationAgent._total_lock:
@@ -484,7 +484,7 @@ class UnlimitedFleetOrchestrator:
         total_files = self._count_files(all_results)
         all_findings = self._bus.get_all_findings()
 
-        elapsed = time.time() - t0
+        elapsed = time.monotonic() - t0
 
         logger.info(
             "[UnlimitedFleet] %d root agents, %d total (incl children), "

@@ -78,6 +78,56 @@ except ImportError:
 logger = logging.getLogger("Ouroboros.Oracle")
 
 
+# ---------------------------------------------------------------------------
+# Boot-timing phase wrapper — observability only.
+#
+# Sub-instruments TheOracle.initialize() so operators can see where
+# the wall-clock goes (cache_load vs full_index vs semantic_index_init).
+#
+# **Pure observability** — does NOT reorder, parallelize, or alter any
+# init step. The macOS ARM64 libmalloc-safe ordering documented at
+# the existing in-line comments (graph BEFORE Chroma, sync cache load
+# never offloaded to asyncio.to_thread) is preserved verbatim. Wrapping
+# the existing sequential calls only records ``time.monotonic()`` deltas;
+# failure is silent and never raises into the boot path.
+# ---------------------------------------------------------------------------
+
+
+class _OraclePhase:
+    """Defensive boot-timing phase wrapper.
+
+    Lazy-imports :mod:`backend.core.ouroboros.battle_test.boot_timing`
+    so this module stays importable when the timing helper is missing.
+    NEVER raises into the boot path. Pure observability — does not
+    affect ordering or behavior.
+    """
+
+    __slots__ = ("_name", "_timer")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._timer = None
+
+    def __enter__(self) -> "_OraclePhase":
+        try:
+            from backend.core.ouroboros.battle_test.boot_timing import (
+                get_default_timer,
+            )
+            self._timer = get_default_timer()
+            self._timer.begin(self._name)
+        except Exception:  # noqa: BLE001 — defensive
+            self._timer = None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        try:
+            if self._timer is not None:
+                self._timer.end(self._name)
+        except Exception:  # noqa: BLE001
+            pass
+        return False  # never swallow exceptions
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -1367,32 +1417,127 @@ class TheOracle:
         OracleConfig.ORACLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
         # Semantic index — DEFERRED until after graph loading to prevent
-        # concurrent C-extension heap allocation (ChromaDB + pickle).
-        # This avoids libmalloc memory corruption on macOS ARM64.
+        # concurrent C-extension heap allocation (ChromaDB + cache
+        # deserialization). This avoids libmalloc memory corruption on
+        # macOS ARM64.
         self._semantic_index: "OracleSemanticIndex" = None  # type: ignore[assignment]
+
+        # Granular readiness — composed primitive. Lets the harness
+        # spawn ``initialize()`` as a background task while consumers
+        # gate on first-class graph/semantic events instead of polling
+        # ``_running`` (which is a single coarse flag).
+        from backend.core.ouroboros.oracle_readiness import OracleReadiness
+        self._readiness = OracleReadiness()
 
         logger.info("The Oracle initialized")
 
+    # ------------------------------------------------------------------
+    # Readiness — public delegates to the composed primitive.
+    # ------------------------------------------------------------------
+
+    @property
+    def readiness(self):
+        """Return the composed :class:`OracleReadiness`. Consumers
+        gate on this primitive when the harness defers init to the
+        background — no silent half-graph answers."""
+        return self._readiness
+
+    def is_graph_ready(self) -> bool:
+        """Sync probe — codebase graph is loaded (cache or full index)."""
+        from backend.core.ouroboros.oracle_readiness import OracleReadinessScope
+        return self._readiness.is_ready(OracleReadinessScope.GRAPH)
+
+    def is_semantic_ready(self) -> bool:
+        """Sync probe — Chroma-backed semantic index is initialized."""
+        from backend.core.ouroboros.oracle_readiness import OracleReadinessScope
+        return self._readiness.is_ready(OracleReadinessScope.SEMANTIC)
+
+    def is_fully_ready(self) -> bool:
+        """Sync probe — both graph and semantic index ready."""
+        from backend.core.ouroboros.oracle_readiness import OracleReadinessScope
+        return self._readiness.is_ready(OracleReadinessScope.FULL)
+
+    async def wait_until_ready(
+        self, scope: str = "full", *, timeout: Optional[float] = None,
+    ) -> None:
+        """Async wait — block the caller until the requested scope is
+        ready. ``scope`` is one of ``"graph"``, ``"semantic"``, ``"full"``.
+        Raises :class:`OracleInitFailed` if init failed."""
+        from backend.core.ouroboros.oracle_readiness import OracleReadinessScope
+        try:
+            scope_enum = OracleReadinessScope(scope)
+        except ValueError:
+            scope_enum = OracleReadinessScope.FULL
+        await self._readiness.wait_until_ready(scope_enum, timeout=timeout)
+
     async def initialize(self) -> bool:
-        """Initialize the Oracle, loading cached data if available."""
+        """Initialize the Oracle, loading cached data if available.
+
+        **Ordering is intentional** — the graph cache loads BEFORE the
+        semantic index is constructed to prevent concurrent C-extension
+        heap allocation (ChromaDB + cache deserialization) which causes
+        libmalloc memory corruption on macOS ARM64. Sub-phases are
+        wrapped with :class:`_OraclePhase` for boot-timing visibility
+        but the original sequential ordering is preserved verbatim.
+
+        **Readiness signaling** — after each phase boundary the
+        composed :class:`OracleReadiness` primitive is signaled so
+        consumers awaiting graph-only or semantic-only readiness
+        unblock at the earliest correct moment. On exception, the
+        failure is recorded so all pending waiters surface a clear
+        error instead of hanging.
+        """
         logger.info("Initializing The Oracle...")
+        _t_start = time.monotonic()
+        _cache_loaded = False
+        try:
+            # Phase 1 — graph cache load (synchronous to avoid libmalloc crash)
+            with _OraclePhase("oracle_load_cache"):
+                _cache_loaded = await self._load_cache()
+            if _cache_loaded:
+                logger.info(f"Loaded cached graph: {self._graph._metrics['total_nodes']} nodes, "
+                           f"{self._graph._metrics['total_edges']} edges")
+            else:
+                # Phase 2 — no cache, do full index (only on cache miss)
+                logger.info("No cache found, performing full index...")
+                with _OraclePhase("oracle_full_index"):
+                    await self.full_index()
 
-        # Try to load cached graph (synchronous to avoid libmalloc crash)
-        if await self._load_cache():
-            logger.info(f"Loaded cached graph: {self._graph._metrics['total_nodes']} nodes, "
-                       f"{self._graph._metrics['total_edges']} edges")
-        else:
-            # No cache, do full index
-            logger.info("No cache found, performing full index...")
-            await self.full_index()
+            # Graph is ready — emit the granular signal so any consumer
+            # gated on GRAPH-scope readiness (blast-radius, dependency
+            # traversal) unblocks immediately rather than waiting for
+            # the still-pending semantic index.
+            self._readiness.mark_graph_ready()
 
-        # Initialize semantic index AFTER graph loading to prevent
-        # concurrent C-extension heap allocation (ChromaDB + pickle).
-        if self._semantic_index is None:
-            self._semantic_index = OracleSemanticIndex()
+            # Phase 3 — Initialize semantic index AFTER graph loading to
+            # prevent concurrent C-extension heap allocation. This is the
+            # ChromaDB PersistentClient construction; ordering invariant
+            # MUST stay graph→semantic.
+            if self._semantic_index is None:
+                with _OraclePhase("oracle_semantic_index_init"):
+                    self._semantic_index = OracleSemanticIndex()
 
-        self._running = True
-        self._last_indexed_monotonic_ns = time.monotonic_ns()
+            self._readiness.mark_semantic_ready()
+            self._running = True
+            self._last_indexed_monotonic_ns = time.monotonic_ns()
+        except BaseException as exc:
+            # Record failure so all wait_until_ready waiters surface an
+            # OracleInitFailed instead of hanging forever. Re-raise to
+            # let the harness's caller log the warning (legacy contract).
+            try:
+                self._readiness.mark_failed(exc)
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+            raise
+        # Structured boot-timing log — single line, parseable, low-noise
+        _elapsed_ms = (time.monotonic() - _t_start) * 1000.0
+        logger.info(
+            "[Oracle.boot] initialize complete elapsed_ms=%.1f cache_loaded=%s "
+            "graph_nodes=%d graph_edges=%d",
+            _elapsed_ms, bool(_cache_loaded),
+            self._graph._metrics.get('total_nodes', 0),
+            self._graph._metrics.get('total_edges', 0),
+        )
         return True
 
     async def shutdown(self) -> None:

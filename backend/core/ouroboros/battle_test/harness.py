@@ -353,6 +353,12 @@ class BattleTestHarness:
 
         # Component references (populated during boot)
         self._oracle: Any = None
+        # Tracked handle for the deferred Oracle initialization task —
+        # awaited (with timeout) during shutdown so a half-initialized
+        # ChromaDB / cache deserialize doesn't leak across SIGTERM.
+        # Single source of truth for the init coroutine; cancellation
+        # safe (task is wrapped to swallow CancelledError on shutdown).
+        self._oracle_init_task: Optional[asyncio.Task] = None
         self._governance_stack: Any = None
         self._governed_loop_service: Any = None
         self._predictive_engine: Any = None
@@ -1079,13 +1085,92 @@ class BattleTestHarness:
     # ------------------------------------------------------------------
 
     async def boot_oracle(self) -> None:
-        """Import and initialize TheOracle."""
+        """Import + construct TheOracle, defer ``initialize()`` to a
+        background task by default.
+
+        **Why deferred** — ``TheOracle.initialize()`` does graph cache
+        load → optional full index → ChromaDB semantic index init in
+        strictly-sequential order (a libmalloc-safety constraint on
+        macOS ARM64). On real installs this takes 8-9s and was
+        previously blocking the entire harness boot path. Per
+        Manifesto §2 (Progressive Awakening), a background service's
+        full warm-up MUST NOT block the operator-facing REPL.
+
+        **What we preserve** — the libmalloc-safe ordering inside
+        ``initialize()`` is unchanged; only the *await site* moves
+        from the boot path to a tracked background task. The Oracle
+        object exists immediately; consumers gate on its composed
+        :class:`OracleReadiness` primitive (``oracle.wait_until_ready``)
+        instead of polling ``_running`` or assuming a warm graph.
+
+        **Env-flag opt-out** — ``JARVIS_ORACLE_BLOCK_BOOT=true``
+        reverts to the legacy synchronous-await path. Use for
+        deterministic CI / perf-baseline harness runs where boot
+        ordering must be reproducible and a warm Oracle is
+        prerequisite to op #1.
+        """
         try:
             from backend.core.ouroboros.oracle import TheOracle
 
+            # Construct synchronously — the constructor only touches
+            # filesystem (cache dir mkdir) and Python objects; cheap.
+            # The Oracle reference is now valid for downstream wiring
+            # (GovernanceStack, GLS) even before init completes.
             self._oracle = TheOracle()
-            await self._oracle.initialize()
-            logger.info("Oracle booted")
+
+            block_on_boot = (
+                os.environ.get("JARVIS_ORACLE_BLOCK_BOOT", "")
+                .strip().lower() in _TRUTHY
+            )
+
+            if block_on_boot:
+                # Legacy synchronous-await path. Single env flag, no
+                # secret modes — operators who need deterministic boot
+                # ordering opt in explicitly.
+                logger.info(
+                    "Oracle init: synchronous (JARVIS_ORACLE_BLOCK_BOOT=true)",
+                )
+                await self._oracle.initialize()
+                logger.info("Oracle booted (synchronous)")
+                return
+
+            # Deferred path — spawn initialize() as a tracked task and
+            # return immediately so the harness boot continues. The
+            # Oracle object is wired into GLS / governance stack at
+            # the normal sites; consumers awaiting graph or semantic
+            # readiness unblock the moment each phase finishes.
+            logger.info(
+                "Oracle init: deferred to background task "
+                "(JARVIS_ORACLE_BLOCK_BOOT=false; default)",
+            )
+
+            async def _deferred_init() -> None:
+                try:
+                    await self._oracle.initialize()
+                    logger.info("Oracle booted (deferred)")
+                except asyncio.CancelledError:
+                    # Shutdown cancellation — propagate cleanly.
+                    raise
+                except Exception as inner_exc:  # noqa: BLE001
+                    # Failure already recorded via OracleReadiness
+                    # (initialize()'s except branch); waiters will
+                    # surface OracleInitFailed instead of hanging.
+                    logger.warning(
+                        "Oracle deferred init failed: %s", inner_exc,
+                    )
+
+            self._oracle_init_task = asyncio.ensure_future(_deferred_init())
+            # Defensive: install a done_callback that swallows
+            # CancelledError so the asyncio loop-level handler
+            # doesn't classify shutdown cancellation as a leak.
+            def _swallow(task: asyncio.Task) -> None:
+                try:
+                    if task.cancelled():
+                        return
+                    task.exception()  # consume so it isn't logged as unhandled
+                except Exception:  # noqa: BLE001
+                    pass
+            self._oracle_init_task.add_done_callback(_swallow)
         except Exception as exc:
             logger.warning("Oracle failed to boot: %s", exc)
 
@@ -4624,6 +4709,35 @@ class BattleTestHarness:
 
         # 6. Oracle
         if self._oracle is not None:
+            # First settle the deferred init task — either it finished
+            # naturally (fast path) or we cancel it and let cancellation
+            # propagate. Either way, no half-initialized Chroma client
+            # leaks across shutdown. Bounded wait so a wedged init
+            # cannot block clean teardown.
+            if (
+                self._oracle_init_task is not None
+                and not self._oracle_init_task.done()
+            ):
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._oracle_init_task),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    # Init still running past the grace window — cancel
+                    # and consume the resulting CancelledError without
+                    # surfacing it as a leak.
+                    self._oracle_init_task.cancel()
+                    try:
+                        await self._oracle_init_task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+                except Exception as _init_exc:  # noqa: BLE001
+                    logger.debug(
+                        "Oracle deferred init terminated during "
+                        "shutdown: %s", _init_exc, exc_info=True,
+                    )
+            self._oracle_init_task = None
             try:
                 await self._oracle.shutdown()
             except Exception as exc:

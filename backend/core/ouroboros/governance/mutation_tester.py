@@ -476,7 +476,9 @@ def run_mutant(
     if timeout_s is None:
         timeout_s = mutant_timeout_s()
     source_path = Path(mutant.source_file)
-    started = time.time()
+    # Monotonic — duration_s is elapsed-time, not wall-clock display
+    # (PRD §3.6.2 vector #11; Wave 3 hygiene 2026-05-05).
+    started = time.monotonic()
     try:
         original_bytes = source_path.read_bytes()
     except Exception as e:  # noqa: BLE001
@@ -517,7 +519,7 @@ def run_mutant(
                 source_path, len(original_bytes),
                 original_hash, source_path,
             )
-    dur = time.time() - started
+    dur = time.monotonic() - started
     if rc == 124:
         return MutantOutcome(
             mutant=mutant, caught=True, reason="timeout",
@@ -575,7 +577,8 @@ def run_mutation_test(
     mutating process env. ``progress_cb(idx, total, outcome)`` is called
     after each mutant for UI streaming — safe to omit.
     """
-    started = time.time()
+    # Monotonic — global-timeout elapsed measurement (PRD §3.6.2 #11).
+    started = time.monotonic()
     cap = max_mutants_override if max_mutants_override is not None else max_mutants()
     per_timeout = (
         timeout_s_override if timeout_s_override is not None else mutant_timeout_s()
@@ -609,7 +612,7 @@ def run_mutation_test(
     outcomes: List[MutantOutcome] = []
     errored = 0
     for idx, m in enumerate(sampled):
-        elapsed = time.time() - started
+        elapsed = time.monotonic() - started
         if elapsed >= global_timeout:
             logger.warning(
                 "[MutationTester] global timeout reached at mutant %d/%d",
