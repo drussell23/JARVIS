@@ -3892,6 +3892,32 @@ SEED_SPECS: list = [
         example="0",
         since="Move 8 Slice 3 (PRD §29.7, 2026-05-05)",
     ),
+    # ====================================================================
+    # Phase 9 synthetic workload — 1 flag.
+    # Hard cap on synthetic envelope injection to prevent misconfigured
+    # cron from spamming ops or spending budget. Operating value is
+    # passed via --seed-intents on the harness CLI (typically 3); this
+    # is defense-in-depth ceiling.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_PHASE9_SEED_INTENTS_MAX",
+        type=FlagType.INT, default=16,
+        description=(
+            "Hard ceiling on the number of synthetic envelopes "
+            "Phase 9 cadence may inject in one harness "
+            "invocation. Default 16 (clamped [1, 64]). The "
+            "cadence wrapper passes a much smaller N (typically "
+            "3) via --seed-intents; this knob is defense-in-"
+            "depth against a misconfigured cron entry."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/graduation/"
+            "phase_9_synthetic_workload.py"
+        ),
+        example="16",
+        since="Phase 9 Slice 1 (PRD §36.5, 2026-05-05)",
+    ),
     FlagSpec(
         name="JARVIS_REPL_DISPATCH_AUTODISCOVERY_ENABLED",
         type=FlagType.BOOL, default=True,

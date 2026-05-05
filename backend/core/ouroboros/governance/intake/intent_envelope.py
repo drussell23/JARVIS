@@ -57,6 +57,17 @@ _VALID_SOURCES = frozenset({
     # VERIFY arc). Mirrors ``SignalSource.VISION_SENSOR.value``. See
     # docs/superpowers/specs/2026-04-18-vision-sensor-verify-design.md.
     "vision_sensor",
+    # Added 2026-05-05 for Phase 9 synthetic workload injection — the
+    # honest-source-token approach that closes the headless-cadence
+    # zero-ops blocker. Same precedent as the 2026-04-12 comment above
+    # ("stop sensors from lying about their source"): synthetic test
+    # workload must NEVER masquerade as real `runtime_health` / `ai_miner`
+    # / etc. The Phase 9.2 graduation contract + downstream observability
+    # filter on this token to distinguish cadence-injected envelopes from
+    # production signal traffic. Routes BACKGROUND via UrgencyRouter
+    # (low-cost; never burns Claude budget). See PRD §36.5 priority #1
+    # + `phase_9_synthetic_workload.py`.
+    "cadence_synthetic",
 })
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 
