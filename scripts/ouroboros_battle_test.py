@@ -1095,6 +1095,12 @@ def main() -> None:
         "asyncio",  # event loop debug
         "aiosqlite",  # SQLite debug queries
         "markdown_it",  # rich.markdown transitive — per-token "entering fence/list/..." spam at DEBUG
+        # Typing-responsiveness fix: prompt_toolkit logs at DEBUG on
+        # every key event under -v mode. Each log line costs ~50us and
+        # races with key handlers — operators perceived as typing
+        # freeze. WARNING level keeps real warnings (e.g. terminal
+        # capability missing) while silencing per-keystroke chatter.
+        "prompt_toolkit",
     ):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 

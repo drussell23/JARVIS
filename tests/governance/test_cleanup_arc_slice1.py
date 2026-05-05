@@ -240,8 +240,9 @@ def test_cleanup_invariants_module_has_register_function():
     # 4 archive-only + 3 consumer-uses-primitive (Slice 2)
     # + 5 observability-module-exposes-register_routes (Slice 3)
     # + 1 observability_route_registry_uses_primitive (Slice 3)
-    # = 13 pins total
-    assert len(invs) == 13
+    # + 1 repl_dispatch_registry_uses_primitive (Slice 4)
+    # = 14 pins total
+    assert len(invs) == 14
 
 
 def test_cleanup_invariants_authority_asymmetry():

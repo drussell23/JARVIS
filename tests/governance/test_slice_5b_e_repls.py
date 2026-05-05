@@ -425,40 +425,50 @@ class TestSerpentREPLHookup:
         )
         return path.read_text(encoding="utf-8")
 
-    def test_serpent_dispatches_probe(self):
+    def test_serpent_uses_repl_dispatch_registry(self):
+        """Slice 5b consolidation Slice 4 (PRD §32.5/§32.11):
+        the legacy if/elif ladder + ``_print_observability_verb``
+        helper was replaced by a generic ``try_dispatch`` call
+        on :mod:`repl_dispatch_registry`. SerpentREPL imports
+        and invokes the registry; the legacy helper is removed."""
         src = self._serpent_source()
-        assert '"probe", "/probe"' in src or (
-            'line in ("probe", "/probe")' in src
+        assert "repl_dispatch_registry" in src, (
+            "SerpentREPL must import repl_dispatch_registry"
         )
-        assert (
-            "_print_observability_verb" in src
-        ), "SerpentREPL must define the shared observability helper"
-
-    def test_serpent_dispatches_coherence(self):
-        src = self._serpent_source()
-        assert '"coherence", "/coherence"' in src or (
-            'line in ("coherence", "/coherence")' in src
+        assert "try_dispatch" in src, (
+            "SerpentREPL must call try_dispatch from the registry"
         )
-
-    def test_serpent_dispatches_quorum(self):
-        src = self._serpent_source()
-        assert '"quorum", "/quorum"' in src or (
-            'line in ("quorum", "/quorum")' in src
+        assert "_print_observability_verb" not in src, (
+            "Legacy _print_observability_verb helper must be "
+            "removed (Slice 4 replaces it with auto-discovery)"
         )
 
     def test_serpent_dispatches_postmortems(self):
+        """Postmortems retains its custom handler because of
+        argv-style invocation (different from
+        ``dispatch_<verb>_command(line)`` contract)."""
         src = self._serpent_source()
         assert '"postmortems"' in src
         assert "_print_postmortems" in src
 
-    def test_serpent_imports_dispatchers_lazily(self):
-        """The helper imports each dispatcher inside its branch
-        so an absent module doesn't break boot."""
-        src = self._serpent_source()
-        assert "dispatch_probe_command" in src
-        assert "dispatch_coherence_command" in src
-        assert "dispatch_quorum_command" in src
-        assert "dispatch_postmortems_command" in src
+    def test_repl_registry_resolves_legacy_dispatchers(self):
+        """The 5 legacy verbs (probe/coherence/quorum/failures/
+        outcomes) resolve through the registry — proves
+        byte-equivalent behavior post-Slice-4."""
+        from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
+            prime_registry, reset_registry_for_tests, list_verbs,
+        )
+        reset_registry_for_tests()
+        prime_registry(force=True)
+        verbs = list_verbs()
+        for legacy_verb in (
+            "probe", "coherence", "quorum",
+            "failures", "outcomes",
+        ):
+            assert legacy_verb in verbs, (
+                f"legacy verb {legacy_verb!r} missing from "
+                f"auto-discovery registry"
+            )
 
     def test_help_lists_all_four_verbs(self):
         """``/help`` enumerates the four new verbs."""

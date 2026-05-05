@@ -604,6 +604,25 @@ def register_shipped_invariants() -> list:
             ),
             validate=_validate_consumer_uses_primitive,
         ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "repl_dispatch_registry_uses_primitive"
+            ),
+            target_file=(
+                "backend/core/ouroboros/battle_test/"
+                "repl_dispatch_registry.py"
+            ),
+            description=(
+                "repl_dispatch_registry.py MUST delegate to "
+                "module_discovery.discover_module_provided_-"
+                "callable (no parallel walker). Uses "
+                "module-scan mode (attr_name=None) since the "
+                "per-module dispatcher attribute name varies "
+                "by filename convention. Slice 5b "
+                "consolidation Slice 4."
+            ),
+            validate=_validate_consumer_uses_primitive,
+        ),
     ]
 
 

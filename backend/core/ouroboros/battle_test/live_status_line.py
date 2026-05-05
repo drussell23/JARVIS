@@ -277,13 +277,244 @@ __all__ = [
     "LIVE_STATUS_LINE_SCHEMA_VERSION",
     "LiveStatusLineRender",
     "MASTER_FLAG_ENV_VAR",
+    "SpinnerInvalidator",
     "compose",
+    "invalidate_app",
+    "is_auto_refresh_enabled",
     "is_master_flag_enabled",
     "make_bottom_toolbar_callable",
+    "make_cached_bottom_toolbar",
     "register_flags",
     "register_shipped_invariants",
     "render_status_segment",
 ]
+
+
+# ===========================================================================
+# Event-driven invalidation — replaces refresh_interval-based redraws
+# ===========================================================================
+#
+# Root cause of typing lag (deeper diagnosis): prompt_toolkit's
+# ``refresh_interval`` schedules a redraw on the asyncio event loop
+# every N seconds regardless of whether anything changed. Each redraw
+# runs the diff/render pipeline. When the operator presses a key,
+# their key event waits its turn on the event loop behind in-progress
+# redraws — observable as keystroke batching.
+#
+# CC has no refresh_interval. It redraws only on input events + on
+# explicit ``app.invalidate()`` calls. We adopt the same model:
+#
+#   * ``refresh_interval=None`` (no background ticks)
+#   * :class:`SpinnerInvalidator` — fires ``app.invalidate()`` at
+#     spinner cadence ONLY while spinner state is active. When idle,
+#     no invalidations, no redraws, fully responsive typing.
+#   * :func:`invalidate_app` — best-effort one-shot for op state
+#     transitions (op_started / completed / failed) where the toolbar
+#     content changes and the operator should see it immediately.
+
+
+_AUTO_REFRESH_ENV_VAR: str = "JARVIS_REPL_AUTO_REFRESH_ENABLED"
+
+
+def is_auto_refresh_enabled() -> bool:
+    """``JARVIS_REPL_AUTO_REFRESH_ENABLED``. Default **false** (event-
+    driven model). Operators can set ``=true`` to restore the legacy
+    refresh_interval-driven redraws if some downstream mechanic
+    breaks under event-driven mode. NEVER raises."""
+    raw = os.environ.get(_AUTO_REFRESH_ENV_VAR, "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def invalidate_app() -> bool:
+    """Defensive ``prompt_toolkit.application.get_app().invalidate()``.
+
+    Returns ``True`` on success, ``False`` when prompt_toolkit isn't
+    importable / no app is running / invalidate raised. NEVER raises
+    into the caller.
+
+    Use at op state transitions (op_started / op_completed / op_failed
+    / cost_tick / posture_change) so the operator sees the new state
+    in the toolbar without waiting for the next refresh tick.
+    """
+    try:
+        from prompt_toolkit.application import get_app
+    except ImportError:
+        return False
+    try:
+        app = get_app()
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+    try:
+        app.invalidate()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class SpinnerInvalidator:
+    """Background asyncio task that fires ``app.invalidate()`` at a
+    configurable cadence WHILE a caller-supplied predicate returns
+    True (typically: while a Rich spinner is animating).
+
+    Replaces ``PromptSession(refresh_interval=...)`` for the
+    spinner-animation case so background ticks don't run during
+    idle typing.
+
+    Lifecycle
+    ---------
+      * :meth:`start` — schedule the background task on the running
+        event loop. Idempotent: starting twice is a no-op.
+      * :meth:`stop` — cancel the task. Idempotent.
+      * :meth:`is_running` — observability hook.
+
+    Defensive contract
+    -------------------
+      * The predicate raising → treated as False (no invalidate this tick)
+      * ``app.invalidate()`` raising → swallowed (next tick retries)
+      * ``stop()`` always succeeds — cancellation is best-effort
+      * NEVER raises into the caller's hot path
+    """
+
+    def __init__(
+        self,
+        *,
+        get_active: Callable[[], bool],
+        cadence_s: float = 0.10,
+    ) -> None:
+        self._get_active = get_active
+        self._cadence_s = max(0.01, min(5.0, float(cadence_s)))
+        self._task: object = None  # asyncio.Task when running
+        self._stop_flag: bool = False
+
+    def is_running(self) -> bool:
+        if self._task is None:
+            return False
+        try:
+            return not self._task.done()  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            return False
+
+    def start(self) -> bool:
+        """Schedule the loop. Returns ``True`` on success, ``False``
+        when no event loop is available."""
+        if self.is_running():
+            return True
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if not loop.is_running():
+                return False
+            self._stop_flag = False
+            self._task = loop.create_task(self._loop())
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[SpinnerInvalidator] start failed", exc_info=True,
+            )
+            return False
+
+    def stop(self) -> None:
+        """Cancel the loop. Idempotent."""
+        self._stop_flag = True
+        if self._task is None:
+            return
+        try:
+            self._task.cancel()  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+        self._task = None
+
+    async def _loop(self) -> None:
+        import asyncio
+        while not self._stop_flag:
+            try:
+                if self._predicate_true():
+                    invalidate_app()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await asyncio.sleep(self._cadence_s)
+            except asyncio.CancelledError:
+                break
+
+    def _predicate_true(self) -> bool:
+        try:
+            return bool(self._get_active())
+        except Exception:  # noqa: BLE001
+            return False
+
+
+# ===========================================================================
+# Typing-responsiveness fix — state-hash cache on the toolbar callable
+# ===========================================================================
+#
+# Root cause of perceived typing lag: prompt_toolkit calls the
+# bottom_toolbar callable on every keystroke AND on every
+# ``refresh_interval`` tick. With Gap #1+5's wrapper the call now
+# does multiple state pulls + Rich formatting per invocation. A
+# single keystroke contends with the in-progress toolbar redraw —
+# operators see the freeze.
+#
+# Fix: wrap the callable with a state-hash cache. The state hash is
+# a cheap tuple of primitives sampled per call. When the hash matches
+# the previous call (typical: rapid keystrokes during idle), return
+# the cached ANSI/string result in microseconds. When the hash
+# changes (op started, cost ticked, spinner frame advanced), recompute.
+#
+# Spinner animation still works because the spinner glyph is part of
+# the hash — every spinner-frame change invalidates. When the spinner
+# is INACTIVE (operator-typing scenario), the hash is stable across
+# keystrokes and the cache dominates.
+
+
+def make_cached_bottom_toolbar(
+    inner: Callable[[], object],
+    state_fetcher: Callable[[], object],
+) -> Callable[[], object]:
+    """Wrap ``inner`` with a state-hash-based cache.
+
+    On each invocation:
+
+      1. Call ``state_fetcher()`` — should return a small hashable
+         object (typically a tuple of primitives).
+      2. Compute its hash. If unchanged from the previous call AND
+         a cached result exists, return the cached result.
+      3. Otherwise call ``inner()``, cache, and return.
+
+    Defensive: ``state_fetcher`` raising → uncached pass-through to
+    ``inner`` (NEVER raises into prompt_toolkit's render path). Same
+    for ``inner`` raising — caller's existing exception handling
+    applies. The cache is single-threaded by construction (toolbar
+    runs on the asyncio event loop, no concurrent invocation).
+
+    NEVER raises.
+    """
+    cache: dict = {"hash": None, "result": None, "primed": False}
+
+    def _cached() -> object:
+        # Fetch state first; on failure, degrade to uncached call
+        try:
+            state = state_fetcher()
+            new_hash = hash(state)
+        except Exception:  # noqa: BLE001
+            try:
+                return inner()
+            except Exception:  # noqa: BLE001
+                return ""
+        # Cache hit — return previous result without re-computing
+        if cache["primed"] and new_hash == cache["hash"]:
+            return cache["result"]
+        # Cache miss — compute, store, return
+        try:
+            result = inner()
+        except Exception:  # noqa: BLE001
+            return ""
+        cache["hash"] = new_hash
+        cache["result"] = result
+        cache["primed"] = True
+        return result
+
+    return _cached
 
 
 # ===========================================================================

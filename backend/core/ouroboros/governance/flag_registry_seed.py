@@ -3628,6 +3628,33 @@ SEED_SPECS: list = [
         since="Slice 5b Slice 2 (PRD §32.5, 2026-05-04)",
     ),
     FlagSpec(
+        name="JARVIS_REPL_DISPATCH_AUTODISCOVERY_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "Master kill switch for the REPL dispatch "
+            "auto-discovery substrate (PRD §32.5 / §32.11 "
+            "Slice 5b consolidation Slice 4). When true (the "
+            "default), SerpentREPL routes verb-shaped lines "
+            "through repl_dispatch_registry.try_dispatch which "
+            "resolves verb→dispatcher via the auto-discovered "
+            "verb→callable map (17+ verbs covering 5 legacy + "
+            "12 newly-unlocked surfaces). When false, the "
+            "registry returns no-match and the legacy hardcoded "
+            "ladder in serpent_flow.py carries the load "
+            "(preserved for instant rollback). Custom-handler "
+            "verbs (budget/risk/goal/cancel/plan/postmortems/"
+            "inline) are excluded regardless of master flag — "
+            "they retain bespoke operator semantics."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/battle_test/"
+            "repl_dispatch_registry.py"
+        ),
+        example="true",
+        since="Slice 5b Slice 4 (PRD §32.5, 2026-05-04)",
+    ),
+    FlagSpec(
         name="JARVIS_OBSERVABILITY_AUTODISCOVERY_ENABLED",
         type=FlagType.BOOL, default=True,
         description=(

@@ -80,7 +80,29 @@ _OUROBOROS_FRAMES = (
     "🐍·····○",
 )
 _OUROBOROS_FRAME_INTERVAL_S = 0.10  # 100ms per frame, named (not hardcoded)
-_REPL_REFRESH_INTERVAL_S = 0.10     # bottom_toolbar refresh cadence
+
+
+def _resolve_repl_refresh_interval_s() -> float:
+    """Bottom-toolbar refresh cadence in seconds. Env-configurable via
+    ``JARVIS_REPL_REFRESH_INTERVAL_S`` (default 0.10 = 10fps spinner).
+
+    The state-hash cache (``make_cached_bottom_toolbar``) makes each
+    tick near-zero-cost when state is unchanged, so the default cadence
+    no longer contends with typing. Operators with very slow terminals
+    can raise this to 0.25 / 0.5 for additional headroom; values below
+    0.05 are clamped to 0.05 to avoid pathological spin.
+    """
+    try:
+        raw = os.environ.get("JARVIS_REPL_REFRESH_INTERVAL_S", "").strip()
+        if not raw:
+            return 0.10
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return 0.10
+    return max(0.05, min(5.0, parsed))
+
+
+_REPL_REFRESH_INTERVAL_S = _resolve_repl_refresh_interval_s()
 
 if _OUROBOROS_SPINNER_NAME not in SPINNERS:
     SPINNERS[_OUROBOROS_SPINNER_NAME] = {
@@ -4419,10 +4441,74 @@ class SerpentREPL:
         try:
             from backend.core.ouroboros.battle_test.live_status_line import (
                 make_bottom_toolbar_callable,
+                make_cached_bottom_toolbar,
             )
             _live_bottom_toolbar = make_bottom_toolbar_callable(_bottom_toolbar)
         except Exception:
             _live_bottom_toolbar = _bottom_toolbar  # safe fallback
+            make_cached_bottom_toolbar = None  # type: ignore[assignment]
+
+        # Typing-responsiveness fix (2026-05-04): wrap with state-hash
+        # cache so unchanged-state ticks return cached output in
+        # microseconds. Eliminates contention between prompt_toolkit's
+        # refresh_interval ticks and operator keystrokes. Spinner
+        # animation still works — the spinner frame is part of the
+        # hash, so each spinner tick invalidates the cache.
+        flow_ref = self._flow
+
+        def _toolbar_state_fetcher() -> tuple:
+            """Tuple-of-primitives fetched on every toolbar tick.
+            Hash equality → cache hit → no re-render. Pulls only the
+            cheap state that affects rendering output."""
+            sn = flow_ref._spinner_state
+            spinner_active = bool(sn.active)
+            # Spinner glyph rotates on a time bucket — include it in
+            # the hash ONLY when the spinner is active so we don't
+            # invalidate the cache during idle typing.
+            spinner_signal = (
+                _frame_for_now() if spinner_active else "_idle_"
+            )
+            # Status-line state (cost / cap / total) — cheap attr reads
+            cost_total = getattr(flow_ref, "_cost_total", 0.0)
+            cost_cap = getattr(flow_ref, "_cost_cap", 0.0)
+            # Status-line builder snapshot signature — pull when on
+            try:
+                from backend.core.ouroboros.battle_test.status_line import (
+                    get_status_line_builder,
+                )
+                _b = get_status_line_builder()
+                if _b is not None:
+                    snap = _b.snapshot()
+                    status_sig = (
+                        snap.phase, snap.phase_detail,
+                        round(snap.cost_spent_usd, 4),
+                        round(snap.idle_elapsed_s, 1),
+                        snap.primary_op_id, snap.route, snap.provider,
+                    )
+                else:
+                    status_sig = ("",)
+            except Exception:
+                status_sig = ("",)
+            return (
+                len(flow_ref._active_ops),
+                flow_ref._focused_op_id or "",
+                flow_ref._lens_mode,
+                spinner_active,
+                sn.token_count if spinner_active else 0,
+                spinner_signal,
+                getattr(flow_ref, "_swarm_last_completed", ""),
+                round(float(cost_total), 4),
+                round(float(cost_cap), 4),
+                status_sig,
+            )
+
+        if make_cached_bottom_toolbar is not None:
+            try:
+                _live_bottom_toolbar = make_cached_bottom_toolbar(
+                    _live_bottom_toolbar, _toolbar_state_fetcher,
+                )
+            except Exception:
+                pass  # uncached fallback
 
         # Gap #7 Slice 3: auto-discovered slash-command palette + tab
         # completion + persistent history. NEVER raises into the boot
@@ -4608,50 +4694,41 @@ class SerpentREPL:
                         rest = line.split(None, 1)[1].strip()
                         self._print_auto_action(arg=rest)
                         continue
-                    # Slice 5b E — observability REPL surfaces.
-                    # Each verb consumes the SAME readers as its
-                    # /observability/<verb> HTTP route via the
-                    # dispatch_<verb>_command function in its
-                    # corresponding *_repl.py module.
-                    if line in ("probe", "/probe") or (
-                        line.startswith("probe ")
-                        or line.startswith("/probe ")
-                    ):
-                        self._print_observability_verb(
-                            line, "probe",
+                    # Slice 5b consolidation Slice 4 — REPL command
+                    # auto-dispatch (PRD §32.5 / §32.11). The
+                    # repl_dispatch_registry walks the curated
+                    # provider packages, builds a verb→dispatcher map
+                    # from every module-level
+                    # ``dispatch_<verb>_command(line)`` callable,
+                    # and routes the line to the matching
+                    # dispatcher. Replaces the legacy hardcoded 5-
+                    # branch ladder (probe/coherence/quorum/failures/
+                    # outcomes) with one generic call covering 17+
+                    # verbs including 12 previously-unwired surfaces
+                    # (m10/decisions/curiosity/governor/posture/
+                    # cost/...). Verbs with bespoke operator
+                    # semantics (budget/risk/goal/cancel/plan/
+                    # postmortems/inline) are EXCLUDED via the
+                    # registry's _CUSTOM_HANDLER_EXCLUSIONS list and
+                    # retain their legacy custom handlers below.
+                    # Master flag JARVIS_REPL_DISPATCH_AUTODISCOVERY_-
+                    # ENABLED gates the registry; when off, falls
+                    # back to legacy paths preserved below for
+                    # instant rollback.
+                    try:
+                        from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
+                            try_dispatch as _try_dispatch,
                         )
-                        continue
-                    if line in ("coherence", "/coherence") or (
-                        line.startswith("coherence ")
-                        or line.startswith("/coherence ")
-                    ):
-                        self._print_observability_verb(
-                            line, "coherence",
-                        )
-                        continue
-                    if line in ("quorum", "/quorum") or (
-                        line.startswith("quorum ")
-                        or line.startswith("/quorum ")
-                    ):
-                        self._print_observability_verb(
-                            line, "quorum",
-                        )
-                        continue
-                    if line in ("failures", "/failures") or (
-                        line.startswith("failures ")
-                        or line.startswith("/failures ")
-                    ):
-                        self._print_observability_verb(
-                            line, "failures",
-                        )
-                        continue
-                    if line in ("outcomes", "/outcomes") or (
-                        line.startswith("outcomes ")
-                        or line.startswith("/outcomes ")
-                    ):
-                        self._print_observability_verb(
-                            line, "outcomes",
-                        )
+                        _outcome = _try_dispatch(line)
+                    except Exception:  # noqa: BLE001 — defensive
+                        _outcome = None
+                    if _outcome is not None and _outcome.matched:
+                        self._flow.console.print()
+                        if _outcome.text:
+                            self._flow.console.print(
+                                _outcome.text, highlight=False,
+                            )
+                        self._flow.console.print()
                         continue
                     if line in (
                         "postmortems", "/postmortems",
@@ -5201,65 +5278,6 @@ class SerpentREPL:
             f"[dim]op-{op_id}[/dim]{target_seg}"
         )
         f.console.print(f"      [dim]{evidence}[/dim]")
-
-    def _print_observability_verb(
-        self, line: str, name: str,
-    ) -> None:
-        """Slice 5b E — generic observability REPL surface.
-
-        Routes ``line`` to the corresponding ``dispatch_<name>_-
-        command`` function in the ``<name>_repl`` module. The
-        dispatcher returns a frozen ``*DispatchResult`` whose
-        ``text`` field is plain-text already formatted; we print
-        with ``highlight=False`` so Rich does not auto-color the
-        operator's content.
-
-        Single helper instead of N near-identical wrappers — the
-        only thing that varies between probe / coherence / quorum
-        is the dispatcher import. NEVER raises out of this method;
-        any failure renders a one-line dim notice."""
-        f = self._flow
-        f.console.print()
-        try:
-            if name == "probe":
-                from backend.core.ouroboros.governance.probe_repl import (  # noqa: E501
-                    dispatch_probe_command as _dispatch,
-                )
-            elif name == "coherence":
-                from backend.core.ouroboros.governance.coherence_repl import (  # noqa: E501
-                    dispatch_coherence_command as _dispatch,
-                )
-            elif name == "quorum":
-                from backend.core.ouroboros.governance.quorum_repl import (  # noqa: E501
-                    dispatch_quorum_command as _dispatch,
-                )
-            elif name == "failures":
-                from backend.core.ouroboros.governance.failures_repl import (  # noqa: E501
-                    dispatch_failures_command as _dispatch,
-                )
-            elif name == "outcomes":
-                from backend.core.ouroboros.governance.outcomes_repl import (  # noqa: E501
-                    dispatch_outcomes_command as _dispatch,
-                )
-            else:
-                f.console.print(
-                    f"[dim]/{name} surface unknown[/dim]"
-                )
-                f.console.print()
-                return
-            result = _dispatch(line)
-            if not result.matched:
-                f.console.print(
-                    f"[dim]/{name}: not a {name} command[/dim]"
-                )
-            else:
-                f.console.print(result.text, highlight=False)
-        except Exception as exc:  # noqa: BLE001 — defensive
-            f.console.print(
-                f"[dim]/{name} surface unavailable: "
-                f"{type(exc).__name__}[/dim]"
-            )
-        f.console.print()
 
     def _print_postmortems(self, line: str) -> None:
         """Slice 5b E — ``/postmortems`` REPL surface.

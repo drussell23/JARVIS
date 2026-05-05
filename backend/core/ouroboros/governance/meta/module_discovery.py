@@ -157,7 +157,7 @@ def _coerce_skipped_reason(exc: BaseException) -> str:
 def discover_module_provided_callable(
     *,
     packages: Sequence[str],
-    attr_name: str,
+    attr_name: Optional[str],
     handler: HandlerCallable,
     excluded_modules: Sequence[str] = (),
     log_prefix: str = "ModuleDiscovery",
@@ -172,9 +172,15 @@ def discover_module_provided_callable(
       * ``attr_name`` — the module-level attribute the primitive
         looks up via :func:`getattr` and tests for callability
         (e.g. ``"register_flags"`` / ``"register_shipped_invariants"``
-        / ``"register_verbs"`` / ``"register_routes"``).
-      * ``handler(full_name, callable)`` — invoked once per
-        matching module; returns the count contributed.
+        / ``"register_verbs"`` / ``"register_routes"``). Pass
+        ``None`` for "module-scan mode" — handler is invoked
+        once per successfully-imported module with the module
+        object itself in lieu of an attribute callable. Used
+        by consumers (e.g. REPL dispatch registry) where the
+        attribute name varies per module by naming convention
+        and must be resolved inside the handler.
+      * ``handler(full_name, attr_or_module)`` — invoked once
+        per matching module; returns the count contributed.
         Non-int / negative / handler-raising → counted as 0,
         skip recorded.
       * ``excluded_modules`` — full dotted names to skip
@@ -262,23 +268,32 @@ def discover_module_provided_callable(
                         log_prefix, full_name, exc,
                     )
                     continue
-                try:
-                    fn = getattr(mod, attr_name, None)
-                    if not callable(fn):
-                        # Module simply doesn't contribute via
-                        # this attr — common case, not an error.
-                        continue
-                except Exception as exc:  # noqa: BLE001
-                    modules_skipped.append(
-                        SkippedModule(
-                            full_name=full_name,
-                            reason=(
-                                f"getattr_failed: "
-                                f"{_coerce_skipped_reason(exc)}"
+                if attr_name is None:
+                    # Module-scan mode: hand the module itself
+                    # to the handler. Handler resolves the
+                    # per-module attribute name internally
+                    # (used by REPL dispatch registry where
+                    # ``dispatch_<verb>_command`` varies per
+                    # module by naming convention).
+                    fn = mod
+                else:
+                    try:
+                        fn = getattr(mod, attr_name, None)
+                        if not callable(fn):
+                            # Module simply doesn't contribute via
+                            # this attr — common case, not an error.
+                            continue
+                    except Exception as exc:  # noqa: BLE001
+                        modules_skipped.append(
+                            SkippedModule(
+                                full_name=full_name,
+                                reason=(
+                                    f"getattr_failed: "
+                                    f"{_coerce_skipped_reason(exc)}"
+                                ),
                             ),
-                        ),
-                    )
-                    continue
+                        )
+                        continue
                 modules_scanned += 1
                 try:
                     count = handler(full_name, fn)
