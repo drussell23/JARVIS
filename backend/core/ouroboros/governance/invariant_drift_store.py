@@ -316,12 +316,49 @@ class InvariantDriftStore:
 
     def write_baseline(self, snap: InvariantSnapshot) -> None:
         """Atomically persist a snapshot as the canonical baseline.
-        NEVER raises — disk failures are logged and swallowed."""
+        NEVER raises — disk failures are logged and swallowed.
+
+        Cross-process serialization (PRD §28.5.1; Wave 3 hygiene
+        2026-05-05): the in-process ``self._lock`` only guards
+        same-process races. Concurrent battle-test sessions
+        (multiple processes sharing the project root's
+        ``.jarvis/`` dir) could race on the read-modify-write
+        cycle around the baseline. We wrap the atomic write in
+        :func:`cross_process_jsonl.flock_critical_section` —
+        same primitive used by all other cross-process state
+        stores (§33.4 Per-Cluster flock'd JSONL Persistence
+        pattern) — so a sibling process either sees the prior
+        baseline or the new baseline, never an interleaved
+        write. Lazy import so the substrate stays load-clean
+        when cross_process_jsonl is unavailable (NEVER raises)."""
         try:
             payload = snap.to_dict()
             text = json.dumps(payload, indent=2, sort_keys=True)
+            try:
+                from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                    flock_critical_section,
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                # Fallback: in-process-lock only when primitive
+                # is unavailable (e.g. import time substrate
+                # not yet ready). Better than failing closed.
+                with self._lock:
+                    self._atomic_write(self.baseline_path, text)
+                return
             with self._lock:
-                self._atomic_write(self.baseline_path, text)
+                with flock_critical_section(
+                    self.baseline_path,
+                ) as acquired:
+                    if not acquired:
+                        # Cross-process flock contended — fall
+                        # back to in-process atomic write; the
+                        # OS-level rename is still POSIX-atomic
+                        # so the file never sees a torn state.
+                        self._atomic_write(
+                            self.baseline_path, text,
+                        )
+                        return
+                    self._atomic_write(self.baseline_path, text)
         except Exception as exc:  # noqa: BLE001 — defensive
             logger.warning(
                 "[InvariantDriftStore] baseline write failed: %s",

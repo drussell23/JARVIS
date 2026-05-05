@@ -190,6 +190,112 @@ class AutoCommitter:
             intent_token = self._compute_intent_token(
                 op_id, target_files,
             )
+
+            # PRD §3.6.2 vector #10 closure (Wave 3 hygiene 2026-05-05):
+            # the intent_token check + git commit + store_intent_token
+            # are a TOCTOU critical section. Two concurrent processes
+            # could both pass `_intent_token_exists()` before either
+            # commits, producing duplicate commits. Wrap the section
+            # in an async cross-process flock keyed on the
+            # intent_token so two processes computing the SAME token
+            # (same op_id + same file content) serialize at the OS
+            # level. Different tokens → different lock files → no
+            # unnecessary serialization across unrelated ops. Per the
+            # §33.4 Per-Cluster flock'd JSONL Persistence pattern
+            # (composing the canonical primitive — no parallel
+            # locking machinery).
+            try:
+                from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                    async_flock_critical_section as _async_flock,
+                )
+            except Exception as _imp_exc:  # noqa: BLE001 — defensive
+                # Substrate unavailable — fall through to the legacy
+                # path. Better to commit (with the residual TOCTOU
+                # window) than to fail closed and miss legitimate
+                # commits.
+                logger.debug(
+                    "[AutoCommitter] async_flock primitive "
+                    "unavailable: %s — proceeding without "
+                    "cross-process lock", _imp_exc,
+                )
+                return await self._commit_critical_section(
+                    intent_token=intent_token,
+                    op_id=op_id,
+                    description=description,
+                    target_files=target_files,
+                    risk_tier=risk_tier,
+                    provider_name=provider_name,
+                    generation_cost=generation_cost,
+                    signal_source=signal_source,
+                    signal_urgency=signal_urgency,
+                    rationale=rationale,
+                )
+
+            lock_path = self._intent_lock_path(intent_token)
+            async with _async_flock(lock_path) as acquired:
+                if not acquired:
+                    # Cross-process contention beyond timeout — a
+                    # sibling process is mid-commit for the same
+                    # intent_token. Returning a distinct
+                    # ``commit_lock_contended`` skipped_reason so
+                    # operators see the contention in audit logs.
+                    # Sibling will write the canonical commit; this
+                    # process correctly skips (idempotent — same as
+                    # the duplicate_intent_token branch).
+                    logger.info(
+                        "[AutoCommitter] Cross-process lock "
+                        "contended for intent_token %s op=%s — "
+                        "skipping (sibling process is committing)",
+                        intent_token[:12], op_id,
+                    )
+                    return CommitResult(
+                        committed=False,
+                        skipped_reason="commit_lock_contended",
+                        intent_token=intent_token,
+                    )
+                return await self._commit_critical_section(
+                    intent_token=intent_token,
+                    op_id=op_id,
+                    description=description,
+                    target_files=target_files,
+                    risk_tier=risk_tier,
+                    provider_name=provider_name,
+                    generation_cost=generation_cost,
+                    signal_source=signal_source,
+                    signal_urgency=signal_urgency,
+                    rationale=rationale,
+                )
+
+        except Exception as exc:
+            logger.warning(
+                "[AutoCommitter] Commit failed for op=%s: %s",
+                op_id, exc,
+            )
+            return CommitResult(committed=False, error=str(exc))
+
+    async def _commit_critical_section(
+        self,
+        *,
+        intent_token: str,
+        op_id: str,
+        description: str,
+        target_files: Tuple[str, ...],
+        risk_tier: Optional[Any],
+        provider_name: str,
+        generation_cost: float,
+        signal_source: str,
+        signal_urgency: str,
+        rationale: str,
+    ) -> "CommitResult":
+        """The TOCTOU-critical section extracted from
+        :meth:`commit` so it can be invoked under the
+        :func:`async_flock_critical_section` guard.
+
+        Pre-Wave-3-hygiene this code lived inline in commit().
+        Refactored 2026-05-05 to support the cross-process lock
+        wrap (PRD §3.6.2 vector #10). NEVER raises out — the
+        outer commit() try/except catches anything that escapes."""
+        try:
             if await self._intent_token_exists(intent_token):
                 logger.info(
                     "[AutoCommitter] Duplicate intent token %s for "
@@ -699,6 +805,32 @@ class AutoCommitter:
     # Notes ref used for intent token storage. Separate namespace from
     # regular git notes so we don't pollute the default notes ref.
     _INTENT_NOTES_REF = "refs/notes/ouroboros-applied"
+
+    # Cross-process lock directory (PRD §3.6.2 vector #10 closure,
+    # Wave 3 hygiene 2026-05-05). Per-token lock files keep
+    # different commit ops from blocking each other while serializing
+    # the TOCTOU section for ops with the SAME intent_token.
+    _LOCK_DIR_NAME = "auto_commit_locks"
+
+    def _intent_lock_path(self, intent_token: str) -> Path:
+        """Per-intent_token lock file under
+        ``<repo_root>/.jarvis/auto_commit_locks/<token>.lock``.
+
+        The token is sha256-hex (64 chars) so the filename is
+        path-safe by construction. Directory is created on demand
+        by the flock primitive. NEVER raises."""
+        # Defensive: clamp to first 32 chars to keep filenames
+        # short, and accept either full token or pre-trimmed
+        # variants. Sha256 maintains uniqueness at 32 hex chars
+        # (128-bit) — collision probability ~2^-128 across the
+        # global commit graph, far below relevant tolerance.
+        safe = (intent_token or "unknown")[:32]
+        return (
+            self._repo_root
+            / ".jarvis"
+            / self._LOCK_DIR_NAME
+            / f"{safe}.lock"
+        )
 
     @staticmethod
     def _compute_intent_token(

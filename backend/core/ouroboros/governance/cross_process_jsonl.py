@@ -61,14 +61,15 @@ Authority invariants (AST-pinned by companion tests):
 """
 from __future__ import annotations
 
+import asyncio
 import errno
 import logging
 import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import AsyncIterator, Iterable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -474,12 +475,108 @@ def flock_append_lines(
 
 
 # ---------------------------------------------------------------------------
+# Async wrapper — async_flock_critical_section
+# ---------------------------------------------------------------------------
+#
+# Rationale: AutoCommitter.commit() runs inside an async event loop
+# and orchestrates ``asyncio.create_subprocess_exec`` git calls. Its
+# critical section spans `_intent_token_exists()` → git commit →
+# `_store_intent_token()` (TOCTOU race per §3.6.2 vector #10). The
+# sync flock_critical_section above would block the event loop for
+# the full git-commit duration. async_flock_critical_section enters
+# / exits the underlying sync context via ``asyncio.to_thread`` so
+# the lock acquisition + release execute in worker threads, while
+# the caller's async block runs while the lock is held.
+#
+# Wave 3 hygiene 2026-05-05 — Item 5 (vector #10 closure).
+
+
+from contextlib import ExitStack as _ExitStack  # noqa: E402
+
+
+@asynccontextmanager
+async def async_flock_critical_section(
+    path: Path,
+    *,
+    timeout_s: Optional[float] = None,
+) -> AsyncIterator[bool]:
+    """Async-safe variant of :func:`flock_critical_section`.
+
+    Acquires the cross-process flock in a worker thread (so the
+    event loop is not blocked during the contention poll) and
+    holds it across the async block. Releases identically on
+    exit. NEVER raises.
+
+    Yields True on success; False on timeout / fcntl-unavailable
+    / OSError (caller branches; same contract as the sync variant).
+
+    Composition: pure wrapper over :func:`flock_critical_section`
+    using :class:`contextlib.AsyncExitStack` to keep the sync
+    context manager's file descriptor open across the async block.
+    No new lock-acquisition logic — single source of truth in the
+    sync primitive.
+
+    Use cases:
+      * AutoCommitter.commit() critical section (PRD §3.6.2 #10
+        — TOCTOU race between intent_token_exists / git commit /
+        store_intent_token)
+      * Any future async caller needing the §33.4 Per-Cluster
+        flock'd JSONL Persistence pattern across awaitable
+        operations.
+    """
+    # Use a sync ExitStack — we drive it from worker threads
+    # via asyncio.to_thread on enter + exit. The sync CM's fd
+    # persists across the async yield because the stack holds
+    # it open until we close().
+    stack = _ExitStack()
+    acquired_holder = [False]
+
+    def _enter() -> bool:
+        # Enter the sync context manager and store its yielded
+        # bool. The CM's __enter__ runs in the worker thread;
+        # __exit__ will run in another worker thread on async
+        # exit. The fd persists across the async block because
+        # the CM's state lives in the stack.
+        cm = flock_critical_section(path, timeout_s=timeout_s)
+        result = stack.enter_context(cm)
+        acquired_holder[0] = bool(result)
+        return acquired_holder[0]
+
+    def _exit() -> None:
+        try:
+            stack.close()
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
+    try:
+        try:
+            ok = await asyncio.to_thread(_enter)
+        except Exception:  # noqa: BLE001 — defensive
+            yield False
+            return
+        try:
+            yield ok
+        finally:
+            try:
+                await asyncio.to_thread(_exit)
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+    except Exception as exc:  # noqa: BLE001 — last-resort
+        logger.debug(
+            "[CrossProcessJSONL] async_flock_critical_section "
+            "raised: %s", exc,
+        )
+        yield False
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
 __all__ = [
     "CROSS_PROCESS_JSONL_SCHEMA_VERSION",
+    "async_flock_critical_section",
     "fcntl_available",
     "flock_append_line",
     "flock_append_lines",
