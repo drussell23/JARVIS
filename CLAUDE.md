@@ -89,8 +89,8 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **Phase B subagents — COMPLETE 2026-04-20** (all 4 graduated, 138 regression tests green): EXPLORE, REVIEW (`JARVIS_REVIEW_SUBAGENT_SHADOW=true` default), PLAN (shadow + parallel-edge default-on, 4× wall-clock on multi-file), GENERAL (infrastructure-only with Semantic Firewall §5). Phase C Slices 1a+1b + Epochs 1+2 landed same day — cage absolute. Details: `memory/project_phase_b_subagent_roadmap.md`, `project_phase_b_step2_deferred.md`, `project_phase_c_general_llm_driver.md`.
 - **GENERAL Semantic Firewall + mutation cage** (`semantic_firewall.py` + `scoped_tool_backend.py` + `dispatch_general`): 11 injection detectors, 5 credential shapes, recursion ban, output quarantine fence, hard-kill wrapper. `ScopedToolBackend` carries per-instance mutation counter + budget as structural COUNT gate (second-rejection after type gate, `POLICY_DENIED reason=mutation_budget_exhausted`). `state_mirror` dict preserves exec_trace across hard-kill. LLM driver gated by `JARVIS_GENERAL_LLM_DRIVER_ENABLED` (default **true** post 2026-04-20).
 - **Gap #4 campaign — CLOSED 2026-04-20** (9 sensors event-primary, 4 polling-by-design): webhook transport for GitHub/CI sensors; `TrinityEventBus` `fs.changed.*` for FS sensors (TestFailure/TodoScanner/Backlog/OpportunityMiner w/ layered storm-guard); conversation-bus for IntentDiscovery. Retained-on-polling (architectural): RuntimeHealth/WebIntelligence/ProactiveExploration/Scheduled. `EventChannelServer` multi-surface (`/webhook/github`, `/webhook/ci`); `/channel/health` per-sensor telemetry. ~120 tests. Details: `memory/project_gap_4_*.md`.
-- **SerpentFlow** (`battle_test/serpent_flow.py`, 1900+ lines): CC-style flowing CLI with `Update(path)` blocks, numbered diffs, per-op reasoning
-- **LiveDashboard** (`battle_test/live_dashboard.py`, 1233 lines): Persistent Rich TUI with 3-channel terminal muting
+- **SerpentFlow** (`battle_test/serpent_flow.py`): CC-style flowing CLI — `Update(path)` blocks, numbered diffs (3-hunk cap, green/red coloring), `⏺`/`⎿` continuation glyphs, per-op reasoning, prompt_toolkit REPL with cwd + mode + posture context.
+- **TUI rendering surface** (`battle_test/{ouroboros_tui,stream_renderer,diff_preview,diff_display,status_line,layout_controller,split_layout}.py`): Live token streaming via Rich `Live + Markdown` with 16ms batched updates (`stream_renderer.py`), Yellow-tier `NOTIFY_APPLY` diff overlay (`diff_preview.py`, transient 5s), legacy ANSI diff fallback (`diff_display.py`), phase/cost/idle status aggregation (`status_line.py`), flow/split/focus mode FSM (`layout_controller.py`) with 3-region Rich `Layout` (`split_layout.py`), Panel-based op lifecycle view (`ouroboros_tui.py`), 3-channel terminal muting throughout.
 - **Venom** (`tool_executor.py`): Multi-turn agentic tool loop -- 16 built-in tools + MCP external tools. Built-in: read_file, search_code, edit_file, write_file, bash, web_fetch, web_search, run_tests, get_callers, glob_files, list_dir, list_symbols, git_log, git_diff, git_blame, ask_human. MCP tools from external servers discovered at prompt time and forwarded (Gap #7). Live context auto-compaction between rounds (Gap #8).
 - **L2 Repair** (`repair_engine.py`): Iterative self-repair FSM (5 iterations, 120s timebox). **Enabled by default** (`JARVIS_L2_ENABLED=true`) — engages when VALIDATE exhausts retries, closes the Ouroboros cycle per Manifesto §6.
 - **Iron Gate** (orchestrator post-GENERATE): Two deterministic gates routed through the GENERATE retry loop. (1) Exploration-first (`JARVIS_EXPLORATION_GATE`): min 2 `read_file`/`search_code`/`get_callers` before any patch. `JARVIS_EXPLORATION_LEDGER_ENABLED=true` switches to diversity-weighted scoring across 5 categories with env-tunable per-complexity floors; insufficient → `ExplorationInsufficientError` + category-aware retry feedback. (2) ASCII-strictness (`JARVIS_ASCII_GATE`): rejects non-ASCII codepoints. Manifesto §6.
@@ -206,8 +206,15 @@ backend/core/ouroboros/
     prophecy_engine.py          # Regression prediction
   battle_test/
     harness.py                  # 6-layer stack boot
-    serpent_flow.py             # SerpentFlow: CC-style CLI (1,900+ lines)
-    live_dashboard.py           # Persistent Rich TUI (1,233 lines)
+    serpent_flow.py             # SerpentFlow: CC-style flowing CLI + REPL
+    serpent_flow_app.py         # Entry point harness
+    ouroboros_tui.py            # Panel-based op lifecycle view (provider badges, phase transitions, generation results)
+    stream_renderer.py          # GENERATE token streaming — Rich Live + Markdown, 16ms batched
+    diff_preview.py             # Yellow-tier NOTIFY_APPLY diff overlay (transient 5s, file-tree + Syntax)
+    diff_display.py             # Legacy ANSI diff formatter (fallback path)
+    status_line.py              # Phase/cost/idle/route/op-count aggregation (one-liner render)
+    layout_controller.py        # Mode FSM: flow / split / focus
+    split_layout.py             # 3-region Rich Layout (stream / dashboard / diff) for split+focus modes
   oracle.py                     # Codebase semantic index
 ```
 
