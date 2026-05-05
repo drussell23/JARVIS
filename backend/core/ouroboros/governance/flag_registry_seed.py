@@ -3744,6 +3744,88 @@ SEED_SPECS: list = [
         example="3",
         since="Phase 10 Slice 5 (PRD §32.8.1, 2026-05-05)",
     ),
+    # ====================================================================
+    # Move 8 — Proactive Curiosity Loop (PRD §29.7) Slice 1 — 4 flags
+    # Master is OPERATOR-PINNED default-FALSE per §33.1 graduation
+    # contract pattern; flips only after Slice 3's empirical contract
+    # proves the loop respects SensorGovernor caps.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_PROACTIVE_CURIOSITY_READER_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master kill switch for Move 8 Proactive Curiosity "
+            "Loop substrate (PRD §29.7). When false (the default), "
+            "rank_curious_clusters() returns an empty tuple and "
+            "Slice 2's ProactiveExplorationSensor wire-up "
+            "short-circuits — composes M9 producer side without "
+            "auto-spawning intents. OPERATOR-PINNED default-FALSE "
+            "per §33.1; flips only after Slice 3's graduation "
+            "contract proves the loop doesn't overrun "
+            "SensorGovernor caps."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "proactive_curiosity_reader.py"
+        ),
+        example="false",
+        since="Move 8 Slice 1 (PRD §29.7, 2026-05-05)",
+    ),
+    FlagSpec(
+        name="JARVIS_PROACTIVE_CURIOSITY_TOP_K",
+        type=FlagType.INT, default=3,
+        description=(
+            "Number of curious clusters to surface per scan. "
+            "Default 3 (matches the existing per-scan emit-cap "
+            "discipline of cluster_coverage — small enough to "
+            "avoid intake flood). Clamped [1, 16]."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "proactive_curiosity_reader.py"
+        ),
+        example="3",
+        since="Move 8 Slice 1 (PRD §29.7, 2026-05-05)",
+    ),
+    FlagSpec(
+        name="JARVIS_PROACTIVE_CURIOSITY_MAGNITUDE_FLOOR",
+        type=FlagType.FLOAT, default=0.40,
+        description=(
+            "Minimum curiosity magnitude to consider for "
+            "ranking. Default 0.40 (matches the existing "
+            "JARVIS_EXPLORATION_ENTROPY_THRESHOLD precedent for "
+            "'this is interesting enough to surface'). Clamped "
+            "[0.0, 1.0]."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "proactive_curiosity_reader.py"
+        ),
+        example="0.40",
+        since="Move 8 Slice 1 (PRD §29.7, 2026-05-05)",
+    ),
+    FlagSpec(
+        name="JARVIS_PROACTIVE_CURIOSITY_COOLDOWN_S",
+        type=FlagType.INT, default=14400,
+        description=(
+            "Minimum interval (seconds) between repeated "
+            "rankings of the same cluster_id. Cross-call dedup "
+            "in the in-process cooldown ledger. Default 14400 "
+            "(4h — long enough to give the cluster a chance to "
+            "drift; short enough to re-fire within a work "
+            "session). Clamped [60, 7d]."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/"
+            "proactive_curiosity_reader.py"
+        ),
+        example="14400",
+        since="Move 8 Slice 1 (PRD §29.7, 2026-05-05)",
+    ),
     FlagSpec(
         name="JARVIS_REPL_DISPATCH_AUTODISCOVERY_ENABLED",
         type=FlagType.BOOL, default=True,
