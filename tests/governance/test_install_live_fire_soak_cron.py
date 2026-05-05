@@ -54,6 +54,7 @@ def test_dry_run_emits_cron_block():
     assert "LIVE_FIRE_SOAK_BEGIN" in r.stdout
     assert "LIVE_FIRE_SOAK_END" in r.stdout
     assert "live_fire_graduation_soak.py" in r.stdout
+    assert "JARVIS_GRADUATION_LEDGER_ENABLED=true" in r.stdout
     assert "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true" in r.stdout
 
 
@@ -108,7 +109,8 @@ def test_dry_run_carries_pause_documentation():
 
 
 # ---------------------------------------------------------------------------
-# 2026-04-27 update — three-master-flag cron entry
+# 2026-04-27 update — cron entry env block (soak + contract + circuit breaker)
+# 2026-05-05 update — JARVIS_GRADUATION_LEDGER_ENABLED for parent harness writes
 # ---------------------------------------------------------------------------
 
 
@@ -133,12 +135,14 @@ def test_dry_run_arms_circuit_breaker():
     )
 
 
-def test_dry_run_three_master_flags_in_correct_order():
-    """The cron entry must arm all three master flags BEFORE
-    invoking python — env-on-prefix syntax. Order: soak, contract,
-    circuit-breaker. Not strictly required, but pinned for review-
-    friendly diffs."""
+def test_dry_run_env_flags_in_correct_order():
+    """The cron entry must arm env vars BEFORE invoking python —
+    env-on-prefix syntax. Order: graduation ledger, soak, contract,
+    circuit-breaker. Pinned for review-friendly diffs."""
     r = _run(["--dry-run"])
+    ledger_idx = r.stdout.index(
+        "JARVIS_GRADUATION_LEDGER_ENABLED=true",
+    )
     soak_idx = r.stdout.index(
         "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true",
     )
@@ -149,7 +153,7 @@ def test_dry_run_three_master_flags_in_correct_order():
         "JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true",
     )
     py_idx = r.stdout.index("/usr/bin/env python3")
-    assert soak_idx < contract_idx < cb_idx < py_idx
+    assert ledger_idx < soak_idx < contract_idx < cb_idx < py_idx
 
 
 def test_dry_run_documents_contract_in_comment_block():
@@ -160,13 +164,14 @@ def test_dry_run_documents_contract_in_comment_block():
     assert "Circuit breaker (Option C)" in r.stdout
 
 
-def test_dry_run_only_one_set_of_three_flags():
+def test_dry_run_only_one_set_of_cron_env_flags():
     """Bit-rot guard: re-running --dry-run after a refactor must
     NOT accidentally double the flag block (e.g. a buggy edit that
-    appends a second cron line). Each master flag literal appears
-    EXACTLY ONCE in the rendered cron entry."""
+    appends a second cron line). Each env literal appears EXACTLY ONCE
+    in the rendered cron entry."""
     r = _run(["--dry-run"])
     for flag in [
+        "JARVIS_GRADUATION_LEDGER_ENABLED=true",
         "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true",
         "JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true",
         "JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true",

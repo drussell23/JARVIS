@@ -85,7 +85,12 @@ EOF
 }
 
 build_cron_block() {
-    # Three master flags armed in the cron entry:
+    # Four env vars armed in the cron entry (parent harness process):
+    #
+    # 0. JARVIS_GRADUATION_LEDGER_ENABLED=true — required so the harness
+    #    process can call GraduationLedger.record_session after the soak
+    #    subprocess returns (subprocess already gets ledger=true via
+    #    live_fire_soak._build_env_for_flag; parent must match for writes).
     #
     # 1. JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true — original P9.1
     #    master switch. Cron-only authority; no production-runtime side
@@ -109,8 +114,8 @@ build_cron_block() {
     #    the fallback if circuit-breaker raises (try/except wrap
     #    in orchestrator).
     #
-    # All three default OFF in the codebase. Cron sets them locally
-    # for the subprocess invocation only — no global state mutation.
+    # All default OFF in the codebase. Cron sets them locally for this
+    # invocation only — no global state mutation.
     cat <<EOF
 $BEGIN_MARKER
 # Phase 9.1 — Live-Fire Graduation Soak Harness (auto-installed)
@@ -118,7 +123,8 @@ $BEGIN_MARKER
 # Operator pause: export JARVIS_LIVE_FIRE_GRADUATION_SOAK_PAUSED=true
 # Contract consultation (P9.2) blocks 0-op false-graduation.
 # Circuit breaker (Option C) keeps logs mathematically pure on DW topology block.
-$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
+# Graduation ledger enabled so parent harness persists clean counts.
+$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
 $END_MARKER
 EOF
 }
@@ -200,9 +206,10 @@ run_once() {
         echo -e "${DIM}  setting=true for this single invocation${RESET}"
     fi
     cd "$REPO_ROOT"
-    # --once mirrors the cron entry's three master flags so a
-    # first-proof run reproduces production cadence behavior.
-    JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true \
+    # --once mirrors the cron entry's env block so a first-proof run
+    # reproduces production cadence behavior (incl. ledger writes).
+    JARVIS_GRADUATION_LEDGER_ENABLED=true \
+        JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true \
         JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true \
         JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true \
         python3 "$HARNESS_SCRIPT" run \

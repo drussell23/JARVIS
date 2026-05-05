@@ -32,6 +32,11 @@ this script does parsing + rendering only.
   0 */8 * * *  cd /path/to/repo && JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true \\
                python3 scripts/live_fire_graduation_soak.py run
 
+Operator helper (sets graduation ledger + soak + contract + DW env):
+``bash scripts/run_live_fire_graduation_soak.sh [subcommand ...]``.
+Example crontab fragment: ``scripts/crontab-live-fire.example``.
+Installer: ``bash scripts/install_live_fire_soak_cron.sh --install``.
+
 Three runs per day rotating through pickable flags. Per PRD §9 P9.1
 estimate: ~3 flips/week × 12+ flags ≈ 4-6 weeks to fully graduated.
 """

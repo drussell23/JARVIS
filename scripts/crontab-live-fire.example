@@ -1,0 +1,19 @@
+# Phase 9 — Live-fire graduation soak (example crontab fragment)
+#
+# 1. Replace /ABSOLUTE/PATH/TO/JARVIS-AI-Agent with your clone.
+# 2. crontab -e and paste ONE line (uncommented), or use:
+#      bash scripts/install_live_fire_soak_cron.sh --install
+#
+# Schedule: every 8 hours (~3 soaks/day). Tunes via COST_CAP / WALL / TIMEOUT.
+#
+# Env block (must match parent harness needs + PRD P9.2 + Option C):
+#   JARVIS_GRADUATION_LEDGER_ENABLED — parent process ledger writes after soak
+#   JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED — allow forked battle test
+#   JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT — block false CLEAN (0-op, etc.)
+#   JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED — clean DW-topology reject path
+#
+# Log directory is created by install_live_fire_soak_cron.sh; for a manual
+# one-liner, mkdir -p the log dir first.
+
+# LOG_DIR=/ABSOLUTE/PATH/TO/JARVIS-AI-Agent/.jarvis/live_fire_soak_logs
+# 0 */8 * * * cd /ABSOLUTE/PATH/TO/JARVIS-AI-Agent && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true /usr/bin/env python3 scripts/live_fire_graduation_soak.py run --cost-cap 0.50 --max-wall-seconds 2400 --timeout 3600 >> .jarvis/live_fire_soak_logs/cron.log 2>&1
