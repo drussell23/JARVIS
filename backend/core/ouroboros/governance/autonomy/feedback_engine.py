@@ -89,6 +89,51 @@ class FeedbackEngineConfig:
 
 
 # ---------------------------------------------------------------------------
+# Default-singleton accessor (PRD §37 Slice 3, 2026-05-05)
+# ---------------------------------------------------------------------------
+#
+# AutonomyFeedbackEngine is constructed by L2 with session-specific config
+# (event_dir, state_dir, command_bus). To enable the operator-facing
+# ``/why-changed`` REPL to read engine state without threading an engine
+# reference through every layer, the FIRST AutonomyFeedbackEngine
+# constructed in a session registers itself as the default singleton
+# (see :class:`AutonomyFeedbackEngine.__init__` registration block).
+#
+# First-engine-wins: subsequent constructions in the same process don't
+# override (e.g., test fixtures that create a fresh engine still see
+# the original singleton until reset). Test isolation: call
+# :func:`reset_default_engine_for_tests` between test runs.
+#
+# Returns ``None`` when no engine has been constructed yet — operator
+# surface (``/why-changed``) renders an honest "engine not booted" line
+# rather than fabricating state.
+
+_DEFAULT_ENGINE: Optional["AutonomyFeedbackEngine"] = None
+
+
+def get_default_engine() -> Optional["AutonomyFeedbackEngine"]:
+    """Return the process-wide default
+    :class:`AutonomyFeedbackEngine` singleton, or ``None`` if no
+    engine has been constructed yet.
+
+    Use this from any code that needs to read engine state across
+    subsystems (the ``/why-changed`` REPL surface). Producers
+    construct + own the engine instance; consumers read via this
+    singleton.
+
+    NEVER raises.
+    """
+    return _DEFAULT_ENGINE
+
+
+def reset_default_engine_for_tests() -> None:
+    """Test-only — production code never calls. Pinned via naming
+    convention (``_for_tests`` suffix)."""
+    global _DEFAULT_ENGINE
+    _DEFAULT_ENGINE = None
+
+
+# ---------------------------------------------------------------------------
 # AutonomyFeedbackEngine
 # ---------------------------------------------------------------------------
 
@@ -133,6 +178,50 @@ class AutonomyFeedbackEngine:
 
         # Load persisted cursor on construction
         self._load_cursor()
+
+        # PRD §37 Slice 3 (2026-05-05) — register self with the
+        # process-wide default singleton so the operator-facing
+        # ``/why-changed`` REPL can read decision state without
+        # threading an engine reference through every layer.
+        # First-engine-wins; subsequent constructions don't override.
+        global _DEFAULT_ENGINE
+        if _DEFAULT_ENGINE is None:
+            _DEFAULT_ENGINE = self
+
+    # ------------------------------------------------------------------
+    # Read-side helpers for operator surfaces (PRD §37 Slice 3, 2026-05-05)
+    # ------------------------------------------------------------------
+
+    def rollback_counts_snapshot(self) -> Dict[str, int]:
+        """Return the current per-brain rollback-count map. Defensive
+        copy — caller mutations don't leak into engine state. Used by
+        the ``/why-changed`` REPL surface."""
+        return dict(self._rollback_counts)
+
+    def brain_hint_threshold(self) -> int:
+        """Return the rollback threshold at which the engine emits
+        ADJUST_BRAIN_HINT advisory commands. Read-only."""
+        return int(self._brain_hint_threshold)
+
+    def seen_files_snapshot(self) -> List[str]:
+        """Return the sorted snapshot of curriculum / reactor files
+        the engine has processed. Defensive copy."""
+        return sorted(self._seen_files)
+
+    def brains_at_threshold(self) -> List[str]:
+        """Return brain IDs whose current rollback count meets or
+        exceeds the hint threshold. These are the brains for which
+        the engine has emitted (or will emit on next rollback) an
+        ADJUST_BRAIN_HINT advisory. Sorted by count descending,
+        then brain_id ascending for stable rendering."""
+        threshold = self._brain_hint_threshold
+        at_threshold = [
+            (bid, count)
+            for bid, count in self._rollback_counts.items()
+            if count >= threshold
+        ]
+        at_threshold.sort(key=lambda t: (-t[1], t[0]))
+        return [bid for bid, _ in at_threshold]
 
     # ------------------------------------------------------------------
     # Public API
