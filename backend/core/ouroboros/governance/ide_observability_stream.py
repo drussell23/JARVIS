@@ -851,6 +851,74 @@ class StreamEventBroker:
     def dropped_count(self) -> int:
         return self._dropped_count
 
+    # --- read-side helpers for operator surfaces ------------------------
+    # PRD §37 Slice 2 (2026-05-05) — ``/listen`` REPL composes these.
+    # All return fresh lists/tuples (caller mutations don't leak back
+    # into broker state). Lock-protected snapshot reads.
+
+    def recent_history(
+        self,
+        *,
+        limit: int = 20,
+        event_type: Optional[str] = None,
+        op_id: Optional[str] = None,
+    ) -> List["StreamEvent"]:
+        """Return the most-recent ``limit`` events from the bounded
+        history ring, optionally filtered by ``event_type`` and/or
+        ``op_id``. Returns events in chronological order (oldest
+        first within the requested window).
+
+        Defensive: caller mutations of the returned list do not
+        leak into broker state. Lock-protected snapshot. NEVER
+        raises.
+
+        Used by the ``/listen`` operator surface to render event
+        history for forensic + state-reconstruction needs.
+        """
+        try:
+            limit_clamped = max(1, min(int(limit), self._history_maxlen))
+        except (TypeError, ValueError):
+            limit_clamped = 20
+        with self._lock:
+            # Snapshot the deque to a list under the lock so no
+            # concurrent publish modifies it during iteration.
+            snapshot = list(self._history)
+        # Apply filters in chronological order (deque order).
+        filtered: List["StreamEvent"] = []
+        for ev in snapshot:
+            if event_type is not None and ev.event_type != event_type:
+                continue
+            if op_id is not None and ev.op_id != op_id:
+                continue
+            filtered.append(ev)
+        # Take the last `limit_clamped` entries (most-recent within
+        # the filter; chronological ordering preserved).
+        return filtered[-limit_clamped:]
+
+    def distinct_event_types(self) -> List[str]:
+        """Return the alphabetically-sorted list of distinct event
+        types currently present in history. Cheap; uses set
+        comprehension. NEVER raises."""
+        with self._lock:
+            return sorted({ev.event_type for ev in self._history})
+
+    def distinct_op_ids(self, *, limit: int = 50) -> List[str]:
+        """Return up to ``limit`` distinct op_ids most-recent-first
+        within history. Caps at ``limit`` to prevent operator
+        wall-of-text rendering when the ring is full."""
+        try:
+            limit_clamped = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit_clamped = 50
+        with self._lock:
+            seen: Dict[str, None] = {}
+            for ev in reversed(self._history):
+                if ev.op_id and ev.op_id not in seen:
+                    seen[ev.op_id] = None
+                    if len(seen) >= limit_clamped:
+                        break
+        return list(seen.keys())
+
     # --- per-subscriber health (edge-case race fix 2026-05-01) -----
 
     def subscriber_health(self) -> List[Dict[str, Any]]:
