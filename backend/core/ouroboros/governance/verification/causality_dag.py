@@ -322,6 +322,60 @@ class CausalityDAG:
         except Exception:  # noqa: BLE001 — defensive
             return ()
 
+    def ancestors_of(
+        self,
+        record_id: str,
+        *,
+        max_depth: int = 16,
+    ) -> Tuple[str, ...]:
+        """Return ancestor record_ids reachable from ``record_id``
+        within ``max_depth`` parent-edge hops upstream.
+
+        Excludes ``record_id`` itself (a node is NOT its own
+        ancestor). BFS traversal — depth-1 ancestors come before
+        depth-2 in the result tuple. NEVER raises.
+
+        Returns empty tuple on:
+          * missing / unknown ``record_id``
+          * blank / non-string ``record_id``
+          * non-positive ``max_depth``
+          * any internal exception (defensive)
+
+        §31 U2 empirical-wiring read API. Public companion of
+        :meth:`subgraph` — both walk parent edges, but
+        ``ancestors_of`` returns a flat ID tuple (cheap; for
+        feature extraction) while ``subgraph`` returns a full
+        ``CausalityDAG`` slice (expensive; for replay).
+        """
+        try:
+            rid = str(record_id or "").strip()
+            if not rid:
+                return ()
+            if rid not in self._nodes:
+                return ()
+            try:
+                depth_cap = int(max_depth)
+            except (TypeError, ValueError):
+                return ()
+            if depth_cap <= 0:
+                return ()
+            visited: set = set()
+            ordered: list = []
+            queue: deque = deque([(rid, 0)])
+            while queue:
+                current, d = queue.popleft()
+                if d >= depth_cap:
+                    continue
+                for pid in self._edges.get(current, ()):
+                    if pid in visited:
+                        continue
+                    visited.add(pid)
+                    ordered.append(pid)
+                    queue.append((pid, d + 1))
+            return tuple(ordered)
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+
     # -- bounded traversal -------------------------------------------------
 
     def subgraph(

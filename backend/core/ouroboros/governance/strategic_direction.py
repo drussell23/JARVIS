@@ -125,6 +125,9 @@ class StrategicDirectionService:
         *,
         target_files: Optional[Sequence[str]] = None,
         plan: Optional[Any] = None,
+        op_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        record_id: Optional[str] = None,
     ) -> str:
         """Format the digest for injection into strategic_memory_prompt.
 
@@ -142,6 +145,18 @@ class StrategicDirectionService:
         Situation`` block is appended (3KB budget cap). Existing
         callers that do not pass these kwargs are byte-identical
         to pre-Slice-4 behavior.
+
+        §31 U2 Slice 2 (2026-05-05): Optional kwargs ``session_id``
+        + ``record_id`` enable the empirical-wiring causal-lineage
+        injection. When both are present + the master flag
+        ``JARVIS_CAUSAL_DECISION_CONSUMER_ENABLED`` is on +
+        :func:`causality_consumer.compute_op_causal_features`
+        returns non-disabled features with ancestor_count > 0, a
+        ``## Recent Causal Lineage`` block is appended (2KB
+        budget cap). Existing callers that do not pass these
+        kwargs are byte-identical to pre-Slice-2 behavior. ``op_id``
+        is reserved for future per-op telemetry but is not
+        load-bearing today.
         """
         if not self._digest:
             return ""
@@ -188,6 +203,18 @@ class StrategicDirectionService:
         )
         if action_outcomes_block:
             body = f"{body}\n\n{action_outcomes_block}"
+        # §31 U2 Slice 2 — Causal-lineage injection. Mirrors the
+        # failure-modes / action-outcomes discipline: ImportError-
+        # safe, master-flag-checked inside the substrate, empty
+        # when no signal exists. Appended LAST among additive
+        # blocks so the most recent decision-graph context sits
+        # closest to the model's first-attempt generation point.
+        causal_lineage_block = self._render_causal_lineage_section(
+            session_id=session_id,
+            record_id=record_id,
+        )
+        if causal_lineage_block:
+            body = f"{body}\n\n{causal_lineage_block}"
         return body
 
     @staticmethod
@@ -336,6 +363,59 @@ class StrategicDirectionService:
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return section
+        except Exception:  # noqa: BLE001 — fail-silent
+            return ""
+
+    @staticmethod
+    def _render_causal_lineage_section(
+        *,
+        session_id: Optional[str],
+        record_id: Optional[str],
+    ) -> str:
+        """Compose the optional ``## Recent Causal Lineage``
+        block (§31 U2 Slice 2 / PRD §31.3 empirical wiring).
+
+        Discipline (load-bearing — mirrors failure-modes /
+        action-outcomes / posture / codebase-character):
+
+          * Either kwarg None → empty (no decision context yet).
+          * ImportError-safe — causality_consumer absent → empty.
+          * Master flag check (per-request, lives inside
+            :func:`causality_consumer.compute_op_causal_features`).
+          * Empty / DISABLED features → empty (no empty headers).
+          * Char budget capped inside
+            :func:`compose_causal_lineage_section` (2KB default).
+          * Authority-free — section explicitly disclaims
+            execution authority (Iron Gate / SemanticGuardian /
+            risk tier still gate every patch post-generation;
+            this is *prior context only*).
+          * Fail-silent on any exception — never break prompt
+            composition.
+
+        Differs from :meth:`_render_action_outcomes_section`:
+          (a) ctx requirements (session_id + record_id, NOT
+              target_files);
+          (b) substrate (causality_consumer vs
+              action_outcome_memory);
+          (c) budget (2KB vs 4KB — lineage is a structural
+              digest, not a verbatim payload).
+        """
+        if session_id is None or record_id is None:
+            return ""
+        try:
+            from backend.core.ouroboros.governance.causality_consumer import (  # noqa: E501
+                compose_causal_lineage_section,
+                compute_op_causal_features,
+            )
+        except ImportError:
+            return ""
+        try:
+            features = compute_op_causal_features(
+                session_id=session_id,
+                record_id=record_id,
+            )
+            section = compose_causal_lineage_section(features)
+            return section or ""
         except Exception:  # noqa: BLE001 — fail-silent
             return ""
 

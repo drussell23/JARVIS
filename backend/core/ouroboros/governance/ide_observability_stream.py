@@ -174,6 +174,17 @@ EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING = (
     "circuit_breaker_approaching"
 )
 
+# §31 U2 Slice 3 (PRD §31.3 empirical wiring, 2026-05-05) —
+# causal-decision advisory transitions. The chatter-suppressed
+# observer composes :func:`causality_consumer.compute_op_causal_features`
+# and emits this event ONLY on advice TRANSITIONS — same-band
+# observations are silent (mirrors the cost_band_crossed +
+# circuit_breaker_approaching discipline). Payload carries
+# session_id + record_id + from_advice + to_advice +
+# ancestor_count + sibling_count + recurrence_score. Operators
+# consume via `/listen filter type=causal_advisory_emitted`.
+EVENT_TYPE_CAUSAL_ADVISORY_EMITTED = "causal_advisory_emitted"
+
 # M9 CuriosityGradient (PRD §30.5.1) Slice 4 vocabulary.
 # Single event covering all CuriosityScore transitions — payload
 # carries cluster_id + magnitude + dominant_source + decay_reason
@@ -657,6 +668,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COST_BAND_CROSSED,                # §37 Slice 5 (PRD §37.7 Tier 1 #1)
     EVENT_TYPE_PLAN_GENERATED,                   # §37 Slice 6 (PRD §37.7 Tier 1 #3)
     EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING,      # §37 Slice 8 (PRD §37.7 Tier 1 #6)
+    EVENT_TYPE_CAUSAL_ADVISORY_EMITTED,          # §31 U2 Slice 3 (PRD §31.3 empirical wiring)
 })
 
 
