@@ -160,6 +160,20 @@ EVENT_TYPE_COST_BAND_CROSSED = "cost_band_crossed"
 # risk_factors / test_strategy / complexity).
 EVENT_TYPE_PLAN_GENERATED = "plan_generated"
 
+# §37 Slice 8 (PRD §37.7 Tier 1 #6, 2026-05-05) — pre-trip
+# circuit-breaker warning. Composes Slice 5's band-crossing
+# discipline applied to ``CircuitBreaker._failure_count`` vs
+# ``_failure_threshold``. Operators see the band ladder
+# (NOTICE / WARN / CRITICAL / BREACH) BEFORE the breaker
+# trips OPEN, instead of only seeing the trip event after
+# the fact. Payload carries breaker_id (component identifier)
+# + from_band + to_band + failure_count + threshold + ratio.
+# Operators consume via `/listen filter
+# type=circuit_breaker_approaching`.
+EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING = (
+    "circuit_breaker_approaching"
+)
+
 # M9 CuriosityGradient (PRD §30.5.1) Slice 4 vocabulary.
 # Single event covering all CuriosityScore transitions — payload
 # carries cluster_id + magnitude + dominant_source + decay_reason
@@ -642,6 +656,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE,  # M11 Slice 4 (PRD §30.5.3)
     EVENT_TYPE_COST_BAND_CROSSED,                # §37 Slice 5 (PRD §37.7 Tier 1 #1)
     EVENT_TYPE_PLAN_GENERATED,                   # §37 Slice 6 (PRD §37.7 Tier 1 #3)
+    EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING,      # §37 Slice 8 (PRD §37.7 Tier 1 #6)
 })
 
 

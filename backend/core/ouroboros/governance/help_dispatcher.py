@@ -497,8 +497,51 @@ def _top_index(flag_registry: Any, verb_registry: VerbRegistry) -> HelpDispatchR
 def _list_verbs(verb_registry: VerbRegistry) -> HelpDispatchResult:
     verbs = verb_registry.list_all()
     lines = [f"  {len(verbs)} REPL verbs:"]
+    # §37 Slice 9 (2026-05-05) — wrap verb names in OSC 8
+    # hyperlinks pointing to the corresponding `<verb>_repl.py`
+    # source file (when it exists per §32.11 naming-cage
+    # convention). Modern terminals render clickable links to
+    # editor-jump; older terminals see plain text.
+    try:
+        from backend.core.ouroboros.governance.osc8 import (
+            file_url as _osc8_file_url,
+            wrap as _osc8_wrap,
+        )
+        from pathlib import Path as _Path
+        _governance_root = _Path(__file__).resolve().parent
+    except Exception:  # noqa: BLE001 — defensive
+        _osc8_wrap = None
+        _osc8_file_url = None
+        _governance_root = None
     for v in verbs:
-        lines.append(f"    {v.name:<12s}  [{v.category}]  {v.one_line}")
+        # Strip leading slash for filename convention:
+        # `/health` → `health_repl.py`. Verb names with
+        # underscores (e.g. `/why_changed`) match directly.
+        bare_name = v.name.lstrip("/")
+        rendered_name = v.name
+        if _osc8_wrap is not None and _governance_root is not None:
+            candidate = (
+                _governance_root / f"{bare_name}_repl.py"
+            )
+            try:
+                if candidate.is_file():
+                    url = _osc8_file_url(str(candidate))
+                    if url:
+                        rendered_name = _osc8_wrap(
+                            v.name, url,
+                        )
+            except OSError:
+                pass
+        # The format string uses :<12s width on the bare name
+        # for column alignment. When wrapped in OSC 8 escape
+        # sequences, the visible width still matches but the
+        # underlying string is longer. Reapply width manually
+        # to the bare name + use the wrapped string for output.
+        padding = max(0, 12 - len(v.name))
+        lines.append(
+            f"    {rendered_name}{' ' * padding}  "
+            f"[{v.category}]  {v.one_line}"
+        )
     return HelpDispatchResult(ok=True, text="\n".join(lines))
 
 

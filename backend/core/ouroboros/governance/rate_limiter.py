@@ -405,6 +405,26 @@ class CircuitBreaker:
             if self._failure_count >= self._failure_threshold:
                 self._opened_at = time.monotonic()
                 self._transition(BreakerState.OPEN)
+        # §37 Slice 8 (2026-05-05) — feed approach-to-trip
+        # observer so operators see band crossings (NOTICE /
+        # WARN / CRITICAL / BREACH) BEFORE silent trips. Self-
+        # gates via chatter-suppression in the observer; this
+        # call is safe to make on every failure. Defensive:
+        # observer NEVER raises; CircuitBreaker NEVER breaks
+        # on observer error.
+        try:
+            from backend.core.ouroboros.governance.circuit_breaker_warning_observer import (
+                get_default_observer as _get_breaker_observer,
+            )
+            _get_breaker_observer().record_failure(
+                breaker_id=getattr(
+                    self, "_breaker_id", "circuit_breaker",
+                ),
+                failure_count=self._failure_count,
+                threshold=self._failure_threshold,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     def reset_terminal(self) -> bool:
         """Slice H — explicit reset of TERMINAL_OPEN to CLOSED.
