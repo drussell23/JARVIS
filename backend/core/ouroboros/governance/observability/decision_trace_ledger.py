@@ -87,11 +87,20 @@ SCHEMA_VERSIONS_READABLE: Tuple[str, ...] = ("1", "2")
 
 
 def is_ledger_enabled() -> bool:
-    """Master flag — ``JARVIS_DECISION_TRACE_LEDGER_ENABLED``
-    (default false)."""
-    return os.environ.get(
+    """Master flag — ``JARVIS_DECISION_TRACE_LEDGER_ENABLED``.
+    **Graduated default-TRUE 2026-05-05** via Phase 9 cadence
+    (3 clean soaks: bt-2026-05-05-232425, bt-2026-05-06-003227,
+    bt-2026-05-06-011344 — all `outcome=clean ops=16 cost=$0.00
+    runner_attributed=False notes=complete_no_runner_failures`).
+    First flag graduation under the seeded-workload + Slice 4 +
+    Slice 5 substrate. Hot-revert: `export
+    JARVIS_DECISION_TRACE_LEDGER_ENABLED=false`."""
+    raw = os.environ.get(
         "JARVIS_DECISION_TRACE_LEDGER_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated default-TRUE 2026-05-05
+    return raw in _TRUTHY
 
 
 def ledger_path() -> Path:

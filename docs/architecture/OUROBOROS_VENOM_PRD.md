@@ -1,7 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.37 (2026-05-05 — **Phase 9 cadence pre-flight hardening shipped — closes 2 latent blockers + 1 operator-UX gap before operator commits wall-clock time**: 16 new regression tests in `tests/governance/test_phase_9_cadence_hardening.py` (236/236 across full Phase 9 + Move 7 + Move 8 + closure + Wave 3 hygiene sweep). Pre-cadence audit (Explore agent) found one CRITICAL data-loss race + 3 hardening gaps. **Slice 1 (CRITICAL)**: `_run_battle_test_subprocess` previously derived session-detection anchor as `time.time() - timeout_s - 60` AFTER `subprocess.run` returned — forward NTP skew (or DST forward-jump) during the subprocess could move `time.time()` such that the session subprocess just wrote (mtime set by OS) gets filtered out by the post-derived window, producing SUMMARY_PARSE_FAILED with no recovery and wasting that soak's evidence. Fix: capture `start_wall_anchor = time.time()` BEFORE `subprocess.run`, derive `after_epoch = start_wall_anchor - _SESSION_DETECTION_GRACE_S` (load-bearing reference; forward skew during subprocess cannot move the captured anchor; backward skew absorbed by 60s grace). Module constant `_SESSION_DETECTION_GRACE_S = 60.0` documents the discipline. **Defense-in-depth**: `_read_most_recent_session` previously sorted candidates by lexicographic name (`sorted(sessions_root.iterdir(), reverse=True)`) — robust ONLY while the battle-test naming convention `bt-YYYY-MM-DD-HHMMSS` holds. Refactored to sort by `st_mtime` descending; matches actual semantic of "most recent." **Slice 2 (operator-UX)**: new `python3 scripts/live_fire_graduation_soak.py ready` CLI subcommand composes existing `GraduationLedger.eligible_flags()` primitive — answers "which flags are ready to flip RIGHT NOW?" in one command. Closes the cognitive-load gap of operator scanning full `queue` output × 24 flags × ~36 soaks of cadence runs. Renders flag list + clean/required progress + dependency status + next-steps guidance. Empty-eligible case prints accumulate-more-evidence guidance instead of confusing silence. **Pinned via 5 source-AST regression checks** (banned-pattern detector for `time.time() - timeout_s` derivation in `_run_battle_test_subprocess`; `_SESSION_DETECTION_GRACE_S` constant present; `start_wall_anchor` captured before `subprocess.run`; `after_epoch` derived from `start_wall_anchor - _SESSION_DETECTION_GRACE_S` shape; `_read_most_recent_session` references `st_mtime`) + 6 behavioral pins on mtime-sort robustness (lexicographic-vs-mtime divergence test proves the fix isn't a no-op; missing-root + empty-root + non-dir-entries + crashed-session-no-summary defensive paths) + 5 CLI shape pins (`cmd_ready` exists + wired into handlers + subparser registered + empty-ledger smoke + populated-ledger smoke). **The operator can now commit wall-clock time confidently.** PRD §36.5 priority #1 row updated with hardening citation. **NEXT**: operator decision — (a) start Phase 9 cadence (run `bash scripts/run_live_fire_graduation_soak.sh` repeatedly; watch `python3 scripts/live_fire_graduation_soak.py ready` for graduation signals) OR (b) execute Priority #2 `--rerun-from` + `/replay` (~3d Temporal Observability spine) OR (c) sweep Priority #3 6-arc UX/autonomy slices (~15-20h). See v2.36 below for §36 brutal review details.)
+**Version**: 2.38 (2026-05-05 — **Phase 9 Day 1 — first flag graduation + §37 Operator UX/UI v10 Brutal Review added**: 5 manual soaks completed (3 clean + 2 legacy-waived); `JARVIS_DECISION_TRACE_LEDGER_ENABLED` graduated default-FALSE → default-TRUE per Phase 9.2 contract evidence ladder (3 unique-session-id clean rows: bt-2026-05-05-232425 / bt-2026-05-06-003227 / bt-2026-05-06-011344, each `outcome=clean ops=16 cost=$0.00 runner_attributed=False notes=complete_no_runner_failures`); cron installed at 12h cadence (00:00/12:00 PDT, 2 fires/day, ~$1/day max API spend; `0 */12 * * *` hot-revert via `--remove`). All 5 Phase 9 Slices empirically validated under real provider conditions; halt discipline applied at every diagnostic event. **First flag graduation event of the entire Phase 9 cadence — closes 1/12+ default-FALSE flags from §3.6.2 vector #6 critical blocker** (calendar to remaining: ~6-9 weeks at 12h cadence). New **§37 Operator UX/UI v10 Brutal Review + Comprehensive CC-Feature Catalog** (~6.6K words, 10 subsections) covers: (37.1) current CLI surface inventory file:line-grounded — 41 unique verb surfaces (20 hardcoded + 21 auto-discovered) + 6 live during-op rendering layers (status line / op blocks / narrative / tool render / diff preview / stream renderer) + cross-substrate ref scheme (`o-N`/`t-N`/`n-N`/`d-N` unified `/expand <ref>` dispatch) + 11-emoji vocabulary (each meaning-pinned). (37.2) **Brutal grade card 5 axes**: Discoverability=B / Density=A / State legibility=A / Navigability=B / Aesthetic identity=B+; **net A− happy path / B+ edge cases**. (37.3) Where O+V's identity shines (preserve unconditionally): narrative channel (`💭🗣🤔🔧💀` Gap #6 closure), ouroboros spinner, posture-aware density rendering, cross-substrate `/expand`, auto-discovered slash palette, chatter-suppression discipline. (37.4) Where O+V leaks inconsistency (close): legacy boot path over-renders / chrome color discipline leaks `bright_green` outside outcomes / tool-icon glyph set incomplete / stream renderer optional / per-op-confidence indicator missing / 41 verbs without OSC 8 hyperlink discoverability. (37.5) **Comprehensive 40-feature CC catalog** organized A/B/C/D/E/F/G/H/I/J/K/L (Conversation+chat / Tool+observability / Diff+apply / Discoverability+help / Mention+completion / Status+state / Session+history / Plan+reasoning / Multi-op+parallel / Permissions+safety / Skills+workflows / Aesthetic+chrome) — each marked ✅ PRESENT / 🟡 PARTIAL / ❌ MISSING / ⛔ DELIBERATELY-NOT-PORT with porting recommendations + sponsor module + effort estimates. (37.6) **Cross-ecosystem implications** for the 3-layer expansion (JARVIS / J-Prime / Reactor-Core): 6 surfaces become load-bearing once cross-repo ops fire (multi-repo status line / per-repo posture / cross-repo causality DAG / cost aggregation / intake / flag graduation). (37.7) **Sequenced UX roadmap** — Tier 1 (~20h tonight/this-week, 9 closures) + Tier 2 (multi-day arcs, 7 items) + Tier 3 (3-layer ecosystem prep, 5 items, trigger-gated). (37.8) **Anti-goals**: 5 CC features explicitly NOT to port (theme support / resumable mid-op / conversation-as-product / per-message regen / CC's "auto" model selection — each with rationale preserving O+V identity). (37.9) **Identity preservation invariants** (6 unconditional rules: ouroboros spinner permanent / emoji vocabulary bounded / color discipline pinned / narrative voice non-negotiable / posture visibility / `/expand` cross-substrate ref). (37.10) Net call: A− happy path / B+ edge cases trending A; ~20h Tier 1 closures push to A across both axes; 3-layer ecosystem prep is forward-compatible with substrate work today. **NEXT**: operator decision — (a) Tier 1 #1-3 polish (~7h: budget warning + `@mention` + `/show-plan`) OR (b) Tier 1 #4-5-7 dashboard (~5h: `/health` + `/listen` + `/why-changed` — wires 6 unwired autonomy modules) OR (c) Tier 2 `--rerun-from` + `/replay` REPL (~3d Temporal Observability spine) OR (d) wait for cron #1 (00:00 PDT) to confirm cron-fired path operational. See v2.37 below for cadence pre-flight hardening details.)
+**Version (prior)**: 2.37 (2026-05-05 — **Phase 9 cadence pre-flight hardening shipped — closes 2 latent blockers + 1 operator-UX gap before operator commits wall-clock time**: 16 new regression tests in `tests/governance/test_phase_9_cadence_hardening.py` (236/236 across full Phase 9 + Move 7 + Move 8 + closure + Wave 3 hygiene sweep). Pre-cadence audit (Explore agent) found one CRITICAL data-loss race + 3 hardening gaps. **Slice 1 (CRITICAL)**: `_run_battle_test_subprocess` previously derived session-detection anchor as `time.time() - timeout_s - 60` AFTER `subprocess.run` returned — forward NTP skew (or DST forward-jump) during the subprocess could move `time.time()` such that the session subprocess just wrote (mtime set by OS) gets filtered out by the post-derived window, producing SUMMARY_PARSE_FAILED with no recovery and wasting that soak's evidence. Fix: capture `start_wall_anchor = time.time()` BEFORE `subprocess.run`, derive `after_epoch = start_wall_anchor - _SESSION_DETECTION_GRACE_S` (load-bearing reference; forward skew during subprocess cannot move the captured anchor; backward skew absorbed by 60s grace). Module constant `_SESSION_DETECTION_GRACE_S = 60.0` documents the discipline. **Defense-in-depth**: `_read_most_recent_session` previously sorted candidates by lexicographic name (`sorted(sessions_root.iterdir(), reverse=True)`) — robust ONLY while the battle-test naming convention `bt-YYYY-MM-DD-HHMMSS` holds. Refactored to sort by `st_mtime` descending; matches actual semantic of "most recent." **Slice 2 (operator-UX)**: new `python3 scripts/live_fire_graduation_soak.py ready` CLI subcommand composes existing `GraduationLedger.eligible_flags()` primitive — answers "which flags are ready to flip RIGHT NOW?" in one command. Closes the cognitive-load gap of operator scanning full `queue` output × 24 flags × ~36 soaks of cadence runs. Renders flag list + clean/required progress + dependency status + next-steps guidance. Empty-eligible case prints accumulate-more-evidence guidance instead of confusing silence. **Pinned via 5 source-AST regression checks** (banned-pattern detector for `time.time() - timeout_s` derivation in `_run_battle_test_subprocess`; `_SESSION_DETECTION_GRACE_S` constant present; `start_wall_anchor` captured before `subprocess.run`; `after_epoch` derived from `start_wall_anchor - _SESSION_DETECTION_GRACE_S` shape; `_read_most_recent_session` references `st_mtime`) + 6 behavioral pins on mtime-sort robustness (lexicographic-vs-mtime divergence test proves the fix isn't a no-op; missing-root + empty-root + non-dir-entries + crashed-session-no-summary defensive paths) + 5 CLI shape pins (`cmd_ready` exists + wired into handlers + subparser registered + empty-ledger smoke + populated-ledger smoke). **The operator can now commit wall-clock time confidently.** PRD §36.5 priority #1 row updated with hardening citation. **NEXT**: operator decision — (a) start Phase 9 cadence (run `bash scripts/run_live_fire_graduation_soak.sh` repeatedly; watch `python3 scripts/live_fire_graduation_soak.py ready` for graduation signals) OR (b) execute Priority #2 `--rerun-from` + `/replay` (~3d Temporal Observability spine) OR (c) sweep Priority #3 6-arc UX/autonomy slices (~15-20h). See v2.36 below for §36 brutal review details.)
 **Version (prior)**: 2.36 (2026-05-05 — **§36 Brutal Architectural Review v10 + Forward Priority Roadmap added**: operator-driven post-Move-7+8+Wave-3+§28.5.1+§33-catalog synthesis. Refreshes §1 "Where we stand" with May 5 reality (4 closures since 2026-04-29 plus 5 §33 meta-pattern catalog + 16 new AST pins + 117 new regression tests). New **§36** (7 sub-sections, ~6.2K words) covering: (36.1) **Cognitive & Epistemic Delta vs CC** with 5-row file:line-grounded gap matrix — speculative execution trees / mid-generation self-critique / counterfactual reasoning / streamed reasoning surface / cross-session continuity; engineers an autonomous-hypothesis-testing loop framing showing the infinite-curiosity-loop failure is closed by Move 5 PROBE_ENVIRONMENT outcome + K-call cap + read-only tool allowlist + §31 Upgrade 1 Bounded Epistemic Loop composition; identifies Move 6.5 Multi-Prior Speculative Execution as the named remaining gap. (36.2) **Deep Observability + State Reconstruction (Temporal Observability)** — what we have (57 SSE event types + 24 GET endpoints + Causality DAG + Phase 1 Determinism Substrate + 5 IDE extensions + 481+ FlagRegistry entries) + 6 missing affordances (`--rerun-from` + `/replay` REPL + latent-confidence drop broadcast + parallel fan-out canvas + pre-trip circuit-breaker events + session search/replay UX); explains chatter-suppression discipline (Move 7 verdict-transition gate as canonical pattern; potential 6th §33 meta-pattern). (36.3) **Brutal Grade A− structural / B+ empirical / trending A** — edge-case fragility audit with 4 still-open vectors (vector #6 Default-False Flag Problem 🔴 / vector #7 Quine-shape cage bypass 🟠 / vector #12 Provider chain SPOF 🟡 / Move 9 single-roll Test-shape gaming 🟡); 5 of 5 known concrete race conditions CLOSED via Wave 3 hygiene; only §3.6 vector 3 advisory file-locking on AdaptationLedger writes remains pending (~1.5h closure); honest call on where Antivenom is most likely bypassed (motivated model crafting plausible-but-vacuous test pattern that passes K-way structural-signature consensus when all K rolls converge on the same vacuity — defense via §31 Upgrade 1 Bounded Epistemic Loop's PROBE_ENVIRONMENT outcome + read-only tool allowlist; load-bearing measurement is Phase 9 P9.4 100-entry adversarial corpus). (36.4) **Critical Path to A-Level RSI — top 3 systemic upgrades**: Priority #1 Phase 9 Live-Fire Graduation Cadence (operator-paced; closes 🔴 vector #6 + provides empirical baseline for Move 7+8 graduation calibration AND closes vector #7 AND closes Move 9 single-roll); Priority #2 `--rerun-from` + `/replay` REPL Temporal Observability spine (~3d, ~250 LOC, ~50 tests; composes Merkle DAG + §31 Upgrade 2 Decision Record Causality Graph; unlocks counterfactual reasoning empirically); Priority #3 wire 6 unwired autonomy/ modules + close 6 CC-style UX gaps (~15-20h total broken into 6 small slices). (36.5) **Forward Priority Roadmap chronological** — 10 sequenced arcs from Phase 9 (start) → M12 JPrimeLoRA (long-horizon). (36.6) **Investigation findings**: autonomy/ folder has 6 high-value unwired modules (execution_monitor / component_health / event_emitter / command_bus / execution_graph_progress / feedback_engine); ZERO actual dead code across 378 governance modules; 6 architecturally-feasible CC-style UX gaps (`@mention` / Plan Inspection / Session Archive+Replay / Live Event Inspector / Component Health / Session search); 3 deferred-architectural-mismatch (Ctrl+R / Resumable sessions / cross-session conversation continuity). (36.7) **Reverse Russian Doll alignment**: pin count 13→20→36→52 (+27% in 7 days while shell expanded via Move 7+8); §33 catalog now 5 patterns all invoked across Move 7+8; §35 in-session-executable backlog is empty. **Honest percentage-completion answer**: O+V is at **~85-90% of "super advanced"** by operator framing — net A−/A trending A. A-level execution achievable in **6-10 weeks** at established cadence (Phase 9 + Priorities 2-9 + first true second-order doll completed). The path is no longer architectural — it's operational. **NEXT**: operator decision — (a) start Phase 9 cadence (operator-paced; closes 🔴 vector #6 — single biggest blocker between A− and A) OR (b) execute Priority #2 `--rerun-from` + `/replay` (in-session ~3d) OR (c) sweep Priority #3 (in-session ~15-20h across 6 small slices). See v2.35 below for Move 8 closure details.)
 **Version (prior)**: 2.35 (2026-05-05 — **Move 8 Proactive Curiosity Loop FULLY CLOSED — 3-slice arc end-to-end same-day**: 117 new regression tests + 220/220 across the full Move 7 + Move 8 + Wave 3 + closure spine. Closes the §29.7 / §35 Move 8 entry — the auto-spawn-exploration-ops half of M9 CuriosityGradient producer-consumer loop. Three slices compose end-to-end: **Slice 1** (`proactive_curiosity_reader.py`) — pure-function substrate `rank_curious_clusters()` composing `CuriosityCollector.snapshot_all` with cooldown / cold-start / decay-reason / magnitude-floor filtering + top-K cap; 5-value `CuriosityRankingDecision` closed enum; §33.5 versioned `CuriosityRanking` artifact; 4 AST pins (master-flag default-FALSE per §33.1 + authority asymmetry + decision taxonomy 5-values + composes-M9-substrate forbidding parallel `compute_curiosity` calls). **Slice 2** wires reader as 3rd signal source inside existing `ProactiveExplorationSensor.scan_once` (alongside LearningConsolidator failure-rules + codebase_character cluster-coverage); composes `make_envelope` + `router.ingest` — NO parallel poll loop; posture-aware HARDEN suppression; structural call-site + composition-order regression pin; SSE `curiosity_intent_emitted`; firing_telemetry counters. **Slice 3** (`proactive_curiosity_loop_graduation_contract.py`) — §33.1 contract harness mirroring `cross_op_semantic_budget_graduation_contract` canonical shape exactly; 5-value `CuriosityGraduationVerdict` closed enum (READY_FOR_GRADUATION / INSUFFICIENT_EMISSIONS / EXCESSIVE_THROTTLES / ALREADY_GRADUATED / DISABLED); 3-gate `is_ready_for_graduation` first-match-wins (Slice 1 already-graduated via composed flag-helper — single source of truth, AST-pinned no parallel `os.environ.get` reads with diagnostic-string false-positive avoidance via AST-precise `os.environ.get(literal)` detection; ≥ required_emissions; ≤ max_governor_throttles); harness master default-TRUE per §33.1 (operator-binding default-FALSE lives on Slice 1's flag); 3 AST pins + 3 FlagRegistry seeds; §33.1 pattern compliance test proves canonical shape parity with Move 7. **RSI exploration-axis closed structurally**: M9 producers feed CuriosityCollector → Slice 1 reader ranks top-K curious → Slice 2 emits IntentEnvelopes → Slice 3 graduation contract gates master flag flip. Substrate-ready; master flag stays default-FALSE; operator-paced graduation cadence (3+ clean evidence ladder, mirrors Phase 9 / Move 7 pattern) flips it after empirical proof. **All 5 §33 reusable meta-patterns invoked across Move 8** (graduation contract / authority asymmetry / versioned-artifact / closed-taxonomy / posture-aware substrate). PRD §35 Move 8 row flipped 🟡 PARTIALLY CLOSED → ✅ CLOSED 2026-05-05. **NEXT**: operator decision — (a) Phase 9 empirical cadence (operator-paced; closes 🔴 Critical vector #6 + provides empirical baseline for both Move 7 and Move 8 graduation calibration) OR (b) §3.6.2 vector #7 Quine-shape cage bypass (waiting on Move 6 master-on + Phase 9 P9.4) OR (c) M12 JPrimeLoRA scoping (long-horizon). Remaining §35 open items are operator-paced empirical OR long-horizon scoping; in-session-executable backlog is now empty. See v2.34 below for §28.5.1 phase-extraction closure details.)
 **Version (prior)**: 2.34 (2026-05-05 — **§28.5.1 4-phases-not-extracted hygiene closure — investigation reveals brutal-review entry was stale; all 11 phases ALREADY extracted**: 31 new regression tests in `tests/governance/test_phase_runner_extraction_closure.py` (31/31 green). Audit 2026-05-05 of `backend/core/ouroboros/governance/phase_runners/` package finds full inventory of extracted runners with all master flags default-true: **CLASSIFY** → `CLASSIFYRunner`; **ROUTE** → `ROUTERunner`; **CONTEXT_EXPANSION** → `ContextExpansionRunner`; **PLAN** → `PLANRunner`; **GENERATE** → `GENERATERunner`; **VALIDATE** → `VALIDATERunner`; **GATE** → `GATERunner`; **APPROVE + APPLY + VERIFY** → `Slice4bRunner` (combined per Wave 2 architectural decision — APPROVE's tail/cancel-check/DRY_RUN gate runs on every path, APPLY consumes APPROVE local state, VERIFY consumes APPLY local state; separate runners would require 6-way artifact threading; combined preserves inline semantics with one flag + one reindent); **COMPLETE** → `COMPLETERunner`. The v9 brutal-review §35 entry "4-phases-not-extracted (CLASSIFY/APPROVE/APPLY/VERIFY) — STILL OPEN" was authored when those phases were inline blocks but never updated post-Wave-2; closure is documentation-update + structural-pin pattern matching Move 8 status reconciliation (Wave 3 Item 1). New regression spine pins: (1) all 9 `JARVIS_PHASE_RUNNER_<PHASE>_EXTRACTED` flags default-true via regex on `orchestrator.py` (parametrized 9 cases); (2) all 9 phase-runner module files exist on disk + expose canonical class name (parametrized 9 cases); (3) `phase_runners/__init__.py` re-exports all 9 canonical class names; (4) orchestrator dispatch site references each flag at least once (parametrized 9 cases); (5) `Slice4bRunner` docstring-commits to APPROVE+APPLY+VERIFY coverage AND handles all three OperationPhase values (bytes-pinned because the combined pattern is intentional); (6) directory-shape pin asserts exactly the 9 canonical module files exist (no more, no fewer — adding a 10th runner without updating the pin set indicates drift; deletion indicates regression to inline); (7) closure-marker bytes-pin asserts CLASSIFY + Slice4b runners both present + their master flags default-true (citation-purposes test for operators auditing the brutal-review backlog). Future regression that flips a flag back to default-false, deletes a runner module, or splits Slice4b without updating the pin set will fail CI before reaching production. **§35 entry flipped** from 🔴 STILL OPEN → ✅ CLOSED 2026-05-05. **NEXT**: operator decision — (a) Phase 9 empirical cadence (operator-paced; closes 🔴 Critical vector #6 + provides baseline for Move 7 graduation calibration) OR (b) Move 8 Proactive Curiosity Loop scoping (long-horizon) OR (c) M12 JPrimeLoRA scoping (long-horizon). See v2.33 below for Move 7 Slice 5 graduation-contract details.)
@@ -5398,6 +5399,275 @@ Multiple "strategic moves" referenced across §28.6.3 (v9 brutal review) and §2
 **Critical path remains**: vectors #6 + #7 close via Phase 9 cadence empirical run. Move 7 (Cross-op Semantic Budget) deserves scoping post-Phase-9 closure.
 
 **Status conflict to resolve in next session**: Move 8 (GENERAL LLM driver) — source-grep `agentic_general_subagent.py:39` to determine if CLAUDE.md or §28.6.3 is stale.
+
+---
+
+## 37. Operator UX/UI v10 Brutal Review + Comprehensive CC-Feature Catalog *(NEW 2026-05-05 — operator-driven post-Phase-9-Day-1-graduation)*
+
+> **Section ordering note**: §37 was authored AFTER §36 chronologically; both are 2026-05-05 v10 reviews (this one operator-UX-focused, §36 architectural-focused). File-order is reversed (§37 appears before §36 in the doc) — content is independent; navigate by section number via TOC.
+
+**Operator binding (verbatim, 2026-05-05)**: *"O+V is an autonomous self-developing organism that lives in JARVIS (the Body) for now but will soon work across the entire 3-layer ecosystem: JARVIS, J-PRIME & the REACTOR-CORE repo. So I want brutal hardcore feedback on my UX/UI operator & structural design and tell me every feature you have from a UI/UX operator on the CLI that will be extremely useful for the user to see for O+V — in its own unique way because O+V is an autonomous self-developing organism."*
+
+**Framing**: This section grades O+V's CLI as if it were a competing CLI in 2026, audited file:line-grounded against Claude Code (CC) without preserving prestige. Then it catalogs every CC UX/UI feature worth knowing about, marks each PRESENT/PARTIAL/MISSING in O+V, and proposes a sequenced porting roadmap that preserves O+V's identity (autonomous organism, narrative voice, emoji vocabulary, ouroboros spinner) instead of becoming CC-clone.
+
+**Reverse Russian Doll alignment**: as the inner core (O+V) carves an exponentially larger shell across JARVIS → J-Prime → Reactor-Core, the operator-facing surfaces MUST scale with the substrate. A CLI that's perfectly tuned for single-repo Body work today fails when one operator must observe + steer ops across three repos simultaneously. The roadmap below sequences toward that 3-layer reality.
+
+### 37.1 Current CLI surface inventory (file:line-grounded)
+
+**REPL verb surfaces — 41 unique** (`backend/core/ouroboros/battle_test/serpent_flow.py` + `repl_dispatch_registry.py`):
+
+- **Hardcoded handlers (20)**: `/budget` (line 6243) · `/risk` (6212) · `/cost` (autodisc) · `/review` (6135) · `/accept` (6060) · `/reject` (6098) · `/expand` (6760) · `/memory` (6311) · `/remember` (6325) · `/forget` (6333) · `/cancel` (5447) · `/attach` (5553) · `/narrate` (6001) · `/mutation` (6341) · `/mutation-gate` (6489) · `/preflight` (5721) · `/organism` (5740) · `/vision` (6578) · `/verify-confirm` (6624) · `/verify-undemote` (6645)
+- **Auto-discovered handlers (21)** via `repl_dispatch_registry.py:93-115`: `/cognitive_metrics` · `/coherence` · `/outcomes` · `/render` · `/semantic_budget` · `/decisions` · `/hypothesis` · `/plan_approval` · `/probe` · `/quorum` · `/recovery` · `/cost` · `/posture` · `/backlog_auto_proposed` · `/m10` · `/curiosity` · `/governor` · `/inline_permission` · etc.
+- **Excluded from auto-discovery (custom semantics)**: `budget` · `risk` · `goal` · `cancel` · `plan` · `postmortems` · `inline` (kept hardcoded to preserve bespoke operator UX)
+
+**Live during-op surfaces — 6 distinct rendering layers**:
+
+1. **Status line** (`live_status_line.py`) — bottom-toolbar via `PromptSession(bottom_toolbar=...)`; phase + cost/budget + route + op-id + risk; TTY-gated via `real_stdout_isatty()`
+2. **Op blocks** (`op_block_buffer.py`) — per-op FIFO ring with `o-N` refs; collapsible; `/expand <ref>` recovers full body
+3. **Narrative channel** (`narrative_channel.py`) — model voice (`💭` INTENT / `🗣` TOOL_PREAMBLE / `🤔` THINKING / `🔧` L2_REPAIR / `💀` POSTMORTEM); bounded ring with `n-N` refs
+4. **Tool render registry** (`tool_render_view.py`) — descriptor-driven adaptive rendering; (Posture × LayoutKind) → DensityLevel; bounded body store with `t-N` refs
+5. **Diff preview** (`diff_preview.py`) — Yellow-tier NOTIFY_APPLY; file-tree breakdown + per-file Pygments-highlighted Panels; 5s countdown with cancel-poll; `d-N` refs (now superseded by ReviewBranch IDE-native diffs)
+6. **Stream renderer** (`stream_renderer.py`) — Rich Live + Markdown; 16ms batched updates; TTFT + TPS metrics; TTY-only (headless falls through to plain spinner)
+
+**Cross-substrate ref scheme**: `o-N` (op blocks) + `t-N` (tool bodies) + `n-N` (narrative frames) + `d-N` (diffs) — all dispatched through unified `/expand <ref>` REPL verb. Monotonic ordinals; bounded rings prevent unbounded memory.
+
+**Emoji vocabulary** — internally consistent (each emoji = ONE meaning):
+- `🐍` = organism identity (spinner / boot / prompt)
+- `✨` = evolved outcome (op success)
+- `💀` = death (failed op)
+- `💰` = cost
+- `⏺ ⎿` = continuation glyphs (CC parity)
+- `💭 🗣 🤔 🔧` = narrative kinds
+- `📝` = log path
+- `📋 🔗 🚫 🎨` = memory types
+
+### 37.2 Brutal grade card (5 axes)
+
+| Axis | Grade | Honest defense |
+|---|---|---|
+| **Discoverability** | **B** | 41 verbs is a lot; auto-discovered `/help` dispatcher with typo detection + posture-relevance filtering helps significantly, but a new operator without docs will not figure out `/expand t-3` from scratch. Ref-scheme is powerful but unobvious. |
+| **Density** | **A** | Multi-surface strategy avoids wall-of-text; status line + narrative + op blocks split information across persistent vs ephemeral channels; presentation restraint substrate (Gap #7 closure) made boot honest. |
+| **State legibility** | **A** | Bottom-toolbar status + per-op refs + stream metrics + `/status`/`/cost`/`/posture` on demand = always-knowable phase/spend/progress. The Phase 9 work today proved this — debug.log + status line let me track 5 simultaneous-day-of soaks without losing thread. |
+| **Navigability** | **B** | Auto-history + reverse-search + `/expand` by ref + slash-completion solid; but no breadcrumb trail through op causality, no graph view of "this op spawned that op," no time-travel REPL (`--rerun-from` + `/replay` deferred per §36.5). |
+| **Aesthetic identity** | **B+** | Emoji vocabulary tight + intentional; ouroboros spinner iconic + identity-preserving; Gap #7 Slice 2 fixed the load-bearing TTY gate; but legacy boot path still over-renders when restraint is off, color discipline leaks in chrome (fixed via `chrome_color()` only when restraint=on), tool-icon glyph set incomplete (some tools have rich descriptors, others fall through). |
+
+**Net grade: A− on the happy path / B+ on edge cases** — same shape as the architectural grade. The CLI is genuinely good; the gaps are targeted closures, not foundational rewrites.
+
+### 37.3 Where O+V's identity shines (preserve unconditionally)
+
+These are O+V's competitive moat. CC doesn't have them; do NOT trade away for parity:
+
+1. **Narrative channel — `💭 🗣 🤔 🔧 💀`** (Gap #6 closure): operators see model voice surface in real time. The `🗣` deterministic tool-preamble synthesizer ensures every tool call has a "WHY" line, no LLM cost. CC has no analog; this is uniquely O+V because O+V is proactive (sensors fire ops without prior prompt — model voice MUST be present to anchor operator context).
+2. **Ouroboros spinner + organism prompt** (`🐍 ouroboros >`): identity-preserving; signals "this is an autonomous organism" not "this is a chat tool." Survives across the 3-layer expansion.
+3. **Posture-aware rendering** (`(Posture × LayoutKind) → DensityLevel` in `tool_render_view.py`): adaptive density that responds to `EXPLORE`/`CONSOLIDATE`/`HARDEN`/`MAINTAIN`. CC has no analog; O+V can render denser when posture is HARDEN ("focus") and sparser when EXPLORE ("breathe").
+4. **Cross-substrate `/expand <ref>` dispatcher** (`o-N` / `t-N` / `n-N` / `d-N`): unified navigation across 4 buffer types via single verb. Powerful when learned; needs better discovery.
+5. **Auto-discovered slash palette** (`repl_completion.py`): walks `_handle_*` methods + module-owned dispatchers with naming convention. New verbs auto-register without hardcoded list. Single source of truth.
+6. **Chatter-suppression via verdict-transition gates** (Move 7 Slice 3 substrate): SSE events fire only on band crossings, never every observer tick. Same discipline applied to status line via TTY gate. CC has unbounded chatter; O+V codifies suppression.
+
+### 37.4 Where O+V leaks inconsistency (close these)
+
+1. **Legacy boot path over-renders** when `JARVIS_PRESENTATION_RESTRAINT_ENABLED=false` (~25+ lines of dashboard chrome). Restraint mode is default-TRUE post-graduation, but the legacy path is still preserved verbatim under master-flag. Recommend: deprecate the legacy boot dashboard path entirely once the graduation contract validates ~30+ days of restraint-on operation.
+2. **Color discipline leaks in chrome** (legacy path uses `bright_green` for activity markers; violates "green = success outcomes only"). The `chrome_color()` helper in `presentation_restraint.py:990-1011` returns `dim` when restraint enabled — but only because restraint is on. Fix at root: forbid `bright_green` in chrome via lint pin.
+3. **Tool-icon glyph set incomplete**: some tools have rich descriptors in `tool_render_registry.py`, others fall through to a generic icon. Standardize via auto-generated glyph for new tools on first sight (consume tool name → emoji table).
+4. **Stream renderer optional** (Slice 5 graduation pending per code comment line 25). Keep it always-on once graduated; falling-through-to-plain-spinner-in-TTY is a bug not a feature.
+5. **Per-op-confidence indicator missing** (audit Section C): operator can't see which tools were "guessing" vs "high-confidence." Provider-gated for Claude (no logprobs), but DW-routed ops have logprobs available — wire the surface for at least the DW path.
+6. **41 verbs without inline help links**: `/help` dispatcher exists but doesn't render hyperlinks (some terminals support OSC 8). Add hyperlinkable verb list when terminal supports it.
+
+### 37.5 Comprehensive CC UX/UI feature catalog (40 features, marked + recommended)
+
+Legend: ✅ PRESENT · 🟡 PARTIAL · ❌ MISSING · ⛔ DELIBERATELY-NOT-PORT (with rationale)
+
+**A — Conversation + chat**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| A1 | Natural-language `/chat` mode | ✅ Phase 3 P2 graduated 2026-04-26 (`/chat` REPL + 4-intent classifier + 3 concrete executors) | preserve |
+| A2 | Conversation continuity across sessions | 🟡 LSS + SemanticIndex + ConversationBridge wired; mid-op suspension absent | ⛔ deliberate — atomic-op model is correct for autonomous substrate |
+| A3 | Inline approval `[y/N]` UX | ✅ Phase 3 P3 graduated (`InlineApprovalProvider` + `[y]/[n]/[s]/[e]/[w]` + 30s timeout-to-defer) | preserve |
+| A4 | Easy mid-flight redirect ("wait, do this instead") | 🟡 `/cancel` infrastructure works; no natural-language redirect | port via `/chat` IntentClassifier interrupt route — ~3h |
+
+**B — Tool + observability**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| B1 | Tool-use display | ✅ ToolRenderRegistry adaptive rendering (Gap #2 closure) | preserve |
+| B2 | MCP tool ecosystem | ✅ MCP tools discovered + injected at GENERATE prompt (Gap #7) | preserve |
+| B3 | Real-time token streaming | ✅ `stream_renderer.py` (TTY) + 🟡 plain fallback in headless | port full headless mode (NDJSON over WebSocket?) — ~5h |
+| B4 | Hooks visualization | ✅ Hooks system exists; no explicit visualization surface | port — extend `tool_render_view.py` with hook-call lines — ~2h |
+| B5 | Per-tool confidence indicator | ❌ MISSING | port via `tool_render_view.py` + DW-route logprobs — ~4h |
+| B6 | Pre-trip circuit-breaker warnings | ❌ MISSING (current breakers trip silently) | port via SSE event broker + status-line band display — ~3h |
+| B7 | Approaching-budget warning | ❌ MISSING | port via cost_tracker + status-line yellow/red blink at 80%/95% — ~2h |
+
+**C — Diff + apply**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| C1 | Diff preview before apply | ✅ Yellow-tier `diff_preview.py` (Gap #4 closure) | preserve |
+| C2 | IDE-native diff branches | ✅ `ReviewBranch` substrate (Gap #4 closure) | preserve |
+| C3 | Multi-file diff overview | ✅ file-tree breakdown in diff_preview | preserve |
+| C4 | Diff stats inline | 🟡 `diff_preview` shows; `Update(<path>:<line>)` + N-added/M-removed already in CC2 follow-ups (§30 v2.9) | preserve |
+| C5 | Parallel-candidate diff (Move 6 K-way) | ❌ MISSING | port — extend `diff_preview.py` with K-pane consensus view — ~5h |
+
+**D — Discoverability + help**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| D1 | `/help` discoverability | ✅ FlagRegistry + help_dispatcher with typo detection | preserve |
+| D2 | Slash-command auto-completion | ✅ `repl_completion.py` (Gap #7 Slice 3) | preserve |
+| D3 | Inline help links (OSC 8) | ❌ MISSING | port — `/help` renders hyperlinks where terminal supports — ~1h |
+| D4 | Subcommand discovery | 🟡 some verbs have subcommands (e.g., `/posture explain`) but inconsistent | standardize via `/help <verb>` — ~2h |
+
+**E — Mention + completion**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| E1 | `@mention` file completion | 🟡 `repl_input_polish.py:_extract_filepath` regex extracts `@filepath` mentions, but no autocompletion of file tree | port — `prompt_toolkit.completion.PathCompleter` gated on `@` prefix — ~2h |
+| E2 | History reverse-search (Ctrl+R) | ✅ `FileHistory` + `enable_history_search=True` (Gap #7 Slice 3) | preserve |
+| E3 | Multi-line input | 🟡 prompt_toolkit supports it; not specifically wired for paste | verify works for paste; possibly polish — ~1h |
+
+**F — Status + state**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| F1 | Persistent status line | ✅ `live_status_line.py` (Gap #1+5 closure) | preserve |
+| F2 | Phase / progress visibility | ✅ status line shows phase + sub-detail | preserve |
+| F3 | Cost meter inline | ✅ status line carries cost spent / budget | preserve |
+| F4 | Token-budget meter | 🟡 stream renderer shows TPS post-hoc, not live consumption-vs-cap | port — live `[used/cap]` token meter inline — ~2h |
+| F5 | Branch + cwd context | ✅ multi-line REPL prompt with cwd / mode / posture (CC2 follow-up §30 v2.9) | preserve |
+| F6 | Activity ribbon (CC's right-edge spinner) | ✅ ouroboros spinner | preserve (better than CC's — has identity) |
+
+**G — Session + history**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| G1 | Session search | ❌ MISSING | port — SQLite index of ops (id / phase / status / timestamp / intent) + `/history --filter risk:RED` — ~4h |
+| G2 | Session replay (`/resume`) | 🟡 `--replay <session-id>` flag exists in battle-test; no REPL `/replay` verb | port `/replay` (composes Priority #2 from §36) — ~3h |
+| G3 | Time-travel debugging (`--rerun-from`) | ❌ MISSING | port (Priority #2 from §36, ~3d) — biggest cognitive-depth multiplier |
+| G4 | Session pin / checkpoint | ❌ MISSING | port via `/checkpoint <label>` + `/rewind <label>` — ~3h |
+
+**H — Plan + reasoning**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| H1 | Plan inspection mode | 🟡 `PlanGenerator` produces structured plans (schema plan.1) but no `/show-plan` REPL surface | port `/show-plan` — ~2h |
+| H2 | Operation modes (`/plan` `/analyze` `/apply` `/auto`) | ❌ MISSING | port (Pattern B from §32.7, ~1 slice / ~120 LOC) |
+| H3 | Adversarial review visibility | ✅ `/adversarial stats` REPL post-2026-04-26 | preserve |
+| H4 | Postmortem visibility | ✅ `/postmortems` REPL + `/postmortems dag` (§25 Priority D + §26.5.2 Priority 2) | preserve |
+| H5 | Causality DAG navigation | ✅ `/postmortems dag` family + `dag_fork_detected` SSE | preserve |
+
+**I — Multi-op + parallel**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| I1 | Multi-op timeline view | ✅ `--multi-op` flag in battle-test (Phase 8.3 substrate) | port a REPL-native version — ~3h |
+| I2 | Parallel fan-out canvas | ❌ MISSING (Move 6 produces K candidates; rendered sequentially) | port (§36.4 named gap) — ~5h |
+| I3 | Op dependency graph view | ❌ MISSING | port via `op_block_buffer.py` extension — ~5h |
+| I4 | Background tasks with notify | ✅ scheduled remote agents via routine API | preserve |
+
+**J — Permissions + safety**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| J1 | Per-tool permission UI | ❌ MISSING (have per-op risk-tier, not per-tool) | port (Venom V2 from §32.6, ~2 slices) |
+| J2 | Per-component tool scope | ❌ MISSING | port (Pattern C from §32.7, ~2 slices) |
+| J3 | Approval audit trail | ✅ `inline_approval_audit.jsonl` ledger | preserve |
+| J4 | Risk-tier ladder | ✅ 4-tier (SAFE_AUTO / NOTIFY_APPLY / APPROVAL_REQUIRED / BLOCKED) | preserve |
+| J5 | Mutation budget | ✅ Pass C Slice 4 per-Order mutation budget | preserve |
+
+**K — Skills + workflows**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| K1 | Saved playbooks / skills | ❌ MISSING | port — `.jarvis/skills/<name>.yaml` + `/skill <name>` — ~5h |
+| K2 | Custom slash commands | 🟡 auto-discovered `_handle_*` works; no per-user user-defined | port — `.jarvis/commands/<name>.py` discovery — ~3h |
+| K3 | Settings / config reflection | 🟡 `/help flags` exists; no `/config` general view | port `/config` — ~1h |
+| K4 | Hooks (pre-tool / post-tool / etc.) | ✅ Hooks substrate exists | preserve + V1 from §32.6 (per-tool granularity) |
+
+**L — Aesthetic + chrome**
+
+| # | Feature | O+V status | Recommendation |
+|---|---|---|---|
+| L1 | Color-as-meaning discipline | ✅ chrome_color() honors restraint discipline | extend — lint-pin no `bright_green` in chrome — ~1h |
+| L2 | Emoji vocabulary | ✅ tight + intentional | preserve |
+| L3 | Spinner / activity glyph | ✅ ouroboros spinner | preserve (identity moat) |
+| L4 | Boot density | ✅ minimal Rich Panel post-Gap-#7 Slice 1 | preserve |
+| L5 | Terminal title (OSC 0) | ✅ `repl_input_polish.py` (Gap #7 Slice 4) | preserve |
+| L6 | OSC 8 hyperlinks | ❌ MISSING | port — `/help` + ref-resolver render hyperlinks — ~2h |
+| L7 | Theme support | ❌ MISSING | ⛔ deliberate (low value; emoji + color discipline does the lifting) |
+
+### 37.6 Cross-ecosystem implications (3-layer expansion)
+
+When O+V starts working across JARVIS / J-Prime / Reactor-Core repos simultaneously, these features become load-bearing (not "nice to have"):
+
+1. **Multi-repo session view**: status line MUST show which repo the current op targets. Add `repo:<name>` token to status-line composition.
+2. **Per-repo posture**: each repo may have its own DirectionInferrer reading. Render `posture(JARVIS):EXPLORE  posture(JPRIME):HARDEN  posture(REACTOR):MAINTAIN`.
+3. **Cross-repo causality DAG**: when J-Prime requests a JARVIS capability that lives across both repos, the causality graph must span repos. Extend `verification/causality_dag.py` to carry `repo` in the record.
+4. **Cross-repo cost aggregation**: cost ledger MUST sum across all 3 repos. Currently single-repo.
+5. **Cross-repo intake**: TrinityEventBus already exists for cross-repo signals. Render incoming events at the operator surface (`/listen --repo all`).
+6. **Cross-repo flag graduation**: Phase 9 cadence today graduates flags repo-by-repo. When an O+V flag has cross-repo behavior (e.g., something in JARVIS that affects J-Prime), the cadence ledger needs `repo` per row.
+
+### 37.7 Sequenced UX roadmap (effort-ranked)
+
+**Tier 1 — Tonight / this week** (each ≤5h, composes existing substrate, high operator-value):
+
+| # | Arc | Sponsor | Effort |
+|---|---|---|---|
+| 1 | Approaching-budget warning + token-budget meter | `live_status_line.py` + `cost_tracker.py` | ~3h |
+| 2 | `@mention` file completion via `PathCompleter` | `repl_input_polish.py` | ~2h |
+| 3 | `/show-plan` REPL verb | `serpent_flow.py` + `OperationContext.plan_blocks` | ~2h |
+| 4 | `/health` (composes 6 unwired autonomy modules) | `component_health.py` | ~1.5h |
+| 5 | `/listen` event-stream tail | `event_emitter.py` + `command_bus.py` | ~2h |
+| 6 | Pre-trip circuit-breaker warnings via SSE | broker + status line | ~3h |
+| 7 | `/why-changed` operator-feedback inline | `feedback_engine.py` | ~1.5h |
+| 8 | Color discipline lint pin (`no bright_green in chrome`) | `presentation_restraint.py` | ~1h |
+| 9 | OSC 8 hyperlinks on `/help` and refs | `help_dispatcher.py` + ref-resolver | ~2h |
+
+**Tier 2 — Multi-day arcs** (3–5 day commitments, architectural depth):
+
+| # | Arc | PRD ref | Effort |
+|---|---|---|---|
+| 10 | `--rerun-from <session>:<phase>` + `/replay` REPL | §36.4 Priority #2 | ~3d |
+| 11 | Session search via SQLite index | new `session_archive.py` | ~4–5h |
+| 12 | Op dependency graph / parallel fan-out canvas | `op_block_buffer.py` ext | ~5h |
+| 13 | Per-tool confidence indicator | `tool_render_view.py` ext | ~4h |
+| 14 | Operation modes (`/plan` `/analyze` `/apply` `/auto`) | §32.7 Pattern B | ~1 slice |
+| 15 | Per-tool permissions (Venom V2) | §32.6 V2 | ~2 slices |
+| 16 | Per-component tool scope (Pattern C) | §32.7 C | ~2 slices |
+
+**Tier 3 — 3-layer ecosystem prep** (when J-Prime / Reactor-Core repos come online):
+
+| # | Arc | Trigger |
+|---|---|---|
+| 17 | Multi-repo status-line composition | first cross-repo op |
+| 18 | Per-repo posture rendering | when DirectionInferrer runs in J-Prime |
+| 19 | Cross-repo causality DAG (`repo` in record) | first cross-repo causal edge |
+| 20 | Cross-repo cost aggregation | first cross-repo budget |
+| 21 | Cross-repo flag graduation (`repo` in ledger row) | first cross-repo flag |
+
+### 37.8 Anti-goals (what NOT to port from CC + why)
+
+- **Theme support** — low value; O+V's emoji + color discipline does the heavy lifting. Theming would dilute identity.
+- **Resumable mid-op sessions** — atomic-op model is correct for autonomous substrate; mid-phase suspension would require 6-way artifact threading (same shape as Phase 1 W2 Slice 4b combined-runner discipline). High complexity, low payoff.
+- **Conversation continuity across sessions** — partly already done (LSS + SemanticIndex + ConversationBridge). Going further toward CC's "the conversation is the product" model would dilute the autonomous-organism framing.
+- **Per-message regeneration** — CC has rerun-with-different-prompt; O+V's analog is `--rerun-from` (deterministic replay) which is more powerful and structurally honest.
+- **CC's "auto" model selection** — O+V's UrgencyRouter is more principled (5 routes, deterministic, sub-ms, AST-pinned). Don't port a less-disciplined version.
+
+### 37.9 Identity preservation invariants
+
+These MUST hold across all UX evolution:
+
+1. **Ouroboros spinner is permanent** — never replace with generic spinner
+2. **Emoji vocabulary stays bounded** — every emoji means ONE thing; no overloading
+3. **Color discipline (green = outcomes only)** — lint-pinned via Tier 1 #8
+4. **Narrative voice (`💭 🗣 🤔 🔧`)** is non-negotiable — distinguishes O+V from CC's "show the model" pattern; O+V is "the organism speaks"
+5. **Posture visibility** — operator can always see if the organism is EXPLORE/CONSOLIDATE/HARDEN/MAINTAIN; this is unique
+6. **`/expand <ref>` cross-substrate dispatch** — preserve the unified ref-scheme; never fork into per-substrate verbs
+
+### 37.10 Net call
+
+**O+V's CLI scores A− on happy path / B+ on edge cases vs CC.** The bones are good; what's missing are 7-9 Tier 1 closures (~20 hours total) that would push the grade to A across both axes. The competitive moat (narrative voice + posture awareness + ouroboros identity + cross-substrate ref scheme) is preserved. The 3-layer ecosystem prep (Tier 3) lights up automatically once the next two repos come online — substrate work today is forward-compatible.
+
+**Operator binding restated**: O+V is the proactive autonomous opposite of CC. The CLI honors that — it surfaces what the autonomous substrate is DOING (ops mid-flight, posture, narrative, causality) rather than what the operator is asking. Closing the gaps in §37.5 brings parity on capabilities the operator actually needs while preserving the identity that makes O+V uniquely O+V.
 
 ---
 
