@@ -289,3 +289,67 @@ class ComponentHealthTracker:
                 "metadata": comp.metadata,
             }
         return {"components": components}
+
+    # ------------------------------------------------------------------
+    # Read-side helpers for operator surfaces (PRD §37 Slice 1, 2026-05-05)
+    # ------------------------------------------------------------------
+
+    def all_components(self) -> List[ComponentStatus]:
+        """Return the current snapshot of every registered component.
+
+        Defensive: returns a fresh list (caller mutations don't leak
+        back into tracker state). Used by the ``/health`` REPL surface
+        and any future operator-facing dashboard.
+        """
+        return list(self._components.values())
+
+    def list_names(self) -> List[str]:
+        """Return sorted component names — operator-facing identifier
+        list. Cheap; uses dict-keys-only access."""
+        return sorted(self._components.keys())
+
+
+# ---------------------------------------------------------------------------
+# Default-singleton accessor (PRD §37 Slice 1, 2026-05-05)
+# ---------------------------------------------------------------------------
+#
+# SafetyNet historically owned its own ComponentHealthTracker instance per
+# session (line 132). To enable cross-subsystem tracking + a single
+# ``/health`` operator surface that aggregates EVERY component's state
+# (not just SafetyNet's), this singleton accessor matches the established
+# ``get_default_X()`` pattern used by GraduationLedger / PostureStore /
+# CuriosityCollector / etc. SafetyNet now defaults to this singleton on
+# init (backward-compat: explicit injection still works) so SafetyNet's
+# state flows into the same surface other future producers will read.
+#
+# Threading: single-writer scenarios only (matches the tracker class
+# docstring constraint). Future cross-thread writers should compose a
+# lock at producer call sites, not duplicate at the singleton.
+
+_DEFAULT_TRACKER: Optional[ComponentHealthTracker] = None
+
+
+def get_default_tracker() -> ComponentHealthTracker:
+    """Return the process-wide default
+    :class:`ComponentHealthTracker` singleton. Created lazily on first
+    access. Subsequent calls return the same instance.
+
+    Use this from any code that needs to share component-health state
+    across subsystems. Producers register + update via the canonical
+    instance; consumers (e.g., the ``/health`` REPL surface) read via
+    the same instance.
+
+    Test isolation: call :func:`reset_default_tracker_for_tests` between
+    test runs to clear the singleton.
+    """
+    global _DEFAULT_TRACKER
+    if _DEFAULT_TRACKER is None:
+        _DEFAULT_TRACKER = ComponentHealthTracker()
+    return _DEFAULT_TRACKER
+
+
+def reset_default_tracker_for_tests() -> None:
+    """Test-only — production code never calls. Pinned via naming
+    convention (``_for_tests`` suffix)."""
+    global _DEFAULT_TRACKER
+    _DEFAULT_TRACKER = None

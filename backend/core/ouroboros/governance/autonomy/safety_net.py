@@ -27,6 +27,7 @@ from backend.core.ouroboros.governance.autonomy.autonomy_types import (
 from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
 from backend.core.ouroboros.governance.autonomy.component_health import (
     ComponentHealthTracker,
+    get_default_tracker,
     ComponentState,
     TransitionReason,
 )
@@ -129,7 +130,12 @@ class ProductionSafetyNet:
         self._consecutive_successes_while_degraded: int = 0
         self._rollback_history: List[Dict[str, Any]] = []
         self._incident_triggered: bool = False
-        self._health_tracker: ComponentHealthTracker = ComponentHealthTracker()
+        # Default-share with the process-wide singleton (PRD §37 Slice 1,
+        # 2026-05-05) so component state flows into the unified `/health`
+        # operator surface. Per-instance tracker remains achievable via
+        # explicit injection (testing); production code uses the shared
+        # singleton.
+        self._health_tracker: ComponentHealthTracker = get_default_tracker()
         self._execution_monitor: ExecutionMonitor = ExecutionMonitor()
         self._risk_classifier: OperationRiskClassifier = OperationRiskClassifier()
         self._escalated_resource_violation: bool = False
