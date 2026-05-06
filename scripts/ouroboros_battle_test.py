@@ -912,12 +912,16 @@ def main() -> None:
         "--rerun-from",
         type=str,
         default=None,
-        metavar="RECORD_ID",
+        metavar="RECORD_ID|SESSION:PHASE",
         help=(
             "Fork replay from a specific decision record within the "
             "session specified by --rerun. Requires --rerun to identify "
             "the session. New decisions written during the forked run "
-            "carry counterfactual_of=<original-record-id>."
+            "carry counterfactual_of=<original-record-id>. "
+            "§37 Tier 2 #10: also accepts the form "
+            "<session-id>:<phase> (e.g. bt-2026-05-05-120000:GENERATE) "
+            "— the harness resolves the FIRST record in that phase via "
+            "the canonical CausalityDAG and forks from it."
         ),
     )
     # Phase 8 surface wiring Slice 3 — multi-op timeline renderer.
@@ -1012,6 +1016,9 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # Priority 2 Slice 5 — record-level fork replay (--rerun-from)
+    # §37 Tier 2 #10 — ALSO accepts <session>:<phase> form,
+    # resolved via the canonical CausalityDAG before the existing
+    # record_id codepath.
     # ------------------------------------------------------------------
     if args.rerun_from is not None:
         if args.rerun is None:
@@ -1019,6 +1026,46 @@ def main() -> None:
                 f"\n  {_RED}--rerun-from requires --rerun <session-id>{_RESET}\n"
             )
             sys.exit(2)
+        if ":" in args.rerun_from:
+            try:
+                _sess_part, _phase_part = args.rerun_from.split(":", 1)
+                _sess_part = _sess_part.strip()
+                _phase_part = _phase_part.strip()
+                if _sess_part and _sess_part != args.rerun:
+                    print(
+                        f"\n  {_RED}--rerun-from session "
+                        f"{_sess_part!r} disagrees with --rerun "
+                        f"{args.rerun!r}{_RESET}\n"
+                    )
+                    sys.exit(2)
+                from backend.core.ouroboros.governance.verification.causality_dag import (
+                    build_dag,
+                )
+                _dag = build_dag(session_id=args.rerun)
+                _record = _dag.first_record_in_phase(_phase_part)
+                if _record is None:
+                    _phases = _dag.distinct_phases()
+                    print(
+                        f"\n  {_RED}No records in phase "
+                        f"{_phase_part!r} for session "
+                        f"{args.rerun!r}{_RESET}\n"
+                        f"  Available: "
+                        f"{', '.join(_phases) if _phases else '(none)'}\n"
+                    )
+                    sys.exit(2)
+                args.rerun_from = _record.record_id
+                print(
+                    f"\n  Resolved {_sess_part}:{_phase_part} → "
+                    f"record_id {args.rerun_from}\n"
+                )
+            except SystemExit:
+                raise
+            except Exception as exc:
+                print(
+                    f"\n  {_RED}Phase-form resolution failed:"
+                    f"{_RESET} {type(exc).__name__}: {exc}\n"
+                )
+                sys.exit(2)
         try:
             from backend.core.ouroboros.governance.verification.replay_from_record import (
                 prepare_replay_from_record,

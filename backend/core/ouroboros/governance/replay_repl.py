@@ -69,13 +69,12 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List
 
 
 _BOLD = "\033[1m"
 _RESET = "\033[0m"
 _DIM = "\033[2m"
-_GREEN = "\033[32m"
 _RED = "\033[31m"
 _YELLOW = "\033[33m"
 _CYAN = "\033[36m"
