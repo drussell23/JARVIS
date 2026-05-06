@@ -697,14 +697,63 @@ class AdaptationLedger:
                 "(proposal_id=%s): %s", proposal.proposal_id, exc,
             )
             return False
+        # §33.4 canonical substrate — Wave 3 hygiene migration
+        # (2026-05-05). Composes ``cross_process_jsonl.
+        # flock_critical_section`` (sibling .lock-file pattern;
+        # robust across NFS / non-POSIX FS where data-fd locks
+        # have known semantic edge cases) instead of the legacy
+        # ``_file_lock.flock_exclusive`` (Phase 7.8) which locked
+        # the data fd directly. Durability semantics preserved
+        # byte-identically — flush + fsync still fire inside the
+        # critical section.
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_critical_section,
+            )
+        except ImportError:
+            # Substrate unavailable (rollback branch) → fall
+            # through to legacy data-fd flock. NEVER raises.
+            return self._append_legacy_data_fd_flock(line, proposal)
+        with flock_critical_section(self._path) as acquired:
+            if not acquired:
+                logger.warning(
+                    "[AdaptationLedger] flock_critical_section "
+                    "failed to acquire for proposal_id=%s",
+                    proposal.proposal_id,
+                )
+                return False
+            try:
+                with self._path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                    f.write("\n")
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+            except OSError as exc:
+                logger.warning(
+                    "[AdaptationLedger] append failed inside "
+                    "critical section (proposal_id=%s): %s",
+                    proposal.proposal_id, exc,
+                )
+                return False
+        return True
+
+    def _append_legacy_data_fd_flock(
+        self,
+        line: str,
+        proposal: AdaptationProposal,
+    ) -> bool:
+        """Pre-Wave-3 legacy path — kept as a NEVER-raises
+        fallback when the canonical ``cross_process_jsonl``
+        substrate is unavailable (e.g. partial-rollback branch).
+        Locks the data fd directly via the older
+        ``_file_lock.flock_exclusive`` helper. NOT the canonical
+        path; if you find yourself reaching for this, prefer
+        landing the substrate first."""
         try:
             with self._path.open("a", encoding="utf-8") as f:
-                # Phase 7.8 — cross-process advisory lock. Best-effort:
-                # no-op fallback when fcntl unavailable (Windows) or
-                # JARVIS_ADAPTATION_LEDGER_FLOCK_ENABLED=false. The
-                # exclusive lock serializes append paths across
-                # processes (within-process serialization remains
-                # threading.RLock at the call site).
                 from backend.core.ouroboros.governance.adaptation._file_lock import (  # noqa: E501
                     flock_exclusive,
                 )
@@ -718,8 +767,8 @@ class AdaptationLedger:
                         pass
         except OSError as exc:
             logger.warning(
-                "[AdaptationLedger] append failed (proposal_id=%s): %s",
-                proposal.proposal_id, exc,
+                "[AdaptationLedger] legacy append failed "
+                "(proposal_id=%s): %s", proposal.proposal_id, exc,
             )
             return False
         return True

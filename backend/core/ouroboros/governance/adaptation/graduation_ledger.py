@@ -358,7 +358,17 @@ def known_flags() -> FrozenSet[str]:
 
 @dataclass(frozen=True)
 class SessionRecord:
-    """One ledger row. Frozen — append-only history."""
+    """One ledger row. Frozen — append-only history.
+
+    Slice 6 (2026-05-05): :attr:`runner_attributed_kind` carries
+    the structured taxonomy classifier emitted by the harness.
+    Legacy rows (pre-Slice-6) have no field — readers default to
+    ``None`` and the suffix back-compat shim
+    (:func:`is_legacy_contract_downgrade`) stays load-bearing for
+    those rows ONLY. New rows route through this typed field;
+    note-string parsing is a back-compat path, not the canonical
+    one.
+    """
 
     flag_name: str
     session_id: str
@@ -367,9 +377,12 @@ class SessionRecord:
     recorded_at_epoch: float
     recorded_by: str
     notes: str = ""
+    # Slice 6 — Optional[str]; serialized only when present so
+    # legacy rows on disk stay byte-identical.
+    runner_attributed_kind: Optional[str] = None
 
     def to_dict(self) -> Dict:
-        return {
+        out: Dict = {
             "flag_name": self.flag_name,
             "session_id": self.session_id,
             "outcome": self.outcome.value,
@@ -378,6 +391,9 @@ class SessionRecord:
             "recorded_by": self.recorded_by,
             "notes": self.notes,
         }
+        if self.runner_attributed_kind is not None:
+            out["runner_attributed_kind"] = self.runner_attributed_kind
+        return out
 
 
 def _utc_now_iso() -> str:
@@ -404,6 +420,7 @@ class GraduationLedger:
         outcome: SessionOutcome,
         recorded_by: str,
         notes: str = "",
+        runner_attributed_kind: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Append ONE session outcome. Returns ``(ok, detail)``.
 
@@ -411,6 +428,15 @@ class GraduationLedger:
           1. Master flag off → (False, "master_off")
           2. flag_name not in known_flags → (False, "unknown_flag")
           3. session_id empty → (False, "empty_session_id")
+
+        Slice 6: ``runner_attributed_kind`` (Optional[str]) carries
+        the structured taxonomy classifier from
+        :class:`runner_kind.RunnerAttributedKind`. When ``None``
+        (legacy callers / non-runner outcomes), the row writes
+        without the field — byte-identical to pre-Slice-6 rows.
+        Unknown / malformed values are coerced to ``None`` via
+        :func:`runner_kind.coerce_kind` so corrupted callers
+        never store invalid taxonomy values.
 
         NEVER raises.
         """
@@ -424,6 +450,20 @@ class GraduationLedger:
             return (False, "empty_session_id")
         recorded_by_clean = (recorded_by or "").strip()[:120] or "unknown"
         notes_clean = (notes or "")[:MAX_NOTES_CHARS]
+        # Slice 6: validate kind through the canonical coercer.
+        # Unknown values become None (write a legacy-shape row
+        # rather than persisting an invalid taxonomy value).
+        kind_clean: Optional[str] = None
+        if runner_attributed_kind is not None:
+            try:
+                from backend.core.ouroboros.governance.graduation.runner_kind import (  # noqa: E501
+                    coerce_kind,
+                )
+                coerced = coerce_kind(runner_attributed_kind)
+                kind_clean = coerced.value if coerced is not None else None
+            except ImportError:
+                # Substrate unavailable — back-compat path.
+                kind_clean = None
         record = SessionRecord(
             flag_name=flag_clean,
             session_id=sid,
@@ -432,6 +472,7 @@ class GraduationLedger:
             recorded_at_epoch=time.time(),
             recorded_by=recorded_by_clean,
             notes=notes_clean,
+            runner_attributed_kind=kind_clean,
         )
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -504,6 +545,23 @@ class GraduationLedger:
                 outcome = SessionOutcome(str(obj.get("outcome") or ""))
             except ValueError:
                 continue
+            # Slice 6 — round-trip the structured kind. Legacy
+            # rows have no field → reads as None and falls
+            # through to the suffix back-compat shim in
+            # ``progress()``.
+            kind_raw = obj.get("runner_attributed_kind")
+            kind_str: Optional[str] = None
+            if kind_raw is not None:
+                try:
+                    from backend.core.ouroboros.governance.graduation.runner_kind import (  # noqa: E501
+                        coerce_kind,
+                    )
+                    coerced = coerce_kind(kind_raw)
+                    kind_str = (
+                        coerced.value if coerced is not None else None
+                    )
+                except ImportError:
+                    kind_str = None
             out.append(SessionRecord(
                 flag_name=str(obj.get("flag_name") or ""),
                 session_id=str(obj.get("session_id") or ""),
@@ -512,6 +570,7 @@ class GraduationLedger:
                 recorded_at_epoch=float(obj.get("recorded_at_epoch") or 0.0),
                 recorded_by=str(obj.get("recorded_by") or ""),
                 notes=str(obj.get("notes") or ""),
+                runner_attributed_kind=kind_str,
             ))
         return out
 
@@ -526,10 +585,21 @@ class GraduationLedger:
         This refines eligibility (per operator binding) WITHOUT
         weakening the "no runner failures" semantics — real
         runner-class failures (Venom / orchestrator / iron-gate /
-        change-engine errors) still block. The filter is the SOLE
-        composition path for the legacy suffix; the predicate at
-        ``graduation.lineage_waiver.is_legacy_contract_downgrade``
-        is AST-pinned as the canonical knower.
+        change-engine errors) still block.
+
+        Slice 6 (2026-05-05): the structured
+        :attr:`SessionRecord.runner_attributed_kind` field is the
+        CANONICAL knower of legacy-downgrade lineage for new
+        rows. Routing precedence:
+
+          1. If the row carries a structured kind, route via
+             :func:`runner_kind.is_legacy_downgrade_kind` —
+             zero string parsing, zero collision risk.
+          2. Otherwise (legacy rows, no structured field),
+             fall through to the existing
+             :func:`is_legacy_contract_downgrade(outcome, notes)`
+             back-compat shim. Both paths route to the SAME
+             ``runner_legacy_downgrade`` bucket.
 
         Master-off → all zeros (best-effort).
 
@@ -541,10 +611,11 @@ class GraduationLedger:
         policy = _POLICY_BY_FLAG.get(flag_name)
         if policy is None:
             return _zero_progress(flag_name)
-        # Lazy-import the lineage waiver to avoid a startup cycle.
-        # Fallback path: if the waiver module is unavailable (rollback
-        # branch), the legacy filter degrades to a no-op — runner
-        # rows count as before. Defensive; NEVER raises.
+        # Lazy-import the lineage waiver + Slice 6 structured-field
+        # selector to avoid a startup cycle. Fallback path: if
+        # either substrate is unavailable (rollback branch), the
+        # corresponding filter degrades to a no-op — runner rows
+        # count as before. Defensive; NEVER raises.
         try:
             from backend.core.ouroboros.governance.graduation.lineage_waiver import (  # noqa: E501
                 is_legacy_contract_downgrade,
@@ -554,6 +625,14 @@ class GraduationLedger:
                 *, outcome: str, notes: str,
             ) -> bool:
                 return False
+        try:
+            from backend.core.ouroboros.governance.graduation.runner_kind import (  # noqa: E501
+                coerce_kind as _coerce_kind,
+                is_legacy_downgrade_kind as _is_legacy_downgrade_kind,
+            )
+        except ImportError:
+            _coerce_kind = None  # type: ignore
+            _is_legacy_downgrade_kind = None  # type: ignore
         counts = {
             "clean": 0, "infra": 0, "runner": 0, "migration": 0,
             "runner_legacy_downgrade": 0,
@@ -570,19 +649,44 @@ class GraduationLedger:
                 continue
             all_sessions.add(r.session_id)
             outcome_key = r.outcome.value
-            # Slice 5 lineage waiver: re-route runner rows whose
-            # notes match the canonical legacy-downgrade suffix
-            # into the audit-visible legacy bucket. The original
-            # row stays in the append-only ledger untouched; only
-            # the in-memory AGGREGATION re-classifies it for
-            # eligibility purposes.
-            if outcome_key == "runner" and (
-                is_legacy_contract_downgrade(
-                    outcome=outcome_key,
-                    notes=r.notes,
-                )
-            ):
-                outcome_key = "runner_legacy_downgrade"
+            # Slice 5 + Slice 6 lineage waiver: re-route runner
+            # rows whose lineage marks them as legacy contract-
+            # downgrades into the audit-visible legacy bucket.
+            # Routing precedence:
+            #   1. If the row has a STRUCTURED kind, route via
+            #      runner_kind.is_legacy_downgrade_kind (Slice 6
+            #      canonical path; zero string parsing).
+            #   2. Otherwise, fall through to the suffix back-
+            #      compat shim (Slice 5 — preserved for legacy
+            #      rows written before Slice 6).
+            # The original row stays in the append-only ledger
+            # untouched; only the in-memory AGGREGATION re-
+            # classifies it for eligibility purposes.
+            if outcome_key == "runner":
+                routed = False
+                # Slice 6 canonical path.
+                if (
+                    r.runner_attributed_kind is not None
+                    and _coerce_kind is not None
+                    and _is_legacy_downgrade_kind is not None
+                ):
+                    coerced_kind = _coerce_kind(
+                        r.runner_attributed_kind,
+                    )
+                    if _is_legacy_downgrade_kind(coerced_kind):
+                        outcome_key = "runner_legacy_downgrade"
+                        routed = True
+                # Slice 5 back-compat shim — only fires when the
+                # row has NO structured kind (legacy rows on disk).
+                if (
+                    not routed
+                    and r.runner_attributed_kind is None
+                    and is_legacy_contract_downgrade(
+                        outcome=outcome_key,
+                        notes=r.notes,
+                    )
+                ):
+                    outcome_key = "runner_legacy_downgrade"
             bucket = seen_per_outcome.get(outcome_key)
             if bucket is None:
                 continue

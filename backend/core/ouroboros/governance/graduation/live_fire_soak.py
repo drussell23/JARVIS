@@ -247,7 +247,13 @@ class HarnessStatus(str, enum.Enum):
 
 @dataclass(frozen=True)
 class EvidenceRow:
-    """One soak's rich-evidence row. Frozen — append-only history."""
+    """One soak's rich-evidence row. Frozen — append-only history.
+
+    Slice 6 (2026-05-05): :attr:`runner_attributed_kind` carries
+    the structured taxonomy classifier from
+    :class:`runner_kind.RunnerAttributedKind`. Optional[str] —
+    legacy rows have no field (serialized only when present).
+    """
 
     schema_version: str
     harness_status: str
@@ -266,9 +272,11 @@ class EvidenceRow:
     finished_at_iso: str
     finished_at_epoch: float
     notes: str
+    # Slice 6 — Optional[str]; serialized only when present.
+    runner_attributed_kind: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "schema_version": self.schema_version,
             "harness_status": self.harness_status,
             "flag_name": self.flag_name,
@@ -287,6 +295,9 @@ class EvidenceRow:
             "finished_at_epoch": self.finished_at_epoch,
             "notes": self.notes,
         }
+        if self.runner_attributed_kind is not None:
+            out["runner_attributed_kind"] = self.runner_attributed_kind
+        return out
 
 
 @dataclass(frozen=True)
@@ -427,6 +438,90 @@ def _is_positive_int(v: Any) -> bool:
         return int(v) > 0
     except (TypeError, ValueError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Slice 6 — structured runner_attributed_kind derivation
+# ---------------------------------------------------------------------------
+
+
+def derive_runner_kind_from_classification(
+    *,
+    summary: Mapping[str, Any],
+    outcome_str: str,
+    runner_attributed: bool,
+    class_notes: str,
+) -> Optional[str]:
+    """Derive the structured ``runner_attributed_kind`` from the
+    same inputs as :func:`classify_outcome` — composes
+    :func:`lineage_waiver.is_legacy_contract_downgrade` (single
+    knower of the legacy suffix) + :class:`runner_kind.
+    RunnerAttributedKind` (single knower of the taxonomy).
+
+    Returns ``None`` for non-runner outcomes so the row writes
+    byte-identical to legacy clean/infra/migration rows.
+
+    Pure function. NEVER raises. Defensive on any subsystem
+    unavailability — returns ``None`` (legacy back-compat).
+
+    Decision tree (mirrors :func:`classify_outcome` after contract
+    consultation):
+
+      1. ``runner_attributed is False`` → ``None``
+      2. Notes match the lineage-waiver suffix → ``CONTRACT_DOWNGRADE_LEGACY``
+      3. Summary's failure_class_counts has runner-class hits →
+         first hit by sorted order (deterministic)
+      4. Default → ``DEFAULT_CONSERVATIVE``
+    """
+    try:
+        if not runner_attributed:
+            return None
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    # Step 2: lineage waiver — compose canonical predicate.
+    try:
+        from backend.core.ouroboros.governance.graduation.lineage_waiver import (  # noqa: E501
+            is_legacy_contract_downgrade,
+        )
+        if is_legacy_contract_downgrade(
+            outcome=outcome_str, notes=class_notes,
+        ):
+            try:
+                from backend.core.ouroboros.governance.graduation.runner_kind import (  # noqa: E501
+                    RunnerAttributedKind,
+                )
+                return RunnerAttributedKind.CONTRACT_DOWNGRADE_LEGACY.value
+            except ImportError:
+                return "contract_downgrade_legacy"
+    except ImportError:
+        pass
+    # Step 3: concrete runner-class hit from failure_class_counts.
+    try:
+        from backend.core.ouroboros.governance.graduation.runner_kind import (  # noqa: E501
+            CONCRETE_RUNNER_FAILURE_CLASS_VALUES,
+            RunnerAttributedKind,
+        )
+        if isinstance(summary, dict):
+            failure_counts = summary.get(
+                "failure_class_counts",
+            ) or {}
+            if isinstance(failure_counts, dict):
+                hits = sorted(
+                    str(k) for k, v in failure_counts.items()
+                    if (
+                        str(k) in CONCRETE_RUNNER_FAILURE_CLASS_VALUES
+                        and _is_positive_int(v)
+                    )
+                )
+                for hit in hits:
+                    try:
+                        return RunnerAttributedKind(hit).value
+                    except ValueError:
+                        continue
+        return RunnerAttributedKind.DEFAULT_CONSERVATIVE.value
+    except ImportError:
+        # Substrate unavailable — back-compat path.
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +809,16 @@ class LiveFireSoakHarness:
         ops_count = _session_ops_count(summary)
         failure_counts_raw = summary.get("failure_class_counts") or {}
         failure_counts = self._truncate_failure_counts(failure_counts_raw)
+        # Slice 6 — derive structured runner_attributed_kind from
+        # the same inputs as classify_outcome (post-contract).
+        # NEVER raises; returns None for non-runner outcomes
+        # (byte-identical legacy row shape).
+        runner_kind_value = derive_runner_kind_from_classification(
+            summary=summary,
+            outcome_str=outcome_str,
+            runner_attributed=runner_attributed,
+            class_notes=class_notes,
+        )
         evidence = EvidenceRow(
             schema_version=EVIDENCE_SCHEMA_VERSION,
             harness_status=HarnessStatus.OK.value,
@@ -732,6 +837,7 @@ class LiveFireSoakHarness:
             finished_at_iso=finished_at_iso,
             finished_at_epoch=finished_at_epoch,
             notes=class_notes[:MAX_NOTES_CHARS],
+            runner_attributed_kind=runner_kind_value,
         )
         # Persist rich-evidence row.
         self._append_history_row(evidence)
@@ -750,6 +856,7 @@ class LiveFireSoakHarness:
             outcome=outcome_enum,
             recorded_by=recorded_by,
             notes=class_notes[:1000],
+            runner_attributed_kind=runner_kind_value,
         )
         if not ok:
             logger.warning(
