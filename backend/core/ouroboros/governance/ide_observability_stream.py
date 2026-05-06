@@ -142,6 +142,24 @@ EVENT_TYPE_MEMORY_PRESSURE_CHANGED = "memory_pressure_changed"
 # the posture_changed / governor_throttle_applied pattern).
 EVENT_TYPE_BUDGET_ACTION_TAKEN = "budget_action_taken"
 
+# §37 Slice 5 (PRD §37.7 Tier 1 #1, 2026-05-05) — approaching-
+# budget warning. Cost-band-crossing detector emits this event
+# only on band TRANSITIONS (chatter-suppression structural via
+# `cost_warning_observer.CostWarningObserver`). Payload carries
+# stream_key + from_band + to_band + fraction + spent_usd +
+# budget_usd. Operators consume via `/listen filter
+# type=cost_band_crossed` (Slice 2 territory).
+EVENT_TYPE_COST_BAND_CROSSED = "cost_band_crossed"
+
+# §37 Slice 6 (PRD §37.7 Tier 1 #3, 2026-05-05) — PlanGenerator
+# output. Emitted at PLAN-phase completion with full schema-plan.1
+# JSON payload for operator consumption via `/show_plan`. Operators
+# read via Slice 2 broker history (`/listen filter
+# type=plan_generated`) OR the dedicated `/show_plan` verb that
+# renders structured fields (approach / ordered_changes /
+# risk_factors / test_strategy / complexity).
+EVENT_TYPE_PLAN_GENERATED = "plan_generated"
+
 # M9 CuriosityGradient (PRD §30.5.1) Slice 4 vocabulary.
 # Single event covering all CuriosityScore transitions — payload
 # carries cluster_id + magnitude + dominant_source + decay_reason
@@ -622,6 +640,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_AUTO_ACTION_PROPOSAL_EMITTED,      # auto_action_router emit phase
     EVENT_TYPE_FAILURE_MODE_RECALLED_AT_GENERATE,  # Upgrade 3 Slice 5 (PRD §31.4)
     EVENT_TYPE_ACTION_OUTCOME_RECALLED_AT_GENERATE,  # M11 Slice 4 (PRD §30.5.3)
+    EVENT_TYPE_COST_BAND_CROSSED,                # §37 Slice 5 (PRD §37.7 Tier 1 #1)
+    EVENT_TYPE_PLAN_GENERATED,                   # §37 Slice 6 (PRD §37.7 Tier 1 #3)
 })
 
 

@@ -188,6 +188,21 @@ class StatusLineBuilder:
         primary_op, extra_ops = self._sample_ops()
         route, provider = self._sample_route_and_provider(primary_op)
 
+        # §37 Slice 5 — feed cost-band-crossing observer.
+        # Chatter-suppression is structural in the observer; this call
+        # is safe to make every render tick (~500ms). Defensive:
+        # observer NEVER raises; status-line never breaks on this.
+        try:
+            from backend.core.ouroboros.governance.cost_warning_observer import (
+                get_default_observer,
+            )
+            get_default_observer().record(
+                spent_usd=cost_spent,
+                budget_usd=cost_budget,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
         return StatusSnapshot(
             phase=phase,
             phase_detail=phase_detail,

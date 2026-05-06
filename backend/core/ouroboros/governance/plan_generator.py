@@ -533,6 +533,49 @@ class PlanGenerator:
                 ctx.op_id, result.complexity,
                 len(result.ordered_changes), result.planning_duration_s,
             )
+
+            # §37 Slice 6 (2026-05-05) — emit canonical SSE event so
+            # `/show_plan` REPL + IDE consumers see plan JSON in the
+            # broker history. Composes Slice 2 territory; same
+            # pipeline as every other event surface. Fire-and-forget
+            # defensive: NEVER raises into PlanGenerator.run.
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (
+                    EVENT_TYPE_PLAN_GENERATED,
+                    get_default_broker,
+                )
+                _broker = get_default_broker()
+                if _broker is not None:
+                    _broker.publish(
+                        event_type=EVENT_TYPE_PLAN_GENERATED,
+                        op_id=str(ctx.op_id or ""),
+                        payload={
+                            "approach": str(result.approach or ""),
+                            "complexity": str(result.complexity or ""),
+                            "ordered_changes": list(
+                                result.ordered_changes or [],
+                            ),
+                            "risk_factors": list(
+                                result.risk_factors or [],
+                            ),
+                            "test_strategy": str(
+                                result.test_strategy or "",
+                            ),
+                            "architectural_notes": str(
+                                result.architectural_notes or "",
+                            ),
+                            "planning_duration_s": float(
+                                result.planning_duration_s or 0.0,
+                            ),
+                            "skipped": bool(result.skipped),
+                            "skip_reason": str(
+                                result.skip_reason or "",
+                            ),
+                            "ui_affected": bool(result.ui_affected),
+                        },
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                pass
             return result
 
         except Exception as exc:
