@@ -20,6 +20,8 @@ import asyncio
 import heapq
 import itertools
 import logging
+import weakref
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.autonomy.autonomy_types import (
@@ -57,6 +59,20 @@ class CommandBus:
         commands.
     """
 
+    # Path D.4 (PRD §36.6, 2026-05-05) — class-level weak-ref
+    # registry of live CommandBus instances. CommandBus has no
+    # global singleton (multiple callers construct their own:
+    # governed_loop_service, subagent_scheduler, advanced_
+    # coordination, safety_net, feedback_engine). The Class-
+    # level Instance Registry pattern lets operator surfaces
+    # (`/bus` + `/observability/command-bus`) aggregate metrics
+    # across ALL live buses without forcing a single-instance
+    # contract.
+    #
+    # WeakSet keeps refs without preventing GC — orphaned buses
+    # drop out automatically.
+    _INSTANCES: "weakref.WeakSet[CommandBus]" = weakref.WeakSet()
+
     def __init__(
         self,
         maxsize: int = 256,
@@ -75,6 +91,18 @@ class CommandBus:
         # Signalled whenever a new item is pushed so that a blocked get()
         # can wake up and try to dequeue.
         self._not_empty = asyncio.Event()
+        # Path D.4 — per-command-type dispatch counter.
+        # Lightweight Dict[str, int] incremented inside _enqueue
+        # AFTER all gates pass (so the count reflects "accepted"
+        # rather than "attempted"). Defaultdict + int — never
+        # raises.
+        self._dispatch_counts: Dict[str, int] = defaultdict(int)
+        # Total commands ever rejected (dedup OR backpressure)
+        # — useful operator signal for back-pressure alerts.
+        self._rejected_dedup: int = 0
+        self._rejected_backpressure: int = 0
+        # Register self for cross-instance aggregation.
+        CommandBus._INSTANCES.add(self)
 
     # ------------------------------------------------------------------
     # put (async, non-blocking on full — returns False)
@@ -187,6 +215,7 @@ class CommandBus:
                 "CommandBus: duplicate idempotency_key=%s dropped",
                 cmd.idempotency_key[:12],
             )
+            self._rejected_dedup += 1
             return False
 
         # 2. Backpressure check
@@ -196,6 +225,7 @@ class CommandBus:
                 self._maxsize,
                 cmd.command_id,
             )
+            self._rejected_backpressure += 1
             return False
 
         # 3. Record key in LRU (now committed to accepting this command)
@@ -206,6 +236,16 @@ class CommandBus:
         heapq.heappush(self._heap, entry)
         self._not_empty.set()
 
+        # Path D.4 — increment per-command-type dispatch counter
+        # after successful enqueue. Counter is "accepted" not
+        # "attempted" — rejections fall in dedicated counters
+        # above. NEVER raises (defaultdict + int).
+        try:
+            ct = cmd.command_type.value
+        except Exception:  # noqa: BLE001 — defensive
+            ct = str(getattr(cmd, "command_type", "unknown"))
+        self._dispatch_counts[ct] += 1
+
         logger.debug(
             "CommandBus: enqueued %s (type=%s, priority=%d, qsize=%d)",
             cmd.command_id,
@@ -214,3 +254,149 @@ class CommandBus:
             len(self._heap),
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Path D.4 — operator-visibility read API
+    # ------------------------------------------------------------------
+
+    def metrics_snapshot(self) -> Dict[str, Any]:
+        """Per-bus metrics snapshot. Pure-read; deep-copies
+        counters so the caller cannot mutate instance state.
+        NEVER raises.
+
+        Composes existing :meth:`qsize` + :meth:`get_rate_limiter_status`
+        + dedup-cache size with the new per-command-type
+        dispatch counters + rejection counters.
+
+        Shape::
+
+            {
+                "qsize": <int>,
+                "maxsize": <int>,
+                "dedup_cache_size": <int>,
+                "rate_limiter": {...} | None,
+                "total_dispatched": <int>,
+                "rejected_dedup": <int>,
+                "rejected_backpressure": <int>,
+                "by_command_type": {
+                    "REQUEST_MODE_SWITCH": <int>,
+                    ...
+                },
+            }
+        """
+        try:
+            by_type = {
+                k: int(v)
+                for k, v in self._dispatch_counts.items()
+            }
+            total_dispatched = sum(by_type.values())
+            try:
+                # IdempotencyLRU.size() if exposed; fall back to
+                # private cache len.
+                if hasattr(self._dedup, "size"):
+                    dedup_size = int(self._dedup.size())  # type: ignore[arg-type]
+                else:
+                    dedup_size = len(
+                        self._dedup._cache,  # noqa: SLF001
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                dedup_size = 0
+            try:
+                rl_status = self.get_rate_limiter_status()
+            except Exception:  # noqa: BLE001 — defensive
+                rl_status = None
+            return {
+                "qsize": int(self.qsize()),
+                "maxsize": int(self._maxsize),
+                "dedup_cache_size": dedup_size,
+                "rate_limiter": rl_status,
+                "total_dispatched": total_dispatched,
+                "rejected_dedup": int(self._rejected_dedup),
+                "rejected_backpressure": int(
+                    self._rejected_backpressure,
+                ),
+                "by_command_type": by_type,
+            }
+        except Exception:  # noqa: BLE001 — defensive
+            return {
+                "qsize": 0,
+                "maxsize": 0,
+                "dedup_cache_size": 0,
+                "rate_limiter": None,
+                "total_dispatched": 0,
+                "rejected_dedup": 0,
+                "rejected_backpressure": 0,
+                "by_command_type": {},
+            }
+
+    @classmethod
+    def snapshot_all(cls) -> Dict[str, Any]:
+        """Aggregate metrics across ALL live CommandBus
+        instances. Composes :meth:`metrics_snapshot` per
+        instance + merges. NEVER raises.
+
+        CommandBus has no global singleton (5 internal
+        consumers each construct their own); this aggregate
+        snapshot is the operator-surface alternative. Live
+        instances are tracked via the class-level
+        :data:`_INSTANCES` WeakSet — orphaned buses drop out
+        automatically.
+        """
+        try:
+            instances = list(cls._INSTANCES)
+            if not instances:
+                return {
+                    "instance_count": 0,
+                    "total_qsize": 0,
+                    "total_dispatched": 0,
+                    "total_rejected_dedup": 0,
+                    "total_rejected_backpressure": 0,
+                    "by_command_type": {},
+                }
+            total_qsize = 0
+            total_dispatched = 0
+            total_rd = 0
+            total_rb = 0
+            agg_by_type: Dict[str, int] = defaultdict(int)
+            for inst in instances:
+                try:
+                    snap = inst.metrics_snapshot()
+                except Exception:  # noqa: BLE001 — defensive
+                    continue
+                total_qsize += int(snap.get("qsize", 0))
+                total_dispatched += int(
+                    snap.get("total_dispatched", 0),
+                )
+                total_rd += int(
+                    snap.get("rejected_dedup", 0),
+                )
+                total_rb += int(
+                    snap.get("rejected_backpressure", 0),
+                )
+                for ct, count in snap.get(
+                    "by_command_type", {},
+                ).items():
+                    agg_by_type[ct] += int(count)
+            return {
+                "instance_count": len(instances),
+                "total_qsize": total_qsize,
+                "total_dispatched": total_dispatched,
+                "total_rejected_dedup": total_rd,
+                "total_rejected_backpressure": total_rb,
+                "by_command_type": dict(agg_by_type),
+            }
+        except Exception:  # noqa: BLE001 — defensive
+            return {
+                "instance_count": 0,
+                "total_qsize": 0,
+                "total_dispatched": 0,
+                "total_rejected_dedup": 0,
+                "total_rejected_backpressure": 0,
+                "by_command_type": {},
+            }
+
+    @classmethod
+    def reset_instance_registry_for_tests(cls) -> None:
+        """Test-only — clear the WeakSet of live instances.
+        Mirrors the equivalent EventEmitter helper."""
+        cls._INSTANCES = weakref.WeakSet()

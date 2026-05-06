@@ -157,6 +157,11 @@ class EventEmitter:
 
         # Always update cursor, even if no subscribers or if handlers failed
         self._last_event_id = event.event_id
+        # Path D.3 — increment per-event-type emission counter
+        # AFTER fan-out so the count reflects "delivered" rather
+        # than "attempted." Counter increment is constant-time +
+        # never raises (defaultdict + int).
+        self._event_counts[key] += 1
 
         # Phase 4 Event Spine: bridge to TrinityEventBus for unified visibility
         await self._bridge_to_spine(event)
@@ -203,6 +208,149 @@ class EventEmitter:
         """Return the number of handlers subscribed to *event_type*."""
         key = event_type.value if isinstance(event_type, EventType) else str(event_type)
         return len(self._subscribers.get(key, []))
+
+    # ------------------------------------------------------------------
+    # Path D.3 — operator-visibility read API
+    # ------------------------------------------------------------------
+
+    def metrics_snapshot(self) -> Dict[str, Any]:
+        """Return a per-event-type metrics snapshot. Pure-read;
+        deep-copies counters so the caller cannot mutate
+        instance state. NEVER raises.
+
+        Shape::
+
+            {
+                "last_event_id": "<uuid>" | None,
+                "total_emissions": <int>,
+                "total_subscribers": <int>,
+                "by_event_type": {
+                    "op_completed": {
+                        "subscriber_count": 2,
+                        "emission_count": 47,
+                    },
+                    ...
+                },
+            }
+        """
+        try:
+            event_types = (
+                set(self._subscribers.keys())
+                | set(self._event_counts.keys())
+            )
+            by_type: Dict[str, Dict[str, int]] = {}
+            for et in sorted(event_types):
+                by_type[et] = {
+                    "subscriber_count": len(
+                        self._subscribers.get(et, []),
+                    ),
+                    "emission_count": int(
+                        self._event_counts.get(et, 0),
+                    ),
+                }
+            total_emissions = sum(
+                int(v) for v in self._event_counts.values()
+            )
+            total_subscribers = sum(
+                len(v) for v in self._subscribers.values()
+            )
+            return {
+                "last_event_id": self._last_event_id,
+                "total_emissions": total_emissions,
+                "total_subscribers": total_subscribers,
+                "by_event_type": by_type,
+            }
+        except Exception:  # noqa: BLE001 — defensive
+            return {
+                "last_event_id": None,
+                "total_emissions": 0,
+                "total_subscribers": 0,
+                "by_event_type": {},
+            }
+
+    @classmethod
+    def snapshot_all(cls) -> Dict[str, Any]:
+        """Aggregate metrics across ALL live EventEmitter
+        instances. Composes :meth:`metrics_snapshot` per
+        instance + merges. NEVER raises.
+
+        EventEmitter has no global singleton (multiple callers
+        construct their own); this aggregate snapshot is the
+        operator-surface alternative. Live instances are tracked
+        via the class-level :data:`_INSTANCES` WeakSet — orphaned
+        emitters drop out automatically.
+
+        Shape::
+
+            {
+                "instance_count": <int>,
+                "total_emissions": <int>,
+                "total_subscribers": <int>,
+                "by_event_type": {
+                    "op_completed": {
+                        "subscriber_count": <sum>,
+                        "emission_count": <sum>,
+                    },
+                    ...
+                },
+            }
+        """
+        try:
+            instances = list(cls._INSTANCES)
+            if not instances:
+                return {
+                    "instance_count": 0,
+                    "total_emissions": 0,
+                    "total_subscribers": 0,
+                    "by_event_type": {},
+                }
+            agg_by_type: Dict[str, Dict[str, int]] = defaultdict(
+                lambda: {"subscriber_count": 0, "emission_count": 0},
+            )
+            total_emissions = 0
+            total_subscribers = 0
+            for inst in instances:
+                try:
+                    snap = inst.metrics_snapshot()
+                except Exception:  # noqa: BLE001 — defensive
+                    continue
+                total_emissions += int(
+                    snap.get("total_emissions", 0),
+                )
+                total_subscribers += int(
+                    snap.get("total_subscribers", 0),
+                )
+                for et, m in snap.get(
+                    "by_event_type", {},
+                ).items():
+                    agg_by_type[et]["subscriber_count"] += int(
+                        m.get("subscriber_count", 0),
+                    )
+                    agg_by_type[et]["emission_count"] += int(
+                        m.get("emission_count", 0),
+                    )
+            return {
+                "instance_count": len(instances),
+                "total_emissions": total_emissions,
+                "total_subscribers": total_subscribers,
+                "by_event_type": dict(agg_by_type),
+            }
+        except Exception:  # noqa: BLE001 — defensive
+            return {
+                "instance_count": 0,
+                "total_emissions": 0,
+                "total_subscribers": 0,
+                "by_event_type": {},
+            }
+
+    @classmethod
+    def reset_instance_registry_for_tests(cls) -> None:
+        """Test-only — clear the WeakSet of live instances.
+        Production code MUST NOT call this (would orphan
+        all live emitters from operator surfaces). Mirrors
+        the reset_default_observer_for_tests / reset_default_
+        monitor_for_tests pattern."""
+        cls._INSTANCES = weakref.WeakSet()
 
     # ------------------------------------------------------------------
     # internals
