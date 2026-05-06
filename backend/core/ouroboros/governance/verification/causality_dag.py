@@ -248,6 +248,80 @@ class CausalityDAG:
         except Exception:  # noqa: BLE001 — defensive
             return ()
 
+    # ------------------------------------------------------------------
+    # Phase-filter read API (PRD §37 Tier 2 #10, 2026-05-05)
+    # ------------------------------------------------------------------
+
+    def nodes_for_phase(
+        self, phase: str,
+    ) -> Tuple["DecisionRecord", ...]:
+        """Return all DecisionRecords whose ``phase`` field matches
+        ``phase``. Insertion-order preserved (matches
+        ``record_ids`` ordering).
+
+        O(n) scan of self._nodes — acceptable since DAG is bounded
+        and operator-paced (called from `--rerun-from
+        <session>:<phase>` resolution + `/replay` REPL); not a
+        hot-path API.
+
+        Used by the §37 Tier 2 #10 phase-boundary deterministic
+        replay arc to resolve a (session, phase) pair to the
+        canonical fork-point record. NEVER raises — returns
+        empty tuple on malformed input.
+        """
+        try:
+            target = str(phase or "").strip()
+            if not target:
+                return ()
+            return tuple(
+                rec for rec in self._nodes.values()
+                if str(getattr(rec, "phase", "") or "") == target
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+
+    def first_record_in_phase(
+        self, phase: str,
+    ) -> Optional["DecisionRecord"]:
+        """Return the FIRST (insertion-order) DecisionRecord
+        whose ``phase`` field matches ``phase``, or None. The
+        canonical fork-point for ``--rerun-from <session>:<phase>``
+        — replay re-executes from this record onward, so the
+        first-record-in-phase is the natural boundary.
+        NEVER raises."""
+        try:
+            target = str(phase or "").strip()
+            if not target:
+                return None
+            for rec in self._nodes.values():
+                if (
+                    str(getattr(rec, "phase", "") or "")
+                    == target
+                ):
+                    return rec
+            return None
+        except Exception:  # noqa: BLE001 — defensive
+            return None
+
+    def distinct_phases(self) -> Tuple[str, ...]:
+        """Return tuple of distinct phase values present in the
+        DAG, in insertion order (first-occurrence wins). Used by
+        the `/replay` REPL surface to render available fork-
+        boundary candidates. NEVER raises."""
+        try:
+            seen: list = []
+            seen_set: set = set()
+            for rec in self._nodes.values():
+                phase = str(
+                    getattr(rec, "phase", "") or "",
+                )
+                if phase and phase not in seen_set:
+                    seen.append(phase)
+                    seen_set.add(phase)
+            return tuple(seen)
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+
     # -- bounded traversal -------------------------------------------------
 
     def subgraph(
