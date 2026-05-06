@@ -519,6 +519,18 @@ class GraduationLedger:
         """Return per-flag counts: clean / infra / runner / migration /
         unique_sessions / required.
 
+        Slice 5 lineage waiver (2026-05-05): rows whose ``(outcome,
+        notes)`` matches the canonical Phase 9.4 legacy-contract-
+        downgrade lineage are filtered out of the canonical ``runner``
+        bucket and surfaced separately as ``runner_legacy_downgrade``.
+        This refines eligibility (per operator binding) WITHOUT
+        weakening the "no runner failures" semantics — real
+        runner-class failures (Venom / orchestrator / iron-gate /
+        change-engine errors) still block. The filter is the SOLE
+        composition path for the legacy suffix; the predicate at
+        ``graduation.lineage_waiver.is_legacy_contract_downgrade``
+        is AST-pinned as the canonical knower.
+
         Master-off → all zeros (best-effort).
 
         Counts UNIQUE session_ids per outcome — the same session
@@ -529,26 +541,58 @@ class GraduationLedger:
         policy = _POLICY_BY_FLAG.get(flag_name)
         if policy is None:
             return _zero_progress(flag_name)
+        # Lazy-import the lineage waiver to avoid a startup cycle.
+        # Fallback path: if the waiver module is unavailable (rollback
+        # branch), the legacy filter degrades to a no-op — runner
+        # rows count as before. Defensive; NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.graduation.lineage_waiver import (  # noqa: E501
+                is_legacy_contract_downgrade,
+            )
+        except ImportError:
+            def is_legacy_contract_downgrade(  # type: ignore
+                *, outcome: str, notes: str,
+            ) -> bool:
+                return False
         counts = {
             "clean": 0, "infra": 0, "runner": 0, "migration": 0,
+            "runner_legacy_downgrade": 0,
             "unique_sessions": 0, "required": policy.required_clean_sessions,
         }
         seen_per_outcome: Dict[str, set] = {
             "clean": set(), "infra": set(),
             "runner": set(), "migration": set(),
+            "runner_legacy_downgrade": set(),
         }
         all_sessions: set = set()
         for r in self._read_all():
             if r.flag_name != flag_name:
                 continue
             all_sessions.add(r.session_id)
-            bucket = seen_per_outcome.get(r.outcome.value)
+            outcome_key = r.outcome.value
+            # Slice 5 lineage waiver: re-route runner rows whose
+            # notes match the canonical legacy-downgrade suffix
+            # into the audit-visible legacy bucket. The original
+            # row stays in the append-only ledger untouched; only
+            # the in-memory AGGREGATION re-classifies it for
+            # eligibility purposes.
+            if outcome_key == "runner" and (
+                is_legacy_contract_downgrade(
+                    outcome=outcome_key,
+                    notes=r.notes,
+                )
+            ):
+                outcome_key = "runner_legacy_downgrade"
+            bucket = seen_per_outcome.get(outcome_key)
             if bucket is None:
                 continue
             if r.session_id in bucket:
                 continue
             bucket.add(r.session_id)
-        for k in ("clean", "infra", "runner", "migration"):
+        for k in (
+            "clean", "infra", "runner", "migration",
+            "runner_legacy_downgrade",
+        ):
             counts[k] = min(len(seen_per_outcome[k]), MAX_CLEAN_COUNT)
         counts["unique_sessions"] = min(
             len(all_sessions), MAX_CLEAN_COUNT,
@@ -582,6 +626,10 @@ def _zero_progress(flag_name: str) -> Dict[str, int]:
     policy = _POLICY_BY_FLAG.get(flag_name)
     return {
         "clean": 0, "infra": 0, "runner": 0, "migration": 0,
+        # Slice 5 lineage waiver — included for shape parity with
+        # the live progress() return so callers never KeyError on
+        # the audit bucket regardless of master-on/off state.
+        "runner_legacy_downgrade": 0,
         "unique_sessions": 0,
         "required": policy.required_clean_sessions if policy else 3,
     }

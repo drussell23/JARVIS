@@ -104,11 +104,40 @@ def _format_flag_row(row: Dict[str, Any]) -> str:
     )
 
 
+def _warn_if_ledger_master_unset() -> None:
+    """Phase 9 Slice 5 UX footgun — when the operator runs `queue`
+    or `ready` without the ledger master flag set, every progress
+    counter renders as 0/N and looks like a data bug. Print one
+    clear line at the top so the all-zeros state can never be
+    confused with "the cadence didn't accumulate evidence." The
+    canonical wrapper script and the cron entry both export the
+    flag; only direct CLI invocations skip it."""
+    raw = os.environ.get(
+        "JARVIS_GRADUATION_LEDGER_ENABLED", "",
+    ).strip().lower()
+    if raw not in ("1", "true", "yes", "on"):
+        print(
+            f"  {_YELLOW}!{_RESET} "
+            f"{_DIM}JARVIS_GRADUATION_LEDGER_ENABLED is unset "
+            f"— progress counters will read as zeros even if the "
+            f"ledger has rows.\n"
+            f"    Re-run via "
+            f"{_CYAN}bash scripts/run_live_fire_graduation_soak.sh{_RESET}"
+            f"{_DIM} OR set the flag explicitly:\n"
+            f"      "
+            f"{_CYAN}JARVIS_GRADUATION_LEDGER_ENABLED=true "
+            f"python3 scripts/live_fire_graduation_soak.py "
+            f"<subcommand>{_RESET}"
+            f"{_DIM}{_RESET}"
+        )
+
+
 def cmd_queue(args: argparse.Namespace) -> int:
     """Render the full graduation queue."""
     from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
         get_default_harness,
     )
+    _warn_if_ledger_master_unset()
     rows = get_default_harness().queue_view()
     n_total = len(rows)
     n_graduated = sum(1 for r in rows if r["graduated"])
@@ -149,6 +178,7 @@ def cmd_ready(args: argparse.Namespace) -> int:
     from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
         get_default_harness,
     )
+    _warn_if_ledger_master_unset()
     ledger = get_default_ledger()
     eligible = ledger.eligible_flags()
     rows = get_default_harness().queue_view()
