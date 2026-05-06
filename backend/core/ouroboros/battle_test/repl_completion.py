@@ -372,7 +372,27 @@ def build_completer(registry: VerbRegistry) -> Optional[object]:
                         display_meta=verb.description,
                     )
 
-    return _SlashCompleter()
+    slash_completer = _SlashCompleter()
+
+    # §37 Slice 7 (2026-05-05) — merge in the @-mention path
+    # completer. Each completer self-gates (slash on `/` prefix,
+    # mention on `@` word-boundary), so they never collide. When
+    # mention completer is unavailable (polish off / prompt_toolkit
+    # missing), fall through to slash-only.
+    try:
+        from backend.core.ouroboros.battle_test.repl_input_polish import (
+            build_mention_completer,
+        )
+        mention_completer = build_mention_completer()
+    except Exception:  # noqa: BLE001 — defensive
+        mention_completer = None
+    if mention_completer is None:
+        return slash_completer
+    try:
+        from prompt_toolkit.completion import merge_completers
+    except ImportError:
+        return slash_completer
+    return merge_completers([slash_completer, mention_completer])
 
 
 # ===========================================================================

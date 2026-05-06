@@ -410,11 +410,123 @@ def _pick_active_op_id(flow: object) -> Optional[str]:
     return next(iter(active))
 
 
+# ===========================================================================
+# §37 Slice 7 (PRD §37.7 Tier 1 #2, 2026-05-05) —
+# @mention path-completion completer
+# ===========================================================================
+#
+# Closes the deferred TODO at lines 53-54 above ("Mount path-completion
+# for ``@``-tokens — that's a Slice 5+ polish"). Composes the existing
+# `_MENTION_RE` extraction shape (a path-token must contain `/` or
+# `.<ext>`) with prompt_toolkit's stdlib `PathCompleter` so operators
+# typing `@back<TAB>` get a dropdown of repo files starting with
+# `back`.
+#
+# Architectural locks:
+#
+#   * **Composes existing PathCompleter** — no parallel file-tree
+#     walking. The stdlib completer handles all the tricky bits
+#     (case-insensitive matching, hidden-file gating, expand-user).
+#   * **Gates on word boundary** — fires only when the current word
+#     under cursor starts with `@`. Operators typing prose / goals
+#     / @-decorators in pasted code don't see file-tree dropdowns
+#     interleaved with their natural input.
+#   * **NEVER raises** — any prompt_toolkit / filesystem error
+#     returns no completions (silent degrade).
+#   * **Master-flag-aware** — when polish is off, returns no
+#     completer (operator opt-out).
+
+
+def build_mention_completer() -> Optional[object]:
+    """Build a ``prompt_toolkit.completion.Completer`` that fires
+    only when the current cursor-word starts with ``@``. Composes
+    stdlib :class:`PathCompleter` for the actual file-tree
+    walking.
+
+    Returns ``None`` when:
+      * prompt_toolkit isn't available (headless / sandbox)
+      * polish master flag is off (operator opt-out)
+
+    NEVER raises. Returns no completions on filesystem errors.
+    """
+    if not is_polish_enabled():
+        return None
+    try:
+        from prompt_toolkit.completion import (
+            Completer, Completion, PathCompleter,
+        )
+    except ImportError:
+        return None
+
+    # Stdlib path completer — handles glob expansion, case
+    # matching, and prefix-relative path rendering.
+    inner = PathCompleter(
+        only_directories=False,
+        get_paths=lambda: ["."],  # repo-root relative
+        # File extensions matter little here; PathCompleter's
+        # default behavior matches all entries.
+    )
+
+    class _MentionCompleter(Completer):
+        """@<partial> completer. Composes stdlib PathCompleter."""
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            # Find the current word under cursor — everything
+            # back to the last whitespace boundary or start.
+            word_start = max(
+                text.rfind(" ") + 1,
+                text.rfind("\t") + 1,
+                0,
+            )
+            current_word = text[word_start:]
+            if not current_word.startswith("@"):
+                return
+            # Strip the leading @, hand the remainder to
+            # PathCompleter via a synthetic Document.
+            path_part = current_word[1:]
+            try:
+                from prompt_toolkit.document import Document
+            except ImportError:
+                return
+            try:
+                # The synthetic document has only the path part
+                # so PathCompleter walks from cwd correctly.
+                synth_doc = Document(
+                    text=path_part,
+                    cursor_position=len(path_part),
+                )
+                # Delegate. Each Completion's start_position is
+                # relative to the synthetic doc; remap by
+                # accounting for the @-prefix offset (-1) so the
+                # final replacement covers the entire @<path>
+                # token in the operator's actual input.
+                for completion in inner.get_completions(
+                    synth_doc, complete_event,
+                ):
+                    yield Completion(
+                        text="@" + completion.text,
+                        start_position=(
+                            completion.start_position - 1
+                        ),
+                        display=completion.display,
+                        display_meta="@mention path",
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                # Filesystem error / permission error / etc. —
+                # return no completions rather than crash the
+                # REPL.
+                return
+
+    return _MentionCompleter()
+
+
 __all__ = [
     "AttachmentExtraction",
     "MASTER_FLAG_ENV_VAR",
     "REPL_INPUT_POLISH_SCHEMA_VERSION",
     "TITLE_ENABLED_ENV_VAR",
+    "build_mention_completer",
     "clear_terminal_title",
     "extract_attachments",
     "format_title",
