@@ -306,3 +306,47 @@ class ExecutionMonitor:
             "total_recorded": self._total_recorded,
             "status_distribution": self.get_status_distribution(),
         }
+
+
+# ---------------------------------------------------------------------------
+# Path D.2 (PRD §36.6, 2026-05-05) — singleton accessor.
+#
+# Originally ExecutionMonitor was instantiated inline by SafetyNet
+# (`safety_net.py:139`). The singleton accessor enables the operator-
+# facing surfaces (``/monitor`` REPL +
+# ``GET /observability/execution-monitor``) to read THE SAME
+# instance the runtime is recording into — single source of truth,
+# Singleton + Read-API Extension Pattern (per §37 Tier 1
+# crystallized pattern).
+#
+# Idempotent: subsequent SafetyNet constructions compose this
+# singleton instead of allocating fresh instances. Test isolation:
+# ``reset_default_monitor_for_tests()`` clears the singleton.
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_MONITOR: Optional[ExecutionMonitor] = None
+
+
+def get_default_monitor() -> ExecutionMonitor:
+    """First-instance-wins singleton for ExecutionMonitor.
+
+    Composed by both SafetyNet (for runtime ``record()`` calls)
+    and operator surfaces (``/monitor`` REPL +
+    ``GET /observability/execution-monitor`` for read-only
+    snapshots) — single source of truth so operator visibility
+    reflects what the runtime is actually recording.
+
+    NEVER raises. Idempotent."""
+    global _DEFAULT_MONITOR
+    if _DEFAULT_MONITOR is None:
+        _DEFAULT_MONITOR = ExecutionMonitor()
+    return _DEFAULT_MONITOR
+
+
+def reset_default_monitor_for_tests() -> None:
+    """Test-only — destroy the singleton + recreate fresh next
+    call to :func:`get_default_monitor`. Production code MUST
+    NOT call this; it would orphan the SafetyNet's reference."""
+    global _DEFAULT_MONITOR
+    _DEFAULT_MONITOR = None

@@ -20,8 +20,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import weakref
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     EventEnvelope,
@@ -60,9 +61,29 @@ class EventEmitter:
         ))
     """
 
+    # Path D.3 (PRD §36.6, 2026-05-05) — class-level weak-ref
+    # registry of live EventEmitter instances. EventEmitter has
+    # no global singleton (multiple callers construct their own:
+    # governed_loop_service, safety_net, execution_graph_progress).
+    # The Class-level Instance Registry pattern lets operator
+    # surfaces (`/events` + `/observability/events`) aggregate
+    # metrics across ALL live emitters without forcing a single-
+    # instance contract.
+    #
+    # WeakSet keeps refs without preventing GC — orphaned emitters
+    # drop out automatically. Class-level so it shares across all
+    # subclasses + instances.
+    _INSTANCES: "weakref.WeakSet[EventEmitter]" = weakref.WeakSet()
+
     def __init__(self) -> None:
         self._subscribers: Dict[str, List[EventHandler]] = defaultdict(list)
         self._last_event_id: Optional[str] = None
+        # Path D.3 — per-event-type emission counter.
+        # Lightweight Dict[str, int] incremented inside emit().
+        # NEVER mutated by readers (snapshot deep-copies).
+        self._event_counts: Dict[str, int] = defaultdict(int)
+        # Register self for cross-instance aggregation.
+        EventEmitter._INSTANCES.add(self)
 
     # ------------------------------------------------------------------
     # subscribe

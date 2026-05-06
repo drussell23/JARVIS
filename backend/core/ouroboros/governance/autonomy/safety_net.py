@@ -36,6 +36,7 @@ from backend.core.ouroboros.governance.autonomy.execution_monitor import (
     ExecutionMonitor,
     ExecutionOutcome,
     ExecutionStatus,
+    get_default_monitor,
 )
 from backend.core.ouroboros.governance.autonomy.risk_classifier import (
     OperationRiskClassifier,
@@ -136,7 +137,12 @@ class ProductionSafetyNet:
         # explicit injection (testing); production code uses the shared
         # singleton.
         self._health_tracker: ComponentHealthTracker = get_default_tracker()
-        self._execution_monitor: ExecutionMonitor = ExecutionMonitor()
+        # Path D.2 (PRD §36.6, 2026-05-05) — compose the
+        # canonical singleton so operator surfaces (/monitor +
+        # /observability/execution-monitor) read the same
+        # instance SafetyNet is recording into. Single source
+        # of truth; Singleton + Read-API Extension Pattern.
+        self._execution_monitor: ExecutionMonitor = get_default_monitor()
         self._risk_classifier: OperationRiskClassifier = OperationRiskClassifier()
         self._escalated_resource_violation: bool = False
 

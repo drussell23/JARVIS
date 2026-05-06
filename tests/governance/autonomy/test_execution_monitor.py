@@ -346,6 +346,23 @@ class TestExecutionMonitor:
 
 
 class TestSafetyNetExecutionIntegration:
+    @pytest.fixture(autouse=True)
+    def _reset_monitor_singleton(self):
+        """Path D.2 (PRD §36.6, 2026-05-05) — SafetyNet now
+        composes the canonical ExecutionMonitor singleton (so
+        operator surfaces /monitor + /observability/execution-
+        monitor read THE SAME instance the runtime is recording
+        into). Per-test isolation requires resetting the
+        singleton between tests. Mirrors the
+        reset_default_observer_for_tests pattern used by §31 U2
+        Slice 3."""
+        from backend.core.ouroboros.governance.autonomy.execution_monitor import (
+            reset_default_monitor_for_tests,
+        )
+        reset_default_monitor_for_tests()
+        yield
+        reset_default_monitor_for_tests()
+
     @pytest.mark.asyncio
     async def test_op_completed_recorded_in_monitor(self):
         bus = CommandBus(maxsize=100)
