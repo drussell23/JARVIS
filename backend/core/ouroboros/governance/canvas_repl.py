@@ -65,6 +65,8 @@ logger = logging.getLogger("Ouroboros.CanvasREPL")
 _VERBS = ("/canvas",)
 _VALID_SUBCOMMANDS = {
     "tree", "op", "json", "dot", "fanout", "help",
+    # Move 6.5 Slice 5 — multi-prior fan-out renderers
+    "multi_prior", "multi_prior_diff",
 }
 
 
@@ -136,10 +138,100 @@ def dispatch_canvas_command(line: str) -> CanvasDispatchResult:
         return _render_dot(focus_op=focus)
     if sub == "fanout":
         return _render_fanout()
+    if sub == "multi_prior":
+        if len(args) < 2:
+            return CanvasDispatchResult(
+                ok=False,
+                text=(
+                    "/canvas multi_prior: missing op-id. "
+                    "Usage: /canvas multi_prior <op-id>"
+                ),
+            )
+        return _render_multi_prior(
+            op_id=args[1], with_diffs=False,
+        )
+    if sub == "multi_prior_diff":
+        if len(args) < 2:
+            return CanvasDispatchResult(
+                ok=False,
+                text=(
+                    "/canvas multi_prior_diff: missing "
+                    "op-id. Usage: /canvas multi_prior_diff "
+                    "<op-id>"
+                ),
+            )
+        return _render_multi_prior(
+            op_id=args[1], with_diffs=True,
+        )
     return CanvasDispatchResult(
         ok=False,
         text=f"/canvas: unhandled subcommand {sub!r}",
     )
+
+
+def _render_multi_prior(
+    *,
+    op_id: str,
+    with_diffs: bool,
+) -> CanvasDispatchResult:
+    """Slice 5 multi-prior fan-out renderer. Composes Slice
+    5's :func:`render_fan_out_overview` /
+    :func:`render_diff_fan_out`. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.verification.multi_prior_canvas import (  # noqa: E501
+            find_recent,
+            master_enabled,
+            render_diff_fan_out,
+            render_fan_out_overview,
+        )
+    except ImportError:
+        return CanvasDispatchResult(
+            ok=False,
+            text=(
+                "/canvas multi_prior — Slice 5 substrate "
+                "unavailable"
+            ),
+        )
+    if not master_enabled():
+        return CanvasDispatchResult(
+            ok=True,
+            text=(
+                "/canvas multi_prior — disabled "
+                "(JARVIS_MULTI_PRIOR_CANVAS_ENABLED=false)"
+            ),
+        )
+    name = (op_id or "").strip()
+    if not name:
+        return CanvasDispatchResult(
+            ok=False,
+            text="/canvas multi_prior: blank op-id",
+        )
+    verdict = find_recent(name)
+    if verdict is None:
+        return CanvasDispatchResult(
+            ok=True,
+            text=(
+                f"/canvas multi_prior {name!r} — not in "
+                f"the in-memory ring (evicted or never "
+                f"recorded). Try /multi_prior op {name!r} "
+                f"for ledger summary."
+            ),
+        )
+    text = (
+        render_diff_fan_out(verdict)
+        if with_diffs
+        else render_fan_out_overview(verdict)
+    )
+    if not text:
+        return CanvasDispatchResult(
+            ok=True,
+            text=(
+                f"/canvas multi_prior {name!r} — verdict "
+                f"present but missing fan-out detail "
+                f"(generator returned no diffs?)"
+            ),
+        )
+    return CanvasDispatchResult(ok=True, text=text)
 
 
 def _render_help() -> CanvasDispatchResult:
@@ -157,6 +249,10 @@ def _render_help() -> CanvasDispatchResult:
         "jq)\n"
         "  /canvas dot [<op-id>]  Graphviz DOT format\n"
         "  /canvas fanout         list ops with ≥2 children\n"
+        "  /canvas multi_prior <op-id>      Move 6.5 K-prior "
+        "fan-out overview (consensus + per-prior signatures)\n"
+        "  /canvas multi_prior_diff <op-id> Move 6.5 K-prior "
+        "fan-out + per-prior diff comparison\n"
         "  /canvas help           this message\n"
         "\n"
         "Master flag: JARVIS_OP_DEPENDENCY_GRAPH_ENABLED "
