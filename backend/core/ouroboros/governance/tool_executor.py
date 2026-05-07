@@ -1278,6 +1278,65 @@ async def _maybe_fire_tool_hook_failure(
         )
 
 
+def _maybe_observe_tool_confidence(
+    call: "ToolCall",
+    policy_ctx: "PolicyContext",
+    result: "ToolResult",
+) -> None:
+    """§37 Tier 2 #13 Slice 2 — observe per-tool-call confidence
+    via the canonical Slice 1 + Slice 2 substrate.
+
+    Composes:
+      1. Slice 1 ``master_enabled()`` master-flag gate (zero
+         freeze/compute_summary cost when off).
+      2. Slice 2 ``observe_active_signal()`` end-to-end: reads
+         the active ConfidenceCapturer (set by DW provider via
+         ContextVar), composes ``compute_summary`` over the
+         frozen trace, projects to [0, 1] confidence, feeds the
+         singleton observer, returns the band-crossing event.
+
+    Fires AFTER successful tool dispatch + BEFORE V1 POST_TOOL_USE
+    so the band-crossing observer state is current at the moment
+    the V1 hook callbacks run (future enhancement: extend V1
+    payload with confidence band when available).
+
+    NEVER raises — every code path defensive. Tool dispatch path
+    integrity is structurally preserved regardless of confidence
+    observer state."""
+    try:
+        from backend.core.ouroboros.governance.tool_confidence_warning_observer import (  # noqa: E501
+            master_enabled as _toolconf_master,
+            observe_active_signal as _toolconf_observe,
+        )
+    except ImportError:
+        return
+    try:
+        if not _toolconf_master():
+            return
+    except Exception:  # noqa: BLE001 — defensive
+        return
+    # Successful dispatches feed the observer; failure paths
+    # don't (failure is its own band-crossing axis — handled by
+    # circuit_breaker_warning_observer + risk-tier failure
+    # accounting). Slice 2 is success-path-only by design.
+    try:
+        if result.status != ToolExecStatus.SUCCESS:
+            return
+    except Exception:  # noqa: BLE001 — defensive
+        return
+    try:
+        _toolconf_observe(
+            op_id=getattr(policy_ctx, "op_id", "") or "",
+            tool_name=getattr(call, "name", "") or "",
+            publish_sse=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[ToolConfidenceObservation] observe raised: %s",
+            exc,
+        )
+
+
 class ToolExecutor:
     """Dispatch ToolCall objects to read-only introspection handlers.
 
@@ -3361,6 +3420,10 @@ class AsyncProcessToolBackend:
                 "hypothesize",     # Priority C — bounded probe primitive
             ):
                 _result = await self._run_async_native_tool(call, policy_ctx, timeout, cap)
+                # §37 Tier 2 #13 Slice 2 (2026-05-07) — observe
+                # per-tool confidence before V1 POST_TOOL_USE fires
+                # (master-flag-gated; zero overhead when off).
+                _maybe_observe_tool_confidence(call, policy_ctx, _result)
                 # Venom V1 Slice 2 — fire POST_TOOL_USE for the
                 # async-native dispatch path. Status branch fires
                 # POST_TOOL_USE_FAILURE so observers can react to
@@ -3379,6 +3442,10 @@ class AsyncProcessToolBackend:
             _result = await self._run_sync_tool_async(
                 call, policy_ctx.repo_root, timeout, cap, op_id=policy_ctx.op_id,
             )
+            # §37 Tier 2 #13 Slice 2 (2026-05-07) — observe per-tool
+            # confidence before V1 POST_TOOL_USE fires (master-flag-
+            # gated; zero overhead when off).
+            _maybe_observe_tool_confidence(call, policy_ctx, _result)
             # Venom V1 Slice 2 — fire POST_TOOL_USE for the sync
             # dispatch path.
             if _result.status == ToolExecStatus.SUCCESS:

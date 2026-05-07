@@ -1162,6 +1162,20 @@ class DoublewordProvider:
                                 )
                     except Exception:  # noqa: BLE001 — capture must
                         pass        # never break the stream loop
+                    # §37 Tier 2 #13 Slice 2 (2026-05-07) — propagate the
+                    # capturer to tool_executor via async-safe ContextVar
+                    # (PolicyContext doesn't carry artifacts dict). Each
+                    # op runs in its own asyncio.Task so the var is
+                    # task-local; new GENERATE rounds re-stamp the var
+                    # with their own capturer. Defensive: set failure
+                    # NEVER breaks the stream loop.
+                    try:
+                        from backend.core.ouroboros.governance.tool_confidence_warning_observer import (  # noqa: E501
+                            set_active_capturer as _toolconf_set_var,
+                        )
+                        _toolconf_set_var(_confidence_capturer)
+                    except Exception:  # noqa: BLE001 — defensive
+                        pass
                 # Phase 12.2 Slice C — TTFT measurement window opens
                 # the moment we issue the request and closes on first
                 # non-empty content chunk. monotonic() is jump-proof
