@@ -293,6 +293,33 @@ _VALID_TOOL_HOOK_EVENTS: frozenset = frozenset(
 HookEventTypes: Tuple[type, ...] = (LifecycleEvent, ToolHookEvent)
 
 
+def hook_async_ffn_enabled() -> bool:
+    """Venom V3 (PRD §32.6 / line 380, 2026-05-07) — master
+    switch for async fire-and-forget hook scheduling
+    (``JARVIS_HOOK_ASYNC_ENABLED``).
+
+    Default-FALSE per §33.1 graduation-contract pattern (matches
+    V1/V2/V4 default-FALSE convention; flips after operator-
+    paced empirical cadence).
+
+    When OFF: all registrations execute as blocking regardless
+    of their ``is_async`` flag (byte-identical to pre-V3
+    behavior; AST pin asserts).
+
+    When ON: registrations with ``is_async=True`` are scheduled
+    via ``asyncio.create_task`` AFTER aggregation; their
+    HookResult does NOT contribute to BLOCK-wins semantics.
+    Registrations with ``is_async=False`` (default) continue
+    to be awaited inside ``asyncio.gather`` and contribute to
+    aggregation."""
+    raw = os.environ.get(
+        "JARVIS_HOOK_ASYNC_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return False  # default-FALSE per §33.1
+    return raw in ("1", "true", "yes", "on")
+
+
 def venom_tool_hooks_enabled() -> bool:
     """``JARVIS_VENOM_TOOL_HOOKS_ENABLED`` master switch
     (default ``false`` per §33.1 graduation-contract pattern).

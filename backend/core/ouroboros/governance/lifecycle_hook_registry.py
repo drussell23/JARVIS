@@ -175,6 +175,17 @@ class HookRegistration:
     # ToolHookEvent dispatch only (those carry a tool_name in
     # the HookContext payload).
     compiled_pattern: Optional[CompiledToolNamePattern] = None
+    # Venom V3 (PRD §32.6 line 380, 2026-05-07) — opt-in
+    # fire-and-forget scheduling. When True AND the master flag
+    # ``JARVIS_HOOK_ASYNC_ENABLED`` is on, the executor
+    # schedules this hook via ``asyncio.create_task`` AFTER
+    # aggregation; its HookResult does NOT contribute to
+    # BLOCK-wins. Default False — every registration is
+    # blocking unless the operator explicitly opts in. When
+    # the master flag is OFF, this field is structurally
+    # ignored: all hooks execute as blocking (byte-identical
+    # pre-V3 behavior). AST-pinned in lifecycle_hook_executor.
+    is_async: bool = False
 
     def is_enabled(self) -> bool:
         """Returns True iff the hook's per-hook enabled_check
@@ -433,6 +444,7 @@ class LifecycleHookRegistry:
         timeout_s: Optional[float] = None,
         enabled_check: Optional[Callable[[], bool]] = None,
         tool_name_pattern: Optional[str] = None,
+        is_async: bool = False,
     ) -> HookRegistration:
         """Register one hook. Raises explicitly on validation
         failure so operator misconfig surfaces at boot.
@@ -507,6 +519,7 @@ class LifecycleHookRegistry:
             enabled_check=enabled_check,
             registered_ts=time.monotonic(),
             compiled_pattern=compiled_pattern,
+            is_async=bool(is_async),
         )
 
         with self._lock:
@@ -726,11 +739,18 @@ def register_shipped_invariants() -> list:
     def _validate_authority_allowlist(
         tree: "_ast.Module", source: str,  # noqa: ARG001
     ) -> tuple:
-        """Slice 2 may import only Slice 1 (lifecycle_hook).
-        Registration-contract exemption applies."""
+        """Slice 2 may import Slice 1 (lifecycle_hook) plus
+        the substrate primitives it composes on:
+        ``tool_name_pattern`` (Venom V4 — compiled pattern
+        helper, pure-stdlib) and ``meta.module_discovery``
+        (Slice 5b consolidation — naming-cage convention,
+        pure-stdlib). Registration-contract exemption
+        applies."""
         violations: list = []
         allowed = {
             "backend.core.ouroboros.governance.lifecycle_hook",
+            "backend.core.ouroboros.governance.tool_name_pattern",
+            "backend.core.ouroboros.governance.meta.module_discovery",
         }
         registration_funcs = {
             "register_flags", "register_shipped_invariants",
@@ -788,8 +808,10 @@ def register_shipped_invariants() -> list:
             target_file=target,
             description=(
                 "Slice 2 registry imports stay within "
-                "{lifecycle_hook} (+ registration-contract "
-                "exemption). Banned: orchestrator-tier."
+                "{lifecycle_hook, tool_name_pattern, "
+                "meta.module_discovery} (+ registration-"
+                "contract exemption). Banned: orchestrator-"
+                "tier."
             ),
             validate=_validate_authority_allowlist,
         ),

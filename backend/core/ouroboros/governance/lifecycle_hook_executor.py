@@ -78,9 +78,11 @@ Authority invariants (AST-pinned by Slice 5):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
-from typing import Optional, Tuple
+import weakref
+from typing import Any, Optional, Tuple
 
 from backend.core.ouroboros.governance.lifecycle_hook import (
     AggregateHookDecision,
@@ -91,6 +93,7 @@ from backend.core.ouroboros.governance.lifecycle_hook import (
     LifecycleEvent,
     ToolHookEvent,
     compute_hook_decision,
+    hook_async_ffn_enabled,
     lifecycle_hooks_enabled,
     make_hook_result,
     venom_tool_hooks_enabled,
@@ -165,10 +168,25 @@ async def _run_one_hook(
         # 1. sync hook doesn't block event loop
         # 2. timeout enforced at the asyncio boundary
         # 3. asyncio.CancelledError propagates cleanly
-        result = await asyncio.wait_for(
-            asyncio.to_thread(registration.callable, context),
-            timeout=timeout_s,
-        )
+        #
+        # Venom V3 (2026-05-07) — async hook support: if the
+        # callable is a coroutine function, await it directly
+        # (no to_thread wrapping; the coroutine is already
+        # event-loop-native). Sync callables continue through
+        # to_thread. Both paths are bounded by the same
+        # per-hook timeout via wait_for.
+        if inspect.iscoroutinefunction(registration.callable):
+            result = await asyncio.wait_for(
+                registration.callable(context),
+                timeout=timeout_s,
+            )
+        else:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    registration.callable, context,
+                ),
+                timeout=timeout_s,
+            )
 
         # Validate hook return — operators may misconfigure and
         # return None / dict / wrong type.
@@ -382,16 +400,42 @@ async def fire_hooks(
         )
         context = HookContext(event=event)
 
-    # 6. Spawn one task per hook in parallel; gather with
-    #    return_exceptions=True so one cancellation doesn't
-    #    cancel siblings. Each task is bounded by the per-hook
-    #    timeout + defensive wrapping inside _run_one_hook.
+    # 6. Venom V3 (PRD §32.6 line 380, 2026-05-07) — partition
+    #    blocking vs fire-and-forget (FFN) registrations BEFORE
+    #    spawning the blocking gather.
+    #
+    #    Discipline (operator binding 2026-05-07):
+    #      * is_async=True hooks scheduled AFTER aggregation
+    #        (via asyncio.create_task on the running loop);
+    #        their HookResult does NOT contribute to BLOCK-wins.
+    #      * is_async=False (default) hooks awaited inside
+    #        asyncio.gather and contribute to aggregation.
+    #      * Master flag JARVIS_HOOK_ASYNC_ENABLED gates the
+    #        partition: when OFF, ALL hooks treated as blocking
+    #        (byte-identical pre-V3 behavior; AST-pinned).
+    #      * FFN tasks named via name= kwarg + tracked in weak
+    #        registry (operator-visible; drain helper available
+    #        via :func:`drain_ffn_tasks`).
+    if hook_async_ffn_enabled():
+        blocking_regs = tuple(
+            r for r in registrations
+            if not getattr(r, "is_async", False)
+        )
+        ffn_regs = tuple(
+            r for r in registrations
+            if getattr(r, "is_async", False)
+        )
+    else:
+        blocking_regs = registrations
+        ffn_regs = ()
+    # Spawn blocking tasks. Each bounded by per-hook timeout +
+    # defensive wrapping inside _run_one_hook.
     tasks = [
         asyncio.create_task(
             _run_one_hook(reg, context),
             name=f"lifecycle-hook-{reg.name}",
         )
-        for reg in registrations
+        for reg in blocking_regs
     ]
     try:
         gathered = await asyncio.gather(
@@ -399,7 +443,8 @@ async def fire_hooks(
         )
     except asyncio.CancelledError:
         # Caller-initiated cancellation. Cancel any stragglers
-        # before propagating.
+        # before propagating. FFN tasks (if any) have not been
+        # spawned yet — V3 schedules them AFTER aggregation.
         for t in tasks:
             if not t.done():
                 t.cancel()
@@ -411,7 +456,7 @@ async def fire_hooks(
     #    CancelledError) AND the case where CancelledError leaked
     #    from one task's underlying to_thread.
     results: list = []
-    for reg, gathered_item in zip(registrations, gathered):
+    for reg, gathered_item in zip(blocking_regs, gathered):
         if isinstance(gathered_item, HookResult):
             results.append(gathered_item)
         elif isinstance(gathered_item, asyncio.CancelledError):
@@ -449,8 +494,176 @@ async def fire_hooks(
                 ),
             ))
 
-    # 8. Aggregate via Slice 1 (BLOCK-wins).
-    return compute_hook_decision(event, tuple(results))
+    # 8. Aggregate via Slice 1 (BLOCK-wins). Aggregation runs
+    #    over BLOCKING results only — FFN registrations are
+    #    structurally excluded from the BLOCK-wins decision.
+    decision = compute_hook_decision(event, tuple(results))
+
+    # 9. Venom V3 (2026-05-07) — schedule FFN tasks AFTER
+    #    aggregation. They run in parallel with whatever the
+    #    caller does next; the dispatcher does NOT await them.
+    #    Each task is named (operator-visible) + tracked in the
+    #    weak registry (queryable via :func:`drain_ffn_tasks`).
+    #    Operator binding: "specify ... task names + weak
+    #    registry + optional ... drain on graceful shutdown."
+    if ffn_regs:
+        try:
+            _schedule_ffn_tasks(ffn_regs, context, event)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[LifecycleHookExecutor] FFN scheduling raised: "
+                "%s — aggregation already complete, decision "
+                "unaffected", exc,
+            )
+    return decision
+
+
+# ---------------------------------------------------------------------------
+# Venom V3 — FFN task registry + drain helper
+# ---------------------------------------------------------------------------
+
+
+# Weak registry of in-flight FFN tasks. Tasks self-remove on
+# completion via the asyncio runtime; the WeakSet ensures
+# orphaned tasks (e.g., loop closing) drop out automatically.
+# Operator binding 2026-05-07: "task names + weak registry +
+# optional asyncio.TaskGroup drain on graceful shutdown hook"
+# — this is the chosen pattern, AST-pinned via the FFN
+# scheduling AST invariant below.
+_FFN_TASK_REGISTRY: "weakref.WeakSet[asyncio.Task[Any]]" = (
+    weakref.WeakSet()
+)
+
+
+def _schedule_ffn_tasks(
+    ffn_regs: Tuple[HookRegistration, ...],
+    context: HookContext,
+    event: "LifecycleEvent | ToolHookEvent",
+) -> None:
+    """Schedule fire-and-forget hook tasks AFTER aggregation.
+    NEVER raises (caller invokes inside try/except). Task names
+    follow the pattern ``venom_v3_ffn_<hook_name>_<event>`` so
+    operators can grep ``asyncio.all_tasks()`` to audit which
+    FFN tasks are in-flight."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop — should not happen since we're
+        # inside an awaited fire_hooks call. Defensive
+        # short-circuit; FFN scheduling is best-effort.
+        return
+    event_value = (
+        event.value if hasattr(event, "value") else str(event)
+    )
+    for reg in ffn_regs:
+        try:
+            task = loop.create_task(
+                _run_one_hook(reg, context),
+                name=f"venom_v3_ffn_{reg.name}_{event_value}",
+            )
+            _FFN_TASK_REGISTRY.add(task)
+            task.add_done_callback(_log_ffn_task_done)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[LifecycleHookExecutor] FFN spawn raised "
+                "for %s: %s", reg.name, exc,
+            )
+
+
+def _log_ffn_task_done(task: "asyncio.Task[Any]") -> None:
+    """Done-callback attached to every FFN task. Logs FAILED
+    outcomes so exceptions in FFN hooks remain auditable
+    (operator binding: 'exception in FFN logged, pipeline
+    continues'). Cancelled tasks are silent (graceful
+    shutdown). NEVER raises."""
+    try:
+        if task.cancelled():
+            return
+        result = task.result()
+        if isinstance(result, HookResult):
+            if result.outcome == HookOutcome.FAILED:
+                logger.warning(
+                    "[VenomV3FFN] task %s returned FAILED: %s",
+                    task.get_name(),
+                    getattr(result, "detail", "")[:200],
+                )
+        # Non-HookResult / unexpected return — log
+        else:
+            logger.warning(
+                "[VenomV3FFN] task %s returned non-HookResult "
+                "type=%s",
+                task.get_name(), type(result).__name__,
+            )
+    except asyncio.CancelledError:
+        # Task was cancelled — silent.
+        pass
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.warning(
+            "[VenomV3FFN] task %s raised: %s",
+            task.get_name(), exc,
+        )
+
+
+async def drain_ffn_tasks(
+    *, timeout: float = 5.0,
+) -> int:
+    """Best-effort drain of in-flight FFN tasks. Returns count
+    of tasks that completed within ``timeout`` seconds. NEVER
+    raises.
+
+    Operators wanting strict drain semantics (e.g., "no FFN
+    work outlives the orchestrator") invoke this from their
+    graceful shutdown hook. Default-off — pre-V3 callers don't
+    need it. Bounded by ``timeout`` so a slow FFN hook can't
+    block shutdown indefinitely.
+
+    Operator binding 2026-05-07: "graceful shutdown drains or
+    asserts bounded task count" — this helper provides the
+    drain primitive; operators choose whether to invoke it.
+    """
+    try:
+        pending = [
+            t for t in list(_FFN_TASK_REGISTRY)
+            if not t.done()
+        ]
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+    if not pending:
+        return 0
+    try:
+        timeout_clamped = max(0.1, min(60.0, float(timeout)))
+    except (TypeError, ValueError):
+        timeout_clamped = 5.0
+    try:
+        done, _pending_after = await asyncio.wait(
+            pending, timeout=timeout_clamped,
+        )
+        return len(done)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[VenomV3FFN] drain raised: %s", exc,
+        )
+        return 0
+
+
+def ffn_pending_count() -> int:
+    """Read-only count of in-flight FFN tasks. Operator
+    visibility primitive — observability surfaces (status
+    REPL / SSE) compose this. NEVER raises."""
+    try:
+        return sum(
+            1 for t in list(_FFN_TASK_REGISTRY) if not t.done()
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+
+
+def reset_ffn_registry_for_tests() -> None:
+    """Test-only — clear the FFN registry. Production code
+    MUST NOT call this (would orphan in-flight tasks from the
+    drain primitive)."""
+    global _FFN_TASK_REGISTRY
+    _FFN_TASK_REGISTRY = weakref.WeakSet()
 
 
 # ---------------------------------------------------------------------------
@@ -459,8 +672,11 @@ async def fire_hooks(
 
 __all__ = [
     "LIFECYCLE_HOOK_EXECUTOR_SCHEMA_VERSION",
+    "drain_ffn_tasks",
+    "ffn_pending_count",
     "fire_hooks",
     "register_shipped_invariants",
+    "reset_ffn_registry_for_tests",
 ]
 
 
@@ -561,6 +777,131 @@ def register_shipped_invariants() -> list:
             )
         return tuple(violations)
 
+    def _validate_v3_ffn_discipline(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Venom V3 (2026-05-07) — FFN tasks MUST be:
+
+          1. Created via ``loop.create_task`` (named, registered,
+             callback-attached) inside ``_schedule_ffn_tasks``.
+          2. Named with ``name=`` kwarg (operator-visible).
+          3. Scheduled AFTER ``compute_hook_decision`` (FFN
+             results MUST NOT contribute to BLOCK-wins).
+          4. Tracked in :data:`_FFN_TASK_REGISTRY` weak set.
+          5. NEVER awaited inside ``fire_hooks`` (the dispatcher
+             returns the decision immediately after scheduling).
+
+        AST scan enforces (1)-(4); test suite enforces (5) via
+        spy."""
+        violations: list = []
+        # Find _schedule_ffn_tasks function — its body MUST
+        # contain loop.create_task with name= kwarg.
+        scheduler_func = None
+        for node in _ast.walk(tree):
+            if (
+                isinstance(node, _ast.FunctionDef)
+                and node.name == "_schedule_ffn_tasks"
+            ):
+                scheduler_func = node
+                break
+        if scheduler_func is None:
+            violations.append(
+                "Venom V3 — _schedule_ffn_tasks function "
+                "missing"
+            )
+            return tuple(violations)
+        found_named_create_task = False
+        found_registry_add = False
+        for sub in _ast.walk(scheduler_func):
+            if isinstance(sub, _ast.Call):
+                fn = sub.func
+                # Detect loop.create_task(...) OR
+                # asyncio.create_task(...) with name= kwarg.
+                if (
+                    isinstance(fn, _ast.Attribute)
+                    and fn.attr == "create_task"
+                ):
+                    has_name_kw = any(
+                        kw.arg == "name" for kw in sub.keywords
+                    )
+                    if has_name_kw:
+                        found_named_create_task = True
+                # _FFN_TASK_REGISTRY.add(...)
+                if (
+                    isinstance(fn, _ast.Attribute)
+                    and fn.attr == "add"
+                    and isinstance(fn.value, _ast.Name)
+                    and fn.value.id == "_FFN_TASK_REGISTRY"
+                ):
+                    found_registry_add = True
+        if not found_named_create_task:
+            violations.append(
+                "Venom V3 — _schedule_ffn_tasks MUST create "
+                "tasks with name= kwarg (operator-visible)"
+            )
+        if not found_registry_add:
+            violations.append(
+                "Venom V3 — _schedule_ffn_tasks MUST add tasks "
+                "to _FFN_TASK_REGISTRY (weak set; drain "
+                "primitive depends on it)"
+            )
+        # Check fire_hooks: _schedule_ffn_tasks call MUST come
+        # AFTER compute_hook_decision call.
+        fire_hooks_func = None
+        for node in _ast.walk(tree):
+            if (
+                isinstance(node, _ast.AsyncFunctionDef)
+                and node.name == "fire_hooks"
+            ):
+                fire_hooks_func = node
+                break
+        if fire_hooks_func is None:
+            violations.append(
+                "Venom V3 — fire_hooks function missing"
+            )
+            return tuple(violations)
+        compute_lineno = None
+        schedule_lineno = None
+        for sub in _ast.walk(fire_hooks_func):
+            if isinstance(sub, _ast.Call):
+                fn = sub.func
+                if (
+                    isinstance(fn, _ast.Name)
+                    and fn.id == "compute_hook_decision"
+                ):
+                    compute_lineno = getattr(
+                        sub, "lineno", None,
+                    )
+                if (
+                    isinstance(fn, _ast.Name)
+                    and fn.id == "_schedule_ffn_tasks"
+                ):
+                    schedule_lineno = getattr(
+                        sub, "lineno", None,
+                    )
+        if compute_lineno is None:
+            violations.append(
+                "Venom V3 — fire_hooks must call "
+                "compute_hook_decision"
+            )
+        if schedule_lineno is None:
+            violations.append(
+                "Venom V3 — fire_hooks must call "
+                "_schedule_ffn_tasks"
+            )
+        if (
+            compute_lineno is not None
+            and schedule_lineno is not None
+            and schedule_lineno < compute_lineno
+        ):
+            violations.append(
+                f"Venom V3 — _schedule_ffn_tasks (line "
+                f"{schedule_lineno}) MUST be called AFTER "
+                f"compute_hook_decision (line {compute_lineno}) "
+                f"so FFN results don't contribute to BLOCK-wins"
+            )
+        return tuple(violations)
+
     target = (
         "backend/core/ouroboros/governance/lifecycle_hook_executor.py"
     )
@@ -586,5 +927,18 @@ def register_shipped_invariants() -> list:
                 "AND asyncio.wait_for (per-hook timeout)."
             ),
             validate=_validate_fail_isolated_gather,
+        ),
+        ShippedCodeInvariant(
+            invariant_name="lifecycle_hook_executor_v3_ffn_discipline",
+            target_file=target,
+            description=(
+                "Venom V3 (2026-05-07) — FFN tasks named via "
+                "name= kwarg, registered in _FFN_TASK_REGISTRY, "
+                "scheduled AFTER compute_hook_decision. "
+                "Operator binding 2026-05-07: 'task names + "
+                "weak registry + ... drain on graceful "
+                "shutdown.'"
+            ),
+            validate=_validate_v3_ffn_discipline,
         ),
     ]
