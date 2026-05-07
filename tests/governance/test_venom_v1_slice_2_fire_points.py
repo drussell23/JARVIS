@@ -347,7 +347,7 @@ def test_execute_async_fires_pre_tool_use():
         'cap = int(os.environ.get("JARVIS_TOOL_OUTPUT_CAP_BYTES"',
     )
     assert idx >= 0
-    section = source[idx:idx + 3500]
+    section = source[idx:idx + 8000]
     assert '_maybe_fire_tool_hook(\n            "pre_tool_use"' in section, (
         "execute_async must fire 'pre_tool_use' before dispatch"
     )
@@ -362,7 +362,10 @@ def test_execute_async_fires_post_tool_use_on_success():
     idx = source.rfind(
         'cap = int(os.environ.get("JARVIS_TOOL_OUTPUT_CAP_BYTES"',
     )
-    section = source[idx:idx + 4500]
+    # Window expanded post-V2 (V2 inserted ~60 lines of
+    # permission check before V1's PRE_TOOL_USE fire — pushing
+    # the V1 anchor further down the method body).
+    section = source[idx:idx + 8000]
     # Look for post_tool_use fire (any indent — the indentation
     # depends on whether it's inside an if-branch vs at top
     # level of the method).
@@ -384,7 +387,7 @@ def test_execute_async_fires_post_tool_use_failure():
     idx = source.rfind(
         'cap = int(os.environ.get("JARVIS_TOOL_OUTPUT_CAP_BYTES"',
     )
-    section = source[idx:idx + 4000]
+    section = source[idx:idx + 8000]
     assert "post_tool_use_failure" in section
 
 
@@ -404,7 +407,10 @@ def test_post_tool_use_branches_on_status():
     idx = source.rfind(
         'cap = int(os.environ.get("JARVIS_TOOL_OUTPUT_CAP_BYTES"',
     )
-    section = source[idx:idx + 4500]
+    # Window expanded post-V2 (V2 inserted ~60 lines of
+    # permission check before V1's PRE_TOOL_USE fire — pushing
+    # the V1 anchor further down the method body).
+    section = source[idx:idx + 8000]
     # Must check ToolExecStatus.SUCCESS to branch
     assert "ToolExecStatus.SUCCESS" in section
 
