@@ -174,6 +174,16 @@ EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING = (
     "circuit_breaker_approaching"
 )
 
+# §37 Tier 2 #13 Slice 1 — per-tool confidence band crossing. Fires
+# only on band TRANSITIONS (chatter-suppressed; mirrors Slice 5 +
+# Slice 8 discipline). Payload: stream_key + op_id + tool_name +
+# from_band + to_band + confidence + sample_size. Master-flag-gated
+# at the producer site (JARVIS_TOOL_CONFIDENCE_INDICATOR_ENABLED).
+# Operators consume via `/listen filter type=tool_confidence_band_crossed`.
+EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED = (
+    "tool_confidence_band_crossed"
+)
+
 # §31 U2 Slice 3 (PRD §31.3 empirical wiring, 2026-05-05) —
 # causal-decision advisory transitions. The chatter-suppressed
 # observer composes :func:`causality_consumer.compute_op_causal_features`
@@ -669,6 +679,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_PLAN_GENERATED,                   # §37 Slice 6 (PRD §37.7 Tier 1 #3)
     EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING,      # §37 Slice 8 (PRD §37.7 Tier 1 #6)
     EVENT_TYPE_CAUSAL_ADVISORY_EMITTED,          # §31 U2 Slice 3 (PRD §31.3 empirical wiring)
+    EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED,     # §37 Tier 2 #13 Slice 1 (per-tool confidence)
 })
 
 
