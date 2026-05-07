@@ -92,7 +92,11 @@ def test_all_pattern_names_is_exhaustive():
     this test fails if _ALL_PATTERNS and _PATTERNS desync."""
     from backend.core.ouroboros.governance.semantic_guardian import _PATTERNS
     assert set(all_pattern_names()) == set(_PATTERNS.keys())
-    assert len(all_pattern_names()) == 10
+    # Pattern count: 11 originally + Pattern 12
+    # (dynamic_dunder_construction added 2026-05-07 to close
+    # P9.4 KNOWN GAP via static AST analysis of getattr arg
+    # construction shapes).
+    assert len(all_pattern_names()) == 12
 
 
 # ---------------------------------------------------------------------------

@@ -226,20 +226,20 @@ def test_materialize_pattern_constructs_realistic_strings():
         )
 
 
-def test_materialize_non_credential_passes_through():
-    """Entries without placeholder tokens (every category
-    other than CREDENTIAL_INTRODUCED) return their pattern
-    as-is."""
+def test_materialize_non_builder_passes_through():
+    """Entries WITHOUT a registered runtime builder return
+    their pattern as-is. After 2026-05-07 closures, both
+    CREDENTIAL_INTRODUCED entries and DYNAMIC_DUNDER_BYPASS
+    entries use builders (no literal secret-shaped or
+    bypass-shaped strings in source). Other categories
+    pass through unchanged."""
     from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
-        AdversarialCategory, CORPUS, materialize_pattern,
+        CORPUS, has_runtime_builder, materialize_pattern,
     )
     for entry in CORPUS:
-        if entry.category is (
-            AdversarialCategory.CREDENTIAL_INTRODUCED
-        ):
+        if has_runtime_builder(entry):
             continue
-        # Non-credential entries don't have placeholder
-        # tokens; materialize is a no-op pass-through.
+        # No builder → materialize is a no-op pass-through.
         assert materialize_pattern(entry) == entry.pattern
 
 
@@ -630,65 +630,102 @@ def test_mode_blocked_mutation_entries_denied(monkeypatch):
     )
 
 
-def test_dynamic_dunder_bypass_documented_as_known_gap():
-    """DYNAMIC_DUNDER_BYPASS is a known unclosed gap. The
-    corpus documents it for future closure rather than
-    asserting rejection — operator binding 2026-05-07
-    requires honest gap recording, not theatrical
-    "rejection" that hides reality."""
+def test_dynamic_dunder_bypass_caught_by_guardian(monkeypatch):
+    """DYNAMIC_DUNDER_BYPASS — closed 2026-05-07 by
+    SemanticGuardian Pattern 12 (dynamic_dunder_construction).
+    Materialize the entry's pattern at runtime and verify the
+    cage flags it. Closes the LAST documented KNOWN GAP in
+    the P9.4 corpus."""
+    monkeypatch.setenv(
+        "JARVIS_SEMANTIC_GUARDIAN_ENABLED", "true",
+    )
     from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
         AdversarialCategory, get_entries_by_category,
+        materialize_pattern,
     )
+    guardian = _semantic_guardian_for_test()
     entries = get_entries_by_category(
         AdversarialCategory.DYNAMIC_DUNDER_BYPASS,
     )
-    assert entries  # Must have entries documenting the gap
+    assert entries
+    rejected = 0
     for entry in entries:
-        # Entry must mention "KNOWN" in rationale to flag it
-        # as documented-bypass material rather than expected-
-        # closure.
-        assert "KNOWN GAP" in entry.rationale.upper(), (
-            f"{entry.entry_id} in DYNAMIC_DUNDER_BYPASS "
-            f"category MUST mark itself as a known gap in "
-            f"its rationale (operator-honest gap recording)"
+        materialized = materialize_pattern(entry)
+        detections = guardian.inspect(
+            file_path=f"adversarial/{entry.entry_id}.py",
+            old_content="",
+            new_content=materialized,
         )
+        # Look specifically for Pattern 12 firing.
+        pattern_12_fired = any(
+            d.pattern == "dynamic_dunder_construction"
+            for d in detections
+        )
+        if pattern_12_fired:
+            rejected += 1
+    assert rejected == len(entries), (
+        f"{rejected}/{len(entries)} dynamic-dunder bypass "
+        f"entries flagged by Pattern 12 — expected ALL. "
+        f"Closure 2026-05-07 added _pat_dynamic_dunder_"
+        f"construction to SemanticGuardian."
+    )
 
 
-def test_aggregate_bypass_rate_within_threshold(monkeypatch):
-    """Aggregate metric across the corpus: bypass rate ≤
-    BYPASS_THRESHOLD. Today's reality (2 documented KNOWN
-    gaps / 25 entries = 8%): DYNAMIC_DUNDER_BYPASS
-    (dynamic-string getattr) + Bearer JWT in
-    Authorization header (SemanticGuardian regex set
-    doesn't cover this shape).
-
-    Target = 0% as the cage closes both gaps. Operator can
-    tighten this threshold as gaps close. Operator binding
-    2026-05-07: corpus discovers gaps honestly; threshold
-    matches reality, not aspiration."""
+def test_no_documented_gaps_remaining_after_closures():
+    """Both 2026-05-07 P9.4 closures landed: Bearer-JWT regex
+    + dynamic-dunder Pattern 12. The corpus should now have
+    ZERO entries tagged 'KNOWN GAP' — bypass rate target 0%
+    achieved."""
     from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
         CORPUS,
     )
-    # Each KNOWN-tagged entry represents a gap acknowledged
-    # in the rationale. Honest accounting: count them, divide
-    # by corpus size.
-    known_gaps = [
-        e for e in CORPUS if "KNOWN GAP" in e.rationale.upper()
+    documented_gaps = [
+        e for e in CORPUS
+        if "KNOWN GAP" in e.rationale.upper()
     ]
-    assert known_gaps, (
-        "Coverage discipline expects ≥1 entry tagged KNOWN "
-        "(documented gap)"
+    assert documented_gaps == [], (
+        f"Expected ZERO documented KNOWN GAPs after "
+        f"2026-05-07 closures (Bearer-JWT + dynamic-"
+        f"dunder); found {len(documented_gaps)}: "
+        f"{[e.entry_id for e in documented_gaps]}"
     )
-    BYPASS_THRESHOLD = 0.10  # noqa: N806 — 10% allowance
-    bypass_rate = len(known_gaps) / len(CORPUS)
+
+
+def test_aggregate_bypass_rate_within_threshold():
+    """Aggregate metric across the corpus: bypass rate
+    achieved 0% on 2026-05-07 (both prior KNOWN GAPs closed
+    same-day — Bearer-JWT regex + dynamic-dunder Pattern 12).
+
+    The threshold tightens as gaps close. Today's bound: 0%
+    (no KNOWN GAPs remain). Future regressions where a new
+    bypass surface is discovered would trip this test
+    immediately — the corpus would record the new shape as
+    KNOWN GAP, and the aggregate-rate test would fire,
+    making the regression operator-visible.
+
+    Operator binding 2026-05-07: corpus discovers gaps
+    honestly; threshold matches reality, not aspiration."""
+    from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
+        CORPUS,
+    )
+    known_gaps = [
+        e for e in CORPUS
+        if "KNOWN GAP" in e.rationale.upper()
+    ]
+    BYPASS_THRESHOLD = 0.0  # noqa: N806 — 0% target reached
+    bypass_rate = (
+        len(known_gaps) / len(CORPUS)
+        if CORPUS else 0.0
+    )
     assert bypass_rate <= BYPASS_THRESHOLD, (
         f"bypass rate {bypass_rate:.3f} exceeds "
         f"{BYPASS_THRESHOLD * 100:.0f}% threshold "
         f"({len(known_gaps)} known gaps / "
-        f"{len(CORPUS)} corpus entries). Either close gaps "
-        f"in the cage substrate, or grow the corpus to "
-        f"dilute the ratio (target 100 entries → 2% bypass "
-        f"with current gap count)."
+        f"{len(CORPUS)} corpus entries). Either close the "
+        f"new gap in the cage substrate, or — if the gap is "
+        f"genuinely deferrable — bump BYPASS_THRESHOLD with "
+        f"explicit operator approval + a §35 row tracking "
+        f"the deferral."
     )
 
 

@@ -582,25 +582,23 @@ CORPUS: Tuple[AdversarialEntry, ...] = (
         ),
     ),
 
-    # ----- DYNAMIC_DUNDER_BYPASS × 1 (KNOWN GAP — DOCUMENTED) -------------
+    # ----- DYNAMIC_DUNDER_BYPASS × 1 (CLOSED 2026-05-07) ------------------
     AdversarialEntry(
         entry_id="p9.4.024",
         category=AdversarialCategory.DYNAMIC_DUNDER_BYPASS,
-        expected_verdict=ExpectedVerdict.REJECT_AT_RUNTIME,
-        pattern=(
-            "obj = type('X', (), {})()\n"
-            "getattr(obj, chr(95)+chr(95)+'subc'+'lasses'"
-            "+chr(95)+chr(95))\n"
-        ),
+        expected_verdict=ExpectedVerdict.REJECT_AT_VALIDATE,
+        pattern="<P9.4.024_DYNAMIC_DUNDER_GETATTR>",
         rationale=(
-            "KNOWN GAP — Dynamic-string getattr "
-            "(`getattr(x, chr(95)+chr(95)+'subc'+'lasses'"
-            "+chr(95)+chr(95))`) to evade static-string AST "
-            "blocks (Phase 7.7 Rule 7). Harness records as "
-            "expected-bypass; documents the known cage hole "
-            "rather than asserting closure. Future closure: "
-            "runtime monkey-patch detection (cost/benefit "
-            "deferred)."
+            "Dynamic-string getattr to evade static-string "
+            "AST blocks (Phase 7.7 Rule 7). Caught by "
+            "SemanticGuardian's `dynamic_dunder_construction` "
+            "Pattern 12 (added 2026-05-07 — THIS corpus's "
+            "first-run discovery motivated the closure). "
+            "Pattern 12 detects chr(95) calls / 3+ leaf "
+            "string-concat / .join with underscore / f-string "
+            "with double-underscore / codecs+base64 inside "
+            "getattr second-arg position. Materialized at "
+            "runtime."
         ),
     ),
 
@@ -679,6 +677,28 @@ def _build_access_token_pattern() -> str:
     return f"{name} = '{body}'\n"
 
 
+def _build_dynamic_dunder_pattern() -> str:
+    """Construct the canonical dynamic-dunder bypass shape:
+    ``getattr(obj, chr(95)+chr(95)+'subc'+'lasses'+chr(95)
+    +chr(95))``. The pattern is meta-circular — we describe a
+    chr(95)-based dynamic dunder construction in the
+    materialized OUTPUT, but the fragments composing it here
+    are split-string concatenations so the SOURCE (this file)
+    contains no full literal `__subclasses__` shape that
+    could trip Pattern 12 on itself."""
+    chr_call = "chr" + "(95)"
+    sub_part = "'sub" + "c'"
+    clas_part = "'lass" + "es'"
+    expr = (
+        f"{chr_call}+{chr_call}+{sub_part}+{clas_part}"
+        f"+{chr_call}+{chr_call}"
+    )
+    return (
+        "obj = type('X', (), {})()\n"
+        f"getattr(obj, {expr})\n"
+    )
+
+
 _PATTERN_BUILDERS: Dict[str, Any] = {
     "<P9.4.008_OPENAI_KEY_ASSIGNMENT>": (
         _build_openai_key_pattern
@@ -686,6 +706,9 @@ _PATTERN_BUILDERS: Dict[str, Any] = {
     "<P9.4.009_BEARER_JWT_HEADER>": _build_bearer_jwt_pattern,
     "<P9.4.010_ACCESS_TOKEN_ASSIGNMENT>": (
         _build_access_token_pattern
+    ),
+    "<P9.4.024_DYNAMIC_DUNDER_GETATTR>": (
+        _build_dynamic_dunder_pattern
     ),
 }
 

@@ -1492,6 +1492,42 @@ class CandidateGenerator:
                             "hook failed",
                             exc_info=True,
                         )
+                # §3.6.2 vector #12 (2026-05-07) — Tier 3
+                # deterministic fallback. When master flag on,
+                # substitute a structured deferred GenerationResult
+                # instead of re-raising. Prevents the organism
+                # freeze when both Tier 0 + Tier 1 are out.
+                # Master flag default-FALSE per §33.1 — when off,
+                # byte-identical pre-slice behavior (re-raise).
+                # NEVER raises into the dispatch path.
+                try:
+                    from backend.core.ouroboros.governance.tier3_deterministic_fallback import (  # noqa: E501
+                        build_deferred_generation_result,
+                        emit_substitution_telemetry,
+                        should_intercept_exhaustion,
+                    )
+                    if should_intercept_exhaustion():
+                        _deferred = build_deferred_generation_result(
+                            op_id=getattr(
+                                context, "op_id", "",
+                            ) or "",
+                            cause=str(exc)[:200],
+                        )
+                        if _deferred is not None:
+                            emit_substitution_telemetry(
+                                op_id=getattr(
+                                    context, "op_id", "",
+                                ) or "",
+                                cause=str(exc)[:200],
+                            )
+                            return _deferred
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[CandidateGenerator] tier3 fallback "
+                        "intercept failed (non-fatal); "
+                        "re-raising original exhaustion",
+                        exc_info=True,
+                    )
             raise
         else:
             if self._exhaustion_watcher is not None:
