@@ -576,6 +576,8 @@ class TestAuthorityAllowlist:
         Module-owned register_* exempt (registration-contract)."""
         allowed = {
             "backend.core.ouroboros.governance.lifecycle_hook",
+            "backend.core.ouroboros.governance.tool_name_pattern",
+            "backend.core.ouroboros.governance.meta.module_discovery",
         }
         tree = ast.parse(self._source())
         registration_funcs = {

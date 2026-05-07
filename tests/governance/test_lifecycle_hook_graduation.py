@@ -119,13 +119,16 @@ class TestFlagDiscovery:
 
 
 class TestInvariantDiscovery:
-    def test_all_8_lifecycle_hook_invariants_discovered(self):
+    def test_all_9_lifecycle_hook_invariants_discovered(self):
+        # Bumped 8 -> 9 when Venom V3 added
+        # ``lifecycle_hook_executor_v3_ffn_discipline``
+        # (2026-05-07).
         invs = list_shipped_code_invariants()
         hook_invs = [
             i for i in invs
             if "lifecycle_hook" in i.invariant_name
         ]
-        assert len(hook_invs) == 8
+        assert len(hook_invs) == 9
 
     def test_each_module_contributes_invariants(self):
         invs = list_shipped_code_invariants()
