@@ -124,7 +124,7 @@ $BEGIN_MARKER
 # Contract consultation (P9.2) blocks 0-op false-graduation.
 # Circuit breaker (Option C) keeps logs mathematically pure on DW topology block.
 # Graduation ledger enabled so parent harness persists clean counts.
-$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true OUROBOROS_BATTLE_SEED_INTENTS=3 /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
+$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_CADENCE_KIND=cron /usr/bin/env python3 $REPO_ROOT/scripts/cadence_preflight.py --cadence-kind cron && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true OUROBOROS_BATTLE_SEED_INTENTS=3 /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
 $END_MARKER
 EOF
 }
@@ -171,12 +171,43 @@ install_cron() {
     echo -e "${GREEN}✓${RESET} crontab installed (schedule: ${BOLD}$CRON_SCHEDULE${RESET})"
     echo -e "${DIM}  cost_cap=\$$COST_CAP wall_cap=${WALL_CAP}s timeout=${TIMEOUT}s${RESET}"
     echo -e "${DIM}  logs: $LOG_DIR/{timestamp}.log${RESET}"
+    # Cadence Slice 1 (2026-05-06) — write cadence manifest as
+    # the single source of truth for schedule + interval. Slice 3
+    # overdue detector reads this; no magic numbers in detection
+    # modules. Best-effort: failure logs warning but doesn't block
+    # the install (operator can re-run later).
+    if write_cadence_manifest; then
+        echo -e "${DIM}  cadence_manifest: .jarvis/cadence_manifest.json${RESET}"
+    else
+        echo -e "${YELLOW}!${RESET} cadence manifest write failed (non-fatal)"
+    fi
     echo
     echo -e "${CYAN}Next steps:${RESET}"
     echo "  1. Verify: $0 --status"
     echo "  2. First proof run: $0 --once"
     echo "  3. Operator pause: export JARVIS_LIVE_FIRE_GRADUATION_SOAK_PAUSED=true"
     echo "  4. Check progress: python3 $HARNESS_SCRIPT status"
+}
+
+write_cadence_manifest() {
+    # Cadence Slice 1 — invoke the canonical CLI seam on the
+    # harness so the Python-side manifest substrate
+    # (backend/.../graduation/cadence_manifest.py) is the SOLE
+    # writer. Composes existing CRON_SCHEDULE / COST_CAP /
+    # WALL_CAP / TIMEOUT env vars as `extras` on the manifest —
+    # operators get a complete forensic witness without schema
+    # bumps.
+    cd "$REPO_ROOT" || return 1
+    /usr/bin/env python3 "$HARNESS_SCRIPT" write-cadence-manifest \
+        --kind cron \
+        --schedule "$CRON_SCHEDULE" \
+        --installer-version "1.0" \
+        --extra "cost_cap_usd=$COST_CAP" \
+        --extra "wall_cap_s=$WALL_CAP" \
+        --extra "timeout_s=$TIMEOUT" \
+        --extra "log_dir=$LOG_DIR" \
+        --extra "harness_script=$HARNESS_SCRIPT" \
+        > /dev/null 2>&1
 }
 
 dry_run() {

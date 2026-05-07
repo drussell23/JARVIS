@@ -47,7 +47,7 @@ import os
 import sys
 import textwrap
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # Ensure project root importable regardless of cwd (cron uses absolute path).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -374,6 +374,58 @@ def cmd_pause(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_write_cadence_manifest(
+    args: argparse.Namespace,
+) -> int:
+    """Write the cadence manifest at install time.
+
+    Composes :func:`cadence_manifest.write_manifest`. Invoked
+    by ``install_live_fire_soak_cron.sh`` after a successful
+    ``crontab -`` (or by the launchd installer in Slice 4)
+    so the schedule's interval is captured as the single
+    source of truth for the overdue detector (Slice 3).
+
+    Cadence Slice 1 — closes the cadence-observability gap
+    surfaced 2026-05-06.
+    """
+    try:
+        from backend.core.ouroboros.governance.graduation.cadence_manifest import (  # noqa: E501
+            write_manifest,
+        )
+    except ImportError as exc:
+        sys.stderr.write(
+            f"error: cadence_manifest substrate unavailable: "
+            f"{exc}\n",
+        )
+        return 2
+    extras: Dict[str, Any] = {}
+    for kv in (args.extra or []):
+        if "=" not in kv:
+            continue
+        k, _, v = kv.partition("=")
+        k = k.strip()
+        if not k:
+            continue
+        extras[k] = v.strip()
+    interval_override: Optional[int] = None
+    if args.interval_hint_s is not None:
+        interval_override = int(args.interval_hint_s)
+    ok, detail = write_manifest(
+        schedule_kind=args.kind,
+        schedule_string=args.schedule,
+        installer_version=args.installer_version,
+        extras=extras,
+        interval_hint_s=interval_override,
+    )
+    if not ok:
+        sys.stderr.write(
+            f"error: write_manifest failed: {detail}\n",
+        )
+        return 2
+    print(f"cadence_manifest written: {detail}")
+    return 0
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
     print(f"  {_GREEN}unset JARVIS_LIVE_FIRE_GRADUATION_SOAK_PAUSED{_RESET}")
     return 0
@@ -431,6 +483,50 @@ def main() -> int:
         "--recorded-by", type=str, default="live_fire_soak_cli",
         help="Operator/runner identity for ledger row (default cli).",
     )
+    # Cadence Slice 1 (2026-05-06) — write cadence_manifest.json.
+    # Invoked by install_live_fire_soak_cron.sh after successful
+    # crontab install + by Slice 4 launchd installer. Single source
+    # of truth for cadence interval; overdue detector (Slice 3)
+    # reads this manifest, no magic numbers in detection modules.
+    p_manifest = sub.add_parser(
+        "write-cadence-manifest",
+        help=(
+            "Write .jarvis/cadence_manifest.json — installer "
+            "invokes this AFTER crontab/launchd install."
+        ),
+    )
+    p_manifest.add_argument(
+        "--kind", type=str, required=True,
+        choices=("cron", "launchd"),
+        help="Schedule kind.",
+    )
+    p_manifest.add_argument(
+        "--schedule", type=str, required=True,
+        help=(
+            "Schedule string — raw crontab line for cron, "
+            "StartInterval seconds for launchd."
+        ),
+    )
+    p_manifest.add_argument(
+        "--installer-version", type=str, default="1.0",
+        help="Installer version stamp.",
+    )
+    p_manifest.add_argument(
+        "--interval-hint-s", type=int, default=None,
+        help=(
+            "Override the derived interval hint in seconds "
+            "(rare; only when caller knows better than the "
+            "cron-spec parser)."
+        ),
+    )
+    p_manifest.add_argument(
+        "--extra", type=str, action="append",
+        help=(
+            "Extra key=value metadata stamped on the manifest "
+            "(repeatable). E.g. --extra cost_cap_usd=0.50 "
+            "--extra wall_cap_s=2400."
+        ),
+    )
     args = parser.parse_args()
     handlers = {
         "queue": cmd_queue,
@@ -440,6 +536,7 @@ def main() -> int:
         "status": cmd_status,
         "pause": cmd_pause,
         "resume": cmd_resume,
+        "write-cadence-manifest": cmd_write_cadence_manifest,
     }
     handler = handlers.get(args.cmd)
     if handler is None:
