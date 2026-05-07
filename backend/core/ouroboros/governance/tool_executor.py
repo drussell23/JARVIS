@@ -44,11 +44,12 @@ from backend.core.ouroboros.governance.test_runner import BlockedPathError
 # ---------------------------------------------------------------------------
 
 class ToolExecStatus(str, enum.Enum):
-    SUCCESS       = "success"
-    TIMEOUT       = "timeout"
-    POLICY_DENIED = "policy_denied"
-    EXEC_ERROR    = "exec_error"
-    CANCELLED     = "cancelled"
+    SUCCESS           = "success"
+    TIMEOUT           = "timeout"
+    POLICY_DENIED     = "policy_denied"
+    PERMISSION_DENIED = "permission_denied"  # Venom V2 (2026-05-06)
+    EXEC_ERROR        = "exec_error"
+    CANCELLED         = "cancelled"
 
 class PolicyDecision(str, enum.Enum):
     ALLOW = "allow"
@@ -1114,6 +1115,167 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
 # ---------------------------------------------------------------------------
 
 _MAX_TOOL_OUTPUT_CHARS = 32_000  # CC-parity: was 4000, raised for full-file reads and rich search results
+
+
+# ---------------------------------------------------------------------------
+# Venom V1 Slice 2 (PRD §32.6 / line 378, 2026-05-06) — per-tool
+# hook fire-point helpers.
+#
+# Composes the canonical lifecycle_hook_executor.fire_hooks
+# substrate (single source of truth — same machinery the phase-
+# boundary hooks use). Master-flag-gated via
+# ``JARVIS_VENOM_TOOL_HOOKS_ENABLED`` (default-FALSE); when off,
+# fire is a sync-fast no-op so pre-graduation overhead is zero.
+# NEVER raises into the tool path — a buggy hook cannot break
+# tool dispatch.
+# ---------------------------------------------------------------------------
+
+
+async def _maybe_fire_tool_hook(
+    event_value: str,
+    call: "ToolCall",
+    policy_ctx: "PolicyContext",
+    *,
+    result_summary: str = "",
+) -> None:
+    """Fire a tool-boundary hook event. NEVER raises.
+
+    ``event_value`` is the string token (e.g. ``"pre_tool_use"``)
+    so this helper avoids importing the enum at module-top
+    (defers to lazy import to keep the hot path stable).
+    """
+    try:
+        from backend.core.ouroboros.governance.lifecycle_hook import (
+            HookContext,
+            ToolHookEvent,
+            venom_tool_hooks_enabled,
+        )
+    except ImportError:
+        return
+    # Sync-fast short-circuit — master flag default-FALSE means
+    # zero work pre-graduation.
+    try:
+        if not venom_tool_hooks_enabled():
+            return
+    except Exception:  # noqa: BLE001 — defensive
+        return
+    try:
+        event = ToolHookEvent(event_value)
+    except (ValueError, TypeError):
+        return
+    try:
+        from backend.core.ouroboros.governance.lifecycle_hook_executor import (  # noqa: E501
+            fire_hooks,
+        )
+    except ImportError:
+        return
+    try:
+        ctx = HookContext(
+            event=event,
+            op_id=getattr(policy_ctx, "op_id", "") or "",
+            phase="TOOL_DISPATCH",
+            payload={
+                "tool_name": getattr(call, "name", ""),
+                "result_summary": result_summary[:128],
+            },
+        )
+        await fire_hooks(event, ctx)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[VenomToolHooks] fire raised: %s", exc,
+        )
+
+
+async def _maybe_evaluate_tool_permission(
+    call: "ToolCall",
+    policy_ctx: "PolicyContext",
+):
+    """Venom V2 (2026-05-06) — evaluate the per-tool permission
+    registry BEFORE V1 PRE_TOOL_USE fires. Returns the
+    aggregate decision OR None when master flag is off (so
+    callers can sync-fast skip the post-evaluation branching).
+
+    Composes the canonical
+    :func:`tool_permission.evaluate_tool_permission` substrate;
+    no parallel evaluator. NEVER raises into the tool path.
+
+    Master-flag-gated via ``JARVIS_VENOM_TOOL_PERMISSIONS_ENABLED``
+    (default-FALSE → returns None, dispatch proceeds normally).
+    """
+    try:
+        from backend.core.ouroboros.governance.tool_permission import (
+            evaluate_tool_permission,
+            venom_tool_permissions_enabled,
+        )
+    except ImportError:
+        return None
+    try:
+        if not venom_tool_permissions_enabled():
+            return None
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        decision = await evaluate_tool_permission(
+            tool_name=getattr(call, "name", ""),
+            op_id=getattr(policy_ctx, "op_id", "") or "",
+            payload={
+                "arguments": getattr(call, "arguments", {}) or {},
+            },
+        )
+        return decision
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[VenomToolPermission] evaluate raised: %s", exc,
+        )
+        return None
+
+
+async def _maybe_fire_tool_hook_failure(
+    event_value: str,
+    call: "ToolCall",
+    policy_ctx: "PolicyContext",
+    *,
+    error: str = "",
+) -> None:
+    """Fire a tool-failure hook event. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.lifecycle_hook import (
+            HookContext,
+            ToolHookEvent,
+            venom_tool_hooks_enabled,
+        )
+    except ImportError:
+        return
+    try:
+        if not venom_tool_hooks_enabled():
+            return
+    except Exception:  # noqa: BLE001 — defensive
+        return
+    try:
+        event = ToolHookEvent(event_value)
+    except (ValueError, TypeError):
+        return
+    try:
+        from backend.core.ouroboros.governance.lifecycle_hook_executor import (  # noqa: E501
+            fire_hooks,
+        )
+    except ImportError:
+        return
+    try:
+        ctx = HookContext(
+            event=event,
+            op_id=getattr(policy_ctx, "op_id", "") or "",
+            phase="TOOL_DISPATCH",
+            payload={
+                "tool_name": getattr(call, "name", ""),
+                "error": str(error)[:256],
+            },
+        )
+        await fire_hooks(event, ctx)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[VenomToolHooks] failure fire raised: %s", exc,
+        )
 
 
 class ToolExecutor:
@@ -3075,9 +3237,76 @@ class AsyncProcessToolBackend:
         if remaining <= 0:
             out = (json.dumps(_dc.asdict(TestRunResult(status=TestRunStatus.TIMEOUT)))
                    if call.name == "run_tests" else "")
+            # Venom V1 Slice 2 — fire POST_TOOL_USE_FAILURE for
+            # the deadline path so observers see the outcome.
+            await _maybe_fire_tool_hook_failure(
+                "post_tool_use_failure", call, policy_ctx,
+                error="TIMEOUT_BEFORE_DISPATCH",
+            )
             return ToolResult(tool_call=call, output=out, error="TIMEOUT",
                 status=ToolExecStatus.TIMEOUT)
         timeout = min(float(os.environ.get("JARVIS_TOOL_TIMEOUT_S", "30")), max(1.0, remaining))
+        # Venom V2 (2026-05-06) — per-tool permission check
+        # fires BEFORE V1 PRE_TOOL_USE hook. Master-flag-gated
+        # via JARVIS_VENOM_TOOL_PERMISSIONS_ENABLED (default
+        # FALSE → zero overhead pre-graduation; DEFER aggregate
+        # treats as ALLOW). DENY short-circuits dispatch with a
+        # canonical TOOL_DENIED result; ASK is conservative
+        # (treated as DENY pre-V2-graduation since we don't yet
+        # have a synchronous-tool-level approval bridge — the
+        # async approval path lands in V2 follow-up). ALLOW /
+        # DEFER → continue to PRE_TOOL_USE + dispatch.
+        _perm_decision = await _maybe_evaluate_tool_permission(
+            call, policy_ctx,
+        )
+        if _perm_decision is not None:
+            if _perm_decision.decision.value == "deny":
+                # Skip dispatch + fire failure hook so observers
+                # see the deny outcome.
+                await _maybe_fire_tool_hook_failure(
+                    "post_tool_use_failure", call, policy_ctx,
+                    error=(
+                        f"PERMISSION_DENIED:"
+                        f"{_perm_decision.detail[:64]}"
+                    ),
+                )
+                return ToolResult(
+                    tool_call=call, output="",
+                    error=(
+                        f"PERMISSION_DENIED: "
+                        f"{_perm_decision.detail[:128]}"
+                    ),
+                    status=ToolExecStatus.PERMISSION_DENIED,
+                )
+            if _perm_decision.decision.value == "ask":
+                # Pre-V2-graduation policy: ASK without a
+                # synchronous bridge defaults to DENY (safe).
+                # Operators who want async-approve-then-allow
+                # register an ASK callback that internally
+                # awaits InlineApprovalProvider + returns
+                # ALLOW/DENY.
+                await _maybe_fire_tool_hook_failure(
+                    "post_tool_use_failure", call, policy_ctx,
+                    error=(
+                        f"PERMISSION_ASK_NO_BRIDGE:"
+                        f"{_perm_decision.detail[:64]}"
+                    ),
+                )
+                return ToolResult(
+                    tool_call=call, output="",
+                    error=(
+                        f"PERMISSION_ASK_NO_BRIDGE: "
+                        f"{_perm_decision.detail[:128]}"
+                    ),
+                    status=ToolExecStatus.PERMISSION_DENIED,
+                )
+        # Venom V1 Slice 2 (2026-05-06) — PRE_TOOL_USE fires
+        # before any dispatch path. Master-flag-gated; default-
+        # FALSE → zero overhead pre-graduation. NEVER raises
+        # into the tool path.
+        await _maybe_fire_tool_hook(
+            "pre_tool_use", call, policy_ctx,
+        )
         async with self._semaphore:
             if call.name == "run_tests":
                 return await self._run_tests_async(call, policy_ctx, timeout, cap)
@@ -3131,10 +3360,38 @@ class AsyncProcessToolBackend:
                 "task_complete",   # Gap #5 Slice 2
                 "hypothesize",     # Priority C — bounded probe primitive
             ):
-                return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
-            return await self._run_sync_tool_async(
+                _result = await self._run_async_native_tool(call, policy_ctx, timeout, cap)
+                # Venom V1 Slice 2 — fire POST_TOOL_USE for the
+                # async-native dispatch path. Status branch fires
+                # POST_TOOL_USE_FAILURE so observers can react to
+                # tool-level failures separately from successes.
+                if _result.status == ToolExecStatus.SUCCESS:
+                    await _maybe_fire_tool_hook(
+                        "post_tool_use", call, policy_ctx,
+                        result_summary=(_result.output or "")[:128],
+                    )
+                else:
+                    await _maybe_fire_tool_hook_failure(
+                        "post_tool_use_failure", call, policy_ctx,
+                        error=(_result.error or _result.status.value),
+                    )
+                return _result
+            _result = await self._run_sync_tool_async(
                 call, policy_ctx.repo_root, timeout, cap, op_id=policy_ctx.op_id,
             )
+            # Venom V1 Slice 2 — fire POST_TOOL_USE for the sync
+            # dispatch path.
+            if _result.status == ToolExecStatus.SUCCESS:
+                await _maybe_fire_tool_hook(
+                    "post_tool_use", call, policy_ctx,
+                    result_summary=(_result.output or "")[:128],
+                )
+            else:
+                await _maybe_fire_tool_hook_failure(
+                    "post_tool_use_failure", call, policy_ctx,
+                    error=(_result.error or _result.status.value),
+                )
+            return _result
 
     async def _run_sync_tool_async(
         self, call: ToolCall, repo_root: Path, timeout: float, cap: int,

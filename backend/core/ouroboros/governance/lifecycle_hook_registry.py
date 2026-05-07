@@ -80,13 +80,23 @@ from typing import (
 
 from backend.core.ouroboros.governance.lifecycle_hook import (
     HookContext,
+    HookEventTypes,
     HookOutcome,
     HookResult,
     LifecycleEvent,
+    ToolHookEvent,
     default_hook_timeout_s,
     make_hook_result,
     max_hooks_per_event,
 )
+
+
+# Type alias for the union of accepted event taxonomies. The
+# registry's storage is keyed by the enum's `.value` string, so
+# both LifecycleEvent (5-value, phase boundary) and ToolHookEvent
+# (6-value, per-tool boundary) coexist without storage drift.
+# Venom V1 Slice 1 (2026-05-06).
+HookEventLike = "LifecycleEvent | ToolHookEvent"
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +147,11 @@ class HookRegistration:
     visibility independent of the master switch)."""
 
     name: str
-    event: LifecycleEvent
+    # Venom V1 Slice 1 (2026-05-06) — widened to accept either
+    # LifecycleEvent (phase boundary; 5 values) or ToolHookEvent
+    # (per-tool boundary; 6 values). Storage keyed by `.value`
+    # string downstream; both enums conform to that contract.
+    event: "LifecycleEvent | ToolHookEvent"
     callable: LifecycleHookCallable
     priority: int = 100
     timeout_s: float = 5.0
@@ -227,7 +241,14 @@ class LifecycleHookRegistry:
             self._max_per_event = max(1, min(256, int(cap)))
         except (TypeError, ValueError):
             self._max_per_event = max_hooks_per_event()
-        self._by_event: Dict[LifecycleEvent, List[HookRegistration]] = {}
+        # Venom V1 Slice 1 — widened key type to accept either
+        # event taxonomy. Both LifecycleEvent and ToolHookEvent
+        # are str-subclass enums; the dict keys hash by identity
+        # but the runtime is duck-typed by isinstance(...).
+        self._by_event: Dict[
+            "LifecycleEvent | ToolHookEvent",
+            List[HookRegistration],
+        ] = {}
         self._by_name: Dict[str, HookRegistration] = {}
         self._lock = threading.RLock()
         self._listeners: List[Callable[[Dict[str, Any]], None]] = []
@@ -242,18 +263,25 @@ class LifecycleHookRegistry:
         with self._lock:
             return len(self._by_name)
 
-    def count_for_event(self, event: LifecycleEvent) -> int:
+    def count_for_event(
+        self, event: "LifecycleEvent | ToolHookEvent",
+    ) -> int:
         with self._lock:
             return len(self._by_event.get(event, []))
 
     def for_event(
-        self, event: LifecycleEvent,
+        self, event: "LifecycleEvent | ToolHookEvent",
     ) -> Tuple[HookRegistration, ...]:
         """Priority-ordered tuple of registrations for one event.
         Sort happens at registration time (insertion-sorted) so
-        this lookup is O(N) tuple copy. NEVER raises."""
+        this lookup is O(N) tuple copy. NEVER raises.
+
+        Venom V1 Slice 1 (2026-05-06) — accepts either event
+        taxonomy. Phase-boundary callers pass LifecycleEvent;
+        per-tool-boundary callers pass ToolHookEvent. Single
+        registry, two event taxonomies."""
         try:
-            if not isinstance(event, LifecycleEvent):
+            if not isinstance(event, HookEventTypes):
                 return ()
             with self._lock:
                 bucket = self._by_event.get(event, [])
@@ -339,7 +367,7 @@ class LifecycleHookRegistry:
 
     def register(
         self,
-        event: LifecycleEvent,
+        event: "LifecycleEvent | ToolHookEvent",
         hook: LifecycleHookCallable,
         *,
         name: str,
@@ -350,18 +378,26 @@ class LifecycleHookRegistry:
         """Register one hook. Raises explicitly on validation
         failure so operator misconfig surfaces at boot.
 
+        Venom V1 Slice 1 (2026-05-06) — accepts either
+        :class:`LifecycleEvent` (phase boundary) or
+        :class:`ToolHookEvent` (per-tool boundary). Single
+        registry, two event taxonomies; storage keyed by
+        ``event.value`` string so both coexist cleanly.
+
         Raises:
-          :class:`InvalidHookError` — non-callable hook, non-event,
-            empty name.
+          :class:`InvalidHookError` — non-callable hook,
+            non-event-of-either-taxonomy, empty name.
           :class:`DuplicateHookNameError` — name already registered.
           :class:`HookCapacityExceededError` — event already at
             max_per_event capacity.
         """
-        # Validate event.
-        if not isinstance(event, LifecycleEvent):
+        # Validate event — accept either of the two closed
+        # taxonomies. ``HookEventTypes`` is the Tuple[type, ...]
+        # imported from lifecycle_hook for direct isinstance use.
+        if not isinstance(event, HookEventTypes):
             raise InvalidHookError(
-                f"event must be a LifecycleEvent — got "
-                f"{type(event).__name__}"
+                f"event must be a LifecycleEvent or "
+                f"ToolHookEvent — got {type(event).__name__}"
             )
         # Validate hook callable.
         if not callable(hook):

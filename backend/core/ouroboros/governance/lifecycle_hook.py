@@ -216,6 +216,106 @@ _VALID_EVENTS: frozenset = frozenset({e.value for e in LifecycleEvent})
 
 
 # ---------------------------------------------------------------------------
+# Venom V1 (PRD §32.6 / line 378, 2026-05-06) — closed 6-value
+# tool-hook taxonomy.
+#
+# LifecycleEvent fires at orchestrator phase boundaries (CLASSIFY /
+# ROUTE / GENERATE / VALIDATE / GATE / etc.). ToolHookEvent fires
+# at PER-TOOL-CALL boundaries inside the Venom tool loop
+# (`tool_executor.py` round-loop) — strictly higher granularity.
+#
+# Coexists with LifecycleEvent: the registry's storage + dispatch
+# share the same machinery (single source of truth) but the two
+# enums are distinct types so a hook author can't accidentally
+# subscribe a phase-boundary hook to a tool-boundary event (or
+# vice versa). Slice 1 (this enum) ships the substrate; Slice 2
+# wires fire points into tool_executor.py; Slice 3 ships the
+# graduation contract.
+#
+# Master flag: ``JARVIS_VENOM_TOOL_HOOKS_ENABLED`` (default
+# ``false`` per §33.1 graduation contract pattern; flips after
+# operator-paced empirical cadence).
+# ---------------------------------------------------------------------------
+
+
+class ToolHookEvent(str, enum.Enum):
+    """Closed 6-value taxonomy of per-tool-call lifecycle events
+    that can fire hooks. Every event maps to exactly one boundary
+    inside the Venom tool loop or subagent dispatch path.
+
+    Slice 2 wires these into ``tool_executor.py`` at the named
+    boundaries. New events require explicit scope-doc + Slice 2
+    wire-up update — adding a value here without a wire-up
+    silently produces dead hooks.
+
+    * :attr:`PRE_TOOL_USE` — before the tool callable is invoked.
+      Hook sees the tool name + arguments. Use case: argument
+      validation, audit-pre-call, side-channel telemetry.
+    * :attr:`POST_TOOL_USE` — after the tool returns successfully.
+      Hook sees the tool name + result summary. Use case: result
+      audit, post-call telemetry, A/B routing of follow-up tools.
+    * :attr:`PRE_TOOL_USE_FAILURE` — fires when the tool RAISED
+      and the executor is about to translate the exception into
+      a failure result. Hook sees the exception type + message.
+      Use case: structured error reporting, retry-policy hints.
+    * :attr:`POST_TOOL_USE_FAILURE` — after the failure result
+      has been recorded but before control returns to the model.
+      Hook sees the failure outcome + bounded detail. Use case:
+      Slack-notify-on-tool-failure, escalation triggers.
+    * :attr:`SUBAGENT_START` — fires when a subagent (Phase B
+      EXPLORE / REVIEW / PLAN / GENERAL via dispatch_general
+      etc.) begins execution. Hook sees the subagent kind +
+      input summary. Use case: subagent-scoped telemetry,
+      capacity planning.
+    * :attr:`SUBAGENT_STOP` — fires when a subagent completes
+      (success OR failure terminal). Hook sees the kind + outcome
+      + duration. Use case: subagent post-mortem, cost accounting.
+
+    Closed taxonomy bytes-pinned via the
+    ``tool_hook_event_taxonomy_closed`` AST invariant (Slice 1)."""
+
+    PRE_TOOL_USE = "pre_tool_use"
+    POST_TOOL_USE = "post_tool_use"
+    PRE_TOOL_USE_FAILURE = "pre_tool_use_failure"
+    POST_TOOL_USE_FAILURE = "post_tool_use_failure"
+    SUBAGENT_START = "subagent_start"
+    SUBAGENT_STOP = "subagent_stop"
+
+
+_VALID_TOOL_HOOK_EVENTS: frozenset = frozenset(
+    {e.value for e in ToolHookEvent},
+)
+
+
+# Union alias for callers that accept either taxonomy (single
+# registry, two event taxonomies). Stored as Tuple of types so
+# the registry's isinstance check can use it directly.
+HookEventTypes: Tuple[type, ...] = (LifecycleEvent, ToolHookEvent)
+
+
+def venom_tool_hooks_enabled() -> bool:
+    """``JARVIS_VENOM_TOOL_HOOKS_ENABLED`` master switch
+    (default ``false`` per §33.1 graduation-contract pattern).
+
+    Asymmetric env semantics — empty/whitespace = unset = current
+    default; explicit truthy/falsy values evaluate at call time
+    so flag flips hot-revert without restart.
+
+    The ``LifecycleEvent`` (5-value, phase-boundary) hooks have
+    their OWN master flag (``JARVIS_LIFECYCLE_HOOKS_ENABLED``,
+    graduated default-TRUE 2026-05-02) so the two surfaces flip
+    independently — operators can adopt phase hooks without
+    enabling tool hooks, or vice versa.
+    """
+    raw = os.environ.get(
+        "JARVIS_VENOM_TOOL_HOOKS_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return False  # default-FALSE per §33.1
+    return raw in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
 # Closed taxonomy — 5-value HookOutcome (J.A.R.M.A.T.R.I.X.)
 # ---------------------------------------------------------------------------
 
@@ -293,7 +393,10 @@ class HookContext:
     action verb + target op). Hooks SHOULD treat payload as
     read-only — mutating it does NOT propagate (frozen dataclass)."""
 
-    event: LifecycleEvent
+    # Venom V1 Slice 2 (2026-05-06) — widened to accept either
+    # LifecycleEvent (phase boundary) or ToolHookEvent (per-tool
+    # boundary).
+    event: "LifecycleEvent | ToolHookEvent"
     op_id: str = ""
     phase: str = ""
     payload: Mapping[str, Any] = field(default_factory=dict)
@@ -437,7 +540,9 @@ class AggregateHookDecision:
     blocked. ``warning_hooks`` similarly for WARN.
     """
 
-    event: LifecycleEvent
+    # Venom V1 Slice 2 (2026-05-06) — widened to accept either
+    # event taxonomy.
+    event: "LifecycleEvent | ToolHookEvent"
     aggregate: HookOutcome
     total_hooks: int = 0
     blocking_hooks: Tuple[str, ...] = ()
@@ -475,7 +580,7 @@ class AggregateHookDecision:
 
 
 def compute_hook_decision(
-    event: LifecycleEvent,
+    event: "LifecycleEvent | ToolHookEvent",
     results: Tuple[HookResult, ...],
 ) -> AggregateHookDecision:
     """Total aggregation — every (event × results-tuple) maps to
@@ -497,16 +602,29 @@ def compute_hook_decision(
     event coerced to PRE_APPLY (the most common phase boundary).
     """
     try:
-        # Coerce event defensively.
-        if not isinstance(event, LifecycleEvent):
-            try:
-                event = LifecycleEvent(str(event))
-            except (ValueError, TypeError):
+        # Coerce event defensively. Venom V1 Slice 2 — accept
+        # ToolHookEvent too (tool-boundary aggregation reuses
+        # the same BLOCK-wins semantics + Phase C tightening
+        # stamping; the event field is just an audit token).
+        if not isinstance(event, (LifecycleEvent, ToolHookEvent)):
+            # Try LifecycleEvent first (5-value), then
+            # ToolHookEvent (6-value); coerce to PRE_APPLY only
+            # as last-resort.
+            coerced = None
+            for cls in (LifecycleEvent, ToolHookEvent):
+                try:
+                    coerced = cls(str(event))
+                    break
+                except (ValueError, TypeError):
+                    continue
+            if coerced is None:
                 logger.warning(
                     "[LifecycleHook] non-event %r — coercing to "
                     "PRE_APPLY", event,
                 )
                 event = LifecycleEvent.PRE_APPLY
+            else:
+                event = coerced
 
         # Coerce results defensively.
         if results is None:

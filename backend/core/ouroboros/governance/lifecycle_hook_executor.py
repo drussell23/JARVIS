@@ -85,12 +85,15 @@ from typing import Optional, Tuple
 from backend.core.ouroboros.governance.lifecycle_hook import (
     AggregateHookDecision,
     HookContext,
+    HookEventTypes,
     HookOutcome,
     HookResult,
     LifecycleEvent,
+    ToolHookEvent,
     compute_hook_decision,
     lifecycle_hooks_enabled,
     make_hook_result,
+    venom_tool_hooks_enabled,
 )
 from backend.core.ouroboros.governance.lifecycle_hook_registry import (
     HookRegistration,
@@ -245,7 +248,7 @@ async def _run_one_hook(
 
 
 async def fire_hooks(
-    event: LifecycleEvent,
+    event: "LifecycleEvent | ToolHookEvent",
     context: HookContext,
     *,
     registry: Optional[LifecycleHookRegistry] = None,
@@ -289,7 +292,8 @@ async def fire_hooks(
       for audit detail.
     """
     # 1. Validate event at boundary.
-    if not isinstance(event, LifecycleEvent):
+    # Venom V1 Slice 2 (2026-05-06) — accept either taxonomy.
+    if not isinstance(event, HookEventTypes):
         logger.warning(
             "[LifecycleHookExecutor] non-event input type=%s — "
             "returning CONTINUE",
@@ -302,11 +306,16 @@ async def fire_hooks(
             monotonic_tightening_verdict="",
         )
 
-    # 2. Master flag short-circuit.
-    is_enabled = (
-        enabled if enabled is not None
-        else lifecycle_hooks_enabled()
-    )
+    # 2. Master flag short-circuit. The two surfaces have
+    # SEPARATE master flags so operators can adopt phase hooks
+    # without enabling tool hooks (or vice versa). Caller's
+    # explicit ``enabled`` override always wins.
+    if enabled is not None:
+        is_enabled = bool(enabled)
+    elif isinstance(event, ToolHookEvent):
+        is_enabled = venom_tool_hooks_enabled()
+    else:
+        is_enabled = lifecycle_hooks_enabled()
     if not is_enabled:
         return AggregateHookDecision(
             event=event,
