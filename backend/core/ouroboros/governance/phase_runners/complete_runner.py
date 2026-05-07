@@ -199,6 +199,37 @@ class COMPLETERunner(PhaseRunner):
                 ctx.op_id, exc_info=True,
             )
 
+        # ── Phase 3 A1: ExecutionMonitor bridge (terminal-success path)
+        # Master flag default-FALSE per §33.1; when off, this is a no-op
+        # (zero behavior change). Bridge composes canonical
+        # ExecutionMonitor singleton + bounded JSONL ledger via §33.4.
+        # NEVER raises — defensive at every layer + try/except wrapper.
+        try:
+            from backend.core.ouroboros.governance.execution_monitor_bridge import (  # noqa: E501
+                record_terminal_outcome,
+            )
+            record_terminal_outcome(
+                op_id=ctx.op_id,
+                terminal_reason_code=(
+                    ctx.terminal_reason_code or "complete"
+                ),
+                terminal_phase="COMPLETE",
+                duration_ms=(
+                    (time.monotonic() - _t_apply) * 1000.0
+                ),
+                metadata={
+                    "applied_files": [
+                        str(p) for p in ctx.target_files
+                    ][:8],
+                },
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[Orchestrator] execution_monitor_bridge "
+                "swallowed for op=%s — op closure unaffected",
+                ctx.op_id, exc_info=True,
+            )
+
         return PhaseResult(
             next_ctx=ctx,
             next_phase=None,

@@ -188,6 +188,19 @@ verdict carries cancelled_count > 0 / error_count > 0
 ledger-observable, not silent). Chatter-suppressed otherwise."""
 
 
+EVENT_TYPE_EXECUTION_GRAPH_PROGRESS = (
+    "execution_graph_progress"
+)
+"""Phase 3 A2 — fired by ``ExecutionGraphProgressBridge``
+when the canonical ``ExecutionGraphProgressTracker`` emits a
+``GraphEvent``. Chatter-suppressed by default to graph-level
+events (GRAPH_SUBMITTED/STARTED/COMPLETED/FAILED/CANCELLED)
++ terminal unit-level events
+(UNIT_COMPLETED/FAILED/CANCELLED). Operator binding
+2026-05-07: 'read-only projection; no authority on APPLY.'
+The bridge MUST NOT mutate tracker state."""
+
+
 EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED = (
     "tool_confidence_band_crossed"
 )
@@ -689,6 +702,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CAUSAL_ADVISORY_EMITTED,          # §31 U2 Slice 3 (PRD §31.3 empirical wiring)
     EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED,     # §37 Tier 2 #13 Slice 1 (per-tool confidence)
     EVENT_TYPE_MULTI_PRIOR_DISPATCH,             # Move 6.5 Slice 4 (multi-prior dispatch observer)
+    EVENT_TYPE_EXECUTION_GRAPH_PROGRESS,         # Phase 3 A2 (read-only projection of canonical tracker)
 })
 
 
@@ -2480,6 +2494,52 @@ def publish_trajectory_drift_event(
         logger.debug(
             "[Stream] trajectory drift event publish exception",
             exc_info=True,
+        )
+        return None
+
+
+def publish_execution_graph_progress_event(
+    *,
+    kind: str,
+    graph_id: str,
+    op_id: str,
+    unit_id: str,
+    ts_ns: int,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Best-effort publisher for ``execution_graph_progress``
+    frames (Phase 3 A2, 2026-05-07). Fired by
+    ``ExecutionGraphProgressBridge`` on canonical tracker
+    events that pass the chatter-suppression filter
+    (graph-level always; unit-level terminal-only by default).
+
+    Operator binding 2026-05-07: 'read-only projection; no
+    authority on APPLY.' The bridge MUST NOT mutate tracker
+    state — this publisher is the canonical SSE surface for
+    operator-facing visibility.
+
+    NEVER raises; returns the published event id or None on
+    master-flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        body: Dict[str, Any] = {
+            "kind": kind or "",
+            "graph_id": graph_id or "",
+            "op_id": op_id or "",
+            "unit_id": unit_id or "",
+            "ts_ns": int(ts_ns),
+            "payload": dict(payload or {}),
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_EXECUTION_GRAPH_PROGRESS,
+            "execution_graph_progress",
+            body,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] execution_graph_progress publish "
+            "exception", exc_info=True,
         )
         return None
 
