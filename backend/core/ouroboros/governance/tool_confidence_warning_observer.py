@@ -71,8 +71,10 @@ producer site. Slice 4 ships the graduation contract harness.
 """
 from __future__ import annotations
 
+import contextvars
 import enum
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -540,6 +542,293 @@ class ToolConfidenceObserver:
 
 
 # ---------------------------------------------------------------------------
+# Slice 2 — Per-tool confidence extraction substrate
+# ---------------------------------------------------------------------------
+#
+# Slice 2 (2026-05-07) wires per-tool-call confidence observation by
+# composing the canonical capture substrate
+# (``verification/confidence_capture.py``). Zero parallel logprob math.
+#
+# **ContextVar bridge**: the DW provider creates a ConfidenceCapturer
+# per GENERATE round and parks it in ``ctx.artifacts``. PolicyContext
+# (passed to ``ToolExecutor.execute_async``) does NOT carry the
+# artifacts dict, so we propagate the capturer via async-safe
+# ContextVar — the same pattern used by ``plan_exploit_active_var``
+# and ``current_curiosity_budget_var``. The DW provider sets the var
+# at round start; tool_executor reads it; the var resets on round exit.
+# ContextVar inherits across asyncio.Task creation, so tool calls
+# within the round see the same capturer.
+#
+# **Projection**: ``ConfidenceSummary.mean_top1_logprob`` is a log-
+# probability in (-inf, 0]. We project to a [0, 1] confidence value
+# via ``exp(mean_top1_logprob)``: a logprob of -0.1 (very confident)
+# → 0.905, a logprob of -2.3 (uncertain) → 0.100. Defensive against
+# missing fields / NaN — projection returns 0.0 (UNKNOWN band)
+# rather than raising. The ``sample_size`` carries the trace token
+# count so risk-tier consumers (Slice 3) can weight the signal by
+# evidence depth.
+#
+# **Cumulative semantic**: each freeze() returns the cumulative trace
+# for the GENERATE round so far. A second tool call within the same
+# round observes confidence projected over MORE tokens than the
+# first. This is acceptable v1 semantics (per-tool ≈ cumulative-as-
+# of-tool-N); per-tool-exclusive would require checkpoint deltas
+# (deferred enhancement).
+
+
+_ACTIVE_CAPTURER_VAR: "contextvars.ContextVar[Optional[Any]]" = (
+    contextvars.ContextVar(
+        "tool_confidence_active_capturer", default=None,
+    )
+)
+"""Async-safe pointer to the ConfidenceCapturer for the current
+GENERATE round. ``Optional[Any]`` rather than ``Optional[
+ConfidenceCapturer]`` to keep the import lazy (avoid eager pull of
+the verification subsystem at module-load time)."""
+
+
+def set_active_capturer(
+    capturer: Optional[Any],
+) -> "contextvars.Token[Optional[Any]]":
+    """Stamp the active ConfidenceCapturer. Returns a Token the
+    caller MUST pass to :func:`reset_active_capturer` to restore
+    the previous value.
+
+    Convention: providers (DW today; future: J-Prime) call this
+    when starting a GENERATE round and reset it in the matching
+    ``finally`` block. Idempotent — passing the same capturer
+    twice is harmless.
+    """
+    return _ACTIVE_CAPTURER_VAR.set(capturer)
+
+
+def reset_active_capturer(
+    token: "contextvars.Token[Optional[Any]]",
+) -> None:
+    """Restore the previous capturer pointer using the Token
+    returned by :func:`set_active_capturer`. Defensive: invalid
+    Token errors are swallowed so a stale reset doesn't crash
+    the GENERATE finally."""
+    try:
+        _ACTIVE_CAPTURER_VAR.reset(token)
+    except (ValueError, LookupError, TypeError):
+        # Token was created in a different context OR caller
+        # passed a non-Token sentinel — defensive silent
+        # recovery rather than crash the finally. NEVER raises.
+        logger.debug(
+            "[ToolConfidenceWarningObserver] reset_active_"
+            "capturer received stale/invalid token (non-fatal)",
+        )
+
+
+def get_active_capturer() -> Optional[Any]:
+    """Read the active ConfidenceCapturer (if any). Returns
+    ``None`` when no provider has stamped one for the current
+    async context (e.g., Claude provider rounds, or pre-GENERATE
+    paths). NEVER raises."""
+    try:
+        return _ACTIVE_CAPTURER_VAR.get()
+    except LookupError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Frozen artifact — extracted confidence signal
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConfidenceSignal:
+    """Single per-tool-call confidence observation. Composes the
+    output of :func:`verification.confidence_capture.compute_summary`
+    via :func:`project_summary_to_confidence`. Adopts §33.5
+    versioned-artifact contract (``schema_version`` + symmetric
+    ``to_dict``)."""
+
+    confidence: float
+    """Projected confidence in [0.0, 1.0]. ``0.0`` when the
+    capture trace was empty / projection failed (UNKNOWN band
+    fallback)."""
+
+    sample_size: int
+    """Tokens that contributed to the underlying confidence
+    trace. Risk-tier consumers (Slice 3) weight the signal by
+    sample_size — a high confidence over 1 token is weaker
+    evidence than a high confidence over 50 tokens."""
+
+    schema_version: str = field(
+        default=TOOL_CONFIDENCE_OBSERVER_SCHEMA_VERSION,
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "confidence": float(self.confidence),
+            "sample_size": int(self.sample_size),
+            "schema_version": str(self.schema_version),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Pure-function projection — ConfidenceSummary → [0, 1] scalar
+# ---------------------------------------------------------------------------
+
+
+def project_summary_to_confidence(
+    summary: Optional[Any],
+) -> ConfidenceSignal:
+    """Project a ``ConfidenceSummary`` into a single [0, 1]
+    confidence scalar + sample_size.
+
+    Mapping: ``exp(mean_top1_logprob)``. Log-probability domain
+    is (-inf, 0]; the exp transform gives a probability in (0, 1].
+
+    Defensive: ``None`` summary, missing fields, NaN, or out-of-
+    range values all return ``ConfidenceSignal(0.0, 0)`` (UNKNOWN
+    band fallback). NEVER raises.
+
+    Pure function — no I/O, no side effects, no env reads. Pin-
+    eligible for AST regression on composition discipline (no
+    parallel logprob math allowed in callers)."""
+    if summary is None:
+        return ConfidenceSignal(confidence=0.0, sample_size=0)
+    try:
+        mean_logprob = getattr(
+            summary, "mean_top1_logprob", None,
+        )
+        token_count = getattr(summary, "token_count", 0)
+    except Exception:  # noqa: BLE001 — defensive
+        return ConfidenceSignal(confidence=0.0, sample_size=0)
+    # token_count first — bound the sample_size regardless of
+    # logprob shape.
+    try:
+        size = int(token_count) if token_count is not None else 0
+    except (TypeError, ValueError):
+        size = 0
+    if size < 0:
+        size = 0
+    # mean_logprob may be None when capturer saw zero tokens.
+    if mean_logprob is None:
+        return ConfidenceSignal(confidence=0.0, sample_size=size)
+    try:
+        lp = float(mean_logprob)
+    except (TypeError, ValueError):
+        return ConfidenceSignal(confidence=0.0, sample_size=size)
+    if not (lp == lp):  # NaN
+        return ConfidenceSignal(confidence=0.0, sample_size=size)
+    # Logprob domain is (-inf, 0]. Defensive cap at 0 (which maps
+    # to confidence=1.0) — values above 0 are spec violations
+    # but we treat them as fully confident rather than crash.
+    if lp > 0.0:
+        lp = 0.0
+    # Avoid extremely small probabilities crashing math.exp on
+    # subnormal floats — clamp at -50 (exp(-50) ≈ 1.9e-22, still
+    # representable; below that is structurally unknown).
+    if lp < -50.0:
+        return ConfidenceSignal(confidence=0.0, sample_size=size)
+    try:
+        confidence = math.exp(lp)
+    except (OverflowError, ValueError):
+        return ConfidenceSignal(confidence=0.0, sample_size=size)
+    # Clamp to [0, 1] defensively (math.exp(0) is exactly 1.0
+    # but float arithmetic can drift).
+    if confidence < 0.0:
+        confidence = 0.0
+    elif confidence > 1.0:
+        confidence = 1.0
+    return ConfidenceSignal(
+        confidence=confidence, sample_size=size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# extract_confidence_signal — composes capture substrate end-to-end
+# ---------------------------------------------------------------------------
+
+
+def extract_confidence_signal_from_active_capturer() -> (
+    Optional[ConfidenceSignal]
+):
+    """Read the active capturer (ContextVar) and project its
+    current trace into a :class:`ConfidenceSignal`. Returns
+    ``None`` when no capturer is active (e.g., Claude provider
+    rounds, pre-GENERATE paths) — caller treats absence as "no
+    signal" and skips the observation rather than recording
+    UNKNOWN band noise.
+
+    Composition path (zero parallel math):
+
+      1. ``get_active_capturer()`` → Optional[ConfidenceCapturer]
+      2. ``capturer.freeze()`` → ConfidenceTrace (immutable)
+      3. ``compute_summary(trace)`` → ConfidenceSummary
+      4. :func:`project_summary_to_confidence` → ConfidenceSignal
+
+    The lazy import of ``compute_summary`` keeps Slice 1 module
+    importable without eagerly pulling the verification subsystem
+    (test isolation discipline).
+
+    Defensive: any error in the chain is swallowed; returns
+    ``None``. NEVER raises.
+    """
+    capturer = get_active_capturer()
+    if capturer is None:
+        return None
+    try:
+        # Lazy import — keeps module-load cycle clean.
+        from backend.core.ouroboros.governance.verification.confidence_capture import (  # noqa: E501
+            compute_summary,
+        )
+        trace = capturer.freeze()
+        summary = compute_summary(trace)
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[ToolConfidenceWarningObserver] active capturer "
+            "extraction failed (non-fatal)", exc_info=True,
+        )
+        return None
+    return project_summary_to_confidence(summary)
+
+
+def observe_active_signal(
+    *,
+    op_id: str,
+    tool_name: str,
+    publish_sse: bool = True,
+) -> Optional[ConfidenceBandCrossing]:
+    """High-level convenience: extract from active capturer and
+    feed the singleton observer in one call. Returns the band
+    crossing (or ``None`` if the band is unchanged or no signal
+    was available).
+
+    Wired into ``tool_executor.execute_async`` at the per-tool-
+    result return path (Slice 2 fire-points). Master-flag-gated
+    at the SITE (caller checks :func:`master_enabled`) to avoid
+    the freeze/compute_summary cost when off.
+
+    NEVER raises.
+    """
+    try:
+        signal = extract_confidence_signal_from_active_capturer()
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    if signal is None:
+        return None
+    try:
+        return get_default_observer().record(
+            confidence=signal.confidence,
+            op_id=op_id,
+            tool_name=tool_name,
+            sample_size=signal.sample_size,
+            publish_sse=publish_sse,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[ToolConfidenceWarningObserver] observe_active_"
+            "signal record() failed (non-fatal)", exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Default-singleton accessor (matches §37 Slice 5 / Slice 8 pattern)
 # ---------------------------------------------------------------------------
 
@@ -900,6 +1189,96 @@ def register_shipped_invariants() -> list:
             )
         return tuple(violations)
 
+    def _validate_slice2_composes_capture(
+        tree: "ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """§37 Tier 2 #13 Slice 2 — extraction MUST compose
+        ``verification.confidence_capture.compute_summary``.
+        Forbids parallel logprob math (e.g., reading
+        ``capturer._tokens`` directly). Canonical projection
+        path is single-call: lazy-import compute_summary +
+        call freeze() + call compute_summary(trace) +
+        project."""
+        violations: list = []
+        extract_func = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                if (
+                    node.name
+                    == (
+                        "extract_confidence_signal_"
+                        "from_active_capturer"
+                    )
+                ):
+                    extract_func = node
+                    break
+        if extract_func is None:
+            violations.append(
+                "extract_confidence_signal_from_active_"
+                "capturer missing — Slice 2 wiring requires "
+                "this composition entry-point"
+            )
+            return tuple(violations)
+        has_lazy_import = False
+        calls_compute_summary = False
+        calls_freeze = False
+        forbidden_dunder_access = False
+        for sub in ast.walk(extract_func):
+            if isinstance(sub, ast.ImportFrom):
+                module = sub.module or ""
+                if (
+                    "verification.confidence_capture" in module
+                    and any(
+                        n.name == "compute_summary"
+                        for n in sub.names
+                    )
+                ):
+                    has_lazy_import = True
+            if isinstance(sub, ast.Call):
+                func = sub.func
+                if (
+                    isinstance(func, ast.Name)
+                    and func.id == "compute_summary"
+                ):
+                    calls_compute_summary = True
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "freeze"
+                ):
+                    calls_freeze = True
+            if isinstance(sub, ast.Attribute):
+                if sub.attr in (
+                    "_tokens", "_ring", "_buffer",
+                ):
+                    forbidden_dunder_access = True
+        if not has_lazy_import:
+            violations.append(
+                "extract_confidence_signal_from_active_"
+                "capturer MUST lazy-import compute_summary "
+                "from verification.confidence_capture "
+                "(composition discipline)"
+            )
+        if not calls_compute_summary:
+            violations.append(
+                "extract_confidence_signal_from_active_"
+                "capturer MUST call compute_summary(trace) "
+                "— no parallel logprob math allowed"
+            )
+        if not calls_freeze:
+            violations.append(
+                "extract_confidence_signal_from_active_"
+                "capturer MUST call capturer.freeze() to "
+                "obtain the immutable trace before projection"
+            )
+        if forbidden_dunder_access:
+            violations.append(
+                "extract_confidence_signal_from_active_"
+                "capturer MUST NOT access capturer._tokens / "
+                "_ring / _buffer — composition discipline "
+                "forbids parallel logprob math"
+            )
+        return tuple(violations)
+
     return [
         ShippedCodeInvariant(
             invariant_name=(
@@ -967,23 +1346,46 @@ def register_shipped_invariants() -> list:
             ),
             validate=_validate_master_flag_default_false,
         ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "tool_confidence_observer_"
+                "slice2_composes_confidence_capture"
+            ),
+            target_file=target,
+            description=(
+                "§37 Tier 2 #13 Slice 2 — extraction MUST "
+                "compose verification.confidence_capture."
+                "compute_summary (no parallel logprob math). "
+                "extract_confidence_signal_from_active_capturer "
+                "MUST lazy-import compute_summary AND call it "
+                "exactly once on the frozen trace."
+            ),
+            validate=_validate_slice2_composes_capture,
+        ),
     ]
 
 
 __all__ = [
     "ConfidenceBandCrossing",
+    "ConfidenceSignal",
     "TOOL_CONFIDENCE_OBSERVER_SCHEMA_VERSION",
     "ToolConfidenceBand",
     "ToolConfidenceObserver",
     "band_severity",
     "certain_threshold_pct",
     "classify_band",
+    "extract_confidence_signal_from_active_capturer",
+    "get_active_capturer",
     "get_default_observer",
     "high_threshold_pct",
     "low_threshold_pct",
     "master_enabled",
     "medium_threshold_pct",
+    "observe_active_signal",
+    "project_summary_to_confidence",
     "register_flags",
     "register_shipped_invariants",
+    "reset_active_capturer",
     "reset_default_observer_for_tests",
+    "set_active_capturer",
 ]
