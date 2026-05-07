@@ -47,7 +47,7 @@ logger = logging.getLogger("Ouroboros.Phase9REPL")
 _VERBS = ("/phase9",)
 _VALID_SUBCOMMANDS = {
     "next", "flag", "interactions", "partners",
-    "diagnose", "help",
+    "diagnose", "health", "help",
 }
 
 
@@ -98,6 +98,8 @@ def dispatch_phase9_command(line: str) -> Phase9DispatchResult:
         return _render_interactions()
     if sub == "diagnose":
         return _render_diagnose()
+    if sub == "health":
+        return _render_health()
     if sub == "flag":
         if len(args) < 2:
             return Phase9DispatchResult(
@@ -141,6 +143,8 @@ def _render_help() -> Phase9DispatchResult:
         "for <FLAG>\n"
         "  /phase9 diagnose          cadence staleness + "
         "per-flag failure patterns\n"
+        "  /phase9 health            substrate-health probe "
+        "+ ETA projection per flag\n"
         "  /phase9 help              this message\n"
         "\n"
         "Master flag: JARVIS_PHASE9_ORCHESTRATOR_ENABLED "
@@ -557,6 +561,102 @@ def _render_diagnose() -> Phase9DispatchResult:
         "scripts/run_live_fire_graduation_soak.sh`. "
         "Operator-paced — engineering surface complete; "
         "evidence accumulation is wall-clock."
+    )
+    return Phase9DispatchResult(
+        ok=True, text="\n".join(lines),
+    )
+
+
+def _render_health() -> Phase9DispatchResult:
+    """§3.6.2 vector #6 closure — substrate-health probe + ETA
+    projection per flag. Composes the canonical
+    `phase9_substrate_health` aggregator (no parallel state).
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.phase9_substrate_health import (  # noqa: E501
+            build_full_health_dashboard,
+            master_enabled as health_master_enabled,
+        )
+    except ImportError:
+        return Phase9DispatchResult(
+            ok=False,
+            text=(
+                "/phase9 health: substrate-health module "
+                "unavailable (non-fatal)"
+            ),
+        )
+    try:
+        if not health_master_enabled():
+            return Phase9DispatchResult(
+                ok=True,
+                text=(
+                    "/phase9 health: substrate-health "
+                    "disabled. Set "
+                    "JARVIS_PHASE9_SUBSTRATE_HEALTH_ENABLED"
+                    "=true to enable. The probe is read-only "
+                    "diagnostic — does NOT change §33.1 "
+                    "evidence semantics."
+                ),
+            )
+    except Exception:  # noqa: BLE001 — defensive
+        return Phase9DispatchResult(
+            ok=False,
+            text=(
+                "/phase9 health: master flag check failed "
+                "(non-fatal)"
+            ),
+        )
+    try:
+        reports = build_full_health_dashboard()
+    except Exception:  # noqa: BLE001 — defensive
+        return Phase9DispatchResult(
+            ok=False,
+            text=(
+                "/phase9 health: dashboard build failed "
+                "(non-fatal)"
+            ),
+        )
+    if not reports:
+        return Phase9DispatchResult(
+            ok=True,
+            text=(
+                "/phase9 health: no flags in CADENCE_POLICY "
+                "table; nothing to probe."
+            ),
+        )
+    # Aggregate health counts.
+    health_counts = {
+        "HEALTHY": 0, "DEGRADED": 0,
+        "BROKEN": 0, "UNKNOWN": 0,
+    }
+    for r in reports:
+        health_counts[r.health.value.upper()] = (
+            health_counts[r.health.value.upper()] + 1
+        )
+    lines = [
+        f"/phase9 health ({len(reports)} flags — "
+        f"{health_counts['HEALTHY']} healthy / "
+        f"{health_counts['DEGRADED']} degraded / "
+        f"{health_counts['BROKEN']} broken / "
+        f"{health_counts['UNKNOWN']} unknown):",
+    ]
+    for r in reports:
+        flag = r.flag_name
+        # Truncate very long flag names for the table column.
+        flag_clip = (
+            flag[:54] + "..." if len(flag) > 54 else flag
+        )
+        lines.append(
+            f"  {r.health.value:<9} "
+            f"{flag_clip:<58} "
+            f"{r.notes}"
+        )
+    lines.append("")
+    lines.append(
+        "Note: substrate-health is a DIAGNOSTIC probe — "
+        "it tells you whether the cage layer for each flag "
+        "is structurally working. It does NOT graduate flags "
+        "(graduation requires real cadence runs per §33.1)."
     )
     return Phase9DispatchResult(
         ok=True, text="\n".join(lines),
