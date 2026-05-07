@@ -62,6 +62,13 @@ from typing import (
     Tuple, runtime_checkable,
 )
 
+from backend.core.ouroboros.governance.tool_name_pattern import (
+    CompiledToolNamePattern,
+    InvalidToolNamePatternError,
+    compile_tool_name_pattern,
+    matches_tool_name,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -261,13 +268,22 @@ class ToolPermissionCallback(Protocol):
 
 @dataclass(frozen=True)
 class PermissionRegistration:
-    """One registered callback. Frozen for safe propagation."""
+    """One registered callback. Frozen for safe propagation.
+
+    Venom V4 (2026-05-07) — :attr:`compiled_pattern` carries
+    the optional tool-name regex compiled at registration time.
+    None means universal (callback fires on every tool —
+    pre-V4 behavior, byte-identical when no pattern supplied).
+    Dispatcher consults via :func:`matches_tool_name` BEFORE
+    spawning the task so non-matched callbacks are NOT awaited.
+    """
 
     name: str
     callback: ToolPermissionCallback
     priority: int = 100
     timeout_s: float = 5.0
     registered_ts: float = 0.0
+    compiled_pattern: Optional[CompiledToolNamePattern] = None
 
     def to_projection(self) -> Dict[str, Any]:
         return {
@@ -275,6 +291,11 @@ class PermissionRegistration:
             "priority": self.priority,
             "timeout_s": self.timeout_s,
             "registered_ts": self.registered_ts,
+            "tool_name_pattern": (
+                self.compiled_pattern.raw
+                if self.compiled_pattern is not None
+                else None
+            ),
         }
 
 
@@ -368,9 +389,18 @@ class PermissionRegistry:
         name: str,
         priority: int = 100,
         timeout_s: Optional[float] = None,
+        tool_name_pattern: Optional[str] = None,
     ) -> PermissionRegistration:
         """Register one callback. Raises on validation failure
-        so operator misconfig surfaces at boot."""
+        so operator misconfig surfaces at boot.
+
+        Venom V4 (2026-05-07) — ``tool_name_pattern`` (optional
+        regex string) compiles at registration time. None means
+        universal (callback fires on every tool, pre-V4
+        behavior). Bad regex / oversized pattern raise
+        :class:`InvalidPermissionCallbackError` so misconfig
+        surfaces at boot, not at dispatch time.
+        """
         if not callable(callback):
             raise InvalidPermissionCallbackError(
                 f"callback must be callable — got "
@@ -393,6 +423,17 @@ class PermissionRegistry:
             clean_timeout = max(0.1, min(60.0, clean_timeout))
         except (TypeError, ValueError):
             clean_timeout = _default_timeout_s()
+        # Venom V4 — compile tool-name pattern at registration
+        # (compile-once; dispatch consults via matches_tool_name
+        # BEFORE spawning a task).
+        try:
+            compiled_pattern = compile_tool_name_pattern(
+                tool_name_pattern,
+            )
+        except InvalidToolNamePatternError as exc:
+            raise InvalidPermissionCallbackError(
+                f"tool_name_pattern invalid: {exc}"
+            ) from exc
         import time
         registration = PermissionRegistration(
             name=clean_name,
@@ -400,6 +441,7 @@ class PermissionRegistry:
             priority=clean_priority,
             timeout_s=clean_timeout,
             registered_ts=time.monotonic(),
+            compiled_pattern=compiled_pattern,
         )
         with self._lock:
             if clean_name in self._by_name:
@@ -685,6 +727,29 @@ async def evaluate_tool_permission(
             total_callbacks=0,
             detail="empty_registry",
         )
+    # Venom V4 (2026-05-07) — filter by tool-name pattern at
+    # registration record level so non-matched callbacks are
+    # NOT spawned as tasks (preserves async robustness + cuts
+    # useless wait_for work). Universal registrations (no
+    # pattern) ALWAYS pass — pre-V4 behavior is byte-identical
+    # when no patterns are registered. Priority order
+    # preserved among matched.
+    matched = tuple(
+        r for r in registrations
+        if matches_tool_name(
+            r.compiled_pattern, str(tool_name or ""),
+        )
+    )
+    if not matched:
+        return AggregatePermissionDecision(
+            schema_version=TOOL_PERMISSION_SCHEMA_VERSION,
+            tool_name=tool_name,
+            op_id=op_id,
+            decision=ToolPermissionDecision.DEFER,
+            total_callbacks=0,
+            detail="no_pattern_matched",
+        )
+    registrations = matched
     import time
     ctx = PermissionContext(
         schema_version=TOOL_PERMISSION_SCHEMA_VERSION,

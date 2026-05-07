@@ -89,6 +89,12 @@ from backend.core.ouroboros.governance.lifecycle_hook import (
     make_hook_result,
     max_hooks_per_event,
 )
+from backend.core.ouroboros.governance.tool_name_pattern import (
+    CompiledToolNamePattern,
+    InvalidToolNamePatternError,
+    compile_tool_name_pattern,
+    matches_tool_name,
+)
 
 
 # Type alias for the union of accepted event taxonomies. The
@@ -158,6 +164,17 @@ class HookRegistration:
     enabled_check: Optional[Callable[[], bool]] = None
     registered_ts: float = 0.0
     schema_version: str = LIFECYCLE_HOOK_REGISTRY_SCHEMA_VERSION
+    # Venom V4 (2026-05-07) — optional compiled tool-name
+    # pattern. None means universal (callback fires on every
+    # tool — pre-V4 behavior, byte-identical when no pattern
+    # supplied). Compiled at registration time via
+    # ``tool_name_pattern.compile_tool_name_pattern``; dispatch
+    # consults via ``matches_tool_name`` BEFORE spawning the
+    # task. Phase-boundary events (LifecycleEvent.PRE_GENERATE
+    # etc.) ignore this field — pattern filtering applies to
+    # ToolHookEvent dispatch only (those carry a tool_name in
+    # the HookContext payload).
+    compiled_pattern: Optional[CompiledToolNamePattern] = None
 
     def is_enabled(self) -> bool:
         """Returns True iff the hook's per-hook enabled_check
@@ -286,6 +303,47 @@ class LifecycleHookRegistry:
             with self._lock:
                 bucket = self._by_event.get(event, [])
                 return tuple(bucket)
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+
+    def for_event_filtered(
+        self,
+        event: "LifecycleEvent | ToolHookEvent",
+        tool_name: Optional[str] = None,
+    ) -> Tuple[HookRegistration, ...]:
+        """Venom V4 (2026-05-07) — priority-ordered tuple of
+        registrations for one event, filtered by
+        ``tool_name`` against each registration's compiled
+        pattern.
+
+        Universal registrations (``compiled_pattern is None``)
+        always pass; pattern-scoped registrations pass iff
+        ``matches_tool_name(reg.compiled_pattern, tool_name)``.
+
+        ``tool_name=None`` short-circuits to :meth:`for_event`
+        (legacy / phase-boundary callers — they don't carry a
+        tool name).
+
+        Priority ordering is preserved among matched
+        registrations. NEVER raises.
+
+        Operator binding 2026-05-07: the dispatcher MUST call
+        this BEFORE spawning tasks so non-matched registrations
+        are not awaited. AST pin in the executor enforces.
+        """
+        try:
+            if tool_name is None:
+                return self.for_event(event)
+            if not isinstance(event, HookEventTypes):
+                return ()
+            with self._lock:
+                bucket = self._by_event.get(event, [])
+                return tuple(
+                    r for r in bucket
+                    if matches_tool_name(
+                        r.compiled_pattern, tool_name,
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 — defensive
             logger.debug(
                 "[LifecycleHookRegistry] for_event %r degraded: %s",
@@ -374,6 +432,7 @@ class LifecycleHookRegistry:
         priority: int = 100,
         timeout_s: Optional[float] = None,
         enabled_check: Optional[Callable[[], bool]] = None,
+        tool_name_pattern: Optional[str] = None,
     ) -> HookRegistration:
         """Register one hook. Raises explicitly on validation
         failure so operator misconfig surfaces at boot.
@@ -425,6 +484,19 @@ class LifecycleHookRegistry:
             clean_timeout = max(0.1, min(60.0, clean_timeout))
         except (TypeError, ValueError):
             clean_timeout = default_hook_timeout_s()
+        # Venom V4 (2026-05-07) — compile tool-name pattern at
+        # registration. None passthrough; bad regex /
+        # oversized pattern raise InvalidHookError so operator
+        # misconfig surfaces at boot (matching the existing
+        # InvalidHookError discipline for this registry).
+        try:
+            compiled_pattern = compile_tool_name_pattern(
+                tool_name_pattern,
+            )
+        except InvalidToolNamePatternError as exc:
+            raise InvalidHookError(
+                f"tool_name_pattern invalid: {exc}"
+            ) from exc
 
         registration = HookRegistration(
             name=clean_name,
@@ -434,6 +506,7 @@ class LifecycleHookRegistry:
             timeout_s=clean_timeout,
             enabled_check=enabled_check,
             registered_ts=time.monotonic(),
+            compiled_pattern=compiled_pattern,
         )
 
         with self._lock:

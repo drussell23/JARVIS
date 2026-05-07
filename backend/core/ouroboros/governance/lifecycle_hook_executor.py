@@ -340,9 +340,29 @@ async def fire_hooks(
         )
 
     # 4. Look up registrations for this event (priority-ordered).
-    registrations: Tuple[HookRegistration, ...] = (
-        active_registry.for_event(event)
-    )
+    # Venom V4 (2026-05-07) — for ToolHookEvent, filter by
+    # tool_name pattern at registry level so non-matched
+    # callbacks are NOT spawned as tasks (preserves async
+    # robustness + cuts useless wait_for work). Phase-boundary
+    # events ignore the filter (their HookContext doesn't carry
+    # a tool_name; the for_event_filtered method passes
+    # tool_name=None which short-circuits to legacy for_event).
+    if isinstance(event, ToolHookEvent):
+        try:
+            _tool_name = (
+                str(context.payload.get("tool_name", ""))
+                if context is not None and context.payload
+                else ""
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            _tool_name = ""
+        registrations: Tuple[HookRegistration, ...] = (
+            active_registry.for_event_filtered(
+                event, _tool_name,
+            )
+        )
+    else:
+        registrations = active_registry.for_event(event)
     if not registrations:
         return AggregateHookDecision(
             event=event,
