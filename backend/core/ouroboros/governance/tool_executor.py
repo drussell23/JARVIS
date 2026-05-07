@@ -1278,6 +1278,60 @@ async def _maybe_fire_tool_hook_failure(
         )
 
 
+def _maybe_block_by_component_scope(
+    call: "ToolCall",
+) -> Optional[str]:
+    """§37 Tier 2 #16 (Pattern C) — Component tool scope gate.
+
+    Returns a block-reason string when the active component's
+    registered ``ComponentToolScope`` denies ``call.name`` AND
+    the master flag is on. Returns ``None`` to pass through
+    (master off, no active component, no scope registered, or
+    tool allowed by scope).
+
+    Composes :func:`component_tool_scope.is_tool_allowed` —
+    single source of truth (which in turn composes V4
+    ``matches_tool_name`` for regex semantics, AST-pinned).
+    NEVER raises into the dispatch path.
+    """
+    try:
+        from backend.core.ouroboros.governance.component_tool_scope import (
+            block_reason as _scope_block_reason,
+            get_active_component as _scope_active,
+            is_tool_allowed as _scope_allows,
+            master_enabled as _scope_master,
+        )
+    except ImportError:
+        return None
+    try:
+        if not _scope_master():
+            return None
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        component_id = _scope_active()
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    if not component_id:
+        # No active component → component scope doesn't apply.
+        return None
+    try:
+        tool_name = getattr(call, "name", "") or ""
+        if _scope_allows(
+            component_id=component_id, tool_name=tool_name,
+        ):
+            return None
+        return _scope_block_reason(
+            component_id=component_id, tool_name=tool_name,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[ComponentScope] block evaluation raised "
+            "(non-fatal)", exc_info=True,
+        )
+        return None
+
+
 def _maybe_block_by_operation_mode(
     call: "ToolCall",
 ) -> Optional[str]:
@@ -3360,6 +3414,30 @@ class AsyncProcessToolBackend:
             return ToolResult(
                 tool_call=call, output="",
                 error=_mode_block[:128],
+                status=ToolExecStatus.POLICY_DENIED,
+            )
+        # §37 Tier 2 #16 (2026-05-07) — Component tool scope
+        # gate (Pattern C). Fires AFTER OperationMode (session-
+        # wide) + BEFORE V2 PermissionRegistry (operator
+        # callbacks). Strictest-first composition: session →
+        # component → callback. Master-flag-gated via
+        # JARVIS_COMPONENT_TOOL_SCOPE_ENABLED (default FALSE →
+        # zero overhead; byte-identical pre-slice behavior).
+        # Component identity flows via async-safe ContextVar
+        # (set by sensor / subagent dispatch sites). NEVER
+        # raises into the dispatch path.
+        _scope_block = _maybe_block_by_component_scope(call)
+        if _scope_block is not None:
+            await _maybe_fire_tool_hook_failure(
+                "post_tool_use_failure", call, policy_ctx,
+                error=(
+                    f"COMPONENT_SCOPE_BLOCKED:"
+                    f"{_scope_block[:64]}"
+                ),
+            )
+            return ToolResult(
+                tool_call=call, output="",
+                error=_scope_block[:128],
                 status=ToolExecStatus.POLICY_DENIED,
             )
         # Venom V2 (2026-05-06) — per-tool permission check

@@ -571,7 +571,11 @@ def test_tool_executor_consults_permission_before_v1_hook():
         'cap = int(os.environ.get("JARVIS_TOOL_OUTPUT_CAP_BYTES"',
     )
     assert idx >= 0
-    section = source[idx:idx + 4500]
+    # Window widened to 8000 chars after §37 Tier 2 #14 / #16
+    # added Operation Mode + Component Scope gates between the
+    # cap read and PRE_TOOL_USE fire (~3500 chars of new gating
+    # logic).
+    section = source[idx:idx + 8000]
     perm_idx = section.find("_maybe_evaluate_tool_permission")
     pre_tool_use_idx = section.find(
         '_maybe_fire_tool_hook(\n            "pre_tool_use"',
