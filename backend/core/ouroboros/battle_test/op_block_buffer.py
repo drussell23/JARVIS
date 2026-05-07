@@ -173,10 +173,46 @@ class OpBlock:
     started_at: float = 0.0
     committed_at: float = 0.0
     schema_version: str = OP_BLOCK_BUFFER_SCHEMA_VERSION
+    # §37 Tier 2 #12 (2026-05-07) — parent/child + fan-out
+    # tracking. Backward-compat: every field defaults to a
+    # neutral value so existing constructors (start_op + commit)
+    # produce blocks byte-identical to pre-slice. Populated only
+    # when callers invoke ``OpBlockBuffer.register_parent`` —
+    # master-flag-gated.
+    parent_op_id: str = ""
+    """Empty when this op is a root (no parent). Set to the
+    parent op's ``op_id`` when an op was spawned as a child
+    (e.g., L3 subagent dispatch, recursive exploration agent,
+    Move 6 K-way candidate)."""
+    candidate_index: int = 0
+    """0-indexed position in a sibling fan-out (e.g., Move 6
+    K-way: candidate_index in [0, K)). Zero for root ops or
+    single-child spawns."""
+    subagent_kind: str = ""
+    """One of ``explore`` / ``review`` / ``plan`` / ``general``
+    when the op was dispatched as a typed subagent. Empty for
+    direct orchestrator ops or recursive-exploration spawns."""
+    child_op_ids: Tuple[str, ...] = ()
+    """Op IDs spawned by this op (in spawn order). Mirrors the
+    parent_op_id reverse-direction relationship — populated on
+    the parent at ``register_parent`` time so subtree walks
+    don't require a global reverse index."""
 
     @property
     def line_count(self) -> int:
         return len(self.lines)
+
+    @property
+    def is_root(self) -> bool:
+        """True when this op has no parent (top-level
+        orchestrator op or session-bootstrapped op)."""
+        return not self.parent_op_id
+
+    @property
+    def fan_out_size(self) -> int:
+        """Number of direct children spawned by this op. Zero
+        for leaf ops + ops that didn't spawn anything."""
+        return len(self.child_op_ids)
 
     @property
     def duration_s(self) -> float:
@@ -195,6 +231,14 @@ class OpBlock:
             "duration_s": self.duration_s,
             "line_count": self.line_count,
             "schema_version": self.schema_version,
+            # §37 Tier 2 #12 — fan-out fields. Always emitted
+            # (defaults to neutral values for non-fan-out ops).
+            "parent_op_id": self.parent_op_id,
+            "candidate_index": self.candidate_index,
+            "subagent_kind": self.subagent_kind,
+            "child_op_ids": list(self.child_op_ids),
+            "is_root": self.is_root,
+            "fan_out_size": self.fan_out_size,
         }
         if include_lines:
             d["lines"] = list(self.lines)
@@ -223,6 +267,26 @@ class BufferSnapshot:
 # ===========================================================================
 # Helpers
 # ===========================================================================
+
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def op_dependency_graph_enabled() -> bool:
+    """§37 Tier 2 #12 — master switch for op-dependency-graph
+    tracking. ``JARVIS_OP_DEPENDENCY_GRAPH_ENABLED`` default-
+    FALSE per §33.1: when off, ``OpBlockBuffer.register_parent``
+    is a no-op (zero state churn pre-graduation). The frozen
+    ``OpBlock`` fields (parent_op_id / candidate_index /
+    subagent_kind / child_op_ids) ALWAYS exist (default
+    neutral) — only the WRITE surface gates on this flag, so
+    backward-compat readers see byte-identical behavior."""
+    raw = os.environ.get(
+        "JARVIS_OP_DEPENDENCY_GRAPH_ENABLED", "",
+    ).strip().lower()
+    if raw == "":
+        return False
+    return raw in _TRUTHY
 
 
 def _read_capacity_from_env() -> int:
@@ -494,6 +558,172 @@ class OpBlockBuffer:
         with self._lock:
             return tuple(self._active_op_ids.keys())
 
+    # ---- §37 Tier 2 #12 — fan-out tracking ----------------------------
+
+    def register_parent(
+        self,
+        *,
+        child_op_id: object,
+        parent_op_id: object,
+        candidate_index: int = 0,
+        subagent_kind: str = "",
+    ) -> bool:
+        """Stamp a parent→child relationship between two ops.
+
+        Atomically updates BOTH endpoints under the buffer
+        lock:
+          * The child block's ``parent_op_id`` /
+            ``candidate_index`` / ``subagent_kind`` fields.
+          * The parent block's ``child_op_ids`` tuple
+            (appended in order).
+
+        Master-flag-gated: when
+        ``JARVIS_OP_DEPENDENCY_GRAPH_ENABLED`` is off, the
+        call is a no-op (zero state churn pre-graduation).
+        Returns ``True`` on success, ``False`` when:
+          * Master flag is off.
+          * Either op_id is missing or unknown.
+          * Either op has been evicted (out-of-window — best-
+            effort tracking, not authoritative).
+
+        Idempotent: re-registering the same (child, parent)
+        pair is a no-op (no duplicate child entries).
+
+        NEVER raises.
+        """
+        if not op_dependency_graph_enabled():
+            return False
+        child_safe = _safe_str(child_op_id)
+        parent_safe = _safe_str(parent_op_id)
+        if not child_safe or not parent_safe:
+            return False
+        if child_safe == parent_safe:
+            # Self-parent is structurally invalid — defensive
+            # rejection rather than crash.
+            return False
+        try:
+            cidx = max(0, int(candidate_index))
+        except (TypeError, ValueError):
+            cidx = 0
+        kind_safe = _safe_str(subagent_kind)
+        with self._lock:
+            child_block = self._find_block_by_op_id(child_safe)
+            parent_block = self._find_block_by_op_id(
+                parent_safe,
+            )
+            if child_block is None or parent_block is None:
+                return False
+            # Update child first.
+            updated_child = replace(
+                child_block,
+                parent_op_id=parent_safe,
+                candidate_index=cidx,
+                subagent_kind=kind_safe,
+            )
+            self._items[child_block.ref] = updated_child
+            # Append child to parent (idempotent).
+            if child_safe not in parent_block.child_op_ids:
+                updated_parent = replace(
+                    parent_block,
+                    child_op_ids=(
+                        parent_block.child_op_ids + (child_safe,)
+                    ),
+                )
+                self._items[parent_block.ref] = updated_parent
+            return True
+
+    def get_parent_op_id(self, op_id: object) -> str:
+        """Return the parent op_id for ``op_id``, or ``""``
+        when no parent registered / op unknown."""
+        op_safe = _safe_str(op_id)
+        if not op_safe:
+            return ""
+        with self._lock:
+            block = self._find_block_by_op_id(op_safe)
+            if block is None:
+                return ""
+            return block.parent_op_id
+
+    def get_child_op_ids(self, op_id: object) -> Tuple[str, ...]:
+        """Return the tuple of direct children for ``op_id``.
+        Empty tuple when ``op_id`` is unknown or has no
+        children."""
+        op_safe = _safe_str(op_id)
+        if not op_safe:
+            return ()
+        with self._lock:
+            block = self._find_block_by_op_id(op_safe)
+            if block is None:
+                return ()
+            return block.child_op_ids
+
+    def find_root_ops(self) -> Tuple[OpBlock, ...]:
+        """Return the tuple of all currently-buffered ops with
+        no parent (oldest-first ordering preserved)."""
+        with self._lock:
+            return tuple(
+                block for block in self._items.values()
+                if block.is_root
+            )
+
+    def walk_subtree(
+        self,
+        op_id: object,
+        *,
+        max_depth: int = 16,
+    ) -> Tuple[OpBlock, ...]:
+        """Breadth-first walk rooted at ``op_id``. Returns the
+        ops in BFS order (root first). Stops at ``max_depth``
+        levels (default 16; clamped to [1, 64]) to bound the
+        traversal regardless of fan-out shape. NEVER raises."""
+        op_safe = _safe_str(op_id)
+        if not op_safe:
+            return ()
+        try:
+            depth_clamp = max(1, min(64, int(max_depth)))
+        except (TypeError, ValueError):
+            depth_clamp = 16
+        with self._lock:
+            root = self._find_block_by_op_id(op_safe)
+            if root is None:
+                return ()
+            visited: set = {op_safe}
+            ordered: list = [root]
+            frontier: list = [(root, 0)]
+            while frontier:
+                current, depth = frontier.pop(0)
+                if depth >= depth_clamp:
+                    continue
+                for child_id in current.child_op_ids:
+                    if child_id in visited:
+                        continue
+                    visited.add(child_id)
+                    child_block = self._find_block_by_op_id(
+                        child_id,
+                    )
+                    if child_block is None:
+                        continue
+                    ordered.append(child_block)
+                    frontier.append((child_block, depth + 1))
+            return tuple(ordered)
+
+    def _find_block_by_op_id(
+        self, op_id: str,
+    ) -> Optional[OpBlock]:
+        """Resolve an op_id to its OpBlock. Searches the active
+        index first (O(1)) then walks the buffer for committed
+        blocks (O(N), bounded by capacity). Caller MUST hold
+        ``self._lock``."""
+        ref = self._active_op_ids.get(op_id)
+        if ref is not None:
+            block = self._items.get(ref)
+            if block is not None:
+                return block
+        for block in reversed(self._items.values()):
+            if block.op_id == op_id:
+                return block
+        return None
+
     # ---- internals -----------------------------------------------------
 
     def _evict_if_needed(self) -> None:
@@ -532,6 +762,148 @@ def reset_default_buffer_for_tests() -> None:
         _default_buffer = None
 
 
+def register_shipped_invariants() -> list:
+    """§37 Tier 2 #12 — auto-discovered AST pins:
+
+      1. ``op_block_fan_out_fields_present`` — OpBlock dataclass
+         carries the 4 fan-out fields (parent_op_id /
+         candidate_index / subagent_kind / child_op_ids).
+      2. ``op_dependency_master_flag_default_false`` — §33.1
+         producer flag stays default-FALSE.
+    """
+    import ast as _ast
+
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    target = (
+        "backend/core/ouroboros/battle_test/op_block_buffer.py"
+    )
+
+    def _validate_fan_out_fields(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        required = {
+            "parent_op_id", "candidate_index",
+            "subagent_kind", "child_op_ids",
+        }
+        for node in _ast.walk(tree):
+            if (
+                isinstance(node, _ast.ClassDef)
+                and node.name == "OpBlock"
+            ):
+                seen: set = set()
+                for stmt in node.body:
+                    if isinstance(stmt, _ast.AnnAssign):
+                        target_node = stmt.target
+                        if isinstance(target_node, _ast.Name):
+                            seen.add(target_node.id)
+                missing = required - seen
+                if missing:
+                    violations.append(
+                        f"OpBlock missing §37 Tier 2 #12 "
+                        f"fan-out fields: {sorted(missing)}"
+                    )
+                return tuple(violations)
+        violations.append("OpBlock dataclass missing")
+        return tuple(violations)
+
+    def _validate_master_default_false(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        violations: list = []
+        target_func = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef):
+                if node.name == "op_dependency_graph_enabled":
+                    target_func = node
+                    break
+        if target_func is None:
+            violations.append(
+                "op_dependency_graph_enabled() helper missing"
+            )
+            return tuple(violations)
+        empty_guard_returns_false = False
+        for sub in _ast.walk(target_func):
+            if not isinstance(sub, _ast.If):
+                continue
+            test = sub.test
+            compares: list = []
+            for st in _ast.walk(test):
+                if isinstance(st, _ast.Compare):
+                    compares.append(st)
+            compares_empty_str = False
+            for cmp_node in compares:
+                if not cmp_node.ops or not isinstance(
+                    cmp_node.ops[0], _ast.Eq,
+                ):
+                    continue
+                for operand in (
+                    cmp_node.left, *cmp_node.comparators,
+                ):
+                    if (
+                        isinstance(operand, _ast.Constant)
+                        and operand.value == ""
+                    ):
+                        compares_empty_str = True
+                        break
+                if compares_empty_str:
+                    break
+            if not compares_empty_str:
+                continue
+            for body_stmt in sub.body:
+                if isinstance(body_stmt, _ast.Return):
+                    if (
+                        isinstance(
+                            body_stmt.value, _ast.Constant,
+                        )
+                        and body_stmt.value.value is False
+                    ):
+                        empty_guard_returns_false = True
+                        break
+            if empty_guard_returns_false:
+                break
+        if not empty_guard_returns_false:
+            violations.append(
+                "op_dependency_graph_enabled() MUST return "
+                "False on empty env-var string per §33.1"
+            )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name=(
+                "op_block_fan_out_fields_present"
+            ),
+            target_file=target,
+            description=(
+                "§37 Tier 2 #12 — OpBlock carries the 4 fan-"
+                "out fields (parent_op_id / candidate_index "
+                "/ subagent_kind / child_op_ids) so /graph "
+                "can render dependency canvas."
+            ),
+            validate=_validate_fan_out_fields,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "op_dependency_master_flag_default_false"
+            ),
+            target_file=target,
+            description=(
+                "§37 Tier 2 #12 — §33.1 producer flag stays "
+                "default-FALSE; register_parent is a no-op "
+                "until operator flips."
+            ),
+            validate=_validate_master_default_false,
+        ),
+    ]
+
+
 __all__ = [
     "BUFFER_SIZE_ENV_VAR",
     "BufferSnapshot",
@@ -541,5 +913,7 @@ __all__ = [
     "OpBlockState",
     "REF_PREFIX",
     "get_default_buffer",
+    "op_dependency_graph_enabled",
+    "register_shipped_invariants",
     "reset_default_buffer_for_tests",
 ]
