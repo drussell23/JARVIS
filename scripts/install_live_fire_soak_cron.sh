@@ -60,27 +60,42 @@ fi
 
 usage() {
     cat <<EOF
-Usage: $0 [--install | --dry-run | --remove | --once | --status | --help]
+Usage: $0 [option]
 
-Options (default = --install):
-  --install   Install/update the cron entry (idempotent).
-  --dry-run   Print the cron entry that WOULD be installed.
-  --remove    Remove the live-fire soak block from crontab.
-  --once      Run a single soak NOW (skips cron, useful for first proof).
-  --status    Show current crontab contents + ledger queue.
-  --help      This message.
+Cron path (legacy; macOS may TCC-deny):
+  --install         Install/update the cron entry (idempotent).
+  --dry-run         Print the cron entry that WOULD be installed.
+  --remove          Remove the live-fire soak block from crontab.
+  --once            Run a single soak NOW (skips cron, first proof).
+  --status          Show current crontab + ledger queue + cadence health.
+
+Launchd path (recommended on macOS — Cadence Slice 4):
+  --launchd         Install User Agent at
+                    ~/Library/LaunchAgents/com.jarvis.live-fire-soak.plist
+                    + launchctl load -w. Reuses the same
+                    run_live_fire_graduation_soak.sh wrapper as
+                    the cron path → single env-block source of
+                    truth. Closes the macOS TCC EPERM gap that
+                    bit cron #1 on 2026-05-06.
+  --launchd-dry-run Print the plist that WOULD be installed.
+  --remove-launchd  launchctl unload + delete plist.
+
+Misc:
+  --help            This message.
 
 Environment overrides:
   CRON_SCHEDULE  default: $CRON_SCHEDULE_DEFAULT (every 8 hours)
+                 Drives launchd StartInterval too — same source.
   COST_CAP       default: \$$COST_CAP_DEFAULT  (per-soak USD cap)
   WALL_CAP       default: $WALL_CAP_DEFAULT s   (per-soak wall-clock cap)
   TIMEOUT        default: $TIMEOUT_DEFAULT s   (subprocess kill timeout)
 
 Examples:
-  $0 --dry-run
-  CRON_SCHEDULE='0 6,14,22 * * *' $0 --install
+  $0 --launchd                                    # recommended on macOS
+  $0 --dry-run                                    # legacy cron preview
+  CRON_SCHEDULE='0 */12 * * *' $0 --launchd       # 12h cadence
   $0 --once
-  $0 --remove
+  $0 --remove-launchd
 EOF
 }
 
@@ -277,11 +292,190 @@ show_status() {
     python3 "$HARNESS_SCRIPT" status 2>&1 | head -30
 }
 
+# ---------------------------------------------------------------------------
+# Cadence Slice 4 (2026-05-06) — launchd User Agent path.
+#
+# macOS LaunchAgents run in a less-restricted user TCC context
+# than cron, so $HOME/Documents access works without granting
+# /usr/sbin/cron Full Disk Access. The plist invokes the SAME
+# run_live_fire_graduation_soak.sh wrapper as the cron path —
+# single source of truth for the env block (cadence_preflight
+# probe + 4 Phase 9 vars + JARVIS_CADENCE_KIND=launchd hint).
+#
+# StartInterval is derived from CRON_SCHEDULE via the canonical
+# manifest parser (cadence_manifest.derive_interval_hint_s).
+# Single source of cadence-string truth: same env knob drives
+# both cron and launchd paths.
+# ---------------------------------------------------------------------------
+
+LAUNCHD_LABEL="com.jarvis.live-fire-soak"
+LAUNCHD_PLIST_PATH="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+WRAPPER_SCRIPT="$REPO_ROOT/scripts/run_live_fire_graduation_soak.sh"
+
+derive_launchd_interval_s() {
+    # Compose the canonical Python parser. Returns 0 on success
+    # with derived seconds on stdout. Falls back to 28800 (8h
+    # = the cron default) on parser failure so the plist still
+    # installs with a sane interval the operator can hand-edit.
+    local result
+    result="$(cd "$REPO_ROOT" && /usr/bin/env python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from backend.core.ouroboros.governance.graduation.cadence_manifest import (
+    derive_interval_hint_s,
+)
+v = derive_interval_hint_s('$CRON_SCHEDULE')
+if v <= 0:
+    sys.exit(1)
+print(v)
+" 2>/dev/null)"
+    if [[ -z "$result" ]]; then
+        echo "28800"  # 8h fallback matching CRON_SCHEDULE_DEFAULT
+        return
+    fi
+    echo "$result"
+}
+
+build_launchd_plist() {
+    local interval_s="$1"
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Phase 9 Cadence Slice 4 (2026-05-06) — Live-Fire Graduation
+     Soak User Agent. Reuses run_live_fire_graduation_soak.sh
+     so the env block stays the single source of truth.
+     Cadence is derived from CRON_SCHEDULE='$CRON_SCHEDULE'.
+
+     Operator commands:
+       launchctl load -w  $LAUNCHD_PLIST_PATH
+       launchctl unload   $LAUNCHD_PLIST_PATH
+       launchctl list | grep $LAUNCHD_LABEL
+
+     Hot-revert: bash scripts/install_live_fire_soak_cron.sh --remove-launchd
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LAUNCHD_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$WRAPPER_SCRIPT</string>
+        <string>run</string>
+        <string>--cost-cap</string>
+        <string>$COST_CAP</string>
+        <string>--max-wall-seconds</string>
+        <string>$WALL_CAP</string>
+        <string>--timeout</string>
+        <string>$TIMEOUT</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>$interval_s</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>WorkingDirectory</key>
+    <string>$REPO_ROOT</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>JARVIS_CADENCE_KIND</key>
+        <string>launchd</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>$LOG_DIR/launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_DIR/launchd.stderr.log</string>
+</dict>
+</plist>
+EOF
+}
+
+install_launchd() {
+    preflight
+    local interval_s
+    interval_s="$(derive_launchd_interval_s)"
+    mkdir -p "$(dirname "$LAUNCHD_PLIST_PATH")"
+    local plist_body
+    plist_body="$(build_launchd_plist "$interval_s")"
+    # Idempotent: unload prior copy if present, then write +
+    # load. launchctl unload of a missing service is a no-op
+    # error; suppress.
+    if [[ -f "$LAUNCHD_PLIST_PATH" ]]; then
+        launchctl unload "$LAUNCHD_PLIST_PATH" 2>/dev/null || true
+    fi
+    echo "$plist_body" > "$LAUNCHD_PLIST_PATH"
+    if launchctl load -w "$LAUNCHD_PLIST_PATH" 2>/dev/null; then
+        echo -e "${GREEN}✓${RESET} launchd User Agent loaded (interval: ${BOLD}${interval_s}s${RESET})"
+    else
+        echo -e "${YELLOW}!${RESET} plist written but launchctl load failed"
+        echo -e "${DIM}  inspect: launchctl load -w $LAUNCHD_PLIST_PATH${RESET}"
+    fi
+    echo -e "${DIM}  plist:  $LAUNCHD_PLIST_PATH${RESET}"
+    echo -e "${DIM}  logs:   $LOG_DIR/launchd.stdout.log${RESET}"
+    # Cadence Slice 1 — write the canonical manifest with
+    # kind=launchd so the overdue detector reads the same
+    # cadence interval the launchd plist enforces.
+    if write_launchd_cadence_manifest "$interval_s"; then
+        echo -e "${DIM}  cadence_manifest: .jarvis/cadence_manifest.json${RESET}"
+    else
+        echo -e "${YELLOW}!${RESET} cadence manifest write failed (non-fatal)"
+    fi
+    echo
+    echo -e "${CYAN}Next steps:${RESET}"
+    echo "  1. Verify: launchctl list | grep $LAUNCHD_LABEL"
+    echo "  2. First proof run: $0 --once"
+    echo "  3. Inspect cadence: python3 $HARNESS_SCRIPT status"
+}
+
+write_launchd_cadence_manifest() {
+    local interval_s="$1"
+    cd "$REPO_ROOT" || return 1
+    /usr/bin/env python3 "$HARNESS_SCRIPT" write-cadence-manifest \
+        --kind launchd \
+        --schedule "$interval_s" \
+        --interval-hint-s "$interval_s" \
+        --installer-version "1.0" \
+        --extra "cost_cap_usd=$COST_CAP" \
+        --extra "wall_cap_s=$WALL_CAP" \
+        --extra "timeout_s=$TIMEOUT" \
+        --extra "log_dir=$LOG_DIR" \
+        --extra "wrapper_script=$WRAPPER_SCRIPT" \
+        --extra "plist_path=$LAUNCHD_PLIST_PATH" \
+        --extra "label=$LAUNCHD_LABEL" \
+        --extra "cron_schedule_source=$CRON_SCHEDULE" \
+        > /dev/null 2>&1
+}
+
+launchd_dry_run() {
+    preflight
+    local interval_s
+    interval_s="$(derive_launchd_interval_s)"
+    echo -e "${BOLD}${CYAN}Launchd plist preview${RESET}  ${DIM}(--launchd-dry-run; nothing installed)${RESET}"
+    echo
+    echo -e "${DIM}  StartInterval derived from CRON_SCHEDULE='$CRON_SCHEDULE' → ${interval_s}s${RESET}"
+    echo
+    build_launchd_plist "$interval_s"
+    echo
+    echo -e "${DIM}To install: $0 --launchd${RESET}"
+}
+
+remove_launchd() {
+    if [[ ! -f "$LAUNCHD_PLIST_PATH" ]]; then
+        echo -e "${YELLOW}!${RESET} launchd plist not present at $LAUNCHD_PLIST_PATH"
+        return 0
+    fi
+    launchctl unload "$LAUNCHD_PLIST_PATH" 2>/dev/null || true
+    rm -f "$LAUNCHD_PLIST_PATH"
+    echo -e "${GREEN}✓${RESET} launchd User Agent unloaded + plist removed"
+}
+
 main() {
     case "${1:-}" in
-        ""|--install)  install_cron ;;
-        --dry-run)     dry_run ;;
-        --remove)      remove_cron ;;
+        ""|--install)      install_cron ;;
+        --dry-run)         dry_run ;;
+        --remove)          remove_cron ;;
+        --launchd)         install_launchd ;;
+        --launchd-dry-run) launchd_dry_run ;;
+        --remove-launchd)  remove_launchd ;;
         --once)        run_once ;;
         --status)      show_status ;;
         --help|-h)     usage ;;

@@ -338,7 +338,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """One-line summary per flag."""
+    """One-line summary per flag + cadence health (Slice 3)."""
     from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
         get_default_harness,
     )
@@ -359,6 +359,23 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(
             f"  {marker} {row['flag_name']:60s} "
             f"{_DIM}{clean}/{required}{_RESET}"
+        )
+    # Cadence Slice 3 (2026-05-06) — overdue detector composing
+    # manifest + health + history. Renders below the per-flag
+    # queue so operators see "did the schedule fire when
+    # expected?" alongside "which flags are progressing?".
+    # Fail-silent on substrate unavailability.
+    try:
+        from backend.core.ouroboros.governance.graduation.cadence_status import (  # noqa: E501
+            evaluate_cadence_status,
+            render_cadence_status_block,
+        )
+        report = evaluate_cadence_status()
+        print(render_cadence_status_block(report))
+    except Exception as exc:  # noqa: BLE001 — fail-silent
+        sys.stderr.write(
+            f"cadence_status unavailable: "
+            f"{type(exc).__name__}: {exc}\n",
         )
     print()
     return 0

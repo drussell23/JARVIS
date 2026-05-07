@@ -39,6 +39,26 @@ if [[ ! -f "$HARNESS" ]]; then
     exit 1
 fi
 
+# Cadence Slice 2 (2026-05-06) — pre-invocation capability
+# probe. Records ONE row to .jarvis/cadence_health.jsonl
+# BEFORE the heavy harness imports. Closes the EPERM-before-
+# Python silent-failure mode (cron #1 fired 2026-05-06 but
+# macOS TCC denied the harness; history.jsonl never appended,
+# detector blind). The probe itself is lightweight so a TCC-
+# restricted Python can still execute it. Non-zero exit
+# blocks the harness — preflight failures DO NOT proceed.
+PREFLIGHT="$REPO_ROOT/scripts/cadence_preflight.py"
+if [[ -f "$PREFLIGHT" ]]; then
+    # Detect cadence kind from environment hints set by cron
+    # / launchd installers. Falls back to "adhoc" for manual
+    # operator invocations.
+    CADENCE_KIND_HINT="${JARVIS_CADENCE_KIND:-adhoc}"
+    if ! /usr/bin/env python3 "$PREFLIGHT" --cadence-kind "$CADENCE_KIND_HINT"; then
+        echo "error: cadence_preflight failed; aborting before harness" >&2
+        exit 2
+    fi
+fi
+
 if [[ $# -eq 0 ]]; then
     exec /usr/bin/env python3 "$HARNESS" run
 fi

@@ -136,9 +136,16 @@ def test_dry_run_arms_circuit_breaker():
 
 
 def test_dry_run_env_flags_in_correct_order():
-    """The cron entry must arm env vars BEFORE invoking python —
-    env-on-prefix syntax. Order: graduation ledger, soak, contract,
-    circuit-breaker. Pinned for review-friendly diffs."""
+    """The cron entry must arm env vars BEFORE invoking the
+    HARNESS python — env-on-prefix syntax. Order: graduation
+    ledger, soak, contract, circuit-breaker. Pinned for
+    review-friendly diffs.
+
+    Cadence Slice 2 (2026-05-06): the cron line now also
+    invokes ``cadence_preflight.py`` (a separate ``python3``
+    call) BEFORE the env block. The harness invocation is the
+    one that requires the env vars; anchor to ``$HARNESS_SCRIPT
+    run`` to find the harness python3 specifically."""
     r = _run(["--dry-run"])
     ledger_idx = r.stdout.index(
         "JARVIS_GRADUATION_LEDGER_ENABLED=true",
@@ -152,8 +159,18 @@ def test_dry_run_env_flags_in_correct_order():
     cb_idx = r.stdout.index(
         "JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true",
     )
-    py_idx = r.stdout.index("/usr/bin/env python3")
-    assert ledger_idx < soak_idx < contract_idx < cb_idx < py_idx
+    # Anchor to the harness invocation specifically — preflight
+    # is a separate (and earlier) python3 call by design. The
+    # ``live_fire_graduation_soak.py run`` token is distinctive
+    # enough to match both the literal ``$HARNESS_SCRIPT run``
+    # form (as written in build_cron_block) AND the expanded
+    # form (where shell substitutes the absolute path).
+    harness_idx = r.stdout.index(
+        "live_fire_graduation_soak.py run",
+    )
+    assert (
+        ledger_idx < soak_idx < contract_idx < cb_idx < harness_idx
+    )
 
 
 def test_dry_run_documents_contract_in_comment_block():
