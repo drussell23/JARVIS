@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from backend.core.ouroboros.battle_test.tool_render_policy import (
     DefaultLayoutModeProvider,
@@ -144,6 +144,16 @@ class ComposedToolRender:
       when no elision happened OR no expansion ref was issued.
     * ``policy`` — the :class:`DensityPolicy` actually applied;
       observability surfaces in Slice 5 echo this back.
+    * ``confidence_band`` — §37 Tier 2 #13 Slice 5 (2026-05-07).
+      Populated from the singleton ``ToolConfidenceObserver`` for
+      this (``op_id``, ``tool_name``) stream when the Slice 1
+      master flag is on; ``None`` otherwise. Type is the Slice 1
+      ``ToolConfidenceBand`` enum (kept as ``Optional[Any]`` here
+      to avoid an eager governance-tier import at module load
+      time — pull the enum lazily in callers that branch on it).
+      Renderers opt into displaying via
+      :func:`confidence_band_markup` (additive — existing
+      renderers pass through unchanged).
     """
 
     header_markup: str
@@ -152,6 +162,7 @@ class ComposedToolRender:
     expansion_hint: str
     policy: DensityPolicy
     schema_version: str = TOOL_RENDER_VIEW_SCHEMA_VERSION
+    confidence_band: Optional[Any] = None
 
 
 # ===========================================================================
@@ -444,13 +455,120 @@ def compose(
         for ln in rendered.body_lines
     )
 
+    # §37 Tier 2 #13 Slice 5 (2026-05-07) — composer pulls the
+    # last-observed confidence band for this (op_id, tool_name)
+    # stream from the canonical singleton observer. Master-flag-
+    # gated (zero observer-touch when off). NEVER raises.
+    confidence_band = _read_confidence_band_for_compose(
+        op_id=op_id, tool_name=tool_name,
+    )
+
     return ComposedToolRender(
         header_markup=header_markup,
         summary_markup=summary_markup,
         body_lines_markup=body_lines_markup,
         expansion_hint=expansion_hint,
         policy=policy,
+        confidence_band=confidence_band,
     )
+
+
+def _read_confidence_band_for_compose(
+    *, op_id: str, tool_name: str,
+) -> Optional[Any]:
+    """§37 Tier 2 #13 Slice 5 — read the last-observed confidence
+    band for this (op_id, tool_name) stream from the canonical
+    singleton ``ToolConfidenceObserver``.
+
+    Composition discipline (operator binding 2026-05-07):
+      * Single source of truth — composes
+        :func:`get_default_observer` (no parallel observer
+        construction; AST-pinned).
+      * Master-flag-gated — when
+        ``JARVIS_TOOL_CONFIDENCE_INDICATOR_ENABLED`` is off,
+        skips the lookup entirely (zero observer touch).
+      * Lazy import — keeps tool_render_view's module-load
+        cycle clean (no eager governance import).
+      * NEVER raises — defensive at every step. Returns
+        ``None`` on any failure.
+    """
+    if not op_id or not tool_name:
+        return None
+    try:
+        from backend.core.ouroboros.governance.tool_confidence_warning_observer import (  # noqa: E501
+            get_default_observer,
+            master_enabled,
+        )
+    except ImportError:
+        return None
+    try:
+        if not master_enabled():
+            return None
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        return get_default_observer().last_band(
+            f"{op_id}::{tool_name}",
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+
+
+# ===========================================================================
+# Confidence-band markup helper — opt-in for renderers
+# ===========================================================================
+
+
+# Color discipline (§37.9 invariant #3): low-confidence bands map
+# to dim/yellow/red — semantically consistent with "warning" /
+# "uncertain" without violating the no-bright_green rule. CERTAIN
+# and HIGH return empty string (silent on safe pole — chatter-
+# suppressed by default).
+_BAND_GLYPH_PALETTE_KEY: Mapping[str, str] = {
+    "medium": "dim",       # Hedged — barely worth showing
+    "low": "code_del",     # Unsafe pole — yellow/red per palette
+    "unknown": "code_del",  # Same severity bucket as LOW
+}
+
+# Glyph: a single dim question mark expresses "uncertain" without
+# crowding the header. Renderers can override by computing their
+# own markup from the band field.
+_BAND_GLYPH = "?"
+
+
+def confidence_band_markup(
+    band: Optional[Any],
+    palette: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Render a single-glyph confidence indicator for renderers
+    that opt into displaying per-tool confidence.
+
+    Returns an empty string when:
+      * ``band`` is ``None`` (no signal observed).
+      * Band is CERTAIN or HIGH (safe pole — silent by design,
+        mirrors the chatter-suppressed first-observation
+        discipline in Slice 1).
+
+    Returns a Rich-markup glyph (e.g.
+    ``" [code_del]?[/code_del]"``) for MEDIUM / LOW / UNKNOWN,
+    using the existing palette tokens (no new color discipline).
+    Renderers append the result to their header_markup or
+    summary line as they see fit. Pure function — no I/O,
+    no env reads. NEVER raises."""
+    if band is None:
+        return ""
+    try:
+        band_value = getattr(band, "value", "")
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
+    if not isinstance(band_value, str):
+        return ""
+    palette_key = _BAND_GLYPH_PALETTE_KEY.get(band_value)
+    if palette_key is None:
+        # CERTAIN / HIGH / unrecognized → silent.
+        return ""
+    color = _palette_value(palette, palette_key)
+    return f" [{color}]{_BAND_GLYPH}[/{color}]"
 
 
 def _empty_render(policy: DensityPolicy) -> ComposedToolRender:

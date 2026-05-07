@@ -304,10 +304,70 @@ def _vision_floor_from_env() -> str:
     return raw
 
 
+def _confidence_floor_for_op(
+    op_id: Optional[str],
+) -> Optional[str]:
+    """§37 Tier 2 #13 Slice 3 — confidence-derived floor.
+
+    Returns the tier-name floor implied by the worst confidence
+    band observed for ``op_id``, or ``None`` when:
+
+      * ``op_id`` is empty / None (no per-op signal).
+      * The Slice 1 master flag is off
+        (``JARVIS_TOOL_CONFIDENCE_INDICATOR_ENABLED=false``).
+      * No tool-call has been observed for this op yet (band
+        absent — caller treats absence as "no signal" rather
+        than UNKNOWN, mirroring Slice 2's "no capturer → no
+        observation" discipline).
+      * The worst band is HIGH or CERTAIN (no clamp needed).
+
+    Mapping (load-bearing Antivenom semantic):
+
+      * UNKNOWN / LOW / MEDIUM → ``"notify_apply"``
+        (low-confidence single-roll Quine-class hallucinations
+        SHOULD NOT auto-apply — see §35 Move 9 and §3.6.2
+        vector #7).
+      * HIGH / CERTAIN → ``None`` (no clamp).
+
+    Composition discipline: lazy-imports Slice 1 to avoid a
+    hard module-load cycle (risk_tier_floor is a leaf substrate;
+    Slice 1 transitively touches the SSE broker). NEVER raises.
+    """
+    if not op_id:
+        return None
+    try:
+        from backend.core.ouroboros.governance.tool_confidence_warning_observer import (  # noqa: E501
+            ToolConfidenceBand,
+            master_enabled,
+            worst_band_for_op,
+        )
+    except ImportError:
+        return None
+    try:
+        if not master_enabled():
+            return None
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    try:
+        band = worst_band_for_op(op_id)
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    if band is None:
+        return None
+    if band in (
+        ToolConfidenceBand.UNKNOWN,
+        ToolConfidenceBand.LOW,
+        ToolConfidenceBand.MEDIUM,
+    ):
+        return "notify_apply"
+    return None
+
+
 def recommended_floor(
     now: Optional[datetime] = None,
     *,
     signal_source: str = "",
+    op_id: Optional[str] = None,
 ) -> Optional[str]:
     """Compose the floor signals into a single recommendation.
 
@@ -318,6 +378,10 @@ def recommended_floor(
         4. Vision-originated op (``signal_source == "vision_sensor"``)
            implies at least ``notify_apply``, or the stronger value
            in ``JARVIS_VISION_SENSOR_RISK_FLOOR`` (Invariant I2).
+        5. **§37 Tier 2 #13 Slice 3** — when ``op_id`` is provided
+           and the Slice 1 master flag is on, the worst observed
+           confidence band for the op implies a floor (LOW /
+           UNKNOWN / MEDIUM → ``notify_apply``).
 
     Returns the normalised tier name or ``None`` when nothing applies.
 
@@ -340,6 +404,9 @@ def recommended_floor(
     if _is_vision_source(signal_source):
         # Raises ValueError if env tries to weaken below notify_apply.
         candidates.append(_vision_floor_from_env())
+    confidence = _confidence_floor_for_op(op_id)
+    if confidence is not None:
+        candidates.append(confidence)
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.
@@ -352,6 +419,7 @@ def apply_floor_to_name(
     *,
     now: Optional[datetime] = None,
     signal_source: str = "",
+    op_id: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """Apply the recommended floor to a tier *name*.
 
@@ -364,13 +432,17 @@ def apply_floor_to_name(
     Unknown input tier names pass through unchanged.
 
     Passing ``signal_source="vision_sensor"`` engages the VisionSensor
-    floor (Invariant I2). See :func:`recommended_floor`.
+    floor (Invariant I2). Passing ``op_id`` engages the §37 Tier 2 #13
+    Slice 3 confidence-derived floor (master-flag-gated). See
+    :func:`recommended_floor`.
     """
     raw_in = _norm_tier(tier_name)
     _order = get_active_tier_order()
     if raw_in not in _order:
         return (tier_name, None)
-    floor = recommended_floor(now, signal_source=signal_source)
+    floor = recommended_floor(
+        now, signal_source=signal_source, op_id=op_id,
+    )
     if floor is None:
         return (tier_name, None)
     if _order[floor] <= _order[raw_in]:
@@ -382,12 +454,15 @@ def floor_reason(
     now: Optional[datetime] = None,
     *,
     signal_source: str = "",
+    op_id: Optional[str] = None,
 ) -> str:
     """Human-readable explanation of why the floor fires.
 
     Used by the orchestrator when logging a tier upgrade so the operator
     can tell *which* knob triggered the upgrade. When a VisionSensor
     source is passed, the vision-specific floor rationale is included.
+    When ``op_id`` is supplied + the §37 Tier 2 #13 Slice 3 master flag
+    is on, the worst observed confidence band for the op is included.
     """
     bits: list = []
     explicit = _env_floor()
@@ -413,6 +488,25 @@ def floor_reason(
             bits.append(
                 f"signal_source=vision_sensor floor={tier} (I2)"
             )
+    # §37 Tier 2 #13 Slice 3 — confidence floor reason. Only
+    # included when op_id supplied + the floor actually applies.
+    if op_id:
+        try:
+            from backend.core.ouroboros.governance.tool_confidence_warning_observer import (  # noqa: E501
+                master_enabled as _conf_master,
+                worst_band_for_op as _conf_worst,
+            )
+            if _conf_master():
+                _band = _conf_worst(op_id)
+                if _band is not None and _confidence_floor_for_op(
+                    op_id,
+                ) is not None:
+                    bits.append(
+                        f"tool_confidence_band={_band.value} "
+                        f"floor=notify_apply (Slice 3)"
+                    )
+        except Exception:  # noqa: BLE001 — defensive
+            pass
     if not bits:
         return "(no floor active)"
     return ", ".join(bits)

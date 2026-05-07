@@ -6582,7 +6582,17 @@ class GovernedOrchestrator:
                     floor_reason,
                 )
                 _cur_name = risk_tier.name.lower()
-                _effective, _applied = apply_floor_to_name(_cur_name)
+                # §37 Tier 2 #13 Slice 3 (2026-05-07) — pass op_id
+                # so the confidence-derived floor (master-flag-gated)
+                # composes with the existing env/paranoia/quiet-hours
+                # floors. Low-confidence per-tool observations
+                # (UNKNOWN/LOW/MEDIUM band) clamp to NOTIFY_APPLY
+                # before auto-apply — load-bearing Antivenom defense
+                # against Move 9 single-roll Quine-class hallucinations.
+                _op_id = getattr(ctx, "op_id", "") or ""
+                _effective, _applied = apply_floor_to_name(
+                    _cur_name, op_id=_op_id,
+                )
                 if _applied is not None:
                     _floor_tier_map = {
                         "safe_auto": RiskTier.SAFE_AUTO,
@@ -6595,7 +6605,8 @@ class GovernedOrchestrator:
                         logger.info(
                             "[Orchestrator] GATE: MIN_RISK_TIER floor → %s→%s "
                             "op=%s reason=%s",
-                            risk_tier.name, _tgt.name, ctx.op_id, floor_reason(),
+                            risk_tier.name, _tgt.name, ctx.op_id,
+                            floor_reason(op_id=_op_id),
                         )
                         risk_tier = _tgt
             except Exception:

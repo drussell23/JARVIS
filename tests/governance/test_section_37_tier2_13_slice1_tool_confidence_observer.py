@@ -784,10 +784,11 @@ def test_event_type_in_canonical_event_set():
 
 
 def test_public_api_complete():
-    """Slice 1 + Slice 2 combined public API. Slice 2 added the
-    ContextVar bridge (set/reset/get_active_capturer), the
-    ConfidenceSignal artifact, the projection helper, and the
-    end-to-end extraction + observation entry-points."""
+    """Slice 1 + Slice 2 + Slice 3 combined public API. Slice 2
+    added the ContextVar bridge + ConfidenceSignal artifact +
+    projection + extraction + observation entry-points. Slice 3
+    added the `worst_band_for_op` aggregator (risk-tier-floor
+    consumer composes this via singleton)."""
     from backend.core.ouroboros.governance import (
         tool_confidence_warning_observer as mod,
     )
@@ -816,5 +817,7 @@ def test_public_api_complete():
         "project_summary_to_confidence",
         "reset_active_capturer",
         "set_active_capturer",
+        # Slice 3 (risk-tier-floor consumer)
+        "worst_band_for_op",
     }
     assert set(mod.__all__) == expected

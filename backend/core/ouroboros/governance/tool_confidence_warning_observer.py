@@ -511,6 +511,67 @@ class ToolConfidenceObserver:
         :meth:`reset` between sessions."""
         return len(self._last_band_per_stream)
 
+    def band_distribution(
+        self,
+    ) -> Dict[ToolConfidenceBand, int]:
+        """Read-only snapshot of per-band stream counts —
+        consumed by the §37 Tier 2 #13 Slice 4 graduation
+        contract for evidence aggregation.
+
+        Returns a dict with EVERY band as a key (counts default
+        to 0 for bands with no current observations) so callers
+        can iterate without missing-key defensiveness. Pure
+        read; NEVER raises."""
+        out: Dict[ToolConfidenceBand, int] = {
+            band: 0 for band in ToolConfidenceBand
+        }
+        try:
+            for band in self._last_band_per_stream.values():
+                if band in out:
+                    out[band] = out[band] + 1
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        return out
+
+    def worst_band_for_op(
+        self, op_id: str,
+    ) -> Optional[ToolConfidenceBand]:
+        """Return the worst-observed band across every tool
+        stream belonging to ``op_id`` — the load-bearing
+        per-op aggregation for §37 Tier 2 #13 Slice 3
+        (risk-tier-floor consumer).
+
+        "Worst" means highest :func:`band_severity`: UNKNOWN
+        (4) > LOW (3) > MEDIUM (2) > HIGH (1) > CERTAIN (0).
+        Returns ``None`` when no stream for this op_id has been
+        observed yet (caller treats absence as "no signal" and
+        skips the confidence floor — single source of truth
+        with Slice 2's "no capturer → no observation"
+        discipline).
+
+        Pure read — no state mutation. Safe to call from any
+        layer (risk-tier-floor consumer is a substrate layer
+        that reads state without owning it). NEVER raises.
+        """
+        if not op_id:
+            return None
+        try:
+            prefix = f"{op_id}::"
+            worst: Optional[ToolConfidenceBand] = None
+            worst_rank = -1
+            for stream_key, band in (
+                self._last_band_per_stream.items()
+            ):
+                if not stream_key.startswith(prefix):
+                    continue
+                rank = band_severity(band)
+                if rank > worst_rank:
+                    worst = band
+                    worst_rank = rank
+            return worst
+        except Exception:  # noqa: BLE001 — defensive
+            return None
+
     @staticmethod
     def _publish_to_broker(
         crossing: ConfidenceBandCrossing,
@@ -855,6 +916,18 @@ def reset_default_observer_for_tests() -> None:
     naming convention (``_for_tests`` suffix)."""
     global _DEFAULT_OBSERVER
     _DEFAULT_OBSERVER = None
+
+
+def worst_band_for_op(op_id: str) -> Optional[ToolConfidenceBand]:
+    """Module-level convenience: return the worst-observed band
+    for ``op_id`` from the default observer singleton. Used by
+    §37 Tier 2 #13 Slice 3 (risk-tier-floor consumer) so the
+    floor module can compose this without holding an observer
+    reference. NEVER raises."""
+    try:
+        return get_default_observer().worst_band_for_op(op_id)
+    except Exception:  # noqa: BLE001 — defensive
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1388,4 +1461,6 @@ __all__ = [
     "reset_active_capturer",
     "reset_default_observer_for_tests",
     "set_active_capturer",
+    # Slice 3 (risk-tier-floor consumer)
+    "worst_band_for_op",
 ]
