@@ -1278,6 +1278,41 @@ async def _maybe_fire_tool_hook_failure(
         )
 
 
+def _maybe_block_by_operation_mode(
+    call: "ToolCall",
+) -> Optional[str]:
+    """§37 Tier 2 #14 — Operation Mode mutation gate.
+
+    Returns a string block-reason when the active OperationMode
+    (PLAN / ANALYZE) forbids the tool's dispatch + the master
+    flag is on. Returns ``None`` to pass through (master off,
+    APPLY/AUTO mode, or non-mutation tool).
+
+    Composes :func:`operation_mode.is_mutation_blocked` —
+    single source of truth for mutation classification (which
+    in turn composes ``scoped_tool_access._MUTATION_TOOLS``,
+    AST-pinned). NEVER raises into the dispatch path.
+    """
+    try:
+        from backend.core.ouroboros.governance.operation_mode import (
+            block_reason as _mode_block_reason,
+            is_mutation_blocked as _mode_blocks,
+        )
+    except ImportError:
+        return None
+    try:
+        tool_name = getattr(call, "name", "") or ""
+        if not _mode_blocks(tool_name):
+            return None
+        return _mode_block_reason(tool_name)
+    except Exception:  # noqa: BLE001 — defensive
+        logger.debug(
+            "[OperationMode] block evaluation raised "
+            "(non-fatal)", exc_info=True,
+        )
+        return None
+
+
 def _maybe_observe_tool_confidence(
     call: "ToolCall",
     policy_ctx: "PolicyContext",
@@ -3305,6 +3340,28 @@ class AsyncProcessToolBackend:
             return ToolResult(tool_call=call, output=out, error="TIMEOUT",
                 status=ToolExecStatus.TIMEOUT)
         timeout = min(float(os.environ.get("JARVIS_TOOL_TIMEOUT_S", "30")), max(1.0, remaining))
+        # §37 Tier 2 #14 (2026-05-07) — Operation Mode mutation
+        # gate. Fires BEFORE V2 permission check + V1 PRE_TOOL_USE
+        # so PLAN/ANALYZE modes structurally short-circuit
+        # mutation tools at the highest layer of the dispatch
+        # ladder. Master-flag-gated via
+        # JARVIS_OPERATION_MODE_ENABLED (default FALSE → zero
+        # overhead pre-graduation; byte-identical pre-slice
+        # behavior). NEVER raises into the dispatch path.
+        _mode_block = _maybe_block_by_operation_mode(call)
+        if _mode_block is not None:
+            await _maybe_fire_tool_hook_failure(
+                "post_tool_use_failure", call, policy_ctx,
+                error=(
+                    f"OPERATION_MODE_BLOCKED:"
+                    f"{_mode_block[:64]}"
+                ),
+            )
+            return ToolResult(
+                tool_call=call, output="",
+                error=_mode_block[:128],
+                status=ToolExecStatus.POLICY_DENIED,
+            )
         # Venom V2 (2026-05-06) — per-tool permission check
         # fires BEFORE V1 PRE_TOOL_USE hook. Master-flag-gated
         # via JARVIS_VENOM_TOOL_PERMISSIONS_ENABLED (default
