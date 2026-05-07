@@ -712,6 +712,69 @@ def test_repl_unknown_subcommand():
     assert "unknown subcommand" in out.text
 
 
+def test_repl_diagnose_disabled_when_master_off(monkeypatch):
+    """`/phase9 diagnose` shares the orchestrator master flag —
+    when off, returns the disabled message."""
+    monkeypatch.delenv(
+        "JARVIS_PHASE9_ORCHESTRATOR_ENABLED", raising=False,
+    )
+    from backend.core.ouroboros.governance.phase9_repl import (
+        dispatch_phase9_command,
+    )
+    out = dispatch_phase9_command("/phase9 diagnose")
+    assert out.ok is True
+    assert "disabled" in out.text
+
+
+def test_repl_diagnose_when_ledger_off(monkeypatch):
+    """When orchestrator master is on but graduation_ledger
+    master is off, diagnose surfaces the structured
+    diagnostic (operator binding 2026-05-07: do not silently
+    no-op)."""
+    monkeypatch.setenv(
+        "JARVIS_PHASE9_ORCHESTRATOR_ENABLED", "true",
+    )
+    monkeypatch.delenv(
+        "JARVIS_GRADUATION_LEDGER_ENABLED", raising=False,
+    )
+    from backend.core.ouroboros.governance.phase9_repl import (
+        dispatch_phase9_command,
+    )
+    out = dispatch_phase9_command("/phase9 diagnose")
+    assert out.ok is True
+    assert "JARVIS_GRADUATION_LEDGER_ENABLED" in out.text
+
+
+def test_repl_diagnose_full_path(
+    isolated_orchestrator, monkeypatch,
+):
+    """End-to-end: master flags on, diagnose surfaces the
+    canonical sections (totals / blocked / next-soakable /
+    cadence guidance)."""
+    monkeypatch.setenv(
+        "JARVIS_GRADUATION_LEDGER_ENABLED", "true",
+    )
+    from backend.core.ouroboros.governance.phase9_repl import (
+        dispatch_phase9_command,
+    )
+    out = dispatch_phase9_command("/phase9 diagnose")
+    assert out.ok is True
+    assert "totals" in out.text
+    assert "next-soakable" in out.text
+    assert "cadence" in out.text
+
+
+def test_repl_help_documents_diagnose():
+    """Help text MUST mention the diagnose subcommand so
+    operators discover it without grep."""
+    from backend.core.ouroboros.governance.phase9_repl import (
+        dispatch_phase9_command,
+    )
+    out = dispatch_phase9_command("/phase9 help")
+    assert out.ok is True
+    assert "/phase9 diagnose" in out.text
+
+
 # ---------------------------------------------------------------------------
 # Public API stability
 # ---------------------------------------------------------------------------

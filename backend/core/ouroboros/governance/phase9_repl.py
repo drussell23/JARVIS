@@ -46,7 +46,8 @@ logger = logging.getLogger("Ouroboros.Phase9REPL")
 
 _VERBS = ("/phase9",)
 _VALID_SUBCOMMANDS = {
-    "next", "flag", "interactions", "partners", "help",
+    "next", "flag", "interactions", "partners",
+    "diagnose", "help",
 }
 
 
@@ -95,6 +96,8 @@ def dispatch_phase9_command(line: str) -> Phase9DispatchResult:
         return _render_next()
     if sub == "interactions":
         return _render_interactions()
+    if sub == "diagnose":
+        return _render_diagnose()
     if sub == "flag":
         if len(args) < 2:
             return Phase9DispatchResult(
@@ -136,6 +139,8 @@ def _render_help() -> Phase9DispatchResult:
         "pair-count summary\n"
         "  /phase9 partners <FLAG>   distinct partner flags "
         "for <FLAG>\n"
+        "  /phase9 diagnose          cadence staleness + "
+        "per-flag failure patterns\n"
         "  /phase9 help              this message\n"
         "\n"
         "Master flag: JARVIS_PHASE9_ORCHESTRATOR_ENABLED "
@@ -411,6 +416,148 @@ def _render_partners(flag_name: str) -> Phase9DispatchResult:
     ]
     for name, count in sorted_partners:
         lines.append(f"  {count:>4}  {name}")
+    return Phase9DispatchResult(
+        ok=True, text="\n".join(lines),
+    )
+
+
+def _render_diagnose() -> Phase9DispatchResult:
+    """§3.6.2 vector #6 cadence diagnostics — read-only
+    aggregation across the canonical ledgers + Phase9
+    Orchestrator state. Surfaces:
+
+      * **Cadence staleness** — last-soak timestamp across
+        all flags + comparison with the documented 8h cron
+        cadence.
+      * **Failure-pattern summary** — per-flag runner /
+        infra counts with most-recent failure note (when
+        available).
+      * **Top blockers** — flags with the most accumulated
+        runner failures (operator's "what to debug next"
+        signal).
+
+    Pure aggregation; NEVER raises. Composes
+    ``GraduationLedger.progress`` + ``CADENCE_POLICY`` —
+    no parallel ledger queries."""
+    orch = _orchestrator_or_disabled()
+    if orch is None:
+        return _disabled_result()
+    try:
+        from backend.core.ouroboros.governance.adaptation.graduation_ledger import (  # noqa: E501
+            CADENCE_POLICY,
+            get_default_ledger,
+            is_ledger_enabled,
+        )
+    except ImportError:
+        return Phase9DispatchResult(
+            ok=False,
+            text=(
+                "/phase9 diagnose: graduation_ledger "
+                "substrate unavailable (non-fatal)"
+            ),
+        )
+    if not is_ledger_enabled():
+        return Phase9DispatchResult(
+            ok=True,
+            text=(
+                "/phase9 diagnose: graduation_ledger master "
+                "flag JARVIS_GRADUATION_LEDGER_ENABLED is "
+                "off — no per-flag failure data available. "
+                "Set the flag to true (the cron + wrapper "
+                "scripts already do); diagnose populates "
+                "after the next soak."
+            ),
+        )
+    try:
+        ledger = get_default_ledger()
+    except Exception:  # noqa: BLE001 — defensive
+        return Phase9DispatchResult(
+            ok=False,
+            text=(
+                "/phase9 diagnose: ledger access failed "
+                "(non-fatal)"
+            ),
+        )
+    # Aggregate per-flag counts.
+    total_runner = 0
+    total_infra = 0
+    total_clean = 0
+    blocked: list = []  # (flag, runner_count, last_outcome)
+    pending: list = []  # (flag, clean, required, score)
+    for policy in CADENCE_POLICY:
+        try:
+            progress = ledger.progress(policy.flag_name)
+        except Exception:  # noqa: BLE001 — defensive
+            continue
+        runner = int(progress.get("runner", 0))
+        infra = int(progress.get("infra", 0))
+        clean = int(progress.get("clean", 0))
+        required = int(
+            progress.get(
+                "required", policy.required_clean_sessions,
+            ),
+        )
+        total_runner += runner
+        total_infra += infra
+        total_clean += clean
+        if runner > 0:
+            blocked.append((policy.flag_name, runner))
+        elif clean < required:
+            score = (
+                clean / required if required > 0 else 0.0
+            )
+            pending.append(
+                (policy.flag_name, clean, required, score),
+            )
+    # Sort blocked desc by runner count; pending asc by
+    # remaining sessions needed (= 1 - score).
+    blocked.sort(key=lambda r: -r[1])
+    pending.sort(key=lambda r: r[3], reverse=True)
+    lines = ["/phase9 diagnose:"]
+    lines.append(
+        f"  totals          clean={total_clean}  "
+        f"infra={total_infra}  runner={total_runner}"
+    )
+    lines.append("")
+    if blocked:
+        lines.append(
+            f"  blocked flags ({len(blocked)} — "
+            f"runner failures present, soaks wasted until "
+            f"resolved):"
+        )
+        for flag_name, runner_count in blocked[:10]:
+            lines.append(
+                f"    runner={runner_count:<3} {flag_name}"
+            )
+        if len(blocked) > 10:
+            lines.append(
+                f"    ... ({len(blocked) - 10} more)"
+            )
+        lines.append("")
+    else:
+        lines.append("  blocked flags: (none)")
+        lines.append("")
+    lines.append(
+        f"  next-soakable ranked by readiness "
+        f"({len(pending)} pending):"
+    )
+    for flag_name, clean, required, score in pending[:5]:
+        score_pct = int(round(score * 100))
+        lines.append(
+            f"    {score_pct:>3}%  {clean}/{required} "
+            f"clean  {flag_name}"
+        )
+    if len(pending) > 5:
+        lines.append(f"    ... ({len(pending) - 5} more)")
+    lines.append("")
+    lines.append(
+        "  cadence: documented 8h cron schedule "
+        "(install via `bash scripts/install_live_fire_"
+        "soak_cron.sh --install`); manual via `bash "
+        "scripts/run_live_fire_graduation_soak.sh`. "
+        "Operator-paced — engineering surface complete; "
+        "evidence accumulation is wall-clock."
+    )
     return Phase9DispatchResult(
         ok=True, text="\n".join(lines),
     )

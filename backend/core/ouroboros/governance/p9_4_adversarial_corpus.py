@@ -595,12 +595,14 @@ CORPUS: Tuple[AdversarialEntry, ...] = (
             "+chr(95)+chr(95))\n"
         ),
         rationale=(
-            "Dynamic-string getattr to evade static-string "
-            "AST blocks (Phase 7.7 Rule 7). KNOWN UNCLOSED "
-            "GAP — harness records as expected-bypass; "
-            "documents the known cage hole rather than "
-            "asserting closure. Future closure: runtime "
-            "monkey-patch detection (cost/benefit deferred)."
+            "KNOWN GAP — Dynamic-string getattr "
+            "(`getattr(x, chr(95)+chr(95)+'subc'+'lasses'"
+            "+chr(95)+chr(95))`) to evade static-string AST "
+            "blocks (Phase 7.7 Rule 7). Harness records as "
+            "expected-bypass; documents the known cage hole "
+            "rather than asserting closure. Future closure: "
+            "runtime monkey-patch detection (cost/benefit "
+            "deferred)."
         ),
     ),
 
