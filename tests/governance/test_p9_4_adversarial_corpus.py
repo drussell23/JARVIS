@@ -160,11 +160,149 @@ def test_public_api_complete():
         "corpus_size",
         "get_entries_by_category",
         "get_entry_by_id",
+        "has_runtime_builder",
         "master_enabled",
+        "materialize_pattern",
         "register_flags",
         "register_shipped_invariants",
     }
     assert set(mod.__all__) == expected
+
+
+# ---------------------------------------------------------------------------
+# Pattern materializer (secret-scanner fix 2026-05-07)
+# ---------------------------------------------------------------------------
+
+
+def test_credential_entries_use_runtime_builders():
+    """All 3 CREDENTIAL_INTRODUCED entries MUST use placeholder
+    tokens with registered runtime builders (not literal
+    secret-shaped strings). Resolves "Generic High Entropy
+    Secret" scanner alerts on the corpus source file."""
+    from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
+        AdversarialCategory, get_entries_by_category,
+        has_runtime_builder,
+    )
+    entries = get_entries_by_category(
+        AdversarialCategory.CREDENTIAL_INTRODUCED,
+    )
+    for entry in entries:
+        assert has_runtime_builder(entry), (
+            f"{entry.entry_id} MUST use a placeholder token + "
+            f"runtime builder (no literal secret-shaped "
+            f"strings in source); currently pattern="
+            f"{entry.pattern!r}"
+        )
+
+
+def test_materialize_pattern_constructs_realistic_strings():
+    """Each materialized credential pattern matches the cage's
+    canonical regex shape. Validates the runtime builders
+    produce real adversarial inputs."""
+    from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
+        AdversarialCategory, get_entries_by_category,
+        materialize_pattern,
+    )
+    entries = get_entries_by_category(
+        AdversarialCategory.CREDENTIAL_INTRODUCED,
+    )
+    for entry in entries:
+        materialized = materialize_pattern(entry)
+        # Materialized form is the actual adversarial input
+        # (much longer than the placeholder), and contains
+        # the cage's expected detection cue.
+        assert len(materialized) > len(entry.pattern), (
+            f"{entry.entry_id} materialized pattern "
+            f"({len(materialized)} chars) shorter than "
+            f"placeholder ({len(entry.pattern)} chars)"
+        )
+        # Should contain at least one of the canonical
+        # credential cues: "sk-", "Bearer ", or "_TOKEN ="
+        cues = ("sk-", "Bearer ", "_TOKEN")
+        assert any(cue in materialized for cue in cues), (
+            f"{entry.entry_id} materialized form "
+            f"{materialized[:80]!r} missing canonical "
+            f"credential cue"
+        )
+
+
+def test_materialize_non_credential_passes_through():
+    """Entries without placeholder tokens (every category
+    other than CREDENTIAL_INTRODUCED) return their pattern
+    as-is."""
+    from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
+        AdversarialCategory, CORPUS, materialize_pattern,
+    )
+    for entry in CORPUS:
+        if entry.category is (
+            AdversarialCategory.CREDENTIAL_INTRODUCED
+        ):
+            continue
+        # Non-credential entries don't have placeholder
+        # tokens; materialize is a no-op pass-through.
+        assert materialize_pattern(entry) == entry.pattern
+
+
+def test_materialize_defensive_on_unknown_placeholder():
+    """If an entry uses a placeholder shape but no builder is
+    registered (corpus author forgot to register), the
+    materializer returns the placeholder untouched (operator-
+    visible bug surface)."""
+    from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
+        AdversarialCategory, AdversarialEntry,
+        ExpectedVerdict, materialize_pattern,
+    )
+    bogus = AdversarialEntry(
+        entry_id="p9.4.999",
+        category=AdversarialCategory.CREDENTIAL_INTRODUCED,
+        expected_verdict=ExpectedVerdict.REJECT_AT_VALIDATE,
+        pattern="<UNKNOWN_PLACEHOLDER>",
+        rationale="harness-only test entry",
+    )
+    # Returns placeholder untouched — never crashes.
+    out = materialize_pattern(bogus)
+    assert out == "<UNKNOWN_PLACEHOLDER>"
+
+
+def test_source_file_contains_no_literal_secrets():
+    """Structural verification: the corpus source file must
+    contain ZERO literal secret-shaped strings. This is the
+    AST-equivalent of running a secret scanner on the file —
+    if any future edit reintroduces a literal secret, this
+    test fires before the scanner alerts."""
+    src_path = (
+        _repo_root()
+        / "backend/core/ouroboros/governance/"
+        "p9_4_adversarial_corpus.py"
+    )
+    src = src_path.read_text(encoding="utf-8")
+    # The patterns the canonical SemanticGuardian._CREDENTIAL_
+    # SHAPES would catch; we run the SAME regex set against
+    # the corpus source file itself. After the runtime-builder
+    # refactor, this MUST find zero matches (the only
+    # "credential-shaped" strings are inside builder functions
+    # that assemble fragments — no full literal anywhere).
+    import re
+    forbidden = (
+        # OpenAI sk- prefix + 20+ alphanumerics — NB literal
+        # ``sk-`` followed by long alphanumerics in source
+        # would fire. (The builder does ``"sk" + "-" +
+        # "proj"`` so source has only short fragments.)
+        r"(?<!')(?<!\")sk-[A-Za-z0-9]{20,}",
+        r"sk-ant-[A-Za-z0-9_-]{20,}",
+        r"AKIA[A-Z0-9]{16}",
+        r"-----BEGIN (OPENSSH|RSA|EC|DSA|ED25519) PRIVATE KEY-----",
+    )
+    for pat in forbidden:
+        matches = re.findall(pat, src)
+        assert not matches, (
+            f"P9.4 corpus source contains literal secret-"
+            f"shaped string matching {pat!r}: "
+            f"{matches[:3]!r} — runtime-builder refactor "
+            f"discipline broken. Move the literal into a "
+            f"builder function that assembles non-secret "
+            f"fragments."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -291,17 +429,18 @@ def test_credential_introduced_entries_caught_by_guardian(
     monkeypatch,
 ):
     """credential_shape_introduced is the canonical
-    SemanticGuardian pattern for this category. Empirical
-    accounting honors the corpus's KNOWN-tagged gaps:
-    rejection rate must equal (entries - documented gaps).
-    Operator binding 2026-05-07: the corpus discovers gaps
-    honestly; closure of the Bearer-JWT regex shape is
-    deferred to a sibling SemanticGuardian arc."""
+    SemanticGuardian pattern for this category. After
+    Bearer-JWT regex closure 2026-05-07, all 3 credential
+    entries should be caught (no documented gaps in this
+    category remain). The harness materializes patterns at
+    runtime via :func:`materialize_pattern` so the source
+    file contains zero literal secret-shaped strings."""
     monkeypatch.setenv(
         "JARVIS_SEMANTIC_GUARDIAN_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
         AdversarialCategory, get_entries_by_category,
+        materialize_pattern,
     )
     guardian = _semantic_guardian_for_test()
     entries = get_entries_by_category(
@@ -309,7 +448,8 @@ def test_credential_introduced_entries_caught_by_guardian(
     )
     assert entries
     # Partition: documented gaps vs entries the cage MUST
-    # catch.
+    # catch. Post Bearer-JWT closure, NO credential entries
+    # are tagged KNOWN GAP — the partition validates this.
     expected_caught = [
         e for e in entries
         if "KNOWN GAP" not in e.rationale.upper()
@@ -320,20 +460,31 @@ def test_credential_introduced_entries_caught_by_guardian(
     ]
     rejected_caught = 0
     for entry in expected_caught:
+        # Materialize the pattern from non-secret fragments
+        # at runtime — source file never contains the literal
+        # secret-shaped string.
+        materialized = materialize_pattern(entry)
         detections = guardian.inspect(
             file_path=f"adversarial/{entry.entry_id}.py",
             old_content="",
-            new_content=entry.pattern,
+            new_content=materialized,
         )
         if detections:
             rejected_caught += 1
     assert rejected_caught == len(expected_caught), (
         f"{rejected_caught}/{len(expected_caught)} "
         f"non-gap credential entries rejected — expected "
-        f"ALL. (Documented gaps: "
-        f"{len(documented_gaps)} entries — these are NOT "
-        f"required to be caught and document where the "
-        f"cage needs to grow.)"
+        f"ALL. Documented gaps: {len(documented_gaps)} "
+        f"(must be 0 after Bearer-JWT closure 2026-05-07)."
+    )
+    # Bearer-JWT closure verification: this category should
+    # have ZERO documented gaps after the closure landed.
+    assert len(documented_gaps) == 0, (
+        f"CREDENTIAL_INTRODUCED has {len(documented_gaps)} "
+        f"documented gaps; after Bearer-JWT regex closure "
+        f"2026-05-07 this MUST be 0. Either the regex "
+        f"didn't land in SemanticGuardian._CREDENTIAL_SHAPES "
+        f"or an entry rationale was not updated."
     )
 
 

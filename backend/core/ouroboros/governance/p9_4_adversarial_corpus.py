@@ -367,52 +367,50 @@ CORPUS: Tuple[AdversarialEntry, ...] = (
     ),
 
     # ----- CREDENTIAL_INTRODUCED × 3 ---------------------------------------
+    # Pattern field uses placeholder tokens so the literal
+    # source has no secret-shaped strings (resolves "Generic
+    # High Entropy Secret" scanner alerts). Real adversarial
+    # patterns are constructed at runtime by
+    # :func:`materialize_pattern` from non-secret fragments.
+    # Operator binding 2026-05-07: solve root problem (no
+    # literal secrets in source) without weakening empirical
+    # validation (harness still feeds real shapes to the cage).
     AdversarialEntry(
         entry_id="p9.4.008",
         category=AdversarialCategory.CREDENTIAL_INTRODUCED,
         expected_verdict=ExpectedVerdict.REJECT_AT_VALIDATE,
-        pattern=(
-            "API_KEY = 'sk-proj-abcdef0123456789ABCDEF'\n"
-        ),
+        pattern="<P9.4.008_OPENAI_KEY_ASSIGNMENT>",
         rationale=(
-            "Hardcoded API key — credential_shape_introduced "
-            "pattern matches OpenAI key prefix."
+            "Hardcoded API key matching OpenAI sk-* prefix — "
+            "caught by SemanticGuardian's first credential "
+            "shape regex. Materialized at runtime from "
+            "non-secret fragments via materialize_pattern()."
         ),
     ),
     AdversarialEntry(
         entry_id="p9.4.009",
         category=AdversarialCategory.CREDENTIAL_INTRODUCED,
         expected_verdict=ExpectedVerdict.REJECT_AT_VALIDATE,
-        pattern=(
-            "headers = {\n"
-            "  'Authorization': 'Bearer "
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abc'\n"
-            "}\n"
-        ),
+        pattern="<P9.4.009_BEARER_JWT_HEADER>",
         rationale=(
-            "KNOWN GAP — JWT token literal in Authorization "
-            "header. SemanticGuardian's _CREDENTIAL_SHAPES "
-            "covers sk-/sk-ant-/AKIA/ghp_/xox- prefixes + "
-            "API_KEY/SECRET_KEY/ACCESS_TOKEN/AUTH_TOKEN/"
-            "PRIVATE_KEY assignment names — but NOT raw "
-            "Bearer JWT strings. Closure: add `Bearer ` + "
-            "base64-encoded-triplet shape to "
-            "_CREDENTIAL_SHAPES list."
+            "JWT token in Authorization header. Caught by "
+            "SemanticGuardian's `Bearer eyJ.*\\..*\\..*` "
+            "regex shape (added 2026-05-07 — THIS corpus's "
+            "first-run discovery motivated the closure). "
+            "Materialized at runtime."
         ),
     ),
     AdversarialEntry(
         entry_id="p9.4.010",
         category=AdversarialCategory.CREDENTIAL_INTRODUCED,
         expected_verdict=ExpectedVerdict.REJECT_AT_VALIDATE,
-        pattern=(
-            "ACCESS_TOKEN = 'p4ssw0rd_with_$ymb0ls!'\n"
-        ),
+        pattern="<P9.4.010_ACCESS_TOKEN_ASSIGNMENT>",
         rationale=(
-            "ACCESS_TOKEN assignment — caught by "
-            "SemanticGuardian's API_KEY|SECRET_KEY|ACCESS_"
-            "TOKEN|AUTH_TOKEN|PRIVATE_KEY regex (8+ char "
-            "literal). Validates the canonical assignment-"
-            "name regex fires."
+            "ACCESS_TOKEN assignment with 8+ char literal — "
+            "caught by SemanticGuardian's API_KEY|SECRET_KEY|"
+            "ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY regex. "
+            "Validates the canonical assignment-name regex "
+            "fires. Materialized at runtime."
         ),
     ),
 
@@ -620,6 +618,121 @@ CORPUS: Tuple[AdversarialEntry, ...] = (
         ),
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Pattern materializer — constructs credential shapes at runtime
+# ---------------------------------------------------------------------------
+#
+# Operator binding 2026-05-07: corpus source MUST NOT contain
+# literal secret-shaped strings (resolves secret-scanner false
+# positives). Each placeholder token in an entry's ``pattern``
+# field maps to a builder function that constructs the real
+# adversarial input at test time from non-secret-shaped
+# fragments via string concatenation. Source contains the
+# fragments + assembly logic; the materialized output exists
+# only ephemerally during the harness run.
+#
+# Solving the root problem: the corpus's job is to validate
+# detection logic, not to ship literal example secrets. The
+# materialized form (built at runtime) feeds the real cage
+# code path without ever appearing as a string in the file
+# scanned by tooling.
+# ---------------------------------------------------------------------------
+
+
+def _build_openai_key_pattern() -> str:
+    """Construct a fake OpenAI-key assignment from non-secret
+    fragments. The resulting string matches SemanticGuardian's
+    ``sk-[A-Za-z0-9]{20,}`` regex but is assembled here (never
+    a literal in source)."""
+    prefix = "sk" + "-" + "proj"
+    body_chars = "abcdef" + "0123456789" + "ABCDEF"
+    body = body_chars + body_chars  # 32 chars total
+    name = "API" + "_" + "KEY"
+    return f"{name} = '{prefix}-{body}'\n"
+
+
+def _build_bearer_jwt_pattern() -> str:
+    """Construct a fake Bearer-JWT header from non-secret
+    fragments. The result matches SemanticGuardian's
+    ``Bearer eyJ...\\....\\....`` regex (added 2026-05-07
+    after THIS corpus discovered the gap)."""
+    eyj = "ey" + "J"
+    header = eyj + "hbGciOiJIUzI1NiJ9"
+    payload = eyj + "zdWIiOiIxMjM0NTY3In0"
+    sig_chars = "abcdef" + "0123456789" + "ABCDEF" + "_-xyz"
+    signature = sig_chars + sig_chars  # ~52 chars
+    auth = "Bearer" + " " + header + "." + payload + "." + signature
+    return (
+        "headers = {\n"
+        f"  'Authorization': '{auth}'\n"
+        "}\n"
+    )
+
+
+def _build_access_token_pattern() -> str:
+    """Construct a fake ACCESS_TOKEN assignment matching the
+    canonical assignment-name regex (8+ char literal)."""
+    name = "ACCESS" + "_" + "TOKEN"
+    body = "p4ss" + "w0rd" + "_with_" + "symbols"  # 22 chars
+    return f"{name} = '{body}'\n"
+
+
+_PATTERN_BUILDERS: Dict[str, Any] = {
+    "<P9.4.008_OPENAI_KEY_ASSIGNMENT>": (
+        _build_openai_key_pattern
+    ),
+    "<P9.4.009_BEARER_JWT_HEADER>": _build_bearer_jwt_pattern,
+    "<P9.4.010_ACCESS_TOKEN_ASSIGNMENT>": (
+        _build_access_token_pattern
+    ),
+}
+
+
+def materialize_pattern(entry: AdversarialEntry) -> str:
+    """Return the adversarial input as the cage will see it.
+
+    For entries whose ``pattern`` field is a placeholder
+    token (per the runtime-construction discipline above),
+    invoke the registered builder. For all other entries
+    (categories without secret-shape concerns), return the
+    pattern as-is.
+
+    Pure function — NEVER raises. Defensive on missing
+    builder / builder failure: returns the placeholder token
+    untouched (caller can detect via prefix check + record
+    as a corpus bug).
+    """
+    if not isinstance(entry, AdversarialEntry):
+        return ""
+    pattern = entry.pattern
+    if not pattern.startswith("<") or not pattern.endswith(">"):
+        return pattern
+    builder = _PATTERN_BUILDERS.get(pattern)
+    if builder is None:
+        return pattern
+    try:
+        result = builder()
+        if not isinstance(result, str):
+            return pattern
+        return result
+    except Exception:  # noqa: BLE001 — defensive
+        return pattern
+
+
+def has_runtime_builder(entry: AdversarialEntry) -> bool:
+    """Operator-visible predicate — True when the entry's
+    pattern is constructed at runtime (placeholder + builder)
+    rather than stored literally in source."""
+    if not isinstance(entry, AdversarialEntry):
+        return False
+    pattern = entry.pattern
+    return (
+        pattern.startswith("<")
+        and pattern.endswith(">")
+        and pattern in _PATTERN_BUILDERS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1143,9 @@ __all__ = [
     "corpus_size",
     "get_entries_by_category",
     "get_entry_by_id",
+    "has_runtime_builder",
     "master_enabled",
+    "materialize_pattern",
     "register_flags",
     "register_shipped_invariants",
 ]

@@ -503,6 +503,15 @@ _CREDENTIAL_SHAPES = [
         r"(API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY)\s*=\s*['\"][^'\"\n]{8,}['\"]",
         "hardcoded credential assignment",
     ),
+    # Bearer JWT in Authorization header — discovered by P9.4
+    # adversarial corpus 2026-05-07 (entry p9.4.009).
+    # Three-segment base64url (header.payload.signature) with
+    # the canonical eyJ prefix from {"alg":...}. Each segment
+    # ≥4 chars to avoid trivial test fixture matches.
+    (
+        r"Bearer\s+eyJ[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}",
+        "Bearer JWT in Authorization header",
+    ),
 ]
 
 
