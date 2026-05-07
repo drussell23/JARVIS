@@ -11,6 +11,11 @@
 #   JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED — allow forked battle test
 #   JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT — block false CLEAN (0-op, etc.)
 #   JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED — clean DW-topology reject path
+#   JARVIS_PHASE9_ORCHESTRATOR_ENABLED — §3.6.2 vector #6 producer-loop
+#       wiring (2026-05-07): populates .jarvis/graduation_interaction_matrix
+#       .jsonl so /phase9 partners surfaces co-soak data as cadence runs.
+#       Operator-binding decision — explicit cadence-host opt-in (no silent
+#       no-op in production).
 #   OUROBOROS_BATTLE_SEED_INTENTS=3 — Phase 9 Slice 3 synthetic workload
 #       injection so headless cadence soaks actually exercise the FSM
 #       (closes ops_count=0 → P9.2 contract downgrade-to-RUNNER blocker).
@@ -22,4 +27,4 @@
 # one-liner, mkdir -p the log dir first.
 
 # LOG_DIR=/ABSOLUTE/PATH/TO/JARVIS-AI-Agent/.jarvis/live_fire_soak_logs
-# 0 */8 * * * cd /ABSOLUTE/PATH/TO/JARVIS-AI-Agent && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true OUROBOROS_BATTLE_SEED_INTENTS=3 /usr/bin/env python3 scripts/live_fire_graduation_soak.py run --cost-cap 0.50 --max-wall-seconds 2400 --timeout 3600 >> .jarvis/live_fire_soak_logs/cron.log 2>&1
+# 0 */8 * * * cd /ABSOLUTE/PATH/TO/JARVIS-AI-Agent && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true JARVIS_PHASE9_ORCHESTRATOR_ENABLED=true OUROBOROS_BATTLE_SEED_INTENTS=3 /usr/bin/env python3 scripts/live_fire_graduation_soak.py run --cost-cap 0.50 --max-wall-seconds 2400 --timeout 3600 >> .jarvis/live_fire_soak_logs/cron.log 2>&1

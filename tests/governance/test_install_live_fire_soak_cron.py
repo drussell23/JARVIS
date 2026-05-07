@@ -218,6 +218,12 @@ _REQUIRED_PHASE9_ENV_VARS = (
     "JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED",
     "JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT",
     "JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED",
+    # §3.6.2 vector #6 producer-loop wiring (2026-05-07) —
+    # populates .jarvis/graduation_interaction_matrix.jsonl
+    # so /phase9 partners surfaces co-soak data as cadence
+    # runs. Operator-binding decision: explicit cadence-host
+    # opt-in (no silent no-op in production).
+    "JARVIS_PHASE9_ORCHESTRATOR_ENABLED",
 )
 
 

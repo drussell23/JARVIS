@@ -25,6 +25,10 @@ export JARVIS_GRADUATION_LEDGER_ENABLED=true
 export JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true
 export JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true
 export JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true
+# §3.6.2 vector #6 producer-loop wiring (2026-05-07) — populate
+# .jarvis/graduation_interaction_matrix.jsonl as cadence runs
+# so /phase9 partners view materializes empirically.
+export JARVIS_PHASE9_ORCHESTRATOR_ENABLED=true
 # Phase 9 Slice 3 — synthetic workload injection for cadence soaks.
 # Closes the headless zero-ops blocker. The harness's
 # `_build_env_for_flag` defaults this to 3 when unset; setting it

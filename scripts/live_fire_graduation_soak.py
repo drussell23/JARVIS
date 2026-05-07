@@ -334,7 +334,98 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"cost=${ev.cost_total_usd:.4f} "
             f"dur={ev.duration_s:.1f}s ops={ev.ops_count}{_RESET}"
         )
+        # §3.6.2 vector #6 producer-loop wiring (2026-05-07) —
+        # feed the Phase9Orchestrator interaction matrix so
+        # `/phase9 partners` populates as the cadence runs.
+        # Composes the SAME flag-set the harness used to build
+        # the subprocess env (target flag + its graduated
+        # dependencies — single source of truth via
+        # ``get_dependencies``). NEVER raises into the run
+        # path. Master-flag-gate decision (operator binding
+        # 2026-05-07): if JARVIS_PHASE9_ORCHESTRATOR_ENABLED
+        # is off, surface a structured operator-visible
+        # message rather than silently no-op-ing — operators
+        # who wonder why the matrix stays empty get a clear
+        # diagnostic.
+        _record_phase9_interaction_matrix(
+            session_id=str(ev.session_id),
+            target_flag=flag,
+        )
     return 0 if status == HarnessStatus.OK else 5
+
+
+def _record_phase9_interaction_matrix(
+    *, session_id: str, target_flag: str,
+) -> None:
+    """§3.6.2 vector #6 producer-loop wiring. Composes the
+    canonical flag-set (target + dependencies) and feeds the
+    Phase9Orchestrator append-only matrix. NEVER raises.
+
+    Master-flag-gate decision: when
+    ``JARVIS_PHASE9_ORCHESTRATOR_ENABLED`` is OFF, prints an
+    operator-visible diagnostic explaining that the matrix
+    will not populate (rather than silently no-op-ing — which
+    would leave operators wondering why ``/phase9 partners``
+    stays empty). When ON, performs the append + prints a
+    one-liner confirmation."""
+    try:
+        from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
+            get_dependencies,
+        )
+        from backend.core.ouroboros.governance.phase9_orchestrator import (  # noqa: E501
+            get_default_orchestrator,
+            master_enabled as phase9_master_enabled,
+        )
+    except ImportError:
+        # Substrate unavailable (rollback branch) —
+        # operator-visible note + skip.
+        print(
+            f"  {_YELLOW}[phase9-matrix] substrate unavailable "
+            f"(import error); session_id={session_id!r} not "
+            f"recorded into interaction matrix{_RESET}"
+        )
+        return
+    try:
+        if not phase9_master_enabled():
+            # OPERATOR-VISIBLE DIAGNOSTIC (operator binding
+            # 2026-05-07: do not silently no-op).
+            print(
+                f"  {_YELLOW}[phase9-matrix] "
+                f"JARVIS_PHASE9_ORCHESTRATOR_ENABLED=false → "
+                f"interaction matrix NOT recorded for "
+                f"session {session_id}. To populate: set "
+                f"the env var to true (cron / wrapper / "
+                f"operator). /phase9 partners will stay empty "
+                f"until then.{_RESET}"
+            )
+            return
+        deps = get_dependencies(target_flag) or frozenset()
+        flags_enabled = (target_flag,) + tuple(sorted(deps))
+        ok = get_default_orchestrator().record_session_flags(
+            session_id=session_id,
+            flags_enabled=flags_enabled,
+        )
+        if ok:
+            partner_count = max(0, len(flags_enabled) - 1)
+            print(
+                f"  {_DIM}[phase9-matrix] recorded "
+                f"session={session_id} flags="
+                f"{len(flags_enabled)} "
+                f"(target+{partner_count} deps){_RESET}"
+            )
+        else:
+            print(
+                f"  {_YELLOW}[phase9-matrix] record_session_"
+                f"flags returned False for "
+                f"session={session_id}{_RESET}"
+            )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        # NEVER raises into the run path; surface failure as
+        # operator-visible non-fatal.
+        print(
+            f"  {_YELLOW}[phase9-matrix] non-fatal error "
+            f"recording session={session_id}: {exc}{_RESET}"
+        )
 
 
 def cmd_status(args: argparse.Namespace) -> int:

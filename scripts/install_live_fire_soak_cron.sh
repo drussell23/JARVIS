@@ -129,6 +129,14 @@ build_cron_block() {
     #    the fallback if circuit-breaker raises (try/except wrap
     #    in orchestrator).
     #
+    # 4. JARVIS_PHASE9_ORCHESTRATOR_ENABLED=true — §3.6.2 vector #6
+    #    producer-loop wiring (2026-05-07). Without this, cmd_run's
+    #    interaction-matrix recorder no-ops and /phase9 partners
+    #    stays empty regardless of cadence runs. Setting it here
+    #    populates .jarvis/graduation_interaction_matrix.jsonl
+    #    automatically — operator-binding decision: explicit
+    #    cadence-host opt-in (no silent no-op in production).
+    #
     # All default OFF in the codebase. Cron sets them locally for this
     # invocation only — no global state mutation.
     cat <<EOF
@@ -139,7 +147,8 @@ $BEGIN_MARKER
 # Contract consultation (P9.2) blocks 0-op false-graduation.
 # Circuit breaker (Option C) keeps logs mathematically pure on DW topology block.
 # Graduation ledger enabled so parent harness persists clean counts.
-$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_CADENCE_KIND=cron /usr/bin/env python3 $REPO_ROOT/scripts/cadence_preflight.py --cadence-kind cron && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true OUROBOROS_BATTLE_SEED_INTENTS=3 /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
+# Phase 9 orchestrator enabled so interaction-matrix populates as cadence runs.
+$CRON_SCHEDULE cd $REPO_ROOT && JARVIS_CADENCE_KIND=cron /usr/bin/env python3 $REPO_ROOT/scripts/cadence_preflight.py --cadence-kind cron && JARVIS_GRADUATION_LEDGER_ENABLED=true JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true JARVIS_PHASE9_ORCHESTRATOR_ENABLED=true OUROBOROS_BATTLE_SEED_INTENTS=3 /usr/bin/env python3 $HARNESS_SCRIPT run --cost-cap $COST_CAP --max-wall-seconds $WALL_CAP --timeout $TIMEOUT >> $LOG_DIR/$LOG_FILE_TEMPLATE 2>&1
 $END_MARKER
 EOF
 }
@@ -258,6 +267,7 @@ run_once() {
         JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true \
         JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true \
         JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true \
+        JARVIS_PHASE9_ORCHESTRATOR_ENABLED=true \
         OUROBOROS_BATTLE_SEED_INTENTS=3 \
         python3 "$HARNESS_SCRIPT" run \
         --cost-cap "$COST_CAP" \
