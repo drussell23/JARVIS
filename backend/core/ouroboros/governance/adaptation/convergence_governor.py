@@ -212,11 +212,54 @@ class ConvergenceGovernor:
                 break
 
     def _persist_beliefs(self) -> Tuple[bool, str]:
+        """Persist all tracked belief states. §33.4 canonical
+        substrate (Wave 3 hygiene closure 2026-05-07): wraps the
+        truncate-rewrite in ``cross_process_jsonl.flock_critical
+        _section`` so concurrent writers (sister process / cron-
+        soak) cannot interleave bytes mid-write. Lazy-imported
+        with NEVER-raises fallback to legacy in-process-only
+        write when the substrate is unavailable (rollback
+        branch). Closes §3.6.2 vector #3."""
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return (False, f"persist_beliefs_failed:{exc}")
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_critical_section,
+            )
+        except ImportError:
+            return self._persist_beliefs_legacy()
+        try:
+            with flock_critical_section(self._state_path) as acquired:
+                if not acquired:
+                    return (False, "persist_beliefs_failed:flock_unacquired")
+                with self._state_path.open("w", encoding="utf-8") as f:
+                    for bs in self._beliefs.values():
+                        line = json.dumps(
+                            bs.to_dict(), separators=(",", ":"),
+                        )
+                        f.write(line + "\n")
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+        except OSError as exc:
+            return (False, f"persist_beliefs_failed:{exc}")
+        return (True, "ok")
+
+    def _persist_beliefs_legacy(self) -> Tuple[bool, str]:
+        """Pre-Wave-3 fallback path — kept as a NEVER-raises
+        fallback when the canonical ``cross_process_jsonl``
+        substrate is unavailable. NOT the canonical path; the
+        race-free path goes through :meth:`_persist_beliefs`."""
+        try:
             with self._state_path.open("w", encoding="utf-8") as f:
                 for bs in self._beliefs.values():
-                    line = json.dumps(bs.to_dict(), separators=(",", ":"))
+                    line = json.dumps(
+                        bs.to_dict(), separators=(",", ":"),
+                    )
                     f.write(line + "\n")
                 f.flush()
                 try:
@@ -228,10 +271,48 @@ class ConvergenceGovernor:
         return (True, "ok")
 
     def _persist_proof(self, proof: ConvergenceProof) -> Tuple[bool, str]:
+        """Append a convergence proof to the JSONL ledger.
+        §33.4 canonical substrate (Wave 3 hygiene closure
+        2026-05-07): wraps the append in ``cross_process_jsonl
+        .flock_critical_section`` so concurrent writers cannot
+        interleave proof rows mid-write. Lazy-imported with
+        NEVER-raises fallback to legacy unflocked append when
+        the substrate is unavailable. Closes §3.6.2 vector #3."""
         try:
             self._proofs_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return (False, f"persist_proof_failed:{exc}")
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_critical_section,
+            )
+        except ImportError:
+            return self._persist_proof_legacy(proof)
+        try:
+            with flock_critical_section(self._proofs_path) as acquired:
+                if not acquired:
+                    return (False, "persist_proof_failed:flock_unacquired")
+                with self._proofs_path.open("a", encoding="utf-8") as f:
+                    line = json.dumps(
+                        proof.to_dict(), separators=(",", ":"),
+                    )
+                    f.write(line + "\n")
+                    f.flush()
+        except OSError as exc:
+            return (False, f"persist_proof_failed:{exc}")
+        return (True, "ok")
+
+    def _persist_proof_legacy(
+        self, proof: ConvergenceProof,
+    ) -> Tuple[bool, str]:
+        """Pre-Wave-3 fallback path — kept as a NEVER-raises
+        fallback when the canonical ``cross_process_jsonl``
+        substrate is unavailable. NOT the canonical path."""
+        try:
             with self._proofs_path.open("a", encoding="utf-8") as f:
-                line = json.dumps(proof.to_dict(), separators=(",", ":"))
+                line = json.dumps(
+                    proof.to_dict(), separators=(",", ":"),
+                )
                 f.write(line + "\n")
                 f.flush()
         except OSError as exc:
