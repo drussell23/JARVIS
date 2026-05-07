@@ -180,6 +180,14 @@ EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING = (
 # from_band + to_band + confidence + sample_size. Master-flag-gated
 # at the producer site (JARVIS_TOOL_CONFIDENCE_INDICATOR_ENABLED).
 # Operators consume via `/listen filter type=tool_confidence_band_crossed`.
+EVENT_TYPE_MULTI_PRIOR_DISPATCH = "multi_prior_dispatch"
+"""Move 6.5 Slice 4 — fired by ``MultiPriorDispatchObserver``
+on action-recommendation transitions OR whenever a dispatch
+verdict carries cancelled_count > 0 / error_count > 0
+(operator binding 2026-05-07 requires cancelled rolls to be
+ledger-observable, not silent). Chatter-suppressed otherwise."""
+
+
 EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED = (
     "tool_confidence_band_crossed"
 )
@@ -680,6 +688,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CIRCUIT_BREAKER_APPROACHING,      # §37 Slice 8 (PRD §37.7 Tier 1 #6)
     EVENT_TYPE_CAUSAL_ADVISORY_EMITTED,          # §31 U2 Slice 3 (PRD §31.3 empirical wiring)
     EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED,     # §37 Tier 2 #13 Slice 1 (per-tool confidence)
+    EVENT_TYPE_MULTI_PRIOR_DISPATCH,             # Move 6.5 Slice 4 (multi-prior dispatch observer)
 })
 
 
@@ -2470,6 +2479,66 @@ def publish_trajectory_drift_event(
     except Exception:  # noqa: BLE001
         logger.debug(
             "[Stream] trajectory drift event publish exception",
+            exc_info=True,
+        )
+        return None
+
+
+def publish_multi_prior_dispatch_event(
+    *,
+    op_id: str,
+    decision: str,
+    action_recommendation: str,
+    prev_action_recommendation: str,
+    consensus_outcome: str,
+    completed_count: int,
+    cancelled_count: int,
+    timeout_count: int,
+    error_count: int,
+    cost_total_usd: float,
+    wall_clock_s: float,
+    ts_unix: float,
+) -> Optional[str]:
+    """Best-effort publisher for ``multi_prior_dispatch``
+    frames (Move 6.5 Slice 4, 2026-05-07). Fired by
+    ``MultiPriorDispatchObserver`` on action-recommendation
+    transitions OR whenever a dispatch verdict carries
+    ``cancelled_count > 0`` / ``error_count > 0`` (operator
+    binding 2026-05-07: cancelled rolls MUST be ledger-
+    observable, not silent). Same-action ticks with no
+    cancellations / errors are chatter-suppressed.
+
+    NEVER raises; returns the published event id or None on
+    master-flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        payload: Dict[str, Any] = {
+            "op_id": op_id or "",
+            "decision": decision or "",
+            "action_recommendation": (
+                action_recommendation or ""
+            ),
+            "prev_action_recommendation": (
+                prev_action_recommendation or ""
+            ),
+            "consensus_outcome": consensus_outcome or "",
+            "completed_count": int(completed_count),
+            "cancelled_count": int(cancelled_count),
+            "timeout_count": int(timeout_count),
+            "error_count": int(error_count),
+            "cost_total_usd": float(cost_total_usd),
+            "wall_clock_s": float(wall_clock_s),
+            "ts_unix": float(ts_unix),
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_MULTI_PRIOR_DISPATCH,
+            "multi_prior_dispatch",
+            payload,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] multi_prior_dispatch publish exception",
             exc_info=True,
         )
         return None
