@@ -531,8 +531,38 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
     idle_fr = _idle_fraction(snap.idle_elapsed_s, snap.idle_timeout_s)
     parts: List[str] = []
 
+    # §38 Slice 1 (PRD v2.57→v2.58, 2026-05-07) — posture
+    # mood-ring badge in LEAD position. Posture is O+V's most
+    # unique signal (CC structurally cannot replicate it);
+    # putting it first makes the differentiation visually
+    # omnipresent. Master-flag-gated; pre-§38-Slice-1 byte-
+    # identical render preserved when off.
+    if not compact:
+        try:
+            posture_tok = _format_posture_badge_token()
+            if posture_tok:
+                parts.append(posture_tok)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
     phase_txt = _format_phase(snap)
     parts.append(f"Phase: {phase_txt}")
+
+    # §38 Slice 2 (PRD v2.58→v2.59, 2026-05-07) — pipeline
+    # progress bar appended after the phase label. Renders the
+    # 11-phase deterministic FSM position uniquely (CC's loose
+    # stages structurally cannot match this granularity).
+    # Master-flag-gated; pre-§38-Slice-2 byte-identical when
+    # off.
+    if not compact:
+        try:
+            progress_tok = _format_pipeline_progress_token(
+                phase=snap.phase,
+            )
+            if progress_tok:
+                parts.append(progress_tok)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
 
     cost_txt = f"Cost: ${snap.cost_spent_usd:.2f} / ${snap.cost_budget_usd:.2f}"
     if cost_fr >= (warn_threshold_pct() / 100.0):
@@ -627,6 +657,60 @@ def _format_hotkey_legend(*, max_entries: int = 4) -> str:
             format_footer_legend,
         )
         return format_footer_legend(max_entries=max_entries)
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
+
+
+def _format_pipeline_progress_token(*, phase: Any) -> str:
+    """Compose ``pipeline_progress.format_pipeline_progress(phase)``.
+    NEVER raises. Returns empty string when:
+
+      * Master flag off (JARVIS_PIPELINE_PROGRESS_BAR_ENABLED)
+      * phase is empty / not in canonical forward-flow
+
+    §38 Slice 2 (PRD v2.58→v2.59, 2026-05-07) — composes
+    canonical `governance/pipeline_progress.format_pipeline_-
+    progress` which in turn composes
+    `op_context.OperationPhase` (the canonical phase enum) +
+    `_FORWARD_FLOW_PHASE_NAMES` (11-phase canonical pipeline,
+    AST-pinned subset of OperationPhase).
+
+    Phase string from ``StatusSnapshot.phase`` flows in as a
+    string (e.g., ``"GENERATE"``); the aggregator's
+    ``phase_index`` accepts strings via the same defensive
+    coercion as ``palette_for_posture``."""
+    try:
+        if not phase:
+            return ""
+        from backend.core.ouroboros.governance.pipeline_progress import (  # noqa: E501
+            format_pipeline_progress,
+        )
+        return format_pipeline_progress(
+            phase=phase,
+            show_phase_name=False,  # phase already shown by _format_phase
+            show_position=True,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
+
+
+def _format_posture_badge_token() -> str:
+    """Compose ``posture_palette.format_posture_badge()`` into
+    the lead-position status-line token. NEVER raises. Returns
+    empty string when:
+      * master flag off (JARVIS_POSTURE_MOOD_RING_ENABLED)
+      * posture store unwired (boot incomplete / test harness)
+      * no current reading on disk
+
+    §38 Slice 1 (PRD v2.57→v2.58, 2026-05-07) — composes
+    canonical `governance/posture_palette.format_posture_badge`
+    which in turn composes `posture_repl._default_store` →
+    `PostureStore.load_current()` → `PostureReading.posture`."""
+    try:
+        from backend.core.ouroboros.governance.posture_palette import (  # noqa: E501
+            format_posture_badge,
+        )
+        return format_posture_badge(plain=True)
     except Exception:  # noqa: BLE001 — defensive
         return ""
 
