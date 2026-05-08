@@ -51,6 +51,31 @@ class MergeCoordinator:
                     else:
                         seen_paths.add(path)
             if conflicts:
+                # Phase 4 A6 — audit BEFORE raise. Master-flag-
+                # gated + try/except wrapped; NEVER raises so
+                # the canonical RuntimeError escalation path
+                # is preserved byte-identical.
+                try:
+                    from backend.core.ouroboros.governance.saga.merge_conflict_audit import (  # noqa: E501
+                        MergeConflictKind,
+                        record_merge_conflict,
+                    )
+                    record_merge_conflict(
+                        kind=MergeConflictKind.OWNED_PATH,
+                        graph_id=graph.graph_id,
+                        repo=repo,
+                        barrier_id=barrier_id,
+                        conflict_units=tuple(
+                            sorted(conflicts),
+                        ),
+                        detail=(
+                            f"merge_coordinator:owned_path_conflict:"
+                            f"{repo}:{barrier_id}:"
+                            f"{sorted(conflicts)}"
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 — defensive
+                    pass
                 raise RuntimeError(
                     f"merge_coordinator:owned_path_conflict:{repo}:{barrier_id}:{sorted(conflicts)}"
                 )
@@ -104,6 +129,33 @@ class MergeCoordinator:
                     continue
                 for patched in result.patch.files:
                     if patched.path in existing_paths:
+                        # Phase 4 A6 — audit BEFORE raise.
+                        try:
+                            from backend.core.ouroboros.governance.saga.merge_conflict_audit import (  # noqa: E501
+                                MergeConflictKind,
+                                record_merge_conflict,
+                            )
+                            record_merge_conflict(
+                                kind=(
+                                    MergeConflictKind
+                                    .DUPLICATE_FILE
+                                ),
+                                graph_id=decision.graph_id,
+                                repo=decision.repo,
+                                barrier_id=(
+                                    decision.barrier_id
+                                ),
+                                conflict_units=(unit_id,),
+                                paths=(patched.path,),
+                                detail=(
+                                    f"merge_coordinator:"
+                                    f"duplicate_file_path:"
+                                    f"{decision.repo}:"
+                                    f"{patched.path}"
+                                ),
+                            )
+                        except Exception:  # noqa: BLE001 — defensive
+                            pass
                         raise RuntimeError(
                             f"merge_coordinator:duplicate_file_path:{decision.repo}:{patched.path}"
                         )
@@ -111,6 +163,32 @@ class MergeCoordinator:
                     existing_paths.add(patched.path)
                 for path, content in result.patch.new_content:
                     if path in existing_new_paths:
+                        # Phase 4 A6 — audit BEFORE raise.
+                        try:
+                            from backend.core.ouroboros.governance.saga.merge_conflict_audit import (  # noqa: E501
+                                MergeConflictKind,
+                                record_merge_conflict,
+                            )
+                            record_merge_conflict(
+                                kind=(
+                                    MergeConflictKind
+                                    .DUPLICATE_NEW_CONTENT
+                                ),
+                                graph_id=decision.graph_id,
+                                repo=decision.repo,
+                                barrier_id=(
+                                    decision.barrier_id
+                                ),
+                                conflict_units=(unit_id,),
+                                paths=(path,),
+                                detail=(
+                                    f"merge_coordinator:"
+                                    f"duplicate_new_content:"
+                                    f"{decision.repo}:{path}"
+                                ),
+                            )
+                        except Exception:  # noqa: BLE001 — defensive
+                            pass
                         raise RuntimeError(
                             f"merge_coordinator:duplicate_new_content:{decision.repo}:{path}"
                         )
