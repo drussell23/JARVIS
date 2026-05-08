@@ -237,6 +237,15 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_DASHBOARD_RENDERED = "dashboard_rendered"
+"""§39 Tier-2 #1 (PRD v2.71→v2.72, 2026-05-08) — fired by
+``organism_dashboard.aggregate_dashboard`` after each fresh
+multi-pane composition. Payload carries layout +
+pane-name list + per-pane size summary (NOT the full
+rendered text — bounded payload). Composes ALL 8
+canonical pane render-surfaces."""
+
+
 EVENT_TYPE_PHASE_FLOW_UPDATED = "phase_flow_updated"
 """§39 Tier-1 #14 (PRD v2.70→v2.71, 2026-05-08) — fired by
 ``phase_flow_ribbon.aggregate_phase_flow`` after each fresh
@@ -817,6 +826,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED,       # §38.11-E (proactive proposal surface ledger entry)
     EVENT_TYPE_CAPABILITY_CONSTELLATION_UPDATED, # §38.11-F (capability constellation snapshot refresh)
     EVENT_TYPE_PHASE_FLOW_UPDATED,               # §39 Tier-1 #14 (phase-flow ribbon snapshot)
+    EVENT_TYPE_DASHBOARD_RENDERED,               # §39 Tier-2 #1 (organism dashboard multi-pane snapshot)
 })
 
 
