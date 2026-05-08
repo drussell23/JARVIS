@@ -128,11 +128,14 @@ class TestCadencePolicy:
         # 10 Pass B (Phase 7.1-7.6 + 7.9 + Items 2 + Item 3 prober +
         # Item 3 bridges) + 5 Pass C mining surfaces + 9 added in
         # Phase 9.1 (5 Phase 8 substrate + 3 Phase 8 surface +
-        # CuriosityEngine).
+        # CuriosityEngine) + Move 6.5 (5 producer flags) +
+        # Phase 3 (3 observability bridges) = 32 total.
         # NOTE: 7.7+7.8 + AST Rule 7+8 not in policy because already
         # default-true (security hardening on by default).
-        assert len(CADENCE_POLICY) == 24
-        assert len(known_flags()) == 24
+        # Slice 6 of Move 6.5 is harness default-TRUE — NOT a
+        # graduation candidate.
+        assert len(CADENCE_POLICY) == 32
+        assert len(known_flags()) == 32
 
     def test_pass_b_default_3_clean(self):
         # All Pass B entries require 3 clean sessions.

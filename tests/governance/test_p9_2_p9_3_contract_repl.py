@@ -490,7 +490,13 @@ def test_live_queue_renders_24_flags(
     _enable_repl(monkeypatch)
     r = dispatch_graduate(["live-queue"])
     assert r.status == DispatchStatus.OK
-    assert "24 flags" in r.output
+    # Live tally — depends on len(CADENCE_POLICY); the help-
+    # text helper now uses dynamic length so test is robust
+    # to future flag additions.
+    from backend.core.ouroboros.governance.adaptation.graduation_ledger import (  # noqa: E501
+        CADENCE_POLICY,
+    )
+    assert f"{len(CADENCE_POLICY)} flags" in r.output
 
 
 def test_live_queue_master_off(monkeypatch: pytest.MonkeyPatch):

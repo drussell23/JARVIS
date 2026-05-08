@@ -251,6 +251,28 @@ _FLAG_TO_CORPUS_CATEGORIES: Dict[str, Tuple[str, ...]] = {
     # Phase 7.5 — Category-weight rebalance (no direct corpus
     # category)
     "JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_CATEGORY_WEIGHTS": (),
+    # ----------------------------------------------------------------
+    # Move 6.5 — Multi-Prior Speculative Execution
+    # No direct P9.4 corpus coverage (Move 6.5 is a defense-
+    # in-depth EXTENSION on consensus, not a primary cage
+    # layer — divergence escalates to operator review rather
+    # than rejecting via cage). All UNKNOWN until probe
+    # coverage extends.
+    # ----------------------------------------------------------------
+    "JARVIS_MULTI_PRIOR_PLANNING_ENABLED": (),
+    "JARVIS_MULTI_PRIOR_RUNNER_ENABLED": (),
+    "JARVIS_MULTI_PRIOR_DISPATCH_ENABLED": (),
+    "JARVIS_MULTI_PRIOR_OBSERVER_ENABLED": (),
+    "JARVIS_MULTI_PRIOR_CANVAS_ENABLED": (),
+    # ----------------------------------------------------------------
+    # Phase 3 — Autonomy observability trio (read-only)
+    # No corpus coverage applicable — these are pure
+    # observability surfaces (no cage layer, no mutation
+    # path). All UNKNOWN by design.
+    # ----------------------------------------------------------------
+    "JARVIS_EXECUTION_MONITOR_BRIDGE_ENABLED": (),
+    "JARVIS_EXEC_GRAPH_BRIDGE_ENABLED": (),
+    "JARVIS_COMMAND_BUS_BRIDGE_ENABLED": (),
 }
 
 

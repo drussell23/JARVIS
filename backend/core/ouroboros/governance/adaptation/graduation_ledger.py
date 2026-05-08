@@ -333,6 +333,89 @@ CADENCE_POLICY: Tuple[CadencePolicyEntry, ...] = (
             "CuriosityEngine — POSTMORTEM clusters → falsifiable hypotheses"
         ),
     ),
+    # ----------------------------------------------------------------
+    # Move 6.5 — Multi-Prior Speculative Execution (5 producer flags;
+    # Slice 6 is harness default-TRUE, NOT a graduation candidate)
+    # ----------------------------------------------------------------
+    CadencePolicyEntry(
+        flag_name="JARVIS_MULTI_PRIOR_PLANNING_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Move 6.5 Slice 1 — multi-prior materializer "
+            "(pure decision; no I/O)"
+        ),
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_MULTI_PRIOR_RUNNER_ENABLED",
+        required_clean_sessions=5,
+        cadence_class=CadenceClass.PASS_C,
+        description=(
+            "Move 6.5 Slice 2 — K-prior async runner with "
+            "cost-cap watchdog (mutation surface — Pass C bar)"
+        ),
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_MULTI_PRIOR_DISPATCH_ENABLED",
+        required_clean_sessions=5,
+        cadence_class=CadenceClass.PASS_C,
+        description=(
+            "Move 6.5 Slice 3 — dispatch adapter (route + "
+            "posture gate composition; Pass C bar — gates "
+            "actual K-prior firing)"
+        ),
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_MULTI_PRIOR_OBSERVER_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Move 6.5 Slice 4 — observer trio "
+            "(read-only ledger + chatter-suppressed SSE)"
+        ),
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_MULTI_PRIOR_CANVAS_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Move 6.5 Slice 5 — canvas + diff-fan-out "
+            "renderer (read-only operator surface)"
+        ),
+    ),
+    # ----------------------------------------------------------------
+    # Phase 3 — Autonomy observability trio (3 read-only bridges)
+    # ----------------------------------------------------------------
+    CadencePolicyEntry(
+        flag_name="JARVIS_EXECUTION_MONITOR_BRIDGE_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Phase 3 A1 — orchestrator terminal-state path "
+            "→ canonical ExecutionMonitor singleton + "
+            "bounded JSONL ledger"
+        ),
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_EXEC_GRAPH_BRIDGE_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Phase 3 A2 — read-only projection of canonical "
+            "ExecutionGraphProgressTracker → SerpentFlow / "
+            "canvas / SSE"
+        ),
+    ),
+    CadencePolicyEntry(
+        flag_name="JARVIS_COMMAND_BUS_BRIDGE_ENABLED",
+        required_clean_sessions=3,
+        cadence_class=CadenceClass.PASS_B,
+        description=(
+            "Phase 3 A3 — read-only polling of canonical "
+            "CommandBus.snapshot_all() with chatter-suppressed "
+            "delta emission"
+        ),
+    ),
 )
 
 

@@ -87,6 +87,16 @@ class DispatchResult:
 
 
 def render_help() -> str:
+    # Compose dynamic flag count — eliminates hardcode drift
+    # as new flags land. Lazy-import to avoid widening the
+    # graduate_repl import graph at module load.
+    try:
+        from backend.core.ouroboros.governance.adaptation.graduation_ledger import (  # noqa: E501
+            CADENCE_POLICY,
+        )
+        _flag_count = len(CADENCE_POLICY)
+    except Exception:  # noqa: BLE001 — defensive
+        _flag_count = 0
     return (
         "/graduate — track per-loader graduation cadences\n"
         "\n"
@@ -99,7 +109,7 @@ def render_help() -> str:
         "                                      (outcome: clean|infra|runner|migration)\n"
         "\n"
         "Live-fire (Phase 9.3 extensions, read-only over harness state):\n"
-        "  live-queue                        — show 24-flag soak queue + dep state\n"
+        f"  live-queue                        — show {_flag_count} flags soak queue + dep state\n"
         "  live-evidence <flag>              — show all evidence rows for flag\n"
         "  live-next                         — what pick-next would return (dry run)\n"
         "  live-contracts                    — show flags with custom GraduationContracts\n"
