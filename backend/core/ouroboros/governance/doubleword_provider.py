@@ -357,7 +357,11 @@ class DoublewordProvider:
             )
         except Exception:
             return self._model
-        override = get_topology().model_for_route(route)
+        # Phase 10 Slice 5a — unified deletion-side helper. Branches
+        # on JARVIS_TOPOLOGY_SENTINEL_ENABLED internally; v2 path
+        # returns first element of dw_models_for_route (catalog-first
+        # → yaml fallback); v1 path is byte-identical to model_for_route.
+        override = get_topology().model_for_route_unified(route)
         return override or self._model
 
     # ------------------------------------------------------------------

@@ -182,19 +182,22 @@ def should_circuit_break(
             type(exc).__name__,
         )
 
+    # Phase 10 Slice 5a — unified deletion-side helper. Branches on
+    # JARVIS_TOPOLOGY_SENTINEL_ENABLED internally; preserves v1
+    # block_mode vocabulary so downstream `!= "skip_and_queue"`
+    # check is byte-identical across the migration.
     try:
-        dw_allowed = topology.dw_allowed_for_route(route_norm)
+        is_blocked, _reason, block_mode = (
+            topology.is_dw_blocked_for_route(route_norm)
+        )
     except Exception as exc:  # noqa: BLE001
-        return (False, f"dw_allowed_check_error:{type(exc).__name__}")
+        return (
+            False,
+            f"dw_blocked_check_error:{type(exc).__name__}",
+        )
 
-    if dw_allowed:
+    if not is_blocked:
         return (False, "dw_allowed")
-
-    # DW NOT allowed — check block_mode.
-    try:
-        block_mode = topology.block_mode_for_route(route_norm)
-    except Exception as exc:  # noqa: BLE001
-        return (False, f"block_mode_check_error:{type(exc).__name__}")
 
     if block_mode != "skip_and_queue":
         # cascade_to_claude (or unknown mode) — caller's late-detection

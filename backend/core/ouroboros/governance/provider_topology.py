@@ -433,6 +433,144 @@ class ProviderTopology:
         env-knob defaults with yaml-driven values."""
         return self.monitor
 
+    # ------------------------------------------------------------------
+    # Phase 10 Slice 5a — Deletion-side unified helpers
+    # ------------------------------------------------------------------
+    #
+    # Operator binding 2026-05-07 (verbatim): "Slice 5 deletion-side
+    # substrate (delete redundant `dw_allowed: false` + `block_mode:`
+    # lines from yaml; migrate readers to topology.2-only methods)".
+    #
+    # The yaml deletion is gated on `phase10_graduation_contract.
+    # is_ready_for_purge() == READY_FOR_PURGE` (operator-paced;
+    # requires 3 forced-clean once-proofs). Until then, callers
+    # MUST route through the unified helpers below — they branch
+    # on `JARVIS_TOPOLOGY_SENTINEL_ENABLED` to derive from v2 when
+    # the master is on (yaml v1 fields irrelevant) and v1 when the
+    # master is off (current production behavior preserved
+    # byte-identical).
+    #
+    # AST-pinned via `phase10_v1_topology_methods_routed_through_helper`
+    # (see :func:`register_shipped_invariants` below): production
+    # code outside this module + tests MUST call the unified
+    # helpers, not the v1 methods directly. New v1-method call
+    # sites are forbidden by construction.
+
+    def is_dw_blocked_for_route(
+        self, route: str,
+    ) -> Tuple[bool, str, str]:
+        """Phase 10 Slice 5a deletion-side unified helper.
+
+        Returns ``(is_blocked, reason, block_mode_v1_vocab)`` for
+        *route*, branching on
+        ``JARVIS_TOPOLOGY_SENTINEL_ENABLED``:
+
+          * Master ON → derives from v2 methods
+            (:meth:`dw_models_for_route` +
+            :meth:`fallback_tolerance_for_route`). Yaml v1
+            fields (``dw_allowed``, ``block_mode``) become
+            irrelevant runtime inputs and can be deleted safely
+            in Slice 5b after :func:`is_ready_for_purge` returns
+            ``READY_FOR_PURGE``.
+          * Master OFF → derives from v1 methods
+            (:meth:`dw_allowed_for_route` +
+            :meth:`block_mode_for_route`). Byte-identical to
+            pre-Phase-10 production behavior.
+
+        ``block_mode`` is returned in the **v1 vocabulary**
+        (``"cascade_to_claude"`` / ``"skip_and_queue"``) so
+        existing call-site string matches keep working across
+        the migration. The v2→v1 translation:
+
+          * v2 ``"queue"`` → v1 ``"skip_and_queue"``
+          * v2 ``"cascade_to_claude"`` (or anything else) → v1
+            ``"cascade_to_claude"``
+
+        Operator binding 2026-05-07: "no second parallel retry
+        loop with divergent env knobs without consolidating
+        names" — single env knob
+        ``JARVIS_TOPOLOGY_SENTINEL_ENABLED`` gates the
+        migration. NEVER raises.
+        """
+        if not self.enabled:
+            return (False, "topology_disabled", "cascade_to_claude")
+
+        sentinel_on = os.environ.get(
+            "JARVIS_TOPOLOGY_SENTINEL_ENABLED", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        reason = self.reason_for_route(route)
+
+        if sentinel_on:
+            # v2 path — yaml v1 fields irrelevant. Slice 5b
+            # deletion is safe under this branch.
+            try:
+                has_dw = bool(self.dw_models_for_route(route))
+            except Exception:  # noqa: BLE001 — defensive
+                # On v2 read failure, fail OPEN (DW allowed)
+                # to mirror legacy fail-open posture (line 268
+                # docstring: "Unknown routes and missing
+                # topology both default to True so that the
+                # legacy DW cascade keeps working").
+                return (False, reason, "cascade_to_claude")
+            if has_dw:
+                return (False, reason, "cascade_to_claude")
+            # No DW path — derive block_mode from v2
+            # fallback_tolerance, translate to v1 vocab.
+            try:
+                fallback = self.fallback_tolerance_for_route(route)
+            except Exception:  # noqa: BLE001 — defensive
+                fallback = "cascade_to_claude"
+            block_mode = (
+                "skip_and_queue" if fallback == "queue"
+                else "cascade_to_claude"
+            )
+            return (True, reason, block_mode)
+
+        # v1 path — current production behavior, byte-identical.
+        try:
+            allowed = self.dw_allowed_for_route(route)
+        except Exception:  # noqa: BLE001 — defensive
+            return (False, reason, "cascade_to_claude")
+        if allowed:
+            return (False, reason, "cascade_to_claude")
+        try:
+            block_mode = self.block_mode_for_route(route)
+        except Exception:  # noqa: BLE001 — defensive
+            block_mode = "cascade_to_claude"
+        return (True, reason, block_mode)
+
+    def model_for_route_unified(
+        self, route: str,
+    ) -> Optional[str]:
+        """Phase 10 Slice 5a deletion-side unified per-route
+        model resolver.
+
+        Branches on ``JARVIS_TOPOLOGY_SENTINEL_ENABLED``:
+
+          * Master ON → first element of
+            :meth:`dw_models_for_route` (v2 catalog-first →
+            yaml fallback). Empty list → ``None``.
+          * Master OFF → :meth:`model_for_route` (v1
+            yaml-direct).
+
+        NEVER raises."""
+        if not self.enabled:
+            return None
+        sentinel_on = os.environ.get(
+            "JARVIS_TOPOLOGY_SENTINEL_ENABLED", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if sentinel_on:
+            try:
+                models = self.dw_models_for_route(route)
+            except Exception:  # noqa: BLE001 — defensive
+                return None
+            return models[0] if models else None
+        try:
+            return self.model_for_route(route)
+        except Exception:  # noqa: BLE001 — defensive
+            return None
+
 
 _EMPTY_TOPOLOGY = ProviderTopology(enabled=False)
 
@@ -913,6 +1051,137 @@ def compute_yaml_diff(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Phase 10 Slice 5a — AST pin: forbid new v1-method call sites
+# ---------------------------------------------------------------------------
+
+
+def register_shipped_invariants() -> list:
+    """Auto-discovered. Pins the deletion-side migration:
+
+      ``phase10_v1_topology_methods_routed_through_helper`` —
+      production code under ``backend/core/ouroboros/governance/``
+      MUST NOT call the v1 methods (:meth:`dw_allowed_for_route` /
+      :meth:`block_mode_for_route` / :meth:`model_for_route`)
+      directly. Use :meth:`is_dw_blocked_for_route` /
+      :meth:`model_for_route_unified` instead.
+
+      Operator binding 2026-05-07: the unified helpers branch on
+      ``JARVIS_TOPOLOGY_SENTINEL_ENABLED`` so v1 yaml fields can
+      be deleted safely once :func:`is_ready_for_purge` returns
+      ``READY_FOR_PURGE``. New v1-method call sites would
+      reintroduce hard yaml dependency and block the purge.
+
+      Exemptions: this module itself (the v1 methods are defined
+      here + the unified helpers call them in the master-OFF
+      branch) + the ``tests/`` tree.
+    """
+    import ast
+    from pathlib import Path
+
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    target = (
+        "backend/core/ouroboros/governance/"
+        "provider_topology.py"
+    )
+
+    # v1 method names — bytes-pinned. Forbidden as method calls
+    # outside this module + tests.
+    _FORBIDDEN_V1_METHODS = (
+        "dw_allowed_for_route",
+        "block_mode_for_route",
+        "model_for_route",
+    )
+
+    def _validate_v1_methods_routed_through_helper(
+        tree: "ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Walk every .py under governance/ excluding this module
+        + tests + provider_topology test files. Forbid calls to
+        v1 method names. NEVER raises."""
+        violations: list = []
+        try:
+            governance_root = Path(__file__).resolve().parent
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+        try:
+            files = list(governance_root.rglob("*.py"))
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+        # Self-exempt: this module defines + dispatches v1 methods.
+        self_path = governance_root / "provider_topology.py"
+        for py_path in files:
+            try:
+                if "__pycache__" in py_path.parts:
+                    continue
+                if py_path == self_path:
+                    continue
+                # Allow tests/ tree (defensive — governance/
+                # shouldn't have tests but check just in case).
+                if any(
+                    p in {"tests", "test"}
+                    for p in py_path.parts
+                ):
+                    continue
+            except Exception:  # noqa: BLE001 — defensive
+                continue
+            try:
+                src = py_path.read_text(encoding="utf-8")
+                t = ast.parse(src)
+            except (OSError, UnicodeDecodeError, SyntaxError):
+                continue
+            for node in ast.walk(t):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not isinstance(func, ast.Attribute):
+                    continue
+                if func.attr not in _FORBIDDEN_V1_METHODS:
+                    continue
+                try:
+                    rel = py_path.relative_to(
+                        governance_root,
+                    ).as_posix()
+                except ValueError:
+                    rel = str(py_path)
+                violations.append(
+                    f"{rel}:{node.lineno} forbidden v1 "
+                    f"method call .{func.attr}() — use "
+                    f"is_dw_blocked_for_route() or "
+                    f"model_for_route_unified() instead "
+                    f"(Phase 10 Slice 5a deletion-side)"
+                )
+        return tuple(violations)
+
+    return [
+        ShippedCodeInvariant(
+            invariant_name=(
+                "phase10_v1_topology_methods_"
+                "routed_through_helper"
+            ),
+            target_file=target,
+            description=(
+                "Phase 10 Slice 5a — production code MUST "
+                "NOT call v1 methods (dw_allowed_for_route "
+                "/ block_mode_for_route / model_for_route) "
+                "directly. Use is_dw_blocked_for_route() / "
+                "model_for_route_unified() so the migration "
+                "to topology.2-only methods stays single-"
+                "source-of-truth and the yaml v1 fields can "
+                "be deleted in Slice 5b after contract "
+                "green."
+            ),
+            validate=_validate_v1_methods_routed_through_helper,
+        ),
+    ]
+
+
 __all__ = [
     "CallerTopology",
     "ProviderTopology",
@@ -922,6 +1191,7 @@ __all__ = [
     "compute_yaml_diff",
     "get_topology",
     "reload_topology",
+    "register_shipped_invariants",
     "set_dynamic_catalog",
     "get_dynamic_catalog",
     "clear_dynamic_catalog",

@@ -1820,11 +1820,15 @@ class CandidateGenerator:
             get_topology as _get_topology,
         )
         _topology = _get_topology()
-        if _topology.enabled and not _topology.dw_allowed_for_route(
-            _provider_route,
-        ):
-            _block_reason = _topology.reason_for_route(_provider_route)
-            _block_mode = _topology.block_mode_for_route(_provider_route)
+        # Phase 10 Slice 5a — unified deletion-side helper. Branches
+        # on JARVIS_TOPOLOGY_SENTINEL_ENABLED internally so v1 yaml
+        # fields can be deleted safely in Slice 5b after contract
+        # green. block_mode preserved in v1 vocab — downstream
+        # `== "skip_and_queue"` check unchanged.
+        _is_blocked, _block_reason, _block_mode = (
+            _topology.is_dw_blocked_for_route(_provider_route)
+        )
+        if _topology.enabled and _is_blocked:
             if _block_mode == "skip_and_queue":
                 # Nervous System Reflex (Manifesto §5 — survival supersedes
                 # cost optimization): read-only ops MUST NOT lock up on a
