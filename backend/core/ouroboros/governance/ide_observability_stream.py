@@ -214,6 +214,18 @@ last poll. Operator binding 2026-05-07:
 slices.'"""
 
 
+EVENT_TYPE_THINKING_PROGRESS_TICK = "thinking_progress_tick"
+"""§37 Phase 2 (PRD §37 v2.54→v2.55, 2026-05-07) — fired by
+``ThinkingProgressObserver`` when the active-thinking
+aggregator detects an effort-band OR verb-phrase crossing.
+Chatter-suppressed structurally: identical re-update is
+silent (no SSE fires). Payload carries the
+:class:`ThinkingProgressSnapshot.to_dict()` projection
+(verb_phrase / elapsed_s / tokens_input / tokens_output /
+effort_band / is_active). Composes canonical
+``narrative_channel`` + ``stream_renderer``."""
+
+
 EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED = (
     "tool_confidence_band_crossed"
 )
@@ -717,6 +729,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_MULTI_PRIOR_DISPATCH,             # Move 6.5 Slice 4 (multi-prior dispatch observer)
     EVENT_TYPE_EXECUTION_GRAPH_PROGRESS,         # Phase 3 A2 (read-only projection of canonical tracker)
     EVENT_TYPE_AUTONOMY_COMMAND_BUS,             # Phase 3 A3 (read-only polling of CommandBus.snapshot_all)
+    EVENT_TYPE_THINKING_PROGRESS_TICK,           # §37 Phase 2 (active-thinking aggregator — chatter-suppressed band/verb crossings)
 })
 
 

@@ -578,6 +578,14 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
         except Exception:  # noqa: BLE001 — defensive
             pass
         try:
+            thinking_tok = _format_thinking_token(
+                op_id=snap.primary_op_id,
+            )
+            if thinking_tok:
+                parts.append(thinking_tok)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        try:
             legend_tok = _format_hotkey_legend()
             if legend_tok:
                 parts.append(legend_tok)
@@ -619,6 +627,37 @@ def _format_hotkey_legend(*, max_entries: int = 4) -> str:
             format_footer_legend,
         )
         return format_footer_legend(max_entries=max_entries)
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
+
+
+def _format_thinking_token(*, op_id: str) -> str:
+    """Compose ``thinking_progress_aggregator`` for the given
+    op_id. NEVER raises. Returns empty string when:
+      * master flag off
+      * op_id is empty / unknown
+      * no active THINKING frame for the op
+
+    Phase 2 (PRD §37 v2.54→v2.55, 2026-05-07)."""
+    try:
+        if not op_id:
+            return ""
+        from backend.core.ouroboros.governance.thinking_progress_aggregator import (  # noqa: E501
+            master_enabled,
+            get_default_observer,
+            format_thinking_line,
+        )
+        if not master_enabled():
+            return ""
+        observer = get_default_observer()
+        # update() composes the canonical sources and stores the
+        # snapshot. Returns (snapshot, sse_eligible). We use the
+        # snapshot directly; SSE publish is handled separately by
+        # observer consumers (orchestrator hooks).
+        snapshot, _ = observer.update(op_id=op_id)
+        if snapshot is None:
+            return ""
+        return format_thinking_line(snapshot)
     except Exception:  # noqa: BLE001 — defensive
         return ""
 
