@@ -204,6 +204,18 @@ def read_current_risk_light_safe() -> RiskTierLight:
     )
 
 
+def rich_color_for_light(light: RiskTierLight) -> str:
+    """Public canonical accessor for the Rich color name
+    associated with a :class:`RiskTierLight` value.
+
+    Composed by §39 Tier-1 #2 ambient-tint substrate
+    (``risk_tier_tint.py``) — exposes the single source of
+    truth so consumers don't redefine the GREEN/YELLOW/
+    ORANGE/RED → Rich-color mapping. NEVER raises.
+    """
+    return _LIGHT_RICH_COLORS.get(light, "white")
+
+
 def format_risk_tier_badge(
     *,
     plain: bool = True,

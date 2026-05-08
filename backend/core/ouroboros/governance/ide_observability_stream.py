@@ -237,6 +237,28 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_PHASE_FLOW_UPDATED = "phase_flow_updated"
+"""§39 Tier-1 #14 (PRD v2.70→v2.71, 2026-05-08) — fired by
+``phase_flow_ribbon.aggregate_phase_flow`` after each fresh
+ribbon snapshot composition. Payload carries the
+:class:`PhaseFlowSnapshot.to_dict()` projection (cells +
+active_phase_name + by_density + window_s). Composes
+canonical ``pipeline_progress.forward_flow_phases`` for
+the 11-phase tuple — no parallel phase ordering."""
+
+
+EVENT_TYPE_CAPABILITY_CONSTELLATION_UPDATED = (
+    "capability_constellation_updated"
+)
+"""§38.11-F (PRD v2.69→v2.70, 2026-05-08) — fired by
+``capability_constellation.aggregate_constellation`` after
+each fresh snapshot composition. Payload carries the
+contracted §38.11.5a row 6 fields per star
+(``flag_name`` / ``brightness`` / ``graduation_state`` /
+``linked_principles``) + by_brightness + by_category
+summary maps. Closes §39 #8 by composition."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -793,6 +815,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_PREFETCH_SCHEDULED,               # §38.11-C (anticipatory pre-fetch indicator)
     EVENT_TYPE_DREAM_EMITTED,                    # §38.11-D (DreamEngine DREAM-kind narrative frame committed)
     EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED,       # §38.11-E (proactive proposal surface ledger entry)
+    EVENT_TYPE_CAPABILITY_CONSTELLATION_UPDATED, # §38.11-F (capability constellation snapshot refresh)
+    EVENT_TYPE_PHASE_FLOW_UPDATED,               # §39 Tier-1 #14 (phase-flow ribbon snapshot)
 })
 
 
