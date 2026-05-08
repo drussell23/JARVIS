@@ -223,6 +223,31 @@ session count + transition details. Composes canonical
 ``unified_graduation_dashboard.aggregate_dashboard()``."""
 
 
+EVENT_TYPE_INTERVENTION_BANNER_RAISED = (
+    "intervention_banner_raised"
+)
+"""§38.11-C (PRD v2.66→v2.67, 2026-05-08) — fired by
+``anticipation_surface.AnticipationSurface.record_banner``
+when an autonomy sensor enqueues a proactive op intervening
+in operator's flow. Payload carries the
+:class:`InterventionBannerEvent.to_dict()` projection
+(banner_kind / signal_source / summary / op_id /
+risk_tier_label). Composes canonical NarrativeChannel INTENT
+prose for human-readable rationale; module never produces
+parallel prose."""
+
+
+EVENT_TYPE_PREFETCH_SCHEDULED = "prefetch_scheduled"
+"""§38.11-C (PRD v2.66→v2.67, 2026-05-08) — fired by
+``anticipation_surface.AnticipationSurface.record_prefetch``
+when the PLAN phase / Venom tool loop schedules a tool call
+about to fire BEFORE GENERATE produces a patch. Payload
+carries the :class:`PrefetchEvent.to_dict()` projection
+(op_id / prefetch_kind / tool_name / arg_summary). Five
+prefetch kinds: read_file / search_code / get_callers /
+glob_files / other."""
+
+
 EVENT_TYPE_THINKING_PROGRESS_TICK = "thinking_progress_tick"
 """§37 Phase 2 (PRD §37 v2.54→v2.55, 2026-05-07) — fired by
 ``ThinkingProgressObserver`` when the active-thinking
@@ -740,6 +765,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_AUTONOMY_COMMAND_BUS,             # Phase 3 A3 (read-only polling of CommandBus.snapshot_all)
     EVENT_TYPE_THINKING_PROGRESS_TICK,           # §37 Phase 2 (active-thinking aggregator — chatter-suppressed band/verb crossings)
     EVENT_TYPE_FLAG_GRADUATED,                   # §38.11-B (graduation ticker — flag READY transitions)
+    EVENT_TYPE_INTERVENTION_BANNER_RAISED,       # §38.11-C (proactive intervention banner)
+    EVENT_TYPE_PREFETCH_SCHEDULED,               # §38.11-C (anticipatory pre-fetch indicator)
 })
 
 
