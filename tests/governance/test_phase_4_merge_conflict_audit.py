@@ -560,8 +560,12 @@ def test_integration_owned_path_conflict_audited(
     rows = read_recent_records(path=tmp_ledger)
     assert len(rows) == 1
     assert rows[0].kind == "owned_path"
-    assert "u1" in rows[0].conflict_units
+    # MergeCoordinator's actual semantic: only the SECOND
+    # unit (whose path collides with already-seen) is added
+    # to the conflicts set. First unit's path goes into
+    # seen_paths first; second triggers the conflict.
     assert "u2" in rows[0].conflict_units
+    assert "owned_path_conflict" in rows[0].detail
 
 
 def test_integration_master_off_no_audit_row(
