@@ -237,6 +237,19 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
+    "proactive_proposal_emitted"
+)
+"""§38.11-E (PRD v2.68→v2.69, 2026-05-08) — fired by
+``proactive_proposal_surface.ProactiveProposalLedger.record``
+when one of the 4 canonical producers (curiosity / capability
+gap / opportunity / architecture) emits a new proposal.
+Payload carries the :class:`ProactiveProposal.to_dict()`
+projection (proposal_id / kind / signal_source / summary /
+rationale / priority_hint / decision). Closes §39 #11
+"Capability gap proactive proposals" by composition."""
+
+
 EVENT_TYPE_DREAM_EMITTED = "dream_emitted"
 """§38.11-D (PRD v2.67→v2.68, 2026-05-08) — fired by
 ``introspective_voice.emit_dream_prose`` when DreamEngine's
@@ -779,6 +792,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_INTERVENTION_BANNER_RAISED,       # §38.11-C (proactive intervention banner)
     EVENT_TYPE_PREFETCH_SCHEDULED,               # §38.11-C (anticipatory pre-fetch indicator)
     EVENT_TYPE_DREAM_EMITTED,                    # §38.11-D (DreamEngine DREAM-kind narrative frame committed)
+    EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED,       # §38.11-E (proactive proposal surface ledger entry)
 })
 
 
