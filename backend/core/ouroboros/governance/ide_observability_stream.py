@@ -214,6 +214,15 @@ last poll. Operator binding 2026-05-07:
 slices.'"""
 
 
+EVENT_TYPE_FLAG_GRADUATED = "flag_graduated"
+"""§38.11-B (PRD v2.65→v2.66, 2026-05-07) — fired by
+``session_continuity.GraduationTicker`` when a flag transitions
+to READY in :class:`UnifiedGraduationVerdict` (eligible for
+default-true flip). Payload carries the flag name + clean
+session count + transition details. Composes canonical
+``unified_graduation_dashboard.aggregate_dashboard()``."""
+
+
 EVENT_TYPE_THINKING_PROGRESS_TICK = "thinking_progress_tick"
 """§37 Phase 2 (PRD §37 v2.54→v2.55, 2026-05-07) — fired by
 ``ThinkingProgressObserver`` when the active-thinking
@@ -730,6 +739,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_EXECUTION_GRAPH_PROGRESS,         # Phase 3 A2 (read-only projection of canonical tracker)
     EVENT_TYPE_AUTONOMY_COMMAND_BUS,             # Phase 3 A3 (read-only polling of CommandBus.snapshot_all)
     EVENT_TYPE_THINKING_PROGRESS_TICK,           # §37 Phase 2 (active-thinking aggregator — chatter-suppressed band/verb crossings)
+    EVENT_TYPE_FLAG_GRADUATED,                   # §38.11-B (graduation ticker — flag READY transitions)
 })
 
 
