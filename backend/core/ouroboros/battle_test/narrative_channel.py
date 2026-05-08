@@ -580,6 +580,80 @@ class NarrativeChannel:
                 if self._active_keys.get(composite) == ref:
                     self._active_keys.pop(composite, None)
 
+    # ---- read-only query API (Phase 2 read-API extension, 2026-05-07) ----
+
+    def frames_by_op_kind(
+        self,
+        *,
+        op_id: str,
+        kind: NarrativeKind,
+        states: Optional[Tuple[FrameState, ...]] = None,
+    ) -> Tuple["NarrativeFrame", ...]:
+        """Return frames matching ``(op_id, kind)`` in registration
+        order. Pure read; NEVER raises.
+
+        Phase 2 (PRD §37 v2.54→v2.55, 2026-05-07): canonical
+        operator-facing read API for the ThinkingProgressObserver
+        aggregator. Eliminates the need for downstream consumers
+        to reach into ``self._items`` private state.
+
+        ``states`` filter — when provided, only frames whose state
+        is in the tuple are returned. Default ``None`` returns
+        every state (BUFFERING + COMMITTED + DISCARDED).
+
+        Empty / invalid ``op_id`` returns empty tuple. Pure read."""
+        try:
+            op_safe = _safe_str(op_id)
+            kind_enum = NarrativeKind.coerce(kind)
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+        with self._lock:
+            out = []
+            for frame in self._items.values():
+                if frame.op_id != op_safe:
+                    continue
+                if frame.kind is not kind_enum:
+                    continue
+                if (
+                    states is not None
+                    and frame.state not in states
+                ):
+                    continue
+                out.append(frame)
+            return tuple(out)
+
+    def active_thinking_frame(
+        self, *, op_id: str,
+    ) -> Optional["NarrativeFrame"]:
+        """Return the BUFFERING THINKING frame for ``op_id`` if
+        one exists, else None. O(1) via composite-key lookup;
+        canonical aggregator-facing accessor.
+
+        Pure read; NEVER raises. Used by
+        :class:`ThinkingProgressObserver` to bind verb-phrase to
+        an op without iterating all frames."""
+        try:
+            op_safe = _safe_str(op_id)
+        except Exception:  # noqa: BLE001 — defensive
+            return None
+        with self._lock:
+            # Composite key is (op_id, phase, kind); we don't
+            # know phase but THINKING is typically GENERATE.
+            # Walk the active-keys index for any (op_safe, *,
+            # THINKING) match.
+            target_kind = NarrativeKind.THINKING.value
+            for (k_op, _phase, k_kind), ref in (
+                self._active_keys.items()
+            ):
+                if k_op == op_safe and k_kind == target_kind:
+                    frame = self._items.get(ref)
+                    if (
+                        frame is not None
+                        and frame.state is FrameState.BUFFERING
+                    ):
+                        return frame
+            return None
+
 
 # ===========================================================================
 # Module singleton

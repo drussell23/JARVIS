@@ -557,7 +557,70 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
         if badge:
             parts.append(badge)
 
+    # Phase 1 (PRD §37 v2.53→v2.54, 2026-05-07) — operation
+    # mode + hotkey legend. Composes canonical sources:
+    #
+    #   * Mode token from operation_mode.current_mode() — single
+    #     source of truth for PLAN/ANALYZE/APPLY/AUTO axis.
+    #     Gated on operation_mode.master_enabled() so mode-master-
+    #     off renders byte-identical to pre-Phase-1.
+    #   * Hotkey legend from keybinding_registry.format_footer_-
+    #     legend() — single source of truth for operator-visible
+    #     bindings; AST-pinned no-hardcoded-strings.
+    #
+    # Compact mode skips both (matches pre-existing compact
+    # behavior — minimum-noise breadcrumb only).
+    if not compact:
+        try:
+            mode_tok = _format_mode_token()
+            if mode_tok:
+                parts.append(mode_tok)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        try:
+            legend_tok = _format_hotkey_legend()
+            if legend_tok:
+                parts.append(legend_tok)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
     return " · ".join(parts)
+
+
+def _format_mode_token() -> str:
+    """Compose ``operation_mode.current_mode()`` into a footer
+    token. NEVER raises — failure returns empty string.
+
+    Renders ``mode:plan`` / ``mode:analyze`` / ``mode:apply`` /
+    ``mode:auto``. Master-off → empty (no token surfaces;
+    pre-Phase-1 byte-identical render preserved).
+    """
+    try:
+        from backend.core.ouroboros.governance.operation_mode import (  # noqa: E501
+            current_mode,
+            master_enabled,
+        )
+        if not master_enabled():
+            return ""
+        mode = current_mode()
+        # mode is OperationMode enum; .value is the canonical
+        # short string used by /mode REPL verb + AST pins.
+        return f"mode:{mode.value}"
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
+
+
+def _format_hotkey_legend(*, max_entries: int = 4) -> str:
+    """Compose ``keybinding_registry.format_footer_legend()``.
+    NEVER raises. Returns empty string when registry is empty
+    OR seeding failed."""
+    try:
+        from backend.core.ouroboros.governance.keybinding_registry import (  # noqa: E501
+            format_footer_legend,
+        )
+        return format_footer_legend(max_entries=max_entries)
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
 
 
 # NOTE: ``_format_html`` (prompt_toolkit HTML rendering for the legacy
