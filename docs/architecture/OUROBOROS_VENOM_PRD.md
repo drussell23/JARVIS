@@ -1,7 +1,9 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.55 (2026-05-07 — **§37 UX Phase 2 SHIPPED + cumulative session post-Phase-2 totals**: Phase 2 closes the operator-flagged "active-thinking timer missing" gap from the v2.53 UX comparison (CC's screenshot shows `* Investigating runner attribution root cause… (6m 52s · ↓ 24.0k tokens · almost done thinking with high effort)` as a single rendered line). New canonical substrate `governance/thinking_progress_aggregator.py` (~700 LOC pure-stdlib): closed 4-value `EffortBand` enum + frozen §33.5 `ThinkingProgressSnapshot` + 6 env-overridable threshold knobs (operator binding "no hardcoding") + pure-function `compute_effort_band` (deterministic strictest-axis-wins) + `derive_verb_phrase` (gerund-pattern + fallback) + `format_thinking_line` (CC visual format match) + `ThinkingProgressObserver` thread-safe singleton with chatter-suppression structural (band/verb crossings → SSE-eligible; identical re-update silent). **Composes canonical sources** — observer lazy-imports `narrative_channel.get_default_channel().active_thinking_frame()` for verb/elapsed (single source of truth) + `stream_renderer.get_stream_renderer()._token_count` for tokens (single source of truth). **NarrativeChannel read-API extension** — 2 new pure-read public methods `frames_by_op_kind` + `active_thinking_frame` (Singleton + Read-API Extension Pattern §33 catalog 10th invocation) eliminate downstream private-state reach-in. **Status-line extension** `_format_thinking_token` composes the aggregator; `_format_plain` non-compact path appends thinking token. **SSE event** `EVENT_TYPE_THINKING_PROGRESS_TICK` registered in canonical broker frozen set; `publish_thinking_progress_event` composes canonical broker (zero parallel publisher). **5 AST pins**: master_default_false / effort_band_taxonomy_4_values / authority_asymmetry / composes_canonical_narrative / composes_canonical_stream_renderer (each fires on synthetic regression). **7 FlagRegistry seeds**: master + 6 threshold knobs. **59 regression tests** including 12 boundary parametrized cases for compute_effort_band + 4 gerund-pattern parametrized for derive_verb_phrase + chatter-suppression structural + canonical accessor tests + AST pin synthetic regressions + EVENT_TYPE registration. **152/152 cumulative regression green** across Phase 1 + Phase 2 + status_line_composer + status_line_bridge (zero collateral). **End-to-end smoke**: status line renders `Phase: GENERATE standard · Cost: $0.04/$0.50 · Idle: 15s/600s · Op: 019d · [std·claude] · mode:auto · * Investigating… (0s · ↓ 0 tokens · low effort) · esc to cancel · enter to submit · ↑/↓ to history · ctrl+r to reverse-search` — visual parity with CC's footer + thinking-progress line. **Cumulative session totals**: ~16,170 LOC across 16 new modules + Slice 7 + Slice 7b + Phase 1 + Phase 2 extensions + 11 new master flags all default-FALSE per §33.1 + 86 new AST pins + 50 new regression tests this turn. **In-flight**: cadence soak `bt-2026-05-08-022312` is the first cron-fired soak in repo history that actually runs the pipeline (Slice 7b path fix unblocked it); was processing real ops at 20:02 PDT (~39min in, near 40min wall-clock cap) when this banner was authored — ledger row pending. **Next**: Phase 3 — persistent task-list panel (`■` in-progress + `□` pending checkboxes pinned to bottom of TUI) ~4-6h; full prompt_toolkit Layout migration may be required. See v2.54 below for Phase 1 details.)
+**Version**: 2.57 (2026-05-07 — **§38 future UX/voice roadmap added + TOC extended through §38**: New §38 (~10 subsections, ~1,200 lines) catalogs the operator-requested UX/UI brutal review. Closes the operator question "is there any UI/UX features, structure, colors and etc that we are missing, edge cases, gaps, and nuances that Claude has that will be useful for O+V and beneficial?" with: §38.1 Why this section / §38.2 Real visibility problem (operator-awareness gap for autonomous organism with 16 sensors + 11 phases + 5 contexts running parallel) / §38.3 **Karen's voice full architecture + risk analysis** (closed 4-value `VoiceEventTier` + 700-LOC `karen_voice_announcer.py` substrate scope + 5 AST pins composing `backend/voice/` + `ide_observability_stream` + `_SENSITIVE_NAME_TOKENS` + `quiet_hours` — all canonical, zero parallel state) / §38.4 Already-unique features that should be visual centerpiece (posture / cost cage / 11-phase pipeline / sensors / op fan-out / causality DAG / per-tool confidence / substrate health) / §38.5 CC features worth porting (animated braille spinner / truncation affordances / effort phrase ladder / smart path truncation / shift+tab cycle / urgency badges / completion notifications) / §38.6 Edge cases (terminal resize / unicode-incapable / narrow terminal / long-running stagnation / multi-line paste / TTY redirection / color profile) / §38.7 Deliberate differentiation — what NOT to port (TaskCreate / "bypass permissions" / image paste / conversation-as-product / "approve once") / §38.8 13 creative ideas ranked by uniqueness × effort / §38.9 Sequencing recommendation (6 slices, ~14-18h, path to A++ professional) / §38.10 Operator-binding alignment table per arc (composes-existing / no-hardcoding / §33.1-default-false / AST-pins). **TOC extended** through §38 with 10 sub-anchors. Operator authorized **slice 1 (posture mood ring) ship next** — `🐍` glyph color shift by posture (EXPLORE=green / CONSOLIDATE=blue / HARDEN=yellow / MAINTAIN=gray); ~1h scope; composes `direction_inferrer.read_posture()` + Rich palette; zero new substrate. Operator binding 2026-05-07 satisfied verbatim across §38 design ("solve the root problem directly — without workarounds, brute force, or shortcut solutions; significantly strengthen the system into something advanced asynchronous dynamic adaptive intelligent and highly robust with no hardcoding; fully leverage existing files and architecture so we avoid duplication and build cleanly on what already exists"). **NEXT**: ship slice 1 immediately. See v2.56 below for §37 UX Phases 1+2+3 closure details.)
+**Version (prior)**: 2.56 (2026-05-07 — **§37 UX Phases 1+2+3 ALL SHIPPED + Slice 7c composite-stop-reason fix + first cron-fired soak completed end-to-end**: All 3 UX phases from operator's screenshot comparison closed sequentially. **Phase 3** persistent task panel (`■` in-progress / `□` pending / `✓` completed) — new `governance/task_panel_aggregator.py` (~620 LOC) composes canonical `OpBlockBuffer.active_blocks` + `recently_committed` (Phase 3 read-API extension on canonical singleton — Singleton + Read-API Extension Pattern §33 catalog 11th invocation) + closed 3-value `TaskPanelGlyph` enum + `_GLYPH_CHARS` canonical mapping with `glyph_char()` accessor enforced via AST pin; `live_status_line.make_bottom_toolbar_callable` extended to merge raw + panel + status segments (multi-line render); 5 AST pins + 5 FlagRegistry seeds + 41 regression tests. **Slice 7c** composite stop_reason + incomplete_kill fix — surfaced via active monitoring of first cron-fired soak `bt-2026-05-08-022312` (May 8 03:10 UTC) which hit 40min wall-clock cap and wrote `stop_reason=wall_clock_cap+atexit_fallback` + `session_outcome=incomplete_kill`. Pre-Slice-7c `classify_outcome` Step 4 used exact set membership (no composite-prefix split) AND didn't recognize `incomplete_kill` as INFRA → row misclassified as runner. **Forward fix** in `live_fire_soak.py`: canonical `_SHUTDOWN_NOISE_STOP_REASONS` + `_INCOMPLETE_OUTCOME_VALUES` frozensets + `_is_shutdown_noise_stop()` helper (split on `+`, check leading segment) + Step 5 incomplete_outcome recognition. **Backward fix** in `lineage_waiver.py`: `is_pre_slice_7c_shutdown_misclassification()` predicate + `_DEFAULT_RUNNER_NOTES_RE` regex parser → existing on-disk rows route to `runner_incomplete_summary_waived` audit bucket. 30 regression tests. **Cumulative session totals**: ~17,290 LOC across 16 new modules + Slice 7/7b/7c + Phase 1/2/3 extensions + 12 new master flags all default-FALSE per §33.1 + 91 new AST pins + 173 new regression tests this turn (50 Phase 1+2+3 + 30 Slice 7c + 7 Slice 7b + 31 Slice 7 + 76 unified dashboard). **337/337 cumulative regression green** across all 9 affected suites (Phase 1 + Phase 2 + Phase 3 + Slice 7 + 7b + 7c + status_line_composer + status_line_bridge + unified_graduation_dashboard). **End-to-end smoke** — status line + task panel render: `[panel: ■ 9d1234 ⏺ Update(...); ✓ 9d5678 ⏺ Bash(...) [3s]]` + `[footer: Phase: GENERATE · Cost: $0.04/$0.50 · Idle: 15s/600s · Op: 019d · [std·claude] · mode:auto · * Investigating… (0s · ↓ 0 tokens · low effort) · esc to cancel · enter to submit · ↑/↓ to history · ctrl+r to reverse-search]`. **Visual parity with CC**: 7/11 elements PRESENT verbatim → all 11 now present (excluding terminal tab bar which is OS-level). **First cron-fired soak completed** — `bt-2026-05-08-022312` exit-code 0 after 46.4min runtime, $0.104 Claude cost, 1 attempted op (failed); ledger row written for `JARVIS_COMMAND_BUS_BRIDGE_ENABLED` (waived to audit bucket post-Slice-7c). The Phase 9 cadence is now **structurally bulletproof**: Slice 7b unblocked the pipeline (path resolution); Slice 7 absorbed the empty-summary attribution bug; Slice 7c handles composite-shutdown-reasons + incomplete_kill outcomes; classify_outcome correctly routes structurally-doomed sessions to INFRA across 5 stop_reason patterns × 2 outcome patterns. **NEXT**: cron at 8h cadence will continue producing real evidence; next 0/8/16h tick fires automatically. Operator binding 2026-05-07 satisfied verbatim across all 5 arcs ("solve the root problem directly — without workarounds, brute force, or shortcut solutions; significantly strengthen the system into something advanced asynchronous dynamic adaptive intelligent and highly robust with no hardcoding; fully leverage existing files and architecture so we avoid duplication and build cleanly on what already exists"). See v2.55 below for Phase 2 details.)
+**Version (prior)**: 2.55 (2026-05-07 — **§37 UX Phase 2 SHIPPED + cumulative session post-Phase-2 totals**: Phase 2 closes the operator-flagged "active-thinking timer missing" gap from the v2.53 UX comparison (CC's screenshot shows `* Investigating runner attribution root cause… (6m 52s · ↓ 24.0k tokens · almost done thinking with high effort)` as a single rendered line). New canonical substrate `governance/thinking_progress_aggregator.py` (~700 LOC pure-stdlib): closed 4-value `EffortBand` enum + frozen §33.5 `ThinkingProgressSnapshot` + 6 env-overridable threshold knobs (operator binding "no hardcoding") + pure-function `compute_effort_band` (deterministic strictest-axis-wins) + `derive_verb_phrase` (gerund-pattern + fallback) + `format_thinking_line` (CC visual format match) + `ThinkingProgressObserver` thread-safe singleton with chatter-suppression structural (band/verb crossings → SSE-eligible; identical re-update silent). **Composes canonical sources** — observer lazy-imports `narrative_channel.get_default_channel().active_thinking_frame()` for verb/elapsed (single source of truth) + `stream_renderer.get_stream_renderer()._token_count` for tokens (single source of truth). **NarrativeChannel read-API extension** — 2 new pure-read public methods `frames_by_op_kind` + `active_thinking_frame` (Singleton + Read-API Extension Pattern §33 catalog 10th invocation) eliminate downstream private-state reach-in. **Status-line extension** `_format_thinking_token` composes the aggregator; `_format_plain` non-compact path appends thinking token. **SSE event** `EVENT_TYPE_THINKING_PROGRESS_TICK` registered in canonical broker frozen set; `publish_thinking_progress_event` composes canonical broker (zero parallel publisher). **5 AST pins**: master_default_false / effort_band_taxonomy_4_values / authority_asymmetry / composes_canonical_narrative / composes_canonical_stream_renderer (each fires on synthetic regression). **7 FlagRegistry seeds**: master + 6 threshold knobs. **59 regression tests** including 12 boundary parametrized cases for compute_effort_band + 4 gerund-pattern parametrized for derive_verb_phrase + chatter-suppression structural + canonical accessor tests + AST pin synthetic regressions + EVENT_TYPE registration. **152/152 cumulative regression green** across Phase 1 + Phase 2 + status_line_composer + status_line_bridge (zero collateral). **End-to-end smoke**: status line renders `Phase: GENERATE standard · Cost: $0.04/$0.50 · Idle: 15s/600s · Op: 019d · [std·claude] · mode:auto · * Investigating… (0s · ↓ 0 tokens · low effort) · esc to cancel · enter to submit · ↑/↓ to history · ctrl+r to reverse-search` — visual parity with CC's footer + thinking-progress line. **Cumulative session totals**: ~16,170 LOC across 16 new modules + Slice 7 + Slice 7b + Phase 1 + Phase 2 extensions + 11 new master flags all default-FALSE per §33.1 + 86 new AST pins + 50 new regression tests this turn. **In-flight**: cadence soak `bt-2026-05-08-022312` is the first cron-fired soak in repo history that actually runs the pipeline (Slice 7b path fix unblocked it); was processing real ops at 20:02 PDT (~39min in, near 40min wall-clock cap) when this banner was authored — ledger row pending. **Next**: Phase 3 — persistent task-list panel (`■` in-progress + `□` pending checkboxes pinned to bottom of TUI) ~4-6h; full prompt_toolkit Layout migration may be required. See v2.54 below for Phase 1 details.)
 **Version (prior)**: 2.54 (2026-05-07 — **§37 UX Phase 1 SHIPPED — footer hotkey legend + permission-mode token close Gap C from operator UX screenshot comparison**: New canonical substrate `governance/keybinding_registry.py` (~470 LOC pure-stdlib) — closed 3-value `KeybindingOrigin` enum + frozen `KeybindingEntry` + idempotent `register_keybinding` + `format_footer_legend` rendering registry into single token + lazy-seeded canonical bindings (esc→cancel + enter→submit + alt+enter→newline + ↑/↓→history + ctrl+r→reverse-search). Status-line extension `_format_mode_token` + `_format_hotkey_legend` compose `operation_mode.current_mode()` + `keybinding_registry.format_footer_legend()` respectively; `_format_plain` non-compact path appends both. **3 AST pins** including tree-level `no_hardcoded_in_status_line` walking `status_line.py` + `live_status_line.py` from disk + forbidding hotkey-string literals outside compose-from-registry calls — operator binding "no hardcoding" enforced structurally. 31 regression tests + 93/93 cumulative green across Phase 1 + existing status_line tests. **End-to-end smoke**: status line now renders `... · mode:auto · esc to cancel · enter to submit · ↑/↓ to history · ctrl+r to reverse-search`. Operator-paced sequencing: Phase 1 → Phase 2 → Phase 3 per operator binding 2026-05-07. See v2.53 below for Slice 7b path fix details.)
 **Version (prior)**: 2.53 (2026-05-07 — **Phase 9 Slice 7b SHIPPED — `_resolve_project_root` dynamic walk fixes the cadence cause; first real cron-fired soak now processing pipeline**: Active monitoring of cron-fired soaks (operator request "monitor the event") surfaced the disease behind Slice 7's symptom: every cron-fired soak since cron install had been silently failing at `[LiveFireSoak] battle-test script not found at /Users/.../JARVIS-AI-Agent/backend/scripts/ouroboros_battle_test.py`. Root cause: `_resolve_project_root` used a 5-deep `.parent` chain whose stale docstring claimed "3 parents" but actually reached `backend/` (off-by-one); `script_path = project_root / "scripts" / "ouroboros_battle_test.py"` then yielded the non-existent `backend/scripts/...` path. Every cron tick produced an `outcome=runner session=unknown ops=0` row that Slice 7's lineage waiver correctly absorbed — but the underlying disease was here. **Structural fix** (operator binding "no hardcoding"): replaced the hardcoded `.parent` chain with a dynamic marker-based walk that climbs ancestors looking for the canonical pair `scripts/ouroboros_battle_test.py` AND `backend/`. 32-deep ceiling defensive against `Path` cycles; defensive fallback returns topmost reached ancestor (caller surfaces clean script-not-found error). `JARVIS_REPO_PATH` env override preserved as operator escape hatch. AST pin in regression spine proves the function MUST contain a loop AND must reference BOTH `scripts` + `backend` string literals — synthetic-regression-fires guard against any future maintainer re-introducing a hardcoded chain. **7 new regression tests** including off-by-one guard + AST pin + synthetic relocated-source-file walk + filesystem-root bail + end-to-end harness-finds-script. **End-to-end verification**: pre-fix `_resolve_project_root()` → `/Users/.../JARVIS-AI-Agent/backend` (off-by-one); post-fix → `/Users/.../JARVIS-AI-Agent` (correct); `script.exists()` → True; live background soak `bt-2026-05-08-022312` confirmed processing real ops via `op-019dfad9-a58c` CLASSIFY-phase dispatch — **first cadence soak in cron history actually running the pipeline**. **Composite Slice 7 + 7b semantic**: Slice 7 forward fixes future bad rows at attribution time (classify_outcome empty-summary path), Slice 7 backward fixes existing bad rows via aggregation routing (lineage_waiver `runner_incomplete_summary_waived` bucket), AND Slice 7b fixes the underlying script-not-found bug that produced them in the first place. **UX comparison delivered** (operator question "is O+V layout like Claude Code?"): element-by-element comparison via Explore agent against operator-provided CC screenshot — 7/11 elements PRESENT (⏺ Update blocks, ⎿ continuation, `●` bullets, color discipline, REPL prompt, Bash blocks, status footer), 2/11 PARTIAL (diagnostic summaries, footer hotkey legend), 2/11 MISSING (active-thinking progress timer with `* … (Xm Ys · ↓Nk tokens)`, persistent task-list panel with `■`/`□` checkboxes), 1/11 DELIBERATELY-DIFFERENT (terminal tab bar — OS-level concern). Net ~85% visual parity; 3 named gaps documented as §37 Tier 2 follow-on candidates (~6-8h total). 199/199 cumulative regression green across all affected suites. **Cumulative session totals**: ~14,170 LOC across 14 new modules + Slice 7 + Slice 7b extensions + 10 new master flags + 76 new AST pins + 38 new regression tests this turn. **NEXT operator decisions**: (a) Wait for `bt-2026-05-08-022312` soak to complete (up to 40min wall-clock) and check `summary.json` + ledger row for the first **clean** cron-fired evidence; (b) Subsequent cron ticks at 00:00 / 08:00 / 16:00 PDT will now produce real evidence (not garbage rows); (c) Once 3 clean DECISION_TRACE soaks accumulate via genuine cadence, graduate the master flag default-true. See v2.52 below for Slice 7 + cron install details.)
 **Version (prior)**: 2.52 (2026-05-07 — **Phase 9 Slice 7 empty-summary lineage waiver SHIPPED + cron installed at 8h cadence + 2 hygiene cleanups**: Resolves the EXPLORATION_LEDGER `EVIDENCE_FAILED` row surfaced by yesterday's unified dashboard ship + activates the wall-clock cadence operator-paced bucket. **Root cause** (operator question "what blocks EXPLORATION_LEDGER?"): `live_fire_soak.classify_outcome` Step 5 default-conservatively routed empty-summary signature (`session_outcome="" AND stop_reason="" AND failure_class_counts={}`) to RUNNER. The May 7 23:40 row had `session_id=unknown`, notes `"default_runner:outcome=|stop="` (exact canonical bytes), `runner_attributed_kind=default_conservative`. The conservative default was designed for cases where signal IS present but unrecognized (concrete failure_counts entries with unknown class names) — it should NEVER fire when there's NO observable signal at all. **Three structural fixes** (no workarounds, no brute force): (1) Forward fix in `classify_outcome` — new Step 5 BEFORE default routes empty-summary signature to INFRA (waiver, non-blocking) with notes `"summary_incomplete:no_observable_signal"`. Step 6 preserves the original conservative-default for partial-signal cases. (2) Backward fix in `lineage_waiver.py` — new `INCOMPLETE_SUMMARY_RUNNER_NOTES` bytes constant + `is_incomplete_summary_runner_lineage()` predicate using `==` EXACT-equality (NOT `endswith`/`startswith`/`in` — AST-pinned forbidden because the canonical bytes are a strict PREFIX of any non-empty-summary runner row; loose match would silently waive legitimate failures). 2 new AST pins (`incomplete_summary_constant` + `incomplete_summary_exact_match`), both fire on synthetic regressions. (3) Aggregation fix in `graduation_ledger.progress()` — new `runner_incomplete_summary_waived` audit bucket with shape-parity in `_zero_progress`; routing fires REGARDLESS of structured kind (the May 7 row carries DEFAULT_CONSERVATIVE which would otherwise block; notes-equality is the load-bearing signal). **Single source of truth**: `lineage_waiver.py` is the SOLE knower of both contract-downgrade AND empty-summary canonical bytes signatures — composition only, no string-grep elsewhere. **31 new regression tests** in `test_phase_9_slice_7_empty_summary_lineage.py` (predicate match/reject including 3 loose-match-rejection tightness tests + classify_outcome 7 paths + ledger routing + eligibility unblock + AST pin firings + dashboard end-to-end). **Hygiene cleanups** (operator binding "no hardcoding"): 2 pre-existing test failures from Tier C cadence extension (`assert == 24` hardcoded count — Tier C grew CADENCE_POLICY 24 → 32 in v2.49) replaced with `len(CADENCE_POLICY)` dynamic primitive matching the canonical pattern used in `graduate_repl.render_help`. **Cron installed at 8h cadence** via `bash scripts/install_live_fire_soak_cron.sh --install` — schedule `0 */8 * * *` = 3 sessions/day, cost cap $0.50/soak, wall cap 2400s, timeout 3600s; cadence_preflight.py runs first; logs to `.jarvis/live_fire_soak_logs/<ts>.log`. **End-to-end verification post-fix**: `/graduation status` reports `evidence_failed: 0` (was 1); EXPLORATION_LEDGER `runner=0` + `runner_incomplete_summary_waived=1` (audit-visible non-blocking); DECISION_TRACE still READY. 234/234 cumulative regression green across all 5 affected suites. **Wall-clock cadence is now ACTIVE** — 32-flag ladder accumulates evidence at 3 soaks/day; minimum ~27 days for PASS_B baseline + ~5 extra for 8 PASS_C flags = ~32 days minimum, realistic 6-9 weeks accounting for infra-failure retries (matches v2.49 estimate). **Cumulative session totals**: ~13,985 LOC across 14 new modules + lineage_waiver Slice 7 extension + 10 new master flags + 75 new AST pins. **NEXT operator decisions**: (a) Graduate `JARVIS_DECISION_TRACE_LEDGER_ENABLED` master default-true (clean=3/3, eligible — first Phase 9 graduation); (b) Monitor cron output at `.jarvis/live_fire_soak_logs/` over next 24h to verify first cadence soak fires correctly; (c) Continue accumulating evidence on remaining 30 default-FALSE flags. See v2.51 below for unified dashboard ship details.)
@@ -179,6 +181,19 @@
 33. [Reusable Meta-Patterns](#33-reusable-meta-patterns-new-2026-05-05--derived-from-coverage-audit)
 34. [VisionSensor + Multi-modal Subsystem](#34-visionsensor--multi-modal-subsystem-new-2026-05-05--anchored-from-claudemd)
 35. [Open Strategic Moves Registry](#35-open-strategic-moves-registry-new-2026-05-05--consolidates-2863--294-scattered-moves)
+36. [Brutal Architectural Review v10 + Forward Priority Roadmap](#36-brutal-architectural-review-v10--forward-priority-roadmap-new-2026-05-05--operator-driven-post-move-7move-8wave-3285133-catalog-closures)
+37. [Operator UX/UI v10 Brutal Review + Comprehensive CC-Feature Catalog](#37-operator-uxui-v10-brutal-review--comprehensive-cc-feature-catalog-new-2026-05-05--operator-driven-post-phase-9-day-1-graduation)
+38. [Karen's Voice + UX/UI Future Roadmap (NEW 2026-05-07)](#38-karens-voice--uxui-future-roadmap-new-2026-05-07--operator-driven-post-phase-1--3-closures)
+    - [38.1 Why this section exists](#381-why-this-section-exists)
+    - [38.2 The real visibility problem (operator awareness gap)](#382-the-real-visibility-problem-operator-awareness-gap)
+    - [38.3 Karen's Voice — full architecture + risk analysis](#383-karens-voice--full-architecture--risk-analysis)
+    - [38.4 Already-unique features that should be the visual centerpiece](#384-already-unique-features-that-should-be-the-visual-centerpiece)
+    - [38.5 CC features worth porting (parity polish)](#385-cc-features-worth-porting-parity-polish)
+    - [38.6 Edge cases + defensive handling](#386-edge-cases--defensive-handling)
+    - [38.7 Deliberate differentiation — what NOT to port](#387-deliberate-differentiation--what-not-to-port)
+    - [38.8 13 creative ideas ranked by uniqueness × effort](#388-13-creative-ideas-ranked-by-uniqueness--effort)
+    - [38.9 Sequencing recommendation (path to A++ professional)](#389-sequencing-recommendation-path-to-a-professional)
+    - [38.10 Operator-binding alignment per arc](#3810-operator-binding-alignment-per-arc)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
@@ -5898,6 +5913,258 @@ The Reverse Russian Doll thesis: O+V (the Builder) carves an exponentially large
 - Net overall: **A−/A trending A** — gap to close is Phase 9 cadence (operator-paced) + 3 in-session priorities (~25-30 hours total).
 
 A-level execution from A-level vision is **achievable in 6-10 weeks** at established cadence: Phase 9 cadence (3-7d/flag × 12+ flags) + Priorities 2-9 from §36.5 (~6-8 weeks of in-session arc work) + first true second-order doll completed (live RSI cycle proof). The path is no longer architectural; it's operational.
+
+---
+
+## 38. Karen's Voice + UX/UI Future Roadmap *(NEW 2026-05-07 — operator-driven post-Phase-1 + 3 closures)*
+
+> **Operator binding (verbatim, 2026-05-07)**: *"is there any UI/UX features, structure, colors and etc that we are missing, edge cases, gaps, and nuances that Claude has that will be useful for O+V and beneficial? give me your critical feedback on it because i really want to make O+V unique and professional. also threw in some creative ideas that will be great for O+V's UI/UX. ... O+V has a lot of features so i want to make sure that the user see what it is doing in real-time if that makes sense? i also want to Karen's voice to the O+V so that O+V (Karen's voice) is communicating with you in real-time something that Claude doesn't but the has the option to tell O+V to turn off it's voice or mute via voice activation command or manually type it in the command."*
+
+### 38.1 Why this section exists
+
+§37 closed the brutal review of operator-facing CLI vs CC. Phases 1-3 (2026-05-07) shipped the three named gaps — footer hotkey legend / active-thinking timer / persistent task panel — bringing element-level visual parity to ~95%. **The remaining gap isn't CC parity — it's making O+V's unique-to-CC capabilities visually centerpiece**, plus an operator-requested **voice channel** (Karen) that CC structurally cannot match.
+
+§38 catalogs:
+1. The **real visibility problem** for an autonomous organism with 16 sensors + 11 phases + 5 contexts + autonomy bridges all running in parallel.
+2. **Karen's voice** — full architectural design + risk analysis + composition contract.
+3. **13 creative ideas** ranked by uniqueness × effort.
+4. **Sequencing recommendation** — path to A++ professional in ~14-18h total scope across 6 slices.
+
+### 38.2 The real visibility problem (operator awareness gap)
+
+CC has **1 thread of execution** (interactive); O+V has **16 sensors + 5 contexts + 11 phases + 22 legacy agents + autonomy bridges + cron-fired soaks + cost cage + posture inferrer + governor + provider topology** — all asynchronous, all happening, mostly invisible to the operator today.
+
+**What the operator sees today**:
+- Current op's phase
+- Status line (post-Phase 1: phase / cost / idle / op-id / mode / hotkeys)
+- Op blocks (`o-N` refs via op_block_buffer)
+- Thinking-progress aggregator (post-Phase 2: `* Investigating… (Xm Ys · ↓Nk tokens · effort)`)
+- Persistent task panel (post-Phase 3: `■` IN_PROGRESS / `■` PENDING / `✓` COMPLETED for active+committed ops)
+
+**What the operator does NOT see**:
+- Which sensors fired in the last 60s (16 active autonomous sensors)
+- How many BG ops are queued in `BackgroundAgentPool`
+- Posture changes mid-session (DirectionInferrer transitions)
+- Cost trajectory (rate, not just total — `cost_governor` rolling window)
+- Which subagents are running (L3 worktree-isolated execution)
+- Phase 3 bridges emitting telemetry (ExecutionMonitor / ExecutionGraphProgress / CommandBus)
+- Substrate-health changes (phase9_substrate_health probe transitions)
+- Confidence band shifts (per-tool confidence indicator §37 Tier 2 #13)
+- Causality DAG fork-points (§31 Upgrade 2)
+- Multi-prior dispatch (Move 6.5 K-way fan-out)
+
+This is the **gap that matters for an autonomous organism**. Not CC parity — operator awareness.
+
+### 38.3 Karen's Voice — full architecture + risk analysis
+
+#### 38.3.1 Why voice belongs in O+V (and structurally not in CC)
+
+CC is interactive: human prompts, model responds. Voice is redundant — operator IS at the keyboard.
+
+O+V is autonomous: organism runs operations the operator did not explicitly request (16 sensors fire spontaneously). The operator's role shifts from "prompter" to "supervisor watching a system work." **Voice is structurally fitting for supervisor mode** — operator can do other work while Karen narrates organism activity.
+
+CC has no voice integration; this is **structural differentiation**, not parity polish.
+
+#### 38.3.2 Risk analysis (must design in from day one)
+
+| Risk | Mitigation |
+|---|---|
+| **Voice spam** (every event = announcement = unbearable in 5 min) | Closed 4-value `VoiceEventTier` enum (`CRITICAL` / `IMPORTANT` / `NORMAL` / `SILENT`) + rate-limit cooldown (30s default, env-tunable via `JARVIS_KAREN_VOICE_COOLDOWN_S`) + same-op event coalescing within window |
+| **Sensitive data leakage via audio** (passwords, file paths, tokens spoken aloud) | Compose existing `_SENSITIVE_NAME_TOKENS` canonical FrozenSet from `flag_change_event_emitter` (Wave 3 hygiene Item 3) — **single source of truth**; AST-pinned `sensitive_redaction_via_canonical_set` invariant |
+| **Headless context** (cron soaks, CI, SSH without audio device) | Auto-mute when `not real_stdout_isatty()` OR `os.environ.get("CI")` OR audio device unavailable; fail-silent on TTS failure (NEVER crash the loop) |
+| **Multi-op cacophony** (5 parallel ops talking over each other) | Per-op_id coalescing within cooldown window; only the highest-tier event per op_id voices |
+| **Operator fatigue** ("high effort" every 30s gets annoying) | Default tier filter — `Tier 4 SILENT` events (posture changes, sensor pulses, op-started Green) DON'T voice; only `Tier 1 CRITICAL` (failures, cost warnings, emergency throttles, graduations) ALWAYS voice; `Tier 2 IMPORTANT` operator-toggleable |
+| **Quiet hours** | Compose existing `JARVIS_AUTO_APPLY_QUIET_HOURS_TZ` env knob — auto-mute during quiet hours |
+| **Audio device unavailable** (no speakers, remote SSH session) | `defensive try/except` around every TTS call; failure is silent and logged at DEBUG only |
+
+#### 38.3.3 Architectural design
+
+```
+governance/karen_voice_announcer.py (~700 LOC pure-stdlib substrate)
+├── Closed 4-value VoiceEventTier enum (CRITICAL / IMPORTANT / NORMAL / SILENT)
+├── Frozen VoiceAnnouncement §33.5-versioned artifact:
+│   schema_version + text + tier + op_id + source_event + voiced_at_unix
+├── Pure-function tier_for_event(event_type, payload) — declarative table
+│   mapping SSE event types → tier; AST-pinned exhaustive-coverage check
+├── KarenVoiceAnnouncer thread-safe singleton:
+│   ├── Composes ide_observability_stream SSE subscriber
+│   │   (canonical EVENT_TYPE_* — no parallel event source)
+│   ├── Composes backend/voice/ TTS pipeline (canonical voice/ infrastructure)
+│   ├── Composes _SENSITIVE_NAME_TOKENS for redaction (canonical set)
+│   ├── Per-op_id cooldown ring + same-op coalescing
+│   ├── Mute state (manual via REPL / voice command / auto-headless / quiet-hours)
+│   └── Persona dispatcher (Karen default + Friday / Jarvis / custom env knob)
+├── Voice-command handler — composes backend/voice/voice_recognition.py wake word
+│   └── Pattern phrases: "Karen, mute" / "Karen, on" / "Karen, status" /
+│       "Karen, what's happening" — phrase patterns lazy-discovered from
+│       canonical word list (no hardcoding individual phrases at call sites)
+└── governance/voice_repl.py — auto-discovered via §33.3 naming-cage
+    └── /voice {off | on | mute | unmute | status | persona | cooldown <N> | help}
+
+5 AST pins:
+  1. master_default_false (JARVIS_KAREN_VOICE_ENABLED §33.1)
+  2. tier_taxonomy_4_values (closed-enum integrity; synthetic-regression on missing)
+  3. composes_canonical_voice_pipeline (forbidden TTS imports outside backend/voice/)
+  4. composes_canonical_sse_broker (forbidden parallel event sources)
+  5. sensitive_redaction_via_canonical_set (must compose _SENSITIVE_NAME_TOKENS;
+     AST-pinned no parallel sensitive-token list)
+```
+
+#### 38.3.4 Event → utterance mapping (declarative tier table)
+
+| Event type | Tier | Sample utterance (after redaction) |
+|---|---|---|
+| `EVENT_TYPE_AUTONOMY_COMMAND_BUS` rejected_dedup spike | CRITICAL | "Command bus rejecting duplicate operations. Investigate." |
+| Op failed (NOTIFY_APPLY+ risk-tier) | CRITICAL | "Operation failed: change-engine error in line forty-two" |
+| `EVENT_TYPE_COST_BAND_CROSSED` → HIGH | CRITICAL | "Heads up — you've used eighty percent of your budget" |
+| `EVENT_TYPE_GOVERNOR_EMERGENCY_BRAKE` | CRITICAL | "Emergency throttle activated. Cost burn or postmortem rate exceeded threshold." |
+| Graduation-ready (new flag in unified_graduation_dashboard) | IMPORTANT | "DECISION TRACE flag is graduation-ready. Three clean sessions, zero runner failures." |
+| `EVENT_TYPE_POSTURE_CHANGED` (DirectionInferrer transitions) | IMPORTANT | "Posture shifted to HARDEN. Sensor cap reduced." |
+| `EVENT_TYPE_BEHAVIORAL_DRIFT_DETECTED` (Coherence Auditor) | IMPORTANT | "Behavioral drift detected. Review recent decisions." |
+| Op completed (Yellow+ risk-tier, mutation-bearing) | NORMAL | "Update applied: live fire soak file. Plus forty-five lines, minus three." |
+| `EVENT_TYPE_TASK_COMPLETED` (Green tier, low-risk) | SILENT | (don't voice — too frequent; surfaces in panel only) |
+| `EVENT_TYPE_HEARTBEAT` | SILENT | (system-internal; never voice) |
+| `EVENT_TYPE_FLAG_TYPO_DETECTED` | NORMAL | "Did you mean JARVIS_POSTURE_ENABLED?" |
+| `EVENT_TYPE_CONFIDENCE_DROP_DETECTED` | IMPORTANT | "Confidence drop on tool call read file." |
+
+#### 38.3.5 Voice-command activation
+
+Composes existing `backend/voice/voice_recognition.py` wake word infrastructure. Phrase patterns (lazy-discovered, AST-pinned no hardcoding):
+
+| Phrase | Action |
+|---|---|
+| "Karen, mute" / "Karen, off" | Set mute state ON; emit confirmation tone (no voice — visual confirm only) |
+| "Karen, unmute" / "Karen, on" / "Karen, resume" | Clear mute state; voice "Resumed." |
+| "Karen, status" | Voice "Mute is on" / "Mute is off" + cooldown + recent event count |
+| "Karen, what's happening" | Voice 1-sentence digest of last 60s activity (composes activity radar §38.8 idea #3) |
+| "Karen, quiet" | Set IMPORTANT/CRITICAL-only filter (suppress NORMAL tier) |
+| "Karen, verbose" | Lift filter — voice all NORMAL tier events |
+
+#### 38.3.6 Text command (`/voice` REPL verb)
+
+Auto-discovered via §33.3 naming-cage at `governance/voice_repl.py`. Subcommands:
+
+| Subcommand | Action |
+|---|---|
+| `/voice` (bare) | Status (mute state / cooldown / persona / recent count) |
+| `/voice off` / `/voice mute` | Manual mute |
+| `/voice on` / `/voice unmute` | Clear mute |
+| `/voice status` | Same as bare |
+| `/voice persona <name>` | Switch persona (`karen` / `friday` / `jarvis` / `custom`) |
+| `/voice cooldown <N>` | Set per-op cooldown seconds (default 30) |
+| `/voice tier <CRITICAL\|IMPORTANT\|NORMAL>` | Set minimum voiced tier |
+| `/voice help` | This text |
+
+#### 38.3.7 Effort estimate + sequencing
+
+**Total**: ~6-8h end-to-end (substrate + voice/ wiring + voice-command parser + REPL verb + tests + AST pins).
+
+**Slices**:
+1. `governance/karen_voice_announcer.py` substrate (~3h, ~700 LOC, ~40 tests)
+2. SSE subscriber + backend/voice/ wire-up (~1.5h, ~150 LOC, ~15 tests)
+3. Voice-command phrase parser composing `backend/voice/voice_recognition.py` (~1h, ~120 LOC, ~10 tests)
+4. `governance/voice_repl.py` `/voice` REPL verb (~1h, ~200 LOC, ~15 tests)
+5. Persona profiles + sensitive-redaction integration tests (~1h, ~80 LOC, ~10 tests)
+
+**Master flag**: `JARVIS_KAREN_VOICE_ENABLED` default-FALSE per §33.1. Operator opts in via `/voice on`.
+
+### 38.4 Already-unique features that should be the visual centerpiece
+
+These O+V capabilities CC structurally **cannot match**. Today they're either buried or invisible. Surfacing them is the path to A++ unique professional.
+
+| O+V feature | Today's surface | Recommendation |
+|---|---|---|
+| **Strategic Posture** (EXPLORE / CONSOLIDATE / HARDEN / MAINTAIN — DirectionInferrer) | Surfaces only via `/posture` REPL + SSE | **Lead the status line** with a posture badge. Make `🐍` glyph color shift with posture (mood ring §38.8 idea #2). |
+| **Cost cage** (deterministic hard caps via `cost_governor`) | `Cost: $0.04/$0.50` static format | Show **trajectory not just position**: `$0.04/$0.50 ↑$0.01/min`. Operator sees velocity. |
+| **11-phase pipeline** (CLASSIFY → ROUTE → CONTEXT_EXPANSION → PLAN → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE) | Currently shown as `Phase: GENERATE` (single label) | Render as **progress bar** `[●●●○○○○○○○○]` — uniquely shows where in the deterministic FSM. CC's loose stages cannot match this granularity. |
+| **Provider routing badges** (`[std·dw]` + tier failback) | Static `[std·dw]` badge | Add **failover indicator**: `[std·dw → claude]` when Tier 0 fell to Tier 1. CC has no provider-tier concept. |
+| **16 autonomous sensors** firing | Internal counters + SSE only | **Surface a pulse**: `🛰 7 sensors active` or per-sensor glyphs in activity radar (§38.8 idea #3). |
+| **Op fan-out tree** (Move 6.5 multi-prior, L3 subagent spawning) | OpBlock has `parent_op_id` + `child_op_ids` (Tier 2 #12) but no rendering | **ASCII tree in task panel**. CC ops are flat; O+V's graph IS the differentiation. |
+| **Causality DAG** (§31 Upgrade 2) | `causality_dag` exists; queryable via `/replay` | Inline `→ caused by op-X` links in op blocks. CC has no causality concept. |
+| **Per-tool confidence indicator** (§37 Tier 2 #13) | Composes risk-tier-floor; surfaces via SSE only | Surface `confidence_band` field in op block + status line for ops where confidence is LOW/UNKNOWN. |
+| **Substrate-health probe** (`phase9_substrate_health`) | Composes `categories_covered()` + ETA projection | Health-light indicator in status line: `🟢 healthy` / `🟡 degraded` / `🔴 broken` / `⚪ unknown`. |
+
+### 38.5 CC features worth porting (parity polish)
+
+| Feature | Why it matters | Effort |
+|---|---|---|
+| **Animated braille thinking spinner** (rotating glyph cycle `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) | Operator engagement signal during long waits — `🤔` is static; CC's rotation conveys "still alive" | ~30min — compose `narrative_channel.THINKING` + 100ms rotation in `prompt_toolkit.Application.invalidate()` |
+| **Truncation affordance hints** (`(ctrl+o to expand)` / `(/expand <ref>)`) | Discoverability — without it, operators don't know they CAN expand | ~1h — audit op_block_buffer + narrative_channel + tool_render_view truncation paths; AST-pin every `... +N` ellipsis followed by `/expand <ref>` |
+| **Effort phrase ladder** (`almost done thinking` vs categorical `high effort`) | Predictive language is friendlier than categorical | ~1h — extend `EffortBand` with `phrase` field: `LOW="just started"` / `MEDIUM="working through it"` / `HIGH="deep in analysis"` / `VERY_HIGH="nearly done thinking"` |
+| **Smart path truncation** (`backend/.../live_fire_soak.py` — head + tail) | Long paths cut mid-token look amateur | ~30min — `derive_label` truncates by char count; replace with `Path(p).parts` head+tail+ellipsis |
+| **Permission mode shift+tab cycle** (in-place toggle without `/mode`) | Hotkey beats slash-command for frequent toggles | ~2h — `prompt_toolkit.key_bindings.KeyBindings.add("s-tab")` cycling OperationMode; register in `keybinding_registry` |
+| **Yellow/red urgency badges in status line** | Color-coded severity beats reading numbers | ~1.5h — when `cost_warning_observer` band HIGH, status cost token renders red. Compose existing `CostBand` enum |
+| **Background task completion notifications** | Long-running async ops finish silently — CC pings | ~3h — compose `ide_observability_stream` SSE → terminal bell + transient banner. Risk: noise; gate on op-importance ≥ NOTIFY_APPLY |
+
+### 38.6 Edge cases + defensive handling
+
+| Edge case | Risk | Recommendation |
+|---|---|---|
+| **Terminal resize (SIGWINCH) mid-render** | Status line wraps awkwardly; bottom_toolbar misaligns | Verify `prompt_toolkit.Application` re-renders on SIGWINCH; add regression test simulating resize |
+| **Unicode-incapable terminals** (PuTTY default, basic SSH) | `⏺ ⎿ ■ □ ✓ 🤔` break | Add `JARVIS_UNICODE_GLYPHS=auto` env knob; auto-detect via `LC_CTYPE`/`LANG`. Fallback: `* | [X] [ ] V ?`. Compose into `keybinding_registry.glyph_char` + `task_panel_aggregator._GLYPH_CHARS` |
+| **Narrow terminal (<80 col)** | Status line overflows | Compose `shutil.get_terminal_size().columns`; cap line at terminal width with smart truncation order (drop badges first, then mode, then legend) |
+| **Long-running op (>5min) without state change** | `🤔` static; operator can't tell if hung | Escalate effort phrase + add elapsed-since-last-token timer; compose `narrative_channel.started_at` for stagnation detection |
+| **Multi-line paste in REPL** | prompt_toolkit may interpret newlines as submit | Verify `serpent_flow.py:4374-4378` Enter binding handles bracketed paste mode |
+| **TTY redirection** (`o+v < input`) | Bottom toolbar rendering crashes on non-TTY | `should_render()` already gates on `real_stdout_isatty` (Slice 2 fix). Verify task panel + thinking line ALSO gate on this |
+| **Color profile detection** (dark vs light terminal) | Color choices clash on light terminal | Compose Rich's `Console.detect_terminal_features()`; add light-terminal palette override |
+
+### 38.7 Deliberate differentiation — what NOT to port
+
+| CC feature | Why O+V should skip |
+|---|---|
+| **TaskCreate/TaskUpdate human-driven tasks** | O+V is autonomous; ops ARE tasks. CC's task panel = human-prompted; O+V's task panel = autonomous ops. Same surface, different semantics. Don't add a parallel human-task system. |
+| **"bypass permissions" framing** | CC frames it as a permissions bypass. O+V has structured `OperationMode` + `risk_tier_floor` + `posture` — multi-axis cage is more professional. Show those, not a single "bypass" toggle. |
+| **Image paste UX** | O+V has `/attach` with multi-modal (visual VERIFY etc). Image paste is a CC convenience for interactive use; O+V's autonomous ops attach via SerpentFlow `/attach` or VisionSensor. |
+| **Conversation-as-product** | CC is a conversation. O+V is an organism. Don't optimize for 1:1 dialog — operator-as-supervisor is the right framing. |
+| **"Approve once" inline prompts** | CC has yes/no inline approval. O+V has `ReviewBranch` with VS Code source-control panel + 5-min auto-reject. Native IDE flow is professionally superior. |
+
+### 38.8 13 creative ideas ranked by uniqueness × effort
+
+| # | Idea | Why unique to O+V | Effort | Recommendation |
+|---|---|---|---|---|
+| 1 | **Karen's voice** (full §38.3 architecture) | CC structurally has no voice; voice fits supervisor-of-organism mode | ~6-8h | **Ship.** Operator-requested + uniquely fits autonomous organism. |
+| 2 | **Posture mood ring** — `🐍` glyph color shifts with posture: green=EXPLORE, blue=CONSOLIDATE, yellow=HARDEN, gray=MAINTAIN | Posture is unique to O+V; visualizing via organism identity glyph reinforces brand | ~1h | **Ship FIRST (slice 1).** Composes `direction_inferrer.read_posture()` + Rich color dispatch. Zero new substrate. |
+| 3 | **Live activity radar** — 60-sec sliding window panel showing which sensors / contexts / bridges fired. ASCII radar visualization | Operators see WHOLE organism's pulse, not just current op | ~4h | **Ship after voice.** Composes `ide_observability_stream` history + sensor firing telemetry. Truly differentiating. |
+| 4 | **Heartbeat indicator** — `♥`/`♡` alternating glyph in status, rate proportional to op-throughput | Glanceable health; CC has nothing | ~1h | **Ship.** Composes `cost_governor.recent_op_count()` + simple modulation. |
+| 5 | **Pipeline progress bar** `[●●●○○○○○○○○] CLASSIFY/11` | 11-phase deterministic FSM — CC has loose stages | ~3h | **Ship.** Composes `phase_runners` registry + current op phase. Most CC-differentiating. |
+| 6 | **Op fan-out tree in panel** | Move 6.5 K-way + L3 subagents — CC has flat ops only | ~3h | **Ship.** `OpBlockBuffer.parent_op_id` + `child_op_ids` already populated by Tier 2 #12. ASCII tree render. |
+| 7 | **Mood/morale indicator** — `😎`/`😐`/`😰`/`🆘` derived from convergence + error rate + cost burn | "How is the organism feeling" — anthropomorphic but earned (autonomous = has internal state) | ~2h | **Ship.** Composes `convergence_governor` + `cost_governor` + recent-failure-rate. |
+| 8 | **Predictive graduation timer** — "Next graduation: ~14 days at current cadence" | Composes Phase 9 substrate-health probe; uniquely tied to wall-clock cadence | ~1h | **Ship.** Already have `phase9_substrate_health.EtaProjection` — just surface it. |
+| 9 | **Constellation map** — sensors/contexts as ASCII constellation; nodes pulse when active | "Ship's bridge" aesthetic; reinforces autonomous-organism framing | ~5h | **Defer.** High effort + needs Phase 3 task panel as foundation. |
+| 10 | **Quote of the moment** — periodic O+V manifesto quote when idle | Establishes personality; differentiated | ~1h | **Ship if voice ships.** The two together = personality. |
+| 11 | **Time-of-day awareness** — softer colors after 11pm; reduced notification frequency | Composes existing quiet_hours; CC has nothing | ~30min | **Ship.** Cheap polish. |
+| 12 | **Trajectory sparklines** — `▁▂▄▅▇` for cost-over-time, ops/min, success rate | Glanceable rate visualization | ~2h | **Ship.** Compose canonical metrics. |
+| 13 | **Voice persona profiles** | Karen as default + Friday / Jarvis / custom env knob | ~30min addon to #1 | **Ship with #1.** No hardcoding personas — each is a substrate config. |
+
+### 38.9 Sequencing recommendation (path to A++ professional)
+
+Total scope ~14-18h across 6 slices. Operator-paced; each slice composes existing canonical surfaces (no new substrate beyond what's listed). All master flags default-FALSE per §33.1.
+
+| Slice | Description | Effort | Why this order |
+|---|---|---|---|
+| **1** | **Posture mood ring** (`🐍` color shift by posture) | ~1h | **Highest leverage / smallest scope** — makes most-unique signal visually omnipresent. Zero new substrate. |
+| **2** | **Pipeline progress bar** `[●●●○○○]` | ~3h | Most CC-differentiating feature — visualizes deterministic FSM CC structurally cannot match. |
+| **3** | **Karen's voice** (full §38.3 architecture) | ~6-8h | Operator-requested + uniquely fits autonomous organism + structurally clean composition. |
+| **4** | **Live activity radar** | ~4h | Solves real visibility problem — operators see WHOLE organism's activity, not just current op. |
+| **5** | **Op fan-out tree in task panel** | ~3h | Composes existing Tier 2 #12 fan-out fields; killer feature for Move 6.5 K-way. |
+| **6** | **Polish bundle** (heartbeat + mood + predictive timer + sparklines + spinner + truncation hints + smart paths + effort phrases) | ~5h | Personality polish that takes O+V from "looks like CC" to "looks like a living system." |
+
+### 38.10 Operator-binding alignment per arc
+
+Operator binding 2026-05-07 (verbatim): *"solve the root problem directly — without workarounds, brute force, or shortcut solutions; significantly strengthen the system into something advanced asynchronous dynamic adaptive intelligent and highly robust with no hardcoding; fully leverage the existing files and architecture within the codebase so we avoid duplication and build cleanly on what already exists."*
+
+Per-arc compliance:
+
+| Arc | Composes existing canonical | Net-new substrate | No hardcoding | AST pins | §33.1 default-FALSE |
+|---|---|---|---|---|---|
+| 1 — Posture mood ring | `direction_inferrer.read_posture()` + Rich palette | None (helper function only) | ✅ posture-to-color via env-overridable map | ✅ taxonomy + color-table-canonical | ✅ |
+| 2 — Pipeline progress bar | `phase_runners` registry + canonical OperationPhase enum | None (renderer only) | ✅ phase count from `len(REGISTERED_RUNNERS)` | ✅ phase-set-derived-from-canonical | ✅ |
+| 3 — Karen's voice | `backend/voice/` + `ide_observability_stream` + `_SENSITIVE_NAME_TOKENS` + `quiet_hours` | New `karen_voice_announcer.py` substrate (~700 LOC) | ✅ tier table declarative + persona env-overridable + cooldown env-tunable | 5 pins (master / taxonomy / canonical-voice / canonical-broker / sensitive-redaction) | ✅ |
+| 4 — Live activity radar | `ide_observability_stream` history + `firing_telemetry` | New `activity_radar.py` substrate | ✅ event types from `_VALID_EVENT_TYPES` frozenset | 4 pins (master / taxonomy / authority / composes-canonical) | ✅ |
+| 5 — Op fan-out tree | `OpBlockBuffer.parent_op_id` + `child_op_ids` (already populated by Tier 2 #12) | Renderer only — no new substrate | ✅ tree depth from data | ✅ composes-canonical-fan-out-fields | ✅ |
+| 6 — Polish bundle | Multiple canonical sources composed; no new substrate | None (extensions) | ✅ all thresholds env-overridable | Per-feature pins | ✅ |
+
+Every arc honors the binding by composition. None introduces parallel state or hardcoded values.
 
 ---
 
