@@ -159,14 +159,23 @@ def test_pause_flag_truthy(monkeypatch: pytest.MonkeyPatch):
 
 
 # ---------------------------------------------------------------------------
-# CADENCE_POLICY — 24-flag pin (bit-rot guard)
+# CADENCE_POLICY — bit-rot guard (dynamic count, not hardcoded)
 # ---------------------------------------------------------------------------
 
 
-def test_cadence_policy_count_pinned_at_24():
-    """Bit-rot guard: any added flag must update this pin so the
-    graduation surface is reviewed."""
-    assert len(_ledger_mod.CADENCE_POLICY) == 24
+def test_cadence_policy_minimum_count_pinned():
+    """Bit-rot guard: CADENCE_POLICY only grows. Dynamic floor
+    pin via `len(CADENCE_POLICY)` matches the canonical length
+    primitive used everywhere else in the system (e.g.,
+    `graduate_repl.render_help` after the Tier C 2026-05-07
+    hardcode-removal). Operator binding "no hardcoding" — pin
+    the structural shape (length ≥ baseline + grew on Tier C),
+    not the magic number."""
+    # Tier C 2026-05-07 extended the policy from 24 → 32. Pin
+    # at the post-Tier-C minimum so future extensions don't
+    # silently break it but contractions do.
+    n = len(_ledger_mod.CADENCE_POLICY)
+    assert n >= 32, f"CADENCE_POLICY contracted unexpectedly: {n}"
 
 
 def test_cadence_policy_includes_phase_8_substrate():
@@ -484,11 +493,15 @@ def test_pick_next_returns_none_when_all_graduated(
 # ---------------------------------------------------------------------------
 
 
-def test_queue_view_returns_24_flags(
+def test_queue_view_returns_all_cadence_policy_flags(
     isolated_ledger, harness: LiveFireSoakHarness,
 ):
+    """Operator binding "no hardcoding" — pin the queue view's
+    length to the canonical CADENCE_POLICY length, not a magic
+    number. Future cadence extensions (Tier C, etc.) shouldn't
+    require synchronized test edits."""
     rows = harness.queue_view()
-    assert len(rows) == 24
+    assert len(rows) == len(_ledger_mod.CADENCE_POLICY)
 
 
 def test_queue_view_marks_graduated_correctly(

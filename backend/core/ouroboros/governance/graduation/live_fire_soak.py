@@ -426,7 +426,32 @@ def classify_outcome(
             "infra", False,
             f"infra_classes:{sorted(infra_hits)}|stop:{stop_reason}",
         )
-    # Step 5: default — conservative classification.
+    # Step 5 (Slice 7, 2026-05-07): empty-summary signature.
+    #
+    # When ALL signal sources are empty (no session_outcome,
+    # no stop_reason, no failure_class_counts), the summary
+    # itself is incomplete — the session never observably
+    # reached a terminal state. This is structurally an INFRA
+    # signal (the harness/observability layer failed to write a
+    # complete summary), not a RUNNER-class failure. Mapping to
+    # RUNNER would conflate "no observable signal" with
+    # "runner-class fault detected" — the same kind of overreach
+    # Slice 5 closed for legacy contract downgrades.
+    #
+    # Canonical example: 2026-05-07 23:40 EXPLORATION_LEDGER_-
+    # LOAD_ADAPTED_CATEGORY_WEIGHTS row (session_id=unknown,
+    # outcome="", stop=""). Pre-Slice-7 this routed to RUNNER;
+    # post-Slice-7 it correctly routes to INFRA (waiver).
+    if (
+        session_outcome == ""
+        and stop_reason == ""
+        and not failure_counts
+    ):
+        return (
+            "infra", False,
+            "summary_incomplete:no_observable_signal",
+        )
+    # Step 6: default — conservative classification.
     return (
         "runner", True,
         f"default_runner:outcome={session_outcome}|stop={stop_reason}",
@@ -1327,13 +1352,55 @@ def _read_most_recent_session(
 
 
 def _resolve_project_root() -> Path:
+    """Resolve the JARVIS-AI-Agent repo root.
+
+    Resolution order:
+
+      1. ``JARVIS_REPO_PATH`` env override (operator escape hatch).
+      2. **Dynamic marker-based walk** — climb parents from this
+         file until a directory is found that contains BOTH the
+         canonical ``scripts/ouroboros_battle_test.py`` AND
+         ``backend/`` markers. This is structural (no hardcoded
+         depth count, immune to future module re-organization);
+         operator binding "no hardcoding" / "fully leverage
+         existing files and architecture".
+      3. Defensive fallback — if no marker is found in the walk
+         (the module was moved outside the repo somehow), return
+         the topmost ancestor reached. Caller will then surface
+         a "battle-test script not found" error pointing at the
+         actual missing path.
+
+    Pre-Slice 7b fix (2026-05-07): function used a hardcoded
+    5-deep ``.parent`` chain whose comment claimed "3 parents"
+    but actually reached ``backend/`` — off-by-one with stale
+    docstring drift. Resulted in cron-fired soaks emitting
+    `outcome=runner` rows because every battle-test invocation
+    failed to find the harness script. Slice 7's lineage waiver
+    correctly absorbed the symptom rows; this is the disease
+    fix.
+    """
     raw = os.environ.get("JARVIS_REPO_PATH")
     if raw:
         return Path(raw)
-    # Walk up from this file: governance/graduation/live_fire_soak.py
-    # → 3 parents = governance, ouroboros, core, backend, repo.
     here = Path(__file__).resolve()
-    return here.parent.parent.parent.parent.parent
+    # Climb until we find the repo-root marker pair. Walk has
+    # a hard depth ceiling (32) defensive against ``Path`` cycles
+    # on exotic filesystems.
+    candidate = here.parent
+    for _ in range(32):
+        if (
+            (candidate / "scripts" / "ouroboros_battle_test.py").exists()
+            and (candidate / "backend").is_dir()
+        ):
+            return candidate
+        if candidate.parent == candidate:
+            # Reached filesystem root; bail.
+            break
+        candidate = candidate.parent
+    # Defensive fallback: caller will surface a clear
+    # "script not found" error pointing at the actual missing
+    # path so the operator can debug.
+    return here.parent.parent.parent.parent.parent.parent
 
 
 # ---------------------------------------------------------------------------

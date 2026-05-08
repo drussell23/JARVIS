@@ -701,10 +701,15 @@ class GraduationLedger:
         # count as before. Defensive; NEVER raises.
         try:
             from backend.core.ouroboros.governance.graduation.lineage_waiver import (  # noqa: E501
+                is_incomplete_summary_runner_lineage,
                 is_legacy_contract_downgrade,
             )
         except ImportError:
             def is_legacy_contract_downgrade(  # type: ignore
+                *, outcome: str, notes: str,
+            ) -> bool:
+                return False
+            def is_incomplete_summary_runner_lineage(  # type: ignore
                 *, outcome: str, notes: str,
             ) -> bool:
                 return False
@@ -719,12 +724,14 @@ class GraduationLedger:
         counts = {
             "clean": 0, "infra": 0, "runner": 0, "migration": 0,
             "runner_legacy_downgrade": 0,
+            "runner_incomplete_summary_waived": 0,
             "unique_sessions": 0, "required": policy.required_clean_sessions,
         }
         seen_per_outcome: Dict[str, set] = {
             "clean": set(), "infra": set(),
             "runner": set(), "migration": set(),
             "runner_legacy_downgrade": set(),
+            "runner_incomplete_summary_waived": set(),
         }
         all_sessions: set = set()
         for r in self._read_all():
@@ -747,9 +754,32 @@ class GraduationLedger:
             # classifies it for eligibility purposes.
             if outcome_key == "runner":
                 routed = False
+                # Slice 7 (2026-05-07) — empty-summary lineage
+                # waiver. Fires REGARDLESS of structured kind:
+                # the May 7 EXPLORATION_LEDGER row carries
+                # kind=DEFAULT_CONSERVATIVE (which would
+                # otherwise block) AND notes matching the
+                # canonical empty-summary bytes. Notes equality
+                # is the load-bearing signal — DEFAULT_CONSERVATIVE
+                # is also emitted for legitimate "unknown
+                # fault-class" rows whose notes carry diagnostic
+                # signal (non-empty outcome OR stop_reason);
+                # those rows DO NOT match the empty-summary bytes
+                # and remain blocking. Pure-string equality on
+                # `INCOMPLETE_SUMMARY_RUNNER_NOTES` keeps the
+                # waiver tight.
+                if is_incomplete_summary_runner_lineage(
+                    outcome=outcome_key,
+                    notes=r.notes,
+                ):
+                    outcome_key = (
+                        "runner_incomplete_summary_waived"
+                    )
+                    routed = True
                 # Slice 6 canonical path.
                 if (
-                    r.runner_attributed_kind is not None
+                    not routed
+                    and r.runner_attributed_kind is not None
                     and _coerce_kind is not None
                     and _is_legacy_downgrade_kind is not None
                 ):
@@ -779,6 +809,7 @@ class GraduationLedger:
         for k in (
             "clean", "infra", "runner", "migration",
             "runner_legacy_downgrade",
+            "runner_incomplete_summary_waived",
         ):
             counts[k] = min(len(seen_per_outcome[k]), MAX_CLEAN_COUNT)
         counts["unique_sessions"] = min(
@@ -817,6 +848,9 @@ def _zero_progress(flag_name: str) -> Dict[str, int]:
         # the live progress() return so callers never KeyError on
         # the audit bucket regardless of master-on/off state.
         "runner_legacy_downgrade": 0,
+        # Slice 7 lineage waiver — empty-summary attribution
+        # bucket; same shape-parity contract as Slice 5.
+        "runner_incomplete_summary_waived": 0,
         "unique_sessions": 0,
         "required": policy.required_clean_sessions if policy else 3,
     }

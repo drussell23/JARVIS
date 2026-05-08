@@ -77,8 +77,40 @@ LEGACY_CONTRACT_DOWNGRADE_NOTE_SUFFIX: str = (
 )
 
 
+# Slice 7 (2026-05-07): empty-summary runner-attribution lineage.
+#
+# Pre-fix `live_fire_soak.classify_outcome` Step 5 default conservatively
+# attributed `outcome="runner"` even when the summary had ZERO observable
+# signal (session_outcome="" AND stop_reason="" AND failure_class_counts
+# empty). The May 7 23:40 EXPLORATION_LEDGER_LOAD_ADAPTED_CATEGORY_WEIGHTS
+# row is the canonical example: emitted with `session_id="unknown"` AND
+# notes `"default_runner:outcome=|stop="` (exact bytes).
+#
+# Forward fix (`live_fire_soak.classify_outcome` Step 5 NEW): empty-
+# summary signature routes to INFRA, not RUNNER. Future soaks emit
+# `outcome="infra"` with `notes="summary_incomplete:no_observable_signal"`
+# and `runner_attributed_kind=NONE` — non-blocking by construction.
+#
+# Backward fix (THIS lineage waiver): existing bad rows (kind=
+# default_conservative + notes matching the canonical bytes) re-route
+# at progress() aggregation time to `runner_incomplete_summary_waived`
+# audit-visible bucket — same pattern as `runner_legacy_downgrade`
+# from Slice 5.
+#
+# Bytes-pinned. AST regression test asserts:
+#   1. Constant exists at module level.
+#   2. String value is exactly "default_runner:outcome=|stop=".
+#   3. Predicate uses `==` exact-equality (NEVER `in` / `endswith`
+#      — operator-mandated tightness; loose match could collide
+#      with legitimate runner-class rows whose notes mention the
+#      prefix in passing).
+INCOMPLETE_SUMMARY_RUNNER_NOTES: str = (
+    "default_runner:outcome=|stop="
+)
+
+
 # ---------------------------------------------------------------------------
-# Pure-function predicate
+# Pure-function predicates
 # ---------------------------------------------------------------------------
 
 
@@ -121,6 +153,39 @@ def is_legacy_contract_downgrade(
     return notes.endswith(
         LEGACY_CONTRACT_DOWNGRADE_NOTE_SUFFIX,
     )
+
+
+def is_incomplete_summary_runner_lineage(
+    *,
+    outcome: str,
+    notes: str,
+) -> bool:
+    """Return True iff ``(outcome, notes)`` matches the empty-
+    summary runner-attribution lineage — Slice 7 backward fix
+    (2026-05-07).
+
+    Tightness contract:
+
+      * Outcome MUST be exactly the string ``"runner"`` (matches
+        ``SessionOutcome.RUNNER.value``). CLEAN / INFRA /
+        MIGRATION rows pass through untouched.
+      * Notes MUST equal :data:`INCOMPLETE_SUMMARY_RUNNER_NOTES`
+        EXACTLY — operator-mandated tightness. ``endswith`` /
+        ``in`` matching is forbidden because the canonical
+        empty-summary bytes (``default_runner:outcome=|stop=``)
+        could appear as a substring of legitimate runner rows
+        whose notes carry additional diagnostic suffix.
+
+    Pure function. NEVER raises. Defensive on type mismatches:
+    non-string inputs return False.
+    """
+    if not isinstance(outcome, str):
+        return False
+    if not isinstance(notes, str):
+        return False
+    if outcome != "runner":
+        return False
+    return notes == INCOMPLETE_SUMMARY_RUNNER_NOTES
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +335,121 @@ def register_shipped_invariants() -> list:
                 return tuple(violations)
         return tuple(violations)
 
+    def _validate_incomplete_summary_constant(
+        tree: "ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 7 — module-level
+        :data:`INCOMPLETE_SUMMARY_RUNNER_NOTES` constant exists
+        and equals the canonical bytes
+        ``"default_runner:outcome=|stop="`` (matches the bytes
+        emitted by ``classify_outcome``'s Step 6 default
+        conservative fallback when both outcome and stop_reason
+        are empty)."""
+        violations: list = []
+        for node in tree.body:
+            if isinstance(node, ast.AnnAssign):
+                if (
+                    isinstance(node.target, ast.Name)
+                    and node.target.id
+                    == "INCOMPLETE_SUMMARY_RUNNER_NOTES"
+                ):
+                    if (
+                        isinstance(node.value, ast.Constant)
+                        and node.value.value
+                        == "default_runner:outcome=|stop="
+                    ):
+                        return ()
+                    violations.append(
+                        "INCOMPLETE_SUMMARY_RUNNER_NOTES must "
+                        "equal literal "
+                        "'default_runner:outcome=|stop='"
+                    )
+                    return tuple(violations)
+        violations.append(
+            "INCOMPLETE_SUMMARY_RUNNER_NOTES module-level "
+            "constant missing"
+        )
+        return tuple(violations)
+
+    def _validate_incomplete_summary_exact_match(
+        tree: "ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Slice 7 — predicate body MUST use ``==`` exact-match
+        on :data:`INCOMPLETE_SUMMARY_RUNNER_NOTES`. ``endswith`` /
+        ``startswith`` / ``in`` are FORBIDDEN — the canonical
+        empty-summary bytes are a strict prefix of any
+        non-empty-summary runner row, so loose match would
+        accidentally waive legitimate runner-class failures."""
+        violations: list = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                if (
+                    node.name
+                    != "is_incomplete_summary_runner_lineage"
+                ):
+                    continue
+                has_eq_check = False
+                for sub in ast.walk(node):
+                    # Reject endswith / startswith / __contains__
+                    # / `in` shapes targeting the constant.
+                    if isinstance(sub, ast.Call):
+                        func = sub.func
+                        if isinstance(func, ast.Attribute):
+                            if func.attr in (
+                                "endswith",
+                                "startswith",
+                                "__contains__",
+                            ):
+                                violations.append(
+                                    f"predicate uses "
+                                    f"{func.attr} — Slice 7 "
+                                    f"requires == exact-match"
+                                )
+                    if isinstance(sub, ast.Compare):
+                        # Reject `<const> in notes`
+                        for op in sub.ops:
+                            if isinstance(op, ast.In):
+                                left = sub.left
+                                if (
+                                    isinstance(left, ast.Name)
+                                    and left.id
+                                    == "INCOMPLETE_SUMMARY_"
+                                       "RUNNER_NOTES"
+                                ):
+                                    violations.append(
+                                        "predicate uses `in` "
+                                        "operator on "
+                                        "incomplete-summary "
+                                        "constant — Slice 7 "
+                                        "requires == "
+                                        "exact-match"
+                                    )
+                        # Look for `notes == <constant>` shape.
+                        for op in sub.ops:
+                            if isinstance(op, ast.Eq):
+                                # Either side may be the Name.
+                                comp = sub.comparators[0] if sub.comparators else None
+                                left = sub.left
+                                names = []
+                                if isinstance(left, ast.Name):
+                                    names.append(left.id)
+                                if isinstance(comp, ast.Name):
+                                    names.append(comp.id)
+                                if (
+                                    "INCOMPLETE_SUMMARY_RUNNER_NOTES"
+                                    in names
+                                    and "notes" in names
+                                ):
+                                    has_eq_check = True
+                if not has_eq_check:
+                    violations.append(
+                        "predicate must use `notes == "
+                        "INCOMPLETE_SUMMARY_RUNNER_NOTES` "
+                        "exact-match"
+                    )
+                return tuple(violations)
+        return tuple(violations)
+
     return [
         ShippedCodeInvariant(
             invariant_name="lineage_waiver_constant_value_pinned",
@@ -302,11 +482,44 @@ def register_shipped_invariants() -> list:
             ),
             validate=_validate_outcome_check_pinned,
         ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "lineage_waiver_incomplete_summary_constant"
+            ),
+            target_file=target,
+            description=(
+                "Slice 7 — module-level constant "
+                "INCOMPLETE_SUMMARY_RUNNER_NOTES equals the "
+                "canonical bytes emitted by classify_outcome's "
+                "Step 6 default conservative fallback when "
+                "both outcome and stop_reason are empty."
+            ),
+            validate=_validate_incomplete_summary_constant,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "lineage_waiver_incomplete_summary_exact_match"
+            ),
+            target_file=target,
+            description=(
+                "Slice 7 — operator-mandated tightness: "
+                "is_incomplete_summary_runner_lineage MUST "
+                "use == exact-match on the constant. "
+                "endswith/startswith/in/__contains__ are "
+                "FORBIDDEN — the canonical bytes are a strict "
+                "prefix of any non-empty-summary runner row, "
+                "so loose match would accidentally waive "
+                "legitimate failures."
+            ),
+            validate=_validate_incomplete_summary_exact_match,
+        ),
     ]
 
 
 __all__ = [
+    "INCOMPLETE_SUMMARY_RUNNER_NOTES",
     "LEGACY_CONTRACT_DOWNGRADE_NOTE_SUFFIX",
+    "is_incomplete_summary_runner_lineage",
     "is_legacy_contract_downgrade",
     "register_shipped_invariants",
 ]
