@@ -201,6 +201,19 @@ events (GRAPH_SUBMITTED/STARTED/COMPLETED/FAILED/CANCELLED)
 The bridge MUST NOT mutate tracker state."""
 
 
+EVENT_TYPE_AUTONOMY_COMMAND_BUS = (
+    "autonomy_command_bus"
+)
+"""Phase 3 A3 — fired by ``AutonomyCommandBusBridge`` when
+``CommandBus.snapshot_all()`` aggregate metrics deltas
+across all live bus instances. Chatter-suppressed: SSE only
+when total_dispatched / rejected_dedup /
+rejected_backpressure / by_command_type counts changed vs
+last poll. Operator binding 2026-05-07:
+'rate-limited, CORS/loopback same as existing observability
+slices.'"""
+
+
 EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED = (
     "tool_confidence_band_crossed"
 )
@@ -703,6 +716,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TOOL_CONFIDENCE_BAND_CROSSED,     # §37 Tier 2 #13 Slice 1 (per-tool confidence)
     EVENT_TYPE_MULTI_PRIOR_DISPATCH,             # Move 6.5 Slice 4 (multi-prior dispatch observer)
     EVENT_TYPE_EXECUTION_GRAPH_PROGRESS,         # Phase 3 A2 (read-only projection of canonical tracker)
+    EVENT_TYPE_AUTONOMY_COMMAND_BUS,             # Phase 3 A3 (read-only polling of CommandBus.snapshot_all)
 })
 
 
@@ -2494,6 +2508,62 @@ def publish_trajectory_drift_event(
         logger.debug(
             "[Stream] trajectory drift event publish exception",
             exc_info=True,
+        )
+        return None
+
+
+def publish_autonomy_command_bus_event(
+    *,
+    instance_count: int,
+    total_qsize: int,
+    total_dispatched: int,
+    total_rejected_dedup: int,
+    total_rejected_backpressure: int,
+    by_command_type: Optional[Dict[str, int]] = None,
+    delta: Optional[Dict[str, int]] = None,
+    ts_unix: float,
+) -> Optional[str]:
+    """Best-effort publisher for ``autonomy_command_bus``
+    frames (Phase 3 A3, 2026-05-07). Fired by
+    ``AutonomyCommandBusBridge`` ONLY when polled metrics
+    show a delta vs last poll (chatter-suppressed otherwise).
+
+    Operator binding 2026-05-07: 'rate-limited, CORS/loopback
+    same as existing observability slices.' The bridge polls
+    canonical ``CommandBus.snapshot_all()``; this publisher
+    is the single SSE projection surface — direct
+    ``broker.publish`` forbidden in the bridge.
+
+    NEVER raises; returns the published event id or None on
+    master-flag-off / publish failure."""
+    if not stream_enabled():
+        return None
+    try:
+        body: Dict[str, Any] = {
+            "instance_count": int(instance_count),
+            "total_qsize": int(total_qsize),
+            "total_dispatched": int(total_dispatched),
+            "total_rejected_dedup": int(
+                total_rejected_dedup,
+            ),
+            "total_rejected_backpressure": int(
+                total_rejected_backpressure,
+            ),
+            "by_command_type": dict(
+                by_command_type or {},
+            ),
+            "delta": dict(delta or {}),
+            "ts_unix": float(ts_unix),
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_AUTONOMY_COMMAND_BUS,
+            "autonomy_command_bus",
+            body,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] autonomy_command_bus publish "
+            "exception", exc_info=True,
         )
         return None
 
