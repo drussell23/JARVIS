@@ -703,6 +703,7 @@ class GraduationLedger:
             from backend.core.ouroboros.governance.graduation.lineage_waiver import (  # noqa: E501
                 is_incomplete_summary_runner_lineage,
                 is_legacy_contract_downgrade,
+                is_pre_slice_7c_shutdown_misclassification,
             )
         except ImportError:
             def is_legacy_contract_downgrade(  # type: ignore
@@ -710,6 +711,10 @@ class GraduationLedger:
             ) -> bool:
                 return False
             def is_incomplete_summary_runner_lineage(  # type: ignore
+                *, outcome: str, notes: str,
+            ) -> bool:
+                return False
+            def is_pre_slice_7c_shutdown_misclassification(  # type: ignore
                 *, outcome: str, notes: str,
             ) -> bool:
                 return False
@@ -771,6 +776,23 @@ class GraduationLedger:
                 if is_incomplete_summary_runner_lineage(
                     outcome=outcome_key,
                     notes=r.notes,
+                ):
+                    outcome_key = (
+                        "runner_incomplete_summary_waived"
+                    )
+                    routed = True
+                # Slice 7c (2026-05-07) — pre-Slice-7c shutdown
+                # misclassification waiver. Detects rows
+                # written with composite stop_reason (e.g.,
+                # `wall_clock_cap+atexit_fallback`) OR
+                # `incomplete_kill` outcome BEFORE the Slice 7c
+                # forward fix landed. Routes to the same audit-
+                # visible non-blocking bucket.
+                if not routed and (
+                    is_pre_slice_7c_shutdown_misclassification(
+                        outcome=outcome_key,
+                        notes=r.notes,
+                    )
                 ):
                     outcome_key = (
                         "runner_incomplete_summary_waived"

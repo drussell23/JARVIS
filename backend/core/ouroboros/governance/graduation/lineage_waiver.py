@@ -1,4 +1,4 @@
-"""Phase 9 Slice 5 — Lineage waiver predicate.
+"""Phase 9 Slice 5 / 7 / 7c — Lineage waiver predicates.
 
 Closes the structural-mismatch problem surfaced by the 2026-05-05
 green-soak proof: pre-Slice-4 cadence soaks recorded ``outcome=runner``
@@ -53,6 +53,8 @@ Forward-looking (deferred — separate slice, not in scope here):
     through the structured field.
 """
 from __future__ import annotations
+
+import re
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +155,99 @@ def is_legacy_contract_downgrade(
     return notes.endswith(
         LEGACY_CONTRACT_DOWNGRADE_NOTE_SUFFIX,
     )
+
+
+_DEFAULT_RUNNER_NOTES_RE = re.compile(
+    r"^default_runner:outcome=([^|]*)\|stop=(.*)$",
+)
+"""Slice 7c (2026-05-07) — canonical regex for parsing the
+``classify_outcome`` Step 6 default conservative notes shape:
+``default_runner:outcome=<X>|stop=<Y>``. Used by
+:func:`is_pre_slice_7c_shutdown_misclassification` to detect
+rows misclassified BEFORE the Slice 7c forward fix landed.
+
+Capture groups:
+  1. The session_outcome value (may be empty / ``incomplete_kill`` / etc.)
+  2. The stop_reason value (may be empty / composite like
+     ``wall_clock_cap+atexit_fallback`` / etc.)
+
+Bytes-pinned via AST regression."""
+
+
+def is_pre_slice_7c_shutdown_misclassification(
+    *,
+    outcome: str,
+    notes: str,
+) -> bool:
+    """Return True iff ``(outcome, notes)`` matches the
+    pre-Slice-7c shutdown misclassification lineage —
+    Slice 7c backward fix (2026-05-07).
+
+    Real cadence soak ``bt-2026-05-08-022312`` (May 8 03:10
+    UTC, first cron-fired soak in repo history that actually
+    completed) hit the 40min wall-clock cap and wrote a
+    composite stop_reason ``wall_clock_cap+atexit_fallback`` +
+    session_outcome ``incomplete_kill``. ``classify_outcome``'s
+    Step 4 used exact set membership on
+    ``_SHUTDOWN_NOISE_STOP_REASONS`` (no composite-prefix
+    handling) and didn't recognize ``incomplete_kill`` as an
+    INFRA signal — both gaps. The row landed as
+    ``outcome=runner runner_attributed_kind=default_conservative``
+    when it should have been INFRA.
+
+    Slice 7c forward-fix in :mod:`live_fire_soak` prevents
+    future rows from this misclassification. THIS predicate is
+    the backward-compat shim for rows already on disk.
+
+    Tightness contract:
+
+      * Outcome MUST be exactly the string ``"runner"``.
+      * Notes MUST match :data:`_DEFAULT_RUNNER_NOTES_RE` (the
+        canonical Step 6 default-runner notes shape).
+      * The captured session_outcome MUST be in
+        :data:`_INCOMPLETE_OUTCOME_VALUES` (e.g.,
+        ``incomplete_kill``) OR the captured stop_reason's
+        leading segment MUST be in
+        :data:`_SHUTDOWN_NOISE_STOP_REASONS_LIVE_FIRE` (e.g.,
+        ``wall_clock_cap`` from ``wall_clock_cap+atexit_fallback``).
+
+    Pure function. NEVER raises. Defensive on type mismatches:
+    non-string inputs return False.
+    """
+    if not isinstance(outcome, str):
+        return False
+    if not isinstance(notes, str):
+        return False
+    if outcome != "runner":
+        return False
+    m = _DEFAULT_RUNNER_NOTES_RE.match(notes)
+    if not m:
+        return False
+    captured_outcome = m.group(1).strip()
+    captured_stop = m.group(2).strip()
+    # Compose canonical sets from live_fire_soak — single source
+    # of truth. Lazy-import to avoid startup cycle. Defensive: any
+    # ImportError → fall back to literal frozenset (preserves
+    # backward-fix coverage even if substrate is partially loaded).
+    try:
+        from backend.core.ouroboros.governance.graduation.live_fire_soak import (  # noqa: E501
+            _INCOMPLETE_OUTCOME_VALUES,
+            _SHUTDOWN_NOISE_STOP_REASONS,
+        )
+        incomplete_values = _INCOMPLETE_OUTCOME_VALUES
+        shutdown_noise = _SHUTDOWN_NOISE_STOP_REASONS
+    except ImportError:
+        incomplete_values = frozenset({"incomplete_kill"})
+        shutdown_noise = frozenset({
+            "sigterm", "sighup", "sigint",
+            "wall_clock_cap", "harness_idle_timeout",
+        })
+    if captured_outcome in incomplete_values:
+        return True
+    # Composite stop-reason prefix match — same logic as
+    # live_fire_soak._is_shutdown_noise_stop.
+    head = captured_stop.split("+", 1)[0].strip()
+    return head in shutdown_noise
 
 
 def is_incomplete_summary_runner_lineage(

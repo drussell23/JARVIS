@@ -199,17 +199,46 @@ def compose(swarm_segment: object) -> LiveStatusLineRender:
 # ===========================================================================
 
 
+def _render_task_panel_segment() -> str:
+    """Compose canonical ``task_panel_aggregator`` into a
+    bottom_toolbar segment. NEVER raises; returns empty string
+    when:
+      * master flag off
+      * aggregator returns no entries
+      * any composition fault (defensive)
+
+    Phase 3 (PRD §37 v2.55→v2.56, 2026-05-07) — composes
+    `governance/task_panel_aggregator.format_task_panel` which
+    in turn composes `OpBlockBuffer.active_blocks` +
+    `recently_committed` (canonical lifecycle source)."""
+    try:
+        from backend.core.ouroboros.governance.task_panel_aggregator import (  # noqa: E501
+            format_task_panel,
+        )
+        return format_task_panel()
+    except Exception:  # noqa: BLE001 — defensive
+        return ""
+
+
 def make_bottom_toolbar_callable(
     swarm_callable: Callable[[], object],
 ) -> Callable[[], object]:
-    """Build a ``bottom_toolbar`` callable that merges ``swarm_callable``'s
-    output with the registered status segment.
+    """Build a ``bottom_toolbar`` callable that merges
+    ``swarm_callable``'s output with the registered status segment
+    AND the persistent task panel.
 
     Returns a function suitable for direct use as ``PromptSession(
     bottom_toolbar=...)``. The wrapped function returns the
-    prompt_toolkit ``ANSI`` wrapper when both segments are non-empty,
-    or the original swarm output (passed through unchanged) when the
-    master flag is off OR no builder is registered.
+    prompt_toolkit ``ANSI`` wrapper when any segment is non-empty,
+    or the original swarm output (passed through unchanged) when
+    every segment is empty.
+
+    Phase 3 (PRD §37 v2.55→v2.56, 2026-05-07) — composes the
+    task-panel segment ABOVE the status line (matches CC's
+    visual order). When the task-panel master flag is OFF, this
+    function is byte-identical to pre-Phase-3 behavior — only
+    the (raw + status) merge fires. When ON, the panel is
+    inserted between raw and status.
 
     The caller in ``serpent_flow.py`` can replace its existing
     ``bottom_toolbar=_bottom_toolbar`` argument with
@@ -230,10 +259,17 @@ def make_bottom_toolbar_callable(
             )
             raw = ""
 
-        # Master flag off OR no status segment → pass through unchanged
-        # (preserves byte-identical legacy behavior).
+        # Compose three segments:
+        #   1. raw (legacy swarm-digest)
+        #   2. task panel (Phase 3 — when JARVIS_TASK_PANEL_ENABLED=true)
+        #   3. status segment (Phase 1+2 — when status_line_enabled)
+        # Empty segments drop out; non-empty join with newline.
+        task_panel = _render_task_panel_segment()
         status_safe = render_status_segment()
-        if not status_safe:
+
+        # All segments empty → pass through unchanged
+        # (preserves byte-identical legacy behavior).
+        if not task_panel and not status_safe:
             return raw
 
         # Merge: convert ``raw`` to a plain string for joining. The
@@ -241,15 +277,25 @@ def make_bottom_toolbar_callable(
         # with ANSI at the join site so escape codes survive.
         try:
             from prompt_toolkit.formatted_text import ANSI
+            wrap_ansi = True
         except ImportError:
-            # No prompt_toolkit available — return joined plain text.
-            raw_str = _to_plain_str(raw)
-            return f"{raw_str}\n{status_safe}" if raw_str else status_safe
+            wrap_ansi = False
 
         raw_str = _to_plain_str(raw)
-        if not raw_str:
-            return ANSI(status_safe)
-        return ANSI(f"{raw_str}\n{status_safe}")
+        # Build the merged string segment-by-segment so any subset
+        # of the three segments can be empty and we still get a
+        # well-formed multi-line result.
+        parts = []
+        if raw_str:
+            parts.append(raw_str)
+        if task_panel:
+            parts.append(task_panel)
+        if status_safe:
+            parts.append(status_safe)
+        merged = "\n".join(parts)
+        if wrap_ansi:
+            return ANSI(merged) if merged else ""
+        return merged
 
     return _wrapped
 

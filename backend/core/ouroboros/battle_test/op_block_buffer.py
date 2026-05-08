@@ -377,6 +377,82 @@ class OpBlockBuffer:
                 expanded_count=expanded,
             )
 
+    # ---- read-only query API (Phase 3 read-API extension, 2026-05-07) ----
+
+    def blocks_by_state(
+        self,
+        states: Tuple[OpBlockState, ...],
+    ) -> Tuple[OpBlock, ...]:
+        """Return blocks whose state is in ``states`` in
+        registration order. Pure read; NEVER raises.
+
+        Phase 3 (PRD §37 v2.55→v2.56, 2026-05-07): canonical
+        operator-facing read API for the
+        ``TaskPanelAggregator`` — eliminates downstream private-
+        state reach-in for ``_items``. Defensive on bad inputs:
+        non-tuple ``states`` or empty input returns empty.
+
+        Singleton + Read-API Extension Pattern (§33 catalog 11th
+        invocation)."""
+        try:
+            if not states:
+                return ()
+            valid = tuple(
+                s for s in states if isinstance(s, OpBlockState)
+            )
+            if not valid:
+                return ()
+        except Exception:  # noqa: BLE001 — defensive
+            return ()
+        with self._lock:
+            return tuple(
+                e for e in self._items.values()
+                if e.state in valid
+            )
+
+    def active_blocks(self) -> Tuple[OpBlock, ...]:
+        """Convenience accessor — return all BUFFERING blocks
+        in registration order. Pure read; NEVER raises.
+
+        Used by :class:`TaskPanelAggregator` to surface
+        in-progress ops in the persistent task panel."""
+        return self.blocks_by_state(
+            (OpBlockState.BUFFERING,),
+        )
+
+    def recently_committed(
+        self,
+        *,
+        within_seconds: float = 30.0,
+        now_monotonic: Optional[float] = None,
+    ) -> Tuple[OpBlock, ...]:
+        """Return COMMITTED blocks committed within
+        ``within_seconds`` of ``now_monotonic`` (defaults to
+        ``time.monotonic()``). Pure read; NEVER raises.
+
+        Used by :class:`TaskPanelAggregator` to surface
+        recently-finished ops in the panel with a fade window
+        (operator-tunable via env knob)."""
+        try:
+            if within_seconds <= 0:
+                return ()
+            now = (
+                float(now_monotonic)
+                if now_monotonic is not None
+                else time.monotonic()
+            )
+        except (TypeError, ValueError):
+            return ()
+        cutoff = now - float(within_seconds)
+        with self._lock:
+            return tuple(
+                e for e in self._items.values()
+                if (
+                    e.state is OpBlockState.COMMITTED
+                    and e.committed_at >= cutoff
+                )
+            )
+
     # ---- mutating API -------------------------------------------------
 
     def start_op(self, op_id: object) -> Optional[OpBlock]:

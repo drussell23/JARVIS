@@ -367,6 +367,61 @@ _MIGRATION_STOP_REASONS: FrozenSet[str] = frozenset({
 })
 
 
+# Slice 7c (2026-05-07) — canonical shutdown-noise stop_reasons.
+# Single source of truth, lifted from inline literals into a
+# module-level frozenset so:
+#
+#   1. Operator-binding "no hardcoding" — additions go here, not
+#      in the function body.
+#   2. The composite-prefix split logic (e.g.,
+#      ``wall_clock_cap+atexit_fallback`` from the partial-shutdown
+#      insurance path in ``ouroboros_battle_test.py``) can use the
+#      same canonical set.
+_SHUTDOWN_NOISE_STOP_REASONS: FrozenSet[str] = frozenset({
+    "sigterm",
+    "sighup",
+    "sigint",
+    "wall_clock_cap",
+    "harness_idle_timeout",
+})
+
+
+# Slice 7c (2026-05-07) — session_outcome values that signal the
+# session never observably reached a terminal state. Cadence soaks
+# that hit ``wall_clock_cap`` while the harness is mid-cleanup
+# write a ``incomplete_kill`` outcome via the partial-shutdown
+# insurance path (see PRD §32.7 Battle Test "Signal handling"). This
+# is structurally an INFRA signal — the session was killed by an
+# external time/signal boundary, not a runner-class fault.
+_INCOMPLETE_OUTCOME_VALUES: FrozenSet[str] = frozenset({
+    "incomplete_kill",
+})
+
+
+def _is_shutdown_noise_stop(stop_reason: str) -> bool:
+    """Return True iff ``stop_reason`` matches a canonical
+    shutdown-noise reason. Pure function. NEVER raises.
+
+    Slice 7c (2026-05-07): handles **composite stop_reasons**
+    via ``+`` separator. The harness's ``atexit`` fallback
+    (per PRD §32.7 Battle Test partial-shutdown insurance)
+    appends ``+atexit_fallback`` to the original signal name
+    (e.g., ``wall_clock_cap+atexit_fallback``); legitimate
+    shutdown-noise sessions MUST still classify as INFRA, not
+    RUNNER.
+
+    Match strategy: split on ``+`` and check if the FIRST
+    segment is in :data:`_SHUTDOWN_NOISE_STOP_REASONS`. The
+    first segment carries the original signal; subsequent
+    segments are insurance-path tokens. Exact set membership
+    is preserved on uncomposed reasons.
+    """
+    if not isinstance(stop_reason, str) or not stop_reason:
+        return False
+    head = stop_reason.split("+", 1)[0].strip()
+    return head in _SHUTDOWN_NOISE_STOP_REASONS
+
+
 def classify_outcome(
     summary: Mapping[str, Any],
     *,
@@ -413,18 +468,37 @@ def classify_outcome(
             f"runner_classes:{sorted(runner_hits)}",
         )
     # Step 4: infra-class failure or shutdown-noise.
+    #
+    # Slice 7c (2026-05-07): `_is_shutdown_noise_stop` handles
+    # composite stop_reasons (e.g., `wall_clock_cap+atexit_fallback`
+    # from the partial-shutdown insurance path) by checking the
+    # leading segment before `+`. AST-pinned: the inline literal
+    # set is FORBIDDEN here — single source of truth lives in
+    # `_SHUTDOWN_NOISE_STOP_REASONS`.
+    #
+    # Additionally, `session_outcome` in `_INCOMPLETE_OUTCOME_VALUES`
+    # (`incomplete_kill`) signals the session was externally killed
+    # before reaching a terminal state — structurally INFRA, not
+    # RUNNER. Operator binding 2026-05-07 satisfied: real cadence
+    # soak `bt-2026-05-08-022312` exposed this gap.
     infra_hits = [
         k for k, v in failure_counts.items()
         if k in _INFRA_FAILURE_CLASSES and _is_positive_int(v)
     ]
-    shutdown_noise = stop_reason in {
-        "sigterm", "sighup", "sigint", "wall_clock_cap",
-        "harness_idle_timeout",
-    }
-    if infra_hits or shutdown_noise:
+    shutdown_noise = _is_shutdown_noise_stop(stop_reason)
+    incomplete_outcome = (
+        session_outcome in _INCOMPLETE_OUTCOME_VALUES
+    )
+    if infra_hits or shutdown_noise or incomplete_outcome:
+        reason_token = (
+            f"incomplete_outcome:{session_outcome}|"
+            if incomplete_outcome
+            else ""
+        )
         return (
             "infra", False,
-            f"infra_classes:{sorted(infra_hits)}|stop:{stop_reason}",
+            f"{reason_token}infra_classes:{sorted(infra_hits)}"
+            f"|stop:{stop_reason}",
         )
     # Step 5 (Slice 7, 2026-05-07): empty-summary signature.
     #
