@@ -237,6 +237,17 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_DREAM_EMITTED = "dream_emitted"
+"""§38.11-D (PRD v2.67→v2.68, 2026-05-08) — fired by
+``introspective_voice.emit_dream_prose`` when DreamEngine's
+speculative-blueprint prose commits as a
+:data:`NarrativeKind.DREAM` frame in the canonical
+NarrativeChannel. Payload carries op_id / phase / ref /
+char_count. Composes the (now 7-value) canonical
+:class:`NarrativeKind` taxonomy — DREAM is the kind this
+slice extends the taxonomy with."""
+
+
 EVENT_TYPE_PREFETCH_SCHEDULED = "prefetch_scheduled"
 """§38.11-C (PRD v2.66→v2.67, 2026-05-08) — fired by
 ``anticipation_surface.AnticipationSurface.record_prefetch``
@@ -767,6 +778,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_FLAG_GRADUATED,                   # §38.11-B (graduation ticker — flag READY transitions)
     EVENT_TYPE_INTERVENTION_BANNER_RAISED,       # §38.11-C (proactive intervention banner)
     EVENT_TYPE_PREFETCH_SCHEDULED,               # §38.11-C (anticipatory pre-fetch indicator)
+    EVENT_TYPE_DREAM_EMITTED,                    # §38.11-D (DreamEngine DREAM-kind narrative frame committed)
 })
 
 

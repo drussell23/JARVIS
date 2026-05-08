@@ -39,10 +39,13 @@ def test_ref_prefix_is_n_dash():
     assert REF_PREFIX == "n-"
 
 
-def test_narrative_kind_closed_six_values():
+def test_narrative_kind_closed_seven_values():
+    """Closed taxonomy extended 2026-05-08 (§38.11-D) — added
+    DREAM for DreamEngine speculative-blueprint prose."""
     assert {m.value for m in NarrativeKind} == {
         "intent", "plan_prose", "tool_preamble",
         "thinking", "l2_repair_prose", "postmortem_prose",
+        "dream",
     }
 
 

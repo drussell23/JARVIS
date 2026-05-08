@@ -123,6 +123,12 @@ _KIND_STYLES: Mapping[NarrativeKind, FrameStyle] = {
         glyph="💀", tint="red",     # dim italic still applies via global
                                     # ``italic=True``; red signals failure
     ),
+    NarrativeKind.DREAM: FrameStyle(
+        glyph="🌙", tint="bright_magenta",  # §38.11-D 2026-05-08:
+                                            # DreamEngine speculative prose;
+                                            # magenta separates idle dreaming
+                                            # from active thinking (gray).
+    ),
 }
 
 

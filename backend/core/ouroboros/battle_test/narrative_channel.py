@@ -31,7 +31,8 @@ Substrate scope
 
 * :class:`NarrativeFrame` frozen dataclass — one buffered narrative
   emission with phase + kind metadata
-* Closed 6-value :class:`NarrativeKind` taxonomy
+* Closed 7-value :class:`NarrativeKind` taxonomy (extended 2026-05-08
+  §38.11-D adds :data:`DREAM` for DreamEngine prose)
 * Closed 3-value :class:`FrameState` lifecycle (BUFFERING / COMMITTED
   / DISCARDED)
 * :class:`NarrativeChannel` thread-safe FIFO ring with monotonic
@@ -105,12 +106,16 @@ REF_PREFIX: str = "n-"
 
 
 class NarrativeKind(str, enum.Enum):
-    """Closed 6-value vocabulary for what the model is saying.
+    """Closed 7-value vocabulary for what the model is saying.
 
     Each kind maps to a distinct phase/context where the model emits
     natural-language prose. Closed taxonomy — adding a new kind
     requires a slice (the renderer in Slice 3 dispatches on this
     enum to choose a glyph/style).
+
+    Extended to 7 values 2026-05-08 (§38.11-D Introspective Voice,
+    merged with §39 #9): added :data:`DREAM` for DreamEngine
+    speculative-improvement prose emitted during idle GPU.
     """
 
     INTENT = "intent"                       # op_started: "I'm going to fix X by..."
@@ -119,6 +124,7 @@ class NarrativeKind(str, enum.Enum):
     THINKING = "thinking"                   # extended-thinking REASONING_TOKEN content
     L2_REPAIR_PROSE = "l2_repair_prose"     # repair iteration narrative
     POSTMORTEM_PROSE = "postmortem_prose"   # failed-op analysis
+    DREAM = "dream"                         # DreamEngine idle speculative blueprint prose
 
     @classmethod
     def coerce(cls, raw: object) -> "NarrativeKind":
@@ -821,9 +827,10 @@ def register_shipped_invariants() -> list:
 
     Four structural invariants:
 
-      1. ``narrative_kind_taxonomy_frozen`` — closed 6-value enum
+      1. ``narrative_kind_taxonomy_frozen`` — closed 7-value enum
          is the source of truth for the renderer's dispatch table;
          losing a value silently disables a model-voice channel.
+         Extended 2026-05-08 (§38.11-D) to require ``DREAM``.
       2. ``narrative_renderer_visual_hierarchy`` — the renderer's
          style table MUST cover every NarrativeKind explicitly
          (Constraint 1: visual hierarchy).
@@ -856,12 +863,14 @@ def register_shipped_invariants() -> list:
         required = {
             "INTENT", "PLAN_PROSE", "TOOL_PREAMBLE",
             "THINKING", "L2_REPAIR_PROSE", "POSTMORTEM_PROSE",
+            "DREAM",  # §38.11-D 2026-05-08 (Introspective Voice)
         }
         missing = required - seen
         if missing:
             return (
                 f"NarrativeKind lost values: {sorted(missing)} — "
-                "the closed taxonomy is frozen by Gap #6 Slice 5",
+                "the closed taxonomy is frozen by Gap #6 Slice 5 "
+                "+ §38.11-D (DREAM)",
             )
         return ()
 
@@ -874,6 +883,7 @@ def register_shipped_invariants() -> list:
         for kind in (
             "INTENT", "PLAN_PROSE", "TOOL_PREAMBLE",
             "THINKING", "L2_REPAIR_PROSE", "POSTMORTEM_PROSE",
+            "DREAM",  # §38.11-D 2026-05-08
         ):
             if f"NarrativeKind.{kind}" not in source:
                 violations.append(
@@ -918,9 +928,10 @@ def register_shipped_invariants() -> list:
                 "backend/core/ouroboros/battle_test/narrative_channel.py"
             ),
             description=(
-                "NarrativeKind's 6-value closed taxonomy must remain "
-                "intact. Losing a kind silently disables a model-voice "
-                "channel."
+                "NarrativeKind's 7-value closed taxonomy must remain "
+                "intact (extended 2026-05-08 §38.11-D adds DREAM for "
+                "DreamEngine prose). Losing a kind silently disables "
+                "a model-voice channel."
             ),
             validate=_validate_narrative_kind_frozen,
         ),
