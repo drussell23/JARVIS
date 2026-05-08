@@ -423,24 +423,40 @@ def register_shipped_invariants() -> list:
         valid OperationPhase enum member."""
         violations: list = []
         # Extract _FORWARD_FLOW_PHASE_NAMES tuple from the
-        # current module source.
+        # current module source. Walks both ast.Assign (bare
+        # assignment) and ast.AnnAssign (type-annotated
+        # assignment) — the canonical source uses
+        # `_FORWARD_FLOW_PHASE_NAMES: Tuple[str, ...] = (...)`.
         flow_names: list = []
         for node in ast.walk(tree):
+            target_name = None
+            value_node = None
             if isinstance(node, ast.Assign):
                 for tgt in node.targets:
                     if (
                         isinstance(tgt, ast.Name)
                         and tgt.id == "_FORWARD_FLOW_PHASE_NAMES"
                     ):
-                        if isinstance(node.value, ast.Tuple):
-                            for elt in node.value.elts:
-                                if (
-                                    isinstance(elt, ast.Constant)
-                                    and isinstance(
-                                        elt.value, str,
-                                    )
-                                ):
-                                    flow_names.append(elt.value)
+                        target_name = tgt.id
+                        value_node = node.value
+            elif isinstance(node, ast.AnnAssign):
+                if (
+                    isinstance(node.target, ast.Name)
+                    and node.target.id
+                    == "_FORWARD_FLOW_PHASE_NAMES"
+                ):
+                    target_name = node.target.id
+                    value_node = node.value
+            if (
+                target_name == "_FORWARD_FLOW_PHASE_NAMES"
+                and isinstance(value_node, ast.Tuple)
+            ):
+                for elt in value_node.elts:
+                    if (
+                        isinstance(elt, ast.Constant)
+                        and isinstance(elt.value, str)
+                    ):
+                        flow_names.append(elt.value)
         if not flow_names:
             violations.append(
                 "_FORWARD_FLOW_PHASE_NAMES tuple not found "
@@ -479,25 +495,35 @@ def register_shipped_invariants() -> list:
     def _validate_forward_flow_length_eleven(
         tree: "ast.Module", source: str,  # noqa: ARG001
     ) -> tuple:
-        """Tuple length pinned to 11 per CLAUDE.md doc."""
+        """Tuple length pinned to 11 per CLAUDE.md doc.
+        Handles both Assign and AnnAssign (canonical uses
+        type annotation)."""
         violations: list = []
         for node in ast.walk(tree):
+            value_node = None
             if isinstance(node, ast.Assign):
                 for tgt in node.targets:
                     if (
                         isinstance(tgt, ast.Name)
                         and tgt.id == "_FORWARD_FLOW_PHASE_NAMES"
                     ):
-                        if isinstance(node.value, ast.Tuple):
-                            count = len(node.value.elts)
-                            if count != 11:
-                                violations.append(
-                                    f"_FORWARD_FLOW_PHASE_NAMES "
-                                    f"length is {count}, "
-                                    f"expected 11 (matches "
-                                    f"CLAUDE.md + §28.5.1 "
-                                    f"closure)"
-                                )
+                        value_node = node.value
+            elif isinstance(node, ast.AnnAssign):
+                if (
+                    isinstance(node.target, ast.Name)
+                    and node.target.id
+                    == "_FORWARD_FLOW_PHASE_NAMES"
+                ):
+                    value_node = node.value
+            if isinstance(value_node, ast.Tuple):
+                count = len(value_node.elts)
+                if count != 11:
+                    violations.append(
+                        f"_FORWARD_FLOW_PHASE_NAMES "
+                        f"length is {count}, "
+                        f"expected 11 (matches CLAUDE.md "
+                        f"+ §28.5.1 closure)"
+                    )
         return tuple(violations)
 
     def _validate_composes_canonical_op_context(
