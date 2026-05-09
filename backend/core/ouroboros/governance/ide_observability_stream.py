@@ -237,6 +237,25 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_SESSION_STORY_RENDERED = "session_story_rendered"
+"""§39 Tier-4 #10 (PRD v2.73→v2.74, 2026-05-09) — fired by
+``session_story.aggregate_session_story`` for each session
+narrative. Payload carries session_id + duration_human +
+cost_human + stop_reason + beats[]. Composes canonical
+LastSessionSummary."""
+
+
+EVENT_TYPE_MEMORY_CRYSTALLIZATION_AGGREGATED = (
+    "memory_crystallization_aggregated"
+)
+"""§39 Tier-4 #18 (PRD v2.73→v2.74, 2026-05-09) — fired by
+``memory_crystallization.aggregate_crystal_timeline`` after
+each insights.jsonl read. Payload bounded to layer summary
++ by_age counts (NOT raw crystal bodies). Composes canonical
+MemoryInsight schema (4 categories) via on-disk
+.jarvis/ouroboros/consciousness/insights.jsonl."""
+
+
 EVENT_TYPE_TRAJECTORY_PREDICTED = "trajectory_predicted"
 """§39 Tier-3 #4 (PRD v2.72→v2.73, 2026-05-08) — fired by
 ``op_trajectory_predictor.predict_trajectory`` after each
@@ -848,6 +867,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_DASHBOARD_RENDERED,               # §39 Tier-2 #1 (organism dashboard multi-pane snapshot)
     EVENT_TYPE_TRAJECTORY_PREDICTED,             # §39 Tier-3 #4 (op trajectory prediction)
     EVENT_TYPE_COMMAND_PREVIEW_RENDERED,         # §39 Tier-3 #19 (pre-submission risk preview)
+    EVENT_TYPE_SESSION_STORY_RENDERED,           # §39 Tier-4 #10 (operator's-eye session story)
+    EVENT_TYPE_MEMORY_CRYSTALLIZATION_AGGREGATED, # §39 Tier-4 #18 (memory crystallization timeline)
 })
 
 
