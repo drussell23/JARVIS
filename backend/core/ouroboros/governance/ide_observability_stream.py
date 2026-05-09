@@ -237,6 +237,25 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_TRAJECTORY_PREDICTED = "trajectory_predicted"
+"""§39 Tier-3 #4 (PRD v2.72→v2.73, 2026-05-08) — fired by
+``op_trajectory_predictor.predict_trajectory`` after each
+prediction. Payload carries op_id + confidence + median/p90
+durations + ETA. Composes canonical OpBlockBuffer history
+— no parallel duration ledger."""
+
+
+EVENT_TYPE_COMMAND_PREVIEW_RENDERED = (
+    "command_preview_rendered"
+)
+"""§39 Tier-3 #19 (PRD v2.72→v2.73, 2026-05-08) — fired by
+``risk_command_preview.preview_command`` for hypothetical
+pre-submission classification. Payload carries predicted
+route + risk-floor + verdict + cost/duration estimates.
+Composes canonical UrgencyRouter classifier + risk_tier_floor
++ sensor_governor — no parallel route logic."""
+
+
 EVENT_TYPE_DASHBOARD_RENDERED = "dashboard_rendered"
 """§39 Tier-2 #1 (PRD v2.71→v2.72, 2026-05-08) — fired by
 ``organism_dashboard.aggregate_dashboard`` after each fresh
@@ -827,6 +846,8 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CAPABILITY_CONSTELLATION_UPDATED, # §38.11-F (capability constellation snapshot refresh)
     EVENT_TYPE_PHASE_FLOW_UPDATED,               # §39 Tier-1 #14 (phase-flow ribbon snapshot)
     EVENT_TYPE_DASHBOARD_RENDERED,               # §39 Tier-2 #1 (organism dashboard multi-pane snapshot)
+    EVENT_TYPE_TRAJECTORY_PREDICTED,             # §39 Tier-3 #4 (op trajectory prediction)
+    EVENT_TYPE_COMMAND_PREVIEW_RENDERED,         # §39 Tier-3 #19 (pre-submission risk preview)
 })
 
 
