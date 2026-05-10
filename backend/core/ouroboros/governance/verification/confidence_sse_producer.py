@@ -417,6 +417,11 @@ class ConfidenceTransitionTracker:
 
         # Publish OUTSIDE the lock so a slow broker doesn't block
         # other observers. Defensive — publisher exceptions swallowed.
+        # §37 Tier 1 #1 (v2.83): thread transition context
+        # (prior_verdict + consecutive_below) into the publishers so
+        # operators distinguish fresh OK→BELOW collapses from
+        # APPROACHING→BELOW progressions without consulting a
+        # separate event stream.
         fired_event_type: Optional[str] = None
         if decision is FireDecision.FIRED_DROP:
             fired_event_type = "model_confidence_drop"
@@ -431,6 +436,8 @@ class ConfidenceTransitionTracker:
                 op_id=safe_op_id,
                 provider=provider,
                 model_id=model_id,
+                prior_verdict=prior.value,
+                consecutive_below=consecutive_below_snapshot,
             )
         elif decision is FireDecision.FIRED_APPROACHING:
             fired_event_type = "model_confidence_approaching"
@@ -445,6 +452,8 @@ class ConfidenceTransitionTracker:
                 op_id=safe_op_id,
                 provider=provider,
                 model_id=model_id,
+                prior_verdict=prior.value,
+                consecutive_below=consecutive_below_snapshot,
             )
         elif decision is FireDecision.FIRED_SUSTAINED:
             fired_event_type = "model_sustained_low_confidence"

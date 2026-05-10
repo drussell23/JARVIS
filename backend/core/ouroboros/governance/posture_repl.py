@@ -65,6 +65,11 @@ _HELP = textwrap.dedent(
           [--until <duration>] [--reason <text>]
           durations: e.g. 30m, 2h, 24h (clamped to JARVIS_POSTURE_OVERRIDE_MAX_H)
       /posture clear-override          drop active override
+      /posture health                  observer task-health verdict
+                                       (HEALTHY / DEGRADED_HUNG /
+                                       DEGRADED_FAILING / TASK_DEAD;
+                                       composes posture_health
+                                       classifier — §37 Tier 1 #2)
       /posture help                    this text
 
     Postures: EXPLORE, CONSOLIDATE, HARDEN, MAINTAIN
@@ -198,10 +203,78 @@ def dispatch_posture_command(
         return _override(args[1:], resolved_store, resolved_ov, audit_sink)
     if head == "clear-override":
         return _clear_override(resolved_store, resolved_ov, audit_sink)
+    if head == "health":
+        return _health()
     return PostureDispatchResult(
         ok=False,
         text=f"  /posture: unknown subcommand {head!r}. Try /posture help.",
     )
+
+
+def _health() -> PostureDispatchResult:
+    """Render observer task-health verdict via the canonical
+    ``posture_health.evaluate_observer_health`` classifier (§37
+    Tier 1 #2). Detection master flag honored: when off, returns
+    a notice that the classifier is dormant rather than fabricating
+    a HEALTHY response (operator binding: no fake-healthy)."""
+    try:
+        from backend.core.ouroboros.governance.posture_health import (
+            detection_enabled,
+            evaluate_observer_health,
+        )
+        from backend.core.ouroboros.governance.posture_observer import (
+            get_default_observer,
+        )
+    except ImportError:
+        return PostureDispatchResult(
+            ok=False,
+            text="  /posture health: posture_health substrate unavailable",
+        )
+    if not detection_enabled():
+        return PostureDispatchResult(
+            ok=True,
+            text=(
+                "  /posture health: detection dormant — set "
+                "JARVIS_POSTURE_HEALTH_DETECTION_ENABLED=true to "
+                "enable the task-death classifier"
+            ),
+        )
+    try:
+        observer = get_default_observer()
+    except Exception:  # noqa: BLE001 — defensive
+        observer = None
+    if observer is None:
+        return PostureDispatchResult(
+            ok=True,
+            text="  /posture health: status=TASK_DEAD (no observer instance)",
+        )
+    try:
+        snapshot = observer.task_health_snapshot()
+        verdict = evaluate_observer_health(snapshot)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        return PostureDispatchResult(
+            ok=False,
+            text=f"  /posture health: classifier error: {exc}",
+        )
+    lines = [
+        f"  /posture health: status={verdict.status.value}",
+        f"  detail: {verdict.detail or '(none)'}",
+        (
+            f"  seconds_since_last_ok="
+            f"{verdict.seconds_since_last_ok:.1f}"
+            if verdict.seconds_since_last_ok is not None
+            else "  seconds_since_last_ok=(no successful cycle yet)"
+        ),
+        (
+            f"  consecutive_failures="
+            f"{verdict.consecutive_failures}"
+        ),
+        (
+            f"  threshold={verdict.interval_s:.1f}s × "
+            f"{verdict.threshold_multiplier:.1f}"
+        ),
+    ]
+    return PostureDispatchResult(ok=True, text="\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

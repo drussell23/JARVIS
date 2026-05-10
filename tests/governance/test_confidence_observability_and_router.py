@@ -286,13 +286,26 @@ def test_observability_no_forbidden_imports() -> None:
 
 def test_observability_pure_stdlib_plus_broker_only() -> None:
     """confidence_observability imports only stdlib + the
-    ide_observability_stream broker."""
+    ide_observability_stream broker + the auto_action_router
+    verdict-buffer bridge (lazy-imported inside the
+    ``record_verdict_for_auto_action_router`` wrapper, which is the
+    canonical bridge to Move 4's drift-signature dedup ring per
+    §37 Tier 1 #1 wiring contract)."""
     src = Path(inspect.getfile(confidence_observability)).read_text()
     tree = ast.parse(src)
     allowed_roots = {
         "logging", "os", "typing", "__future__",
         "backend",
     }
+    # Sibling substrates allowed under backend. — broker is the
+    # publish target; auto_action_router is the consumer-side
+    # verdict-buffer bridge (read-only producer to the buffer's
+    # ring per Move 3 Slice 3). Both are lazy-imported inside
+    # function bodies — no top-level coupling.
+    allowed_backend_substrates = (
+        "ide_observability_stream",
+        "auto_action_router",
+    )
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -301,9 +314,10 @@ def test_observability_pure_stdlib_plus_broker_only() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module:
             root = node.module.split(".")[0]
             assert root in allowed_roots
-            # backend.* must be the broker only
             if root == "backend":
-                assert "ide_observability_stream" in node.module
+                assert any(
+                    s in node.module for s in allowed_backend_substrates
+                ), node.module
 
 
 # ===========================================================================

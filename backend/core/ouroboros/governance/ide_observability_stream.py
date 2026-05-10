@@ -823,6 +823,14 @@ EVENT_TYPE_ADMISSION_DECISION_EMITTED = "admission_decision_emitted"
 # events sharing the same op_id once intake assigns one).
 EVENT_TYPE_CODEBASE_CHARACTER_INJECTED = "codebase_character_injected"
 
+# §37 Tier 1 #2 (PRD §37.7, 2026-05-09 v2.84) — PostureObserver
+# task-death detection. Fires when posture_health classifies the
+# observer as DEGRADED_HUNG / DEGRADED_FAILING / TASK_DEAD.
+# Debounced cross-process via posture_health._maybe_publish_*.
+# Operators consume via `/listen filter type=
+# posture_observer_degraded` OR `/posture health` REPL.
+EVENT_TYPE_POSTURE_OBSERVER_DEGRADED = "posture_observer_degraded"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -890,6 +898,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TERMINATION_HOOK_DISPATCHED,       # TermHook Slice 4
     EVENT_TYPE_ADMISSION_DECISION_EMITTED,        # AdmissionGate Slice 3
     EVENT_TYPE_CODEBASE_CHARACTER_INJECTED,       # CodebaseCharDigest Slice 3
+    EVENT_TYPE_POSTURE_OBSERVER_DEGRADED,         # §37 Tier 1 #2 (v2.84)
     EVENT_TYPE_AUTO_ACTION_PROPOSAL,              # auto_action_router (Move 3)
     EVENT_TYPE_PRODUCTION_ORACLE_SIGNAL,          # Production Oracle (Tier 2 #6)
     EVENT_TYPE_SEMANTIC_EMBEDDER_FALLBACK,        # SemanticIndex stdlib fallback

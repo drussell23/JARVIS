@@ -148,12 +148,23 @@ def _build_confidence_payload(
     op_id: Any = None,
     provider: Any = None,
     model_id: Any = None,
+    prior_verdict: Any = None,
+    consecutive_below: Any = None,
 ) -> Dict[str, Any]:
     """Build a JSON-friendly payload from confidence-verdict fields.
     Defensive on every field. NEVER raises.
 
     The verdict argument is interpreted permissively: an enum-like
-    object with ``.value`` attribute, or a string, or ``None``."""
+    object with ``.value`` attribute, or a string, or ``None``.
+
+    §37 Tier 1 #1 (2026-05-09 v2.83): ``prior_verdict`` +
+    ``consecutive_below`` are additive transition-context fields
+    that distinguish fresh OK→BELOW collapses from
+    APPROACHING→BELOW progressions — different failure modes
+    warranting different operator response. Producers compose them
+    from ``confidence_sse_producer.TransitionResult``; legacy
+    callers omit them and get default values that preserve
+    backward-compat schema."""
     verdict_str = ""
     try:
         if hasattr(verdict, "value"):
@@ -162,6 +173,14 @@ def _build_confidence_payload(
             verdict_str = _safe_str(verdict)
     except Exception:  # noqa: BLE001
         verdict_str = ""
+    prior_verdict_str = ""
+    try:
+        if hasattr(prior_verdict, "value"):
+            prior_verdict_str = _safe_str(prior_verdict.value)
+        elif prior_verdict is not None:
+            prior_verdict_str = _safe_str(prior_verdict)
+    except Exception:  # noqa: BLE001
+        prior_verdict_str = ""
     return {
         "schema_version": CONFIDENCE_OBSERVABILITY_SCHEMA_VERSION,
         "verdict": verdict_str,
@@ -174,6 +193,8 @@ def _build_confidence_payload(
         "op_id": _safe_str(op_id, default=""),
         "provider": _safe_str(provider, default=""),
         "model_id": _safe_str(model_id, default=""),
+        "prior_verdict": prior_verdict_str,
+        "consecutive_below": _safe_int(consecutive_below, default=0),
     }
 
 
@@ -224,9 +245,18 @@ def publish_confidence_drop_event(
     provider: Any = None,
     model_id: Any = None,
     severity: str = "P1",
+    prior_verdict: Any = None,
+    consecutive_below: Any = None,
 ) -> Optional[str]:
     """P1 — confidence-drop event. Fires when the monitor observes
     BELOW_FLOOR mid-stream (with or without ENFORCE-driven abort).
+
+    §37 Tier 1 #1 (v2.83): ``prior_verdict`` + ``consecutive_below``
+    are additive transition-context fields composed from the
+    producer's ``TransitionResult``. Operators distinguish fresh
+    OK→BELOW collapses (severe — sudden) from APPROACHING→BELOW
+    progressions (predicted) without consulting a separate event
+    stream.
 
     Returns the broker's frame_id when published, ``None`` when
     suppressed by master flag / stream master / broker exception.
@@ -247,6 +277,8 @@ def publish_confidence_drop_event(
             op_id=op_id,
             provider=provider,
             model_id=model_id,
+            prior_verdict=prior_verdict,
+            consecutive_below=consecutive_below,
         )
         payload["severity"] = "P1"
         del severity  # unused; severity is structurally fixed at P1
@@ -288,11 +320,17 @@ def publish_confidence_approaching_event(
     op_id: Any = None,
     provider: Any = None,
     model_id: Any = None,
+    prior_verdict: Any = None,
+    consecutive_below: Any = None,
 ) -> Optional[str]:
     """P2 — confidence-approaching-floor event. Fires when the
     monitor's rolling margin is in (effective_floor, effective_floor
     × approaching_factor). Warns observers that an abort may be
     imminent without actually triggering the breaker.
+
+    §37 Tier 1 #1 (v2.83): ``prior_verdict`` + ``consecutive_below``
+    are additive transition-context fields composed from the
+    producer's ``TransitionResult``. NEVER raises.
 
     Returns the broker's frame_id when published, ``None`` when
     suppressed. NEVER raises."""
@@ -312,6 +350,8 @@ def publish_confidence_approaching_event(
             op_id=op_id,
             provider=provider,
             model_id=model_id,
+            prior_verdict=prior_verdict,
+            consecutive_below=consecutive_below,
         )
         payload["severity"] = "P2"
         # Move 3 Slice 3 — feed the auto-action router's verdict

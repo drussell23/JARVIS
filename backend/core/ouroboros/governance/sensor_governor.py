@@ -316,32 +316,71 @@ class BudgetDecision:
 
 
 def _default_posture_fn() -> Optional[str]:
-    """Default posture reader — pulls current posture from Wave 1 #1's
-    PostureStore if present. Returns None on any error so sensors get
-    unweighted (1.0) caps without crashing."""
+    """Default posture reader — pulls current posture via the
+    canonical ``posture_health.safe_load_posture_value`` wrapper
+    so a dead PostureObserver task degrades the governor to
+    unweighted (1.0×) caps — equivalent to MAINTAIN safe-default —
+    instead of silently applying weights against frozen state.
+
+    §37 Tier 1 #2 (v2.84): closes the silent-degradation cascade
+    documented at ``posture_observer.py:558-572``. When detection
+    master flag is off, the wrapper passes through to
+    ``store.load_current()`` byte-equivalent to legacy behavior.
+
+    Returns None on any error so sensors get unweighted caps
+    without crashing."""
     try:
+        from backend.core.ouroboros.governance.posture_health import (
+            safe_load_posture_value,
+        )
         from backend.core.ouroboros.governance.posture_observer import (
+            get_default_observer,
             get_default_store,
         )
-        reading = get_default_store().load_current()
-        if reading is not None:
-            return reading.posture.value
+        return safe_load_posture_value(
+            observer=get_default_observer(),
+            store=get_default_store(),
+        )
     except Exception:  # noqa: BLE001
-        pass
-    return None
+        # Substrate-unavailable rollback — preserve legacy direct
+        # store read so a missing posture_health module never
+        # breaks the governor.
+        try:
+            from backend.core.ouroboros.governance.posture_observer import (  # noqa: E501
+                get_default_store as _get_store_fallback,
+            )
+            reading = _get_store_fallback().load_current()
+            if reading is not None:
+                return reading.posture.value
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
 
 def _default_signal_bundle_fn() -> Optional[Any]:
     """Default signal-bundle reader for emergency brake thresholds.
 
     Returns the most recent PostureReading's underlying signals if
-    accessible, else None (brake disabled). We read through the
-    reading's evidence list which carries raw_value per signal."""
+    accessible AND the observer is healthy, else None (brake
+    disabled). We read through the reading's evidence list which
+    carries raw_value per signal.
+
+    §37 Tier 1 #2 (v2.84): composes ``safe_load_posture`` so a
+    dead observer disables the brake (safer than triggering
+    emergency brake on stale signals — operators see unweighted
+    caps rather than frozen-state panic responses). NEVER raises."""
     try:
+        from backend.core.ouroboros.governance.posture_health import (
+            safe_load_posture,
+        )
         from backend.core.ouroboros.governance.posture_observer import (
+            get_default_observer,
             get_default_store,
         )
-        reading = get_default_store().load_current()
+        reading = safe_load_posture(
+            observer=get_default_observer(),
+            store=get_default_store(),
+        )
         if reading is None:
             return None
         # Rebuild a lookup from evidence for cost_burn + postmortem

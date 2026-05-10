@@ -233,6 +233,12 @@ class IDEObservabilityRouter:
             "/observability/posture/history",
             self._handle_posture_history,
         )
+        # §37 Tier 1 #2 (v2.84) — observer task-health verdict
+        # surface composing posture_health.evaluate_observer_health.
+        app.router.add_get(
+            "/observability/posture/health",
+            self._handle_posture_health,
+        )
         # FlagRegistry Slice 3 — flag + verb introspection surface.
         app.router.add_get(
             "/observability/flags", self._handle_flags_list,
@@ -1000,6 +1006,111 @@ class IDEObservabilityRouter:
                 "count": len(readings),
                 "limit": limit,
             },
+        )
+
+    async def _handle_posture_health(self, request: "web.Request") -> Any:
+        """GET /observability/posture/health — observer task-health
+        verdict (§37 Tier 1 #2).
+
+        Composes the canonical
+        ``posture_health.evaluate_observer_health`` classifier over
+        ``observer.task_health_snapshot()``. Read-only; never mutates
+        observer state. NEVER raises.
+
+        Shape::
+
+            {
+              "schema_version": "posture_health.1",
+              "status": "HEALTHY|DEGRADED_HUNG|DEGRADED_FAILING|TASK_DEAD",
+              "detail": "<one-line explanation>",
+              "seconds_since_last_ok": 3.2 | null,
+              "consecutive_failures": 0,
+              "interval_s": 300.0,
+              "threshold_multiplier": 3.0,
+              "is_degraded": false
+            }
+
+        403 when ``JARVIS_IDE_OBSERVABILITY_ENABLED=false`` (port
+        scanners see no surface). 200 + ``status=TASK_DEAD`` when
+        the observer instance is unavailable (load-bearing distinction
+        — operator sees DEAD rather than 5xx). 200 + ``detection_off``
+        notice when the classifier master flag is dormant (operator
+        binding: never fabricate HEALTHY when classifier is off).
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._posture_master_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.posture_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.posture_health import (
+                detection_enabled,
+                evaluate_observer_health,
+            )
+            from backend.core.ouroboros.governance.posture_observer import (
+                get_default_observer,
+            )
+        except ImportError:
+            return self._json_response(
+                request, 200,
+                {
+                    "status": "TASK_DEAD",
+                    "detail": "posture_health substrate unavailable",
+                    "is_degraded": True,
+                },
+            )
+        if not detection_enabled():
+            return self._json_response(
+                request, 200,
+                {
+                    "status": "HEALTHY",
+                    "detail": (
+                        "detection_off — set "
+                        "JARVIS_POSTURE_HEALTH_DETECTION_ENABLED=true "
+                        "to enable the task-death classifier"
+                    ),
+                    "detection_enabled": False,
+                    "is_degraded": False,
+                },
+            )
+        try:
+            observer = get_default_observer()
+        except Exception:  # noqa: BLE001 — defensive
+            observer = None
+        if observer is None:
+            return self._json_response(
+                request, 200,
+                {
+                    "status": "TASK_DEAD",
+                    "detail": "no observer instance available",
+                    "is_degraded": True,
+                },
+            )
+        try:
+            snapshot = observer.task_health_snapshot()
+            verdict = evaluate_observer_health(snapshot)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] posture_health failed",
+                exc_info=True,
+            )
+            return self._json_response(
+                request, 200,
+                {
+                    "status": "TASK_DEAD",
+                    "detail": "classifier raised — assumed dead",
+                    "is_degraded": True,
+                },
+            )
+        return self._json_response(
+            request, 200, verdict.to_dict(),
         )
 
     # --- FlagRegistry Slice 3 — flag + verb introspection --------------------
