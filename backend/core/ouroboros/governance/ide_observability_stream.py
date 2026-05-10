@@ -237,6 +237,15 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_PHASE_ORCHESTRA_CUE = "phase_orchestra_cue"
+"""§39 Tier-7 #20 (PRD v2.75→v2.76, 2026-05-09) — fired by
+``phase_orchestra.emit_cue`` on every phase transition.
+Payload carries phase_name + phase_index + note + intensity
++ op_id. Composes canonical pipeline_progress 11-phase
+tuple. Downstream audio consumers (TUI, IDE, Karen voice)
+play the actual sound; substrate is producer-only."""
+
+
 EVENT_TYPE_ARCHITECTURE_SNAPSHOT = "architecture_snapshot"
 """§39 Tier-5 #5 (PRD v2.74→v2.75, 2026-05-09) — fired by
 ``architecture_viz.aggregate_architecture_snapshot``. Payload
@@ -905,6 +914,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CONFIDENCE_AURA_RENDERED,         # §39 Tier-5 #15 (per-token confidence aura)
     EVENT_TYPE_ATTENTION_MIRROR_UPDATED,         # §39 Tier-5 #16 (attention focus snapshot)
     EVENT_TYPE_PORTRAIT_RENDERED,                # §39 Tier-5 #17 (procedural ASCII portrait)
+    EVENT_TYPE_PHASE_ORCHESTRA_CUE,              # §39 Tier-7 #20 (phase orchestra audio cue)
 })
 
 
