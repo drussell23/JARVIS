@@ -496,17 +496,47 @@ def maybe_record_decision(
     policy module's import graph (callers import THIS function,
     not the archive class). Master-flag-gated: when
     :func:`permission_archive_enabled` is False this is a no-op.
-    NEVER raises.
+
+    **SSE producer-bridge** (Slice 3): when the record is
+    archived successfully, also fires
+    ``EVENT_TYPE_PERMISSION_DECISION_RECORDED`` on the canonical
+    :class:`StreamEventBroker` so IDE consumers see the decision
+    live. Composes the existing :func:`publish_task_event`
+    bridge (best-effort, never raises; stream-side master flag
+    ``JARVIS_IDE_STREAM_ENABLED`` still gates the publish).
+
+    NEVER raises into the policy path.
     """
     try:
         if not permission_archive_enabled():
             return
         archive = get_default_archive()
-        archive.record(
+        record = archive.record(
             op_id=op_id,
             tool_name=tool_name,
             decision=decision,
         )
+        # SSE producer-bridge §33.2 — fire the canonical
+        # permission_decision_recorded event so IDE consumers
+        # (Slice 4 GET endpoint, VS Code extension) can correlate
+        # the decision to a /expand p-N retrieval. Best-effort:
+        # stream-disabled / broker-unavailable / publish-raises
+        # all fall through silently. The archive's authoritative
+        # record() write happened above; SSE is a parallel
+        # observability surface.
+        if record is not None:
+            try:
+                from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+                    EVENT_TYPE_PERMISSION_DECISION_RECORDED,
+                    publish_task_event,
+                )
+                publish_task_event(
+                    EVENT_TYPE_PERMISSION_DECISION_RECORDED,
+                    record.op_id,
+                    record.to_dict(),
+                )
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
     except Exception as exc:  # noqa: BLE001 — never raise into policy path
         logger.debug(
             "[PermissionDecisionArchive] maybe_record_decision "

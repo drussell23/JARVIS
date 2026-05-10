@@ -847,6 +847,21 @@ EVENT_TYPE_CODEBASE_CHARACTER_INJECTED = "codebase_character_injected"
 # posture_observer_degraded` OR `/posture health` REPL.
 EVENT_TYPE_POSTURE_OBSERVER_DEGRADED = "posture_observer_degraded"
 
+# Venom V2 Slice 3 (PRD v2.91, 2026-05-10) — fires every time
+# permission_decision_archive.maybe_record_decision archives a
+# Venom-V2 per-tool permission decision. Payload carries the
+# canonical AggregatePermissionDecision projection (decision /
+# tool_name / detail / deny_callbacks / ask_callbacks /
+# total_callbacks) plus the archive ref (``p-N``) so IDE
+# consumers can correlate the SSE event to a /expand p-N
+# retrieval. Best-effort: master-flag-gated at the archive's
+# producer (JARVIS_PERMISSION_ARCHIVE_ENABLED) — when off, the
+# record() short-circuits before publish. Stream-side gate
+# (JARVIS_IDE_STREAM_ENABLED) still applies via publish_task_event.
+EVENT_TYPE_PERMISSION_DECISION_RECORDED = (
+    "permission_decision_recorded"
+)
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -952,6 +967,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_PORTRAIT_RENDERED,                # §39 Tier-5 #17 (procedural ASCII portrait)
     EVENT_TYPE_PHASE_ORCHESTRA_CUE,              # §39 Tier-7 #20 (phase orchestra audio cue)
     EVENT_TYPE_COHERENCE_REPORTED,               # §3.6.2 Vector #5 (cross-session coherence harness)
+    EVENT_TYPE_PERMISSION_DECISION_RECORDED,     # Venom V2 Slice 3 (PRD v2.91, permission_decision_archive)
 })
 
 

@@ -5759,7 +5759,7 @@ class SerpentREPL:
 
     def _handle_expand(self, line: str) -> None:
         """``/expand <ref>`` — dispatches by ref prefix across the
-        three artifact substrates:
+        cross-substrate artifact family:
 
           * ``t-N`` → :class:`BoundedBodyStore` (Gap #2): re-renders
             the full tool result body via :func:`tool_render_view.compose`
@@ -5768,10 +5768,14 @@ class SerpentREPL:
             archived diff text via the existing :class:`DiffPreviewRenderer`.
           * ``o-N`` → :class:`OpBlockBuffer` (Gap #3): re-emits the
             buffered op-block lines.
+          * ``n-N`` → :class:`NarrativeChannel` (Gap #6 Slice 4):
+            re-renders an archived narrative frame.
+          * ``p-N`` → :class:`BoundedDecisionArchive` (v2.89 Slice 2):
+            re-prints an archived permission decision.
           * ``<op-id>`` (no prefix) → look up the matching ``o-N`` for
             the most recent op with that id.
 
-        Empty arg → list recent refs across all three substrates.
+        Empty arg → list recent refs across all substrates.
         NEVER raises — every lookup degrades to a friendly error line.
         """
         parts = line.replace("/expand", "expand", 1).split(None, 1)
@@ -5791,6 +5795,9 @@ class SerpentREPL:
             elif ref_or_op.startswith("n-"):
                 # Gap #6 Slice 4 — narrative frame retrieval
                 self._expand_narrative_frame(ref_or_op)
+            elif ref_or_op.startswith("p-"):
+                # v2.89 Slice 2 — permission decision archive
+                self._expand_permission_decision(ref_or_op)
             else:
                 # Treat as op_id and find latest matching o-N
                 self._expand_op_block_by_op_id(ref_or_op)
@@ -5821,6 +5828,17 @@ class SerpentREPL:
         op_recent = _ob().list_recent(limit=5)
         diff_recent = _da().list_recent(limit=5)
         tool_refs = _ts().all_refs()[-5:]
+        # v2.89 Slice 2 — permission decisions (5th cross-substrate
+        # ref family). Composed lazily so substrate-unavailable
+        # rollback doesn't block the rest of the summary.
+        perm_recent: tuple = ()
+        try:
+            from backend.core.ouroboros.governance.permission_decision_archive import (  # noqa: E501
+                get_default_archive as _pa,
+            )
+            perm_recent = _pa().all_refs()[-5:]
+        except Exception:
+            perm_recent = ()
 
         self._flow.console.print(
             f"  [{_C['neural']}]Recent retrievable refs:[/{_C['neural']}]",
@@ -5856,7 +5874,17 @@ class SerpentREPL:
                 f"[{_C['evolved']}]{', '.join(tool_refs)}[/{_C['evolved']}]",
                 highlight=False,
             )
-        if not op_recent and not diff_recent and not tool_refs:
+        if perm_recent:
+            self._flow.console.print(
+                f"    [{_C['dim']}]permissions:[/{_C['dim']}] "
+                f"[{_C['evolved']}]{', '.join(perm_recent)}"
+                f"[/{_C['evolved']}]",
+                highlight=False,
+            )
+        if (
+            not op_recent and not diff_recent
+            and not tool_refs and not perm_recent
+        ):
             self._flow.console.print(
                 f"  [{_C['dim']}]No retrievable refs yet[/{_C['dim']}]",
                 highlight=False,
@@ -5993,6 +6021,75 @@ class SerpentREPL:
             op_active=frame.op_id in self._flow._active_ops,
             max_chars_per_line=80,
         )
+
+    def _expand_permission_decision(self, ref: str) -> None:
+        """v2.89 Slice 2 — re-render an archived permission decision
+        from :class:`BoundedDecisionArchive`. Composes the canonical
+        archive (no parallel state). Master-flag-gated at the
+        producer side; the lookup itself is read-only and returns
+        ``None`` when the archive is empty / master-off / ref
+        evicted."""
+        try:
+            from backend.core.ouroboros.governance.permission_decision_archive import (  # noqa: E501
+                get_default_archive,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/expand permission unavailable: "
+                f"{exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        record = get_default_archive().lookup(ref)
+        if record is None:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No permission decision for {ref}"
+                f"[/{_C['heal']}]",
+                highlight=False,
+            )
+            return
+        self._flow.console.print(
+            f"  [{_C['neural']}]⏺ Permission[/{_C['neural']}] "
+            f"[{_C['dim']}]{ref} · tool={record.tool_name} · "
+            f"op={record.op_id} · "
+            f"decision={record.decision_value}[/{_C['dim']}]",
+            highlight=False,
+        )
+        # Re-render the canonical AggregatePermissionDecision
+        # projection — composes the §33.5 to_dict contract; we
+        # don't reach into the projection's typed shape so a future
+        # tool_permission schema bump (decision.2) flows through
+        # without edits here.
+        proj = record.decision_projection or {}
+        detail = str(proj.get("detail", "") or "")[:200]
+        if detail:
+            self._flow.console.print(
+                f"    [{_C['dim']}]detail: {detail}[/{_C['dim']}]",
+                highlight=False,
+            )
+        deny_callbacks = proj.get("deny_callbacks") or []
+        if deny_callbacks:
+            self._flow.console.print(
+                f"    [{_C['dim']}]deny callbacks: "
+                f"{', '.join(map(str, deny_callbacks))}"
+                f"[/{_C['dim']}]",
+                highlight=False,
+            )
+        ask_callbacks = proj.get("ask_callbacks") or []
+        if ask_callbacks:
+            self._flow.console.print(
+                f"    [{_C['dim']}]ask callbacks: "
+                f"{', '.join(map(str, ask_callbacks))}"
+                f"[/{_C['dim']}]",
+                highlight=False,
+            )
+        total = proj.get("total_callbacks")
+        if total is not None:
+            self._flow.console.print(
+                f"    [{_C['dim']}]total callbacks consulted: "
+                f"{total}[/{_C['dim']}]",
+                highlight=False,
+            )
 
     # ── Gap #6 Slice 4 — /narrate REPL verb ─────────────────────
 
