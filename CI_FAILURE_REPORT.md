@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: Secret Scanning
-- **Run Number**: #4905
-- **Branch**: `ouroboros/inline-prompt-gate/slice-5b-wireup`
-- **Commit**: `dd8b70b3503b3e7b31778ab6993787c2d76f98f9`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #53703
+- **Branch**: `fix/ci/secret-scanning-run4905-20260510-041302`
+- **Commit**: `617c72de01e925c84ed43d664b67b201488f3806`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-10T04:08:13Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25619444112)
+- **Timestamp**: 2026-05-10T04:13:31Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25619533515)
 
 ## Failure Overview
 
@@ -17,23 +17,23 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Scan for Secrets with Gitleaks | linting_error | high | 31s |
+| 1 | Validate PR Title | timeout | high | 3s |
 
 ## Detailed Analysis
 
-### 1. Scan for Secrets with Gitleaks
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Linting Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-10T04:08:16Z
-**Completed**: 2026-05-10T04:08:47Z
-**Duration**: 31 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25619444112/job/75203274486)
+**Started**: 2026-05-10T04:14:30Z
+**Completed**: 2026-05-10T04:14:33Z
+**Duration**: 3 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25619533515/job/75203501101)
 
 #### Failed Steps
 
-- **Step 3**: Run Gitleaks
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
@@ -42,25 +42,23 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 47: `2026-05-10T04:08:43.5821367Z [90m4:08AM[0m [31mERR[0m [1mfailed to scan Git repository[0m [36`
-    - Line 59: `2026-05-10T04:08:44.1534499Z ##[error]ERROR: Unexpected exit code [1]`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 47: `2026-05-10T04:08:43.5821367Z [90m4:08AM[0m [31mERR[0m [1mfailed to scan Git repository[0m [36`
-    - Line 96: `2026-05-10T04:08:45.3232737Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 30: `2026-05-10T04:14:31.8503015Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-10T04:14:32.3143364Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Secr`
 
 - Pattern: `WARN|Warning|warning`
-  - Occurrences: 4
+  - Occurrences: 1
   - Sample matches:
-    - Line 65: `2026-05-10T04:08:44.1634946Z   if-no-files-found: warn`
-    - Line 70: `2026-05-10T04:08:44.3668249Z ##[warning]No files were found with the provided path: gitleaks-report.`
-    - Line 96: `2026-05-10T04:08:45.3232737Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 58: `2026-05-10T04:14:32.3579315Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
 1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -80,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-10T04:13:02.042000*
+📊 *Report generated on 2026-05-10T04:25:50.541485*
 🤖 *JARVIS CI/CD Auto-PR Manager*
