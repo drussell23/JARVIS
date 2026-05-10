@@ -237,6 +237,16 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_COHERENCE_REPORTED = "coherence_reported"
+"""§3.6.2 Vector #5 closure (PRD v2.79→v2.80, 2026-05-09) —
+fired by ``cross_session_harness.report_coherence`` after
+each multi-session coherence aggregation. Payload carries
+boundary_count + per-boundary drift records (4 axes ×
+DriftLevel). Composes the 4 canonical cross-session
+memory substrates: UserPreferenceStore + AdaptationLedger
++ SemanticIndex + LastSessionSummary."""
+
+
 EVENT_TYPE_PHASE_ORCHESTRA_CUE = "phase_orchestra_cue"
 """§39 Tier-7 #20 (PRD v2.75→v2.76, 2026-05-09) — fired by
 ``phase_orchestra.emit_cue`` on every phase transition.
@@ -915,6 +925,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_ATTENTION_MIRROR_UPDATED,         # §39 Tier-5 #16 (attention focus snapshot)
     EVENT_TYPE_PORTRAIT_RENDERED,                # §39 Tier-5 #17 (procedural ASCII portrait)
     EVENT_TYPE_PHASE_ORCHESTRA_CUE,              # §39 Tier-7 #20 (phase orchestra audio cue)
+    EVENT_TYPE_COHERENCE_REPORTED,               # §3.6.2 Vector #5 (cross-session coherence harness)
 })
 
 
