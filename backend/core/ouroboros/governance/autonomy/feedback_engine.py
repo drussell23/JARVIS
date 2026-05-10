@@ -557,6 +557,20 @@ class AutonomyFeedbackEngine:
                     brain_id,
                     count,
                 )
+                # §33.2 producer-bridge — fire-and-forget SSE
+                # projection. Master-flag-gated; NEVER raises.
+                try:
+                    from backend.core.ouroboros.governance.feedback_engine_sse_producer import (  # noqa: E501
+                        feed_rollback_threshold,
+                    )
+                    feed_rollback_threshold(
+                        brain_id=brain_id,
+                        rollback_count=count,
+                        threshold=self._brain_hint_threshold,
+                        weight_delta=-0.1,
+                    )
+                except Exception:  # noqa: BLE001 — defensive
+                    pass
             else:
                 logger.warning(
                     "FeedbackEngine: bus rejected ADJUST_BRAIN_HINT for "
@@ -626,6 +640,7 @@ class AutonomyFeedbackEngine:
 
         max_entries = self._config.max_backlog_entries_per_curriculum
         emitted = 0
+        rejected = 0
 
         for entry in top_k[:max_entries]:
             if not isinstance(entry, dict):
@@ -639,10 +654,28 @@ class AutonomyFeedbackEngine:
             if accepted:
                 emitted += 1
             else:
+                rejected += 1
                 logger.debug(
                     "FeedbackEngine: bus rejected command for %s (dedup or backpressure)",
                     entry.get("task_type", "<unknown>"),
                 )
+
+        if emitted > 0:
+            # §33.2 producer-bridge — fire-and-forget SSE projection
+            # at per-file granularity (source_curriculum_id is the
+            # file name). Empty batches stay silent (chatter
+            # suppression in the producer). NEVER raises.
+            try:
+                from backend.core.ouroboros.governance.feedback_engine_sse_producer import (  # noqa: E501
+                    feed_curriculum_batch,
+                )
+                feed_curriculum_batch(
+                    source_curriculum_id=path.name,
+                    emitted_count=emitted,
+                    rejected_count=rejected,
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                pass
 
         return emitted
 
@@ -754,6 +787,22 @@ class AutonomyFeedbackEngine:
                 data.get("model_id", "<unknown>"),
                 source_file,
             )
+            # §33.2 producer-bridge — fire-and-forget SSE projection.
+            # Master-flag-gated; NEVER raises.
+            try:
+                from backend.core.ouroboros.governance.feedback_engine_sse_producer import (  # noqa: E501
+                    feed_model_promoted,
+                )
+                feed_model_promoted(
+                    model_id=str(data.get("model_id", "")),
+                    previous_model_id=str(
+                        data.get("previous_model_id", "")
+                    ),
+                    source_event_file=source_file,
+                    repo=str(data.get("repo", "")),
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                pass
             return 1
 
         logger.debug(

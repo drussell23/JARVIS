@@ -379,24 +379,48 @@ def register_shipped_invariants() -> list:
             )
         return ()
 
-    def _validate_no_authority_imports(_tree, source) -> tuple:
-        forbidden = (
-            "from backend.core.ouroboros.governance.orchestrator",
-            "from backend.core.ouroboros.governance.iron_gate",
-            "from backend.core.ouroboros.governance.providers",
-            "from backend.core.ouroboros.governance.candidate_generator",
-            "from backend.core.ouroboros.governance.urgency_router",
-            "from backend.core.ouroboros.governance.sensor_governor",
-            "from backend.core.ouroboros.governance.tool_executor",
-            "from backend.core.ouroboros.governance.change_engine",
-            "from backend.core.ouroboros.governance.strategic_direction",
-        )
-        for module in forbidden:
-            if module in source:
-                return (
-                    f"feedback_engine_sse_producer authority "
-                    f"asymmetry violated: must not import {module!r}.",
-                )
+    def _validate_no_authority_imports(tree, _source) -> tuple:
+        # AST-walk-based check (not substring match) so the
+        # validator's OWN forbidden list doesn't self-match.
+        forbidden_modules = frozenset({
+            "backend.core.ouroboros.governance.orchestrator",
+            "backend.core.ouroboros.governance.iron_gate",
+            "backend.core.ouroboros.governance.providers",
+            "backend.core.ouroboros.governance.candidate_generator",
+            "backend.core.ouroboros.governance.urgency_router",
+            "backend.core.ouroboros.governance.sensor_governor",
+            "backend.core.ouroboros.governance.tool_executor",
+            "backend.core.ouroboros.governance.change_engine",
+            "backend.core.ouroboros.governance.strategic_direction",
+        })
+        try:
+            import ast as _ast
+        except ImportError:  # pragma: no cover — stdlib always present
+            return ()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                # node.module is the dotted source ('backend.x.y.z').
+                # Drop trailing component checks — we only forbid
+                # the exact forbidden modules, not their submodules
+                # like governance.orchestrator.helpers (which don't
+                # exist anyway, but the discipline is "no orchestrator
+                # import root").
+                mod = node.module or ""
+                if mod in forbidden_modules:
+                    return (
+                        f"feedback_engine_sse_producer authority "
+                        f"asymmetry violated: imports forbidden "
+                        f"module {mod!r}.",
+                    )
+            elif isinstance(node, _ast.Import):
+                for alias in node.names:
+                    mod = alias.name or ""
+                    if mod in forbidden_modules:
+                        return (
+                            f"feedback_engine_sse_producer authority "
+                            f"asymmetry violated: imports forbidden "
+                            f"module {mod!r}.",
+                        )
         return ()
 
     target = (
@@ -445,6 +469,61 @@ def register_shipped_invariants() -> list:
     ]
 
 
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagSpec declaration (§33 naming-cage —
+    auto-discovered by ``flag_registry_seed._discover_module_provided_flags``).
+
+    Single flag: ``JARVIS_FEEDBACK_ENGINE_SSE_PRODUCER_ENABLED``,
+    default-FALSE, OBSERVABILITY category, posture-relevant under
+    HARDEN/CONSOLIDATE (operator wants to see autonomy state in
+    those postures; less interesting in EXPLORE/MAINTAIN).
+
+    NEVER raises. Returns count installed (0 or 1)."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category,
+            FlagSpec,
+            FlagType,
+            Relevance,
+        )
+    except ImportError:
+        return 0
+    try:
+        spec = FlagSpec(
+            name="JARVIS_FEEDBACK_ENGINE_SSE_PRODUCER_ENABLED",
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Master switch for FeedbackEngine SSE "
+                "producer-bridge (Phase B4). When true, three "
+                "AutonomyFeedbackEngine state transitions publish "
+                "to the IDE event stream as "
+                "``feedback_engine_signal`` frames: "
+                "rollback_threshold_crossed (brain weight-delta "
+                "advisory), model_promoted (reactor batch), and "
+                "curriculum_batch_emitted (per-file batch result). "
+                "Default-false until Phase 9 cadence graduation "
+                "(3 clean soaks). Producer-bridge §33.2 — engine "
+                "state mirroring forbidden; lazy-import contract."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "feedback_engine_sse_producer.py"
+            ),
+            example="false",
+            since="Phase B4 (2026-05-10)",
+            posture_relevance={
+                "HARDEN": Relevance.RELEVANT,
+                "CONSOLIDATE": Relevance.RELEVANT,
+            },
+        )
+        registry.register(spec, override=True)
+        return 1
+    except Exception:  # noqa: BLE001 — defensive
+        return 0
+
+
 __all__ = [
     "FEEDBACK_ENGINE_SSE_PRODUCER_SCHEMA_VERSION",
     "TRANSITION_ROLLBACK_THRESHOLD_CROSSED",
@@ -454,5 +533,6 @@ __all__ = [
     "feed_rollback_threshold",
     "feed_model_promoted",
     "feed_curriculum_batch",
+    "register_flags",
     "register_shipped_invariants",
 ]
