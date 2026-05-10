@@ -824,6 +824,63 @@ async def dispatch_pipeline(
                 f"{type(result).__name__}, not a PhaseResult"
             )
 
+        # §35 row 🟡 #4 / §3.6.3 priority #4 (v2.85) — schema-versioned
+        # artifact contract validation at the SINGLE merge_artifacts
+        # choke point. Composes canonical
+        # ``artifact_contract.validate_artifacts_bundle`` (NEVER raises
+        # internally; failures surface via ``ArtifactValidation``
+        # outcomes). Master-flag-gated:
+        #
+        #   master off (default)                   → bypass; legacy behavior
+        #   master on + strictness="advisory"      → log violations + proceed
+        #   master on + strictness="strict"        → raise PhaseContextError on
+        #                                            first failure (fragility
+        #                                            vector #8 closure)
+        #
+        # The validator catches: rename / typo (UNKNOWN_KEY),
+        # type-shape drift (TYPE_MISMATCH), phase-ownership
+        # confusion (WRONG_PRODUCER). Without this, one unversioned
+        # dict shape change crashes the FSM mid-pipeline with no
+        # recovery path — exactly the §35 row #4 fragility.
+        try:
+            from backend.core.ouroboros.governance.artifact_contract import (  # noqa: E501
+                first_failure as _ac_first_failure,
+                master_enabled as _ac_master_enabled,
+                strictness as _ac_strictness,
+                validate_artifacts_bundle as _ac_validate_bundle,
+            )
+            if _ac_master_enabled():
+                _ac_validations = _ac_validate_bundle(
+                    result.artifacts,
+                    producer_phase=dispatch_phase,
+                )
+                _ac_failure = _ac_first_failure(_ac_validations)
+                if _ac_failure is not None:
+                    if _ac_strictness() == "strict":
+                        raise PhaseContextError(
+                            f"artifact contract violation at "
+                            f"{dispatch_phase.name} → "
+                            f"{_ac_failure.outcome.value}: "
+                            f"{_ac_failure.detail}"
+                        )
+                    logger.warning(
+                        "[PhaseDispatcher] artifact contract "
+                        "advisory violation phase=%s outcome=%s "
+                        "key=%s detail=%s",
+                        dispatch_phase.name,
+                        _ac_failure.outcome.value,
+                        _ac_failure.artifact_key,
+                        _ac_failure.detail,
+                    )
+        except PhaseContextError:
+            raise
+        except Exception:  # noqa: BLE001 — defensive: contract
+            # substrate failure must never break the pipeline.
+            logger.debug(
+                "[PhaseDispatcher] artifact_contract validation "
+                "swallowed", exc_info=True,
+            )
+
         # Merge runner artifacts into PhaseContext for downstream phases.
         pctx.merge_artifacts(dict(result.artifacts))
 
