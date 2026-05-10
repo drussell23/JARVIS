@@ -272,7 +272,10 @@ run_once() {
         echo -e "${RED}ERROR${RESET} wrapper not executable: $WRAPPER_SCRIPT"
         exit 1
     fi
-    JARVIS_CADENCE_KIND="${JARVIS_CADENCE_KIND:-once}" \
+    # cadence_preflight enum is {cron, launchd, adhoc} — `--once` is an
+    # adhoc one-shot (the wrapper's own default at line 59). Operator
+    # override path: setting JARVIS_CADENCE_KIND in the parent env wins.
+    JARVIS_CADENCE_KIND="${JARVIS_CADENCE_KIND:-adhoc}" \
         bash "$WRAPPER_SCRIPT" run \
         --cost-cap "$COST_CAP" \
         --max-wall-seconds "$WALL_CAP" \
