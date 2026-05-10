@@ -791,3 +791,234 @@ def test_sse_bridge_pipes_through_mask_helper():
     # Bridge wrapper composes both: getattr extraction + mask.
     assert 'getattr(event, "prev_value"' in source
     assert 'getattr(event, "next_value"' in source
+
+
+# ---------------------------------------------------------------------------
+# Item 5b — Vector #10 strengthening (2026-05-09):
+# cross-process race + AutoCommitter contention path
+# ---------------------------------------------------------------------------
+#
+# The Item 5 tests above prove within-process serialization + correct
+# AutoCommitter wiring at the source-grep level. These two add the
+# missing depth: (1) genuine cross-process race coverage (the whole
+# point of flock vs asyncio.Lock); (2) AutoCommitter behavior when
+# the lock is genuinely contended.
+
+
+def test_async_flock_serializes_across_processes():
+    """The flock primitive's whole purpose is OS-level cross-process
+    serialization (asyncio.Lock can't serialize across processes).
+    This test forks a child that holds the lock and proves the
+    parent cannot acquire while the child holds it.
+    """
+    import asyncio
+    import multiprocessing
+    import tempfile
+    import time as _time
+    from pathlib import Path
+    from backend.core.ouroboros.governance.cross_process_jsonl import (
+        async_flock_critical_section,
+        flock_critical_section,
+    )
+
+    def _child_holds_lock(target_path: str, hold_seconds: float) -> None:
+        # Child uses the SYNC primitive for simplicity — the
+        # underlying flock fd is what matters; the parent's async
+        # variant also reaches the same fcntl call.
+        with flock_critical_section(Path(target_path)) as ok:
+            if ok:
+                _time.sleep(hold_seconds)
+
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "xprocess.json"
+        # Spawn child holding the lock for ~1.2s.
+        ctx = multiprocessing.get_context("fork")
+        child = ctx.Process(
+            target=_child_holds_lock,
+            args=(str(target), 1.2),
+        )
+        child.start()
+        # Give the child a moment to acquire the lock before the
+        # parent tries.
+        _time.sleep(0.2)
+
+        async def _parent_tries() -> bool:
+            # Short timeout — should miss while child holds.
+            async with async_flock_critical_section(
+                target, timeout_s=0.3,
+            ) as got:
+                return got
+
+        try:
+            held_during_contention = asyncio.run(
+                _parent_tries(),
+            )
+            assert held_during_contention is False, (
+                "Parent acquired flock while child was holding "
+                "— cross-process serialization broken (vector "
+                "#10 regression)"
+            )
+        finally:
+            child.join(timeout=3.0)
+            if child.is_alive():
+                child.terminate()
+                child.join(timeout=1.0)
+
+        # After child release, parent must be able to acquire.
+        async def _parent_after() -> bool:
+            async with async_flock_critical_section(
+                target, timeout_s=2.0,
+            ) as got:
+                return got
+
+        held_after_release = asyncio.run(_parent_after())
+        assert held_after_release is True, (
+            "Parent failed to acquire flock after child "
+            "released — release-on-exit broken"
+        )
+
+
+def test_auto_committer_returns_commit_lock_contended_on_timeout(
+    monkeypatch, tmp_path,
+):
+    """When the cross-process lock is genuinely contended beyond
+    timeout, AutoCommitter.commit() MUST return
+    ``CommitResult(committed=False, skipped_reason='commit_lock_contended',
+    intent_token=...)`` — proves the contention-handling code
+    path is wired.
+
+    Strategy: monkey-patch ``async_flock_critical_section`` in
+    ``cross_process_jsonl`` to yield False (simulated contention).
+    The AutoCommitter lazily imports the symbol so this works
+    deterministically without needing real lock pressure.
+    """
+    import asyncio
+    from contextlib import asynccontextmanager
+    from backend.core.ouroboros.governance import (
+        auto_committer as ac_mod,
+        cross_process_jsonl as cp_mod,
+    )
+    from backend.core.ouroboros.governance.auto_committer import (
+        AutoCommitter,
+    )
+
+    # Force enabled even if test env disabled it.
+    monkeypatch.setattr(ac_mod, "_ENABLED", True)
+
+    @asynccontextmanager
+    async def _fake_contended(path, *, timeout_s=None):
+        # Simulate contention beyond timeout — yield False to
+        # signal "lock not acquired".
+        yield False
+
+    monkeypatch.setattr(
+        cp_mod, "async_flock_critical_section", _fake_contended,
+    )
+
+    ac = AutoCommitter(repo_root=tmp_path)
+
+    async def _run():
+        return await ac.commit(
+            op_id="op-vector10-contention",
+            description="test",
+            target_files=("file.py",),
+            risk_tier=None,
+            provider_name="test",
+            generation_cost=0.0,
+            signal_source="test",
+            signal_urgency="normal",
+            rationale="test",
+        )
+
+    result = asyncio.run(_run())
+    assert result.committed is False
+    assert result.skipped_reason == "commit_lock_contended"
+    # Audit field present so operator can see WHICH op contended.
+    assert result.intent_token, (
+        "intent_token MUST be populated on contention so "
+        "operator can correlate with sibling process"
+    )
+
+
+def test_auto_committer_substrate_unavailable_falls_through(
+    monkeypatch, tmp_path,
+):
+    """Substrate-unavailable fallback: if
+    ``async_flock_critical_section`` cannot be imported (e.g.,
+    fcntl unavailable on Windows), AutoCommitter MUST proceed
+    via the legacy critical section path rather than failing
+    closed. NEVER raises; never blocks legitimate commits."""
+    import asyncio
+    import sys
+    from backend.core.ouroboros.governance import (
+        auto_committer as ac_mod,
+    )
+    from backend.core.ouroboros.governance.auto_committer import (
+        AutoCommitter,
+    )
+
+    # Force enabled.
+    monkeypatch.setattr(ac_mod, "_ENABLED", True)
+
+    # Make the substrate import fail by hiding the module.
+    real_module = sys.modules.get(
+        "backend.core.ouroboros.governance.cross_process_jsonl",
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "backend.core.ouroboros.governance.cross_process_jsonl",
+        None,
+    )
+
+    # Stub out _commit_critical_section so this test focuses on
+    # the fallback DECISION (not the real git path).
+    fallback_called = {"hit": False}
+
+    async def _fake_commit_critical_section(self, **kwargs):
+        from backend.core.ouroboros.governance.auto_committer import (
+            CommitResult,
+        )
+        fallback_called["hit"] = True
+        return CommitResult(
+            committed=False,
+            skipped_reason="fallback_path_test_stub",
+            intent_token=kwargs.get("intent_token", ""),
+        )
+
+    monkeypatch.setattr(
+        AutoCommitter, "_commit_critical_section",
+        _fake_commit_critical_section,
+    )
+
+    ac = AutoCommitter(repo_root=tmp_path)
+
+    async def _run():
+        return await ac.commit(
+            op_id="op-vector10-fallback",
+            description="test",
+            target_files=("file.py",),
+            risk_tier=None,
+            provider_name="test",
+            generation_cost=0.0,
+            signal_source="test",
+            signal_urgency="normal",
+            rationale="test",
+        )
+
+    try:
+        result = asyncio.run(_run())
+    finally:
+        # Restore real module so subsequent tests aren't affected.
+        if real_module is not None:
+            sys.modules[
+                "backend.core.ouroboros.governance."
+                "cross_process_jsonl"
+            ] = real_module
+
+    assert fallback_called["hit"] is True, (
+        "Substrate-unavailable path MUST fall through to "
+        "_commit_critical_section legacy path (better to commit "
+        "with residual TOCTOU window than fail closed)"
+    )
+    assert result.committed is False
+    assert result.skipped_reason == "fallback_path_test_stub"
