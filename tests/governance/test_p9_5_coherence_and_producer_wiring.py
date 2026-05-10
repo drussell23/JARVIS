@@ -425,10 +425,13 @@ def all_substrates_on(monkeypatch: pytest.MonkeyPatch):
 # ---------------------------------------------------------------------------
 
 
-def test_substrate_flag_snapshot_default_all_false():
+def test_substrate_flag_snapshot_default_post_graduation():
+    """JARVIS_DECISION_TRACE_LEDGER_ENABLED graduated default-TRUE
+    on 2026-05-05 via Phase 9 cadence; the other 4 substrate flags
+    are still default-FALSE pending their own graduation soaks."""
     snap = substrate_flag_snapshot()
     assert snap == {
-        "decision_trace_ledger": False,
+        "decision_trace_ledger": True,
         "latent_confidence_ring": False,
         "flag_change_emitter": False,
         "latency_slo_detector": False,
@@ -459,8 +462,12 @@ def test_substrate_flag_snapshot_partial(
 
 
 def test_record_decision_master_off_returns_false(
-    isolated_substrate,
+    isolated_substrate, monkeypatch: pytest.MonkeyPatch,
 ):
+    """JARVIS_DECISION_TRACE_LEDGER_ENABLED graduated default-TRUE
+    on 2026-05-05; opting back to false requires the explicit
+    ``=false`` rollback per the graduated-flag escape-hatch contract."""
+    monkeypatch.setenv("JARVIS_DECISION_TRACE_LEDGER_ENABLED", "false")
     ok = record_decision(
         op_id="op-1", phase="ROUTE", decision="STANDARD",
     )

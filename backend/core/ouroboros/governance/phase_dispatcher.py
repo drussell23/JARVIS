@@ -81,6 +81,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -788,7 +789,34 @@ async def dispatch_pipeline(
             _iter, dispatch_phase.name, type(runner).__name__,
         )
 
+        # Phase 8.5 producer wiring (Vector #5 Part B) — measure
+        # per-phase wall-clock latency at the single dispatch choke
+        # point. Every PhaseRunner exits through this line so wiring
+        # here covers all 9 extracted runners with one record() call.
+        # monotonic clock to defend against NTP skew (Vector #11).
+        # Composes the canonical `phase8_producers.record_phase_latency`
+        # wrapper (NEVER raises; substrate's master flag gates the
+        # underlying detector). check_breach_and_publish piggy-backs
+        # the SSE breach signal on the same call site so operators
+        # see live SLO violations without a separate observer loop.
+        _phase_t0 = time.monotonic()
         result = await runner.run(ctx)
+        _phase_elapsed_s = time.monotonic() - _phase_t0
+        try:
+            from backend.core.ouroboros.governance.observability.phase8_producers import (  # noqa: E501
+                record_phase_latency as _phase8_record_phase_latency,
+                check_breach_and_publish as _phase8_check_breach,
+            )
+            _phase8_record_phase_latency(
+                phase=dispatch_phase.name,
+                latency_s=_phase_elapsed_s,
+            )
+            _phase8_check_breach(phase=dispatch_phase.name)
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[PhaseDispatcher] phase8_producers.record_phase_latency(%s) failed",
+                dispatch_phase.name, exc_info=True,
+            )
 
         if not isinstance(result, PhaseResult):
             raise PhaseDispatchError(

@@ -104,10 +104,17 @@ _OBS_DIR = (
 
 
 class TestDecisionTraceMasterFlag:
-    def test_default_false(self, monkeypatch):
+    def test_default_true_post_graduation(self, monkeypatch):
+        """Graduated default-TRUE 2026-05-05 via Phase 9 cadence.
+        Empty/unset env now returns True; explicit ``=false`` is
+        the rollback escape hatch."""
         monkeypatch.delenv(
             "JARVIS_DECISION_TRACE_LEDGER_ENABLED", raising=False,
         )
+        assert is_dtl_enabled() is True
+
+    def test_explicit_false_disables(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_DECISION_TRACE_LEDGER_ENABLED", "false")
         assert is_dtl_enabled() is False
 
     def test_truthy(self, monkeypatch):
@@ -122,7 +129,9 @@ class TestDecisionTraceConstants:
         assert MAX_RATIONALE_CHARS == 1_000
         assert MAX_FACTORS_KEYS == 32
         assert MAX_RECORDS_PER_OP == 200
-        assert SCHEMA_VERSION == "1"
+        # SCHEMA_VERSION bumped 1 → 2 when DecisionRow gained
+        # predecessor_ids/decision_tier/decision_hash_digest fields.
+        assert SCHEMA_VERSION == "2"
 
 
 @pytest.fixture
@@ -133,8 +142,11 @@ def fresh_dtl(tmp_path, monkeypatch):
 
 class TestDecisionTraceRecord:
     def test_master_off_skips(self, monkeypatch, tmp_path):
-        monkeypatch.delenv(
-            "JARVIS_DECISION_TRACE_LEDGER_ENABLED", raising=False,
+        """Post-graduation 2026-05-05 the master flag is default-TRUE;
+        opting back to false requires the explicit ``=false`` rollback
+        per the graduated-flag escape-hatch contract."""
+        monkeypatch.setenv(
+            "JARVIS_DECISION_TRACE_LEDGER_ENABLED", "false",
         )
         ledger = DecisionTraceLedger(path=tmp_path / "x.jsonl")
         ok, detail = ledger.record(

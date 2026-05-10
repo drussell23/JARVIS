@@ -380,6 +380,34 @@ class SemanticTriageEngine:
                 len(ctx.target_files),
             )
 
+            # Phase 8.2 producer wiring (Vector #5 Part B) — append a
+            # confidence event + best-effort SSE publish so operators
+            # can see "is the triage classifier getting LESS confident
+            # over a session?". Composes the canonical
+            # `phase8_producers.record_confidence` wrapper (NEVER
+            # raises; substrate's master flag gates the underlying
+            # ring).
+            try:
+                from backend.core.ouroboros.governance.observability.phase8_producers import (  # noqa: E501
+                    record_confidence as _phase8_record_confidence,
+                )
+                _phase8_record_confidence(
+                    classifier_name="semantic_triage",
+                    confidence=float(result.confidence),
+                    threshold=0.5,
+                    outcome=result.decision.name,
+                    op_id=ctx.op_id[:12],
+                    extra={
+                        "model": self._effective_model.split("/")[-1],
+                        "files": len(ctx.target_files),
+                    },
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[SemanticTriage] phase8_producers.record_confidence failed",
+                    exc_info=True,
+                )
+
             return result
 
         except asyncio.TimeoutError:

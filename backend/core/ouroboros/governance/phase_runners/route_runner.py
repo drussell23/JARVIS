@@ -215,6 +215,33 @@ class ROUTERunner(PhaseRunner):
                 "[Orchestrator] \U0001f6e4️  Route: %s (%s) [%s]",
                 _provider_route.value, _route_reason, ctx.op_id,
             )
+
+            # Phase 8.1 producer wiring (Vector #5 Part B) — append a
+            # decision-trace row + best-effort SSE publish capturing
+            # the routing decision's causal factors. Composes the
+            # canonical `phase8_producers.record_decision` wrapper
+            # (NEVER raises; substrate's master flag gates the
+            # underlying ledger). Routing must always succeed.
+            try:
+                from backend.core.ouroboros.governance.observability.phase8_producers import (  # noqa: E501
+                    record_decision as _phase8_record_decision,
+                )
+                _phase8_record_decision(
+                    op_id=ctx.op_id,
+                    phase="ROUTE",
+                    decision=_provider_route.value,
+                    factors={
+                        "signal_urgency": str(getattr(ctx, "signal_urgency", "") or ""),
+                        "signal_source": str(getattr(ctx, "signal_source", "") or ""),
+                        "task_complexity": str(getattr(ctx, "task_complexity", "") or ""),
+                    },
+                    rationale=_route_reason or "",
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[Orchestrator] phase8_producers.record_decision(ROUTE) failed",
+                    exc_info=True,
+                )
             if hasattr(orch._stack, "comm") and orch._stack.comm is not None:
                 try:
                     from backend.core.ouroboros.governance.urgency_router import (
