@@ -1222,6 +1222,21 @@ async def _maybe_evaluate_tool_permission(
                 "arguments": getattr(call, "arguments", {}) or {},
             },
         )
+        # Producer-bridge §33.2 — record the decision into the
+        # bounded ring archive for operator observability. Master-
+        # flag-gated (JARVIS_PERMISSION_ARCHIVE_ENABLED, default
+        # FALSE); no-op when off. NEVER raises into the policy path.
+        try:
+            from backend.core.ouroboros.governance.permission_decision_archive import (  # noqa: E501
+                maybe_record_decision,
+            )
+            maybe_record_decision(
+                op_id=getattr(policy_ctx, "op_id", "") or "",
+                tool_name=getattr(call, "name", ""),
+                decision=decision,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            pass
         return decision
     except Exception as exc:  # noqa: BLE001 — defensive
         logger.debug(

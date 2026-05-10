@@ -695,17 +695,47 @@ def _format_pipeline_progress_token(*, phase: Any) -> str:
 
 
 def _format_posture_badge_token() -> str:
-    """Compose ``posture_palette.format_posture_badge()`` into
-    the lead-position status-line token. NEVER raises. Returns
-    empty string when:
-      * master flag off (JARVIS_POSTURE_MOOD_RING_ENABLED)
+    """Compose the lead-position posture badge into a status-line
+    token. NEVER raises. Returns empty string when:
+      * both master flags off
+        (JARVIS_POSTURE_MOOD_RING_ENABLED and
+        JARVIS_POSTURE_AURORA_ENABLED)
       * posture store unwired (boot incomplete / test harness)
       * no current reading on disk
 
-    §38 Slice 1 (PRD v2.57→v2.58, 2026-05-07) — composes
-    canonical `governance/posture_palette.format_posture_badge`
-    which in turn composes `posture_repl._default_store` →
-    `PostureStore.load_current()` → `PostureReading.posture`."""
+    §37 Tier 2 (PRD §37.7, 2026-05-10) — when
+    ``JARVIS_POSTURE_AURORA_ENABLED`` is on, composes
+    :func:`posture_aurora.format_posture_aurora_badge` which adds
+    confidence-band intensity modulation on top of the canonical
+    palette. The aurora variant returns Rich markup
+    (``[bright_green]🐍 EXPLORE[/bright_green]``) so the
+    plain-text status line embeds the markup directly — Rich
+    consumers render the color, plain stdout sees the brackets
+    as visual decoration. Aurora flag default-FALSE.
+
+    §38 Slice 1 (PRD v2.57→v2.58, 2026-05-07) — fallback
+    composes canonical
+    `governance/posture_palette.format_posture_badge` which in
+    turn composes `posture_repl._default_store` →
+    `PostureStore.load_current()` → `PostureReading.posture`.
+    The fallback emits plain text (no markup) — graduated
+    behavior preserved verbatim."""
+    # Aurora path — confidence-modulated badge with Rich markup.
+    try:
+        from backend.core.ouroboros.governance.posture_aurora import (  # noqa: E501
+            aurora_enabled,
+            format_posture_aurora_badge,
+        )
+        if aurora_enabled():
+            aurora_token = format_posture_aurora_badge(plain=False)
+            if aurora_token:
+                return aurora_token
+            # Aurora master is on but no reading available — fall
+            # through to canonical badge (which will also return
+            # empty in that case, but the contract is the same).
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+    # Canonical path — graduated palette badge (plain text).
     try:
         from backend.core.ouroboros.governance.posture_palette import (  # noqa: E501
             format_posture_badge,
