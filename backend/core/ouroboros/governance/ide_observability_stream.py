@@ -237,6 +237,38 @@ prose for human-readable rationale; module never produces
 parallel prose."""
 
 
+EVENT_TYPE_ARCHITECTURE_SNAPSHOT = "architecture_snapshot"
+"""§39 Tier-5 #5 (PRD v2.74→v2.75, 2026-05-09) — fired by
+``architecture_viz.aggregate_architecture_snapshot``. Payload
+carries 8-zone activity counts. Composes canonical
+activity_radar."""
+
+
+EVENT_TYPE_CONFIDENCE_AURA_RENDERED = (
+    "confidence_aura_rendered"
+)
+"""§39 Tier-5 #15 — fired by ``confidence_aura.aggregate_aura``.
+Bounded payload (by_tier summary + token count, not raw
+text). Composes canonical ConfidenceTrace +
+margin_top1_top2."""
+
+
+EVENT_TYPE_ATTENTION_MIRROR_UPDATED = (
+    "attention_mirror_updated"
+)
+"""§39 Tier-5 #16 — fired by
+``attention_mirror.aggregate_attention``. Payload bounded
+to primary_focus + item count + window. Composes canonical
+SSE broker recent_history + narrative_channel."""
+
+
+EVENT_TYPE_PORTRAIT_RENDERED = "portrait_rendered"
+"""§39 Tier-5 #17 — fired by
+``procedural_portrait.aggregate_portrait``. Payload carries
+mode + mood + posture labels + deterministic seed. Composes
+canonical polish_bundle + posture_palette."""
+
+
 EVENT_TYPE_SESSION_STORY_RENDERED = "session_story_rendered"
 """§39 Tier-4 #10 (PRD v2.73→v2.74, 2026-05-09) — fired by
 ``session_story.aggregate_session_story`` for each session
@@ -869,6 +901,10 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COMMAND_PREVIEW_RENDERED,         # §39 Tier-3 #19 (pre-submission risk preview)
     EVENT_TYPE_SESSION_STORY_RENDERED,           # §39 Tier-4 #10 (operator's-eye session story)
     EVENT_TYPE_MEMORY_CRYSTALLIZATION_AGGREGATED, # §39 Tier-4 #18 (memory crystallization timeline)
+    EVENT_TYPE_ARCHITECTURE_SNAPSHOT,            # §39 Tier-5 #5 (8-zone organism viz)
+    EVENT_TYPE_CONFIDENCE_AURA_RENDERED,         # §39 Tier-5 #15 (per-token confidence aura)
+    EVENT_TYPE_ATTENTION_MIRROR_UPDATED,         # §39 Tier-5 #16 (attention focus snapshot)
+    EVENT_TYPE_PORTRAIT_RENDERED,                # §39 Tier-5 #17 (procedural ASCII portrait)
 })
 
 
