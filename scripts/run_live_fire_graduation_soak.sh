@@ -21,6 +21,61 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Cadence env discipline (2026-05-09) — load $REPO_ROOT/.env BEFORE
+# the Phase 9 exports so DOUBLEWORD_API_KEY / ANTHROPIC_API_KEY land
+# in the subprocess inherit-set. Diagnosed root cause of the soak's
+# silent zero-cost / DW-blocked-by-topology runner-failure pattern:
+# the canonical providers read os.environ at module load + never
+# call load_dotenv(); the wrapper is the single env-block boundary
+# that all cadence paths (cron / launchd / --once / manual) flow
+# through, so it is the right place to source secrets.
+#
+# Operator-override discipline: explicit shell-set values WIN over
+# .env (operator can `DOUBLEWORD_API_KEY=alt-key bash run_…sh` for
+# testing without modifying .env). Implementation does not `source`
+# the .env file — that would shell-eval arbitrary content. Instead
+# parses KEY=VALUE lines with a tight regex + skips comments + only
+# sets keys that are unset OR empty in the current env.
+if [[ -f "$REPO_ROOT/.env" ]]; then
+    # Use `case` + shell glob (not bash 4 regex) so the loader runs
+    # cleanly under macOS's frozen bash 3.2.57 + zsh + every cadence
+    # path. Validates KEY shape: starts with [A-Z_], contains only
+    # [A-Z0-9_]. Anything else (comments / blank lines / lowercase
+    # / shell substitutions / malformed lines) is silently skipped.
+    #
+    # Glob negation portability: bash 3.2 (frozen on macOS) treats
+    # `[!chars]` as a literal `!` in the character class, NOT as
+    # POSIX-style negation — only `[^chars]` works as negation.
+    # Using `[^...]` keeps the loader portable across bash 3.2 +
+    # bash 4+ + zsh.
+    #
+    # Indirect lookup portability: bash 3.2 lacks the
+    # `${!var:-default}` combinator (bash 4.2+). We use the
+    # `eval "lookup=\${$key}"` shape instead — same semantics
+    # under set -e, no fragile combinators.
+    while IFS='=' read -r _env_key _env_val; do
+        [[ -z "$_env_key" ]] && continue
+        case "$_env_key" in
+            [A-Z_]*) ;;          # head must be valid
+            *) continue ;;
+        esac
+        case "$_env_key" in
+            *[^A-Z0-9_]*) continue ;;  # body must be all-valid
+        esac
+        # Strip surrounding quotes from value (common .env idiom).
+        _env_val="${_env_val%\"}"; _env_val="${_env_val#\"}"
+        _env_val="${_env_val%\'}"; _env_val="${_env_val#\'}"
+        # Operator override wins — only set if currently unset/empty.
+        # bash 3.2-safe indirect lookup via eval (no ${!var:-} combinator).
+        _existing=""
+        eval "_existing=\${$_env_key:-}"
+        if [[ -z "$_existing" ]]; then
+            export "$_env_key=$_env_val"
+        fi
+    done < "$REPO_ROOT/.env"
+    unset _env_key _env_val _existing
+fi
+
 export JARVIS_GRADUATION_LEDGER_ENABLED=true
 export JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true
 export JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true

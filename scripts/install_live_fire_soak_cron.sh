@@ -256,20 +256,24 @@ run_once() {
     preflight
     echo -e "${BOLD}${CYAN}Running ONE live-fire soak now${RESET}  ${DIM}(--once)${RESET}"
     echo
-    if [[ "${JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED:-}" != "true" ]]; then
-        echo -e "${YELLOW}!${RESET} JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED not set"
-        echo -e "${DIM}  setting=true for this single invocation${RESET}"
-    fi
     cd "$REPO_ROOT"
-    # --once mirrors the cron entry's env block so a first-proof run
-    # reproduces production cadence behavior (incl. ledger writes).
-    JARVIS_GRADUATION_LEDGER_ENABLED=true \
-        JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true \
-        JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true \
-        JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true \
-        JARVIS_PHASE9_ORCHESTRATOR_ENABLED=true \
-        OUROBOROS_BATTLE_SEED_INTENTS=3 \
-        python3 "$HARNESS_SCRIPT" run \
+    # 2026-05-09 — delegate to the canonical wrapper instead of
+    # inlining a duplicate env block. The wrapper already sets every
+    # JARVIS_* + OUROBOROS_* var the cron + launchd paths use AND
+    # loads $REPO_ROOT/.env so DOUBLEWORD_API_KEY / ANTHROPIC_API_KEY
+    # reach the subprocess. This is the same single-source-of-truth
+    # discipline the launchd plist already honors (line 311 comment:
+    # "single source of truth for the env block"). Removing the
+    # duplicate inline block here closes the gap that bit the
+    # 2026-05-09 21:35 PDT --once attempt — DW connectivity passed
+    # raw curl in 500ms but the soak's harness saw 30s timeouts
+    # because the parent shell's env never carried the API keys.
+    if [[ ! -x "$WRAPPER_SCRIPT" ]]; then
+        echo -e "${RED}ERROR${RESET} wrapper not executable: $WRAPPER_SCRIPT"
+        exit 1
+    fi
+    JARVIS_CADENCE_KIND="${JARVIS_CADENCE_KIND:-once}" \
+        bash "$WRAPPER_SCRIPT" run \
         --cost-cap "$COST_CAP" \
         --max-wall-seconds "$WALL_CAP" \
         --timeout "$TIMEOUT"
