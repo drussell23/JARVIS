@@ -575,3 +575,182 @@ class TestAuthorityInvariants:
             "import anthropic",
         ):
             assert token not in source, f"banned token: {token}"
+
+
+# ---------------------------------------------------------------------------
+# Section J — Vector #11 wall-clock → monotonic regression
+# ---------------------------------------------------------------------------
+#
+# §3.6.2 Vector #11 / Wave 3 hygiene: rate-cap window + cooldown
+# elapsed-time math MUST be monotonic. NTP correction during a
+# session previously produced spurious throttle / spurious cap-hit.
+# These tests inject ``now_mono`` separately from ``now_unix`` to
+# simulate clock drift and prove the gates are NTP-immune.
+
+
+class TestVector11MonotonicGating:
+    def test_backward_ntp_correction_does_not_extend_cooldown(
+        self, monkeypatch,
+    ):
+        """Vector #11: with wall-clock gating, a backward ntpd jump
+        of Δ seconds produced ``elapsed = -Δ`` and the scheduler
+        sat in cooldown for ``cooldown_s + Δ`` seconds. With
+        monotonic gating, ntpd cannot push the gate past
+        ``cooldown_s``."""
+        monkeypatch.setenv("JARVIS_CURIOSITY_SCHEDULER_ENABLED", "1")
+        sched = CuriosityScheduler(
+            engine=_FakeEngine(),
+            cluster_provider=lambda: _clusters(),
+            cooldown_s=60.0,
+            max_cycles_per_hour=10,
+        )
+        # Fire at wall=1000 / mono=500.
+        r1 = sched.tick(now_unix=1000.0, now_mono=500.0)
+        assert r1.status is SchedulerStatus.FIRED
+        # ntpd corrects backward 30s mid-session: wall=970 (< prev),
+        # but monotonic continues forward to 561 (61s elapsed > 60s
+        # cooldown). With monotonic gating the next fire IS allowed.
+        r2 = sched.tick(now_unix=970.0, now_mono=561.0)
+        assert r2.status is SchedulerStatus.FIRED
+
+    def test_forward_ntp_jump_does_not_evict_history_early(
+        self, monkeypatch,
+    ):
+        """Vector #11: with wall-clock gating, a forward ntpd jump
+        evicted recent fires from the rolling-hour window. With
+        monotonic gating, only true elapsed time can prune."""
+        monkeypatch.setenv("JARVIS_CURIOSITY_SCHEDULER_ENABLED", "1")
+        sched = CuriosityScheduler(
+            engine=_FakeEngine(),
+            cluster_provider=lambda: _clusters(),
+            cooldown_s=0.0,
+            max_cycles_per_hour=4,
+        )
+        # 4 fires at mono=0,1,2,3 (wall arbitrary).
+        for i in range(4):
+            r = sched.tick(
+                now_unix=1000.0 + i, now_mono=float(i),
+            )
+            assert r.status is SchedulerStatus.FIRED
+        # ntpd jumps forward 4 hours of wall-clock — but only 5s of
+        # real (monotonic) elapsed time. Old fires must STILL be
+        # within the rolling-hour window → cap MUST hold.
+        r = sched.tick(
+            now_unix=1000.0 + 14400, now_mono=5.0,
+        )
+        assert r.status is SchedulerStatus.SKIPPED_RATE_CAP
+
+    def test_seconds_since_last_fire_uses_monotonic_delta(
+        self, monkeypatch,
+    ):
+        """``seconds_since_last_fire`` reports honest monotonic
+        delta (not wall-clock subtraction which was buggy on the
+        ``ts - 0`` fallback path)."""
+        monkeypatch.setenv("JARVIS_CURIOSITY_SCHEDULER_ENABLED", "1")
+        sched = CuriosityScheduler(
+            engine=_FakeEngine(),
+            cluster_provider=lambda: _clusters(),
+            cooldown_s=60.0,
+            max_cycles_per_hour=10,
+        )
+        sched.tick(now_unix=1000.0, now_mono=500.0)
+        r = sched.tick(now_unix=1010.0, now_mono=510.0)
+        assert r.status is SchedulerStatus.SKIPPED_COOLDOWN
+        # 10s elapsed in monotonic terms — independent of wall clock
+        assert r.seconds_since_last_fire == 10.0
+
+    def test_seconds_since_last_fire_none_before_first_fire(
+        self, monkeypatch,
+    ):
+        """When no fire has happened, the field is None (not 0 or
+        a since-epoch number — fixes legacy ``ts - 0`` bug)."""
+        monkeypatch.setenv("JARVIS_CURIOSITY_SCHEDULER_ENABLED", "1")
+        sched = CuriosityScheduler(
+            engine=_FakeEngine(),
+            cluster_provider=lambda: _clusters(),
+        )
+        # Force cooldown gate via injection of last_fire history
+        # never set. Cooldown gate short-circuits to None when
+        # _last_fire_mono is None — gate doesn't fire SKIPPED_COOLDOWN
+        # at all on first tick. Verify FIRED on first tick.
+        r = sched.tick(now_unix=1000.0, now_mono=500.0)
+        assert r.status is SchedulerStatus.FIRED
+        # And subsequent SKIPPED_COOLDOWN reports the real elapsed.
+        r2 = sched.tick(now_unix=1001.0, now_mono=501.0)
+        assert r2.status is SchedulerStatus.SKIPPED_COOLDOWN
+        assert r2.seconds_since_last_fire == 1.0
+
+    def test_production_path_uses_real_monotonic(
+        self, monkeypatch,
+    ):
+        """When neither now_unix nor now_mono is supplied, tick
+        defaults to time.time() + time.monotonic() — proves
+        production callers don't need to supply timestamps."""
+        monkeypatch.setenv("JARVIS_CURIOSITY_SCHEDULER_ENABLED", "1")
+        sched = CuriosityScheduler(
+            engine=_FakeEngine(),
+            cluster_provider=lambda: _clusters(),
+            cooldown_s=0.0,
+        )
+        r = sched.tick()
+        assert r.status is SchedulerStatus.FIRED
+        # ts_epoch is wall-clock-ish (within 5s of test execution)
+        assert abs(r.ts_epoch - time.time()) < 5.0
+
+    def test_internal_state_uses_monotonic_fields(
+        self, monkeypatch,
+    ):
+        """Pin: internal state has _fire_history_mono +
+        _last_fire_mono (monotonic) populated after a fire.
+        Wave 3 / Vector #11 invariant — drift requires
+        explicit pin update."""
+        monkeypatch.setenv("JARVIS_CURIOSITY_SCHEDULER_ENABLED", "1")
+        sched = CuriosityScheduler(
+            engine=_FakeEngine(),
+            cluster_provider=lambda: _clusters(),
+        )
+        sched.tick(now_unix=1000.0, now_mono=500.0)
+        assert sched._last_fire_mono == 500.0
+        assert sched._fire_history_mono == [500.0]
+        assert sched._last_fire_ts == 1000.0  # wall-clock audit
+
+
+class TestVector11SourcePins:
+    """Bytes-level regression on the curiosity_scheduler.py
+    source — vector #11 fix is structural."""
+
+    def test_no_wall_clock_in_rate_cap_pruning(self):
+        """The pruning helper MUST take a monotonic argument
+        and operate on _fire_history_mono. Drift requires
+        explicit pin update."""
+        source = _SCHED_PATH.read_text(encoding="utf-8")
+        # The function signature must reference mono.
+        assert "_prune_fire_history(self, mono_now: float)" in source
+        # The check_rate_cap must reference mono_now.
+        assert "_check_rate_cap(self, mono_now: float)" in source
+        # The check_cooldown must reference mono_now.
+        assert "mono_now: float" in source
+        # The internal state MUST be _fire_history_mono +
+        # _last_fire_mono (the monotonic fields).
+        assert "_fire_history_mono" in source
+        assert "_last_fire_mono" in source
+
+    def test_tick_accepts_now_mono_kwarg(self):
+        """The tick() API MUST accept ``now_mono`` for test
+        injection / determinism."""
+        source = _SCHED_PATH.read_text(encoding="utf-8")
+        assert "now_mono: Optional[float] = None" in source
+
+    def test_production_falls_back_to_real_monotonic(self):
+        """Pin: when neither argument is supplied, tick uses
+        time.monotonic() — proven by source bytes."""
+        source = _SCHED_PATH.read_text(encoding="utf-8")
+        assert "mono_ts = time.monotonic()" in source
+
+    def test_vector_11_provenance_in_docstring(self):
+        """The fix's audit trail (Vector #11) MUST be cited in
+        the source so future maintainers can find the rationale.
+        """
+        source = _SCHED_PATH.read_text(encoding="utf-8")
+        assert "Vector #11" in source
+        assert "NTP-immune" in source

@@ -190,7 +190,17 @@ class CuriosityScheduler:
     cooldown_s: Optional[float] = None
 
     # Internal state — not part of the dataclass init signature.
-    _fire_history: List[float] = field(default_factory=list)
+    # ----- monotonic-clock state (used for ALL elapsed-time math)
+    # NTP-immune. ``time.monotonic()`` measures wall-clock-equivalent
+    # seconds but is guaranteed never to go backward and is unaffected
+    # by ntpd corrections. Per Vector #11 (PRD §3.6.2 → §35) this is
+    # the load-bearing fix that prevents spurious throttle when the
+    # system clock is corrected mid-session.
+    _fire_history_mono: List[float] = field(default_factory=list)
+    _last_fire_mono: Optional[float] = field(default=None)
+    # ----- wall-clock fields (operator-display-only — never gating)
+    # ``ts_epoch`` on every SchedulerResult comes from these so the
+    # operator-visible audit trail still reads as wall-clock.
     _last_fire_ts: Optional[float] = field(default=None)
 
     def __post_init__(self) -> None:
@@ -199,16 +209,24 @@ class CuriosityScheduler:
         if self.cooldown_s is None:
             self.cooldown_s = get_cooldown_s()
 
-    def _prune_fire_history(self, now: float) -> None:
-        """Drop entries older than 1 hour."""
-        cutoff = now - 3600.0
-        self._fire_history = [
-            t for t in self._fire_history if t >= cutoff
+    def _prune_fire_history(self, mono_now: float) -> None:
+        """Drop monotonic-history entries older than 1 hour.
+
+        Uses :func:`time.monotonic` semantics — NTP-immune.
+        """
+        cutoff = mono_now - 3600.0
+        self._fire_history_mono = [
+            t for t in self._fire_history_mono if t >= cutoff
         ]
 
-    def _check_rate_cap(self, now: float) -> bool:
-        """True iff firing now would exceed the per-hour cap."""
-        self._prune_fire_history(now)
+    def _check_rate_cap(self, mono_now: float) -> bool:
+        """True iff firing now would exceed the per-hour cap.
+
+        Operates on monotonic timestamps — NTP correction (forward
+        OR backward) cannot push the rolling-hour window into a
+        false-positive cap-hit nor a false-negative drop.
+        """
+        self._prune_fire_history(mono_now)
         # Use explicit None check (not `or`) so cap=0 is honored if
         # ever supplied; __post_init__ ensures this is non-None at
         # construction.
@@ -217,13 +235,23 @@ class CuriosityScheduler:
             if self.max_cycles_per_hour is not None
             else DEFAULT_MAX_CYCLES_PER_HOUR
         )
-        return len(self._fire_history) >= cap
+        return len(self._fire_history_mono) >= cap
 
-    def _check_cooldown(self, now: float) -> Optional[float]:
-        """Return seconds until cooldown expires (None if expired)."""
-        if self._last_fire_ts is None:
+    def _check_cooldown(
+        self, mono_now: float,
+    ) -> Optional[float]:
+        """Return seconds until cooldown expires (None if expired).
+
+        Uses monotonic clock so ntpd backward-correction cannot
+        artificially extend the cooldown window. Vector #11 fix:
+        before the conversion a backward jump of ``Δ`` seconds
+        produced ``elapsed = -Δ`` and ``remaining = cooldown_s + Δ``
+        — operators saw the scheduler stuck in cooldown for hours
+        after a routine clock sync.
+        """
+        if self._last_fire_mono is None:
             return None
-        elapsed = now - self._last_fire_ts
+        elapsed = mono_now - self._last_fire_mono
         # Explicit None check (not `or`) so cooldown=0.0 is honored
         # — falsy-but-not-None must NOT fall through to default.
         cd = (
@@ -239,9 +267,23 @@ class CuriosityScheduler:
         self,
         *,
         now_unix: Optional[float] = None,
+        now_mono: Optional[float] = None,
     ) -> SchedulerResult:
         """One scheduler tick. Evaluates all gates + fires if all
         green. NEVER raises.
+
+        Args:
+            now_unix: Wall-clock seconds since epoch. Used ONLY for
+                operator-visible audit fields (``ts_epoch``). Defaults
+                to ``time.time()``. Production callers should leave
+                this unset; tests inject for determinism.
+            now_mono: Monotonic seconds for elapsed-time gating
+                (rate-cap window + cooldown). NTP-immune. Defaults
+                to ``time.monotonic()``. When ``now_unix`` is
+                injected without ``now_mono``, the wall-clock value
+                is mirrored so existing test contracts remain
+                deterministic — production never relies on this
+                fallback because it always passes neither argument.
 
         Gates (in order):
           1. Master flag → SKIPPED_MASTER_OFF
@@ -249,13 +291,21 @@ class CuriosityScheduler:
           3. Posture is HARDEN → SKIPPED_POSTURE_HARDEN
           4. Memory pressure HIGH/CRITICAL → SKIPPED_MEMORY_PRESSURE
           5. Not idle → SKIPPED_NOT_IDLE
-          6. Per-hour rate cap → SKIPPED_RATE_CAP
-          7. Cooldown active → SKIPPED_COOLDOWN
+          6. Per-hour rate cap → SKIPPED_RATE_CAP (monotonic gating)
+          7. Cooldown active → SKIPPED_COOLDOWN (monotonic gating)
           8. ENGINE FIRES — run_cycle() invoked
 
         Failures during engine invocation → ENGINE_ERROR with detail.
         """
         ts = now_unix if now_unix is not None else time.time()
+        # Monotonic ts: explicit injection wins; else mirror injected
+        # wall-clock for test determinism; else real time.monotonic().
+        if now_mono is not None:
+            mono_ts = now_mono
+        elif now_unix is not None:
+            mono_ts = now_unix
+        else:
+            mono_ts = time.monotonic()
 
         if not is_scheduler_enabled():
             return SchedulerResult(
@@ -335,28 +385,37 @@ class CuriosityScheduler:
                 ts_epoch=ts,
             )
 
-        # Gate 6: per-hour rate cap
-        if self._check_rate_cap(ts):
+        # Gate 6: per-hour rate cap (monotonic — NTP-immune)
+        if self._check_rate_cap(mono_ts):
             return SchedulerResult(
                 status=SchedulerStatus.SKIPPED_RATE_CAP,
                 posture=posture_str, pressure_level=pressure_str,
                 is_idle=is_idle,
-                cycles_in_window=len(self._fire_history),
+                cycles_in_window=len(self._fire_history_mono),
                 detail=(
-                    f"rate_cap_hit:{len(self._fire_history)}>="
+                    f"rate_cap_hit:{len(self._fire_history_mono)}>="
                     f"{self.max_cycles_per_hour}"
                 ),
                 ts_epoch=ts,
             )
 
-        # Gate 7: cooldown
-        remaining = self._check_cooldown(ts)
+        # Gate 7: cooldown (monotonic — NTP-immune)
+        remaining = self._check_cooldown(mono_ts)
         if remaining is not None:
+            # ``seconds_since_last_fire`` reports the monotonic
+            # delta — the honest elapsed time. Returns None when
+            # we never fired (avoids the legacy ``ts - 0`` bug
+            # which surfaced timestamps-since-epoch as "elapsed").
+            seconds_since = (
+                mono_ts - self._last_fire_mono
+                if self._last_fire_mono is not None
+                else None
+            )
             return SchedulerResult(
                 status=SchedulerStatus.SKIPPED_COOLDOWN,
                 posture=posture_str, pressure_level=pressure_str,
                 is_idle=is_idle,
-                seconds_since_last_fire=ts - (self._last_fire_ts or 0),
+                seconds_since_last_fire=seconds_since,
                 detail=f"cooldown_remaining_s={remaining:.2f}",
                 ts_epoch=ts,
             )
@@ -388,15 +447,18 @@ class CuriosityScheduler:
 
         # Update fire history regardless of engine outcome (the
         # scheduler made the decision to FIRE; the engine's verdict
-        # is downstream).
-        self._fire_history.append(ts)
+        # is downstream). Monotonic timestamp drives the rolling-
+        # hour window + cooldown gating; wall-clock is preserved as
+        # an audit-only field on the SchedulerResult.
+        self._fire_history_mono.append(mono_ts)
+        self._last_fire_mono = mono_ts
         self._last_fire_ts = ts
 
         return SchedulerResult(
             status=SchedulerStatus.FIRED,
             posture=posture_str, pressure_level=pressure_str,
             is_idle=is_idle,
-            cycles_in_window=len(self._fire_history),
+            cycles_in_window=len(self._fire_history_mono),
             engine_result=engine_result,
             detail=f"engine_status={getattr(engine_result, 'status', '?')}",
             ts_epoch=ts,
@@ -404,7 +466,8 @@ class CuriosityScheduler:
 
     def reset_state(self) -> None:
         """Test-only: clear fire history + cooldown."""
-        self._fire_history = []
+        self._fire_history_mono = []
+        self._last_fire_mono = None
         self._last_fire_ts = None
 
 
