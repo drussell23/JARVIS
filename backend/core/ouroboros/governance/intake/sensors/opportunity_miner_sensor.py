@@ -32,7 +32,6 @@ import logging
 import os
 import random
 import re
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,163 +40,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Gap #4 migration: FS-event-primary mode
-# ---------------------------------------------------------------------------
-#
-# When ``JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED=true``, TrinityEventBus
-# ``fs.changed.*`` events become the primary trigger: a ``.py`` file change
-# → single-file multi-dim analysis at pub/sub latency, not a 1-hour full
-# rglob sweep. Poll demotes to ``JARVIS_OPPORTUNITY_MINER_FALLBACK_INTERVAL_S``
-# (default 6h) as a safety net for dropped events.
-#
-# Shadow pattern: flag defaults OFF so current pure-poll behavior is
-# preserved until a battle-test graduation arc flips it (same precedent as
-# every earlier gap-#4 sensor migration).
-#
-# Storm-guard (unique to this sensor, not shared with TodoScanner):
-#   - Per-file debounce keeps an ``npm install`` / ``git checkout`` burst
-#     from re-scanning the same file 40 times in 5 seconds.
-#   - Global burst threshold: if incoming events exceed the threshold in a
-#     rolling 1s window, the sensor enters storm mode for a cooldown period
-#     during which ALL events are dropped (counted), trading coverage for
-#     CPU budget. One WARNING per storm; counters expose the drop count.
-#
-# Unlike the standard per-event path, storm mode is expected during normal
-# developer actions — the goal is to avoid a thousand AST parses in two
-# seconds, not to be "accurate" during a bulk mutation.
-def fs_events_enabled() -> bool:
-    """Re-read ``JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED`` at call-time."""
-    return os.environ.get(
-        "JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED", "true",
-    ).lower() in ("true", "1", "yes")
-
-
-_OPP_MINER_FALLBACK_INTERVAL_S: float = float(
-    os.environ.get("JARVIS_OPPORTUNITY_MINER_FALLBACK_INTERVAL_S", "21600")
-)
-
-
-# ---------------------------------------------------------------------------
-# Slice 11.6.c — Merkle Cartographer consultation (subtree-scoped)
-# ---------------------------------------------------------------------------
-#
-# When the per-sensor flag JARVIS_OPPMINER_USE_MERKLE is on AND the
-# cartographer's master flag is on, the scan loop short-circuits to the
-# cached prior selection when nothing under the sensor's _scan_paths has
-# changed since the last successful scan.
-#
-# Beef vs. Slices 11.6.a/b: this sensor uses *per-watched-path* subtree
-# hashes rather than a single root hash. A change in ``docs/`` (outside
-# the miner's scope) does NOT invalidate the cache. Only mutations under
-# a watched path bust short-circuit. This matters because the miner runs
-# AST-heavy analysis across multiple strategies — every avoided no-op
-# scan saves real CPU, not just a directory walk.
-#
-# The cache stores the *full ingested-candidate list* from the last scan.
-# A short-circuit replays nothing through the router (envelopes are not
-# re-emitted; the dedup ledger handled them already). The cycle counter
-# DOES still advance so the strategy-rotation index advances on every
-# call — the next non-short-circuit cycle picks up the rotated strategy
-# without skipping any.
-#
-# Default false to preserve byte-identical legacy behavior. Per-sensor
-# graduation: each Slice 11.6.{a,b,c,d} flag flips independently after
-# its own forced-clean once-proof cadence.
-
-
-def merkle_consult_enabled() -> bool:
-    """Re-read ``JARVIS_OPPMINER_USE_MERKLE`` at call time so monkeypatch
-    works in tests + operator can flip live without re-init.
-
-    Default ``true`` — graduated in Phase 11 Slice 11.7. Hot-revert:
-    ``export JARVIS_OPPMINER_USE_MERKLE=false``."""
-    raw = os.environ.get(
-        "JARVIS_OPPMINER_USE_MERKLE", "",
-    ).strip().lower()
-    if raw == "":
-        return True  # graduated default
-    return raw in ("1", "true", "yes", "on")
-
-# Per-file debounce: suppress repeat events on the same file within this
-# window. 30s is long enough to absorb an editor's atomic-save spray
-# (save → backup → rename → chmod → fsync) but short enough that a genuine
-# human follow-up edit still triggers a fresh scan.
-_OPP_MINER_DEBOUNCE_S: float = float(
-    os.environ.get("JARVIS_OPPORTUNITY_MINER_DEBOUNCE_S", "30")
-)
-
-# Global burst circuit-breaker. Sized for "normal `git checkout` after a
-# 10-file PR" (≈30 events in a blink) passing through, but "`npm install`
-# touching 8000 files" tripping immediately.
-_OPP_MINER_STORM_THRESHOLD: int = int(
-    os.environ.get("JARVIS_OPPORTUNITY_MINER_STORM_THRESHOLD", "50")
-)
-_OPP_MINER_STORM_COOLDOWN_S: float = float(
-    os.environ.get("JARVIS_OPPORTUNITY_MINER_STORM_COOLDOWN_S", "60")
-)
-
-# Matches TodoScanner's _SKIP_DIRS and FileWatchGuard's default excludes —
-# a change in any of these under repo root cannot produce a real
-# opportunity envelope, so skip before parsing.
-_OPP_SKIP_DIRS: frozenset[str] = frozenset({
-    "venv", ".venv", "venv_py39_backup", "node_modules", ".git",
-    "site-packages", "__pycache__", ".worktrees",
-    ".pytest_cache", ".mypy_cache", "build", "dist",
-    ".ouroboros",
-})
-
-
-# ---------------------------------------------------------------------------
-# Auto-ack lane configuration (Task #69 — C1+C3 fix)
-# ---------------------------------------------------------------------------
-# The auto-ack lane lets the OpportunityMiner rescue coalesced graph batches
-# from the AC2 pending_ack gate when the batch passes a strict guard set.
-# Without it, every miner batch sits at pending_ack forever and the loop
-# never makes safe-module progress (empirically: enqueued=0 across all
-# observed cycles in bt-2026-04-12-005521 / bt-2026-04-12-025527).
-#
-# Why guards matter: the orchestrator's _build_profile (orchestrator.py:4892)
-# does NOT thread `source` into OperationProfile, so source-specific risk
-# rules are bypassed for ai_miner ops. The empirical risk-tier audit (Apr 11)
-# showed 1-file plain miner refactors land in SAFE_AUTO and 2-file in
-# NOTIFY_APPLY — silent or near-silent auto-apply. The lane enforces N>=3
-# so re-ingested batches always trip the classifier's `too_many_files` /
-# `blast_radius_exceeded` rules and route to APPROVAL_REQUIRED (Orange).
-#
-# Master switches:
-#   JARVIS_MINER_AUTO_ACK_LANE        — default false; flip on with
-#                                        JARVIS_MINER_GRAPH_AUTO_SUBMIT=true
-#   JARVIS_MINER_AUTO_ACK_MIN_FILES   — default 3 (matches the classifier's
-#                                        too_many_files threshold)
-#   JARVIS_MINER_AUTO_ACK_MAX_FILES   — default 8 (cap blast radius)
-#
-# Hard constants (not env-tunable; changing them is a code review concern):
-_AUTO_ACK_LANE_ENABLED: bool = (
-    os.environ.get("JARVIS_MINER_AUTO_ACK_LANE", "false").strip().lower()
-    in ("1", "true", "yes", "on")
-)
-_AUTO_ACK_MIN_FILES: int = int(os.environ.get("JARVIS_MINER_AUTO_ACK_MIN_FILES", "3"))
-_AUTO_ACK_MAX_FILES: int = int(os.environ.get("JARVIS_MINER_AUTO_ACK_MAX_FILES", "8"))
-
-# Allowlist of path prefixes for the lane. Excludes scripts/ for v1 because
-# loose scripts are a broader blast radius than packaged backend code.
-_AUTO_ACK_ALLOWED_PREFIXES: Tuple[str, ...] = ("backend/", "tests/")
-
-# Defense-in-depth fragments — even though the risk classifier already blocks
-# these, the lane double-checks before bypassing the AC2 gate. Order matters
-# for grep-friendly diagnostics: kernel sentinels first, then security.
-_AUTO_ACK_FORBIDDEN_FRAGMENTS: Tuple[str, ...] = (
-    "supervisor",
-    "auth/",
-    "credential",
-    "secret",
-    "token",
-    "encrypt",
-    ".env",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -273,18 +115,12 @@ class _CycleCounters:
       queued_behind   — ingest() returned "queued_behind" (file conflict)
       deduplicated    — ingest() returned "deduplicated" (dedup window hit)
       backpressure    — ingest() returned "backpressure" (queue full)
-      auto_acked      — Auto-ack lane successfully rescued a parked envelope
-                        via router.acknowledge() (Task #69 C1+C3 fix). When
-                        non-zero, expect enqueued >= auto_acked because each
-                        rescue increments both counters.
 
     Reading the summary line:
       mined=N selected=M graph_built=1 graph_submitted=0 …
         → C1: JARVIS_MINER_GRAPH_AUTO_SUBMIT=false is the wall.
-      … pending_ack=K enqueued=0 auto_acked=0
-        → C3: AC2 requires_human_ack=True is the wall AND lane is off/blocked.
-      … pending_ack=K enqueued=K auto_acked=K
-        → Lane is working: every parked batch was rescued.
+      … pending_ack=K enqueued=0
+        → C3: AC2 requires_human_ack=True is the wall.
       … enqueued=K (K small relative to mined)
         → C2 (JARVIS_MINER_MAX_PER_SCAN + module_cap) is the next knob.
     """
@@ -299,7 +135,6 @@ class _CycleCounters:
     queued_behind: int = 0
     deduplicated: int = 0
     backpressure: int = 0
-    auto_acked: int = 0
 
 
 
@@ -465,7 +300,6 @@ class OpportunityMinerSensor:
         self._repo = repo
         self._poll_interval_s = poll_interval_s
         self._running = False
-        self._poll_task: Optional[asyncio.Task] = None
         self._seen_file_paths: set[str] = set()
         # Graph coalescer: when >=2 candidates are selected in a scan, they
         # are merged into a single ExecutionGraph envelope instead of N
@@ -497,34 +331,6 @@ class OpportunityMinerSensor:
         self._explore_ratio: float = float(
             os.environ.get("JARVIS_MINER_EXPLORE_RATIO", "0.4")
         )
-
-        # --- Gap #4 FS-event state ------------------------------------
-        # Captured at __init__ so a runtime env flip does not retroactively
-        # demote the poll loop; matches the TodoScanner precedent.
-        self._fs_events_mode: bool = fs_events_enabled()
-        self._fs_events_handled: int = 0
-        self._fs_events_ignored: int = 0
-        self._fs_events_debounced: int = 0
-        self._fs_events_storm_dropped: int = 0
-        # Per-file debounce ledger: path → monotonic timestamp of last scan.
-        self._event_debounce: Dict[str, float] = {}
-        # Global burst-rate circuit breaker state.
-        self._storm_window_start: float = 0.0
-        self._storm_window_count: int = 0
-        self._storm_active_until: float = 0.0
-
-        # --- Slice 11.6.c — Merkle cartographer consultation ----------
-        # Per-watched-path baseline: { rel_scan_path → subtree_hash }.
-        # Short-circuit only when ALL watched subtree hashes match.
-        # Empty dict on cold-start → first scan always runs.
-        self._merkle_last_seen_subtree_hashes: Dict[str, str] = {}
-        # Cached candidate list from the last full scan. Replayed on
-        # short-circuit cycles so caller sees the same prior result.
-        # Stored regardless of merkle flag so flipping the flag mid-
-        # session doesn't blank state.
-        self._merkle_cached_candidates: List[StaticCandidate] = []
-        self._merkle_short_circuits: int = 0
-        self._merkle_full_scans: int = 0
 
     # v350.4: Third-party / non-project directory segments
     _NON_PROJECT_SEGMENTS = frozenset({
@@ -653,27 +459,7 @@ class OpportunityMinerSensor:
 
         Rotates through analysis strategies each cycle, applies cooldowns,
         and uses exploit/explore selection for diverse coverage.
-
-        Slice 11.6.c — when ``JARVIS_OPPMINER_USE_MERKLE=true`` AND the
-        Merkle Cartographer reports ALL watched scan-path subtree hashes
-        unchanged since the last successful scan, short-circuit to the
-        cached candidate list (skip filesystem walk + AST parse + ingest).
-        Subtree-scoped: a change outside the miner's ``_scan_paths`` does
-        NOT bust the cache.
         """
-        current_subtree_hashes = self._merkle_subtree_hashes()
-        if self._merkle_should_short_circuit(current_subtree_hashes):
-            self._merkle_short_circuits += 1
-            logger.debug(
-                "OpportunityMinerSensor: Merkle short-circuit "
-                "(scan #%d skipped, %d cached candidates, %d watched paths)",
-                self._merkle_short_circuits + self._merkle_full_scans,
-                len(self._merkle_cached_candidates),
-                len(current_subtree_hashes),
-            )
-            return list(self._merkle_cached_candidates)
-
-        self._merkle_full_scans += 1
         self._scan_cycle += 1
 
         # Pick the strategy for this cycle (round-robin)
@@ -688,13 +474,52 @@ class OpportunityMinerSensor:
         )
 
         # Phase 1: Full filesystem scan + multi-dimensional analysis
-        # Offloaded to a thread so rglob + ast.parse don't block the loop.
-        loop = asyncio.get_running_loop()
-        scanned, skipped_non_package, errors, analyses = await loop.run_in_executor(
-            None,
-            self._scan_files_sync,
-            sort_field,
-        )
+        analyses: List[_FileAnalysis] = []
+        scanned = 0
+        skipped_non_package = 0
+        errors = 0
+
+        for scan_path in self._scan_paths:
+            root = self._repo_root / scan_path
+            if not root.exists():
+                continue
+            for py_file in root.rglob("*.py"):
+                rel = str(py_file.relative_to(self._repo_root))
+
+                if not self._is_production_code(py_file, root):
+                    skipped_non_package += 1
+                    continue
+
+                scanned += 1
+                try:
+                    source = py_file.read_text(encoding="utf-8")
+                    tree = ast.parse(source)
+                except SyntaxError:
+                    errors += 1
+                    continue
+                except (OSError, UnicodeDecodeError):
+                    errors += 1
+                    continue
+
+                analysis = _analyze_file(rel, source, tree)
+                self._analysis_cache[rel] = analysis
+
+                # Strategy-specific threshold gate
+                value = getattr(analysis, sort_field, 0)
+                if sort_field == "cyclomatic_complexity" and value < self._threshold:
+                    continue
+                elif sort_field == "max_function_length" and value < 80:
+                    continue
+                elif sort_field == "cognitive_complexity" and value < 50:
+                    continue
+                elif sort_field == "duplicate_block_count" and value < 3:
+                    continue
+                elif sort_field == "import_fan_out" and value < 15:
+                    continue
+                elif sort_field == "todo_fixme_count" and value < 3:
+                    continue
+
+                analyses.append(analysis)
 
         # Phase 2: Diverse candidate selection
         counters = _CycleCounters(mined=len(analyses))
@@ -738,9 +563,6 @@ class OpportunityMinerSensor:
                         ingested, errors, skipped_non_package,
                     )
                     self._emit_cycle_summary(counters, strategy_name)
-                    self._merkle_refresh_baseline(
-                        ingested, current_subtree_hashes,
-                    )
                     return ingested
                 # Coalescing envelope was rejected — fall through to per-file
                 # ingest as a best-effort fallback.
@@ -823,200 +645,11 @@ class OpportunityMinerSensor:
             ingested, errors, skipped_non_package,
         )
         self._emit_cycle_summary(counters, strategy_name)
-        self._merkle_refresh_baseline(ingested, current_subtree_hashes)
         return ingested
-
-    # ------------------------------------------------------------------
-    # Slice 11.6.c — Merkle Cartographer consultation (subtree-scoped)
-    # ------------------------------------------------------------------
-
-    def _merkle_normalized_scan_paths(self) -> List[str]:
-        """Project ``self._scan_paths`` into the cartographer's relpath
-        namespace (POSIX, no leading/trailing slash, ``"."`` → root).
-
-        Stable order: same iteration order as ``_scan_paths`` so the
-        baseline dict stays comparable across cycles even if the path
-        list is reordered (it shouldn't be, but defensive)."""
-        out: List[str] = []
-        for raw in self._scan_paths:
-            s = str(raw).replace("\\", "/").strip()
-            if s in ("", ".", "./"):
-                out.append("")  # root marker
-                continue
-            out.append(s.strip("/"))
-        return out
-
-    def _merkle_subtree_hashes(self) -> Dict[str, str]:
-        """Read per-watched-path subtree hashes from the cartographer.
-        Empty dict on any failure path — fail-safe to legacy scan.
-
-        For each scan path: empty-string relpath means "use root hash"
-        (i.e. ``_scan_paths == ["."]``); any other relpath uses
-        ``subtree_hash(relpath)``. A missing/unhashable subtree returns
-        empty string, which the comparison treats as 'always changed'
-        (fail-safe).
-        """
-        if not merkle_consult_enabled():
-            return {}
-        try:
-            from backend.core.ouroboros.governance.merkle_cartographer import (
-                get_default_cartographer,
-            )
-            c = get_default_cartographer(repo_root=self._repo_root)
-            out: Dict[str, str] = {}
-            for relpath in self._merkle_normalized_scan_paths():
-                if relpath == "":
-                    out[relpath] = c.current_root_hash()
-                else:
-                    out[relpath] = c.subtree_hash(relpath)
-            return out
-        except Exception:  # noqa: BLE001 — defensive
-            logger.debug(
-                "OpportunityMinerSensor: subtree hash read failed; "
-                "falling through to full scan", exc_info=True,
-            )
-            return {}
-
-    def _merkle_should_short_circuit(
-        self, current_hashes: Dict[str, str],
-    ) -> bool:
-        """Decide whether to skip the multi-strategy scan based on
-        cartographer state. Returns False (i.e. proceed with full scan)
-        on any failure path — fail-safe to legacy behavior.
-
-        Conditions for short-circuit (ALL must hold):
-          1. Per-sensor flag ``JARVIS_OPPMINER_USE_MERKLE`` is true
-          2. Cartographer master flag enabled (empty hashes dict from
-             ``_merkle_subtree_hashes`` indicates flag off / error /
-             cold-cartographer → fail-safe)
-          3. Every watched subtree hash matches the recorded baseline
-          4. We have a recorded baseline (cold-start guard — the
-             baseline dict is empty until the first full scan
-             completes; an *empty cache* with a populated baseline
-             is a legitimate "scan found 0 candidates" state and
-             SHOULD short-circuit)
-          5. The set of watched paths is unchanged since last scan
-             (operator may have added/removed paths via reconfig —
-             a different shape means we cannot trust the baseline)
-          6. No watched subtree returned an empty hash (would mean
-             cartographer cannot resolve that path — e.g. it doesn't
-             exist on disk yet, fail-safe to full scan)
-        """
-        if not merkle_consult_enabled():
-            return False
-        if not current_hashes:
-            return False  # cartographer disabled / cold-start / error
-        if not self._merkle_last_seen_subtree_hashes:
-            return False  # cold start — no baseline yet
-        if (
-            set(current_hashes.keys())
-            != set(self._merkle_last_seen_subtree_hashes.keys())
-        ):
-            return False  # scan-path topology changed
-        if any(not h for h in current_hashes.values()):
-            return False  # at least one subtree unresolved
-        return all(
-            current_hashes[k] == self._merkle_last_seen_subtree_hashes[k]
-            for k in current_hashes
-        )
-
-    def _merkle_refresh_baseline(
-        self,
-        ingested: List[StaticCandidate],
-        current_hashes: Dict[str, str],
-    ) -> None:
-        """Snapshot the freshly-scanned cartographer state + ingested
-        candidates as the new baseline for the next cycle's
-        short-circuit decision. Always-safe — never raises."""
-        try:
-            self._merkle_cached_candidates = list(ingested)
-            self._merkle_last_seen_subtree_hashes = dict(current_hashes)
-        except Exception:  # noqa: BLE001 — defensive
-            logger.debug(
-                "OpportunityMinerSensor: merkle baseline refresh failed",
-                exc_info=True,
-            )
-
-    def health(self) -> Dict[str, Any]:
-        """Operator-visible health snapshot. Slice 11.6.c added — exposes
-        merkle short-circuit telemetry for graduation observability."""
-        return {
-            "sensor": "OpportunityMinerSensor",
-            "repo": self._repo,
-            "running": self._running,
-            "scan_cycle": self._scan_cycle,
-            "cooldown_files": len(self._cooldown_map),
-            "seen_files": len(self._seen_file_paths),
-            "fs_events_mode": self._fs_events_mode,
-            "fs_events_handled": self._fs_events_handled,
-            "fs_events_ignored": self._fs_events_ignored,
-            "fs_events_debounced": self._fs_events_debounced,
-            "fs_events_storm_dropped": self._fs_events_storm_dropped,
-            # Slice 11.6.c — Merkle consultation telemetry
-            "merkle_consult_enabled": merkle_consult_enabled(),
-            "merkle_short_circuits": self._merkle_short_circuits,
-            "merkle_full_scans": self._merkle_full_scans,
-            "merkle_watched_paths": list(
-                self._merkle_last_seen_subtree_hashes.keys()
-            ),
-            "merkle_cached_candidates": len(self._merkle_cached_candidates),
-        }
 
     # ------------------------------------------------------------------
     # Internal helpers (shared between coalesced and per-file paths)
     # ------------------------------------------------------------------
-
-    def _scan_files_sync(
-        self, sort_field: str,
-    ) -> Tuple[int, int, int, List[_FileAnalysis]]:
-        """CPU-bound Phase 1 scan — runs in a thread via run_in_executor."""
-        analyses: List[_FileAnalysis] = []
-        scanned = 0
-        skipped_non_package = 0
-        errors = 0
-
-        for scan_path in self._scan_paths:
-            root = self._repo_root / scan_path
-            if not root.exists():
-                continue
-            for py_file in root.rglob("*.py"):
-                rel = str(py_file.relative_to(self._repo_root))
-
-                if not self._is_production_code(py_file, root):
-                    skipped_non_package += 1
-                    continue
-
-                scanned += 1
-                try:
-                    source = py_file.read_text(encoding="utf-8")
-                    tree = ast.parse(source)
-                except SyntaxError:
-                    errors += 1
-                    continue
-                except (OSError, UnicodeDecodeError):
-                    errors += 1
-                    continue
-
-                analysis = _analyze_file(rel, source, tree)
-                self._analysis_cache[rel] = analysis
-
-                value = getattr(analysis, sort_field, 0)
-                if sort_field == "cyclomatic_complexity" and value < self._threshold:
-                    continue
-                elif sort_field == "max_function_length" and value < 80:
-                    continue
-                elif sort_field == "cognitive_complexity" and value < 50:
-                    continue
-                elif sort_field == "duplicate_block_count" and value < 3:
-                    continue
-                elif sort_field == "import_fan_out" and value < 15:
-                    continue
-                elif sort_field == "todo_fixme_count" and value < 3:
-                    continue
-
-                analyses.append(analysis)
-
-        return scanned, skipped_non_package, errors, analyses
 
     def _prune_cooldowns(self) -> None:
         """Drop cooldown entries older than 2× cooldown window."""
@@ -1088,68 +721,13 @@ class OpportunityMinerSensor:
             "mined=%d eligible=%d selected=%d "
             "graph_built=%d graph_submitted=%d "
             "enqueued=%d pending_ack=%d queued_behind=%d "
-            "deduplicated=%d backpressure=%d auto_acked=%d",
+            "deduplicated=%d backpressure=%d",
             self._scan_cycle, strategy_name, self._max_per_scan,
             counters.mined, counters.eligible, counters.selected,
             counters.graph_built, counters.graph_submitted,
             counters.enqueued, counters.pending_ack, counters.queued_behind,
-            counters.deduplicated, counters.backpressure, counters.auto_acked,
+            counters.deduplicated, counters.backpressure,
         )
-
-    @staticmethod
-    def _check_auto_ack_lane(target_files: Tuple[str, ...]) -> Tuple[bool, str]:
-        """Decide whether the auto-ack lane may rescue a parked miner batch.
-
-        Returns ``(eligible, reason)``. ``reason`` is a stable, grep-friendly
-        token explaining the decision — emitted in the audit log on both
-        success and skip so the lane is fully observable.
-
-        The guards (in evaluation order, first failure wins):
-          1. Lane disabled by env var → ``lane_disabled``
-          2. Below ``_AUTO_ACK_MIN_FILES`` (default 3) → ``below_min_files``
-          3. Above ``_AUTO_ACK_MAX_FILES`` (default 8) → ``above_max_files``
-          4. Any file outside ``_AUTO_ACK_ALLOWED_PREFIXES`` → ``path_not_allowed``
-          5. Any file matches a forbidden fragment → ``forbidden_fragment``
-          6. Any file matches a UserPreferenceMemory FORBIDDEN_PATH substring
-             → ``forbidden_user_pref``
-          7. All passed → ``ok``
-
-        Defense in depth: rules 4–6 enforce a hard floor even if the risk
-        classifier is later modified. The lane never widens its own scope.
-        """
-        if not _AUTO_ACK_LANE_ENABLED:
-            return False, "lane_disabled"
-        n = len(target_files)
-        if n < _AUTO_ACK_MIN_FILES:
-            return False, "below_min_files"
-        if n > _AUTO_ACK_MAX_FILES:
-            return False, "above_max_files"
-        for f in target_files:
-            if not any(f.startswith(p) for p in _AUTO_ACK_ALLOWED_PREFIXES):
-                return False, "path_not_allowed"
-            f_lower = f.lower()
-            for frag in _AUTO_ACK_FORBIDDEN_FRAGMENTS:
-                if frag in f_lower:
-                    return False, "forbidden_fragment"
-        # FORBIDDEN_PATH check via the same global hook ToolExecutor uses.
-        # Fault-isolated: a missing/broken provider must not break the lane.
-        try:
-            from backend.core.ouroboros.governance.user_preference_memory import (
-                get_protected_path_provider,
-            )
-            provider = get_protected_path_provider()
-            if provider is not None:
-                forbidden_substrings = list(provider() or ())
-                for f in target_files:
-                    for sub in forbidden_substrings:
-                        if sub and sub in f:
-                            return False, "forbidden_user_pref"
-        except Exception:
-            logger.debug(
-                "OpportunityMinerSensor: forbidden-path provider check failed",
-                exc_info=True,
-            )
-        return True, "ok"
 
     async def _ingest_coalesced_batch(
         self,
@@ -1193,58 +771,6 @@ class OpportunityMinerSensor:
 
         self._record_ingest_result(counters, result)
 
-        # Auto-ack lane: if the batch landed at pending_ack and the lane
-        # guards pass, rescue it via router.acknowledge(). The lane is
-        # gated on JARVIS_MINER_AUTO_ACK_LANE (default off) and a strict
-        # file count + path allowlist + forbidden-fragment check that
-        # bounds the bypass to coalesced batches that will route to
-        # APPROVAL_REQUIRED in the risk classifier (3+ files trips
-        # too_many_files; see Task #69 audit).
-        if result == "pending_ack":
-            lane_ok, lane_reason = self._check_auto_ack_lane(batch.target_files)
-            if lane_ok:
-                extra_evidence = {
-                    "auto_acked": True,
-                    "auto_ack_reason": "miner_graph_lane",
-                    "auto_ack_graph_id": batch.graph.graph_id,
-                    "auto_ack_file_count": len(batch.target_files),
-                }
-                try:
-                    rescued = await self._router.acknowledge(
-                        envelope.idempotency_key,
-                        extra_evidence=extra_evidence,
-                    )
-                except Exception:
-                    logger.exception(
-                        "OpportunityMinerSensor: auto_ack lane raised "
-                        "(graph=%s)", batch.graph.graph_id,
-                    )
-                    rescued = False
-                if rescued:
-                    counters.enqueued += 1
-                    counters.auto_acked += 1
-                    result = "enqueued"  # treat as success below
-                    logger.info(
-                        "OpportunityMinerSensor auto_ack lane=miner_graph "
-                        "graph_id=%s files=%d strategy=%s reason=%s",
-                        batch.graph.graph_id, len(batch.target_files),
-                        strategy_name, lane_reason,
-                    )
-                else:
-                    logger.info(
-                        "OpportunityMinerSensor auto_ack lane=miner_graph "
-                        "graph_id=%s files=%d strategy=%s status=reingest_failed",
-                        batch.graph.graph_id, len(batch.target_files),
-                        strategy_name,
-                    )
-            else:
-                logger.info(
-                    "OpportunityMinerSensor auto_ack lane=miner_graph "
-                    "graph_id=%s files=%d strategy=%s status=skipped reason=%s",
-                    batch.graph.graph_id, len(batch.target_files),
-                    strategy_name, lane_reason,
-                )
-
         if result not in ("enqueued", "pending_ack"):
             logger.info(
                 "OpportunityMinerSensor: coalesced envelope not accepted "
@@ -1272,174 +798,35 @@ class OpportunityMinerSensor:
     async def start(self) -> None:
         """Start background scanning loop."""
         self._running = True
-        if self._poll_task is not None and not self._poll_task.done():
-            return
-        self._poll_task = asyncio.create_task(
-            self._poll_loop(), name="opportunity_miner_poll",
-        )
-        effective = (
-            _OPP_MINER_FALLBACK_INTERVAL_S
-            if self._fs_events_mode
-            else self._poll_interval_s
-        )
-        mode = (
-            "fs-events-primary (.py change → scan_file; poll=fallback)"
-            if self._fs_events_mode
-            else "poll-primary"
-        )
-        logger.info(
-            "[OpportunityMiner] Started for repo=%s poll_interval=%ds mode=%s",
-            self._repo, int(effective), mode,
-        )
+        asyncio.create_task(self._poll_loop(), name="opportunity_miner_poll")
 
-    async def stop(self) -> None:
+    def stop(self) -> None:
         self._running = False
-        task = self._poll_task
-        self._poll_task = None
-        if task is None or task.done():
-            return
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
 
     # ------------------------------------------------------------------
     # Event-driven path (Manifesto §3: zero polling, pure reflex)
     # ------------------------------------------------------------------
 
     async def subscribe_to_bus(self, event_bus: Any) -> None:
-        """Subscribe to file-system events via ``TrinityEventBus``.
-
-        Gated by ``JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED`` (default
-        OFF). When the flag is off this method is a logged no-op so the
-        legacy 1h-poll behavior is preserved exactly. Caller contract
-        matches every other gap-#4 sensor: ``IntakeLayerService``
-        unconditionally calls ``subscribe_to_bus`` on every sensor that
-        exposes it; the flag check lives here so one sensor's decision
-        doesn't require special-casing at the call site.
-
-        Subscription failures are caught locally — the intake layer must
-        never regress just because TrinityEventBus rejected a
-        subscription.
-        """
-        if not self._fs_events_mode:
-            logger.debug(
-                "[OpportunityMiner] FS-event subscription skipped "
-                "(JARVIS_OPPORTUNITY_MINER_FS_EVENTS_ENABLED=false). "
-                "Poll-primary mode active — no gap #4 resolution.",
-            )
-            return
-
-        try:
-            await event_bus.subscribe("fs.changed.*", self._on_fs_event)
-        except Exception as exc:
-            logger.warning(
-                "[OpportunityMiner] FS-event subscription failed: %s "
-                "(poll-fallback at %ds continues)",
-                exc, int(_OPP_MINER_FALLBACK_INTERVAL_S),
-            )
-            return
-
-        logger.info(
-            "[OpportunityMiner] subscribed to fs.changed.* — "
-            "FS events now PRIMARY (poll demoted to %ds fallback, "
-            "debounce=%ds, storm_threshold=%d/s, storm_cooldown=%ds)",
-            int(_OPP_MINER_FALLBACK_INTERVAL_S),
-            int(_OPP_MINER_DEBOUNCE_S),
-            _OPP_MINER_STORM_THRESHOLD,
-            int(_OPP_MINER_STORM_COOLDOWN_S),
-        )
+        """Subscribe to file system events for instant complexity detection."""
+        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        logger.info("OpportunityMinerSensor: subscribed to fs.changed.* events")
 
     async def _on_fs_event(self, event: Any) -> None:
-        """React to file change — multi-dim analysis on the changed file.
-
-        Filter order matters: cheapest checks first, so bulk events are
-        dropped before any AST work.
-          1. Extension + test-file filter (near-free).
-          2. Delete-event state cleanup (near-free).
-          3. Storm-guard: active cooldown → drop.
-          4. Skip-dirs filter (string match on path parts).
-          5. Burst-rate update: may push us into storm mode.
-          6. Per-file debounce: path-keyed monotonic window.
-          7. scan_file (AST parse + multi-dim analysis).
-
-        Each filter increments exactly one counter so the
-        handled/ignored/debounced/storm_dropped totals sum to the event
-        count the bus delivered. Exceptions in scan_file never propagate
-        — the bus must stay subscribed.
-        """
-        try:
-            payload = event.payload
-        except AttributeError:
-            self._fs_events_ignored += 1
-            return
-
+        """React to file change — analyze only the changed file."""
+        payload = event.payload
         if payload.get("extension") != ".py":
-            self._fs_events_ignored += 1
             return
         if payload.get("is_test_file", False):
-            self._fs_events_ignored += 1
             return
         if event.topic == "fs.changed.deleted":
-            rel = payload.get("relative_path", "")
-            if rel:
-                self._seen_file_paths.discard(rel)
-                self._cooldown_map.pop(rel, None)
-                self._event_debounce.pop(rel, None)
-            self._fs_events_ignored += 1
+            self._seen_file_paths.discard(payload.get("relative_path", ""))
+            self._cooldown_map.pop(payload.get("relative_path", ""), None)
             return
-
-        path_raw = payload.get("path")
-        if not path_raw:
-            self._fs_events_ignored += 1
-            return
-        file_path = Path(path_raw)
-
-        # Storm-guard: if we're in an active cooldown window, drop now.
-        now = time.monotonic()
-        if now < self._storm_active_until:
-            self._fs_events_storm_dropped += 1
-            return
-
-        if any(skip in file_path.parts for skip in _OPP_SKIP_DIRS):
-            self._fs_events_ignored += 1
-            return
-
-        # Burst-rate accounting (post skip-dir so bulk venv thrashing
-        # cannot trip the circuit breaker on already-filtered paths).
-        if now - self._storm_window_start >= 1.0:
-            self._storm_window_start = now
-            self._storm_window_count = 1
-        else:
-            self._storm_window_count += 1
-            if self._storm_window_count > _OPP_MINER_STORM_THRESHOLD:
-                self._storm_active_until = now + _OPP_MINER_STORM_COOLDOWN_S
-                self._fs_events_storm_dropped += 1
-                logger.warning(
-                    "[OpportunityMiner] FS-event storm detected "
-                    "(>%d events/s) — dropping events for %ds",
-                    _OPP_MINER_STORM_THRESHOLD,
-                    int(_OPP_MINER_STORM_COOLDOWN_S),
-                )
-                return
-
-        # Per-file debounce — burst-save sprays.
-        rel_for_debounce = payload.get("relative_path") or str(file_path)
-        last_seen = self._event_debounce.get(rel_for_debounce)
-        if last_seen is not None and (now - last_seen) < _OPP_MINER_DEBOUNCE_S:
-            self._fs_events_debounced += 1
-            return
-        self._event_debounce[rel_for_debounce] = now
-
-        self._fs_events_handled += 1
         try:
-            await self.scan_file(file_path)
+            await self.scan_file(Path(payload["path"]))
         except Exception:
-            logger.debug(
-                "[OpportunityMiner] Event-driven scan error",
-                exc_info=True,
-            )
+            logger.debug("OpportunityMinerSensor: event-driven scan error", exc_info=True)
 
     async def scan_file(self, py_file: Path) -> Optional[StaticCandidate]:
         """Analyze a single file for all dimensions (event-driven path)."""
@@ -1531,12 +918,7 @@ class OpportunityMinerSensor:
                 await self.scan_once()
             except Exception:
                 logger.exception("OpportunityMinerSensor: poll error")
-            effective_interval = (
-                _OPP_MINER_FALLBACK_INTERVAL_S
-                if self._fs_events_mode
-                else self._poll_interval_s
-            )
             try:
-                await asyncio.sleep(effective_interval)
+                await asyncio.sleep(self._poll_interval_s)
             except asyncio.CancelledError:
                 break

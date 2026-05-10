@@ -4344,10 +4344,18 @@ class BattleTestHarness:
             )
         except (TypeError, ValueError):
             grace_s = 30.0
-        # Anchor on monotonic clock — same discipline as the asyncio
-        # path; immune to NTP adjustments mid-soak.
+        # Layer 7 fix (v2.92, 2026-05-10) — dual-clock authority.
+        # Both monotonic AND wall-clock anchored; the deadline check
+        # below fires on whichever ticks fastest (preserves NTP-
+        # rollback safety AND catches host sleep/suspend gaps that
+        # pause monotonic on macOS). See _monitor_wall_clock for
+        # the full rationale (soak bt-2026-05-10-093428 ran 11h
+        # instead of 40min because monotonic paused during laptop
+        # sleep).
         anchor_monotonic = time.monotonic()
+        anchor_wall = time.time()
         deadline_monotonic = anchor_monotonic + cap_s + grace_s
+        deadline_wall = anchor_wall + cap_s + grace_s
         loop = asyncio.get_event_loop()
         stop_event = threading.Event()
         self._wall_clock_hard_deadline_stop = stop_event
@@ -4396,9 +4404,21 @@ class BattleTestHarness:
                 pass
             try:
                 # ── Layer 2: fire the asyncio event at cap + grace ──
+                # Layer 7 (v2.92) — dual-clock authority. remaining is
+                # the MIN of monotonic-remaining and wall-remaining, so
+                # whichever clock advances faster wins. Sleep/suspend
+                # on macOS pauses monotonic; wall keeps ticking →
+                # deadline_wall hits first, thread fires correctly.
                 while not stop_event.is_set():
-                    now = time.monotonic()
-                    remaining = deadline_monotonic - now
+                    now_monotonic = time.monotonic()
+                    now_wall = time.time()
+                    remaining_monotonic = deadline_monotonic - now_monotonic
+                    remaining_wall = deadline_wall - now_wall
+                    # Effective remaining = whichever is closer to zero
+                    # (the "first to expire" clock). NEVER negative for
+                    # the wait timeout below; the deadline check sees
+                    # the raw value to decide firing.
+                    remaining = min(remaining_monotonic, remaining_wall)
                     if remaining <= 0:
                         try:
                             loop.call_soon_threadsafe(
@@ -4409,19 +4429,28 @@ class BattleTestHarness:
                         if self._stop_reason in ("unknown", "", None):
                             self._stop_reason = "wall_clock_cap"
                         try:
+                            # Diagnostic: log which clock won the race
+                            # (operator-visible signal for sleep/NTP
+                            # forensics).
+                            _which = (
+                                "wall" if remaining_wall <= remaining_monotonic
+                                else "monotonic"
+                            )
                             _wd_log.warning(
                                 "[WallClockWatchdog] HARD DEADLINE "
-                                "thread fired (Layer 2): monotonic "
-                                "elapsed %.0fs >= cap %.0fs + grace "
-                                "%.0fs (asyncio path was wedged or "
-                                "already fired).",
-                                time.monotonic() - anchor_monotonic,
-                                cap_s, grace_s,
+                                "thread fired (Layer 2): "
+                                "monotonic_elapsed=%.0fs "
+                                "wall_elapsed=%.0fs cap=%.0fs grace=%.0fs "
+                                "won_clock=%s (asyncio path was wedged "
+                                "or already fired).",
+                                now_monotonic - anchor_monotonic,
+                                max(0.0, now_wall - anchor_wall),
+                                cap_s, grace_s, _which,
                             )
                         except Exception:  # noqa: BLE001
                             pass
                         break
-                    stop_event.wait(timeout=min(5.0, remaining))
+                    stop_event.wait(timeout=min(5.0, max(0.1, remaining)))
                 # ── Layer 3: SIGTERM self if event-set didn't work ──
                 # Reach here either via Layer 2 fire OR
                 # stop_event.set() from clean shutdown path. If clean
@@ -4558,10 +4587,25 @@ class BattleTestHarness:
         ``wall_clock_cap`` is treated equivalent to ``idle_timeout`` for
         clean-bar purposes — both are orderly graceful-shutdown paths.
         """
-        # Capture monotonic anchor at task entry — immune to NTP
-        # adjustments during the soak (wall-clock time.time() can jump
-        # backwards or forwards; monotonic cannot).
+        # Capture BOTH monotonic AND wall-clock anchors at task entry.
+        # Layer 7 fix (v2.92, 2026-05-10) — monotonic-only enforcement
+        # silently failed under host sleep/suspend on macOS, where
+        # `time.monotonic()` (`mach_absolute_time()`) pauses while the
+        # CPU is halted. Observed in soak bt-2026-05-10-093428: laptop
+        # slept ~10.5h, monotonic advanced 1892s, cap (2400s) never
+        # fired, soak ran 11h instead of 40min. The watchdog's stated
+        # contract is "wall-clock cap" — monotonic violates that
+        # contract under sleep.
+        #
+        # Dual-clock authority: compose both clocks and take the max
+        # as effective elapsed. This preserves NTP-rollback safety
+        # (wall jumping backward falls back to monotonic via max())
+        # AND catches sleep/suspend gaps (wall keeps advancing
+        # against frozen monotonic). Forward NTP jumps fire the cap
+        # earlier than intended — acceptable for soak semantics where
+        # the operator wants "kill after N seconds of real time".
         anchor_monotonic = time.monotonic()
+        anchor_wall = time.time()
         # Env-tunable check interval (no hardcoding; floor 1s to avoid
         # busy-loop; ceiling 60s to cap fire delay under sane configs).
         try:
@@ -4573,6 +4617,19 @@ class BattleTestHarness:
             )
         except (TypeError, ValueError):
             check_interval_s = 5.0
+        # Skew threshold — Layer 7 (v2.92). When wall_elapsed exceeds
+        # monotonic_elapsed by this much, log a warning (host sleep
+        # OR forward NTP jump). Debounced: only re-warn after another
+        # threshold-worth of additional skew.
+        try:
+            raw_skew = os.environ.get(
+                "JARVIS_WALL_CLOCK_SKEW_WARN_THRESHOLD_S", "",
+            ).strip()
+            skew_threshold_s = max(
+                5.0, min(3600.0, float(raw_skew) if raw_skew else 60.0),
+            )
+        except (TypeError, ValueError):
+            skew_threshold_s = 60.0
         # Diagnostic — confirm the task actually started running.
         # Without this, a silently-cancelled task is invisible
         # (the previous Defect #1 regression hid behind exactly
@@ -4580,8 +4637,9 @@ class BattleTestHarness:
         # even returns; the task itself never logged).
         logger.info(
             "[WallClockWatchdog] async monitor task alive: "
-            "cap=%.0fs check_interval=%.0fs",
-            cap_s, check_interval_s,
+            "cap=%.0fs check_interval=%.0fs "
+            "skew_warn_threshold=%.0fs (Layer 7 dual-clock authority)",
+            cap_s, check_interval_s, skew_threshold_s,
         )
         # Heartbeat every Nth iteration so an operator tailing the
         # log can confirm the task is still running. Default: every
@@ -4594,34 +4652,73 @@ class BattleTestHarness:
         except (TypeError, ValueError):
             hb_every = 12
         _tick = 0
+        _last_skew_warned_at: float = 0.0  # debounce skew warnings
         while True:
             try:
                 await asyncio.sleep(check_interval_s)
             except asyncio.CancelledError:
+                # Log both clocks for post-mortem diagnostic.
+                _mono_at_cancel = time.monotonic() - anchor_monotonic
+                _wall_at_cancel = max(
+                    0.0, time.time() - anchor_wall,
+                )
                 logger.info(
                     "[WallClockWatchdog] async monitor task cancelled "
-                    "after %.0fs (NEVER fired)",
-                    time.monotonic() - anchor_monotonic,
+                    "after %.0fs monotonic / %.0fs wall (NEVER fired)",
+                    _mono_at_cancel, _wall_at_cancel,
                 )
                 return
             _tick += 1
-            elapsed = time.monotonic() - anchor_monotonic
+            elapsed_monotonic = time.monotonic() - anchor_monotonic
+            elapsed_wall = max(0.0, time.time() - anchor_wall)
+            # Layer 7 dual-clock cap check — fire on whichever ticks
+            # fastest. NTP-rollback safe (wall < monotonic → max
+            # picks monotonic). Sleep/suspend safe (monotonic paused
+            # → max picks wall). Forward NTP jump fires early
+            # (acceptable for soak semantics).
+            effective_elapsed = max(elapsed_monotonic, elapsed_wall)
+            # Diagnostic: log skew if divergence exceeds threshold
+            # (debounced — re-warn only after another threshold-worth
+            # of additional drift, so a sustained sleep gap doesn't
+            # spam the log every tick).
+            skew = elapsed_wall - elapsed_monotonic
+            if (
+                skew >= skew_threshold_s
+                and skew - _last_skew_warned_at >= skew_threshold_s
+            ):
+                logger.warning(
+                    "[WallClockWatchdog] clock skew detected: "
+                    "monotonic=%.0fs wall=%.0fs skew=%.0fs "
+                    "(host sleep/suspend OR forward NTP jump). "
+                    "Treating wall-clock as cap-authoritative.",
+                    elapsed_monotonic, elapsed_wall, skew,
+                )
+                _last_skew_warned_at = skew
             if hb_every > 0 and _tick % hb_every == 0:
                 logger.debug(
-                    "[WallClockWatchdog] heartbeat: tick=%d elapsed=%.0fs "
+                    "[WallClockWatchdog] heartbeat: tick=%d "
+                    "monotonic=%.0fs wall=%.0fs effective=%.0fs "
                     "remaining=%.0fs",
-                    _tick, elapsed, max(0.0, cap_s - elapsed),
+                    _tick, elapsed_monotonic, elapsed_wall,
+                    effective_elapsed,
+                    max(0.0, cap_s - effective_elapsed),
                 )
-            if elapsed >= cap_s:
+            if effective_elapsed >= cap_s:
                 break
             # Loop continues; next sleep will wake at +check_interval_s.
         # If another waiter already fired and the shutdown path is in progress,
         # this is a no-op — set() on an already-set event is idempotent, and
         # the FIRST_COMPLETED race has already picked its winner.
         logger.warning(
-            "[WallClockWatchdog] fired: wall time %.0fs exceeded max_wall_seconds=%.0fs — "
-            "triggering graceful shutdown with stop_reason=wall_clock_cap.",
-            time.time() - self._started_at,
+            "[WallClockWatchdog] fired: monotonic=%.0fs wall=%.0fs "
+            "effective=%.0fs >= max_wall_seconds=%.0fs — triggering "
+            "graceful shutdown with stop_reason=wall_clock_cap.",
+            time.monotonic() - anchor_monotonic,
+            max(0.0, time.time() - anchor_wall),
+            max(
+                time.monotonic() - anchor_monotonic,
+                max(0.0, time.time() - anchor_wall),
+            ),
             cap_s,
         )
         # Stamp stop_reason FIRST so the termination-hook adapter
@@ -5222,6 +5319,11 @@ def register_shipped_invariants() -> list:
     REQUIRED_LITERALS = (
         "JARVIS_WALL_CLOCK_CHECK_INTERVAL_S",
         "JARVIS_WALL_CLOCK_HARD_DEADLINE_GRACE_S",
+        # Layer 7 fix (v2.92, 2026-05-10) — dual-clock skew threshold
+        # env knob. Required-literal pin guarantees the skew-warning
+        # path (asyncio monitor) doesn't silently regress to
+        # monotonic-only enforcement.
+        "JARVIS_WALL_CLOCK_SKEW_WARN_THRESHOLD_S",
         "WallClockHardDeadlineThread",
         # Defect #2 fix (2026-05-03) — boot wire-up for the Production
         # Oracle observer's run_periodic loop. Without these markers,
@@ -5267,6 +5369,8 @@ def register_shipped_invariants() -> list:
         # ``await asyncio.sleep(cap_s)`` single-call.
         if wall_clock_node is not None:
             saw_while_true = False
+            saw_monotonic = False
+            saw_wall = False
             for sub in _ast.walk(wall_clock_node):
                 if isinstance(sub, _ast.While):
                     if (
@@ -5274,13 +5378,46 @@ def register_shipped_invariants() -> list:
                         and sub.test.value is True
                     ):
                         saw_while_true = True
-                        break
+                elif isinstance(sub, _ast.Attribute):
+                    # Detect time.monotonic() AND time.time() calls.
+                    if (
+                        isinstance(sub.value, _ast.Name)
+                        and sub.value.id == "time"
+                    ):
+                        if sub.attr == "monotonic":
+                            saw_monotonic = True
+                        elif sub.attr == "time":
+                            saw_wall = True
             if not saw_while_true:
                 violations.append(
                     "_monitor_wall_clock MUST contain a 'while True' "
                     "periodic-check loop (the Defect #1 fix); single-"
                     "sleep regressions caused 22-min fire delay in "
                     "soak v5"
+                )
+            # Layer 7 pin (v2.92, 2026-05-10) — dual-clock authority:
+            # _monitor_wall_clock body MUST reference BOTH
+            # `time.monotonic()` AND `time.time()`. Monotonic alone
+            # pauses during host sleep on macOS (mach_absolute_time
+            # halts when CPU is halted) → soak bt-2026-05-10-093428
+            # ran 11h instead of 40min. Composing wall-clock as a
+            # second authority catches sleep/suspend gaps and forward
+            # NTP jumps while preserving NTP-rollback safety via
+            # max() (wall < monotonic falls back to monotonic).
+            if not saw_monotonic:
+                violations.append(
+                    "_monitor_wall_clock MUST call time.monotonic() "
+                    "(Layer 7 dual-clock authority); needed for NTP-"
+                    "rollback safety as the lower bound of effective "
+                    "elapsed"
+                )
+            if not saw_wall:
+                violations.append(
+                    "_monitor_wall_clock MUST call time.time() "
+                    "(Layer 7 dual-clock authority, v2.92); needed "
+                    "to catch host sleep/suspend gaps that pause "
+                    "monotonic on macOS — without it, the cap "
+                    "silently fails to fire after a sleep event"
                 )
         return tuple(violations)
 
