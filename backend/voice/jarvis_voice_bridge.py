@@ -94,12 +94,42 @@ class JarvisVoiceBridge:
 
         Registered via RealTimeVoiceCommunicator.register_transcript_hook().
         Returns the response text or None if not handled.
+
+        §37 Tier 2 — Karen voice-command pre-router fires FIRST
+        when the master flag JARVIS_KAREN_VOICE_COMMAND_ENABLED
+        is on. Matched phrases ("karen mute" / "karen verbose"
+        / etc.) route through voice_repl.dispatch_voice_command
+        and skip the conversation manager. NEVER raises — when
+        master off OR phrase doesn't match, falls through to the
+        canonical handle_utterance path verbatim.
         """
         if not _ENABLED or not self._conversation_mgr:
             return None
 
         if not text or not text.strip():
             return None
+
+        # Pre-router: closed-vocabulary Karen voice command path.
+        # Master-flag-off short-circuits structurally (returns
+        # handled=False) so the existing path runs unchanged.
+        try:
+            from backend.core.ouroboros.governance.karen_voice_command_router import (  # noqa: E501
+                dispatch_karen_voice_command,
+            )
+            karen_result = dispatch_karen_voice_command(text)
+            if karen_result.handled:
+                logger.info(
+                    "[VoiceBridge] karen voice command "
+                    "matched_verb=%s repl_verb=%s",
+                    karen_result.matched_verb,
+                    karen_result.repl_verb,
+                )
+                return karen_result.text
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[VoiceBridge] karen voice command pre-router "
+                "raised: %s — falling through", exc,
+            )
 
         try:
             response = await self._conversation_mgr.handle_utterance(
