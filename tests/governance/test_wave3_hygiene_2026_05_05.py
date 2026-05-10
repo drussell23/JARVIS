@@ -603,3 +603,191 @@ def test_general_llm_driver_factory_present():
         "fallback path must remain — flag-gate retains the stub "
         "for opt-out"
     )
+
+
+# ---------------------------------------------------------------------------
+# Item 7 — §35 #6 / §3.6.3 #5 mask-discipline consumer-chain pin
+# (Vector #9 broader closure, 2026-05-09)
+# ---------------------------------------------------------------------------
+#
+# Wave 3 v2.25 closed the substrate: FlagChangeEvent.to_dict() masks
+# credential-shaped values. But the dataclass STILL holds raw secrets
+# in `prev_value` / `next_value` — a future consumer reading those
+# fields directly bypasses the Wave 3 mask and leaks the raw value.
+#
+# The §35 #6 / §3.6.3 #5 closure: AST regression sweep that walks
+# backend/, detects every `.prev_value` / `.next_value` attribute
+# access + every `getattr(*, "prev_value"|"next_value")` call, and
+# asserts the receiver file is on a canonical bytes-pinned allowlist.
+#
+# This pin enforces the substrate→consumer chain at lint-time: any
+# new consumer must either compose `to_dict()` (Wave 3 mask) OR be
+# explicitly added to the allowlist with reviewer attention.
+#
+# IMPORTANT: scoped to backend/ only. Test files inherently access
+# these fields to validate substrate behavior — that's expected and
+# allowed.
+
+
+# Bytes-pinned canonical allowlist of files that may legitimately
+# read FlagChangeEvent.prev_value / .next_value as raw values:
+#
+#   * flag_change_emitter.py — substrate that owns FlagChangeEvent
+#     and the masking. All raw access here is internal (property
+#     methods, comparison helpers, to_dict masking branch).
+#   * sse_bridge.py — uses ``getattr(event, "prev_value", None)``
+#     and ``getattr(event, "next_value", None)`` to extract values
+#     and IMMEDIATELY pipes them through ``_mask_flag_value`` before
+#     SSE publish. The values never reach a consumer in raw form.
+#
+# Drift requires reviewer attention + explicit allowlist update.
+_FLAG_VALUE_ACCESS_ALLOWLIST = frozenset({
+    "core/ouroboros/governance/observability/flag_change_emitter.py",
+    "core/ouroboros/governance/observability/sse_bridge.py",
+})
+
+
+def _walk_flag_value_access_sites(
+    backend_root: Path,
+) -> list:
+    """Find every `.prev_value` / `.next_value` Attribute access
+    + every `getattr(*, "prev_value"|"next_value")` Call across
+    backend/. Returns list of (rel_path, kind, lineno) tuples.
+
+    Skipped: __pycache__, venv/, third-party.
+    """
+    violations = []
+    for py in backend_root.rglob("*.py"):
+        try:
+            rel = py.relative_to(backend_root).as_posix()
+        except ValueError:
+            continue
+        if (
+            "__pycache__" in rel
+            or rel.startswith("venv/")
+            or rel.startswith("env/")
+        ):
+            continue
+        try:
+            src = py.read_text(encoding="utf-8")
+            tree = _ast.parse(src)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for node in _ast.walk(tree):
+            # Direct attribute access: e.prev_value / e.next_value
+            if (
+                isinstance(node, _ast.Attribute)
+                and node.attr in ("prev_value", "next_value")
+            ):
+                violations.append(
+                    (rel, "Attribute", node.lineno),
+                )
+            # getattr(event, "prev_value", ...) string-attr access
+            if (
+                isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], _ast.Constant)
+                and node.args[1].value
+                in ("prev_value", "next_value")
+            ):
+                violations.append(
+                    (rel, "getattr", node.lineno),
+                )
+    return violations
+
+
+def test_mask_discipline_consumer_chain_pinned():
+    """§35 #6 / §3.6.3 #5: regression sweep against future
+    consumers that bypass FlagChangeEvent.to_dict() and read
+    raw .prev_value / .next_value fields directly.
+
+    Wave 3 v2.25 closed the SUBSTRATE (to_dict masks sensitive
+    flag names). This pin closes the LATENT vector: any future
+    consumer doing ``e.prev_value`` on a credential-shaped flag
+    would leak the raw secret because the dataclass fields hold
+    raw values; only the to_dict() projection masks.
+    """
+    backend = _repo_root() / "backend"
+    sites = _walk_flag_value_access_sites(backend)
+    out_of_allowlist = [
+        s for s in sites if s[0] not in _FLAG_VALUE_ACCESS_ALLOWLIST
+    ]
+    assert not out_of_allowlist, (
+        "Vector #9 mask-discipline violation: file(s) read raw "
+        "FlagChangeEvent.prev_value/next_value outside the "
+        "canonical allowlist. Either compose `event.to_dict()` "
+        "(which masks credential-shaped flags) OR add the file "
+        "to _FLAG_VALUE_ACCESS_ALLOWLIST with explicit reviewer "
+        f"attention. Violations: {out_of_allowlist}"
+    )
+
+
+def test_allowlist_files_actually_use_the_fields():
+    """Companion regression: prove the allowlist is not stale —
+    each entry must still actually read the fields. If a file
+    no longer accesses the fields, it should be removed from
+    the allowlist (lest a future malicious-leak path reuse the
+    file's allowed status)."""
+    backend = _repo_root() / "backend"
+    sites = _walk_flag_value_access_sites(backend)
+    sites_by_file = {s[0] for s in sites}
+    stale = _FLAG_VALUE_ACCESS_ALLOWLIST - sites_by_file
+    assert not stale, (
+        f"Allowlist contains stale entries (no longer accessing "
+        f"the fields): {stale}. Remove from "
+        "_FLAG_VALUE_ACCESS_ALLOWLIST."
+    )
+
+
+def test_allowlist_size_pinned():
+    """Bytes-pin: the allowlist size is exactly 2 today. Adding
+    a NEW consumer requires both (a) updating the allowlist AND
+    (b) updating this size assertion — forces reviewer attention
+    on the safety policy."""
+    assert len(_FLAG_VALUE_ACCESS_ALLOWLIST) == 2, (
+        "Allowlist size drifted from canonical 2-entry value. "
+        "Adding a new consumer is permitted but requires explicit "
+        "reviewer attention on the masking policy. Update both "
+        "_FLAG_VALUE_ACCESS_ALLOWLIST and this size assertion."
+    )
+
+
+def test_substrate_uses_mask_helper():
+    """Defense-in-depth: the substrate file (flag_change_emitter)
+    MUST use ``_mask_value()`` in its ``to_dict()`` projection.
+    Bytes-pin against accidental removal of the masking branch."""
+    target = (
+        _repo_root()
+        / "backend/core/ouroboros/governance/"
+        "observability/flag_change_emitter.py"
+    )
+    source = target.read_text(encoding="utf-8")
+    # The masking helper exists.
+    assert "def _mask_value(" in source
+    # The sensitive-name detector exists.
+    assert "def _is_sensitive_flag(" in source
+    # to_dict invokes the mask path.
+    assert "_mask_value(self.prev_value)" in source
+    assert "_mask_value(self.next_value)" in source
+    # The "value_masked" boolean field is exposed so consumers
+    # can audit the decision.
+    assert '"value_masked"' in source
+
+
+def test_sse_bridge_pipes_through_mask_helper():
+    """Defense-in-depth: sse_bridge.publish_flag_change_event
+    MUST pipe ``getattr(event, "prev_value")`` through its
+    own ``_mask_flag_value`` helper before SSE publish (the
+    canonical consumer-side double-mask)."""
+    target = (
+        _repo_root()
+        / "backend/core/ouroboros/governance/"
+        "observability/sse_bridge.py"
+    )
+    source = target.read_text(encoding="utf-8")
+    assert "_mask_flag_value" in source
+    # Bridge wrapper composes both: getattr extraction + mask.
+    assert 'getattr(event, "prev_value"' in source
+    assert 'getattr(event, "next_value"' in source

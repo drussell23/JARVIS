@@ -591,9 +591,15 @@ class Phase8ObservabilityRouter:
         masked = {
             k: ("<set>" if v else "<empty>") for k, v in snap.items()
         }
-        # Mask delta values too — raw FlagChangeEvent.to_dict()
-        # echoes prev_value/next_value verbatim. Replace those with
-        # presence markers so secrets stored in JARVIS_* never leak.
+        # Mask delta values too. Wave 3 v2.25 made
+        # FlagChangeEvent.to_dict() mask credential-shaped flag
+        # names via sha256[:8]+length-token (PRD §3.6.2 vector #9
+        # substrate fix). This route applies stricter aggressive
+        # presence-only masking ("<set>"/"<empty>") on top, so
+        # secrets stored in non-sensitive-named JARVIS_* (e.g.,
+        # accidentally named env vars) ALSO never leak — defense
+        # in depth, distinct from the substrate's name-pattern
+        # mask.
         masked_deltas: List[Dict[str, Any]] = []
         for d in deltas:
             d_dict = d.to_dict()
