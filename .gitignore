@@ -233,6 +233,13 @@ core.*
 !tests/unit/backend/core/
 !tests/unit/backend/core/**
 !tests/unit/backend/core/**/*
+# Re-exclude pyc/pycache in test directories (negations above would un-ignore them)
+tests/core/**/__pycache__/
+tests/core/**/*.pyc
+tests/unit/core/**/__pycache__/
+tests/unit/core/**/*.pyc
+tests/unit/backend/core/**/__pycache__/
+tests/unit/backend/core/**/*.pyc
 # But still ignore build artifacts and cache in backend/core/
 backend/core/__pycache__/
 backend/core/**/__pycache__/
@@ -251,139 +258,3 @@ backend/voice_unlock/core/__pycache__/
 # Benchmark results
 benchmark_results/
 *.bench
-
-# Duplicate files prevention (macOS/editor duplicates)
-* 2.*
-* 3.*
-* 4.*
-* 5.*
-* 2
-* 3
-* 4
-* 5
-*\ 2.*
-*\ 3.*
-*\ 4.*
-*\ 5.*
-*\ 2
-*\ 3
-*\ 4
-*\ 5
-* copy.*
-* copy
-*-copy.*
-*-copy
-*(2).*
-*(3).*
-*(4).*
-*(5).*
-*(2)
-*(3)
-*(4)
-*(5)
-*\(2\).*
-*\(3\).*
-*\(4\).*
-*\(5\).*
-*\(2\)
-*\(3\)
-*\(4\)
-*\(5\)
-
-# Voice Unlock sensitive files
-backend/voice_unlock/test_*.py
-backend/voice_unlock/debug_*.py
-backend/voice_unlock/*_test.py
-backend/voice_unlock/fix_*.py
-backend/voice_unlock/.jarvis/
-backend/voice_unlock/config.json
-backend/voice_unlock/objc/bin/
-backend/voice_unlock/objc/build/
-backend/voice_unlock/objc/*.o
-backend/voice_unlock/objc/*.dylib
-/tmp/websocket_*.log
-/tmp/daemon_*.log
-/tmp/*_debug.log
-
-# Proximity Voice Auth specific
-backend/voice_unlock/proximity_voice_auth/python/venv/
-backend/voice_unlock/proximity_voice_auth/bin/
-backend/voice_unlock/proximity_voice_auth/logs/*.log
-backend/voice_unlock/proximity_voice_auth/**/__pycache__/
-backend/voice_unlock/proximity_voice_auth/**/*.pyc
-
-# Keychain passwords - NEVER commit
-**/unlock_token
-**/com.jarvis.voiceunlock
-**/*password*.txt
-**/*credentials*.txt
-backend/.jarvis_cache/
-.env.gcp
-backend/backend/.env.gcp
-cloud_sql_proxy
-
-# Certificates and keys - NEVER commit
-*.cer
-*.p12
-*.pfx
-*.key
-*.pem
-
-# Cloud SQL and GCP secrets
-**/gcp_config.json
-**/database_config.json
-**/*-key.json
-**/service-account*.json
-~/.jarvis/cloud-sql-proxy.log
-nohup.out
-
-# GitHub Actions service account (sensitive)
-/tmp/github-actions-key*.json
-
-# Model checkpoints and training data
-model_checkpoints/
-*.ckpt
-*.pt
-*.checkpoint
-
-# SpeechBrain cache and models
-.cache/jarvis/speechbrain/
-~/.cache/jarvis/speechbrain/
-
-# Voice enrollment data
-backend/voice/voice_samples/
-backend/voice/voiceprints/
-ROTATION_INSTRUCTIONS.md
-
-# Postman - Keep collections but ignore reports and secrets
-postman/reports/
-postman/*.log
-postman/newman-run-*.json
-postman/.postman/
-postman/environments/*-secrets.json
-postman/environments/*-production.json
-postman/environments/*-staging.json
-# Keep local development environment in git
-!postman/environments/JARVIS_Environment.postman_environment.json
-
-# Newman reports and output
-newman/
-newman-*.html
-newman-*.json
-.terraform/
-terraform/.terraform/
-terraform/*.tfplan
-terraform/*.tfplan2
-terraform/terraform.tfvars
-
-# Claude Code working state
-.claude/worktrees/
-.worktrees/
-
-# VisionSensor + Visual VERIFY retention / ledgers
-# Retained frame files + cost/FP ledgers are per-session local state —
-# must never land in git (privacy: ambient screen content; correctness:
-# session-scoped).
-.jarvis/vision_frames/
-.jarvis/vision_cost_ledger.json
-.jarvis/vision_sensor_fp_ledger.json
