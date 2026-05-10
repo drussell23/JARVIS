@@ -404,6 +404,27 @@ class IDEObservabilityRouter:
             "/observability/render",
             self._handle_render_substrate,
         )
+        # Venom V2 Slice 4 (PRD v2.93, 2026-05-10) — IDE projection of
+        # the permission_decision_archive ring. Read-only over the
+        # canonical archive (v2.89 substrate) + composes the existing
+        # AggregatePermissionDecision.to_dict() projection. Three
+        # sub-routes: recent / by-tool / by-op. Route-order discipline:
+        # the literal-prefix routes (``/by-tool/{name}``) MUST register
+        # BEFORE the generic ``/{op_id}`` route — aiohttp matches in
+        # order and a generic op_id pattern would otherwise capture
+        # ``by-tool`` as an op_id.
+        app.router.add_get(
+            "/observability/tool-permissions",
+            self._handle_tool_permissions_recent,
+        )
+        app.router.add_get(
+            "/observability/tool-permissions/by-tool/{tool_name}",
+            self._handle_tool_permissions_by_tool,
+        )
+        app.router.add_get(
+            "/observability/tool-permissions/{op_id}",
+            self._handle_tool_permissions_by_op,
+        )
 
     # --- request-path helpers ---------------------------------------------
 
@@ -511,7 +532,7 @@ class IDEObservabilityRouter:
                 "api_version": IDE_OBSERVABILITY_SCHEMA_VERSION,
                 # Which data domains are live — documented surface
                 # contract IDE clients feature-detect against.
-                "surface": "tasks,plans,sessions",
+                "surface": "tasks,plans,sessions,tool-permissions",
                 "now_mono": time.monotonic(),
             },
         )
@@ -2929,6 +2950,248 @@ class IDEObservabilityRouter:
                 "observers": observers,
                 "arc_flags_total": arc_flag_count,
                 "arc_invariants_total": arc_invariant_count,
+            },
+        )
+
+    # ----------------------------------------------------------------------
+    # Venom V2 Slice 4 (PRD v2.93, 2026-05-10) — tool-permissions surface
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _permission_archive_master_enabled() -> bool:
+        """Authority-free gate — the tool-permissions surface
+        inherits the permission_decision_archive master switch.
+        When the switch is off we 403 so port scanners see no
+        signal about what's behind the route. Mirrors the
+        :meth:`_posture_master_enabled` pattern.
+
+        NEVER raises — falls through to False on any import or
+        runtime failure.
+        """
+        try:
+            from backend.core.ouroboros.governance.permission_decision_archive import (  # noqa: E501
+                permission_archive_enabled,
+            )
+        except ImportError:
+            return False
+        try:
+            return bool(permission_archive_enabled())
+        except Exception:  # noqa: BLE001 — defensive
+            return False
+
+    @staticmethod
+    def _parse_limit(
+        request: "web.Request",
+        *,
+        default: int,
+        ceiling: int,
+    ) -> int:
+        """Parse ?limit=N query param with bounds clamping.
+        Falls through to ``default`` on parse failure / missing.
+        NEVER raises."""
+        try:
+            raw = request.query.get("limit", "")
+            if not raw:
+                return default
+            n = int(raw)
+            if n < 1:
+                return 1
+            if n > ceiling:
+                return ceiling
+            return n
+        except (TypeError, ValueError):
+            return default
+
+    async def _handle_tool_permissions_recent(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/tool-permissions[?limit=N]`` —
+        bounded read-only projection of the most-recent N
+        permission decisions across all tools and ops.
+
+        Composes the canonical
+        :class:`BoundedDecisionArchive` ring (v2.89 substrate)
+        + the canonical ``DecisionRecord.to_dict()`` projection.
+        Read-only — never mutates the archive.
+
+        Query params:
+
+        * ``limit`` — integer in [1, 200], default 20.
+
+        Shape::
+
+            {
+              "schema_version": "1.0",
+              "count": 17,
+              "snapshot": {
+                "capacity": 50,
+                "size": 17,
+                "next_seq": 18,
+                "utilization": 0.34,
+                "schema_version": "permission_decision_archive.v1"
+              },
+              "records": [
+                {
+                  "ref": "p-17",
+                  "op_id": "op-019e1148-3081",
+                  "tool_name": "read_file",
+                  "decision_value": "allow",
+                  "decision": { ... canonical AggregatePermissionDecision ... },
+                  "inserted_at": 12345.678,
+                  "schema_version": "permission_decision_archive.v1"
+                },
+                ...
+              ]
+            }
+
+        Returns 403 when ``JARVIS_IDE_OBSERVABILITY_ENABLED=false``
+        (port-scanner discipline — consistent with sibling routes).
+        Returns 403 when ``JARVIS_PERMISSION_ARCHIVE_ENABLED=false``
+        (the archive's own master flag — operators see no signal
+        about what's behind the surface). Returns 429 on rate-limit.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._permission_archive_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.tool_permissions_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        limit = self._parse_limit(request, default=20, ceiling=200)
+        try:
+            from backend.core.ouroboros.governance.permission_decision_archive import (  # noqa: E501
+                get_default_archive,
+            )
+            archive = get_default_archive()
+            records = archive.recent(limit=limit)
+            snap = archive.snapshot()
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.tool_permissions_unavailable",
+            )
+        return self._json_response(
+            request, 200,
+            {
+                "count": len(records),
+                "snapshot": snap.to_dict(),
+                "records": [r.to_dict() for r in records],
+            },
+        )
+
+    async def _handle_tool_permissions_by_tool(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/tool-permissions/by-tool/{tool_name}
+        [?limit=N]`` — filter the archive ring to one tool name
+        (case-sensitive exact match), newest-first.
+
+        Composes :meth:`BoundedDecisionArchive.by_tool`. Read-only.
+
+        Returns 400 when ``tool_name`` is missing or empty. 403/429
+        same as the parent route.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._permission_archive_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.tool_permissions_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        tool_name = (
+            request.match_info.get("tool_name", "") or ""
+        ).strip()
+        if not tool_name:
+            return self._error_response(
+                request, 400,
+                "ide_observability.tool_permissions_missing_tool_name",
+            )
+        limit = self._parse_limit(request, default=20, ceiling=200)
+        try:
+            from backend.core.ouroboros.governance.permission_decision_archive import (  # noqa: E501
+                get_default_archive,
+            )
+            records = get_default_archive().by_tool(
+                tool_name, limit=limit,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.tool_permissions_unavailable",
+            )
+        return self._json_response(
+            request, 200,
+            {
+                "tool_name": tool_name,
+                "count": len(records),
+                "records": [r.to_dict() for r in records],
+            },
+        )
+
+    async def _handle_tool_permissions_by_op(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/tool-permissions/{op_id}[?limit=N]``
+        — filter the archive ring to one op (case-sensitive exact
+        match), newest-first.
+
+        Composes :meth:`BoundedDecisionArchive.by_op`. Read-only.
+
+        Returns 400 when ``op_id`` is missing or empty. 403/429
+        same as the parent route.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._permission_archive_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.tool_permissions_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        op_id = (
+            request.match_info.get("op_id", "") or ""
+        ).strip()
+        if not op_id:
+            return self._error_response(
+                request, 400,
+                "ide_observability.tool_permissions_missing_op_id",
+            )
+        limit = self._parse_limit(request, default=100, ceiling=200)
+        try:
+            from backend.core.ouroboros.governance.permission_decision_archive import (  # noqa: E501
+                get_default_archive,
+            )
+            records = get_default_archive().by_op(
+                op_id, limit=limit,
+            )
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.tool_permissions_unavailable",
+            )
+        return self._json_response(
+            request, 200,
+            {
+                "op_id": op_id,
+                "count": len(records),
+                "records": [r.to_dict() for r in records],
             },
         )
 
