@@ -207,11 +207,24 @@ class MetricsHistoryLedger:
                 snapshot.session_id, MAX_LINE_BYTES, len(encoded),
             )
             return False
+        # Wave 3 v2.26 canonical cross-process append. Within-
+        # process ``self._lock`` retained as a complementary fence
+        # for intra-process emission; flock covers multi-process
+        # session overlap. NEVER raises.
         try:
             with self._lock:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                with self._path.open("a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
+                try:
+                    from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                        flock_append_line,
+                    )
+                    ok = flock_append_line(self._path, line)
+                    if not ok:
+                        return False
+                except ImportError:
+                    # Substrate-unavailable rollback.
+                    with self._path.open("a", encoding="utf-8") as fh:
+                        fh.write(line + "\n")
             return True
         except OSError as exc:
             if not self._io_warned:

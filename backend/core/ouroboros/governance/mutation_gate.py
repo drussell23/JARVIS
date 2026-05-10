@@ -498,11 +498,27 @@ def append_ledger(
         "reason": verdict.reason,
         "applied_tier_change": applied_tier_change or "",
     }
+    # Wave 3 v2.26 canonical cross-process append. Module-level
+    # ``_ledger_lock`` retained as a complementary fence — covers
+    # intra-process concurrent verdict emission; flock covers
+    # multi-process battle-test overlap. NEVER raises.
+    try:
+        line = json.dumps(entry, sort_keys=True)
+    except (TypeError, ValueError):
+        logger.debug("[MutationGate] ledger serialize failed", exc_info=True)
+        return
     try:
         with _ledger_lock:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, sort_keys=True) + "\n")
+            try:
+                from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                    flock_append_line,
+                )
+                flock_append_line(path, line)
+            except ImportError:
+                # Substrate-unavailable rollback.
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
             _ledger_rotate_if_needed(path, ledger_max_lines())
     except Exception:  # noqa: BLE001
         logger.debug("[MutationGate] ledger append failed", exc_info=True)

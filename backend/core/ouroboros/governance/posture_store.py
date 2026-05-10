@@ -371,12 +371,31 @@ class PostureStore:
     # ---- override audit ---------------------------------------------------
 
     def append_audit(self, record: OverrideRecord) -> None:
-        """Append-only audit log. Never truncated — §8 immutable audit."""
-        line = json.dumps(record.to_dict(), separators=(",", ":"))
+        """Append-only audit log. Never truncated — §8 immutable audit.
+
+        Wave 3 v2.26 canonical cross-process append (sibling .lock
+        file via fcntl.flock). Within-process ``self._lock`` retained
+        as a complementary fence — ``threading.Lock`` covers
+        intra-process concurrent override emission; flock covers
+        multi-process battle-test overlap. NEVER raises."""
+        try:
+            line = json.dumps(record.to_dict(), separators=(",", ":"))
+        except (TypeError, ValueError):
+            return
         with self._lock:
             self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.audit_path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+            try:
+                from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                    flock_append_line,
+                )
+            except ImportError:
+                # Substrate-unavailable rollback — preserve legacy
+                # within-process behavior; cross-process race
+                # remains but never raises into caller.
+                with self.audit_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                return
+            flock_append_line(self.audit_path, line)
 
     def load_audit(self, limit: Optional[int] = None) -> List[OverrideRecord]:
         """Read the audit log. Newest last."""

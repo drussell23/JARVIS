@@ -59,7 +59,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -568,9 +568,42 @@ class GraduationLedger:
             line = json.dumps(record.to_dict(), separators=(",", ":"))
         except (TypeError, ValueError) as exc:
             return (False, f"serialize_failed:{exc}")
+        # Wave 3 v2.26 canonical cross-process append (sibling .lock
+        # file via fcntl.flock). Replaces the pre-Wave-3 legacy
+        # `flock_exclusive(fileno)` pattern — same TOCTOU safety,
+        # routed through the single canonical substrate per
+        # adaptation/ledger.py:752 contract.
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_append_line,
+            )
+        except ImportError:
+            return self._append_legacy_fileno_flock(
+                line, flag_clean, sid, outcome, recorded_by_clean,
+            )
+        ok = flock_append_line(self.path, line)
+        if not ok:
+            return (False, "flock_append_failed")
+        logger.info(
+            "[GraduationLedger] flag=%s session=%s outcome=%s by=%s",
+            flag_clean, sid, outcome.value, recorded_by_clean,
+        )
+        return (True, "ok")
+
+    def _append_legacy_fileno_flock(
+        self,
+        line: str,
+        flag_clean: str,
+        sid: str,
+        outcome: Any,
+        recorded_by_clean: str,
+    ) -> Tuple[bool, str]:
+        """Pre-Wave-3 legacy fallback — kept as a NEVER-raises path
+        when the canonical ``cross_process_jsonl`` substrate is
+        unavailable. Mirrors adaptation/ledger.py's substrate-
+        unavailable contract."""
         try:
             with self.path.open("a", encoding="utf-8") as f:
-                # Reuse Phase 7.8's flock for cross-process safety.
                 from backend.core.ouroboros.governance.adaptation._file_lock import (  # noqa: E501
                     flock_exclusive,
                 )
@@ -585,7 +618,8 @@ class GraduationLedger:
         except OSError as exc:
             return (False, f"append_failed:{exc}")
         logger.info(
-            "[GraduationLedger] flag=%s session=%s outcome=%s by=%s",
+            "[GraduationLedger] flag=%s session=%s outcome=%s by=%s "
+            "(legacy fallback)",
             flag_clean, sid, outcome.value, recorded_by_clean,
         )
         return (True, "ok")

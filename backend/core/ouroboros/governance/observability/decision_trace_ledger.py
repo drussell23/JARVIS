@@ -289,6 +289,34 @@ class DecisionTraceLedger:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return (False, f"mkdir_failed:{exc}")
+        # Wave 3 v2.26 canonical cross-process append (sibling .lock
+        # file via fcntl.flock). Replaces the pre-Wave-3 legacy
+        # `flock_exclusive(fileno)` pattern — same TOCTOU safety,
+        # routed through the single canonical substrate per
+        # adaptation/ledger.py:752 ("if you find yourself reaching
+        # for [legacy], prefer landing the substrate first").
+        # Substrate-unavailable rollback path preserved below.
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_append_line,
+            )
+        except ImportError:
+            return self._append_legacy_fileno_flock(line, op, current_count)
+        ok = flock_append_line(self.path, line)
+        if not ok:
+            return (False, "flock_append_failed")
+        self._per_op_count[op] = current_count + 1
+        return (True, "ok")
+
+    def _append_legacy_fileno_flock(
+        self, line: str, op: str, current_count: int,
+    ) -> Tuple[bool, str]:
+        """Pre-Wave-3 legacy fallback — kept as a NEVER-raises path
+        when the canonical ``cross_process_jsonl`` substrate is
+        unavailable (e.g. partial-rollback branch). Locks the data
+        fd directly via the older ``_file_lock.flock_exclusive``
+        helper. NOT the canonical path; mirrors
+        adaptation/ledger.py's substrate-unavailable contract."""
         try:
             with self.path.open("a", encoding="utf-8") as f:
                 from backend.core.ouroboros.governance.adaptation._file_lock import (  # noqa: E501

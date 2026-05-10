@@ -687,10 +687,25 @@ class TestAuthorityInvariants:
             "__future__", "enum", "json", "logging", "os", "time",
             "dataclasses", "datetime", "pathlib", "typing",
         )
+        # Wave 3 v2.26: the canonical cross-process flock substrate
+        # `governance.cross_process_jsonl` is also allowed (sibling
+        # of `adaptation` in the substrate boundary). Migration from
+        # legacy `_file_lock.flock_exclusive` to canonical
+        # `flock_append_line` per adaptation/ledger.py:752 contract.
+        # graduation/ siblings (runner_kind / lineage_waiver) are
+        # also pre-existing graduation-substrate companions.
+        allowed_substrates = (
+            "adaptation",
+            "cross_process_jsonl",
+            "graduation.runner_kind",
+            "graduation.lineage_waiver",
+        )
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
                 if node.module.startswith("backend."):
-                    assert "adaptation" in node.module, node.module
+                    assert any(s in node.module for s in allowed_substrates), (
+                        node.module
+                    )
                 else:
                     assert any(
                         node.module.startswith(p) for p in stdlib_prefixes
@@ -720,6 +735,12 @@ class TestAuthorityInvariants:
                 assert token not in source, f"{path}: banned token {token}"
 
     def test_ledger_uses_flock(self):
-        # Cross-process safety: writes must use flock_exclusive.
+        # Cross-process safety: writes must compose a flock primitive.
+        # Wave 3 v2.26 migration: canonical `flock_append_line` is now
+        # the primary path; legacy `flock_exclusive(fileno)` is
+        # retained as the substrate-unavailable fallback. EITHER
+        # token present satisfies the cross-process invariant.
         source = _LEDGER_PATH.read_text()
-        assert "flock_exclusive" in source
+        assert (
+            "flock_append_line" in source or "flock_exclusive" in source
+        ), "graduation_ledger must compose a flock primitive"

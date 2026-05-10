@@ -208,7 +208,26 @@ class WAL:
     # ------------------------------------------------------------------
 
     def _write_line(self, record: Dict[str, Any]) -> None:
-        with self._path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        """Append one WAL line cross-process safe via the canonical
+        ``cross_process_jsonl.flock_append_line`` substrate
+        (Wave 3 v2.26). Multiple sensors may concurrently append to
+        the same WAL during a session — without flock, two processes
+        could interleave bytes mid-line. NEVER raises."""
+        try:
+            line = json.dumps(record, default=str)
+        except (TypeError, ValueError):
+            return
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_append_line,
+            )
+        except ImportError:
+            # Substrate-unavailable rollback — preserve legacy
+            # within-process behavior; cross-process race remains
+            # but never raises into caller.
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            return
+        flock_append_line(self._path, line)

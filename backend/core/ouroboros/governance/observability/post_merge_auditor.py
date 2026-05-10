@@ -638,10 +638,39 @@ class PostMergeAuditor:
     # ------------------------------------------------------------------
 
     def _persist_outcome(self, outcome: MergeOutcome) -> Tuple[bool, str]:
-        """Append one outcome to the JSONL ledger. NEVER raises."""
+        """Append one outcome to the JSONL ledger. NEVER raises.
+
+        Wave 3 v2.26 canonical cross-process append (sibling .lock
+        file via fcntl.flock). Replaces the pre-Wave-3 legacy
+        `flock_exclusive(fileno)` pattern — same TOCTOU safety,
+        routed through the single canonical substrate."""
         try:
             self._outcomes_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return (False, f"persist_failed:{exc}")
+        try:
             line = json.dumps(outcome.to_dict(), separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            return (False, f"serialize_failed:{exc}")
+        try:
+            from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: E501
+                flock_append_line,
+            )
+        except ImportError:
+            return self._persist_outcome_legacy_fallback(line)
+        ok = flock_append_line(self._outcomes_path, line)
+        if not ok:
+            return (False, "flock_append_failed")
+        return (True, "ok")
+
+    def _persist_outcome_legacy_fallback(
+        self, line: str,
+    ) -> Tuple[bool, str]:
+        """Pre-Wave-3 legacy path — kept as a NEVER-raises fallback
+        when the canonical ``cross_process_jsonl`` substrate is
+        unavailable. Mirrors adaptation/ledger.py's substrate-
+        unavailable contract."""
+        try:
             with self._outcomes_path.open("a", encoding="utf-8") as f:
                 try:
                     from backend.core.ouroboros.governance.adaptation._file_lock import (  # noqa: E501
