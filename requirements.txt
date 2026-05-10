@@ -155,6 +155,13 @@ hf-xet==1.2.0
 httpcore==1.0.9
 httptools==0.7.1
 httpx==0.28.1
+# httpx SOCKS support (`pip install httpx[socks]` extras) — required
+# when the harness runs under a parent process whose network tunnel
+# is socks5h:// (e.g., Claude Code agent sandboxing). Without this,
+# httpx 0.28+ raises `Using SOCKS proxy, but the 'socksio' package
+# is not installed` on every Claude API call. See
+# scripts/run_live_fire_graduation_soak.sh proxy-discipline block.
+socksio==1.0.0
 huggingface-hub==0.36.0
 humanfriendly==10.0
 HyperPyYAML==1.2.2

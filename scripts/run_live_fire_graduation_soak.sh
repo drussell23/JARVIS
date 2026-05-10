@@ -21,6 +21,21 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Proxy / SOCKS dep discipline (2026-05-09) — when the wrapper is
+# invoked from an agent / IDE / CI runner whose parent process
+# tunnels network through a SOCKS5h proxy (Claude Code does this
+# for sandboxing — `ALL_PROXY=socks5h://localhost:N`), the SOCKS
+# proxy IS the only network path: stripping it breaks DNS
+# resolution because the parent agent's tunnel is what resolves
+# external hosts. The right structural fix is keeping the proxy
+# AND ensuring `socksio` is installed so httpx 0.28+ accepts the
+# socks5h scheme without raising
+# `Using SOCKS proxy, but the 'socksio' package is not installed`.
+#
+# `socksio` is an optional httpx dependency (`pip install
+# httpx[socks]`); it's added to requirements.txt as part of this
+# arc so the harness's environment carries it by default.
+
 # Cadence env discipline (2026-05-09) — load $REPO_ROOT/.env BEFORE
 # the Phase 9 exports so DOUBLEWORD_API_KEY / ANTHROPIC_API_KEY land
 # in the subprocess inherit-set. Diagnosed root cause of the soak's
@@ -80,6 +95,22 @@ export JARVIS_GRADUATION_LEDGER_ENABLED=true
 export JARVIS_LIVE_FIRE_GRADUATION_SOAK_ENABLED=true
 export JARVIS_LIVE_FIRE_USE_GRADUATION_CONTRACT=true
 export JARVIS_DW_TOPOLOGY_EARLY_REJECT_ENABLED=true
+# Cadence connectivity discipline (2026-05-09) — without this, the
+# v1 path through `provider_topology.is_dw_blocked_for_route` reads
+# the YAML's `dw_allowed: false` (intentionally purged in Phase 12
+# Slice E graduation) and blocks every DW op. The v2 path
+# (dynamic catalog from `dw_catalog_classifier`) is the actual
+# runtime authority but is gated by THIS flag, which defaults to
+# false. Diagnosed root cause of the soak's silent zero-cost +
+# all-ops-rejected pattern: catalog discovery completes correctly
+# (`routes_assigned=['background','complex','speculative','standard']`)
+# but the orchestrator never consults it because the sentinel flag
+# is off → falls through to v1 yaml → all DW routes blocked.
+# Operator-override discipline preserved: explicit shell-set
+# JARVIS_TOPOLOGY_SENTINEL_ENABLED=false still wins over this
+# export (operator can hot-revert to v1 yaml authority for
+# diagnostic isolation).
+export JARVIS_TOPOLOGY_SENTINEL_ENABLED="${JARVIS_TOPOLOGY_SENTINEL_ENABLED:-true}"
 # §3.6.2 vector #6 producer-loop wiring (2026-05-07) — populate
 # .jarvis/graduation_interaction_matrix.jsonl as cadence runs
 # so /phase9 partners view materializes empirically.
