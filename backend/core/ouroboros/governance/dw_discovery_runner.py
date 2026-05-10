@@ -590,18 +590,49 @@ def _get_or_create_ledger() -> PromotionLedger:
 
 
 def _get_or_create_modality_ledger() -> Optional[Any]:
-    """Slice G — lazy ModalityLedger singleton. Returns None when the
-    master flag is off OR import fails (defensive for older deploys
-    that haven't shipped the module yet)."""
+    """Slice G — lazy ModalityLedger singleton. Returns None only when
+    the import itself fails (defensive for older deploys).
+
+    v2.87 (2026-05-10) — separated ledger-consulting from verification-
+    probing concerns. Previously the master flag
+    ``JARVIS_DW_MODALITY_VERIFICATION_ENABLED`` gated both:
+    ``mled.load()`` (cheap disk read of pre-existing verdicts) AND
+    ``verify_catalog_modalities(...)`` (live probe of new models).
+    With the master flag off, even an existing disk ledger with 22
+    pre-classified verdicts was silently ignored — the classifier
+    fell back to filtering-disabled mode that ranked TERMINAL_OPEN
+    models (lightonai-OCR + olmOCR — already deny-listed by sentinel
+    breakers) at the top of BG/STANDARD assignments. The sentinel
+    then exhausted those before reaching the canonical Qwen3.5-397B
+    that's clean and accessible. Result: 75% of ops blanket-blocked
+    even when DW connectivity was healthy.
+
+    Structural separation:
+      * Loading the ledger from disk is ALWAYS safe — pure I/O of
+        previously-recorded operator-account-specific verdicts. The
+        classifier consulting these is the load-bearing posture
+        (NON_CHAT excluded; UNKNOWN routes to SPECULATIVE only).
+      * PROBING new models is the expensive operation — gated by
+        ``modality_verification_enabled()`` because it issues real
+        HTTP calls. That gate is honored at the call site
+        (``verify_catalog_modalities``) — see ``run_discovery``
+        Step 1.5.
+
+    Operator-override discipline preserved: setting
+    ``JARVIS_DW_MODALITY_LEDGER_DISABLE=true`` still skips the load
+    entirely (escape hatch for diagnostic isolation)."""
     global _MODALITY_LEDGER_SINGLETON
     try:
         from backend.core.ouroboros.governance.dw_modality_ledger import (
             ModalityLedger,
-            modality_verification_enabled,
         )
     except ImportError:
         return None
-    if not modality_verification_enabled():
+    if (
+        os.environ.get(
+            "JARVIS_DW_MODALITY_LEDGER_DISABLE", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+    ):
         return None
     with _BOOT_SYNC_LOCK:
         if _MODALITY_LEDGER_SINGLETON is None:

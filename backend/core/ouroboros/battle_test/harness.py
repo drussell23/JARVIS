@@ -4472,6 +4472,41 @@ class BattleTestHarness:
                             )
                         except Exception:
                             pass
+                        # Layer 6 closure (2026-05-10 v2.88) — write a
+                        # synchronous partial summary.json BEFORE
+                        # os._exit(75) so the soak harness's
+                        # `_read_most_recent_session` can link the
+                        # session even after this escape-hatch fires.
+                        # Without this, all wall-clock-cap exits whose
+                        # asyncio cleanup wedges leave the session dir
+                        # without a `summary.json`, causing the parent
+                        # harness to write `outcome=infra
+                        # session=unknown` (operator-visible: cadence
+                        # produces unparseable evidence). Composes the
+                        # existing canonical
+                        # `_atexit_fallback_write` (Wave 3 v2.79
+                        # partial-shutdown insurance) — sync I/O is
+                        # safe from this thread because the watchdog
+                        # runs in its own thread, NOT the asyncio loop
+                        # that's wedged. NEVER raises out of this
+                        # block: any exception is swallowed so the
+                        # os._exit(75) escape hatch always fires.
+                        try:
+                            self._atexit_fallback_write(
+                                session_outcome=(
+                                    "incomplete_kill_layer4"
+                                ),
+                            )
+                        except Exception as _wd_summary_exc:  # noqa: BLE001
+                            try:
+                                _wd_log.error(
+                                    "[WallClockWatchdog] partial "
+                                    "summary write failed before "
+                                    "os._exit(75): %r",
+                                    _wd_summary_exc,
+                                )
+                            except Exception:
+                                pass
                         try:
                             os._exit(75)  # EX_TEMPFAIL — try again
                         except Exception:
