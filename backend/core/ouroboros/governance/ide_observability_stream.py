@@ -214,6 +214,22 @@ last poll. Operator binding 2026-05-07:
 slices.'"""
 
 
+EVENT_TYPE_FEEDBACK_ENGINE_SIGNAL = (
+    "feedback_engine_signal"
+)
+"""Phase B4 (PRD §3.6.x, 2026-05-10) — fired by
+``feedback_engine_sse_producer`` on AutonomyFeedbackEngine state
+transitions. Closed 3-kind taxonomy (rollback_threshold_crossed
+/ model_promoted / curriculum_batch_emitted) — string-typed in
+the payload so external consumers (VS Code extension,
+dashboards, audit replay) can dispatch on the kind without
+needing the producer module. Chatter-suppressed at the
+canonical engine site (multiples-of-threshold for rollbacks;
+empty batches silent for curriculum). Producer-bridge §33.2.
+Master flag ``JARVIS_FEEDBACK_ENGINE_SSE_PRODUCER_ENABLED``
+default-false until Phase 9 cadence."""
+
+
 EVENT_TYPE_FLAG_GRADUATED = "flag_graduated"
 """§38.11-B (PRD v2.65→v2.66, 2026-05-07) — fired by
 ``session_continuity.GraduationTicker`` when a flag transitions
@@ -917,6 +933,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_EXECUTION_GRAPH_PROGRESS,         # Phase 3 A2 (read-only projection of canonical tracker)
     EVENT_TYPE_AUTONOMY_COMMAND_BUS,             # Phase 3 A3 (read-only polling of CommandBus.snapshot_all)
     EVENT_TYPE_THINKING_PROGRESS_TICK,           # §37 Phase 2 (active-thinking aggregator — chatter-suppressed band/verb crossings)
+    EVENT_TYPE_FEEDBACK_ENGINE_SIGNAL,           # Phase B4 (AutonomyFeedbackEngine producer-bridge)
     EVENT_TYPE_FLAG_GRADUATED,                   # §38.11-B (graduation ticker — flag READY transitions)
     EVENT_TYPE_INTERVENTION_BANNER_RAISED,       # §38.11-C (proactive intervention banner)
     EVENT_TYPE_PREFETCH_SCHEDULED,               # §38.11-C (anticipatory pre-fetch indicator)
@@ -2781,6 +2798,48 @@ def publish_autonomy_command_bus_event(
     except Exception:  # noqa: BLE001
         logger.debug(
             "[Stream] autonomy_command_bus publish "
+            "exception", exc_info=True,
+        )
+        return None
+
+
+def publish_feedback_engine_signal_event(
+    *,
+    transition_kind: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Best-effort publisher for ``feedback_engine_signal``
+    frames (Phase B4, 2026-05-10). Fired by
+    ``feedback_engine_sse_producer`` on three closed transition
+    kinds: ``rollback_threshold_crossed`` /
+    ``model_promoted`` / ``curriculum_batch_emitted``.
+
+    The producer is the single SSE projection surface for
+    AutonomyFeedbackEngine state — direct broker.publish from
+    the engine itself is forbidden (authority asymmetry).
+    Chatter-suppression is enforced at the engine site (no
+    same-state re-emission).
+
+    NEVER raises; returns the published event id or ``None`` on
+    master-flag-off / publish failure / empty transition_kind."""
+    if not stream_enabled():
+        return None
+    try:
+        kind = str(transition_kind or "").strip()
+        if not kind:
+            return None
+        body: Dict[str, Any] = {
+            "transition_kind": kind,
+            "payload": dict(payload or {}),
+        }
+        return get_default_broker().publish(
+            EVENT_TYPE_FEEDBACK_ENGINE_SIGNAL,
+            "feedback_engine_signal",
+            body,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[Stream] feedback_engine_signal publish "
             "exception", exc_info=True,
         )
         return None
