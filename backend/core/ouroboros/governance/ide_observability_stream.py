@@ -388,6 +388,19 @@ under operator authority). Composes canonical flag_registry
 auto_committer.ov_signature_substring — no parallel state."""
 
 
+EVENT_TYPE_AUTOBIOGRAPHY_AUDIT_COMPLETED = (
+    "autobiography_audit_completed"
+)
+"""§40 Wave 1 #8 (PRD v2.98+, 2026-05-10) — fired by
+``adversarial_autobiography.audit_autobiography`` after every
+fresh retrospective audit run. Payload carries ``finding`` +
+``commits_audited`` + ``escape_count`` + ``clean_count`` +
+``cage_health_ratio`` projection. Closes §3.6.2 Vector #7
+(Quine-shape cage bypass) empirically by composing P9.4
+corpus + auto_committer.ov_signature_substring + git log
+walker against O+V's own commit history."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -984,6 +997,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COHERENCE_REPORTED,               # §3.6.2 Vector #5 (cross-session coherence harness)
     EVENT_TYPE_PERMISSION_DECISION_RECORDED,     # Venom V2 Slice 3 (PRD v2.91, permission_decision_archive)
     EVENT_TYPE_SECOND_ORDER_DOLL_PROGRESS_UPDATED, # §40 Tier 1 #15 (PRD v2.98+, second-order doll completion metric)
+    EVENT_TYPE_AUTOBIOGRAPHY_AUDIT_COMPLETED,    # §40 Wave 1 #8 (PRD v2.98+, adversarial autobiography retrospective audit)
 })
 
 

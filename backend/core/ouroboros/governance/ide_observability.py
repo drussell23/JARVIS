@@ -246,6 +246,14 @@ class IDEObservabilityRouter:
             "/observability/second-order-doll",
             self._handle_second_order_doll,
         )
+        # §40 Wave 1 #8 (v2.98+) — adversarial autobiography
+        # retrospective auditor composing P9.4 corpus +
+        # auto_committer.ov_signature_substring + git log walker.
+        # Closes §3.6.2 Vector #7 empirically.
+        app.router.add_get(
+            "/observability/adversarial-autobiography",
+            self._handle_adversarial_autobiography,
+        )
         # FlagRegistry Slice 3 — flag + verb introspection surface.
         app.router.add_get(
             "/observability/flags", self._handle_flags_list,
@@ -1220,6 +1228,93 @@ class IDEObservabilityRouter:
                 "ide_observability.second_order_doll_aggregate_failed",
             )
         return self._json_response(request, 200, snapshot.to_dict())
+
+    # --- §40 Wave 1 #8 — adversarial autobiography ------------------------
+
+    @staticmethod
+    def _autobiography_master_enabled() -> bool:
+        """Authority-free gate inheriting the substrate master
+        switch. 403 when off — port scanners see no signal."""
+        try:
+            from backend.core.ouroboros.governance.adversarial_autobiography import (  # noqa: E501
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
+    async def _handle_adversarial_autobiography(
+        self, request: "web.Request",
+    ) -> Any:
+        """GET /observability/adversarial-autobiography —
+        retrospective audit report.
+
+        Returns the canonical
+        :class:`AutobiographyReport.to_dict()` projection.
+        Read-only — composes
+        ``adversarial_autobiography.audit_autobiography`` which
+        composes P9.4 corpus + auto_committer signature + git log.
+        NEVER raises.
+
+        Shape::
+
+            {
+              "schema_version": "adversarial_autobiography.1",
+              "master_enabled": true,
+              "finding": "corpus_clean|corpus_escape|...",
+              "commits_audited": 17,
+              "escape_count": 0,
+              "clean_count": 17,
+              "per_category_escape": {},
+              "per_entry_escape": {},
+              "cage_health_ratio": 1.0,
+              ...
+            }
+
+        403 when ``JARVIS_IDE_OBSERVABILITY_ENABLED=false`` or the
+        autobiography master flag is off. 503 when substrate is
+        unavailable.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._autobiography_master_enabled():
+            return self._error_response(
+                request,
+                403,
+                "ide_observability."
+                "adversarial_autobiography_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.adversarial_autobiography import (  # noqa: E501
+                audit_autobiography,
+            )
+        except ImportError:
+            return self._error_response(
+                request,
+                503,
+                "ide_observability."
+                "adversarial_autobiography_substrate_unavailable",
+            )
+        try:
+            report = audit_autobiography()
+        except Exception:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[IDEObservability] autobiography audit failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request,
+                503,
+                "ide_observability."
+                "adversarial_autobiography_audit_failed",
+            )
+        return self._json_response(request, 200, report.to_dict())
 
     # --- FlagRegistry Slice 3 — flag + verb introspection --------------------
 
