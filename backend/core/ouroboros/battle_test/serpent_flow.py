@@ -721,6 +721,40 @@ class SerpentFlow:
                 if log_path:
                     self.console.print(f"  [dim]📝 {log_path}[/dim]")
                     self.console.print()
+                # §41.3 Slice 2 #15 — first-launch expanded
+                # onboarding. welcome_state composes the verb
+                # registry for the starter-verb list and writes
+                # a sentinel after rendering so returning
+                # operators see only the minimal welcome. Both
+                # imports are lazy + defensive — NEVER raises
+                # into the boot path. No-op when sentinel
+                # exists (RETURNING) or master flag off
+                # (DISABLED).
+                try:
+                    from backend.core.ouroboros.battle_test import (
+                        welcome_state as _welcome_state,
+                    )
+                    _state = _welcome_state.evaluate()
+                    if _state.should_show_expanded_banner():
+                        # SerpentFlow doesn't hold a direct
+                        # SerpentREPL reference at boot time —
+                        # discover_verbs accepts None and the
+                        # banner falls back to a curated starter
+                        # list. The registry-aware branch fires
+                        # later from the REPL itself if needed.
+                        _banner_text = (
+                            _welcome_state.render_first_launch_banner(
+                                None,
+                            )
+                        )
+                        self.console.print()
+                        for _bln in _banner_text.splitlines():
+                            self.console.print(f"  [dim]{_bln}[/dim]")
+                        self.console.print()
+                        _welcome_state.mark_seen()
+                except Exception:  # noqa: BLE001
+                    # Welcome state failure must NEVER break boot.
+                    pass
                 return
             except Exception:
                 # Restraint render failed → fall through to legacy
@@ -4781,6 +4815,35 @@ class SerpentREPL:
                     # ENABLED gates the registry; when off, falls
                     # back to legacy paths preserved below for
                     # instant rollback.
+                    # §41.3 Slice 3 #20 — universal `--help` /
+                    # `-h` interception. Any slash line ending
+                    # with the help suffix short-circuits dispatch
+                    # to render the verb's help block from the
+                    # registry. NEVER raises into the dispatch.
+                    if line.startswith("/") and (
+                        line.endswith(" --help")
+                        or line.endswith(" -h")
+                    ):
+                        try:
+                            from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
+                                discover_verbs as _vr_discover,
+                                format_verb_help as _vr_format_help,
+                            )
+                            _verb_word = line.split(None, 1)[0]
+                            _help_reg = _vr_discover(self)
+                            _hv = _help_reg.find(_verb_word)
+                            if _hv is not None:
+                                self._flow.console.print()
+                                self._flow.console.print(
+                                    _vr_format_help(_hv),
+                                    highlight=False,
+                                )
+                                self._flow.console.print()
+                                continue
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # Unknown verb with --help — fall through
+                        # to the typo suggestion at the tail.
                     try:
                         from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
                             try_dispatch as _try_dispatch,
@@ -4862,6 +4925,14 @@ class SerpentREPL:
                         continue
                     if line in ("/organism", "organism"):
                         self._handle_organism()
+                        continue
+                    # §41.3 Slice 2 #17 — /tutorial verb
+                    if (
+                        line in ("/tutorial", "tutorial")
+                        or line.startswith("/tutorial ")
+                        or line.startswith("tutorial ")
+                    ):
+                        self._handle_tutorial(line)
                         continue
 
                     # Runtime configuration commands
@@ -4988,6 +5059,51 @@ class SerpentREPL:
                                 highlight=False,
                             )
                             continue
+
+                    # §41.3 Slice 2 #18 — typo suggestion on
+                    # unknown slash verbs. Lines starting with
+                    # `/` that didn't match any handler get a
+                    # "did you mean …" surface from the verb
+                    # registry's bounded Levenshtein. NEVER raises
+                    # into the dispatch path; on miss falls through
+                    # to the external handler as before.
+                    if line.startswith("/"):
+                        try:
+                            from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
+                                discover_verbs as _typo_discover,
+                                suggest_for_typo as _typo_suggest,
+                            )
+                            _verb_word = line.split(None, 1)[0]
+                            _typo_reg = _typo_discover(self)
+                            # Only suggest when the typed verb
+                            # truly isn't known — avoids spam
+                            # when a real verb falls through for
+                            # any other reason.
+                            if _typo_reg.find(_verb_word) is None:
+                                _candidates = _typo_suggest(
+                                    _verb_word, _typo_reg,
+                                )
+                                if _candidates:
+                                    self._flow.console.print()
+                                    self._flow.console.print(
+                                        f"  [dim]unknown verb "
+                                        f"{_verb_word!r} — did you "
+                                        f"mean: "
+                                        f"{', '.join(_candidates)}?"
+                                        f"[/dim]",
+                                        highlight=False,
+                                    )
+                                    self._flow.console.print(
+                                        "  [dim]append `--help` "
+                                        "to any verb for usage "
+                                        "(e.g. `/cancel --help`)"
+                                        "[/dim]",
+                                        highlight=False,
+                                    )
+                                    self._flow.console.print()
+                                    continue
+                        except Exception:  # noqa: BLE001
+                            pass  # NEVER break the REPL
 
                     # ConversationBridge capture (V1: user turns only).
                     # Any line that fell through the built-in dispatch is
@@ -5717,6 +5833,58 @@ class SerpentREPL:
         )
 
     # ── Gap #7 Slice 1 — /preflight and /organism (moved boot content) ──
+
+    def _handle_tutorial(self, line: str = "") -> None:
+        """``/tutorial`` — category-grouped tour of slash verbs.
+
+        Composes :func:`repl_completion.discover_verbs` (single
+        source of truth) + :func:`welcome_state.render_tutorial`
+        — NEVER duplicates the registry. Accepts an optional
+        category filter as the first argument.
+
+        @arg_spec: [category]
+        @example: /tutorial
+        @example: /tutorial lifecycle
+        @category: introspection
+        """
+        try:
+            from backend.core.ouroboros.battle_test.repl_completion import (
+                discover_verbs,
+            )
+            from backend.core.ouroboros.battle_test.welcome_state import (
+                render_tutorial,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/tutorial: substrate import "
+                f"failed: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        # Parse optional category filter from the line.
+        _category: Optional[str] = None
+        try:
+            _parts = (line or "").split(None, 1)
+            if len(_parts) > 1:
+                _category = _parts[1].strip() or None
+        except Exception:  # noqa: BLE001
+            _category = None
+        try:
+            _registry = discover_verbs(self)
+            _text = render_tutorial(
+                _registry, category_filter=_category,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/tutorial: render failed: "
+                f"{exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        self._flow.console.print()
+        for _ln in _text.splitlines():
+            self._flow.console.print(_ln, highlight=False)
+        self._flow.console.print()
 
     def _handle_preflight(self) -> None:
         """``/preflight`` — render the preflight checklist on demand.
