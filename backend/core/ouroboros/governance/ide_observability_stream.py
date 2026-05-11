@@ -459,6 +459,19 @@ postmortem_clusterer + Wave 4 #9 belief_revision_ledger.
 Producer hook is best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_SCHELLING_TIE_BROKEN = "schelling_tie_broken"
+"""§40 Wave 4 #12 (PRD v2.99+, 2026-05-10) — fired by
+``schelling_consensus_prior.break_tie`` only when decision is
+TIE_BROKEN (NO_TIE / NO_RECORD / DISABLED outcomes are silent
+— operators get pinged only on actionable selections). Payload
+carries the tie-break summary (``decision`` + ``consensus_outcome``
++ ``chosen_prior_kind`` + ``chosen_roll_id`` + ``trust_table_size``
++ ``elapsed_s`` + ``schema_version``). Composes Move 6.5
+generative_quorum ConsensusVerdict read-only + the §33.4
+prior-history ledger at ``.jarvis/schelling_prior_history.jsonl``.
+Producer hook is best-effort — broker exception NEVER raises."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -1060,6 +1073,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_VOICE_TRANSCRIPT_RECORDED,        # §40 Wave 3 #17 (PRD v2.98+, voice transcript bounded beacon)
     EVENT_TYPE_BELIEF_REVISION_RECORDED,         # §40 Wave 4 #9 (PRD v2.99+, belief revision ledger evidence row)
     EVENT_TYPE_POSTMORTEM_FUSED,                 # §40 Wave 4 #11 (PRD v2.99+, postmortem fusion meta-postmortem)
+    EVENT_TYPE_SCHELLING_TIE_BROKEN,             # §40 Wave 4 #12 (PRD v2.99+, schelling-point tie-break)
 })
 
 
