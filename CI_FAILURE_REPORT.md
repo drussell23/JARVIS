@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: pip in /backend - Update #1359745429
-- **Run Number**: #139
-- **Branch**: `main`
-- **Commit**: `7d63389fc2f6c37fa8cd06ae7defbe403df17c02`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #57785
+- **Branch**: `fix/ci/pip-in-backend-update-1359745429-run139-20260511-133150`
+- **Commit**: `48df026241ecf483a62f493c9bcc91660a5e6784`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-05-11T12:29:58Z
-- **Triggered By**: @dependabot[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25670183678)
+- **Timestamp**: 2026-05-11T13:32:24Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/25673378363)
 
 ## Failure Overview
 
@@ -17,49 +17,48 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Dependabot | permission_error | high | 267s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
-### 1. Dependabot
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-05-11T12:30:10Z
-**Completed**: 2026-05-11T12:34:37Z
-**Duration**: 267 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25670183678/job/75353081060)
+**Started**: 2026-05-11T13:32:58Z
+**Completed**: 2026-05-11T13:33:02Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/25673378363/job/75364379863)
 
 #### Failed Steps
 
-- **Step 3**: Run Dependabot
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
 - Pattern: `ERROR|Error|error`
-  - Occurrences: 7
-  - Sample matches:
-    - Line 77: `2026-05-11T12:34:34.8559925Z Dependabot encountered '1' error(s) during execution, please check the `
-    - Line 81: `2026-05-11T12:34:34.8561196Z | Dependency   | Error Type    | Error Details |`
-    - Line 83: `2026-05-11T12:34:34.8561735Z | transformers | unknown_error | null          |`
-
-- Pattern: `FAIL|Failed|failed`
   - Occurrences: 2
   - Sample matches:
-    - Line 79: `2026-05-11T12:34:34.8560662Z |        Dependencies failed to update         |`
-    - Line 85: `2026-05-11T12:34:35.0421615Z Failure running container d57ff78c3e6f0ce8e302513e95d425cebe53bb121d065`
+    - Line 30: `2026-05-11T13:33:00.1537106Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-05-11T13:33:00.7466617Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: pip `
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 98: `2026-05-11T12:34:36.3232405Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-05-11T13:33:00.8020096Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -79,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-05-11T13:31:50.943127*
+📊 *Report generated on 2026-05-11T13:36:08.883879*
 🤖 *JARVIS CI/CD Auto-PR Manager*
