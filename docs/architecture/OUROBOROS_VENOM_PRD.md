@@ -403,27 +403,36 @@ The 27 UX gaps from the brutal review (§37 + §38). Slice 1 (UX Polish Pack, `u
 | — | Pipeline progress bar | `pipeline_progress.py` |
 | — | (+ 8 more pack-activatable) | various |
 
-**Engineering-required (genuinely missing — Slice 2 + Slice 3):**
+**Engineering-required (Slice 2 + Slice 3 PARTIAL CLOSURE 2026-05-11):**
 
-| # | Item | Effort | Slice |
-|---|---|---|---|
-| 14 | Tab completion on slash commands/args | ~3 days | Slice 3 |
-| 15 | Welcome banner on first launch | ~2 days | Slice 2 |
-| 16 | First-time setup walkthrough | ~5 days | Slice 2 |
-| 17 | Tutorial mode (`/tutorial`) | ~4 days | Slice 2 |
-| 18 | "Did you mean?" for slash command typos | ~1 day | Slice 2 |
-| 19 | Inline command examples in errors | ~2 days | Slice 2 |
-| 20 | Per-command `--help` flag | ~1 day | Slice 3 |
-| 11 | Fuzzy slash palette + inline descriptions | ~3 days | Slice 3 |
-| 12 | Inline `?` tooltip mid-line | ~2 days | Slice 3 |
-| 8 | Pretty-printed JSON tool outputs | ~3 days | Slice 3 |
-| 26 | Fast-path for simple Q&A | ~5 days | Slice 3 |
-| 10 | @-mention completion (rich) | ~3 days | Slice 3 |
-| 21 | Resumable conversations | ~5 days | Slice 4 |
-| 22 | Conversation export to file | ~2 days | Slice 4 |
-| 23 | Search within conversation | ~3 days | Slice 4 |
-| 24 | Bookmark/star turns | ~2 days | Slice 4 |
-| 27 | Progressive streaming (unwrap cage) | ~5 days | Slice 4 |
+7 of 12 Slice 2/3 items shipped across 3 commits as a single
+substrate-then-consumer arc: `5e1ad3d3ca` (VerbDescriptor
+extensions + suggest_for_typo/fuzzy_match/format_verb_help
+helpers) + `e8f4c203a4` (welcome_state + tutorial renderer
+substrate) + `c475e3de66` (SerpentREPL consumer wiring at 4
+surgical insertion points). 174 cumulative regression tests
+across the stack. Per the operator binding, every consumer
+composes the substrate — no duplicated logic, no parallel state.
+
+| # | Item | Status | Effort | Slice |
+|---|---|---|---|---|
+| 14 | Tab completion on slash commands/args | 🟡 SUBSTRATE READY (`5e1ad3d3ca` — `VerbDescriptor.arg_spec` populated via `@arg_spec:` tag OR signature inspection; per-position completer wiring deferred) | ~3 days | Slice 3 |
+| 15 | Welcome banner on first launch | ✅ **SHIPPED 2026-05-11** (`e8f4c203a4` substrate + `c475e3de66` boot wiring) | ~2 days | Slice 2 |
+| 16 | First-time setup walkthrough | ⚪ DEFERRED (significant overlap with shipped `/tutorial`; revisit if operator-driven need surfaces) | ~5 days | Slice 2 |
+| 17 | Tutorial mode (`/tutorial`) | ✅ **SHIPPED 2026-05-11** (`e8f4c203a4` + `c475e3de66`) | ~4 days | Slice 2 |
+| 18 | "Did you mean?" for slash command typos | ✅ **SHIPPED 2026-05-11** (`5e1ad3d3ca` bounded Levenshtein + `c475e3de66` dispatch-tail wiring) | ~1 day | Slice 2 |
+| 19 | Inline command examples in errors | 🟡 PARTIAL (typo suggestion now hints `append --help for usage`; full inline-example-in-error injection deferred) | ~2 days | Slice 2 |
+| 20 | Per-command `--help` flag | ✅ **SHIPPED 2026-05-11** (`5e1ad3d3ca` `format_verb_help` + `c475e3de66` universal `--help`/`-h` interception in dispatch) | ~1 day | Slice 3 |
+| 11 | Fuzzy slash palette + inline descriptions | ✅ **SHIPPED 2026-05-11** (`5e1ad3d3ca` `fuzzy_match` — prefix-first, edit-distance fallback) | ~3 days | Slice 3 |
+| 12 | Inline `?` tooltip mid-line | ⚪ DEFERRED (prompt_toolkit keybinding work, no substrate dependency) | ~2 days | Slice 3 |
+| 8 | Pretty-printed JSON tool outputs | ⚪ DEFERRED (needs locating the REPL tool-output surface) | ~3 days | Slice 3 |
+| 26 | Fast-path for simple Q&A | ⚪ DEFERRED (controversial scope; design needed) | ~5 days | Slice 3 |
+| 10 | @-mention completion (rich) | 🟡 PARTIAL (existing `repl_input_polish.build_mention_completer` ships path completion; rich file-stat metadata deferred) | ~3 days | Slice 3 |
+| 21 | Resumable conversations | unchanged | ~5 days | Slice 4 |
+| 22 | Conversation export to file | unchanged | ~2 days | Slice 4 |
+| 23 | Search within conversation | unchanged | ~3 days | Slice 4 |
+| 24 | Bookmark/star turns | unchanged | ~2 days | Slice 4 |
+| 27 | Progressive streaming (unwrap cage) | unchanged | ~5 days | Slice 4 |
 
 **Architectural-decision-required (not feature work):**
 
