@@ -446,6 +446,19 @@ row is durably appended to the §33.4 JSONL ledger at
 NEVER raises into the calibration path."""
 
 
+EVENT_TYPE_POSTMORTEM_FUSED = "postmortem_fused"
+"""§40 Wave 4 #11 (PRD v2.99+, 2026-05-10) — fired by
+``postmortem_fusion.fuse_recent_postmortems`` whenever the
+evaluation surfaces a non-NO_PATTERN verdict (FUSED or
+EMERGING). Payload carries summary metrics (``verdict`` +
+``fused_count`` + ``emerging_count`` + ``postmortems_scanned``
++ ``clusters_examined`` + ``elapsed_s`` + ``schema_version``)
+— the per-meta detail lives in the :class:`FusionReport`
+artifact returned to the caller. Composes Wave 3 #7's
+postmortem_clusterer + Wave 4 #9 belief_revision_ledger.
+Producer hook is best-effort — broker exception NEVER raises."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -1046,6 +1059,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_ANTIVENOM_IMMUNIZATION_AUDITED,   # §40 Wave 2 #7 (PRD v2.98+, antivenom self-immunization probe loop)
     EVENT_TYPE_VOICE_TRANSCRIPT_RECORDED,        # §40 Wave 3 #17 (PRD v2.98+, voice transcript bounded beacon)
     EVENT_TYPE_BELIEF_REVISION_RECORDED,         # §40 Wave 4 #9 (PRD v2.99+, belief revision ledger evidence row)
+    EVENT_TYPE_POSTMORTEM_FUSED,                 # §40 Wave 4 #11 (PRD v2.99+, postmortem fusion meta-postmortem)
 })
 
 
