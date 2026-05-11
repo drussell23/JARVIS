@@ -519,6 +519,17 @@ EXHAUSTED / DISABLED) + budget allowance. Producer hook is
 best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_COGNITIVE_LOAD_SHED_TRIGGERED = (
+    "cognitive_load_shed_triggered"
+)
+"""§40 Wave 5 #21 (PRD v2.99+, 2026-05-11) — fired by
+``cognitive_load_shedding.evaluate_cognitive_load`` whenever
+verdict is ELEVATED or OVERLOADED. Payload carries load_score,
+shed_kind, and stressed/exhausted counts. Composes Wave 4 #13
++ Wave 5 #18. Advisory only — consumer-side throttling stays
+out of scope."""
+
+
 EVENT_TYPE_PREDICTIVE_POSTMORTEM_FORECASTED = (
     "predictive_postmortem_forecasted"
 )
@@ -1163,6 +1174,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COMPOSITIONAL_CURIOSITY_EVALUATED, # §40 Wave 1 #16 (PRD v2.99+, compositional curiosity)
     EVENT_TYPE_META_PRIOR_LEARNED,               # §40 Wave 5 #22 (PRD v2.99+, meta-prior learning)
     EVENT_TYPE_PREDICTIVE_POSTMORTEM_FORECASTED, # §40 Wave 5 #18 (PRD v2.99+, predictive postmortem)
+    EVENT_TYPE_COGNITIVE_LOAD_SHED_TRIGGERED,    # §40 Wave 5 #21 (PRD v2.99+, cognitive load shedding)
 })
 
 
