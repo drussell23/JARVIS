@@ -620,6 +620,48 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"network"}),
     ),
+    # §41.5 WebBrowser substrate consumers (master-gated via
+    # JARVIS_WEB_BROWSER_ENABLED §33.1). Routes through
+    # web_browser.perform_browsing_action which composes
+    # web_research_service + browser_bridge + redact_secrets +
+    # mcp_output_scanner + cross_process_jsonl citation ledger.
+    "web_browse": ToolManifest(
+        name="web_browse", version="1.0",
+        description=(
+            "Fetch a URL through the governance composer (per-domain "
+            "allowlist + secret redaction + credential-leak scan + "
+            "citation-ledger). Pass js_render=true for JS-rendered "
+            "pages. Returns sanitized body."
+        ),
+        arg_schema={
+            "url":       {"type": "string"},
+            "js_render": {"type": "boolean", "default": False},
+        },
+        capabilities=frozenset({"network"}),
+    ),
+    "web_follow": ToolManifest(
+        name="web_follow", version="1.0",
+        description=(
+            "Follow a link discovered from a prior web_search or "
+            "web_browse result. Audit-distinct from web_browse so the "
+            "citation graph captures navigation provenance."
+        ),
+        arg_schema={"url": {"type": "string"}},
+        capabilities=frozenset({"network"}),
+    ),
+    "web_cite": ToolManifest(
+        name="web_cite", version="1.0",
+        description=(
+            "Record a citation to the §33.4 web-browsing ledger. "
+            "Pure ledger write — no network. Use after web_browse/"
+            "web_follow when an excerpt informs a decision."
+        ),
+        arg_schema={
+            "url":      {"type": "string"},
+            "fragment": {"type": "string"},
+        },
+        capabilities=frozenset({"write"}),
+    ),
     "code_explore": ToolManifest(
         name="code_explore", version="1.0",
         description="Run a Python snippet in a sandboxed subprocess to test a hypothesis",
@@ -3559,6 +3601,9 @@ class AsyncProcessToolBackend:
             if call.name in (
                 "web_search",
                 "web_fetch",
+                "web_browse",      # §41.5 WebBrowser substrate
+                "web_follow",      # §41.5 WebBrowser substrate
+                "web_cite",        # §41.5 WebBrowser substrate
                 "code_explore",
                 "ask_human",
                 "delegate_to_agent",
@@ -3701,6 +3746,84 @@ class AsyncProcessToolBackend:
                 results = await asyncio.wait_for(fetcher.fetch_urls([url]), timeout=timeout)
                 output = "\n".join(r.text for r in results if r.success)[:cap]
                 await fetcher.close()
+
+            elif call.name in ("web_browse", "web_follow", "web_cite"):
+                # §41.5 WebBrowser composer entry point. Routes through
+                # web_browser.perform_browsing_action which composes
+                # the 5 canonical surfaces (web_research_service +
+                # browser_bridge + web_search + redact_secrets +
+                # mcp_output_scanner) and writes to the §33.4 citation
+                # ledger. Master flag JARVIS_WEB_BROWSER_ENABLED §33.1
+                # default-FALSE — when off, substrate returns FAILED
+                # with diagnostic and we surface that as EXEC_ERROR so
+                # the model sees the affordance is gated.
+                from backend.core.ouroboros.governance.web_browser import (
+                    BrowsingAction,
+                    BrowsingVerdict,
+                    perform_browsing_action,
+                )
+                if call.name == "web_browse":
+                    js_render = bool(call.arguments.get("js_render", False))
+                    target_action = (
+                        BrowsingAction.EXTRACT_TEXT
+                        if js_render else BrowsingAction.NAVIGATE
+                    )
+                    _result_obj = await asyncio.wait_for(
+                        perform_browsing_action(
+                            target_action,
+                            url=str(call.arguments.get("url", "")),
+                            js_render=js_render,
+                            op_id=policy_ctx.op_id,
+                        ),
+                        timeout=timeout,
+                    )
+                elif call.name == "web_follow":
+                    _result_obj = await asyncio.wait_for(
+                        perform_browsing_action(
+                            BrowsingAction.FOLLOW_LINK,
+                            url=str(call.arguments.get("url", "")),
+                            op_id=policy_ctx.op_id,
+                        ),
+                        timeout=timeout,
+                    )
+                else:  # web_cite
+                    _result_obj = await asyncio.wait_for(
+                        perform_browsing_action(
+                            BrowsingAction.CITE,
+                            url=str(call.arguments.get("url", "")),
+                            fragment=str(call.arguments.get("fragment", "")),
+                            op_id=policy_ctx.op_id,
+                        ),
+                        timeout=timeout,
+                    )
+                # Verdict → ToolResult mapping. CLEAN is the only
+                # success path. Everything else surfaces as
+                # EXEC_ERROR so the model can adjust strategy
+                # (different URL, different action, request approval).
+                if _result_obj.verdict is BrowsingVerdict.CLEAN:
+                    if call.name == "web_cite":
+                        output = (
+                            f"cited: {_result_obj.url} "
+                            f"({_result_obj.content_bytes} bytes recorded) "
+                            f"[latency_ms={_result_obj.latency_ms:.1f}]"
+                        )
+                    else:
+                        body = (_result_obj.sanitized_body or "")[:cap]
+                        output = (
+                            f"=== {_result_obj.host} ===\n{body}\n"
+                            f"[backend={_result_obj.backend_used} "
+                            f"redacted_bytes={_result_obj.redacted_bytes} "
+                            f"latency_ms={_result_obj.latency_ms:.1f}]"
+                        )
+                else:
+                    return ToolResult(
+                        tool_call=call, output="",
+                        error=(
+                            f"{_result_obj.verdict.value}: "
+                            f"{_result_obj.diagnostic}"
+                        ),
+                        status=ToolExecStatus.EXEC_ERROR,
+                    )
 
             elif call.name == "code_explore":
                 from backend.core.ouroboros.governance.code_exploration import CodeExplorationTool
