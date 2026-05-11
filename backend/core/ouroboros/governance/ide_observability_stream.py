@@ -560,6 +560,19 @@ reap_orphans) into unified periodic scanner with hard-opt-in
 mutation gate per Manifesto §6."""
 
 
+EVENT_TYPE_MULTI_DAY_DEADLOCK_EVALUATED = (
+    "multi_day_deadlock_evaluated"
+)
+"""§41.4 Phase 1 ninth (final) arc (PRD v3.0+, 2026-05-11) — fired
+by ``multi_day_deadlock_detector.detect_deadlocks`` after each
+cross-session scan. Payload carries verdict + lookback_days +
+sessions_scanned + signal_count + by_kind/severity histograms +
+elapsed_s. 4 detector kinds catch patterns single-session detection
+misses: REPEAT_STOP_REASON / REPEAT_FAILURE / VERDICT_THRASH /
+ZERO_PROGRESS. Observational only — surfaces diagnostic signals;
+operator action is NEVER autonomous."""
+
+
 EVENT_TYPE_MUTATION_TESTING_EVALUATED = (
     "mutation_testing_evaluated"
 )
@@ -1298,6 +1311,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COVERAGE_GATE_EVALUATED,          # §41.4 Phase 1 sixth arc (PRD v3.0+, coverage_gate)
     EVENT_TYPE_LONG_HORIZON_MEMORY_RECALLED,     # §41.4 Phase 1 seventh arc (PRD v3.0+, long_horizon_memory)
     EVENT_TYPE_INFRA_RECOVERY_EVALUATED,         # §41.4 Phase 1 eighth arc (PRD v3.0+, infra_recovery_loop)
+    EVENT_TYPE_MULTI_DAY_DEADLOCK_EVALUATED,     # §41.4 Phase 1 ninth (final) arc (PRD v3.0+, multi_day_deadlock_detector)
 })
 
 
