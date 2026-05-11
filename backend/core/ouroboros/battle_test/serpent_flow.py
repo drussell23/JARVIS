@@ -5160,6 +5160,7 @@ class SerpentREPL:
                         try:
                             from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
                                 discover_verbs as _typo_discover,
+                                format_verb_hint as _typo_hint,
                                 suggest_for_typo as _typo_suggest,
                             )
                             _verb_word = line.split(None, 1)[0]
@@ -5182,13 +5183,26 @@ class SerpentREPL:
                                         f"[/dim]",
                                         highlight=False,
                                     )
-                                    self._flow.console.print(
-                                        "  [dim]append `--help` "
-                                        "to any verb for usage "
-                                        "(e.g. `/cancel --help`)"
-                                        "[/dim]",
-                                        highlight=False,
+                                    # §41.3 #19 — surface the
+                                    # descriptor's actual data
+                                    # (usage + example) for the
+                                    # top suggestion. NO hardcoded
+                                    # verb-to-hint map; the data
+                                    # lives on the existing
+                                    # VerbDescriptor and is
+                                    # rendered by the canonical
+                                    # format_verb_hint composer.
+                                    _top = _typo_reg.find(
+                                        _candidates[0],
                                     )
+                                    if _top is not None:
+                                        _hint = _typo_hint(_top)
+                                        if _hint:
+                                            for _hl in _hint.splitlines():
+                                                self._flow.console.print(
+                                                    f"[dim]{_hl}[/dim]",
+                                                    highlight=False,
+                                                )
                                     self._flow.console.print()
                                     continue
                         except Exception:  # noqa: BLE001

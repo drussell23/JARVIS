@@ -1004,6 +1004,50 @@ def resolve_help_for_buffer(
         return None
 
 
+def format_verb_hint(
+    verb: VerbDescriptor,
+    *,
+    max_examples: int = 1,
+    indent: str = "  ",
+) -> str:
+    """Render a **compact** one-block hint suitable for inline
+    injection into error / suggestion messages.
+
+    Closes §41.3 Slice 2 #19 by composing the existing
+    :class:`VerbDescriptor` fields (no new registry, no
+    hardcoded verb→hint map). Distinct from :func:`format_verb_help`
+    which renders the full help block (usage + description +
+    aliases + all examples) for ``/verb --help`` and the
+    inline ``?`` tooltip.
+
+    Output shape::
+
+        usage: /cancel <op_id> [--immediate]
+          example: /cancel op-abc123
+
+    When the verb has no ``arg_spec`` it still surfaces the
+    primary slash form so the operator at least sees what to
+    type. NEVER raises — returns the verb's slash_form as a
+    last-resort fallback when anything goes wrong.
+    """
+    try:
+        if not isinstance(verb, VerbDescriptor):
+            return ""
+        slash = verb.slash_form
+        usage = slash if not verb.arg_spec else f"{slash} {verb.arg_spec}"
+        lines: List[str] = [f"{indent}usage: {usage}"]
+        cap = max(0, int(max_examples))
+        if cap > 0 and verb.examples:
+            for ex in verb.examples[:cap]:
+                lines.append(f"{indent}  example: {ex}")
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        try:
+            return f"{indent}usage: {verb.slash_form}"  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            return ""
+
+
 def format_verb_help(verb: VerbDescriptor) -> str:
     """Render a ``/verb --help`` block. NEVER raises.
 
@@ -1380,6 +1424,7 @@ __all__ = [
     "cursor_arg_position",
     "discover_verbs",
     "format_verb_help",
+    "format_verb_hint",
     "fuzzy_match",
     "get_arg_candidates",
     "is_completion_enabled",

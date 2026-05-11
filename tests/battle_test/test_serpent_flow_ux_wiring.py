@@ -194,8 +194,32 @@ def test_typo_suggestion_continues_on_match():
     src = _source()
     idx = src.find("_typo_suggest(")
     assert idx > 0
-    post = src[idx:idx + 2500]
+    post = src[idx:idx + 3000]
     assert "continue" in post
+
+
+def test_typo_suggestion_surfaces_descriptor_hint():
+    """§41.3 #19 — bytes-pin: the typo path renders the
+    descriptor's actual usage + example via format_verb_hint
+    instead of a generic '--help' instruction. NO new registry
+    in the wiring — the data lives on VerbDescriptor."""
+    src = _source()
+    # The wiring lazy-imports format_verb_hint (as `_typo_hint`)
+    # and renders its lines.
+    assert "format_verb_hint" in src
+    # The legacy generic instruction is gone.
+    assert "append `--help`" not in src
+
+
+def test_typo_suggestion_renders_top_candidate_hint():
+    """Bytes-pin: the wiring looks up the *top* suggestion in
+    the registry (via .find on `_candidates[0]`) and renders
+    its hint — not a hardcoded verb name."""
+    src = _source()
+    idx = src.find("_typo_suggest(")
+    body = src[idx:idx + 3000]
+    assert "_candidates[0]" in body
+    assert "_typo_hint" in body
 
 
 # --- /tutorial dispatch wiring ------------------------------------------
