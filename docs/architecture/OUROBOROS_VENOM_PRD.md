@@ -425,9 +425,9 @@ composes the substrate — no duplicated logic, no parallel state.
 | 20 | Per-command `--help` flag | ✅ **SHIPPED 2026-05-11** (`5e1ad3d3ca` `format_verb_help` + `c475e3de66` universal `--help`/`-h` interception in dispatch) | ~1 day | Slice 3 |
 | 11 | Fuzzy slash palette + inline descriptions | ✅ **SHIPPED 2026-05-11** (`5e1ad3d3ca` `fuzzy_match` — prefix-first, edit-distance fallback) | ~3 days | Slice 3 |
 | 12 | Inline `?` tooltip mid-line | ✅ **SHIPPED 2026-05-11** (`e4a0972463` — `resolve_help_for_buffer` substrate + prompt_toolkit `?` keybinding using `run_in_terminal`; composes existing verb_registry + `format_verb_help`, NO parallel state; ambiguity-refusal + 2-layer defensive try/except + literal-`?` fallback) | ~2 days | Slice 3 |
-| 8 | Pretty-printed JSON tool outputs | ⚪ DEFERRED (needs locating the REPL tool-output surface) | ~3 days | Slice 3 |
+| 8 | Pretty-printed JSON tool outputs | ✅ **SHIPPED 2026-05-11** (`76b11909e0` — two-tier JSON detection (descriptor hint OR content auto-detect with size threshold) hooked into the canonical `tool_render_view.compose()` BEFORE the line-bounding cap; per-line token colorizer with 5-entry data-on-module palette table; operator themes via the same palette mapping passed to compose(). NO new BodyShape value (closed taxonomy preserved); NO parallel rendering pipeline. Master flag `JARVIS_TOOL_OUTPUT_JSON_PRETTY_ENABLED` default-TRUE.) | ~3 days | Slice 3 |
 | 26 | Fast-path for simple Q&A | ⚪ DEFERRED (controversial scope; design needed) | ~5 days | Slice 3 |
-| 10 | @-mention completion (rich) | 🟡 PARTIAL (existing `repl_input_polish.build_mention_completer` ships path completion; rich file-stat metadata deferred) | ~3 days | Slice 3 |
+| 10 | @-mention completion (rich) | ✅ **SHIPPED 2026-05-11** (`752a451387` — `MentionMetadata` frozen artifact + `build_mention_metadata` composer + `format_mention_metadata` renderer; three data-on-module tables drive glyph / size / age formatting; per-candidate dropdown shows `📄 1.2 KB · 5m ago`. NO new registry; pure composition over the existing `_MentionCompleter`) | ~3 days | Slice 3 |
 | 21 | Resumable conversations | unchanged | ~5 days | Slice 4 |
 | 22 | Conversation export to file | unchanged | ~2 days | Slice 4 |
 | 23 | Search within conversation | unchanged | ~3 days | Slice 4 |
