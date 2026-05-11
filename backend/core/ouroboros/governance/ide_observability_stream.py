@@ -490,6 +490,19 @@ provider). Producer hook is best-effort — broker exception
 NEVER raises."""
 
 
+EVENT_TYPE_MIRROR_SELF_CALIBRATED = "mirror_self_calibrated"
+"""§40 Wave 4 #14 (PRD v2.99+, 2026-05-10) — fired by
+``mirror_self_test.compute_all_calibrations`` whenever at
+least one prediction dimension reaches actionable verdict
+(POOR / FAIR / GOOD — UNCALIBRATED is silent). Payload carries
+a per-dimension summary (``next_phase`` / ``target_file`` /
+``risk_tier`` / ``outcome`` each with their verdict + accuracy
++ sample_count). Substrate records predictions at op-start +
+actuals at op-end and computes 4-axis calibration; falsified
+predictions optionally bridge into Wave 4 #9 belief ledger.
+Producer hook is best-effort — broker exception NEVER raises."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -1093,6 +1106,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_POSTMORTEM_FUSED,                 # §40 Wave 4 #11 (PRD v2.99+, postmortem fusion meta-postmortem)
     EVENT_TYPE_SCHELLING_TIE_BROKEN,             # §40 Wave 4 #12 (PRD v2.99+, schelling-point tie-break)
     EVENT_TYPE_SLEEP_CONSOLIDATION_PASSED,       # §40 Wave 4 #10 (PRD v2.99+, sleep consolidation pass)
+    EVENT_TYPE_MIRROR_SELF_CALIBRATED,           # §40 Wave 4 #14 (PRD v2.99+, mirror-self calibration)
 })
 
 
