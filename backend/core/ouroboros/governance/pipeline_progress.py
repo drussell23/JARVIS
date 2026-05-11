@@ -392,6 +392,7 @@ def register_shipped_invariants() -> list:
                 isinstance(node, ast.FunctionDef)
                 and node.name == "master_enabled"
             ):
+                src = ast.unparse(node)
                 # §40 polish-pack composition: walk only the
                 # top-level body + unconditional containers (Try)
                 # so `if env_check: return True` is correctly
