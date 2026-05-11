@@ -519,6 +519,17 @@ EXHAUSTED / DISABLED) + budget allowance. Producer hook is
 best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_PREDICTIVE_POSTMORTEM_FORECASTED = (
+    "predictive_postmortem_forecasted"
+)
+"""§40 Wave 5 #18 (PRD v2.99+, 2026-05-11) — fired by
+``predictive_postmortem.forecast_postmortem_risk`` whenever
+verdict is MODERATE / HIGH / CRITICAL (LOW silent). Payload
+carries forecast_score + per-component scores + dominant_factor
++ schema_version. Composes Wave 4 #9 belief drift + #11 meta
+recurrence + #14 calibration decay."""
+
+
 EVENT_TYPE_META_PRIOR_LEARNED = "meta_prior_learned"
 """§40 Wave 5 #22 (PRD v2.99+, 2026-05-11) — fired by
 ``meta_prior_learning.compute_meta_distribution`` whenever at
@@ -1151,6 +1162,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_ANTI_FRAGILITY_EVALUATED,         # §40 Wave 4 #13 (PRD v2.99+, anti-fragility budget)
     EVENT_TYPE_COMPOSITIONAL_CURIOSITY_EVALUATED, # §40 Wave 1 #16 (PRD v2.99+, compositional curiosity)
     EVENT_TYPE_META_PRIOR_LEARNED,               # §40 Wave 5 #22 (PRD v2.99+, meta-prior learning)
+    EVENT_TYPE_PREDICTIVE_POSTMORTEM_FORECASTED, # §40 Wave 5 #18 (PRD v2.99+, predictive postmortem)
 })
 
 
