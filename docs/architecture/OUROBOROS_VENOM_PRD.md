@@ -1,7 +1,13 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.98 (2026-05-10 — **Soak #5 SHIPPED + 3 flags graduation-eligible + advanced forward roadmap**: First operator-visible proof that the cadence engine produces graduations in PARALLEL not serially. Soak #5 (`bt-2026-05-10-185226` → session_id `bt-2026-05-11-015226` UTC) result: `outcome=clean stop_reason=idle_timeout duration_s=2569 cost_total=$0.0397 ops=16` testing `JARVIS_EXEC_GRAPH_BRIDGE_ENABLED` (NEW flag, 1/3 ladder started tonight). **Layer 6/7/8 + Move 6.5 PLAN seam all held empirically** under realistic adversarial conditions (DW Tier 0 degraded → §5 cascade fell through to Claude Tier 1; Layer 6 atexit fallback wrote summary before ShutdownWatchdog os._exit(75); Layer 8 stamped `session_outcome=complete` correctly; Move 6.5 master flags off → fell through to single-shot — zero behavior change at default). **PHASE 9 GRADUATION LADDER state post-soak-#5** (3 flags now eligible, NOT just one):
+**Version**: 2.99 (2026-05-11 — **§41 ADDED: Critical Path to Tier D — Fully Autonomous JARVIS Development**: The first explicit PRD statement of the load-bearing goal: *"O+V develops the JARVIS repo proactively + fully autonomously, safely + governance-bounded."* Prior sessions framed §40 Waves 1-3 (RRD recursion-bounding + adversarial cage + cross-session coherence + UX polish) as the engineering arc. §41 reframes those Waves as the **engineering preamble to the actual North Star**: Tier D operation, where O+V develops JARVIS without operator-in-the-loop. New §41 (~7,200 words, 10 subsections): (41.1) the goal verbatim + why it's load-bearing; (41.2) the 4-tier operating framework (A/B/C/D) with current readiness percentages (Tier A ~80-85%, Tier D ~10-15%); (41.3) updated UX polish gap analysis post-Slice 1 (27 items, ~8 closed by activation, 19 remaining); (41.4) Layer 2 capability gaps (RoadmapReader / goal decomposition / architectural taste / mutation testing / coverage gate / long-horizon memory / infra recovery — ~14-22 weeks of focused engineering); (41.5) **NEW operator-flagged gap — Web Search & Browsing capability**: Venom has basic `web_fetch` + `web_search` tools, but Claude's rich browsing (multi-page navigation, JS render, link-follow, image extraction, authenticated sessions, search-then-cite chains) is MISSING. Proposed `WebBrowser` substrate composes existing Venom tool loop + cross_process_jsonl citation ledger + governance_boundary_gate URL allowlist; ~3-5 weeks effort; load-bearing for autonomous development (researching new APIs, reading docs, following PR discussions); (41.6) Layer 3 empirical evidence requirements (M10 proposals shipped 0→30+, OV-signed commits adversarially audited 2→50+, cadence flags graduated 1→20+, antivenom gaps closed 0→5, continuous unsupervised days 0→90+ — wall-clock 3-6 months per tier transition); (41.7) Layer 4 architectural decision (operator-replacement options: signed roadmap document RECOMMENDED, multi-operator quorum, external trusted oracle, self-bounding research-grade — Tier C→D isn't pure engineering, it's a design decision about what "safe" means); (41.8) 18-30 month phased roadmap from Phase 0 (today, finish Slice 2-3 + WebBrowser substrate) through Phase 5 (Tier D operational); (41.9) prioritization framework (highest leverage at each time horizon); (41.10) honest framing — target Tier B (monthly review) as practical operating point with Tier D as long-horizon destination. **Operator-binding alignment**: §41 explicitly affirms that the cage architecture treats operator as the zero-order doll (structural assumption, not runtime check). Removing operator-in-loop isn't a feature to ship — it's a deliberate architectural rearchitecture requiring Layer 4 substrate work + 12+ months of evidence. **Cumulative session totals (post-§41 push)**: 18,900+ LOC + 765+ regression tests across §40 Wave 1-3 (10 items closed) + UX Polish Pack Slice 1 (~870 LOC + 100 tests). The PRD now contains the explicit Tier D goal + the honest roadmap to it. Future sessions reference §41 as the load-bearing North Star.
+
+---
+
+## §41 PRIOR-CONTEXT: WAVES 1-3 CLOSURE BANNER (2026-05-10 evening session)
+
+**Soak #5 SHIPPED + 3 flags graduation-eligible + §40 Waves 1-3 ALL CLOSED + UX Polish Pack Slice 1 SHIPPED**: First operator-visible proof that the cadence engine produces graduations in PARALLEL not serially. Soak #5 (`bt-2026-05-10-185226` → session_id `bt-2026-05-11-015226` UTC) result: `outcome=clean stop_reason=idle_timeout duration_s=2569 cost_total=$0.0397 ops=16` testing `JARVIS_EXEC_GRAPH_BRIDGE_ENABLED` (NEW flag, 1/3 ladder started tonight). **Layer 6/7/8 + Move 6.5 PLAN seam all held empirically** under realistic adversarial conditions (DW Tier 0 degraded → §5 cascade fell through to Claude Tier 1; Layer 6 atexit fallback wrote summary before ShutdownWatchdog os._exit(75); Layer 8 stamped `session_outcome=complete` correctly; Move 6.5 master flags off → fell through to single-shot — zero behavior change at default). **PHASE 9 GRADUATION LADDER state post-soak-#5** (3 flags now eligible, NOT just one):
 
 | Flag | Clean rows | Status |
 |------|-----------|--------|
@@ -189,6 +195,368 @@ The §40 roadmap is not invented in a vacuum. The architectural patterns O+V imp
 3. **Move 6.5 multi-prior dispatch is the published-consensus primitive**, formalized by HEAVYSKILL + Agent0. O+V's substrate-complete + tonight's PLAN-seam wiring positions the system at parity with current research-grade multi-agent code synthesis.
 
 **Operator value**: when designing future O+V slices, the §40.7 citations provide (a) prior-art justification for architectural choices, (b) baseline numbers to benchmark against (e.g., Constitutional Classifiers' 86%→4.4% jailbreak reduction is the Antivenom self-immunization target), (c) terminology alignment with the published research community (for the PhD §6 dissertation eval). The §40 roadmap items reference these foundations explicitly so each engineering decision has cited-research provenance, not just operator binding.
+
+---
+
+## §41 CRITICAL PATH TO TIER D — FULLY AUTONOMOUS JARVIS DEVELOPMENT (NEW 2026-05-11)
+
+§40 Waves 1-3 closed the recursion-bounding + adversarial cage + cross-session coherence triad. The UX Polish Pack (Slice 1) closed ~8 of the 27 polish surface gaps by composer-flip activation. The cadence engine produces graduations. Move 6.5 PLAN seam holds empirically. The system is operator-paced + cage-bounded + self-auditing.
+
+**But §40 + Slice 1 are the engineering preamble, NOT the destination.**
+
+§41 makes the load-bearing goal explicit and lays out the honest path to it.
+
+---
+
+### §41.1 The Stated Goal (Verbatim)
+
+> *"O+V develops the JARVIS repo proactively + fully autonomously, while doing so safely and governance-bounded."*
+>
+> — Operator binding, 2026-05-11
+
+This is the **North Star**. Every prior § (§28 through §40) has been engineering toward this. §41 is the first explicit PRD statement of the destination + an honest decomposition of what remains.
+
+**Why this is the goal, not a goal**:
+
+* JARVIS is the **Body** of the Trinity (J-Prime / Reactor Core arrive later). For the Trinity vision to function structurally, the Body must self-maintain — otherwise operator becomes the bottleneck on every Trinity expansion arc.
+* O+V's **structural moat over Claude Code** isn't raw cognitive horsepower (O+V routes Claude, so O+V ≤ Claude on raw IQ) — it's *autonomous + persistent + cage-bounded + self-auditing*. Half-realizing that moat (Tier B operator-paced helper) leaves the bulk of the architectural value on the table.
+* The cage substrates (Wave 1-3 closures, §38/§39 polish, M10 architectural proposer) ALL assume eventual Tier D operation. Building them with operator-in-the-loop as the permanent endpoint would have been over-engineering.
+
+**What this is NOT**:
+
+* NOT "operator becomes irrelevant" — operator remains the **zero-order doll** (structural authority). Tier D shifts operator's role from per-PR reviewer to roadmap-level overseer.
+* NOT "remove all safety gates" — Tier D requires the cage to be *more* trustworthy, not less. The boundary gate, hash-cap, antivenom, M10 forced approval — all stay, possibly tightened.
+* NOT "infinitely autonomous" — Tier D operates within an operator-signed roadmap / budget / scope. Beyond those bounds, escalation happens.
+
+---
+
+### §41.2 The Tier Framework: A → B → C → D
+
+A 4-tier operating model. Each tier defines a concrete operating cadence + readiness percentage today.
+
+| Tier | Operating cadence | Operator role | Readiness today | What ships first to advance |
+|---|---|---|---|---|
+| **Tier A** | Weekly review | Per-PR reviewer | **80-85%** | UX Polish Slice 2 + Slice 3; finish M10 first proposal cycle |
+| **Tier B** | Monthly review | Batch-approver | **45-55%** | RoadmapReader + goal decomposition planner; 3 months evidence |
+| **Tier C** | Quarterly review | Dashboard overseer | **20-25%** | Architectural taste + mutation testing + infra recovery; 6 months evidence |
+| **Tier D** | Roadmap-level only | Roadmap signer (zero-order doll) | **10-15%** | Layer 4 architectural decision + 12+ months evidence + signed roadmap substrate |
+
+**The asymmetry — why this matters**:
+
+* **Tier A → Tier B** is mostly engineering (RoadmapReader + goal decomposition substrate). ~3 months.
+* **Tier B → Tier C** is mostly empirical (months of cadence + infra-recovery battle-testing). ~6 months.
+* **Tier C → Tier D** is mostly architectural — the cage's safety properties derive from operator-in-the-loop as a *structural assumption*, not a runtime check. Removing operator isn't a feature to ship; it's a rearchitecture of how "safe" is defined.
+
+**The bulk of the engineering complexity is in Tier C → Tier D, not Tier A → Tier C.**
+
+---
+
+### §41.3 UX Polish Gap (Updated Post-Slice 1)
+
+The 27 UX gaps from the brutal review (§37 + §38). Slice 1 (UX Polish Pack, `ux_polish_pack.py`) closed ~8 by composer-flip activation. Remaining gaps split into three categories.
+
+**Activation-only (already shipped, just needs pack-flip — closed by Slice 1):**
+
+| # | Item | Substrate |
+|---|---|---|
+| 1 | Active-thinking timer | `thinking_progress_aggregator.py` |
+| 2 | Persistent task panel | `task_panel_aggregator.py` |
+| 3 | Animated braille spinner | `polish_bundle.py` |
+| 4 | Effort phrase ladder | `polish_bundle.py` |
+| 5 | Smart path truncation | `polish_bundle.py` |
+| — | Posture mood ring | `posture_palette.py` |
+| — | Pipeline progress bar | `pipeline_progress.py` |
+| — | (+ 8 more pack-activatable) | various |
+
+**Engineering-required (genuinely missing — Slice 2 + Slice 3):**
+
+| # | Item | Effort | Slice |
+|---|---|---|---|
+| 14 | Tab completion on slash commands/args | ~3 days | Slice 3 |
+| 15 | Welcome banner on first launch | ~2 days | Slice 2 |
+| 16 | First-time setup walkthrough | ~5 days | Slice 2 |
+| 17 | Tutorial mode (`/tutorial`) | ~4 days | Slice 2 |
+| 18 | "Did you mean?" for slash command typos | ~1 day | Slice 2 |
+| 19 | Inline command examples in errors | ~2 days | Slice 2 |
+| 20 | Per-command `--help` flag | ~1 day | Slice 3 |
+| 11 | Fuzzy slash palette + inline descriptions | ~3 days | Slice 3 |
+| 12 | Inline `?` tooltip mid-line | ~2 days | Slice 3 |
+| 8 | Pretty-printed JSON tool outputs | ~3 days | Slice 3 |
+| 26 | Fast-path for simple Q&A | ~5 days | Slice 3 |
+| 10 | @-mention completion (rich) | ~3 days | Slice 3 |
+| 21 | Resumable conversations | ~5 days | Slice 4 |
+| 22 | Conversation export to file | ~2 days | Slice 4 |
+| 23 | Search within conversation | ~3 days | Slice 4 |
+| 24 | Bookmark/star turns | ~2 days | Slice 4 |
+| 27 | Progressive streaming (unwrap cage) | ~5 days | Slice 4 |
+
+**Architectural-decision-required (not feature work):**
+
+| # | Item | Decision needed |
+|---|---|---|
+| 9 | Drag-and-drop image paste | Native terminal support + multimodal cage routing |
+| 13 | Multi-line paste at volume | Stream-capable Tier -1 sanitizer + ConversationBridge capacity bump |
+| 25 | Branching/fork turns | Conflicts with linear CausalityDAG semantics — needs DAG design extension |
+
+**Slice 2 + Slice 3 + Slice 4 combined effort**: ~45-50 days focused work. After Slice 4, O+V's CLI is at CC parity for casual operators (~95% polish coverage). The 3 architectural-decision items remain deferred until operator chooses the design.
+
+---
+
+### §41.4 Layer 2 — Engineering Capability Gaps
+
+What needs BUILDING (not just composing) for Tier B/C/D. Per-substrate composition surface noted so each is "thin composer" over canonical existing files.
+
+| Capability | Status | Effort | Composition surface |
+|---|---|---|---|
+| **RoadmapReader** substrate | Doesn't exist | ~1-2 weeks | Operator-signed `.jarvis/roadmap.yaml` → parse → emit IntentEnvelopes via UnifiedIntakeRouter |
+| **Goal decomposition planner** | Doesn't exist | ~2-3 weeks | Above PLAN phase; takes a roadmap goal → decomposes into N dependent ops → tracks completion |
+| **Architectural taste layer** | Mechanical only (SemanticGuardian/M10 validator are shape-only) | ~3-4 weeks | New substrate composing existing patterns from `git log` + structural code analysis; emits "design-quality" verdict via Claude API |
+| **Multi-step plan orchestrator** | Move 6.5 K-way (intra-op only) | ~2 weeks | Inter-op dependency tracker composing OpBlockBuffer + CausalityDAG |
+| **Mutation testing harness** | Doesn't exist | ~1-2 weeks | Composes existing TestRunner + AST mutation library (e.g., `mutmut`); fires on PRs touching governance/ |
+| **Coverage gate** | Doesn't exist | ~1 week | Composes `coverage.py` + Iron Gate; refuses commits below threshold |
+| **Long-horizon memory beyond sessions** | Partial (UserPreferenceStore + AdaptationLedger cover some) | ~2 weeks | Compose existing 4 cross-session substrates + add commit-history-aware memory layer |
+| **Infrastructure recovery loop** | Manual today | ~1-2 weeks | Composes existing TerminationHookRegistry + cost_governor; escalates disk/network/API failures via webhook |
+| **Multi-day deadlock detection** | Doesn't exist (L2 handles single-op) | ~1 week | Composes session-level watchdog above L2; detects stuck states across multiple op cycles |
+
+**Subtotal: ~14-22 weeks of focused engineering** to deliver Layer 2 capability surface.
+
+Each substrate follows the canonical §33.1 pattern (default-FALSE master flag, AST-pinned authority asymmetry, frozen §33.5 artifacts, FlagRegistry seeds). No parallel state, no hardcoding — same discipline as Wave 1-3 ships.
+
+---
+
+### §41.5 NEW Operator-Flagged Gap — Web Search & Browsing Capability
+
+The operator flagged this directly: *"I don't think web search and being able to browse the web like how Claude does is integrated in O+V."* They are correct. This is a load-bearing gap for autonomous JARVIS development.
+
+**Current state (Venom tool loop, per CLAUDE.md)**:
+
+* `web_fetch(url)` — fetches a single URL, returns response body as text
+* `web_search(query)` — runs a search query, returns top results as plain text
+
+**What Claude has that O+V doesn't**:
+
+| Capability | Claude | O+V today |
+|---|---|---|
+| Single-URL fetch | ✅ | ✅ `web_fetch` |
+| Search-as-text | ✅ | ✅ `web_search` |
+| Multi-page navigation (follow links) | ✅ | ❌ |
+| JavaScript-rendered content | ✅ | ❌ |
+| Image extraction from pages | ✅ | ❌ |
+| PDF parsing from web sources | ✅ | ❌ |
+| Authenticated browsing (cookies/sessions) | ✅ | ❌ |
+| Search-then-browse-then-cite chains | ✅ | ❌ |
+| Citation tracking across operations | ✅ | ❌ |
+| Per-domain trust boundary | ✅ (implicit) | ❌ |
+
+**Why this is load-bearing for Tier D autonomous JARVIS development**:
+
+* **Researching new libraries / APIs** — when M10 ArchitectureProposer wants to integrate a new substrate (e.g., a new vector DB, a new MCP server), it needs to *read the library's documentation* + *understand version compatibility* + *check for security advisories*. `web_fetch` + `web_search` aren't enough — needs link-following.
+* **Reading docs for features being built** — autonomous development of a feature requires reading docs in the form they're published (often JS-heavy, multi-page).
+* **Following PR discussions** — when proposing changes that touch external dependencies, reading the upstream project's PR discussions for context.
+* **Investigating bug reports** — autonomous debugging requires reading external issue trackers (GitHub Issues, Stack Overflow, etc.).
+* **Citing sources** — Tier D autonomous commits should reference external sources for justification. The cage's adversarial autobiography (§40 Wave 1 #8) gets stronger when citations are auditable.
+
+**Proposed substrate: `web_browser.py`**
+
+* New canonical substrate ~3-5 weeks effort
+* Composes existing:
+    * `tool_executor.py` Venom tool loop (canonical tool dispatch)
+    * `cross_process_jsonl.py` flock'd ledger (citation history)
+    * `governance_boundary_gate.py` (URL allowlist by domain — operator-tunable via `JARVIS_WEB_BROWSER_DOMAIN_ALLOWLIST`)
+    * `conversation_bridge.redact_secrets` (Tier -1 sanitization of fetched content for credential leaks)
+    * `mcp_output_scanner.py` (the Wave 3 #5 scanner — reused for browser output scanning)
+* Closed taxonomies:
+    * `BrowsingAction` enum (NAVIGATE / FOLLOW_LINK / EXTRACT_TEXT / EXTRACT_IMAGE / SEARCH / CITE)
+    * `BrowsingVerdict` enum (CLEAN / CREDENTIAL_LEAKED / OUT_OF_ALLOWLIST / RATE_LIMITED / FAILED)
+* New Venom tools registered:
+    * `web_browse(url)` — multi-step navigation with link discovery
+    * `web_follow(link_id)` — follow a discovered link
+    * `web_cite(url, fragment)` — record a citation to the JSONL ledger
+    * Replaces or augments existing `web_fetch` / `web_search`
+* AST pins:
+    * Master default-FALSE per §33.1 (cognitive substrate awaiting graduation)
+    * Authority asymmetry (NO orchestrator/iron_gate/policy imports)
+    * Composes Wave 2 #5 boundary gate (no parallel URL allowlist)
+    * Composes Wave 3 #5 MCP scanner (no parallel credential redaction)
+    * Closed `BrowsingAction` + `BrowsingVerdict` taxonomies bytes-pinned
+* §33.4 audit ledger at `.jarvis/web_browsing_ledger.jsonl` (every navigation + citation recorded)
+* SSE event `web_browsing_action` registered in canonical broker
+* IDE GET route `/observability/web-browsing` for operator-visible browsing history
+
+**Why this is in §41 rather than §40**:
+
+§40 Waves 4-5 were calibration learning + experimental (item-numbered #9-#22). Web browsing is a *prerequisite capability* for autonomous JARVIS development — it doesn't fit cleanly into "calibration." §41 promotes it to a load-bearing capability gap for Tier D.
+
+**Sequencing**: Web browser substrate ships in **Phase 0** of §41.8 roadmap (alongside UX Polish Slices 2-3, ~3-5 weeks).
+
+---
+
+### §41.6 Layer 3 — Empirical Evidence Requirements (Wall-Clock)
+
+What CANNOT be engineered around — months of operator-paced cadence accumulating evidence that the cage holds in production.
+
+| Evidence threshold | Current | Tier A min | Tier B min | Tier C min | Tier D min |
+|---|---|---|---|---|---|
+| M10 proposals shipped with no regressions | 0 | 1 | 10 | 30 | 100 |
+| OV-signed commits adversarially audited clean | 2 | 10 | 30 | 50 | 200 |
+| Cadence flags graduated default-TRUE | 1 | 5 | 10 | 20 | 30 |
+| Antivenom gaps closed | 0 of 5 found | 5 | 10 | 20 | 50 |
+| Continuous unsupervised days | 0 | 1 | 7 | 30 | 90 |
+| Coherence ratio sustained across N sessions | 1.000 on 3 | 1.000 on 10 | ≥0.95 on 30 | ≥0.90 on 50 | ≥0.85 on 100 |
+| Postmortem-fusion lessons retained | 0 (substrate missing) | 0 | 5 | 20 | 50 |
+| Cross-session belief-revision cycles | 0 | 0 | 5 | 20 | 50 |
+
+**Wall-clock timeline at current cadence (1 soak / 8h cron, ~3/day)**:
+
+* Tier A min: ~2 weeks
+* Tier B min: ~3 months
+* Tier C min: ~6 months
+* Tier D min: ~12-18 months
+
+The cadence engine is structurally bulletproof (Layer 6/7/8 closed). What's missing is **wall-clock time** + **autonomous activity volume**. The cron + soak harness handles the wall-clock; M10 master flag flip + roadmap consumption handle the activity volume.
+
+---
+
+### §41.7 Layer 4 — The Architectural Decision (Tier C → Tier D)
+
+This is the hard one. Tier C → Tier D isn't an engineering problem — it's a design decision about what "safe" means when operator isn't in the per-PR loop.
+
+The cage's safety properties (Wave 2 boundary gate, hash-cap, M10 forced approval, protected branches) all *assume operator-in-the-loop* as a structural invariant. Removing operator requires choosing a **replacement authority** that the cage can compose against.
+
+Four options, ordered by cost-effectiveness:
+
+**Option 1 — Signed Roadmap Document (RECOMMENDED)**
+
+* Operator writes `.jarvis/roadmap.signed.yaml` quarterly + signs it cryptographically (operator's GPG key)
+* Roadmap declares: scope (which subsystems O+V may modify), budget (cost cap + time cap), success criteria (test coverage, posture stability, drift bounds)
+* New substrate `signed_roadmap.py` verifies signature + parses scope/budget
+* Boundary gate + hash-cap consult roadmap: changes WITHIN scope auto-approve; OUT-OF-scope route to approval_required (same as today)
+* RoadmapReader (Layer 2) consumes the signed roadmap directly
+* Operator's authority retained: quarterly review of the roadmap document, not per-PR review
+* **Tradeoff**: operator still does work, just at a slower cadence; substantially less than per-PR review
+* **Effort**: ~2-3 weeks substrate + ongoing operator effort (quarterly)
+
+**Option 2 — Multi-Operator Quorum**
+
+* 2-of-3 maintainers must co-sign architectural commits
+* New substrate `quorum_authority.py` collects + verifies signatures
+* Replaces operator-singleton-authority with operator-quorum-authority
+* **Tradeoff**: requires recruiting 2 additional humans willing to act as quorum signers
+* **Effort**: ~4-6 weeks substrate + 2 additional humans + signature-collection workflow
+
+**Option 3 — External Trusted Oracle**
+
+* CI/CD pipeline (e.g., GitHub Actions w/ required human reviews on critical paths) replaces in-process operator review
+* Composes existing GitHub API + governance_boundary_gate for which paths require review
+* **Tradeoff**: still has human in critical-path loop (just outside the local repo); needs CI infrastructure
+* **Effort**: ~3-4 weeks substrate + CI configuration
+
+**Option 4 — Self-Bounding (Research-Grade)**
+
+* O+V proves to itself that a change is safe (proof carriers, formal verification, type-theoretic guarantees)
+* Composes AlphaVerus-style formal verification + Constitutional Classifiers
+* **Tradeoff**: currently unproven approach; research-grade only
+* **Effort**: 6-12 months R&D; high risk of not working
+
+**Recommendation**: **Option 1 (Signed Roadmap Document)**
+
+* Lowest engineering cost
+* Retains operator authority at the long-horizon level (quarterly signing) without per-PR friction
+* Composes naturally with existing Wave 2 substrates (boundary gate consults roadmap)
+* Compatible with Tier D operation while preserving the zero-order-doll architecture
+* Doesn't require recruiting additional humans (Option 2) or research breakthroughs (Option 4)
+
+**This decision should be made explicitly before Phase 3 (Tier C operational) — earlier is better since the chosen path constrains substrate design.**
+
+---
+
+### §41.8 Roadmap to Tier D — Phased 18-30 Month Plan
+
+| Phase | Duration | Milestone | Engineering | Operator |
+|---|---|---|---|---|
+| **Phase 0** | Today → 2 weeks | UX polish + WebBrowser substrate | Ship Slice 2 + Slice 3 + `web_browser.py` substrate | Review weekly |
+| **Phase 1** | 2 wks → 3 months | **Tier A operational** | M10 master flag flip + first 10 proposals + cadence-flag graduations | Review weekly, approve PRs |
+| **Phase 2** | 3 → 6 months | **Tier B operational** | RoadmapReader + goal decomposition planner | Review monthly, batch-approve aligned proposals |
+| **Phase 3** | 6 → 12 months | **Tier C operational** | Architectural taste + mutation testing + infra recovery + Layer 4 decision | Review quarterly, dashboard overseer |
+| **Phase 4** | 12 → 18 months | **Layer 4 substrate** | Build chosen replacement authority (recommended: signed_roadmap.py) | Sign roadmap quarterly |
+| **Phase 5** | 18 → 30 months | **Tier D operational** | Sustained evidence accumulation; cage proves Tier D-safe empirically | Sign roadmap; receive monthly status report |
+
+**Total realistic timeline to Tier D from 2026-05-11**: **18-30 months**.
+
+Most of the timeline is **Layer 3 wall-clock evidence + Layer 4 architectural decision**, not engineering. The engineering portion is ~14-22 weeks (~4-5 months) focused work.
+
+**Decision gates between phases**:
+
+* **Phase 0 → Phase 1**: UX polish is at parity; WebBrowser substrate has shipped + Phase 9 cadence has flipped ≥5 cadence flags.
+* **Phase 1 → Phase 2**: ≥10 M10 proposals shipped clean; ≥30 OV-signed commits adversarially audited clean.
+* **Phase 2 → Phase 3**: RoadmapReader is consuming a signed roadmap (even an unsigned one initially); goal decomposition is producing multi-step plans.
+* **Phase 3 → Phase 4**: Layer 4 decision is made + substrate has been designed (even if not yet shipped).
+* **Phase 4 → Phase 5**: Signed roadmap substrate is operational; first quarter of operator-paced quarterly review cycle complete.
+
+---
+
+### §41.9 Prioritization Framework — Highest Leverage at Each Horizon
+
+What to build NOW vs. what to defer, by time horizon.
+
+**This week (Phase 0)**:
+
+1. **UX Polish Slice 2** (welcome banner + tutorial + did-you-mean) — closes 6 of 19 remaining UX gaps; ~1-2 weeks
+2. **UX Polish Slice 3** (tab completion + fast-path + slash palette) — closes 7 more UX gaps; ~1-2 weeks
+3. **WebBrowser substrate** — unblocks autonomous research capability; ~3-5 weeks
+
+**This month (Phase 1 prep)**:
+
+4. **M10 master flag flip** — first autonomous architectural proposal; operator reviews + accepts/rejects → graduation contract begins accumulating evidence
+5. **Phase 9 cadence cron** — already running at 8h interval; just needs to keep running
+
+**3 months (Phase 2)**:
+
+6. **RoadmapReader substrate** — operator writes `.jarvis/roadmap.yaml` (unsigned initially); sensors consume goal items
+7. **Goal decomposition planner** — above PLAN phase; takes roadmap goal → decomposes into op chain
+8. **Slice 4** — resumable conversations + conversation export + search-in-conversation
+
+**6 months (Phase 3)**:
+
+9. **Architectural taste layer** — composes Claude API for design-quality verdicts on M10 proposals
+10. **Mutation testing harness** — composes existing TestRunner + AST mutation
+11. **Coverage gate** — composes `coverage.py` + Iron Gate
+12. **Long-horizon memory** — commit-history-aware memory layer
+13. **Infrastructure recovery loop** — autonomous disk/network/API recovery
+
+**12 months (Phase 4)**:
+
+14. **Layer 4 decision** — operator picks: signed roadmap (recommended) / multi-operator quorum / external oracle / self-bounding
+15. **Signed roadmap substrate** (assuming Option 1) — `signed_roadmap.py` composes existing boundary gate + hash-cap
+
+**18+ months (Phase 5)**:
+
+16. **Tier D activation** — boundary gate + hash-cap consult signed roadmap; M10 forced-approval lifts within roadmap scope; protected branches keep main-push gated on roadmap scope check
+17. **Trinity expansion** — once Tier D is stable, J-Prime and Reactor Core repos can be brought online with the same cage discipline
+
+---
+
+### §41.10 Honest Framing & Decision Points
+
+**The §40 → §41 reframe**:
+
+* §40 Waves 1-3 were framed as "advanced forward roadmap." They closed RRD recursion-bounding, adversarial cage completion, cross-session coherence, polish substrates. Each Wave shipped clean.
+* §41 reframes those Waves as **engineering preamble to Tier D**, not destination. The Tier D framing was implicit; §41 makes it explicit.
+* This isn't moving the goalposts — it's making them visible.
+
+**The fundamental decision the operator faces**:
+
+* **Path A: Stop at Tier B (monthly review)** — Achievable in 6-9 months. ~70% of "fully autonomous" value with ~10% of the architectural risk. Operator's role becomes batch-approver of weekly-batched proposals. Most pragmatic.
+* **Path B: Push to Tier D (roadmap-level only)** — Achievable in 18-30 months. Requires Layer 4 architectural decision. Fully realizes the operator-binding stated goal. Highest value, highest cost, highest architectural risk.
+* **Path C: Recognize Tier D isn't the goal you actually want** — The operator-in-the-loop pattern is O+V's load-bearing safety property. Other "fully autonomous" agents fail because they have no equivalent cage. Tier B might be the sweet spot architecturally.
+
+**The operator binding 2026-05-11 confirms Path B is the destination**. §41 is the honest decomposition of that path.
+
+**§41 vs. §40**: §40 closure was structural completion of the recursion-bounding triad + UX polish + cross-session coherence. §41 is what comes after — the actual destination. Future sessions reference §41.8 (the phased roadmap) for sequencing decisions; reference §41.7 (the architectural decision) for the load-bearing architectural choice; reference §41.5 (web browsing) for the operator-flagged capability gap; reference §41.6 (empirical evidence) for the wall-clock reality check.
+
+**The cage doesn't get weaker as we move toward Tier D — it gets stronger**. Boundary gate stays; hash-cap stays; antivenom stays; M10 forced-approval stays (but consults signed roadmap for scope). The operator's authority migrates from per-PR to roadmap-level. That's the actual architecture.
+
+**§41 status**: roadmap shipped 2026-05-11. Phase 0 work (Slice 2 + Slice 3 + WebBrowser substrate) is the next operator-paced sequence.
 
 ---
 
@@ -563,6 +931,17 @@ All shipped today, ALL CLOSED structurally:
         - [40.7.4 — AI Safety + Constitutional Cage (Antivenom philosophical foundation)](#4074--ai-safety--constitutional-cage-antivenom-philosophical-foundation)
         - [40.7.5 — Benchmarks (Phase 9 cadence empirical foundation)](#4075--benchmarks-phase-9-cadence-empirical-foundation)
         - [40.7.6 — Why this matters](#4076--why-this-matters)
+41. [Critical Path to Tier D — Fully Autonomous JARVIS Development (NEW 2026-05-11)](#41-critical-path-to-tier-d--fully-autonomous-jarvis-development-new-2026-05-11) *(the load-bearing North Star: O+V develops JARVIS proactively + fully autonomously, safely + governance-bounded — 18-30 month phased roadmap)*
+    - [41.1 The Stated Goal (Verbatim)](#411-the-stated-goal-verbatim)
+    - [41.2 The Tier Framework: A → B → C → D](#412-the-tier-framework-a--b--c--d)
+    - [41.3 UX Polish Gap (Updated Post-Slice 1)](#413-ux-polish-gap-updated-post-slice-1)
+    - [41.4 Layer 2 — Engineering Capability Gaps](#414-layer-2--engineering-capability-gaps)
+    - [41.5 NEW Operator-Flagged Gap — Web Search & Browsing Capability](#415-new-operator-flagged-gap--web-search--browsing-capability)
+    - [41.6 Layer 3 — Empirical Evidence Requirements (Wall-Clock)](#416-layer-3--empirical-evidence-requirements-wall-clock)
+    - [41.7 Layer 4 — The Architectural Decision (Tier C → Tier D)](#417-layer-4--the-architectural-decision-tier-c--tier-d)
+    - [41.8 Roadmap to Tier D — Phased 18-30 Month Plan](#418-roadmap-to-tier-d--phased-18-30-month-plan)
+    - [41.9 Prioritization Framework — Highest Leverage at Each Horizon](#419-prioritization-framework--highest-leverage-at-each-horizon)
+    - [41.10 Honest Framing & Decision Points](#4110-honest-framing--decision-points)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
