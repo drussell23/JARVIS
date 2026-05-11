@@ -519,6 +519,13 @@ EXHAUSTED / DISABLED) + budget allowance. Producer hook is
 best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_CROSS_REPO_MIRROR_FOUND = "cross_repo_mirror_found"
+"""§40 Wave 5 #20 (PRD v2.99+, 2026-05-11) — fired by
+``cross_repo_causal_mirror.scan_mirror_correlations`` only on
+MIRROR_FOUND verdict. TRIGGER-GATED — substrate stays inert
+unless multi-remote repo OR force flag."""
+
+
 EVENT_TYPE_PROOF_CARRIER_BUILT = "proof_carrier_built"
 """§40 Wave 5 #19 (PRD v2.99+, 2026-05-11) — fired by
 ``proof_carrier_transport.build_proof_carrier`` whenever
@@ -1183,6 +1190,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_PREDICTIVE_POSTMORTEM_FORECASTED, # §40 Wave 5 #18 (PRD v2.99+, predictive postmortem)
     EVENT_TYPE_COGNITIVE_LOAD_SHED_TRIGGERED,    # §40 Wave 5 #21 (PRD v2.99+, cognitive load shedding)
     EVENT_TYPE_PROOF_CARRIER_BUILT,              # §40 Wave 5 #19 (PRD v2.99+, proof carrier)
+    EVENT_TYPE_CROSS_REPO_MIRROR_FOUND,          # §40 Wave 5 #20 (PRD v2.99+, cross-repo mirror)
 })
 
 
