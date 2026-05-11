@@ -39,10 +39,12 @@ Authority boundary
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 from backend.core.ouroboros.battle_test.tool_render_policy import (
     DefaultLayoutModeProvider,
@@ -76,6 +78,16 @@ TOOL_RENDER_VIEW_SCHEMA_VERSION: str = "tool_render_view.v1"
 
 MASTER_FLAG_ENV_VAR: str = "JARVIS_TOOL_RENDER_REGISTRY_ENABLED"
 
+# §41.3 #8 — JSON pretty-print sub-flag. Composes the master
+# (off when master is off; rich rendering not in the dispatch
+# path at all in that case).
+JSON_PRETTY_ENABLED_ENV_VAR: str = (
+    "JARVIS_TOOL_OUTPUT_JSON_PRETTY_ENABLED"
+)
+JSON_PRETTY_MIN_SIZE_ENV_VAR: str = (
+    "JARVIS_TOOL_OUTPUT_JSON_PRETTY_MIN_SIZE"
+)
+
 
 def is_master_flag_enabled() -> bool:
     """Read the master flag. **Default ``true``** post Slice 5
@@ -87,6 +99,220 @@ def is_master_flag_enabled() -> bool:
     next tool render without restart. NEVER raises."""
     raw = os.environ.get(MASTER_FLAG_ENV_VAR, "true")
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def is_json_pretty_enabled() -> bool:
+    """``JARVIS_TOOL_OUTPUT_JSON_PRETTY_ENABLED``. §41.3 #8 —
+    default ``true``. Gates JSON detection + pretty-printing
+    + per-token coloring of tool-output bodies. Implicitly off
+    when the registry master is off (no rendering path). NEVER
+    raises."""
+    if not is_master_flag_enabled():
+        return False
+    raw = os.environ.get(JSON_PRETTY_ENABLED_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def json_pretty_min_size() -> int:
+    """Below this byte count, JSON pretty-printing is skipped —
+    tiny responses (e.g., ``{"ok": true}``) don't benefit from
+    indentation. Default 60. Clamped [10, 100_000]. NEVER raises."""
+    raw = os.environ.get(JSON_PRETTY_MIN_SIZE_ENV_VAR, "").strip()
+    try:
+        n = int(raw) if raw else 60
+        if n < 10:
+            return 10
+        if n > 100_000:
+            return 100_000
+        return n
+    except (TypeError, ValueError):
+        return 60
+
+
+# ---------------------------------------------------------------------------
+# §41.3 #8 — JSON detection + pretty-printing substrate
+# ---------------------------------------------------------------------------
+#
+# Two-tier detection per the operator binding:
+#   1. Descriptor hint (``descriptor.body_lexer == "json"``) wins
+#      first — when a tool's ToolRenderDescriptor declares its
+#      body is JSON, trust the declaration without re-parsing.
+#   2. Content auto-detect — try ``json.loads`` on the stripped
+#      body. Triggered when the descriptor doesn't declare a
+#      lexer OR declares something else (e.g., text bodies that
+#      happen to contain JSON from a `read_file` of a `.json`).
+#
+# Per-token coloring runs over the pretty-printed output. Tokens
+# resolve to palette keys so operators can theme JSON via the
+# same palette they pass to compose() — NO hardcoded hex colors
+# inside the wrapper. Falls back to sensible defaults when the
+# palette doesn't carry json-specific keys.
+
+
+# Palette keys for JSON tokens. Operators can override any of
+# these via the palette mapping passed to :func:`compose`. The
+# defaults below are tuned for dark terminals; the value-tier
+# tokens stay distinct from prose body lines.
+_JSON_TOKEN_PALETTE_KEYS: Tuple[Tuple[str, str], ...] = (
+    ("code_key", "cyan"),       # "key":
+    ("code_str", "green"),      # "string value"
+    ("code_num", "magenta"),    # 42, 3.14
+    ("code_kw", "bright_black bold"),  # null / true / false
+    ("code_punct", "dim"),      # { } [ ] , :
+)
+
+
+def _json_palette_value(
+    palette: Optional[Mapping[str, str]], key: str,
+) -> str:
+    """Look up a JSON-token palette colour. Falls back through
+    operator-passed palette → :data:`_JSON_TOKEN_PALETTE_KEYS`
+    defaults → ``"white"``."""
+    if palette and key in palette:
+        return palette[key]
+    for k, default in _JSON_TOKEN_PALETTE_KEYS:
+        if k == key:
+            return default
+    return "white"
+
+
+def _detect_json_body(
+    text: object,
+    *,
+    body_lexer_hint: Optional[str] = None,
+    min_size: Optional[int] = None,
+) -> Optional[Any]:
+    """Two-tier JSON detector. NEVER raises.
+
+    Returns the parsed Python object when the body is JSON,
+    ``None`` otherwise.
+
+    Tier 1: descriptor's ``body_lexer == "json"`` — explicit hint
+            from a tool's render descriptor. We still parse to
+            verify the body is *valid* JSON (a tool might
+            misreport its content type).
+    Tier 2: content auto-detect — strip whitespace; if the body
+            starts with ``{`` or ``[`` and meets the min-size
+            threshold, attempt ``json.loads``. Successful parse
+            → return the object.
+
+    Below the min-size threshold the detector returns ``None``
+    even when JSON parses (tiny responses look fine raw)."""
+    try:
+        body = str(text or "")
+    except Exception:  # noqa: BLE001
+        return None
+    stripped = body.strip()
+    if not stripped:
+        return None
+    min_bytes = (
+        min_size if min_size is not None
+        else json_pretty_min_size()
+    )
+    # Tier 1: explicit hint → parse anyway to validate.
+    if (
+        isinstance(body_lexer_hint, str)
+        and body_lexer_hint.strip().lower() == "json"
+    ):
+        try:
+            return json.loads(stripped)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+    # Tier 2: auto-detect — must look like JSON AND be substantial.
+    if not (stripped.startswith("{") or stripped.startswith("[")):
+        return None
+    if len(stripped) < min_bytes:
+        return None
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def pretty_print_json(
+    parsed: object,
+    *,
+    indent: int = 2,
+) -> str:
+    """Render a Python object as pretty-printed JSON. NEVER
+    raises — degrades to ``str(parsed)`` on any failure."""
+    try:
+        i = max(0, int(indent))
+    except (TypeError, ValueError):
+        i = 2
+    try:
+        return json.dumps(
+            parsed,
+            indent=i,
+            ensure_ascii=False,
+            sort_keys=False,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        try:
+            return str(parsed)
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+# Token-level regex over one JSON line. Order matters: keys are
+# strings that end with ":", so the key pattern must match BEFORE
+# the bare-string pattern. Numbers must match before keywords so
+# ``true_count`` isn't mis-tokenized.
+_JSON_LINE_TOKENIZER = re.compile(
+    r"""
+    (?P<key>"(?:\\.|[^"\\])*"\s*:)              # "key":
+    | (?P<str>"(?:\\.|[^"\\])*")                # "string"
+    | (?P<num>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?) # number
+    | (?P<kw>\b(?:true|false|null)\b)           # keywords
+    | (?P<punct>[{}\[\],:])                     # punctuation
+    """,
+    re.VERBOSE,
+)
+
+
+def _wrap_json_line(
+    line: str,
+    palette: Optional[Mapping[str, str]],
+) -> str:
+    """Per-line JSON colorizer. NEVER raises.
+
+    Walks the regex tokenizer left-to-right, emits Rich markup
+    around each recognized token; unrecognized spans pass
+    through untouched. Operates on PRETTY-PRINTED JSON lines so
+    each line carries balanced quotes / punctuation — partial
+    quotes from elision aren't possible since elision happens
+    AFTER pretty-printing.
+    """
+    try:
+        out: List[str] = []
+        last = 0
+        for match in _JSON_LINE_TOKENIZER.finditer(line):
+            start, end = match.span()
+            if start > last:
+                out.append(_escape(line[last:start]))
+            token_type = match.lastgroup or ""
+            text = match.group()
+            color_key = {
+                "key": "code_key",
+                "str": "code_str",
+                "num": "code_num",
+                "kw": "code_kw",
+                "punct": "code_punct",
+            }.get(token_type, "")
+            if color_key:
+                color = _json_palette_value(palette, color_key)
+                out.append(f"[{color}]{_escape(text)}[/{color}]")
+            else:
+                out.append(_escape(text))
+            last = end
+        if last < len(line):
+            out.append(_escape(line[last:]))
+        return "".join(out)
+    except Exception:  # noqa: BLE001
+        # Defensive: any tokenizer pathology degrades to plain
+        # text-line wrapping so the operator still sees the body.
+        return _escape(line)
 
 
 # ===========================================================================
@@ -380,6 +606,24 @@ def compose(
     # --- 1. Descriptor lookup
     descriptor = get_descriptor(tool_name)
 
+    # --- 1b. §41.3 #8 — JSON detection on the FULL body BEFORE
+    # render() applies the line cap. Two-tier: descriptor hint
+    # wins first; falls back to content auto-detect. When
+    # detected, we replace result_str with the pretty-printed
+    # form so render()'s bounding caps the indented output.
+    # The `_json_detected` flag downstream switches the per-line
+    # wrapper to the token-colorizer. NEVER raises into render().
+    _json_detected = False
+    if is_json_pretty_enabled() and result_str:
+        _parsed = _detect_json_body(
+            result_str, body_lexer_hint=descriptor.body_lexer,
+        )
+        if _parsed is not None:
+            _pretty = pretty_print_json(_parsed)
+            if _pretty:
+                result_str = _pretty
+                _json_detected = True
+
     # --- 2. Density resolution
     policy: DensityPolicy
     if isinstance(explicit_density, DensityPolicy):
@@ -447,8 +691,17 @@ def compose(
         palette,
     )
 
-    # Body lines wrapped per shape
-    wrapper = _BODY_WRAPPERS.get(descriptor.body_shape, _wrap_text_line)
+    # Body lines wrapped per shape. §41.3 #8 — when JSON was
+    # detected in step 1b, override the shape-dispatched wrapper
+    # with the JSON token-colorizer so keys/strings/numbers/
+    # keywords/punctuation get distinct markup. Elision markers
+    # still route through _wrap_marker_line uniformly.
+    if _json_detected:
+        wrapper = _wrap_json_line
+    else:
+        wrapper = _BODY_WRAPPERS.get(
+            descriptor.body_shape, _wrap_text_line,
+        )
     body_lines_markup: Tuple[str, ...] = tuple(
         _wrap_marker_line(ln, palette) if "elided" in ln and ln.lstrip().startswith("…")
         else wrapper(ln, palette)
