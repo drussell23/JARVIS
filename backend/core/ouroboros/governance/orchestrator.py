@@ -6615,9 +6615,18 @@ class GovernedOrchestrator:
                 # (UNKNOWN/LOW/MEDIUM band) clamp to NOTIFY_APPLY
                 # before auto-apply — load-bearing Antivenom defense
                 # against Move 9 single-roll Quine-class hallucinations.
+                # §40 Wave 2 #5 (2026-05-10) — pass target_files so the
+                # RRD §1 Boundary recursion-depth gate composes into
+                # the strictest-wins ladder. Ops touching the canonical
+                # governance directory force APPROVAL_REQUIRED — closes
+                # the infinite-regress risk where an autonomous proposer
+                # could modify the cage layer without operator review.
                 _op_id = getattr(ctx, "op_id", "") or ""
+                _target_files = getattr(ctx, "target_files", ()) or ()
                 _effective, _applied = apply_floor_to_name(
-                    _cur_name, op_id=_op_id,
+                    _cur_name,
+                    op_id=_op_id,
+                    target_files=_target_files,
                 )
                 if _applied is not None:
                     _floor_tier_map = {
@@ -6632,7 +6641,10 @@ class GovernedOrchestrator:
                             "[Orchestrator] GATE: MIN_RISK_TIER floor → %s→%s "
                             "op=%s reason=%s",
                             risk_tier.name, _tgt.name, ctx.op_id,
-                            floor_reason(op_id=_op_id),
+                            floor_reason(
+                                op_id=_op_id,
+                                target_files=_target_files,
+                            ),
                         )
                         risk_tier = _tgt
             except Exception:

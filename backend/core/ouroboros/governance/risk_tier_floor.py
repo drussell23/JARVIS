@@ -55,7 +55,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.RiskFloor")
 
@@ -363,11 +363,40 @@ def _confidence_floor_for_op(
     return None
 
 
+def _governance_boundary_floor(
+    target_files: Optional[Sequence[Any]],
+) -> Optional[str]:
+    """§40 Wave 2 #5 — compose the RRD §1 Boundary
+    recursion-depth gate. Lazy-imports the gate substrate;
+    returns ``"approval_required"`` when any target path crosses
+    into the canonical governance directory; ``None`` otherwise.
+    NEVER raises.
+
+    Composes the gate **at the consumer side** — the gate
+    substrate stays pure (no risk_tier_floor import); this
+    helper does the composition.
+    """
+    if not target_files:
+        return None
+    try:
+        from backend.core.ouroboros.governance.governance_boundary_gate import (  # noqa: E501
+            BoundaryVerdict,
+            evaluate_target_files,
+        )
+        report = evaluate_target_files(target_files)
+        if report.verdict is BoundaryVerdict.BOUNDARY_CROSSED:
+            return "approval_required"
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    return None
+
+
 def recommended_floor(
     now: Optional[datetime] = None,
     *,
     signal_source: str = "",
     op_id: Optional[str] = None,
+    target_files: Optional[Sequence[Any]] = None,
 ) -> Optional[str]:
     """Compose the floor signals into a single recommendation.
 
@@ -382,6 +411,13 @@ def recommended_floor(
            and the Slice 1 master flag is on, the worst observed
            confidence band for the op implies a floor (LOW /
            UNKNOWN / MEDIUM → ``notify_apply``).
+        6. **§40 Wave 2 #5 RRD §1 Boundary** — when ``target_files``
+           is provided and any path lies inside the canonical
+           governance directory (``backend/core/ouroboros/
+           governance/``), forces ``approval_required``. Closes
+           infinite-regress risk: M10 ArchitectureProposer (or
+           any future autonomous proposer) cannot autonomously
+           modify the cage layer.
 
     Returns the normalised tier name or ``None`` when nothing applies.
 
@@ -407,6 +443,9 @@ def recommended_floor(
     confidence = _confidence_floor_for_op(op_id)
     if confidence is not None:
         candidates.append(confidence)
+    boundary = _governance_boundary_floor(target_files)
+    if boundary is not None:
+        candidates.append(boundary)
     if not candidates:
         return None
     # Pick the strictest — highest ordinal wins.
@@ -420,6 +459,7 @@ def apply_floor_to_name(
     now: Optional[datetime] = None,
     signal_source: str = "",
     op_id: Optional[str] = None,
+    target_files: Optional[Sequence[Any]] = None,
 ) -> Tuple[str, Optional[str]]:
     """Apply the recommended floor to a tier *name*.
 
@@ -433,15 +473,20 @@ def apply_floor_to_name(
 
     Passing ``signal_source="vision_sensor"`` engages the VisionSensor
     floor (Invariant I2). Passing ``op_id`` engages the §37 Tier 2 #13
-    Slice 3 confidence-derived floor (master-flag-gated). See
-    :func:`recommended_floor`.
+    Slice 3 confidence-derived floor (master-flag-gated). Passing
+    ``target_files`` engages the §40 Wave 2 #5 RRD §1 Boundary gate
+    (forces ``approval_required`` for ops touching the canonical
+    governance directory). See :func:`recommended_floor`.
     """
     raw_in = _norm_tier(tier_name)
     _order = get_active_tier_order()
     if raw_in not in _order:
         return (tier_name, None)
     floor = recommended_floor(
-        now, signal_source=signal_source, op_id=op_id,
+        now,
+        signal_source=signal_source,
+        op_id=op_id,
+        target_files=target_files,
     )
     if floor is None:
         return (tier_name, None)
@@ -455,6 +500,7 @@ def floor_reason(
     *,
     signal_source: str = "",
     op_id: Optional[str] = None,
+    target_files: Optional[Sequence[Any]] = None,
 ) -> str:
     """Human-readable explanation of why the floor fires.
 
@@ -463,6 +509,8 @@ def floor_reason(
     source is passed, the vision-specific floor rationale is included.
     When ``op_id`` is supplied + the §37 Tier 2 #13 Slice 3 master flag
     is on, the worst observed confidence band for the op is included.
+    When ``target_files`` is supplied + the §40 Wave 2 #5 RRD §1
+    Boundary gate fires, the crossing-paths rationale is included.
     """
     bits: list = []
     explicit = _env_floor()
@@ -505,6 +553,30 @@ def floor_reason(
                         f"tool_confidence_band={_band.value} "
                         f"floor=notify_apply (Slice 3)"
                     )
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+    # §40 Wave 2 #5 — RRD §1 Boundary recursion-depth gate
+    # rationale. Only included when target_files supplied + the
+    # boundary gate actually fires (returns BOUNDARY_CROSSED).
+    if target_files:
+        try:
+            from backend.core.ouroboros.governance.governance_boundary_gate import (  # noqa: E501
+                BoundaryVerdict,
+                evaluate_target_files,
+            )
+            report = evaluate_target_files(target_files)
+            if report.verdict is BoundaryVerdict.BOUNDARY_CROSSED:
+                # Bound the rendered path list at 3 entries +
+                # canonical ellipsis for the rest.
+                paths = list(report.crossing_paths)[:3]
+                more = (
+                    f" (+{len(report.crossing_paths) - 3} more)"
+                    if len(report.crossing_paths) > 3 else ""
+                )
+                bits.append(
+                    f"governance_boundary_crossed={','.join(paths)}"
+                    f"{more} floor=approval_required (RRD §1)"
+                )
         except Exception:  # noqa: BLE001 — defensive
             pass
     if not bits:
