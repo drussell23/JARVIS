@@ -401,6 +401,21 @@ corpus + auto_committer.ov_signature_substring + git log
 walker against O+V's own commit history."""
 
 
+EVENT_TYPE_ANTIVENOM_IMMUNIZATION_AUDITED = (
+    "antivenom_immunization_audited"
+)
+"""§40 Wave 2 #7 (PRD v2.98+, 2026-05-10) — fired by
+``antivenom_self_immunization.audit_self_immunization`` after
+every probe loop. Payload carries ``finding`` + ``probes_run``
++ ``immunized_count`` + ``gap_count`` + ``baseline_miss_count``
++ ``coverage_ratio`` + ``per_kind_gap`` projection. Composes
+P9.4 corpus + SemanticGuardian with 5 deterministic mutations
+(whitespace_drift / comment_insertion / rename_variable /
+string_split_concat / parens_wrap) to surface immunization
+gaps where the cage's static-string AST detectors miss
+semantically-equivalent variants."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -998,6 +1013,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_PERMISSION_DECISION_RECORDED,     # Venom V2 Slice 3 (PRD v2.91, permission_decision_archive)
     EVENT_TYPE_SECOND_ORDER_DOLL_PROGRESS_UPDATED, # §40 Tier 1 #15 (PRD v2.98+, second-order doll completion metric)
     EVENT_TYPE_AUTOBIOGRAPHY_AUDIT_COMPLETED,    # §40 Wave 1 #8 (PRD v2.98+, adversarial autobiography retrospective audit)
+    EVENT_TYPE_ANTIVENOM_IMMUNIZATION_AUDITED,   # §40 Wave 2 #7 (PRD v2.98+, antivenom self-immunization probe loop)
 })
 
 
