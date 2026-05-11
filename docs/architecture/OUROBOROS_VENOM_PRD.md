@@ -416,7 +416,7 @@ composes the substrate — no duplicated logic, no parallel state.
 
 | # | Item | Status | Effort | Slice |
 |---|---|---|---|---|
-| 14 | Tab completion on slash commands/args | 🟡 SUBSTRATE READY (`5e1ad3d3ca` — `VerbDescriptor.arg_spec` populated via `@arg_spec:` tag OR signature inspection; per-position completer wiring deferred) | ~3 days | Slice 3 |
+| 14 | Tab completion on slash commands/args | ✅ **SHIPPED 2026-05-11** (`10673d9deb` — `ArgKind` closed taxonomy + `parse_arg_spec` regex parser + `register_arg_provider` callable registry + `get_arg_candidates` dispatcher + `cursor_arg_position` parser + `_SlashCompleter` per-position branch; SerpentREPL wires `op_id` provider snapshotting `GLS._active_ops`; convention dispatch makes any future verb with `<op_id>` complete live without further code changes) | ~3 days | Slice 3 |
 | 15 | Welcome banner on first launch | ✅ **SHIPPED 2026-05-11** (`e8f4c203a4` substrate + `c475e3de66` boot wiring) | ~2 days | Slice 2 |
 | 16 | First-time setup walkthrough | ⚪ DEFERRED (significant overlap with shipped `/tutorial`; revisit if operator-driven need surfaces) | ~5 days | Slice 2 |
 | 17 | Tutorial mode (`/tutorial`) | ✅ **SHIPPED 2026-05-11** (`e8f4c203a4` + `c475e3de66`) | ~4 days | Slice 2 |
