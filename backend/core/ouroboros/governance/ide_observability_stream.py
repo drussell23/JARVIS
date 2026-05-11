@@ -472,6 +472,24 @@ prior-history ledger at ``.jarvis/schelling_prior_history.jsonl``.
 Producer hook is best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_SLEEP_CONSOLIDATION_PASSED = (
+    "sleep_consolidation_passed"
+)
+"""§40 Wave 4 #10 (PRD v2.99+, 2026-05-10) — fired by
+``sleep_consolidation_pass.run_consolidation_pass`` whenever
+the evaluation completes with a verdict of CONSOLIDATED or
+DREAMING (AWAKE / DISABLED are silent — operators get pinged
+only when the substrate actually ran the pattern matcher).
+Payload carries summary metrics (``verdict`` + ``idle_seconds``
++ ``idle_threshold_s`` + ``blueprints_examined`` +
+``candidate_count`` + ``falsified_belief_count`` +
+``fused_meta_count`` + ``elapsed_s`` + ``schema_version``).
+Composes Wave 4 #9 belief_revision_ledger + Wave 4 #11
+postmortem_fusion + DreamEngine (read-only via injectable
+provider). Producer hook is best-effort — broker exception
+NEVER raises."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -1074,6 +1092,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_BELIEF_REVISION_RECORDED,         # §40 Wave 4 #9 (PRD v2.99+, belief revision ledger evidence row)
     EVENT_TYPE_POSTMORTEM_FUSED,                 # §40 Wave 4 #11 (PRD v2.99+, postmortem fusion meta-postmortem)
     EVENT_TYPE_SCHELLING_TIE_BROKEN,             # §40 Wave 4 #12 (PRD v2.99+, schelling-point tie-break)
+    EVENT_TYPE_SLEEP_CONSOLIDATION_PASSED,       # §40 Wave 4 #10 (PRD v2.99+, sleep consolidation pass)
 })
 
 
