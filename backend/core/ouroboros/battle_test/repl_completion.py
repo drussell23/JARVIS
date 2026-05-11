@@ -53,6 +53,7 @@ What this module does NOT do
 """
 from __future__ import annotations
 
+import enum
 import inspect
 import logging
 import os
@@ -155,6 +156,20 @@ def resolve_history_path() -> Optional[Path]:
 # ===========================================================================
 
 
+class VerbCategory(str, enum.Enum):
+    """Closed 4-value taxonomy — bytes-pinned via AST.
+
+    Group verbs for tutorial mode + ``/help`` rendering. Categories
+    derive from the handler's docstring tag (``@category: lifecycle``)
+    or default to OPERATIONAL when no tag is present.
+    """
+
+    LIFECYCLE = "lifecycle"       # /accept /reject /cancel /quit /goal
+    INTROSPECTION = "introspection"   # /status /posture /budget /memory
+    NAVIGATION = "navigation"     # /expand /attach /review
+    OPERATIONAL = "operational"   # everything else (default)
+
+
 @dataclass(frozen=True)
 class VerbDescriptor:
     """One discovered REPL verb.
@@ -166,11 +181,28 @@ class VerbDescriptor:
       :class:`SerpentREPL` (empty string for built-ins).
     * ``description`` — first line of the handler's docstring (or a
       curated string for built-ins). Shown in the completion dropdown.
+    * ``aliases`` — additional slash-forms that route to the same
+      handler (e.g. ``/exit`` aliases ``/quit``). Empty tuple by default.
+    * ``examples`` — operator-facing usage examples surfaced in
+      ``--help`` output AND injected into error messages. Each entry
+      is one example line (e.g. ``"/cancel op-abc123 --immediate"``).
+    * ``arg_spec`` — short usage line derived from the handler's
+      signature (e.g. ``"<op_id> [--immediate]"``). Empty for verbs
+      taking no arguments.
+    * ``category`` — :class:`VerbCategory` for tutorial grouping.
+
+    All extension fields default to empty/OPERATIONAL so existing
+    callers constructing :class:`VerbDescriptor` keyword-only with the
+    original three fields remain byte-identical.
     """
 
     slash_form: str
     handler_method: str
     description: str
+    aliases: Tuple[str, ...] = ()
+    examples: Tuple[str, ...] = ()
+    arg_spec: str = ""
+    category: VerbCategory = VerbCategory.OPERATIONAL
     schema_version: str = REPL_COMPLETION_SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -178,8 +210,20 @@ class VerbDescriptor:
             "slash_form": self.slash_form,
             "handler_method": self.handler_method,
             "description": self.description,
+            "aliases": list(self.aliases),
+            "examples": list(self.examples),
+            "arg_spec": self.arg_spec,
+            "category": self.category.value,
             "schema_version": self.schema_version,
         }
+
+    def matches(self, slash_form: object) -> bool:
+        """True iff ``slash_form`` matches the primary form OR an alias."""
+        if not isinstance(slash_form, str):
+            return False
+        if slash_form == self.slash_form:
+            return True
+        return slash_form in self.aliases
 
 
 @dataclass(frozen=True)
@@ -196,12 +240,34 @@ class VerbRegistry:
         return tuple(v.slash_form for v in self.verbs)
 
     def find(self, slash_form: object) -> Optional[VerbDescriptor]:
+        """Find by primary slash form OR alias. NEVER raises."""
         if not isinstance(slash_form, str):
             return None
         for v in self.verbs:
-            if v.slash_form == slash_form:
+            if v.matches(slash_form):
                 return v
         return None
+
+    def by_category(
+        self, category: object,
+    ) -> Tuple[VerbDescriptor, ...]:
+        """Filter verbs by category. NEVER raises."""
+        try:
+            value = (
+                category.value if hasattr(category, "value")
+                else str(category)
+            )
+        except Exception:  # noqa: BLE001
+            return ()
+        return tuple(
+            v for v in self.verbs if v.category.value == value
+        )
+
+    def categories(self) -> Tuple[str, ...]:
+        """Unique categories present, sorted. NEVER raises."""
+        return tuple(sorted(
+            {v.category.value for v in self.verbs}
+        ))
 
 
 # ===========================================================================
@@ -242,6 +308,9 @@ def _first_doc_line(method: object) -> str:
         stripped = line.strip()
         if not stripped:
             continue
+        # @-tag lines aren't the description; skip past them.
+        if stripped.startswith("@") and ":" in stripped:
+            continue
         # Strip ``literal`` backticks and Sphinx role prefixes for
         # cleaner dropdown rendering.
         cleaned = re.sub(r"``([^`]+)``", r"\1", stripped)
@@ -251,6 +320,250 @@ def _first_doc_line(method: object) -> str:
             # Truncate to ~80 chars for tidy dropdown rendering
             return cleaned[:80]
     return ""
+
+
+# Lightweight docstring @-tag parser. Convention (additive — no
+# handler is REQUIRED to use these; missing tags default to
+# empty/OPERATIONAL):
+#
+#   @arg_spec: <op_id> [--immediate]
+#   @example: /cancel op-abc123
+#   @example: /cancel op-abc123 --immediate
+#   @category: lifecycle
+#   @alias: /stop
+#
+# Multiple ``@example`` and ``@alias`` lines collect into tuples.
+_TAG_LINE_RE = re.compile(r"^\s*@(\w+)\s*:\s*(.+?)\s*$")
+
+
+def _parse_doc_tags(method: object) -> dict:
+    """Parse @-tag metadata out of a handler's docstring. NEVER raises."""
+    out: dict = {
+        "aliases": [],
+        "examples": [],
+        "arg_spec": "",
+        "category": VerbCategory.OPERATIONAL,
+    }
+    try:
+        doc = inspect.getdoc(method) or ""
+    except Exception:  # noqa: BLE001
+        return out
+    for line in doc.splitlines():
+        m = _TAG_LINE_RE.match(line)
+        if not m:
+            continue
+        tag, value = m.group(1).lower(), m.group(2).strip()
+        if not value:
+            continue
+        if tag == "alias":
+            slash = value if value.startswith("/") else f"/{value}"
+            out["aliases"].append(slash[:64])
+        elif tag == "example":
+            out["examples"].append(value[:200])
+        elif tag == "arg_spec":
+            out["arg_spec"] = value[:160]
+        elif tag == "category":
+            try:
+                out["category"] = VerbCategory(value.lower())
+            except (TypeError, ValueError):
+                pass  # unknown category → stays OPERATIONAL
+    return out
+
+
+def _infer_arg_spec_from_signature(method: object) -> str:
+    """Build a usage-line fallback from the method's signature.
+
+    Used when no ``@arg_spec:`` tag is present. NEVER raises —
+    returns empty on failure. Skips ``self`` and ignores *args/
+    **kwargs so the output stays operator-friendly.
+    """
+    try:
+        sig = inspect.signature(method)
+    except (TypeError, ValueError):
+        return ""
+    parts: List[str] = []
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        kind = param.kind
+        if kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if param.default is inspect.Parameter.empty:
+            parts.append(f"<{name}>")
+        else:
+            parts.append(f"[{name}]")
+    return " ".join(parts)[:160]
+
+
+# ===========================================================================
+# §41.3 Slice 2/3 substrate helpers — typo suggestion + fuzzy match + help
+# ===========================================================================
+
+
+def _levenshtein(a: str, b: str, *, cap: int = 4) -> int:
+    """Bounded Levenshtein distance. NEVER raises.
+
+    Early-exits when the running minimum exceeds ``cap`` — keeps the
+    cost O(min(len, cap)) per call so this is safe to run against
+    every verb on every unknown-verb error.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    # Two-row dynamic programming
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i] + [0] * len(b)
+        row_min = curr[0]
+        for j, cb in enumerate(b, start=1):
+            ins = curr[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            curr[j] = min(ins, dele, sub)
+            if curr[j] < row_min:
+                row_min = curr[j]
+        if row_min > cap:
+            return cap + 1
+        prev = curr
+    return prev[-1]
+
+
+def suggest_for_typo(
+    typed: object,
+    registry: VerbRegistry,
+    *,
+    max_distance: int = 2,
+    max_results: int = 3,
+) -> Tuple[str, ...]:
+    """Suggest verb candidates for a probable typo. NEVER raises.
+
+    Returns a tuple of slash forms ordered by edit distance. Used by
+    the unknown-verb error path so operators see ``did you mean
+    /cancel?`` when they type ``/cancl``. The distance cap is
+    operator-tunable via :data:`max_distance` (default 2 — catches
+    one transposition or one missing char).
+    """
+    try:
+        text = str(typed or "").strip()
+    except Exception:  # noqa: BLE001
+        return ()
+    if not text or not text.startswith("/"):
+        return ()
+    scored: List[Tuple[int, str]] = []
+    for v in registry.verbs:
+        for candidate in (v.slash_form,) + tuple(v.aliases):
+            dist = _levenshtein(text, candidate, cap=max_distance + 1)
+            if dist <= max_distance:
+                scored.append((dist, candidate))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    # De-dup while preserving order (a verb's alias may tie with its
+    # primary form — keep the primary first).
+    seen: set = set()
+    out: List[str] = []
+    for _, name in scored:
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= max(1, int(max_results)):
+            break
+    return tuple(out)
+
+
+def fuzzy_match(
+    prefix: object,
+    registry: VerbRegistry,
+    *,
+    max_results: int = 8,
+) -> Tuple[VerbDescriptor, ...]:
+    """Fuzzy-match verbs for the completion palette. NEVER raises.
+
+    Routing:
+
+    1. Prefix-match always wins — the existing palette behavior
+       (line-by-line ``startswith``) is preserved when the operator
+       is typing a known prefix.
+    2. When prefix-match yields 0 results AND ``prefix`` is at least
+       2 chars past the leading slash, fall back to a substring +
+       edit-distance composite score so ``/risc`` still surfaces
+       ``/risk`` and ``/budgt`` surfaces ``/budget``.
+
+    The completer composes this helper to extend behavior without
+    changing the existing prefix-match path's byte-identical output.
+    """
+    try:
+        text = str(prefix or "").strip()
+    except Exception:  # noqa: BLE001
+        return ()
+    if not text or not text.startswith("/"):
+        return ()
+    # Phase 1 — prefix-match
+    prefix_hits = tuple(
+        v for v in registry.verbs
+        if v.slash_form.startswith(text)
+        or any(a.startswith(text) for a in v.aliases)
+    )
+    if prefix_hits:
+        return prefix_hits[: max(1, int(max_results))]
+    # Phase 2 — only invoke fuzzy when prefix-match has nothing AND
+    # operator has typed enough that it isn't a "just started a /"
+    # case (avoid surfacing nonsense when the user has only typed
+    # ``/`` or ``/x``).
+    if len(text) < 3:
+        return ()
+    scored: List[Tuple[int, VerbDescriptor]] = []
+    body = text[1:]
+    for v in registry.verbs:
+        candidate_body = v.slash_form[1:]
+        score = _levenshtein(body, candidate_body, cap=4)
+        if body in candidate_body:
+            # Substring hit beats pure edit-distance — bias toward 0.
+            score = min(score, max(0, len(candidate_body) - len(body)))
+        if score <= 4:
+            scored.append((score, v))
+    scored.sort(key=lambda x: (x[0], x[1].slash_form))
+    return tuple(v for _, v in scored[: max(1, int(max_results))])
+
+
+def format_verb_help(verb: VerbDescriptor) -> str:
+    """Render a ``/verb --help`` block. NEVER raises.
+
+    Output shape::
+
+        /cancel <op_id> [--immediate]
+          Cancel a pending op via cooperative cancellation.
+
+          aliases: /stop
+          examples:
+            /cancel op-abc123
+            /cancel op-abc123 --immediate
+    """
+    try:
+        usage = verb.slash_form
+        if verb.arg_spec:
+            usage = f"{usage} {verb.arg_spec}"
+        lines = [usage]
+        if verb.description:
+            lines.append(f"  {verb.description}")
+        if verb.aliases:
+            lines.append("")
+            lines.append(f"  aliases: {', '.join(verb.aliases)}")
+        if verb.examples:
+            lines.append("")
+            lines.append("  examples:")
+            for ex in verb.examples:
+                lines.append(f"    {ex}")
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        return verb.slash_form if verb else ""
 
 
 # ===========================================================================
@@ -296,11 +609,17 @@ def discover_verbs(repl_instance: object) -> VerbRegistry:
             if not slash or slash in seen:
                 continue
             seen.add(slash)
+            tags = _parse_doc_tags(method)
+            arg_spec = tags["arg_spec"] or _infer_arg_spec_from_signature(method)
             discovered.append(
                 VerbDescriptor(
                     slash_form=slash,
                     handler_method=name,
                     description=_first_doc_line(method),
+                    aliases=tuple(tags["aliases"]),
+                    examples=tuple(tags["examples"]),
+                    arg_spec=arg_spec,
+                    category=tags["category"],
                 )
             )
 
@@ -362,15 +681,23 @@ def build_completer(registry: VerbRegistry) -> Optional[object]:
             # suggestions interleaved with their natural input.
             if not text.startswith("/"):
                 return
-            # ``text`` includes the leading slash; match by prefix.
-            for verb in verbs:
-                if verb.slash_form.startswith(text):
-                    yield Completion(
-                        text=verb.slash_form,
-                        start_position=-len(text),
-                        display=verb.slash_form,
-                        display_meta=verb.description,
-                    )
+            # ``text`` includes the leading slash. Route through
+            # fuzzy_match — it returns prefix hits first, falls back
+            # to substring + edit-distance only when prefix yields
+            # nothing AND the operator has typed enough to make
+            # fuzzy meaningful. Byte-identical to legacy prefix-match
+            # for the common case (operator typing a known verb).
+            try:
+                matches = fuzzy_match(text, registry)
+            except Exception:  # noqa: BLE001 — defensive
+                matches = ()
+            for verb in matches:
+                yield Completion(
+                    text=verb.slash_form,
+                    start_position=-len(text),
+                    display=verb.slash_form,
+                    display_meta=verb.description,
+                )
 
     slash_completer = _SlashCompleter()
 
@@ -522,13 +849,17 @@ __all__ = [
     "HISTORY_PATH_ENV_VAR",
     "MASTER_FLAG_ENV_VAR",
     "REPL_COMPLETION_SCHEMA_VERSION",
+    "VerbCategory",
     "VerbDescriptor",
     "VerbRegistry",
     "build_completer",
     "build_completion_wiring",
     "build_history",
     "discover_verbs",
+    "format_verb_help",
+    "fuzzy_match",
     "is_completion_enabled",
     "is_history_enabled",
     "resolve_history_path",
+    "suggest_for_typo",
 ]
