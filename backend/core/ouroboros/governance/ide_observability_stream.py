@@ -519,6 +519,15 @@ EXHAUSTED / DISABLED) + budget allowance. Producer hook is
 best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_META_PRIOR_LEARNED = "meta_prior_learned"
+"""§40 Wave 5 #22 (PRD v2.99+, 2026-05-11) — fired by
+``meta_prior_learning.compute_meta_distribution`` whenever at
+least one prior reaches DOMINANT or EMERGING verdict. Payload
+carries per-verdict counts + elapsed_s + schema_version.
+Composes Wave 4 #12 Schelling history ledger. Producer hook
+is best-effort — broker exception NEVER raises."""
+
+
 EVENT_TYPE_COMPOSITIONAL_CURIOSITY_EVALUATED = (
     "compositional_curiosity_evaluated"
 )
@@ -1141,6 +1150,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_MIRROR_SELF_CALIBRATED,           # §40 Wave 4 #14 (PRD v2.99+, mirror-self calibration)
     EVENT_TYPE_ANTI_FRAGILITY_EVALUATED,         # §40 Wave 4 #13 (PRD v2.99+, anti-fragility budget)
     EVENT_TYPE_COMPOSITIONAL_CURIOSITY_EVALUATED, # §40 Wave 1 #16 (PRD v2.99+, compositional curiosity)
+    EVENT_TYPE_META_PRIOR_LEARNED,               # §40 Wave 5 #22 (PRD v2.99+, meta-prior learning)
 })
 
 
