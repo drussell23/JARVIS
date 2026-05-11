@@ -526,6 +526,16 @@ MIRROR_FOUND verdict. TRIGGER-GATED — substrate stays inert
 unless multi-remote repo OR force flag."""
 
 
+EVENT_TYPE_ARCHITECTURAL_TASTE_EVALUATED = (
+    "architectural_taste_evaluated"
+)
+"""§41.4 Phase 1 third arc (PRD v3.0+, 2026-05-11) — fired by
+``architectural_taste_layer.evaluate_change`` after each
+assessment. Payload carries overall_verdict + assessment_count
++ llm_enriched + elapsed_s + schema_version. Advisory only —
+substrate does not gate APPLY."""
+
+
 EVENT_TYPE_GOAL_DECOMPOSED = "goal_decomposed"
 """§41.4 Phase 1 second arc (PRD v3.0+, 2026-05-11) — fired
 by ``goal_decomposition_planner.decompose_and_emit`` after
@@ -1226,6 +1236,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_WEB_BROWSING_ACTION,              # §41.5 Phase 0 (PRD v3.0+, web_browser composer)
     EVENT_TYPE_ROADMAP_PROCESSED,                # §41.4 Phase 1 (PRD v3.0+, roadmap_reader)
     EVENT_TYPE_GOAL_DECOMPOSED,                  # §41.4 Phase 1 second arc (PRD v3.0+, goal_decomposition_planner)
+    EVENT_TYPE_ARCHITECTURAL_TASTE_EVALUATED,    # §41.4 Phase 1 third arc (PRD v3.0+, architectural_taste_layer)
 })
 
 
