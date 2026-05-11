@@ -526,6 +526,16 @@ MIRROR_FOUND verdict. TRIGGER-GATED — substrate stays inert
 unless multi-remote repo OR force flag."""
 
 
+EVENT_TYPE_GOAL_DECOMPOSED = "goal_decomposed"
+"""§41.4 Phase 1 second arc (PRD v3.0+, 2026-05-11) — fired
+by ``goal_decomposition_planner.decompose_and_emit`` after
+each decomposition pass. Payload carries verdict +
+sub_goal_count + dag_depth + emitted_count + elapsed_s +
+schema_version. Composes canonical
+intake.intent_envelope.make_envelope — no parallel envelope
+construction."""
+
+
 EVENT_TYPE_ROADMAP_PROCESSED = "roadmap_processed"
 """§41.4 Phase 1 (PRD v3.0+, 2026-05-11) — fired by
 ``roadmap_reader.process_roadmap`` after each roadmap
@@ -1215,6 +1225,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_CROSS_REPO_MIRROR_FOUND,          # §40 Wave 5 #20 (PRD v2.99+, cross-repo mirror)
     EVENT_TYPE_WEB_BROWSING_ACTION,              # §41.5 Phase 0 (PRD v3.0+, web_browser composer)
     EVENT_TYPE_ROADMAP_PROCESSED,                # §41.4 Phase 1 (PRD v3.0+, roadmap_reader)
+    EVENT_TYPE_GOAL_DECOMPOSED,                  # §41.4 Phase 1 second arc (PRD v3.0+, goal_decomposition_planner)
 })
 
 
