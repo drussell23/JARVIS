@@ -526,6 +526,18 @@ MIRROR_FOUND verdict. TRIGGER-GATED — substrate stays inert
 unless multi-remote repo OR force flag."""
 
 
+EVENT_TYPE_WEB_BROWSING_ACTION = "web_browsing_action"
+"""§41.5 Phase 0 (PRD v3.0+, 2026-05-11) — fired by
+``web_browser.perform_browsing_action`` after every browsing
+action (SEARCH/NAVIGATE/FOLLOW_LINK/EXTRACT_TEXT/EXTRACT_IMAGE
+/CITE) regardless of verdict. Payload carries action +
+verdict + host + content_bytes + redacted_bytes +
+leaked_credential_kinds + backend_used + latency_ms +
+op_id. Composes 5 existing surfaces (web_search /
+browser_bridge / web_research_service / conversation_bridge /
+mcp_output_scanner) + cross_process_jsonl — no parallel HTTP."""
+
+
 EVENT_TYPE_PROOF_CARRIER_BUILT = "proof_carrier_built"
 """§40 Wave 5 #19 (PRD v2.99+, 2026-05-11) — fired by
 ``proof_carrier_transport.build_proof_carrier`` whenever
@@ -1191,6 +1203,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_COGNITIVE_LOAD_SHED_TRIGGERED,    # §40 Wave 5 #21 (PRD v2.99+, cognitive load shedding)
     EVENT_TYPE_PROOF_CARRIER_BUILT,              # §40 Wave 5 #19 (PRD v2.99+, proof carrier)
     EVENT_TYPE_CROSS_REPO_MIRROR_FOUND,          # §40 Wave 5 #20 (PRD v2.99+, cross-repo mirror)
+    EVENT_TYPE_WEB_BROWSING_ACTION,              # §41.5 Phase 0 (PRD v3.0+, web_browser composer)
 })
 
 
