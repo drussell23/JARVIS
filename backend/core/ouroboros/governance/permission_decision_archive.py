@@ -555,5 +555,115 @@ __all__ = [
     "get_default_archive",
     "maybe_record_decision",
     "permission_archive_enabled",
+    "register_flags",
     "reset_default_archive_for_tests",
 ]
+
+
+# ===========================================================================
+# Venom V2 Slice 5 — FlagRegistry self-registration
+# ===========================================================================
+#
+# Auto-discovered by ``flag_registry_seed._discover_module_provided_flags``
+# via the ``backend.core.ouroboros.governance`` provider package walk. The
+# §33.3 naming-cage discipline applied to flags: co-located with the
+# consuming substrate (this module), zero edits to the seed file. Adding
+# a new flag here lands in the registry next boot without touching
+# ``flag_registry_seed.SEED_SPECS``.
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration for the Venom V2
+    permission-decision archive.
+
+    Returns count of FlagSpecs added. NEVER raises — graduation soak
+    path is fail-open (the canonical module-discovery primitive
+    swallows our return value as a best-effort hint).
+
+    Composes the canonical :class:`FlagSpec` shape from
+    :mod:`flag_registry`. Mirrors the seed pattern from
+    ``tool_render_view.register_flags`` (Gap #2 Slice 5, 2026-05-04):
+
+      * master kill switch first (``SAFETY`` category, BOOL,
+        default-FALSE per §33.1 graduation contract — operator
+        flip-points)
+      * capacity tuning second (``CAPACITY`` category, INT,
+        default 50 — RAM-bound)
+
+    Both flags are operator-visible via ``/help flags`` + ``GET
+    /observability/flags`` + Levenshtein typo detection.
+    """
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category, FlagSpec, FlagType,
+        )
+    except ImportError:
+        return 0
+    specs = [
+        FlagSpec(
+            name=MASTER_FLAG_ENV_VAR,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Master kill switch for the Venom V2 permission "
+                "decision archive. When false, "
+                "``maybe_record_decision`` short-circuits before "
+                "the ring write AND before the SSE producer-bridge "
+                "(``permission_decision_recorded`` event). The "
+                "IDE GET routes ``/observability/tool-permissions"
+                "[/by-tool/{tool_name}|/{op_id}]`` 403 with "
+                "reason_code=``ide_observability.tool_permissions_"
+                "disabled``. The REPL verb ``/tool_permissions`` "
+                "returns a disabled-notice (help still works). "
+                "Default FALSE per §33.1 graduation contract — "
+                "operator flips via 3-clean-soak ladder when "
+                "Venom V2 callback registrations land in production."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "permission_decision_archive.py"
+            ),
+            example="true",
+            since="Venom V2 Slice 1 (v2.89, 2026-05-10)",
+        ),
+        FlagSpec(
+            name=ARCHIVE_SIZE_ENV_VAR,
+            type=FlagType.INT,
+            default=_DEFAULT_ARCHIVE_SIZE,
+            description=(
+                "Capacity of the BoundedDecisionArchive ring (Slice "
+                "1) — the session-scoped FIFO of permission "
+                "decisions behind ``/expand p-N`` recovery hints + "
+                "``/tool_permissions`` REPL queries + "
+                "``/observability/tool-permissions`` IDE GET. "
+                "Drop-oldest eviction; clamped to [1, 10_000]. "
+                "Increase for high-decision-throughput sessions "
+                "(rare today since Venom V2 callback registrations "
+                "are operator-opt-in); decrease for memory-tight "
+                "environments. Monotonic ``p-N`` ref counter "
+                "NEVER rewinds even after eviction — refs always "
+                "resolve to the same decision or to None."
+            ),
+            category=Category.CAPACITY,
+            source_file=(
+                "backend/core/ouroboros/governance/"
+                "permission_decision_archive.py"
+            ),
+            example="50",
+            since="Venom V2 Slice 1 (v2.89, 2026-05-10)",
+        ),
+    ]
+    count = 0
+    for spec in specs:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001 — boot-time fail-open
+            logger.debug(
+                "[PermissionDecisionArchive] flag registration "
+                "failed for %s",
+                getattr(spec, "name", "?"),
+                exc_info=True,
+            )
+    return count
