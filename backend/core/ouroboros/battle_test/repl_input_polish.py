@@ -63,7 +63,9 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.ReplInputPolish")
@@ -79,6 +81,9 @@ REPL_INPUT_POLISH_SCHEMA_VERSION: str = "repl_input_polish.v1"
 
 MASTER_FLAG_ENV_VAR: str = "JARVIS_REPL_INPUT_POLISH_ENABLED"
 TITLE_ENABLED_ENV_VAR: str = "JARVIS_TERMINAL_TITLE_ENABLED"
+MENTION_RICH_METADATA_ENV_VAR: str = (
+    "JARVIS_REPL_MENTION_RICH_METADATA_ENABLED"
+)
 
 
 def is_polish_enabled() -> bool:
@@ -87,6 +92,20 @@ def is_polish_enabled() -> bool:
     @-mention extraction, Esc-to-cancel, and terminal title updates.
     NEVER raises."""
     raw = os.environ.get(MASTER_FLAG_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def is_mention_rich_metadata_enabled() -> bool:
+    """``JARVIS_REPL_MENTION_RICH_METADATA_ENABLED``. §41.3 #10 —
+    default true. Gates the rich @-mention metadata enrichment
+    (type glyph + size + age) on completion entries. Implicitly
+    off when polish master is off (no @-mention completer
+    available). NEVER raises."""
+    if not is_polish_enabled():
+        return False
+    raw = os.environ.get(
+        MENTION_RICH_METADATA_ENV_VAR, "true",
+    )
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
@@ -437,6 +456,228 @@ def _pick_active_op_id(flow: object) -> Optional[str]:
 #     completer (operator opt-out).
 
 
+# ===========================================================================
+# §41.3 #10 — rich @-mention metadata
+# ===========================================================================
+#
+# Data on module — operator-readable, AST-pinnable. Adding a new
+# kind / unit requires editing this table, NOT the format function.
+# Order matters for size units (largest threshold last so the loop
+# below picks the most compact representation).
+
+_MENTION_KIND_GLYPHS: Tuple[Tuple[str, str], ...] = (
+    ("dir", "📁"),
+    ("symlink", "🔗"),
+    ("file", "📄"),
+    ("missing", "?"),
+)
+
+# (threshold_bytes, divisor, suffix). Largest threshold last; the
+# format function picks the LAST entry whose threshold is ≤ size.
+_MENTION_SIZE_UNITS: Tuple[Tuple[int, int, str], ...] = (
+    (0, 1, "B"),
+    (1024, 1024, "KB"),
+    (1024 * 1024, 1024 * 1024, "MB"),
+    (1024 * 1024 * 1024, 1024 * 1024 * 1024, "GB"),
+)
+
+# (threshold_seconds, divisor, suffix). Same ordering convention
+# as size — last threshold ≤ age wins.
+_MENTION_AGE_UNITS: Tuple[Tuple[int, int, str], ...] = (
+    (0, 1, "s"),
+    (60, 60, "m"),
+    (3600, 3600, "h"),
+    (86_400, 86_400, "d"),
+    (86_400 * 7, 86_400 * 7, "w"),
+)
+
+
+@dataclass(frozen=True)
+class MentionMetadata:
+    """Frozen projection of one path's metadata for @-mention
+    completion. Composes :class:`pathlib.Path` stat() results;
+    pure data, no rendering."""
+
+    kind: str       # one of: file / dir / symlink / missing
+    glyph: str      # display glyph for ``kind``
+    size_bytes: int  # 0 for dirs / missing / unreadable
+    size_pretty: str  # "1.2 KB" / "—" for dirs
+    age_seconds: float  # 0.0 for missing
+    age_pretty: str    # "5m ago" / "—"
+
+
+def _classify_kind(p: Path) -> str:
+    """Pure classifier — NEVER raises."""
+    try:
+        # is_symlink first; symlinks may also report is_file/is_dir
+        if p.is_symlink():
+            return "symlink"
+        if p.is_dir():
+            return "dir"
+        if p.is_file():
+            return "file"
+    except Exception:  # noqa: BLE001
+        return "missing"
+    return "missing"
+
+
+def _format_size(size: int) -> str:
+    """Walk :data:`_MENTION_SIZE_UNITS` largest-fit-first. NEVER
+    raises. Negative values surface "—" since byte counts can't
+    be negative — that signals "unknown / unreadable"."""
+    try:
+        n = int(size)
+    except (TypeError, ValueError):
+        return "—"
+    if n < 0:
+        return "—"
+    if n == 0:
+        return "0 B"
+    picked = _MENTION_SIZE_UNITS[0]
+    for entry in _MENTION_SIZE_UNITS:
+        threshold, _div, _suffix = entry
+        if n >= threshold:
+            picked = entry
+    threshold, div, suffix = picked
+    if div <= 1:
+        return f"{n} {suffix}"
+    return f"{n / div:.1f} {suffix}"
+
+
+def _format_age(age_seconds: float) -> str:
+    """Walk :data:`_MENTION_AGE_UNITS` largest-fit-first. NEVER
+    raises."""
+    try:
+        a = float(age_seconds)
+    except (TypeError, ValueError):
+        return "—"
+    if a < 0:
+        return "—"
+    picked = _MENTION_AGE_UNITS[0]
+    for entry in _MENTION_AGE_UNITS:
+        threshold, _div, _suffix = entry
+        if a >= threshold:
+            picked = entry
+    threshold, div, suffix = picked
+    if div <= 1:
+        return f"{int(a)}{suffix}"
+    return f"{int(a / div)}{suffix}"
+
+
+def _glyph_for_kind(kind: str) -> str:
+    for k, g in _MENTION_KIND_GLYPHS:
+        if k == kind:
+            return g
+    # Final fallback — last entry in the table is "missing"
+    return _MENTION_KIND_GLYPHS[-1][1]
+
+
+def build_mention_metadata(
+    path_text: object,
+    *,
+    base_dir: Optional[Path] = None,
+    now_unix: Optional[float] = None,
+) -> MentionMetadata:
+    """Resolve metadata for a path string under ``base_dir``
+    (defaults to ``cwd``). NEVER raises.
+
+    Missing / unreadable / permission-denied paths all return a
+    :class:`MentionMetadata` with ``kind='missing'``, ``glyph='?'``,
+    and ``"—"`` placeholders so the caller can always render
+    safely."""
+    try:
+        text = str(path_text or "")
+    except Exception:  # noqa: BLE001
+        text = ""
+    now = (
+        time.time() if now_unix is None
+        else float(now_unix)
+    )
+    missing = MentionMetadata(
+        kind="missing",
+        glyph=_glyph_for_kind("missing"),
+        size_bytes=0,
+        size_pretty="—",
+        age_seconds=0.0,
+        age_pretty="—",
+    )
+    if not text:
+        return missing
+    try:
+        root = base_dir if base_dir is not None else Path.cwd()
+        # Reject path traversal escapes — operator types
+        # `@foo.py`, not `@../../etc/passwd`. The completer
+        # already constrains via PathCompleter; this is
+        # defense-in-depth.
+        candidate = (root / text).resolve()
+        # If the resolved candidate escapes root, fall back to
+        # treating ``text`` as relative-to-root and try its stat
+        # directly so we still surface metadata for legitimate
+        # repo-rooted paths. NEVER raises.
+        try:
+            _ = candidate.relative_to(root.resolve())
+        except Exception:  # noqa: BLE001
+            candidate = root / text
+    except Exception:  # noqa: BLE001
+        return missing
+    kind = _classify_kind(candidate)
+    if kind == "missing":
+        return missing
+    try:
+        stat = (
+            candidate.lstat() if kind == "symlink"
+            else candidate.stat()
+        )
+    except Exception:  # noqa: BLE001
+        return missing
+    size_bytes = int(getattr(stat, "st_size", 0))
+    age_seconds = max(0.0, now - float(getattr(stat, "st_mtime", now)))
+    return MentionMetadata(
+        kind=kind,
+        glyph=_glyph_for_kind(kind),
+        size_bytes=(0 if kind == "dir" else size_bytes),
+        size_pretty=(
+            "—" if kind == "dir"
+            else _format_size(size_bytes)
+        ),
+        age_seconds=age_seconds,
+        age_pretty=f"{_format_age(age_seconds)} ago",
+    )
+
+
+def format_mention_metadata(
+    path_text: object,
+    *,
+    base_dir: Optional[Path] = None,
+    now_unix: Optional[float] = None,
+    fallback: str = "@mention path",
+) -> str:
+    """Render the rich ``display_meta`` string for an @-mention
+    completion candidate. NEVER raises.
+
+    Output shape:
+
+      * File:    ``📄 1.2 KB · 5m ago``
+      * Dir:     ``📁 — · 5m ago``
+      * Missing: ``fallback`` literal (the legacy "@mention path"
+                  string by default)
+
+    When :func:`is_mention_rich_metadata_enabled` returns False,
+    returns ``fallback`` so the completer keeps its legacy
+    display_meta value byte-identical.
+    """
+    if not is_mention_rich_metadata_enabled():
+        return fallback
+    meta = build_mention_metadata(
+        path_text, base_dir=base_dir, now_unix=now_unix,
+    )
+    if meta.kind == "missing":
+        return fallback
+    # Compose: glyph · size · age. Bullet separator matches the
+    # CC-style status line conventions used elsewhere.
+    return f"{meta.glyph} {meta.size_pretty} · {meta.age_pretty}"
+
+
 def build_mention_completer() -> Optional[object]:
     """Build a ``prompt_toolkit.completion.Completer`` that fires
     only when the current cursor-word starts with ``@``. Composes
@@ -504,13 +745,23 @@ def build_mention_completer() -> Optional[object]:
                 for completion in inner.get_completions(
                     synth_doc, complete_event,
                 ):
+                    # §41.3 #10 — compose per-candidate metadata.
+                    # The completion.text is the path PathCompleter
+                    # would insert (relative to ``synth_doc``'s base
+                    # = cwd via get_paths=["."]). format_mention_metadata
+                    # stat()s the resolved candidate; NEVER raises.
+                    # When the rich-metadata flag is off, the helper
+                    # returns the legacy "@mention path" string so
+                    # the dropdown stays byte-identical pre-graduation.
                     yield Completion(
                         text="@" + completion.text,
                         start_position=(
                             completion.start_position - 1
                         ),
                         display=completion.display,
-                        display_meta="@mention path",
+                        display_meta=format_mention_metadata(
+                            completion.text,
+                        ),
                     )
             except Exception:  # noqa: BLE001 — defensive
                 # Filesystem error / permission error / etc. —
@@ -524,13 +775,18 @@ def build_mention_completer() -> Optional[object]:
 __all__ = [
     "AttachmentExtraction",
     "MASTER_FLAG_ENV_VAR",
+    "MENTION_RICH_METADATA_ENV_VAR",
+    "MentionMetadata",
     "REPL_INPUT_POLISH_SCHEMA_VERSION",
     "TITLE_ENABLED_ENV_VAR",
     "build_mention_completer",
+    "build_mention_metadata",
     "clear_terminal_title",
     "extract_attachments",
+    "format_mention_metadata",
     "format_title",
     "is_attachment_mention",
+    "is_mention_rich_metadata_enabled",
     "is_polish_enabled",
     "is_terminal_title_enabled",
     "make_esc_cancel_binding",
