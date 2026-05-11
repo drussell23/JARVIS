@@ -378,3 +378,53 @@ def test_repl_completion_inline_help_helpers_reachable():
     assert hasattr(rc, "resolve_help_for_buffer")
     assert hasattr(rc, "is_inline_help_enabled")
     assert hasattr(rc, "INLINE_HELP_ENABLED_ENV_VAR")
+
+
+# --- §41.3 Slice 3 #14 — op_id arg-completion provider wiring -------------
+
+
+def test_op_id_provider_registered_in_loop():
+    """Bytes-pin: SerpentREPL._loop registers a `op_id` arg
+    provider via register_arg_provider. Snapshot of GLS
+    `_active_ops` powers `/cancel ` tab completion."""
+    src = _source()
+    assert "register_arg_provider" in src
+    assert '"op_id"' in src
+
+
+def test_op_id_provider_reads_active_ops():
+    """Bytes-pin: provider composes `self._gls._active_ops`
+    rather than building a parallel state surface."""
+    src = _source()
+    idx = src.find("_op_id_provider")
+    assert idx > 0
+    body = src[idx:idx + 2000]
+    assert "_active_ops" in body
+
+
+def test_op_id_provider_defensive():
+    """Bytes-pin: provider is wrapped in try/except so a buggy
+    GLS surface NEVER propagates into prompt_toolkit."""
+    src = _source()
+    idx = src.find("_op_id_provider")
+    body = src[idx:idx + 2000]
+    assert "try:" in body
+    assert "except" in body
+
+
+def test_op_id_provider_handles_none_gls():
+    """Bytes-pin: when `self._gls` is None (headless / pre-boot),
+    provider returns () rather than raising."""
+    src = _source()
+    idx = src.find("_op_id_provider")
+    body = src[idx:idx + 2000]
+    assert "is None" in body
+
+
+def test_arg_completion_symbols_reachable():
+    """Sanity: arg-completion substrate symbols exist."""
+    assert hasattr(rc, "ArgKind")
+    assert hasattr(rc, "ArgPositionSpec")
+    assert hasattr(rc, "register_arg_provider")
+    assert hasattr(rc, "parse_arg_spec")
+    assert hasattr(rc, "get_arg_candidates")

@@ -4405,6 +4405,39 @@ class SerpentREPL:
         # input handling and output coordination land in this commit.
         _repl_bindings = KeyBindings()
 
+        # §41.3 Slice 3 #14 — register a dynamic arg-completion
+        # provider for ``<op_id>``. Snapshots GLS._active_ops (a
+        # Set[str]) at completion time, so newly-spawned ops surface
+        # in the next tab press. The provider key matches the arg
+        # name convention used by all `_handle_cancel`-style verbs
+        # (``<op_id>``). NEVER raises into prompt_toolkit.
+        try:
+            from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
+                register_arg_provider as _ac_register,
+            )
+
+            def _op_id_provider(prefix: str) -> Tuple[str, ...]:
+                _gls = self._gls
+                if _gls is None:
+                    return ()
+                try:
+                    active = getattr(_gls, "_active_ops", None)
+                    if active is None:
+                        return ()
+                    # Snapshot to a tuple — guards against
+                    # mutation during iteration. Sorted for
+                    # stable dropdown ordering.
+                    return tuple(sorted(
+                        op for op in active
+                        if isinstance(op, str)
+                    ))
+                except Exception:  # noqa: BLE001
+                    return ()
+
+            _ac_register("op_id", _op_id_provider)
+        except Exception:  # noqa: BLE001
+            pass  # arg completion unavailable — verb-name path still works
+
         @_repl_bindings.add("enter")
         def _on_enter(event: Any) -> None:
             event.current_buffer.validate_and_handle()

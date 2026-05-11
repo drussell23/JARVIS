@@ -60,7 +60,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, FrozenSet, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.ReplCompletion")
 
@@ -410,6 +410,372 @@ def _infer_arg_spec_from_signature(method: object) -> str:
         else:
             parts.append(f"[{name}]")
     return " ".join(parts)[:160]
+
+
+# ===========================================================================
+# §41.3 Slice 3 #14 — arg completion substrate
+# ===========================================================================
+
+
+class ArgKind(str, enum.Enum):
+    """Closed 4-value taxonomy — bytes-pinned via AST.
+
+    Determines how :func:`get_arg_candidates` resolves completions
+    for an argument position:
+
+    * STATIC   — enumeration of fixed values (e.g., posture names,
+                 risk tiers). Values come from ``static_values``.
+    * DYNAMIC  — runtime state (e.g., active op IDs). Resolved by
+                 a callable registered via
+                 :func:`register_arg_provider` keyed by
+                 ``provider_key``.
+    * PATH     — filesystem path; delegated to the existing
+                 :mod:`repl_input_polish` PathCompleter when
+                 available.
+    * FREE     — no completion; operator types whatever they want.
+    """
+
+    STATIC = "static"
+    DYNAMIC = "dynamic"
+    PATH = "path"
+    FREE = "free"
+
+
+@dataclass(frozen=True)
+class ArgPositionSpec:
+    """One argument position within a verb's signature.
+
+    Fields
+    ------
+    * ``name`` — operator-facing argument name from
+      :attr:`VerbDescriptor.arg_spec` (e.g., ``"op_id"``,
+      ``"category"``).
+    * ``required`` — True for ``<x>``; False for ``[x]`` or
+      ``[--flag]``.
+    * ``kind`` — :class:`ArgKind` controlling how candidates are
+      resolved.
+    * ``static_values`` — populated when ``kind == STATIC``.
+    * ``provider_key`` — populated when ``kind == DYNAMIC``;
+      looks up a callable in the module-level provider registry.
+    * ``flag_form`` — non-empty when this position is a flag
+      (e.g., ``"--immediate"``); empty for positional args.
+    """
+
+    name: str
+    required: bool
+    kind: ArgKind = ArgKind.FREE
+    static_values: Tuple[str, ...] = ()
+    provider_key: str = ""
+    flag_form: str = ""
+    schema_version: str = REPL_COMPLETION_SCHEMA_VERSION
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "required": self.required,
+            "kind": self.kind.value,
+            "static_values": list(self.static_values),
+            "provider_key": self.provider_key,
+            "flag_form": self.flag_form,
+            "schema_version": self.schema_version,
+        }
+
+
+# Module-level provider registry — convention-based dispatch.
+# Keyed by argument NAME (e.g., "op_id", "category"); operator-side
+# wiring registers callables at boot via
+# :func:`register_arg_provider`. The substrate's own seeds (e.g.,
+# ``category`` → :class:`VerbCategory` values) live in
+# ``_STATIC_DEFAULTS`` so they're discoverable without any runtime
+# registration.
+
+_ARG_PROVIDERS: "dict[str, Callable[[str], Tuple[str, ...]]]" = {}
+
+
+# Default static value tables. Convention-based dispatch reads
+# from this table when an argument's NAME matches; the parser
+# automatically tags such positions as :attr:`ArgKind.STATIC`.
+# Operators / wiring sites can override per-position by calling
+# :func:`register_arg_provider` (DYNAMIC kind takes precedence).
+def _seed_static_defaults() -> "dict[str, Tuple[str, ...]]":
+    # NEVER raises — VerbCategory is defined above; this is a
+    # closed-taxonomy enumeration we know exists.
+    return {
+        "category": tuple(c.value for c in VerbCategory),
+    }
+
+
+_STATIC_DEFAULTS: "dict[str, Tuple[str, ...]]" = (
+    _seed_static_defaults()
+)
+
+
+# Argument names whose semantics are filesystem paths. Convention-
+# based — wiring sites can extend by appending.
+_PATH_NAMES: FrozenSet[str] = frozenset({
+    "path", "file", "file_path", "filepath",
+})
+
+
+def register_arg_provider(
+    key: object,
+    provider: object,
+) -> bool:
+    """Register a runtime provider for DYNAMIC arg completion.
+
+    The provider must be a callable ``(prefix: str) ->
+    Tuple[str, ...]``. NEVER raises. Returns True on success,
+    False when the input is invalid.
+
+    Operator-side example::
+
+        register_arg_provider(
+            "op_id",
+            lambda prefix: tuple(
+                op for op in gls.active_op_ids()
+                if op.startswith(prefix)
+            ),
+        )
+    """
+    try:
+        if not isinstance(key, str) or not key.strip():
+            return False
+        if not callable(provider):
+            return False
+        _ARG_PROVIDERS[key.strip()] = provider  # type: ignore[assignment]
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def unregister_arg_provider(key: object) -> bool:
+    """Remove a previously-registered provider. NEVER raises."""
+    try:
+        if not isinstance(key, str):
+            return False
+        return _ARG_PROVIDERS.pop(key, None) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def list_arg_providers() -> Tuple[str, ...]:
+    """Snapshot of registered provider keys for introspection."""
+    try:
+        return tuple(sorted(_ARG_PROVIDERS.keys()))
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+# Regex covering the four arg_spec atom forms:
+#   <name>             — required positional
+#   [name]             — optional positional
+#   [--flag]           — optional flag, no value
+#   [--flag <value>]   — optional flag with value
+# Compiled once; pure-function consumers are thread-safe.
+_ARG_SPEC_ATOM_RE = re.compile(
+    r"<(?P<req>[a-zA-Z_][\w-]*)>"
+    r"|\[--(?P<flag>[a-zA-Z][\w-]*)(?:\s+<(?P<flag_val>[a-zA-Z_][\w-]*)>)?\]"
+    r"|\[(?P<opt>[a-zA-Z_][\w-]*)\]"
+)
+
+
+def _classify_arg_name(name: str) -> Tuple[ArgKind, Tuple[str, ...], str]:
+    """Classify a position by convention. NEVER raises.
+
+    Returns ``(kind, static_values, provider_key)`` triple. Rules
+    (first match wins):
+
+    1. ``name`` in :data:`_PATH_NAMES` → PATH
+    2. ``name`` in :data:`_STATIC_DEFAULTS` → STATIC with the
+       seeded values
+    3. ``name`` is a registered provider key → DYNAMIC with that
+       key
+    4. otherwise → FREE
+    """
+    try:
+        clean = name.strip().lower()
+    except Exception:  # noqa: BLE001
+        return ArgKind.FREE, (), ""
+    if not clean:
+        return ArgKind.FREE, (), ""
+    if clean in _PATH_NAMES:
+        return ArgKind.PATH, (), ""
+    if clean in _STATIC_DEFAULTS:
+        return ArgKind.STATIC, _STATIC_DEFAULTS[clean], ""
+    if clean in _ARG_PROVIDERS:
+        return ArgKind.DYNAMIC, (), clean
+    return ArgKind.FREE, (), ""
+
+
+def parse_arg_spec(raw: object) -> Tuple[ArgPositionSpec, ...]:
+    """Parse an arg_spec string into structured position specs.
+
+    Pure function; NEVER raises. Returns empty tuple on bad input.
+
+    Convention examples::
+
+        ""                                       → ()
+        "<op_id>"                                → (REQ op_id,)
+        "<op_id> [--immediate]"                  → (REQ op_id, FLAG --immediate)
+        "[category]"                             → (OPT category,)
+        "<set <amount>>"  (not supported)        → graceful fallback
+
+    Recognition order (per atom):
+      1. Flag form ``[--name]`` or ``[--name <value>]``
+      2. Required positional ``<name>``
+      3. Optional positional ``[name]``
+    """
+    try:
+        text = str(raw or "")
+    except Exception:  # noqa: BLE001
+        return ()
+    if not text.strip():
+        return ()
+    out: List[ArgPositionSpec] = []
+    for match in _ARG_SPEC_ATOM_RE.finditer(text):
+        gd = match.groupdict()
+        if gd.get("flag"):
+            flag_name = gd["flag"]
+            flag_val = gd.get("flag_val") or ""
+            if flag_val:
+                # Flag with value — completion targets the value
+                kind, statics, key = _classify_arg_name(flag_val)
+                out.append(ArgPositionSpec(
+                    name=flag_val,
+                    required=False,
+                    kind=kind,
+                    static_values=statics,
+                    provider_key=key,
+                    flag_form=f"--{flag_name}",
+                ))
+            else:
+                # Bare flag — completes to its own literal
+                out.append(ArgPositionSpec(
+                    name=flag_name,
+                    required=False,
+                    kind=ArgKind.STATIC,
+                    static_values=(f"--{flag_name}",),
+                    provider_key="",
+                    flag_form=f"--{flag_name}",
+                ))
+        elif gd.get("req"):
+            name = gd["req"]
+            kind, statics, key = _classify_arg_name(name)
+            out.append(ArgPositionSpec(
+                name=name,
+                required=True,
+                kind=kind,
+                static_values=statics,
+                provider_key=key,
+            ))
+        elif gd.get("opt"):
+            name = gd["opt"]
+            kind, statics, key = _classify_arg_name(name)
+            out.append(ArgPositionSpec(
+                name=name,
+                required=False,
+                kind=kind,
+                static_values=statics,
+                provider_key=key,
+            ))
+    return tuple(out)
+
+
+def get_arg_candidates(
+    position: object,
+    prefix: object = "",
+    *,
+    max_results: int = 32,
+) -> Tuple[str, ...]:
+    """Resolve completion candidates for one argument position.
+
+    Pure dispatcher composing the static_values table OR the
+    registered DYNAMIC provider; PATH is intentionally left to the
+    completer (which already integrates the existing
+    ``repl_input_polish`` PathCompleter); FREE returns ``()``.
+
+    NEVER raises. Prefix-filters and de-dupes case-insensitively.
+    """
+    try:
+        if not isinstance(position, ArgPositionSpec):
+            return ()
+        pref = str(prefix or "")
+    except Exception:  # noqa: BLE001
+        return ()
+    candidates: Tuple[str, ...] = ()
+    if position.kind is ArgKind.STATIC:
+        candidates = position.static_values
+    elif position.kind is ArgKind.DYNAMIC:
+        provider = _ARG_PROVIDERS.get(position.provider_key)
+        if provider is None:
+            return ()
+        try:
+            raw = provider(pref)
+        except Exception:  # noqa: BLE001
+            return ()
+        if not isinstance(raw, tuple):
+            try:
+                raw = tuple(raw)  # type: ignore[arg-type]
+            except Exception:  # noqa: BLE001
+                return ()
+        candidates = tuple(
+            str(c) for c in raw if c is not None
+        )
+    else:
+        # PATH + FREE — completer handles separately or yields none
+        return ()
+    if not candidates:
+        return ()
+    pref_lower = pref.lower()
+    seen: set = set()
+    out: List[str] = []
+    for c in candidates:
+        if not isinstance(c, str):
+            continue
+        if pref_lower and not c.lower().startswith(pref_lower):
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+        if len(out) >= max(1, int(max_results)):
+            break
+    return tuple(out)
+
+
+def cursor_arg_position(buffer_text: object) -> Tuple[int, str]:
+    """Determine the operator's current argument position.
+
+    Returns ``(position_index, prefix)`` where ``position_index``
+    is 0 for the first arg slot (just after the verb), 1 for the
+    second, etc., and ``prefix`` is the partial text typed at the
+    current position.
+
+    Returns ``(-1, "")`` when the buffer doesn't represent an
+    arg-completable state (no leading slash, no verb token yet,
+    or the parser can't decide).
+
+    NEVER raises.
+    """
+    try:
+        text = str(buffer_text or "")
+    except Exception:  # noqa: BLE001
+        return -1, ""
+    stripped_left = text.lstrip()
+    if not stripped_left.startswith("/"):
+        return -1, ""
+    # Number of leading spaces consumed when lstripping — preserved
+    # so that downstream completers can compute start_position
+    # correctly if needed.
+    tokens = stripped_left.split(" ")
+    # tokens[0] is the verb (e.g., "/cancel"); subsequent tokens
+    # are arg slots. Trailing empty string means "started a new
+    # token" (operator typed a space).
+    if len(tokens) <= 1:
+        return -1, ""
+    position_index = len(tokens) - 2  # tokens[1] is position 0
+    prefix = tokens[-1]
+    return position_index, prefix
 
 
 # ===========================================================================
@@ -786,6 +1152,54 @@ def build_completer(registry: VerbRegistry) -> Optional[object]:
             # suggestions interleaved with their natural input.
             if not text.startswith("/"):
                 return
+            # §41.3 Slice 3 #14 — when the operator has typed past
+            # the verb name (text contains a space), dispatch to
+            # per-position arg completion instead of verb-name
+            # matching. The verb itself is parsed deterministically
+            # from token 0 via ``registry.find``; the position
+            # index + prefix come from ``cursor_arg_position``.
+            try:
+                pos_index, pos_prefix = cursor_arg_position(text)
+            except Exception:  # noqa: BLE001
+                pos_index, pos_prefix = -1, ""
+            if pos_index >= 0:
+                try:
+                    verb_token = text.lstrip().split(" ", 1)[0]
+                    verb = registry.find(verb_token)
+                except Exception:  # noqa: BLE001
+                    verb = None
+                if verb is None or not verb.arg_spec:
+                    return
+                try:
+                    positions = parse_arg_spec(verb.arg_spec)
+                except Exception:  # noqa: BLE001
+                    positions = ()
+                if pos_index >= len(positions):
+                    return
+                position = positions[pos_index]
+                # PATH is delegated to the existing @-mention path
+                # completer (already merged in below). FREE +
+                # over-position positions yield nothing — operator
+                # is past the spec.
+                if position.kind in (ArgKind.PATH, ArgKind.FREE):
+                    return
+                try:
+                    candidates = get_arg_candidates(
+                        position, pos_prefix,
+                    )
+                except Exception:  # noqa: BLE001
+                    candidates = ()
+                for cand in candidates:
+                    yield Completion(
+                        text=cand,
+                        start_position=-len(pos_prefix),
+                        display=cand,
+                        display_meta=(
+                            f"{position.name}"
+                            f"{' (required)' if position.required else ''}"
+                        ),
+                    )
+                return
             # ``text`` includes the leading slash. Route through
             # fuzzy_match — it returns prefix hits first, falls back
             # to substring + edit-distance only when prefix yields
@@ -949,6 +1363,8 @@ def build_completion_wiring(
 
 
 __all__ = [
+    "ArgKind",
+    "ArgPositionSpec",
     "CompletionWiring",
     "HISTORY_ENABLED_ENV_VAR",
     "HISTORY_PATH_ENV_VAR",
@@ -961,13 +1377,19 @@ __all__ = [
     "build_completer",
     "build_completion_wiring",
     "build_history",
+    "cursor_arg_position",
     "discover_verbs",
     "format_verb_help",
     "fuzzy_match",
+    "get_arg_candidates",
     "is_completion_enabled",
     "is_history_enabled",
     "is_inline_help_enabled",
+    "list_arg_providers",
+    "parse_arg_spec",
+    "register_arg_provider",
     "resolve_help_for_buffer",
     "resolve_history_path",
     "suggest_for_typo",
+    "unregister_arg_provider",
 ]
