@@ -239,6 +239,13 @@ class IDEObservabilityRouter:
             "/observability/posture/health",
             self._handle_posture_health,
         )
+        # §40 Tier 1 #15 (v2.98+) — second-order doll completion
+        # metric surface composing second_order_doll_metric
+        # .aggregate_doll_completion. RSI-acceleration probe.
+        app.router.add_get(
+            "/observability/second-order-doll",
+            self._handle_second_order_doll,
+        )
         # FlagRegistry Slice 3 — flag + verb introspection surface.
         app.router.add_get(
             "/observability/flags", self._handle_flags_list,
@@ -1133,6 +1140,86 @@ class IDEObservabilityRouter:
         return self._json_response(
             request, 200, verdict.to_dict(),
         )
+
+    # --- §40 Tier 1 #15 — second-order doll completion metric -------------
+
+    @staticmethod
+    def _doll_metric_master_enabled() -> bool:
+        """Authority-free gate — the second-order doll surface
+        inherits the metric's master switch. 403 when off so port
+        scanners see no signal."""
+        try:
+            from backend.core.ouroboros.governance.second_order_doll_metric import (  # noqa: E501
+                master_enabled,
+            )
+        except ImportError:
+            return False
+        return master_enabled()
+
+    async def _handle_second_order_doll(
+        self, request: "web.Request",
+    ) -> Any:
+        """GET /observability/second-order-doll — RSI-acceleration probe.
+
+        Returns the canonical
+        :class:`DollCompletionSnapshot.to_dict()` projection. Read-only;
+        composes ``second_order_doll_metric.aggregate_doll_completion``
+        which itself composes the canonical FlagRegistry + git log +
+        capability_constellation principle map. NEVER raises.
+
+        Shape::
+
+            {
+              "schema_version": "second_order_doll_metric.1",
+              "master_enabled": true,
+              "axes": [{"category": "safety", "stage": "observed", ...}],
+              "stage_counts": {"untouched": 4, "observed": 2, ...},
+              "completion_ratio": 0.15,
+              "elapsed_s": 0.04,
+              "diagnostic": "..."
+            }
+
+        403 when ``JARVIS_IDE_OBSERVABILITY_ENABLED=false`` or when
+        the metric's own master flag is off. 503 when the substrate
+        is unavailable.
+        """
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._doll_metric_master_enabled():
+            return self._error_response(
+                request,
+                403,
+                "ide_observability.second_order_doll_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        try:
+            from backend.core.ouroboros.governance.second_order_doll_metric import (  # noqa: E501
+                aggregate_doll_completion,
+            )
+        except ImportError:
+            return self._error_response(
+                request,
+                503,
+                "ide_observability.second_order_doll_substrate_unavailable",
+            )
+        try:
+            snapshot = aggregate_doll_completion()
+        except Exception:  # noqa: BLE001 — defensive (NEVER raises)
+            logger.debug(
+                "[IDEObservability] second_order_doll aggregation failed",
+                exc_info=True,
+            )
+            return self._error_response(
+                request,
+                503,
+                "ide_observability.second_order_doll_aggregate_failed",
+            )
+        return self._json_response(request, 200, snapshot.to_dict())
 
     # --- FlagRegistry Slice 3 — flag + verb introspection --------------------
 

@@ -202,6 +202,25 @@ def _principles_for_category(category_value: object) -> Tuple[str, ...]:
         return ()
 
 
+# Public re-export for downstream observability substrates (e.g.
+# second_order_doll_metric.py) — composes the canonical map without
+# reaching into the underscored private function. This is the §37
+# Singleton + Read-API Extension Pattern: extend the public surface
+# rather than have consumers parallel-import the private name.
+def principles_for_category(category_value: object) -> Tuple[str, ...]:
+    """Canonical Category → Manifesto-principles mapping.
+
+    Accepts a :class:`flag_registry.Category` enum value, a string
+    like ``"safety"``, or anything else with a ``.value`` attribute.
+    Unknown / malformed inputs return an empty tuple — NEVER raises.
+
+    Single source of truth for the Manifesto-principle linkage.
+    Drift between this map and downstream consumers is structurally
+    prevented because every consumer composes this accessor.
+    """
+    return _principles_for_category(category_value)
+
+
 # ===========================================================================
 # Frozen §33.5 versioned artifacts
 # ===========================================================================

@@ -92,6 +92,33 @@ _OV_COAUTHOR = "Co-Authored-By: Ouroboros+Venom <ouroboros@jarvis.trinity>"
 
 
 # ---------------------------------------------------------------------------
+# Public accessors — single source of truth for downstream observability
+# ---------------------------------------------------------------------------
+#
+# Read-only observability substrates (e.g. second_order_doll_metric) need to
+# detect O+V-authored commits from ``git log`` output. Rather than have those
+# consumers grep on parallel string literals (drift risk), they compose these
+# accessors via lazy-import. The constants themselves stay private (under-
+# scored) — the API surface is the function, not the value.
+
+
+def ov_signature_substring() -> str:
+    """Canonical substring identifying an O+V commit in ``git log`` output.
+
+    Downstream metric / observability layers detect autonomous commits by
+    checking whether this substring is present in the commit message body.
+    Stable across schema bumps — adding lines to the commit body never
+    removes this exact signature line.
+    """
+    return _OV_SIGNATURE
+
+
+def ov_coauthor_line() -> str:
+    """Canonical ``Co-Authored-By:`` trailer line for O+V commits."""
+    return _OV_COAUTHOR
+
+
+# ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
 

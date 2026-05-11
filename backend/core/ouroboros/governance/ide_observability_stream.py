@@ -373,6 +373,21 @@ contracted §38.11.5a row 6 fields per star
 summary maps. Closes §39 #8 by composition."""
 
 
+EVENT_TYPE_SECOND_ORDER_DOLL_PROGRESS_UPDATED = (
+    "second_order_doll_progress_updated"
+)
+"""§40 Tier 1 #15 (PRD v2.98+, 2026-05-10) — fired by
+``second_order_doll_metric.aggregate_doll_completion`` after
+each fresh snapshot composition. Payload carries
+``stage_counts`` + ``completion_ratio`` + per-axis
+``{category, stage, autonomous_commit_count}`` projection.
+RSI-acceleration probe: measures how close O+V is to safely
+completing second-order self-modification (cage-modification
+under operator authority). Composes canonical flag_registry
++ capability_constellation.principles_for_category +
+auto_committer.ov_signature_substring — no parallel state."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -968,6 +983,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_PHASE_ORCHESTRA_CUE,              # §39 Tier-7 #20 (phase orchestra audio cue)
     EVENT_TYPE_COHERENCE_REPORTED,               # §3.6.2 Vector #5 (cross-session coherence harness)
     EVENT_TYPE_PERMISSION_DECISION_RECORDED,     # Venom V2 Slice 3 (PRD v2.91, permission_decision_archive)
+    EVENT_TYPE_SECOND_ORDER_DOLL_PROGRESS_UPDATED, # §40 Tier 1 #15 (PRD v2.98+, second-order doll completion metric)
 })
 
 
