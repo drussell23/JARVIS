@@ -11,7 +11,9 @@
 | `JARVIS_EXPLORATION_LEDGER_LOAD_ADAPTED_CATEGORY_WEIGHTS` | 1/3 | (2 more needed) |
 | `JARVIS_EXEC_GRAPH_BRIDGE_ENABLED` | 1/3 | (2 more needed — started tonight) |
 
-**Operator-visible consequence**: the calendar-to-A+ estimate of "~6-9 weeks at ~1 flag/week" compresses significantly — the cadence engine is graduating multiple flags simultaneously. **Session totals (final, post-soak-#5)**: 16 commits on main / ~210 new regression tests / ~46 AST pins / 5 cost-positive evidence rows across soaks #1-5 (#3 misclassified pre-Layer-8; #1/#2/#4/#5 clean) / **3 graduation-eligible flags (was 1 at session start)**.
+**Operator-visible consequence**: the calendar-to-A+ estimate of "~6-9 weeks at ~1 flag/week" compresses significantly — the cadence engine is graduating multiple flags simultaneously. **Session totals (final, post-soak-#5)**: 16 commits on main / ~210 new regression tests / ~46 AST pins / 5 cost-positive evidence rows across soaks #1-5 (#3 misclassified pre-Layer-8; #1/#2/#4/#5 clean) / **3 graduation-eligible flags (was 1 at session start)**. See **§40 ADVANCED FORWARD ROADMAP** below for the post-tonight prioritized work queue.)
+
+---
 
 ## §40 ADVANCED FORWARD ROADMAP (post-tonight, operator-paced)
 
@@ -71,17 +73,70 @@ These directly enable safe recursive self-modification. **Each is structurally r
 
 22. **Meta-prior learning** (Move 6.5 follow-on, ~1w) — After 100+ multi-prior observations, learn which style_hint priors dominate which task complexity classes. Operator-tuned via observation, not hand-curated. Composes Slice 6 graduation contract.
 
-### §40.5 Honest prioritization (operator's call)
+### §40.5 Chronological prioritization — all 22 items ranked by impact + sequencing
 
-My top-3 if you want immediate momentum (compounding RSI signals):
+**How to read this table**: items are listed in **execution order** (not item-number order), grouped into 4 chronological waves. Each wave's items have **no inter-wave dependencies** — they can ship in any order within their wave. Cross-wave dependencies are noted in the **Depends-on** column. The **Impact** column rates each item's contribution to A+ grade (HIGH = closes a 🟡 / 🟠 vector OR adds a capability CC structurally cannot have; MEDIUM = compounds existing capability; LOW = refinement / experimental).
 
-| # | Item | Effort | Why |
-|---|------|--------|-----|
-| 15 | Second-order doll completion metric | ~3h | Cheapest path to measuring whether RSI is accelerating |
-| 8 | Adversarial autobiography | ~2d | Closes the only remaining 🟠 vector empirically |
-| 7 | Counterfactual rehearsal mode | ~2-3d | Exploits something CC structurally cannot do |
+**Wave 1 — Foundation telemetry (week 1, ~3-5 days total)**: cheap RSI-acceleration probes that produce data the later waves need.
 
-My anti-recommendation: **do NOT build operator-facing curiosity proposal feed** (rejected from list). Making operator the preference oracle reduces autonomy — save for future supervised-mode if non-architect users ever onboard.
+| Exec order | Item # | Title | Effort | Impact | Depends-on | Rationale |
+|-----------|--------|-------|--------|--------|------------|-----------|
+| 1 | 15 | Second-order doll completion metric | ~3h | **HIGH** | none | Cheapest path to *measuring* whether RSI is accelerating. Watches for specific commit signature (`feat()` touching governance/ + AutoCommitter produced + all gates passed). Without this metric, Waves 2-4 ship blind. |
+| 2 | 4 | M10 ArchitectureProposer graduation contract | ~2-3h | **HIGH** | none | Closes weak-form ontogeny loop: detection → proposal → empirical validation → integration. Substrate 70% complete; just needs graduation contract wired. |
+| 3 | 8 | Adversarial autobiography | ~2d | **HIGH** | #15 (uses doll metric to know when to fire) | Closes only remaining 🟠 vector (#7 Quine-shape cage bypass) empirically. Composes Phase 9.4 corpus + AutoCommitter. |
+| 4 | 16 | Compositional curiosity (two-clusters-meet) | ~1d | **MEDIUM** | none | Detects connective-tissue gaps via SemanticIndex cluster cross-pollination analysis. Auto-proposes integration ops. |
+
+**Wave 2 — Recursion bounding (week 2-3, ~7-10 days total)**: load-bearing safety for second-order doll. **Each is structurally required before O+V can safely modify its own governance**.
+
+| Exec order | Item # | Title | Effort | Impact | Depends-on | Rationale |
+|-----------|--------|-------|--------|--------|------------|-----------|
+| 5 | 1 | RRD §1 Boundary recursion-depth gate | ~2-3d | **HIGH** | #4 (M10 must be graduation-ready) | Deterministic gate forbids proposals from modifying governance without operator approval. Maps to Anthropic ASL-4 RSI framework. **Load-bearing for unattended multi-day soaks**. |
+| 6 | 2 | Hash-cap on self-modification (cryptographic signature gate) | ~2d | **HIGH** | #5 (boundary gate must exist) | AutoCommitter refuses to land commits touching `governance/` if operator's last-approved AST checksum signature breaks. Defense-in-depth atop #5. |
+| 7 | 3 | Antivenom self-immunization | ~1w | **HIGH** | #5+#6 (only safe AFTER recursion-bounded) | When SemanticGuardian flags pattern, generate K mutations + re-test cage against them. Anthropic Constitutional Classifiers' 86%→4.4% reduction is the empirical target. |
+
+**Wave 3 — Antivenom + cross-session calibration (week 4-5, ~10-14 days total)**: completeness items that compound with Wave 1-2.
+
+| Exec order | Item # | Title | Effort | Impact | Depends-on | Rationale |
+|-----------|--------|-------|--------|--------|------------|-----------|
+| 8 | 7 | Counterfactual rehearsal mode | ~2-3d | **HIGH** | none | Run proposed risky changes against last N sessions' op states BEFORE applying. CC structurally cannot do this (no session memory). Closes a moat over CC. |
+| 9 | 5 | SemanticGuardian ↔ MCP boundary | ~1-2w | **HIGH** | #3 (self-immunization patterns) | External MCP tools (GitHub MCP, Drive MCP) aren't pattern-matched by guardian's 11 internal-tool detectors. Closes the "first-class MCP" claim. |
+| 10 | 6 | Vector #5 cross-session coherence harness | ~1-2w | **MEDIUM** | #15 (uses doll metric for convergence proof) | Empirical closure-verdict rig over 50+ ops / 3-5 sessions. Feeds PhD §6 dissertation eval. |
+| 11 | 17 | ConversationBridge V1.2 voice integration | ~3-5d | **MEDIUM** | none | Authority-free seam wiring. Closes Trinity Body Communicator context feedback loop. Per CLAUDE.md §142 v1.2 backlog. |
+
+**Wave 4 — Calibration learning (week 6+, ~3-5 weeks total)**: items that calibrate trust/cost/belief empirically as data accumulates.
+
+| Exec order | Item # | Title | Effort | Impact | Depends-on | Rationale |
+|-----------|--------|-------|--------|--------|------------|-----------|
+| 12 | 9 | Belief revision ledger | ~3d | **MEDIUM** | #15 (doll metric) | Bayesian calibration learning. PostmortemEngine assertions become structured claims with falsifying-evidence hooks. |
+| 13 | 11 | Postmortem fusion | ~2d | **MEDIUM** | #9 (belief ledger) | Synthesize meta-postmortems when K postmortems mention same root cause. Learning across failures at architectural scale. |
+| 14 | 12 | Schelling-point consensus prior (Move 6.5 extension) | ~3d | **MEDIUM** | none | Deterministic baseline prior to Move 6.5 K-roll dispatch. Calibrates whether priors found better approach or just shuffled. |
+| 15 | 10 | Sleep consolidation pass | ~1.5d | **MEDIUM** | #9 (belief ledger) | REM-equivalent: replay recent ops fast-forward against DreamEngine blueprints. Auto-graduate blueprints matching real patterns. |
+| 16 | 14 | Mirror-self test | ~3d | **LOW** | #15 (doll metric) | System reproduces own canonical behavior from CLAUDE.md spec. Drift → repair ops. Self-documentation discipline. |
+| 17 | 13 | Anti-fragility budget per-module | ~4d | **LOW** | #15 + #9 | Track reliable vs flaky outcomes per-module. Low-budget modules get more validation cycles. Empirical trust calibration. |
+
+**Wave 5 — Experimental (research-grade, deferred — week 10+)**: items that depend on Waves 1-4 maturing + external triggers.
+
+| Exec order | Item # | Title | Effort | Impact | Depends-on | Rationale |
+|-----------|--------|-------|--------|--------|------------|-----------|
+| 18 | 22 | Meta-prior learning (Move 6.5 follow-on) | ~1w | **MEDIUM** | 100+ multi-prior observations from Wave 1's M10 + Wave 4's #12 | Learn which style_hint priors dominate which task complexity classes. Operator-tuned via observation, not hand-curated. |
+| 19 | 18 | Predictive postmortem | ~1w | **MEDIUM** | #9 (belief ledger) + #11 (fusion) | Before APPLY, predict what postmortem would say if op succeeds vs fails. Reconcile post-VERIFY. Forces calibration. |
+| 20 | 21 | Cognitive load shedding | ~3d | **LOW** | #6 (coherence harness data) | When SemanticIndex centroid drifts > X over Y days, refuse new exploration until consolidation cycles bring it back. Bounded curiosity → bounded RSI scope. |
+| 21 | 19 | Proof carrier transport | ~1-2w | **LOW** | #5 + #6 + #7 (full Antivenom completeness) | Generated fixes produce proof artifact (formal or test-shaped) that travels with patch. Future ops respect the invariant. |
+| 22 | 20 | Cross-repo causal mirror | ~2w | **HIGH** (when applicable) | **TRIGGER-GATED**: J-Prime + Reactor-Core repos exist + accept inbound SSE | JARVIS commits that might affect J-Prime contracts auto-emit `cross_repo_ripple` SSE. Repos talk via predictions, not requests. |
+
+### §40.5.1 Top-3 if you want to start TODAY
+
+If energy is finite, **start here** — these are the 3 items with maximum impact-per-effort + lowest dependency burden:
+
+1. **#15 Second-order doll completion metric** (~3h) — cheapest RSI-acceleration probe; produces data Waves 2-4 need
+2. **#4 M10 ArchitectureProposer graduation contract** (~2-3h) — closes weak-form ontogeny loop; substrate 70% already there
+3. **#8 Adversarial autobiography** (~2d) — closes the only remaining 🟠 vector (#7 Quine-shape cage bypass) empirically
+
+These three combined: **~3-5 days of focused work**. Each completes a measurable closure. Together they unlock Waves 2-4 with hard data to drive prioritization.
+
+### §40.5.2 Anti-recommendation
+
+**Do NOT build operator-facing curiosity proposal feed** (rejected from list). Making operator the preference oracle reduces autonomy — save for future supervised-mode if non-architect users ever onboard. This is a Tier-0 (reactive CC-style) pattern that contradicts O+V's autonomy mandate.
 
 ### §40.6 Status — operational, not engineering
 
@@ -135,7 +190,7 @@ The §40 roadmap is not invented in a vacuum. The architectural patterns O+V imp
 
 **Operator value**: when designing future O+V slices, the §40.7 citations provide (a) prior-art justification for architectural choices, (b) baseline numbers to benchmark against (e.g., Constitutional Classifiers' 86%→4.4% jailbreak reduction is the Antivenom self-immunization target), (c) terminology alignment with the published research community (for the PhD §6 dissertation eval). The §40 roadmap items reference these foundations explicitly so each engineering decision has cited-research provenance, not just operator binding.
 
-**See v2.97 below for Move 6.5 PLAN seam details.**)
+---
 
 **Version (prior)**: 2.97 (2026-05-10 — **Move 6.5 PLAN canonical integration seam SHIPPED + completed-arcs cross-off table**: Closes the §36 v10 brutal-review "Move 6.5 still named gap" finding from May 5. Pre-v2.97 state was: 6 Move 6.5 substrate slices fully shipped between May 1-7 (multi_prior_planning + runner + dispatch + observer + graduation_contract + canvas — 10 files, 410 tests, 6 master flags), 30 Phase 9.4 adversarial corpus tests shipped, but **the orchestrator never invoked `dispatch_multi_prior`** — the system was substrate-complete but operationally unreachable. The brutal review correctly cited this; the gap was operational integration, not substrate existence. **The fix — ONE shared async helper** `multi_prior_plan_seam.py` composing the canonical substrate (zero parallel logic): `dispatch_multi_prior` (Slice 3) for K-roll dispatch + `ConsensusActionRecommendation` closed 4-value taxonomy + `record_dispatch_outcome` (Slice 4) drives graduation ledger growth + `PlanGenerator._parse_plan_response` (existing) rehydrates winner + `PlanGenerator._validate_plan_coherence` (existing) same coherence path + `classify_ui_affected` (existing) same ui_affected stamping + `Prior.system_prompt_addendum` + `seed` real prior angles per operator binding clarification #4 (not cosmetic noise). **Single helper, two callers** (operator binding clarification #5 — no duplication): `phase_runners/plan_runner.py` (Slice 3-extracted path) AND `orchestrator.py` inline PLAN block (legacy fallback when `JARVIS_PHASE_RUNNER_SLICE3_FULLY_EXTRACTED=false`). Both callers: if seam returns PlanResult, use it; if None (master-off OR non-actionable consensus OR ESCALATE), fall through to existing single-shot `generate_plan` path. **Zero behavior change at default** (all 4 master flags FALSE). **Action recommendation routing**: ACCEPT_CANONICAL → use consensus winner; CLAMP_TO_NOTIFY_APPLY → use winner (risk-tier clamp is downstream GATE phase's concern); ESCALATE_TO_OPERATOR_REVIEW → fall through to single-shot (operator reviews via SSE event + recorded verdict; pipeline continues); FALL_THROUGH → fall through (disabled/failed). **Master-flag AND-composition** (no parallel flag — uses substrate's internal `evaluate_dispatch_decision` check): `JARVIS_MULTI_PRIOR_PLANNING_ENABLED` (Slice 1 materializer) AND `JARVIS_MULTI_PRIOR_RUNNER_ENABLED` (Slice 2 runner) AND `JARVIS_MULTI_PRIOR_DISPATCH_ENABLED` (Slice 3 dispatch); `JARVIS_MULTI_PRIOR_OBSERVER_ENABLED` (Slice 4 ledger) gated internally by `record_dispatch_outcome`. **Route + posture gates** (substrate-enforced via `materialize_priors`): `route=complex` AND `posture=EXPLORE` — naturally narrow blast radius; only the ops that most benefit trigger multi-prior. **Authority asymmetry (AST-pinned via test)**: Seam imports stdlib + `verification/multi_prior_*` + `plan_generator` only. NEVER imports `orchestrator` / `iron_gate` / `policy_engine` / `candidate_generator` / `providers` / `change_engine` / `semantic_guardian` — pure integration adapter, zero policy. **15 regression tests** in `tests/governance/test_multi_prior_plan_seam.py`: master-off + partial-flags returns None (3 tests); substrate-gate-fails returns None (route + posture, 2 tests); exception isolation NEVER raises into caller (1 test); **8 AST pins** (canonical substrate imports / authority asymmetry / rehydration via `_parse_plan_response` / coherence via `_validate_plan_coherence` / `record_dispatch_outcome(verdict)` invoked / `Prior.system_prompt_addendum` threaded / `seed` threaded / two-caller consumer presence in plan_runner.py + orchestrator.py); schema version canonical literal (1 test). **273 broader Move 6.5 regression tests still green** (all 6 substrate slices unaffected — Slice 1 through Slice 6). **Why this matters for RSI** (operator binding clarification #6): graduation observations accumulate ONLY via `record_dispatch_outcome` — pre-v2.97 the helper was unused so Slice 6's graduation contract (`is_ready_for_graduation()` needs 50+ observations) could never advance. Post-v2.97, when operator flips the 3 substrate master flags via Phase 9 cadence, every PLAN-phase op on (complex, EXPLORE) routes through multi-prior dispatch + records to ledger. After 50+ observations with <40% non-actionable rate, Slice 6 reports READY → operator flips `JARVIS_MULTI_PRIOR_DISPATCH_ENABLED=true` permanently. **Files**: `backend/core/ouroboros/governance/verification/multi_prior_plan_seam.py` (NEW, ~360 LOC); `backend/core/ouroboros/governance/phase_runners/plan_runner.py` (+22 LOC integration); `backend/core/ouroboros/governance/orchestrator.py` (+22 LOC integration — same helper, mirrors plan_runner exactly); `tests/governance/test_multi_prior_plan_seam.py` (NEW, 15 tests + 8 AST pins). Operator binding 2026-05-10 satisfied verbatim across all 7 clarifications: (1) plan JSON as str artifact OK via SHA-256 signature; (2) rehydration via canonical parser + validator, not parallel parser; (3) Slice 1 substrate purity preserved (Slice 1 materializer doesn't fork PlanGenerator; the seam — not the substrate — composes both); (4) real prior angles via `system_prompt_addendum` + `seed` threading from `materialize_priors`; (5) shared helper across both callers, no duplication; (6) `record_dispatch_outcome` invoked unconditionally (observer-flag-gated by recorder internally); (7) Seam A (GENERATE/GenerationResult) deferred to follow-on slice (closure-map pattern is an adapter, not cheating; higher cost + higher blast radius justifies deferring). 
 
@@ -413,6 +468,22 @@ All shipped today, ALL CLOSED structurally:
     - [38.9 Sequencing recommendation (path to A++ professional)](#389-sequencing-recommendation-path-to-a-professional)
     - [38.10 Operator-binding alignment per arc](#3810-operator-binding-alignment-per-arc)
     - [38.11 Proactive-only UX features (CC structurally cannot have these)](#3811-proactive-only-ux-features-cc-structurally-cannot-have-these-new-2026-05-07)
+40. [Advanced Forward Roadmap (post-tonight, operator-paced) (NEW 2026-05-10)](#40-advanced-forward-roadmap-post-tonight-operator-paced) *(22-item prioritization across 5 chronological waves + academic-research grounding)*
+    - [40.1 Tier 1 — Recursion-bounding (load-bearing for second-order doll)](#401-tier-1--recursion-bounding-load-bearing-for-second-order-doll)
+    - [40.2 Tier 2 — Antivenom completeness + cross-session coherence](#402-tier-2--antivenom-completeness--cross-session-coherence)
+    - [40.3 Tier 3 — Calibration, learning, second-order metrics](#403-tier-3--calibration-learning-second-order-metrics)
+    - [40.4 Truly experimental (research-grade, deferred)](#404-truly-experimental-research-grade-deferred)
+    - [40.5 Chronological prioritization — all 22 items ranked by impact + sequencing (5 waves)](#405-chronological-prioritization--all-22-items-ranked-by-impact--sequencing)
+        - [40.5.1 Top-3 if you want to start TODAY](#4051-top-3-if-you-want-to-start-today)
+        - [40.5.2 Anti-recommendation](#4052-anti-recommendation)
+    - [40.6 Status — operational, not engineering](#406-status--operational-not-engineering)
+    - [40.7 Academic foundations & related work (prestigious-university research grounding)](#407-academic-foundations--related-work-prestigious-university-research-grounding)
+        - [40.7.1 — Recursive Self-Improvement (RRD architectural foundation)](#4071--recursive-self-improvement-rrd-architectural-foundation)
+        - [40.7.2 — Formal verification + AST safety (Antivenom foundation)](#4072--formal-verification--ast-safety-antivenom-foundation)
+        - [40.7.3 — Multi-agent consensus + speculative execution (Move 6.5 foundation)](#4073--multi-agent-consensus--speculative-execution-move-65-foundation)
+        - [40.7.4 — AI Safety + Constitutional Cage (Antivenom philosophical foundation)](#4074--ai-safety--constitutional-cage-antivenom-philosophical-foundation)
+        - [40.7.5 — Benchmarks (Phase 9 cadence empirical foundation)](#4075--benchmarks-phase-9-cadence-empirical-foundation)
+        - [40.7.6 — Why this matters](#4076--why-this-matters)
 - [Appendix A — Glossary](#appendix-a--glossary)
 - [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
 - [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
