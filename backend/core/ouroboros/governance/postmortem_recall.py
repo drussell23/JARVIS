@@ -528,6 +528,61 @@ class PostmortemRecallService:
 
 
 # ---------------------------------------------------------------------------
+# Public accessor — downstream substrates compose this rather than reach
+# into the underscored helper. Mirrors the canonical Singleton + Read-API
+# Extension Pattern (cf. ``capability_constellation.principles_for_category``,
+# ``auto_committer.ov_signature_substring``).
+# ---------------------------------------------------------------------------
+
+
+def gather_recent_postmortems(
+    sessions_dir: Optional[Path] = None,
+    *,
+    max_total: Optional[int] = None,
+) -> List[PostmortemRecord]:
+    """Public canonical accessor for the recent-postmortem walker.
+
+    Composes :func:`_gather_recent_postmortems` (private) so downstream
+    surfaces (e.g., §40 Wave 3 #7 counterfactual_rehearsal_mode) have
+    a single source of truth for "read the last N postmortems from on-
+    disk session debug logs" without reaching into private state.
+
+    Parameters
+    ----------
+    sessions_dir:
+        Override the canonical sessions root. Defaults to
+        ``<repo>/.ouroboros/sessions``.
+    max_total:
+        Hard ceiling on records returned. Defaults to the env-tunable
+        :func:`max_postmortems_to_scan`.
+
+    Returns
+    -------
+    List[PostmortemRecord]
+        Newest-first; bounded by ``max_total``. Empty list when the
+        sessions directory is missing / unreadable / empty. NEVER
+        raises.
+    """
+    if sessions_dir is None:
+        # Mirrors the canonical default path used by
+        # :func:`get_default_service` (line ~627) — single source
+        # of truth for "where do battle-test session debug logs
+        # live". Avoids reaching into a harness-private helper.
+        sessions_dir = Path(".ouroboros/sessions")
+    cap = (
+        int(max_total)
+        if max_total is not None
+        else max_postmortems_to_scan()
+    )
+    try:
+        return _gather_recent_postmortems(
+            Path(sessions_dir), max_total=cap,
+        )
+    except Exception:  # noqa: BLE001 — defensive (NEVER raises)
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Prompt rendering
 # ---------------------------------------------------------------------------
 
@@ -583,6 +638,7 @@ __all__ = [
     "decay_days",
     "similarity_threshold",
     "max_postmortems_to_scan",
+    "gather_recent_postmortems",
     "render_recall_section",
     "get_default_service",
     "reset_default_service",
