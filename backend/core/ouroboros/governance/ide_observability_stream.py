@@ -519,6 +519,13 @@ EXHAUSTED / DISABLED) + budget allowance. Producer hook is
 best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_PROOF_CARRIER_BUILT = "proof_carrier_built"
+"""§40 Wave 5 #19 (PRD v2.99+, 2026-05-11) — fired by
+``proof_carrier_transport.build_proof_carrier`` whenever
+verdict is WARN or BLOCK (CLEAN silent). Payload carries
+per-candidate evidence summary across Wave 3 #5/#6/#7 sources."""
+
+
 EVENT_TYPE_COGNITIVE_LOAD_SHED_TRIGGERED = (
     "cognitive_load_shed_triggered"
 )
@@ -1175,6 +1182,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_META_PRIOR_LEARNED,               # §40 Wave 5 #22 (PRD v2.99+, meta-prior learning)
     EVENT_TYPE_PREDICTIVE_POSTMORTEM_FORECASTED, # §40 Wave 5 #18 (PRD v2.99+, predictive postmortem)
     EVENT_TYPE_COGNITIVE_LOAD_SHED_TRIGGERED,    # §40 Wave 5 #21 (PRD v2.99+, cognitive load shedding)
+    EVENT_TYPE_PROOF_CARRIER_BUILT,              # §40 Wave 5 #19 (PRD v2.99+, proof carrier)
 })
 
 
