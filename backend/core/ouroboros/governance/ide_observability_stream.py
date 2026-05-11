@@ -526,6 +526,16 @@ MIRROR_FOUND verdict. TRIGGER-GATED — substrate stays inert
 unless multi-remote repo OR force flag."""
 
 
+EVENT_TYPE_ROADMAP_PROCESSED = "roadmap_processed"
+"""§41.4 Phase 1 (PRD v3.0+, 2026-05-11) — fired by
+``roadmap_reader.process_roadmap`` after each roadmap
+processing pass. Payload carries verdict (NO_ROADMAP / VALID /
+INVALID_SIGNATURE / MALFORMED) + goal_count + emitted_count +
+signature_valid + elapsed_s + schema_version. Composes
+canonical intake.intent_envelope.make_envelope +
+UnifiedIntakeRouter.ingest — no parallel cage."""
+
+
 EVENT_TYPE_WEB_BROWSING_ACTION = "web_browsing_action"
 """§41.5 Phase 0 (PRD v3.0+, 2026-05-11) — fired by
 ``web_browser.perform_browsing_action`` after every browsing
@@ -1204,6 +1214,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_PROOF_CARRIER_BUILT,              # §40 Wave 5 #19 (PRD v2.99+, proof carrier)
     EVENT_TYPE_CROSS_REPO_MIRROR_FOUND,          # §40 Wave 5 #20 (PRD v2.99+, cross-repo mirror)
     EVENT_TYPE_WEB_BROWSING_ACTION,              # §41.5 Phase 0 (PRD v3.0+, web_browser composer)
+    EVENT_TYPE_ROADMAP_PROCESSED,                # §41.4 Phase 1 (PRD v3.0+, roadmap_reader)
 })
 
 
