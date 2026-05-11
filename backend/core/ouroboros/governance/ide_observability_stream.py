@@ -526,6 +526,17 @@ MIRROR_FOUND verdict. TRIGGER-GATED — substrate stays inert
 unless multi-remote repo OR force flag."""
 
 
+EVENT_TYPE_MULTI_STEP_ORCHESTRATED = (
+    "multi_step_orchestrated"
+)
+"""§41.4 Phase 1 fourth arc (PRD v3.0+, 2026-05-11) — fired
+by ``multi_step_orchestrator.advance_orchestration`` after
+each tick. Payload carries verdict + parent_goal_id +
+total/blocked/ready/emitted/done/failed counts +
+completion_ratio + elapsed_s + schema_version. Composes
+goal_decomposition_planner + canonical envelope factory."""
+
+
 EVENT_TYPE_ARCHITECTURAL_TASTE_EVALUATED = (
     "architectural_taste_evaluated"
 )
@@ -1237,6 +1248,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_ROADMAP_PROCESSED,                # §41.4 Phase 1 (PRD v3.0+, roadmap_reader)
     EVENT_TYPE_GOAL_DECOMPOSED,                  # §41.4 Phase 1 second arc (PRD v3.0+, goal_decomposition_planner)
     EVENT_TYPE_ARCHITECTURAL_TASTE_EVALUATED,    # §41.4 Phase 1 third arc (PRD v3.0+, architectural_taste_layer)
+    EVENT_TYPE_MULTI_STEP_ORCHESTRATED,          # §41.4 Phase 1 fourth arc (PRD v3.0+, multi_step_orchestrator)
 })
 
 
