@@ -377,11 +377,34 @@ _MIGRATION_STOP_REASONS: FrozenSet[str] = frozenset({
 #      ``wall_clock_cap+atexit_fallback`` from the partial-shutdown
 #      insurance path in ``ouroboros_battle_test.py``) can use the
 #      same canonical set.
+#
+# Layer 8 revision (v2.96, 2026-05-10) — REMOVED ``wall_clock_cap``
+# from this set. CLAUDE.md battle-test footnote: "wall_clock_cap
+# is treated equivalent to idle_timeout for clean-bar purposes".
+# ``idle_timeout`` was NEVER in the noise set (symmetry: it
+# produces clean classification). ``wall_clock_cap`` belongs in
+# the same category — it's the harness's own watchdog firing per
+# design, not an external boundary cutting cleanup short.
+#
+# Soak ``bt-2026-05-10-221432`` exposed the mis-classification:
+# the v2.92 Layer 7 dual-clock watchdog fired wall_clock_cap
+# correctly at 2400s wall (sleep-resilient), the v2.88 Layer 6
+# atexit fallback wrote summary.json before ShutdownWatchdog
+# os._exit(75), but the soak classifier read ``wall_clock_cap``
+# as noise and downgraded to ``outcome=infra``. With Layer 8
+# the same composite stop_reason routes through Step 4 as a
+# clean termination.
+#
+# External-signal causes (SIGTERM/SIGINT/SIGHUP) stay in the
+# noise set because they're external — the harness did not
+# intend the termination.
 _SHUTDOWN_NOISE_STOP_REASONS: FrozenSet[str] = frozenset({
     "sigterm",
     "sighup",
     "sigint",
-    "wall_clock_cap",
+    # `wall_clock_cap` REMOVED in Layer 8 (v2.96, 2026-05-10) —
+    # see comment above. Harness-intended terminations classify
+    # as clean per CLAUDE.md clean-bar-equivalence footnote.
     "harness_idle_timeout",
 })
 

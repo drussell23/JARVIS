@@ -246,12 +246,18 @@ class TestHookHappyPath:
 
 class TestCauseMatrix:
     @pytest.mark.parametrize("cause,expected", [
+        # External-signal causes — incomplete_kill (the harness
+        # did NOT intend this termination).
         (TerminationCause.SIGTERM, "incomplete_kill"),
         (TerminationCause.SIGINT, "incomplete_kill"),
         (TerminationCause.SIGHUP, "incomplete_kill"),
-        (TerminationCause.WALL_CLOCK_CAP, "incomplete_kill"),
-        (TerminationCause.IDLE_TIMEOUT, "incomplete_kill"),
-        (TerminationCause.BUDGET_EXCEEDED, "incomplete_kill"),
+        # Layer 8 (v2.96, 2026-05-10) — harness-intended causes
+        # now stamp ``complete`` per CLAUDE.md clean-bar
+        # equivalence. Was ``incomplete_kill`` pre-Layer-8.
+        (TerminationCause.WALL_CLOCK_CAP, "complete"),
+        (TerminationCause.IDLE_TIMEOUT, "complete"),
+        (TerminationCause.BUDGET_EXCEEDED, "complete"),
+        # UNKNOWN stays safe-default.
         (TerminationCause.UNKNOWN, "incomplete_kill"),
     ])
     def test_cause_maps_to_session_outcome(self, cause, expected):
@@ -510,21 +516,33 @@ class TestWallCapBugFix:
             stop_reason="wall_clock_cap",
         )
         # THE bug fix: writer was called. Pre-migration: this
-        # would have been zero calls.
+        # would have been zero calls. Layer 8 (v2.96, 2026-05-10):
+        # WALL_CLOCK_CAP now stamps ``complete`` (was
+        # ``incomplete_kill`` pre-Layer-8) per CLAUDE.md
+        # clean-bar-equivalence with idle_timeout.
         assert len(h._calls) == 1
-        assert h._calls[0]["session_outcome"] == "incomplete_kill"
+        assert h._calls[0]["session_outcome"] == "complete"
 
     def test_wall_cap_classified_session_outcome(self):
-        # The session_outcome value distinguishes
-        # complete-vs-interrupted for LastSessionSummary (the
-        # downstream parser). Pin: WALL_CLOCK_CAP yields
-        # "incomplete_kill" so audit tooling treats it the same
-        # as a signal-driven shutdown (both are interrupted).
+        # Layer 8 (v2.96, 2026-05-10) revised the WALL_CLOCK_CAP
+        # session_outcome from ``incomplete_kill`` to ``complete``.
+        # Rationale: CLAUDE.md battle-test footnote treats
+        # wall_clock_cap as clean-bar-equivalent to idle_timeout
+        # (both are harness-intended terminations, not external
+        # interruptions). Pre-Layer-8 the mapping was wrong:
+        # bt-2026-05-10-221432 (soak #3) was misclassified as
+        # outcome=infra when the atexit fallback fired because
+        # the clean shutdown path took 35.7s (>30s ShutdownWatchdog
+        # deadline).
         assert (
             _CAUSE_TO_SESSION_OUTCOME[
                 TerminationCause.WALL_CLOCK_CAP
             ]
-            == "incomplete_kill"
+            == "complete"
+        ), (
+            "Layer 8 invariant: WALL_CLOCK_CAP maps to "
+            "'complete' (harness-intended termination). Drift "
+            "regresses to soak #3 misclassification."
         )
 
     def test_idle_and_budget_paths_also_write(self):
@@ -541,9 +559,13 @@ class TestWallCapBugFix:
             set_active_harness(h)
             partial_summary_writer_hook(_ctx(cause=cause))
             assert len(h._calls) == 1
+            # Layer 8 (v2.96, 2026-05-10): these harness-intended
+            # causes now stamp ``complete`` (was ``incomplete_kill``
+            # pre-Layer-8). The adapter is ready, the writer
+            # stamps the right value when wired.
             assert (
                 h._calls[0]["session_outcome"]
-                == "incomplete_kill"
+                == "complete"
             )
             clear_active_harness()
 

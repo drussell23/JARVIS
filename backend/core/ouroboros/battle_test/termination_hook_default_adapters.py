@@ -142,24 +142,52 @@ def clear_active_harness() -> None:
 # ---------------------------------------------------------------------------
 
 
-# Closed mapping. Pristine-equivalency invariant: every cause that
-# was previously classified as "incomplete_kill" by the signal
-# handler at harness.py:3290 MUST still map to "incomplete_kill"
-# after migration. New causes (wall-cap, idle, budget) ALSO map to
-# "incomplete_kill" because the LastSessionSummary parser's
-# clean-vs-interrupted dichotomy treats them all the same — the
-# specific cause is in ``stop_reason``, which the writer also
-# stamps.
+# Closed mapping. Layer 8 (v2.96, 2026-05-10) — revised semantics:
+#
+# Two distinct termination classes, with DIFFERENT session_outcome
+# values matching the operator-facing intent (cf. CLAUDE.md battle-
+# test footnote: "wall_clock_cap is treated equivalent to
+# idle_timeout for clean-bar purposes"):
+#
+# 1. **External-signal causes** (SIGTERM/SIGINT/SIGHUP) — the
+#    session was killed by something outside the harness's own
+#    control. Stamp ``incomplete_kill`` because the harness did
+#    NOT intend this termination.
+# 2. **Harness-intended causes** (WALL_CLOCK_CAP/IDLE_TIMEOUT/
+#    BUDGET_EXCEEDED) — the harness's own watchdogs/gates fired
+#    per design. These are clean stops by intent; the soak-
+#    classifier (live_fire_soak._SHUTDOWN_NOISE_STOP_REASONS,
+#    revised in Layer 8) treats them as harness-class-clean.
+#    Stamp ``"complete"`` so the partial summary (when the
+#    atexit fallback fires because the clean shutdown path is
+#    slow OR wedged) reflects the intent, NOT the cleanup
+#    timing accident.
+#
+# Soak ``bt-2026-05-10-221432`` exposed the gap: wall_clock_cap
+# fired correctly at 2400s (v2.92 Layer 7), clean path ran 35.7s,
+# ShutdownWatchdog os._exit(75) fired (v2.88 Layer 6 wrote
+# partial summary first). Result was ``session_outcome=
+# incomplete_kill`` → soak classifier → ``outcome=infra``. With
+# Layer 8 mapping, the partial-summary stamps ``complete`` →
+# classifier → ``outcome=clean``, matching the harness's intent.
+#
+# UNKNOWN stays ``incomplete_kill`` (safe default — if we don't
+# know why we're terminating, treat as interrupted).
 _CAUSE_TO_SESSION_OUTCOME: dict = {
+    # External-signal causes — incomplete_kill (the harness did
+    # not intend this termination).
     TerminationCause.SIGTERM: "incomplete_kill",
     TerminationCause.SIGINT: "incomplete_kill",
     TerminationCause.SIGHUP: "incomplete_kill",
-    TerminationCause.WALL_CLOCK_CAP: "incomplete_kill",
-    TerminationCause.IDLE_TIMEOUT: "incomplete_kill",
-    TerminationCause.BUDGET_EXCEEDED: "incomplete_kill",
-    TerminationCause.NORMAL_EXIT: None,  # clean path — writer
-                                          # uses default ("complete")
-    TerminationCause.UNKNOWN: "incomplete_kill",
+    # Harness-intended causes — clean stamp per Layer 8 (v2.96).
+    # CLAUDE.md battle-test footnote: wall_clock_cap is treated
+    # equivalent to idle_timeout for clean-bar purposes.
+    TerminationCause.WALL_CLOCK_CAP: "complete",
+    TerminationCause.IDLE_TIMEOUT: "complete",
+    TerminationCause.BUDGET_EXCEEDED: "complete",
+    TerminationCause.NORMAL_EXIT: None,  # clean path writes
+                                          # "complete" itself
+    TerminationCause.UNKNOWN: "incomplete_kill",  # safe default
 }
 
 
