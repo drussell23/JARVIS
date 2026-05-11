@@ -467,7 +467,13 @@ What needs BUILDING (not just composing) for Tier B/C/D. Per-substrate compositi
 
 ---
 
-### §41.5 NEW Operator-Flagged Gap — Web Search & Browsing Capability
+### §41.5 NEW Operator-Flagged Gap — Web Search & Browsing Capability  **[SUBSTRATE + VENOM WIRING SHIPPED 2026-05-11]**
+
+**Closure status**: Substrate shipped `31933e5da9` (`web_browser.py` 1580 LOC, 74 substrate tests). Venom tool-loop wiring shipped `16152a29ef` (3 new tools registered in `_L1_MANIFESTS` — `web_browse(url, js_render)` / `web_follow(url)` / `web_cite(url, fragment)` — routing through `perform_browsing_action` with `BrowsingAction` + `BrowsingVerdict` closed taxonomies; legacy `web_fetch`/`web_search` left byte-identical per augment-not-replace; master `JARVIS_WEB_BROWSER_ENABLED` §33.1 default-FALSE for operator-paced graduation; 20 wiring regression tests + 5 AST pins on dispatch source). Cumulative §41.5 surface: **94 tests** across substrate + wiring. The remainder of this subsection is preserved as the original design intent record.
+
+---
+
+
 
 The operator flagged this directly: *"I don't think web search and being able to browse the web like how Claude does is integrated in O+V."* They are correct. This is a load-bearing gap for autonomous JARVIS development.
 
