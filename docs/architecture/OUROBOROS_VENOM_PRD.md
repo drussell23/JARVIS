@@ -424,7 +424,7 @@ composes the substrate — no duplicated logic, no parallel state.
 | 19 | Inline command examples in errors | 🟡 PARTIAL (typo suggestion now hints `append --help for usage`; full inline-example-in-error injection deferred) | ~2 days | Slice 2 |
 | 20 | Per-command `--help` flag | ✅ **SHIPPED 2026-05-11** (`5e1ad3d3ca` `format_verb_help` + `c475e3de66` universal `--help`/`-h` interception in dispatch) | ~1 day | Slice 3 |
 | 11 | Fuzzy slash palette + inline descriptions | ✅ **SHIPPED 2026-05-11** (`5e1ad3d3ca` `fuzzy_match` — prefix-first, edit-distance fallback) | ~3 days | Slice 3 |
-| 12 | Inline `?` tooltip mid-line | ⚪ DEFERRED (prompt_toolkit keybinding work, no substrate dependency) | ~2 days | Slice 3 |
+| 12 | Inline `?` tooltip mid-line | ✅ **SHIPPED 2026-05-11** (`e4a0972463` — `resolve_help_for_buffer` substrate + prompt_toolkit `?` keybinding using `run_in_terminal`; composes existing verb_registry + `format_verb_help`, NO parallel state; ambiguity-refusal + 2-layer defensive try/except + literal-`?` fallback) | ~2 days | Slice 3 |
 | 8 | Pretty-printed JSON tool outputs | ⚪ DEFERRED (needs locating the REPL tool-output surface) | ~3 days | Slice 3 |
 | 26 | Fast-path for simple Q&A | ⚪ DEFERRED (controversial scope; design needed) | ~5 days | Slice 3 |
 | 10 | @-mention completion (rich) | 🟡 PARTIAL (existing `repl_input_polish.build_mention_completer` ships path completion; rich file-stat metadata deferred) | ~3 days | Slice 3 |
