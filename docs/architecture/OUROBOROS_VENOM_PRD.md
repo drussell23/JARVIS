@@ -1,7 +1,9 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 3.1 (2026-05-11 — **§41.4 Phase 1 FULLY CLOSED — all 9 of 9 Layer 2 capability substrates shipped in a single same-day arc**: This session closed the entire §41.4 Layer 2 engineering capability table — what the PRD scoped at "~14–22 weeks of focused engineering" landed in one continuous arc on 2026-05-11. 9 commits / 9 new substrates / **825 cross-suite regression tests** (171 → 825, a +654 delta) / **61 AST pins** / **86 FlagRegistry seeds** / **9 new SSE events**. Substrate-by-substrate (commit hash + LOC + test count): (1) RoadmapReader `d0eb3780b6` operator-signed `roadmap.yaml`→IntentEnvelope pipeline with HMAC-SHA256 verification + closed RoadmapVerdict/GoalPriority taxonomies, composes intake.intent_envelope + UnifiedIntakeRouter + cross_process_jsonl; (2) Goal Decomposition Planner `708cd531ec` sits above plan_generator: RoadmapGoal→N dependent SubGoals→Kahn-DAG-validated→IntentEnvelopes, 3 closed taxonomies (DecompositionVerdict/SubGoalKind/CompletionStatus), pluggable decomposer (heuristic default + LLM-injectable); (3) Architectural Taste Layer `eb0ca7a68c` advisory design-quality verdict via git+AST baseline profile (snake_case ratio, function lengths, sibling-import ratio, AST node count), 3 closed taxonomies (TasteVerdict/TasteSignal/TasteDimension), exception-safe LLM enricher; (4) Multi-Step Plan Orchestrator `6cc1c52340` enforces DAG contract at RUNTIME (not just emit-time), closed OrchestrationVerdict/SubGoalRunState, idempotent + bounded (max_emits_per_tick); (5) Mutation Testing Harness `861d8bf9ac` AST-based operator flips (comparison/arithmetic/boolean/identity) with **atomic backup-then-restore pattern** + try/finally — file ALWAYS restored even on runner crash/timeout/exception, operator-injectable test_runner_callable; (6) Coverage Gate `8a69033960` 4-source coverage parser (JSON/XML/SQLITE/SUBPROCESS) with 3-pass path matching, operator-tunable missing_file_penalty, auto-clamp strong≥floor, source_override label preserved on empty result; (7) Long-Horizon Memory `2927655de7` commit-history-aware cross-session layer composing 3 existing factories (user_preference_memory + last_session_summary + semantic_index) plus 90-day git-log walker, 3 closed taxonomies (RecallVerdict/MemoryHorizon/MemoryTheme), classify_theme via conventional-commit prefix priority + body-keyword fallback; (8) Infrastructure Recovery Loop `169fe5ceb0` unified periodic scanner composing posture_health task-death classifier + worktree_manager.reap_orphans + 2 new detectors (stale-lock-with-dead-PID + summary-less-session-dir post-Layer-8 forensic), **DUAL master/mutation gate per Manifesto §6** — `JARVIS_INFRA_RECOVERY_LOOP_AUTO_RECLAIM_ENABLED` default-FALSE hard opt-in for file mutation, bounded by MAX_RECOVERIES_PER_RUN, 3-tier PID liveness probe (psutil → os.kill(0) → ps -p); (9) Multi-Day Deadlock Detector `7faf3315d8` cross-session pattern recognition with 4 detector kinds (REPEAT_STOP_REASON excluding canonical clean-bar-equivalents `wall_clock_cap`/`idle_timeout`/`budget_exceeded` per v2.95 §32, REPEAT_FAILURE failure-ratio threshold, VERDICT_THRASH composing long_horizon_memory.walk_git_log to find files getting repeated BUGFIX commits across distinct days, ZERO_PROGRESS newest-first contiguous run of branch_commits=0), tolerant summary.json parser supporting both `stats` dict + flat fields. Every substrate ships the canonical shape: §33.1 default-FALSE master flag, closed 4-value taxonomies bytes-pinned via AST, frozen §33.5 artifacts with to_dict + schema_version stamp, lazy-imported composers (NEVER duplicating logic), NEVER-raises contract at the substrate boundary, SSE event registered in `_VALID_EVENT_TYPES`, FlagRegistry seeds. Authority asymmetry AST-pinned across all 9 — forbids orchestrator/iron_gate/policy/providers/candidate_generator/urgency_router/change_engine/semantic_guardian/auto_committer/risk_tier_floor/tool_executor/plan_generator imports (substrates are observational; the composed canonical substrates remain accessible to their direct consumers). Per the PRD's §41.4 scoping: "Each substrate follows the canonical §33.1 pattern. No parallel state, no hardcoding — same discipline as Wave 1-3 ships" — confirmed verbatim. **What this unlocks per §41.8 phased roadmap**: Phase 2 (Tier B operational) prerequisites complete — RoadmapReader + Goal Decomposition Planner are the named blockers for "Tier B operational" in §41.8's Phase 2 row. Mutation Testing Harness + Coverage Gate + Architectural Taste Layer raise the quality floor required for Tier C autonomous operation. Long-Horizon Memory + Infrastructure Recovery Loop + Multi-Day Deadlock Detector are the cross-session resilience triad enabling continuous unsupervised days (the Layer 3 evidence threshold gating Tier D readiness). **Remaining critical-path items per §41**: (a) §41.5 Web Browser substrate (~3-5 weeks, Phase 0); (b) §41.3 UX Polish Slices 2-3 (19 items, Phase 0); (c) Layer 3 wall-clock evidence accumulation (3-6 months at current cadence — structurally cannot be engineered around); (d) Layer 4 architectural decision on operator-replacement authority (signed roadmap document is RECOMMENDED option). **Cumulative session totals (post-§41.4-closure push)**: §40 (22 substrates) + §41.4 (9 substrates) = **31 Phase-1-class substrates landed** across 2026-05-10 → 2026-05-11. Prior version note retained:
+**Version**: 3.2 (2026-05-11 — **§41.3 Slice 2/3 UX arc structurally complete + §41.3.1 fast-path Q&A design-doc anchored**: This session closed §41.3 Slice 2 + Slice 3 to 10-of-12 items shipped end-to-end (#8 JSON pretty-print `76b11909e0` + #10 rich @-mention `752a451387` + #11 fuzzy slash + #12 inline ? tooltip `e4a0972463` + #14 arg completion `10673d9deb` + #15 welcome banner + #17 /tutorial `e8f4c203a4` + #18 typo + #19 examples-in-errors `fb41338a97` + #20 --help, with full descriptor-driven REPL seam fully exercised — every consumer reads from the single `VerbDescriptor` source of truth, no parallel state). One item (#16 setup walkthrough) remains ⚪ deferred-by-design as PRD-flagged redundant with the shipped `/tutorial`. **New §41.3.1 added** — fast-path Q&A (#26) design-doc placeholder: 5 explicit open decisions (D1-D5: classification trigger / answer authority / cost contract / memory & audit / failure escalation) each with options + tradeoffs + composition-map to existing canonical surfaces + RECOMMENDED paths + ruled-out non-decisions + phased engineering plan (~2 weeks across 4 phases) + 3 open empirical questions that can only resolve after traffic accumulates (Layer 3 evidence, not Layer 2 engineering). The design-doc anchors the decision so future-me / operator can return, pick paths, and engineering follows cleanly. Also same-day shipped: Phase 10 Slice 5b yaml_purger substrate (`6b0a7a254f`) — gated end-to-end by `phase10_graduation_contract.is_ready_for_purge` + master flag, dry-run-default, atomic write via tempfile+os.replace, 6 AST pins enforcing gate ordering + closed-5-value PurgeVerdict taxonomy + composes-canonical (no parallel YAML parser). Cross-suite this session: REPL seam 283+99+102 = 484 across §41.3 substrate + wiring; Phase 10 156/156. Prior version note retained:
+
+— v3.1 (2026-05-11 — **§41.4 Phase 1 FULLY CLOSED — all 9 of 9 Layer 2 capability substrates shipped in a single same-day arc**: This session closed the entire §41.4 Layer 2 engineering capability table — what the PRD scoped at "~14–22 weeks of focused engineering" landed in one continuous arc on 2026-05-11. 9 commits / 9 new substrates / **825 cross-suite regression tests** (171 → 825, a +654 delta) / **61 AST pins** / **86 FlagRegistry seeds** / **9 new SSE events**. Substrate-by-substrate (commit hash + LOC + test count): (1) RoadmapReader `d0eb3780b6` operator-signed `roadmap.yaml`→IntentEnvelope pipeline with HMAC-SHA256 verification + closed RoadmapVerdict/GoalPriority taxonomies, composes intake.intent_envelope + UnifiedIntakeRouter + cross_process_jsonl; (2) Goal Decomposition Planner `708cd531ec` sits above plan_generator: RoadmapGoal→N dependent SubGoals→Kahn-DAG-validated→IntentEnvelopes, 3 closed taxonomies (DecompositionVerdict/SubGoalKind/CompletionStatus), pluggable decomposer (heuristic default + LLM-injectable); (3) Architectural Taste Layer `eb0ca7a68c` advisory design-quality verdict via git+AST baseline profile (snake_case ratio, function lengths, sibling-import ratio, AST node count), 3 closed taxonomies (TasteVerdict/TasteSignal/TasteDimension), exception-safe LLM enricher; (4) Multi-Step Plan Orchestrator `6cc1c52340` enforces DAG contract at RUNTIME (not just emit-time), closed OrchestrationVerdict/SubGoalRunState, idempotent + bounded (max_emits_per_tick); (5) Mutation Testing Harness `861d8bf9ac` AST-based operator flips (comparison/arithmetic/boolean/identity) with **atomic backup-then-restore pattern** + try/finally — file ALWAYS restored even on runner crash/timeout/exception, operator-injectable test_runner_callable; (6) Coverage Gate `8a69033960` 4-source coverage parser (JSON/XML/SQLITE/SUBPROCESS) with 3-pass path matching, operator-tunable missing_file_penalty, auto-clamp strong≥floor, source_override label preserved on empty result; (7) Long-Horizon Memory `2927655de7` commit-history-aware cross-session layer composing 3 existing factories (user_preference_memory + last_session_summary + semantic_index) plus 90-day git-log walker, 3 closed taxonomies (RecallVerdict/MemoryHorizon/MemoryTheme), classify_theme via conventional-commit prefix priority + body-keyword fallback; (8) Infrastructure Recovery Loop `169fe5ceb0` unified periodic scanner composing posture_health task-death classifier + worktree_manager.reap_orphans + 2 new detectors (stale-lock-with-dead-PID + summary-less-session-dir post-Layer-8 forensic), **DUAL master/mutation gate per Manifesto §6** — `JARVIS_INFRA_RECOVERY_LOOP_AUTO_RECLAIM_ENABLED` default-FALSE hard opt-in for file mutation, bounded by MAX_RECOVERIES_PER_RUN, 3-tier PID liveness probe (psutil → os.kill(0) → ps -p); (9) Multi-Day Deadlock Detector `7faf3315d8` cross-session pattern recognition with 4 detector kinds (REPEAT_STOP_REASON excluding canonical clean-bar-equivalents `wall_clock_cap`/`idle_timeout`/`budget_exceeded` per v2.95 §32, REPEAT_FAILURE failure-ratio threshold, VERDICT_THRASH composing long_horizon_memory.walk_git_log to find files getting repeated BUGFIX commits across distinct days, ZERO_PROGRESS newest-first contiguous run of branch_commits=0), tolerant summary.json parser supporting both `stats` dict + flat fields. Every substrate ships the canonical shape: §33.1 default-FALSE master flag, closed 4-value taxonomies bytes-pinned via AST, frozen §33.5 artifacts with to_dict + schema_version stamp, lazy-imported composers (NEVER duplicating logic), NEVER-raises contract at the substrate boundary, SSE event registered in `_VALID_EVENT_TYPES`, FlagRegistry seeds. Authority asymmetry AST-pinned across all 9 — forbids orchestrator/iron_gate/policy/providers/candidate_generator/urgency_router/change_engine/semantic_guardian/auto_committer/risk_tier_floor/tool_executor/plan_generator imports (substrates are observational; the composed canonical substrates remain accessible to their direct consumers). Per the PRD's §41.4 scoping: "Each substrate follows the canonical §33.1 pattern. No parallel state, no hardcoding — same discipline as Wave 1-3 ships" — confirmed verbatim. **What this unlocks per §41.8 phased roadmap**: Phase 2 (Tier B operational) prerequisites complete — RoadmapReader + Goal Decomposition Planner are the named blockers for "Tier B operational" in §41.8's Phase 2 row. Mutation Testing Harness + Coverage Gate + Architectural Taste Layer raise the quality floor required for Tier C autonomous operation. Long-Horizon Memory + Infrastructure Recovery Loop + Multi-Day Deadlock Detector are the cross-session resilience triad enabling continuous unsupervised days (the Layer 3 evidence threshold gating Tier D readiness). **Remaining critical-path items per §41**: (a) §41.5 Web Browser substrate (~3-5 weeks, Phase 0); (b) §41.3 UX Polish Slices 2-3 (19 items, Phase 0); (c) Layer 3 wall-clock evidence accumulation (3-6 months at current cadence — structurally cannot be engineered around); (d) Layer 4 architectural decision on operator-replacement authority (signed roadmap document is RECOMMENDED option). **Cumulative session totals (post-§41.4-closure push)**: §40 (22 substrates) + §41.4 (9 substrates) = **31 Phase-1-class substrates landed** across 2026-05-10 → 2026-05-11. Prior version note retained:
 
 — v3.0 (2026-05-11 — **§40 FULLY CLOSED — all 22 items shipped across 5 Waves**: This session closed Waves 1+4+5 in one continuous arc (Waves 2+3 closed earlier session). New substrates: Wave 1 #16 Compositional Curiosity (compositional_curiosity); Wave 4 #9 Belief Revision Ledger, #11 Postmortem Fusion, #12 Schelling-Point Consensus Prior, #10 Sleep Consolidation Pass, #14 Mirror-Self Test, #13 Anti-Fragility Budget; Wave 5 #22 Meta-Prior Learning, #18 Predictive Postmortem, #21 Cognitive Load Shedding, #19 Proof Carrier Transport, #20 Cross-Repo Causal Mirror (TRIGGER-GATED). 17 commits / 12 new substrates / **727 new regression tests** / **61 AST pins** / **74 FlagRegistry seeds** / **12 new SSE events**. The complete §40 graph is now wired end-to-end: foundation telemetry (W1) → recursion bounding (W2) → antivenom + cross-session (W3) → calibration learning (W4) → experimental meta-cognition (W5). Every substrate ships §33.1 default-FALSE — the entire loop graduates operator-paced, one flag at a time. Every composition flows through canonical surfaces (no parallel ledgers, no duplicate taxonomies). Advisory cage is one-way at every edge (AST-pinned). See **§40.8 §40 CLOSURE BANNER** below for substrate-by-substrate provenance. **§41 unchanged** — Tier D north star remains. The §40 closure satisfies the engineering preamble; §41's roadmap (Tier B → Tier D, 18-30 months) is now the operative path forward. Prior version note retained:
 
@@ -426,7 +428,7 @@ composes the substrate — no duplicated logic, no parallel state.
 | 11 | Fuzzy slash palette + inline descriptions | ✅ **SHIPPED 2026-05-11** (`5e1ad3d3ca` `fuzzy_match` — prefix-first, edit-distance fallback) | ~3 days | Slice 3 |
 | 12 | Inline `?` tooltip mid-line | ✅ **SHIPPED 2026-05-11** (`e4a0972463` — `resolve_help_for_buffer` substrate + prompt_toolkit `?` keybinding using `run_in_terminal`; composes existing verb_registry + `format_verb_help`, NO parallel state; ambiguity-refusal + 2-layer defensive try/except + literal-`?` fallback) | ~2 days | Slice 3 |
 | 8 | Pretty-printed JSON tool outputs | ✅ **SHIPPED 2026-05-11** (`76b11909e0` — two-tier JSON detection (descriptor hint OR content auto-detect with size threshold) hooked into the canonical `tool_render_view.compose()` BEFORE the line-bounding cap; per-line token colorizer with 5-entry data-on-module palette table; operator themes via the same palette mapping passed to compose(). NO new BodyShape value (closed taxonomy preserved); NO parallel rendering pipeline. Master flag `JARVIS_TOOL_OUTPUT_JSON_PRETTY_ENABLED` default-TRUE.) | ~3 days | Slice 3 |
-| 26 | Fast-path for simple Q&A | ⚪ DEFERRED (controversial scope; design needed) | ~5 days | Slice 3 |
+| 26 | Fast-path for simple Q&A | ⚪ **DESIGN-DOC ANCHORED 2026-05-11** — see §41.3.1 for 5 open decisions (D1 classification trigger / D2 answer authority / D3 cost contract / D4 memory & audit / D5 failure escalation) with RECOMMENDED paths + composition map + non-decisions. Engineering deferred until operator picks paths; phased plan (~2 weeks) ready when approved. | ~5 days | Slice 3 |
 | 10 | @-mention completion (rich) | ✅ **SHIPPED 2026-05-11** (`752a451387` — `MentionMetadata` frozen artifact + `build_mention_metadata` composer + `format_mention_metadata` renderer; three data-on-module tables drive glyph / size / age formatting; per-candidate dropdown shows `📄 1.2 KB · 5m ago`. NO new registry; pure composition over the existing `_MentionCompleter`) | ~3 days | Slice 3 |
 | 21 | Resumable conversations | unchanged | ~5 days | Slice 4 |
 | 22 | Conversation export to file | unchanged | ~2 days | Slice 4 |
@@ -443,6 +445,118 @@ composes the substrate — no duplicated logic, no parallel state.
 | 25 | Branching/fork turns | Conflicts with linear CausalityDAG semantics — needs DAG design extension |
 
 **Slice 2 + Slice 3 + Slice 4 combined effort**: ~45-50 days focused work. After Slice 4, O+V's CLI is at CC parity for casual operators (~95% polish coverage). The 3 architectural-decision items remain deferred until operator chooses the design.
+
+---
+
+### §41.3.1 Fast-Path Q&A — Open Design Decisions (Deferred 2026-05-11)
+
+**Status**: design-doc placeholder. No engineering until operator picks paths below. Item #26 from §41.3 was deferred specifically because shipping it without these decisions would itself be a binding-violating shortcut.
+
+#### The Problem
+
+Operator types `what does CONTEXT_EXPANSION mean?` at the REPL. Current behavior routes through the full Ouroboros 11-phase pipeline (CLASSIFY → ROUTE → CONTEXT_EXPANSION → PLAN → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE). That's ~$0.03/op via Claude IMMEDIATE route + ~30–60s wall-clock for what should be a 2-second informational lookup. The pipeline is necessary for mutation work and proposal-generation, but **excessive for read-only knowledge queries**.
+
+The design is controversial because Ouroboros is **intentionally** designed to never bypass governance. A fast-path is a designed bypass — that's exactly what the binding "no shortcuts" should rule out unless the operator explicitly defines its safety envelope.
+
+#### Open Decisions (Operator Must Choose)
+
+##### D1 — Classification Trigger: when is something a "question"?
+
+| Option | Composes existing | Tradeoff |
+|---|---|---|
+| **D1a** Heuristic on input shape | New ~30-LOC classifier; starts with `what`/`why`/`how`/`when`/`where`/`who`, ends with `?`, no slash prefix | Cheap; brittle; false-positives ("what should we work on?" is a goal, not a Q) |
+| **D1b** Extend `complexity_classifier.py` with `ComplexityClass.QUESTION` | Existing `ComplexityClass.TRIVIAL` + `fast_path_eligible` flag already extends naturally | Canonical; ~80 LOC; needs labeled examples for the classifier |
+| **D1c** Explicit prefix `?<question>` or `/ask <question>` | New verb via existing `verb_registry` seam; zero ambiguity | Explicit + safe; requires operator habit change |
+
+**RECOMMENDED**: D1c (`/ask` verb) for the first ship — explicit-prefix is the only option that's binding-clean. Operators can adopt the habit voluntarily; the auto-classifiers (D1a / D1b) can ship later as additive paths if D1c proves load-bearing.
+
+##### D2 — Answer Authority: where does the answer come from?
+
+| Option | Composes existing | Tradeoff |
+|---|---|---|
+| **D2a** Lightweight Claude call (no tools, no thinking, low max_tokens) | `providers.ClaudeProvider` already supports thinking=off; just need a curated system prompt + max_tokens=400 + temperature=0.3 | Fast (~3-5s); ~$0.005/op; risks confabulation on project-specifics |
+| **D2b** Semantic index lookup over docs + CLAUDE.md + commits | `semantic_index.py` already builds recency-weighted centroid; add cosine-top-K retrieval + render snippets | Cheapest (~$0/op, local); limited coverage (only indexed text); no synthesis |
+| **D2c** Hybrid: try D2b first, fall back to D2a if confidence low | Both surfaces above + a confidence threshold | Best of both; needs threshold tuning; two failure modes |
+
+**RECOMMENDED**: D2c (hybrid). The semantic index already exists and is being populated continuously — leveraging it first is the binding-aligned path. The Claude fallback handles the long-tail. **Open**: the confidence threshold (cosine score) needs empirical tuning, which itself is deferred until traffic exists.
+
+##### D3 — Cost Contract: which budget pays?
+
+| Option | Composes existing | Tradeoff |
+|---|---|---|
+| **D3a** IMMEDIATE budget (existing) | `cost_governor.py` already tracks per-route spend | Simple; Q&A competes with operator-triggered urgent work |
+| **D3b** New `INFORMATIONAL` sub-budget | New env knob `JARVIS_INFORMATIONAL_BUDGET_USD` + `urgency_router.Route.INFORMATIONAL`; separate ledger | Cleanest accounting; new route requires AST-pin update |
+| **D3c** No additional budget — Q&A free under the master cap | Existing cost_governor enforces; Q&A is "fee waived" if total spend below cap | Simplest; risks budget exhaustion via Q&A spam |
+
+**RECOMMENDED**: D3b (separate sub-budget). Aligns with the manifesto §5 urgency-route taxonomy. Operator sets the Q&A budget independently. ~50 LOC addition to `urgency_router` + `cost_governor`.
+
+##### D4 — Memory & Audit: what's recorded?
+
+| Decision | Default | Composes existing |
+|---|---|---|
+| Q&A turns recorded in `ConversationBridge`? | **YES** (source=`ask_human_q`/`ask_human_a` variant) | Bridge already supports source tags |
+| Q&A turns appear in postmortems? | **NO** (informational; not state-changing) | `last_session_summary.py` digest excludes them |
+| Q&A turns count toward `LastSessionSummary` `attempted` stat? | **NO** (separate `questions_asked` counter) | Additive field on SessionRecord |
+| Q&A persists to `long_horizon_memory` ledger? | **NO** (questions aren't state) | Ledger semantics preserved |
+
+**These defaults are recommendations — operator can flip any of them.** All four compose existing canonical surfaces; no new ledger needed.
+
+##### D5 — Failure Escalation: what if fast-path is wrong?
+
+When fast-path Q&A returns a suspicious answer, operator must have an escape:
+
+| Option | Composes existing | Tradeoff |
+|---|---|---|
+| **D5a** Prefix re-trigger: `/ask --full <question>` re-runs through full pipeline | Existing `/ask` verb with `@arg_spec: [--full]` tag | Operator-controlled escape; cheap |
+| **D5b** Auto-escalate when semantic-index confidence below `min_confidence` AND Claude fallback flags uncertainty | Composes D2c hybrid + Claude's confidence signals | Adaptive; risk of false-escalations |
+| **D5c** Always cache + offer re-run: every Q&A surfaces `/expand q-N` to re-run through full pipeline | Existing `BoundedBodyStore` pattern (`t-N`/`d-N`/`o-N`/`n-N`/`p-N`) extends to `q-N` | Most operator-friendly; ~30 LOC addition |
+
+**RECOMMENDED**: D5c (q-N refs). Aligns structurally with the existing artifact-ref family — operator never loses access to the question, and re-running is one verb away. Composes the established `cross_substrate_ref` pattern.
+
+#### Composition Map — Existing Files to Compose (When Built)
+
+| Capability | Canonical file |
+|---|---|
+| Verb registration (`/ask`) | `verb_registry` via `_handle_ask` on SerpentREPL |
+| Question classification (D1b future) | `complexity_classifier.py` |
+| Route assignment (D3b) | `urgency_router.py` |
+| Provider call (D2a) | `providers.ClaudeProvider` (thinking=off variant) |
+| Semantic retrieval (D2b) | `semantic_index.get_default_index()` |
+| Cost tracking (D3b) | `cost_governor` + new env knob |
+| Turn recording | `conversation_bridge.get_default_bridge()` |
+| Audit ledger | `cross_process_jsonl` (§33.4 pattern) |
+| Q&A ref family (D5c) | `BoundedBodyStore` pattern (mirror of `t-N`/`d-N`/`o-N`/`n-N`/`p-N`) |
+
+**Every capability composes an existing canonical surface.** No parallel state. No new registry. Adding a new sub-budget to `urgency_router` is the only schema change, and it's additive (the closed-5-value Route taxonomy gains a 6th member, AST-pin updates atomically).
+
+#### What's OFF the Table (Non-Decisions)
+
+These are ruled out by the operator binding and **cannot ship under any path**:
+
+1. **Q&A bypassing semantic_guardian / boundary_gate** — if a question generates ANY mutation suggestion, it MUST route to full pipeline. Fast-path is read-only by definition.
+2. **Q&A auto-triggering** from sensors / autonomous proposals — only operator-typed input ever invokes fast-path. The 16 sensors continue to use full pipeline.
+3. **Q&A as a shortcut for code questions** — `where is X tested?` MUST route to Venom tool loop (search_code), not Q&A. The classifier (D1b future) must reject code-shape questions explicitly.
+4. **Skipping conversation_bridge capture** — even though Q&A turns are informational, they shape context for subsequent ops. The bridge captures them regardless.
+
+#### Recommended Phased Engineering (When Operator Approves)
+
+| Phase | Scope | Effort |
+|---|---|---|
+| **Phase 0** — Substrate | New `_handle_ask` verb + `/ask` dispatch; D2a Claude-direct backend; D3a IMMEDIATE budget (cheapest first ship); D5c q-N refs | ~3 days |
+| **Phase 1** — Hybrid retrieval | Add D2b semantic_index lookup; D2c confidence-threshold fallback | ~5 days |
+| **Phase 2** — Budget isolation | D3b INFORMATIONAL route + sub-budget; AST-pin updates for closed-route taxonomy | ~3 days |
+| **Phase 3** — Classifier (optional) | D1b ComplexityClass.QUESTION; auto-route when prefix omitted | ~5 days |
+| **Total when operator approves**: ~2 weeks across 4 phases | | |
+
+**Until then, this section is the design-doc anchor.** Future-me / operator can return, pick paths, and engineering follows.
+
+#### Open Empirical Questions (Cannot Decide Without Traffic)
+
+1. **What's the actual Q&A volume?** Until operator regularly types questions, the cost-budget knob value is a guess.
+2. **What's the semantic-index hit rate?** Depends on how well CLAUDE.md / PRD / commits cover question-shaped queries — needs ≥50 question samples to tune.
+3. **Does the explicit-prefix habit stick?** D1c (`/ask`) requires operator habit. If after 2 weeks no questions are typed, the prefix is friction; if 50+ questions are typed, D1b auto-classification becomes worth shipping.
+
+These three answers come **after** Phase 0 ships and traffic accumulates — they're Layer 3 empirical evidence (§41.6), not Layer 2 engineering.
 
 ---
 
