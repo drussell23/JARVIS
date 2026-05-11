@@ -526,6 +526,17 @@ MIRROR_FOUND verdict. TRIGGER-GATED — substrate stays inert
 unless multi-remote repo OR force flag."""
 
 
+EVENT_TYPE_MUTATION_TESTING_EVALUATED = (
+    "mutation_testing_evaluated"
+)
+"""§41.4 Phase 1 fifth arc (PRD v3.0+, 2026-05-11) — fired
+by ``mutation_testing_harness.evaluate_file`` after each
+assessment. Payload carries verdict + source_file +
+total_mutants + killed/survived/timeout/error counts +
+kill_ratio + boundary_crossed + elapsed_s. Advisory only —
+substrate does not gate APPLY."""
+
+
 EVENT_TYPE_MULTI_STEP_ORCHESTRATED = (
     "multi_step_orchestrated"
 )
@@ -1249,6 +1260,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_GOAL_DECOMPOSED,                  # §41.4 Phase 1 second arc (PRD v3.0+, goal_decomposition_planner)
     EVENT_TYPE_ARCHITECTURAL_TASTE_EVALUATED,    # §41.4 Phase 1 third arc (PRD v3.0+, architectural_taste_layer)
     EVENT_TYPE_MULTI_STEP_ORCHESTRATED,          # §41.4 Phase 1 fourth arc (PRD v3.0+, multi_step_orchestrator)
+    EVENT_TYPE_MUTATION_TESTING_EVALUATED,       # §41.4 Phase 1 fifth arc (PRD v3.0+, mutation_testing_harness)
 })
 
 
