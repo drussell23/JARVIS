@@ -416,6 +416,21 @@ gaps where the cage's static-string AST detectors miss
 semantically-equivalent variants."""
 
 
+EVENT_TYPE_VOICE_TRANSCRIPT_RECORDED = (
+    "voice_transcript_recorded"
+)
+"""§40 Wave 3 #17 (PRD v2.98+, 2026-05-10) — fired by
+``conversation_bridge.record_voice_transcript`` after a voice
+ASR transcript successfully lands in the ConversationBridge
+ring buffer. Payload carries bounded operator-visibility fields
+(``length_chars``, ``op_id``, ``confidence`` if supplied) — the
+raw text NEVER appears in the SSE payload so untrusted voice
+content doesn't traverse the observability stream. Surface is
+purely a "voice transcript captured at T" beacon; downstream
+operator tooling reads the actual content from the bridge's
+``snapshot()`` via existing observability surfaces."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -1014,6 +1029,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SECOND_ORDER_DOLL_PROGRESS_UPDATED, # §40 Tier 1 #15 (PRD v2.98+, second-order doll completion metric)
     EVENT_TYPE_AUTOBIOGRAPHY_AUDIT_COMPLETED,    # §40 Wave 1 #8 (PRD v2.98+, adversarial autobiography retrospective audit)
     EVENT_TYPE_ANTIVENOM_IMMUNIZATION_AUDITED,   # §40 Wave 2 #7 (PRD v2.98+, antivenom self-immunization probe loop)
+    EVENT_TYPE_VOICE_TRANSCRIPT_RECORDED,        # §40 Wave 3 #17 (PRD v2.98+, voice transcript bounded beacon)
 })
 
 

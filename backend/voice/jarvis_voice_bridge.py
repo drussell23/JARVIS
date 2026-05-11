@@ -109,6 +109,28 @@ class JarvisVoiceBridge:
         if not text or not text.strip():
             return None
 
+        # §40 Wave 3 #17 — ConversationBridge V1.2 voice
+        # integration. Voice transcripts flow through the
+        # canonical Tier -1 sanitizer + secret-redaction +
+        # ring-buffer pipeline so CONTEXT_EXPANSION sees voice
+        # the same way it sees tui_user input. Recorded BEFORE
+        # the Karen pre-router so handled-by-Karen utterances
+        # still land in the dialogue history (operator-visible).
+        # Best-effort: governance substrate unavailable / master
+        # flag off / sub-flag off all silently no-op. Voice
+        # subsystem MUST NOT break when the bridge is dormant.
+        try:
+            from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+                record_voice_transcript,
+            )
+            record_voice_transcript(text, confidence=confidence)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[VoiceBridge] conversation_bridge "
+                "record_voice_transcript raised: %s — "
+                "voice path continues unaffected", exc,
+            )
+
         # Pre-router: closed-vocabulary Karen voice command path.
         # Master-flag-off short-circuits structurally (returns
         # handled=False) so the existing path runs unchanged.

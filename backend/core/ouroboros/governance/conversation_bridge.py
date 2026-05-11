@@ -151,6 +151,21 @@ def _capture_postmortem() -> bool:
     return _env_bool("JARVIS_CONVERSATION_BRIDGE_CAPTURE_POSTMORTEM", True)
 
 
+def _capture_voice() -> bool:
+    """Sub-gate for ``voice`` ASR-transcript capture (V1.2).
+
+    Only effective when master ``JARVIS_CONVERSATION_BRIDGE_ENABLED``
+    is on. Default-TRUE so V1.2 wiring is live the moment an operator
+    flips the master flag. Operators who want voice paths to NOT
+    feed CONTEXT_EXPANSION (e.g., privacy-sensitive sessions) flip
+    ``JARVIS_CONVERSATION_BRIDGE_CAPTURE_VOICE=false`` to drop voice
+    turns silently without disabling tui_user / ask_human capture.
+    """
+    return _env_bool(
+        "JARVIS_CONVERSATION_BRIDGE_CAPTURE_VOICE", True,
+    )
+
+
 def _max_postmortems() -> int:
     """K-cap on postmortem turns visible in a single snapshot."""
     return max(0, _env_int(
@@ -356,6 +371,13 @@ class ConversationBridge:
                     return
             elif src == SOURCE_POSTMORTEM:
                 if not _capture_postmortem():
+                    return
+            elif src == SOURCE_VOICE:
+                # V1.2 — voice transcripts flow through the same
+                # sanitize → cap → ring buffer path as tui_user
+                # input. Per-source sub-gate lets operators shed
+                # voice without disabling the rest of the bridge.
+                if not _capture_voice():
                     return
 
             # Tier -1 sanitize pass — strips control chars, applies length cap.
@@ -651,3 +673,214 @@ def reset_default_bridge() -> None:
     global _DEFAULT_BRIDGE
     with _DEFAULT_BRIDGE_LOCK:
         _DEFAULT_BRIDGE = None
+
+
+# ---------------------------------------------------------------------------
+# V1.2 — Voice transcript public wrapper (§40 Wave 3 #17)
+# ---------------------------------------------------------------------------
+#
+# The voice subsystem (``backend/voice/jarvis_voice_bridge.py``) calls this
+# wrapper when an ASR utterance terminates. Voice signals flow through the
+# canonical ``record_turn`` body — same Tier -1 sanitizer + secret
+# redaction + per-turn cap + ring buffer eviction policy as every other
+# signal source. The wrapper exists so voice consumers compose ONE public
+# function rather than reach for ``record_turn(source=SOURCE_VOICE)``.
+
+
+def _publish_voice_transcript_beacon(
+    text: str,
+    op_id: str,
+    confidence: Optional[float],
+) -> None:
+    """Compose canonical SSE broker for a bounded voice-transcript
+    observability beacon. Best-effort; NEVER raises into the
+    record_voice_transcript path.
+
+    Payload carries ONLY:
+      * ``length_chars`` — int (no raw text)
+      * ``op_id`` — caller-supplied operator-visible tag
+      * ``confidence`` — float if supplied, else None
+
+    The raw transcript NEVER traverses the SSE stream. Downstream
+    consumers read content from :func:`get_default_bridge.snapshot`
+    via existing observability surfaces (subject to ConversationBridge's
+    Tier -1 sanitizer + secret redaction already applied).
+    """
+    try:
+        from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
+            EVENT_TYPE_VOICE_TRANSCRIPT_RECORDED,
+            publish_task_event,
+        )
+        payload = {
+            "schema_version": "voice_transcript_beacon.1",
+            "length_chars": int(len(text or "")),
+            "op_id": str(op_id or ""),
+            "confidence": (
+                float(confidence)
+                if confidence is not None
+                else None
+            ),
+        }
+        publish_task_event(
+            EVENT_TYPE_VOICE_TRANSCRIPT_RECORDED,
+            f"voice::{str(op_id or 'no-op')}",
+            payload,
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return
+
+
+def record_voice_transcript(
+    text: str,
+    *,
+    op_id: str = "",
+    confidence: Optional[float] = None,
+) -> bool:
+    """Public V1.2 entry point — admit one voice transcript turn.
+
+    Composes :meth:`ConversationBridge.record_turn` with
+    ``source=SOURCE_VOICE``. ``confidence`` is accepted for API
+    symmetry with ASR producers (``JarvisVoiceBridge.on_transcript
+    (text, confidence)``) but currently informational only — the
+    bridge's downstream consumers don't yet branch on confidence
+    score. Future slices may surface it in :class:`ConversationTurn`
+    metadata.
+
+    Returns True iff the call reached :meth:`record_turn` (master
+    flag on AND sub-gate on AND substrate ready); False otherwise.
+    NEVER raises — voice subsystem must never break because the
+    bridge is unavailable.
+
+    Operator-binding semantics:
+      * ``JARVIS_CONVERSATION_BRIDGE_ENABLED=false`` → False (master)
+      * ``JARVIS_CONVERSATION_BRIDGE_CAPTURE_VOICE=false`` → False
+        (sub-flag)
+      * Either gate off + any internal error → False, no log spam,
+        no exception propagation
+    """
+    try:
+        if not _is_enabled():
+            return False
+        if not _capture_voice():
+            return False
+        if not isinstance(text, str) or not text.strip():
+            return False
+        bridge = get_default_bridge()
+        bridge.record_turn(
+            role="user",
+            text=text,
+            source=SOURCE_VOICE,
+            op_id=str(op_id or ""),
+        )
+        # Best-effort observability beacon — bounded payload
+        # (length only, NEVER the raw transcript). Downstream
+        # operator tooling reads content from bridge.snapshot()
+        # via existing observability paths, not from SSE.
+        _publish_voice_transcript_beacon(text, op_id, confidence)
+        return True
+    except Exception:  # pragma: no cover — defensive (NEVER raises)
+        logger.debug(
+            "[ConversationBridge] record_voice_transcript "
+            "dropped by internal error",
+            exc_info=True,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# FlagRegistry seeds (auto-discovered via §33.3 naming-cage)
+# ---------------------------------------------------------------------------
+
+
+def register_flags(registry: Any) -> int:
+    """Auto-discovered. Seeds the V1.2 voice sub-flag + the V1.1
+    master + existing sub-flags into the canonical typed registry.
+
+    Mirrors the canonical §33.3 naming-cage hook pattern (cf.
+    ``capability_constellation.register_flags``,
+    ``governance_boundary_gate.register_flags``).
+    """
+    from backend.core.ouroboros.governance.flag_registry import (
+        Category,
+        FlagSpec,
+        FlagType,
+    )
+
+    src = (
+        "backend/core/ouroboros/governance/"
+        "conversation_bridge.py"
+    )
+
+    seeds = [
+        FlagSpec(
+            name="JARVIS_CONVERSATION_BRIDGE_ENABLED",
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Master switch for the sanitized agentic-"
+                "dialogue bridge feeding CONTEXT_EXPANSION. "
+                "§33.1 default-FALSE — operator opts in once "
+                "the Tier -1 sanitizer + redaction discipline "
+                "is reviewed."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="JARVIS_CONVERSATION_BRIDGE_ENABLED=true",
+        ),
+        FlagSpec(
+            name="JARVIS_CONVERSATION_BRIDGE_CAPTURE_VOICE",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "V1.2 sub-gate — voice ASR transcripts flow "
+                "through CONTEXT_EXPANSION the same way "
+                "tui_user input does. Default-TRUE when master "
+                "is on; flip false to drop voice turns "
+                "without disabling other capture sources."
+            ),
+            category=Category.INTEGRATION,
+            source_file=src,
+            example=(
+                "JARVIS_CONVERSATION_BRIDGE_CAPTURE_VOICE=false"
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_CONVERSATION_BRIDGE_CAPTURE_ASK_HUMAN",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "V1.1 sub-gate — Venom ``ask_human`` Q+A "
+                "capture. Default-TRUE when master is on."
+            ),
+            category=Category.INTEGRATION,
+            source_file=src,
+            example=(
+                "JARVIS_CONVERSATION_BRIDGE_CAPTURE_ASK_HUMAN"
+                "=false"
+            ),
+        ),
+        FlagSpec(
+            name="JARVIS_CONVERSATION_BRIDGE_CAPTURE_POSTMORTEM",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "V1.1 sub-gate — POSTMORTEM line capture. "
+                "Default-TRUE when master is on."
+            ),
+            category=Category.INTEGRATION,
+            source_file=src,
+            example=(
+                "JARVIS_CONVERSATION_BRIDGE_CAPTURE_POSTMORTEM"
+                "=false"
+            ),
+        ),
+    ]
+
+    count = 0
+    for spec in seeds:
+        try:
+            registry.register(spec)
+            count += 1
+        except Exception:  # noqa: BLE001 — fail-open per §33.1
+            continue
+    return count
