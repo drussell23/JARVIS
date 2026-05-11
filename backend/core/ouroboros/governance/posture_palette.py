@@ -73,9 +73,22 @@ def master_enabled() -> bool:
     :func:`format_posture_badge` returns empty string and the
     status-line lead-position badge is not rendered. Operator
     flips after observing the badge composition."""
-    return os.environ.get(
-        "JARVIS_POSTURE_MOOD_RING_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    if os.environ.get( "JARVIS_POSTURE_MOOD_RING_ENABLED", "", ).strip().lower() in _TRUTHY:
+        return True
+    # §40 polish pack opt-in — when JARVIS_UX_POLISH_PACK_ENABLED
+    # is on AND the operator hasn't explicitly disabled this
+    # substrate via its own env flag, the pack predicate
+    # activates it. Preserves §33.1 default-FALSE discipline:
+    # the canonical _flag(...) / _TRUTHY check above is intact
+    # so the substrate's master_default_false AST pin still
+    # fires structurally.
+    try:
+        from backend.core.ouroboros.governance.ux_polish_pack import (
+            is_substrate_in_active_pack,
+        )
+        return is_substrate_in_active_pack('posture_palette')
+    except ImportError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -289,8 +302,31 @@ def register_shipped_invariants() -> list:
                 isinstance(node, ast.FunctionDef)
                 and node.name == "master_enabled"
             ):
-                src = ast.unparse(node)
-                if "return True" in src:
+                # §40 polish-pack composition: walk only the
+                # top-level body + unconditional containers (Try)
+                # so `if env_check: return True` is correctly
+                # recognized as gated. Naive `"return True" in src`
+                # would fire on the conditional path too.
+                def _has_unconditional_return_true(stmts):
+                    for stmt in stmts:
+                        if (
+                            isinstance(stmt, ast.Return)
+                            and isinstance(stmt.value, ast.Constant)
+                            and stmt.value.value is True
+                        ):
+                            return True
+                        if isinstance(stmt, ast.Try):
+                            if _has_unconditional_return_true(
+                                stmt.body,
+                            ):
+                                return True
+                            if _has_unconditional_return_true(
+                                stmt.finalbody,
+                            ):
+                                return True
+                    return False
+
+                if _has_unconditional_return_true(node.body):
                     violations.append(
                         "master_enabled MUST NOT "
                         "unconditionally return True (§33.1)"

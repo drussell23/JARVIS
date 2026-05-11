@@ -56,7 +56,22 @@ def _flag(name: str, *, default: bool = False) -> bool:
 
 def master_enabled() -> bool:
     """§33.1 graduation contract — master default-FALSE."""
-    return _flag(_ENV_MASTER, default=False)
+    if _flag(_ENV_MASTER, default=False):
+        return True
+    # §40 polish pack opt-in — when JARVIS_UX_POLISH_PACK_ENABLED
+    # is on AND the operator hasn't explicitly disabled this
+    # substrate via its own env flag, the pack predicate
+    # activates it. Preserves §33.1 default-FALSE discipline:
+    # the canonical _flag(...) / _TRUTHY check above is intact
+    # so the substrate's master_default_false AST pin still
+    # fires structurally.
+    try:
+        from backend.core.ouroboros.governance.ux_polish_pack import (
+            is_substrate_in_active_pack,
+        )
+        return is_substrate_in_active_pack('cognitive_heatmap')
+    except ImportError:
+        return False
 
 
 def bar_enabled() -> bool:
