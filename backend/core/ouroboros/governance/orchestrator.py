@@ -2849,10 +2849,36 @@ class GovernedOrchestrator:
                 _plan_deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=PLAN_TIMEOUT_S,
                 )
-                _plan_result = await asyncio.wait_for(
-                    _plan_gen.generate_plan(ctx, _plan_deadline),
-                    timeout=PLAN_TIMEOUT_S + 5.0,
-                )
+                # Move 6.5 PLAN seam (v2.97, 2026-05-10) — same
+                # shared helper plan_runner.py uses (no duplication
+                # between Slice 3-extracted path + this inline
+                # legacy path). Returns None on master-off or
+                # non-actionable consensus; caller falls through
+                # to single-shot.
+                _plan_result = None
+                try:
+                    from backend.core.ouroboros.governance.verification.multi_prior_plan_seam import (  # noqa: E501
+                        dispatch_plan_with_multi_prior,
+                    )
+                    _plan_result = await dispatch_plan_with_multi_prior(
+                        ctx=ctx,
+                        plan_generator=_plan_gen,
+                        deadline=_plan_deadline,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.debug(
+                        "[Orchestrator] multi_prior_plan_seam "
+                        "swallowed exception; falling through",
+                        exc_info=True,
+                    )
+                    _plan_result = None
+                if _plan_result is None:
+                    _plan_result = await asyncio.wait_for(
+                        _plan_gen.generate_plan(ctx, _plan_deadline),
+                        timeout=PLAN_TIMEOUT_S + 5.0,
+                    )
 
                 if not _plan_result.skipped:
                     # Store plan in context for injection into GENERATE prompt

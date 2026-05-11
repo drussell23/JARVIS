@@ -257,10 +257,41 @@ class PLANRunner(PhaseRunner):
             _plan_deadline = datetime.now(tz=timezone.utc) + timedelta(
                 seconds=PLAN_TIMEOUT_S,
             )
-            _plan_result = await asyncio.wait_for(
-                _plan_gen.generate_plan(ctx, _plan_deadline),
-                timeout=PLAN_TIMEOUT_S + 5.0,
-            )
+            # Move 6.5 PLAN seam (v2.97, 2026-05-10) — canonical
+            # integration. When all 3 master flags are on AND the
+            # route+posture gates pass (route=complex +
+            # posture=EXPLORE in Slice 1 materializer),
+            # ``dispatch_plan_with_multi_prior`` runs K planning
+            # rolls with real prior angles, consensus-aggregates
+            # via Slice 2's runner, and rehydrates the winner
+            # through PlanGenerator._parse_plan_response. Returns
+            # None on master-off / non-actionable consensus /
+            # ESCALATE — caller falls through to single-shot. No
+            # behavior change at default (all flags FALSE).
+            _plan_result = None
+            try:
+                from backend.core.ouroboros.governance.verification.multi_prior_plan_seam import (  # noqa: E501
+                    dispatch_plan_with_multi_prior,
+                )
+                _plan_result = await dispatch_plan_with_multi_prior(
+                    ctx=ctx,
+                    plan_generator=_plan_gen,
+                    deadline=_plan_deadline,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — defensive
+                logger.debug(
+                    "[PLANRunner] multi_prior_plan_seam swallowed "
+                    "exception; falling through to single-shot",
+                    exc_info=True,
+                )
+                _plan_result = None
+            if _plan_result is None:
+                _plan_result = await asyncio.wait_for(
+                    _plan_gen.generate_plan(ctx, _plan_deadline),
+                    timeout=PLAN_TIMEOUT_S + 5.0,
+                )
 
             if not _plan_result.skipped:
                 # Store plan in context for injection into GENERATE prompt
