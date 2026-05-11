@@ -526,6 +526,16 @@ MIRROR_FOUND verdict. TRIGGER-GATED — substrate stays inert
 unless multi-remote repo OR force flag."""
 
 
+EVENT_TYPE_COVERAGE_GATE_EVALUATED = (
+    "coverage_gate_evaluated"
+)
+"""§41.4 Phase 1 sixth arc (PRD v3.0+, 2026-05-11) — fired by
+``coverage_gate.evaluate_coverage`` after each assessment.
+Payload carries verdict + source + overall_pct + thresholds +
+matched/missing counts + boundary_crossed + elapsed_s.
+Advisory only — substrate does NOT gate APPLY."""
+
+
 EVENT_TYPE_MUTATION_TESTING_EVALUATED = (
     "mutation_testing_evaluated"
 )
@@ -1261,6 +1271,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_ARCHITECTURAL_TASTE_EVALUATED,    # §41.4 Phase 1 third arc (PRD v3.0+, architectural_taste_layer)
     EVENT_TYPE_MULTI_STEP_ORCHESTRATED,          # §41.4 Phase 1 fourth arc (PRD v3.0+, multi_step_orchestrator)
     EVENT_TYPE_MUTATION_TESTING_EVALUATED,       # §41.4 Phase 1 fifth arc (PRD v3.0+, mutation_testing_harness)
+    EVENT_TYPE_COVERAGE_GATE_EVALUATED,          # §41.4 Phase 1 sixth arc (PRD v3.0+, coverage_gate)
 })
 
 
