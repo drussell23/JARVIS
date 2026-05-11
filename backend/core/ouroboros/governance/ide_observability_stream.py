@@ -503,6 +503,22 @@ predictions optionally bridge into Wave 4 #9 belief ledger.
 Producer hook is best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_ANTI_FRAGILITY_EVALUATED = (
+    "anti_fragility_evaluated"
+)
+"""§40 Wave 4 #13 (PRD v2.99+, 2026-05-10) — fired by
+``anti_fragility_budget.evaluate_modules`` whenever at least
+one module is STRESSED or EXHAUSTED (HEALTHY-only batches are
+silent — operators get pinged only on actionable stress).
+Payload carries summary metrics (``module_count`` +
+``healthy_count`` + ``stressed_count`` + ``exhausted_count`` +
+``elapsed_s`` + ``schema_version``). Substrate composes Wave
+4 #9 belief-pressure + Wave 1 #15 doll-fragility into a per-
+module stress score → 4-value verdict (HEALTHY / STRESSED /
+EXHAUSTED / DISABLED) + budget allowance. Producer hook is
+best-effort — broker exception NEVER raises."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -1107,6 +1123,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SCHELLING_TIE_BROKEN,             # §40 Wave 4 #12 (PRD v2.99+, schelling-point tie-break)
     EVENT_TYPE_SLEEP_CONSOLIDATION_PASSED,       # §40 Wave 4 #10 (PRD v2.99+, sleep consolidation pass)
     EVENT_TYPE_MIRROR_SELF_CALIBRATED,           # §40 Wave 4 #14 (PRD v2.99+, mirror-self calibration)
+    EVENT_TYPE_ANTI_FRAGILITY_EVALUATED,         # §40 Wave 4 #13 (PRD v2.99+, anti-fragility budget)
 })
 
 
