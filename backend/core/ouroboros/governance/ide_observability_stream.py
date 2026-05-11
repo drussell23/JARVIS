@@ -431,6 +431,21 @@ operator tooling reads the actual content from the bridge's
 ``snapshot()`` via existing observability surfaces."""
 
 
+EVENT_TYPE_BELIEF_REVISION_RECORDED = (
+    "belief_revision_recorded"
+)
+"""§40 Wave 4 #9 (PRD v2.99+, 2026-05-10) — fired by
+``belief_revision_ledger.record_evidence`` after one evidence
+row is durably appended to the §33.4 JSONL ledger at
+``.jarvis/belief_revision_ledger.jsonl``. Payload carries the
+:class:`EvidenceRecord.to_dict()` projection (``claim_id`` +
+``evidence_kind`` + ``source_op_id`` + ``source_session_id`` +
+``observed_at_iso`` + ``observed_at_unix`` + ``note`` +
+``schema_version``). Load-bearing dependency for Wave 4 #11 /
+#10 / #13. Producer hook is best-effort — broker exception
+NEVER raises into the calibration path."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -1030,6 +1045,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_AUTOBIOGRAPHY_AUDIT_COMPLETED,    # §40 Wave 1 #8 (PRD v2.98+, adversarial autobiography retrospective audit)
     EVENT_TYPE_ANTIVENOM_IMMUNIZATION_AUDITED,   # §40 Wave 2 #7 (PRD v2.98+, antivenom self-immunization probe loop)
     EVENT_TYPE_VOICE_TRANSCRIPT_RECORDED,        # §40 Wave 3 #17 (PRD v2.98+, voice transcript bounded beacon)
+    EVENT_TYPE_BELIEF_REVISION_RECORDED,         # §40 Wave 4 #9 (PRD v2.99+, belief revision ledger evidence row)
 })
 
 
