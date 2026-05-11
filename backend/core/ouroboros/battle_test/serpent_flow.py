@@ -4413,6 +4413,62 @@ class SerpentREPL:
         def _on_alt_enter(event: Any) -> None:
             event.current_buffer.insert_text("\n")
 
+        @_repl_bindings.add("?")
+        def _on_question_mark(event: Any) -> None:
+            """§41.3 Slice 3 #12 — inline ``?`` tooltip mid-line.
+
+            Press ``?`` while typing a slash verb to surface the
+            verb's help block (usage + description + aliases +
+            examples) without disrupting the input buffer. Falls
+            back to literal ``?`` insertion when:
+              * buffer doesn't start with ``/`` (free-text input)
+              * verb word is too short / ambiguous to resolve
+              * substrate's master flag is off
+              * any composer call raises
+
+            Composes ``repl_completion.discover_verbs(self)`` +
+            ``resolve_help_for_buffer(buf.text, registry)`` — NO
+            parallel state, single source of truth for verb
+            metadata. NEVER raises into the prompt_toolkit
+            event loop.
+            """
+            buf = event.current_buffer
+            _help_text: Optional[str] = None
+            try:
+                from backend.core.ouroboros.battle_test.repl_completion import (  # noqa: E501
+                    discover_verbs as _qm_discover,
+                    resolve_help_for_buffer as _qm_resolve,
+                )
+                _reg = _qm_discover(self)
+                _help_text = _qm_resolve(buf.text, _reg)
+            except Exception:  # noqa: BLE001 — NEVER raise
+                _help_text = None
+            if not _help_text:
+                buf.insert_text("?")
+                return
+            _flow = self._flow
+
+            def _emit() -> None:
+                try:
+                    _flow.console.print()
+                    for _ln in _help_text.splitlines():
+                        _flow.console.print(_ln, highlight=False)
+                    _flow.console.print()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            try:
+                from prompt_toolkit.application import (
+                    run_in_terminal,
+                )
+                run_in_terminal(_emit)
+            except Exception:  # noqa: BLE001
+                # run_in_terminal not available (headless /
+                # patched / no app context). Fall back to
+                # literal `?` insertion rather than dropping
+                # the keystroke silently.
+                buf.insert_text("?")
+
         # Gap #7 Slice 4: merge in the Esc-to-cancel binding (no-op
         # when the polish master flag is off OR prompt_toolkit's
         # filter primitives are unavailable).

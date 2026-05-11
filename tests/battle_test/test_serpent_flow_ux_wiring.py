@@ -317,3 +317,64 @@ def test_welcome_state_exports_helpers():
     assert hasattr(ws, "mark_seen")
     assert hasattr(ws, "render_first_launch_banner")
     assert hasattr(ws, "render_tutorial")
+
+
+# --- §41.3 Slice 3 #12 — inline `?` tooltip keybinding wiring -------------
+
+
+def test_question_mark_keybinding_present():
+    """Bytes-pin: SerpentREPL._loop registers a `?` keybinding."""
+    src = _source()
+    assert "@_repl_bindings.add(\"?\")" in src
+
+
+def test_question_mark_binding_invokes_resolve():
+    """Bytes-pin: the binding composes resolve_help_for_buffer
+    from the registry — no parallel help logic in the wiring."""
+    src = _source()
+    idx = src.find("@_repl_bindings.add(\"?\")")
+    assert idx > 0
+    body = src[idx:idx + 3000]
+    assert "resolve_help_for_buffer" in body
+    assert "discover_verbs" in body
+
+
+def test_question_mark_binding_falls_back_to_literal_insert():
+    """Bytes-pin: when resolve returns None OR composer raises,
+    the binding must fall back to `buf.insert_text('?')` rather
+    than swallowing the keystroke."""
+    src = _source()
+    idx = src.find("@_repl_bindings.add(\"?\")")
+    body = src[idx:idx + 3000]
+    assert "buf.insert_text(\"?\")" in body
+
+
+def test_question_mark_binding_uses_run_in_terminal():
+    """Bytes-pin: rendering goes through prompt_toolkit's
+    `run_in_terminal` so the help block lands above the prompt
+    without clobbering the input buffer."""
+    src = _source()
+    idx = src.find("@_repl_bindings.add(\"?\")")
+    body = src[idx:idx + 3000]
+    assert "run_in_terminal" in body
+
+
+def test_question_mark_binding_defensive_try_except():
+    """Bytes-pin: the substrate composition is wrapped in
+    try/except so a buggy resolve_help_for_buffer NEVER propagates
+    into the prompt_toolkit event loop."""
+    src = _source()
+    idx = src.find("@_repl_bindings.add(\"?\")")
+    body = src[idx:idx + 3000]
+    # Two try blocks expected — the resolve call AND the
+    # run_in_terminal invocation
+    assert body.count("try:") >= 2
+    assert body.count("except") >= 2
+
+
+def test_repl_completion_inline_help_helpers_reachable():
+    """Sanity: the symbols the binding lazy-imports are
+    actually exported by repl_completion."""
+    assert hasattr(rc, "resolve_help_for_buffer")
+    assert hasattr(rc, "is_inline_help_enabled")
+    assert hasattr(rc, "INLINE_HELP_ENABLED_ENV_VAR")

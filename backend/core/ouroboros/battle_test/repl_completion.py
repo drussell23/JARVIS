@@ -76,6 +76,7 @@ REPL_COMPLETION_SCHEMA_VERSION: str = "repl_completion.v1"
 MASTER_FLAG_ENV_VAR: str = "JARVIS_REPL_COMPLETION_ENABLED"
 HISTORY_PATH_ENV_VAR: str = "JARVIS_REPL_HISTORY_FILE"
 HISTORY_ENABLED_ENV_VAR: str = "JARVIS_REPL_HISTORY_ENABLED"
+INLINE_HELP_ENABLED_ENV_VAR: str = "JARVIS_REPL_INLINE_HELP_ENABLED"
 
 
 # Default: project-local. Operators with multiple O+V projects get
@@ -119,6 +120,19 @@ def is_history_enabled() -> bool:
     history is conventional and minimally invasive. Operators can
     opt out for confidentiality (set to ``false``)."""
     raw = os.environ.get(HISTORY_ENABLED_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def is_inline_help_enabled() -> bool:
+    """``JARVIS_REPL_INLINE_HELP_ENABLED``. §41.3 Slice 3 #12 —
+    default true. Gates the inline ``?`` tooltip keybinding that
+    surfaces verb help mid-line without disrupting the input
+    buffer. Implicitly off when
+    ``JARVIS_REPL_COMPLETION_ENABLED=false`` (no verb registry
+    available). NEVER raises."""
+    if not is_completion_enabled():
+        return False
+    raw = os.environ.get(INLINE_HELP_ENABLED_ENV_VAR, "true")
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
@@ -533,6 +547,97 @@ def fuzzy_match(
     return tuple(v for _, v in scored[: max(1, int(max_results))])
 
 
+def resolve_help_for_buffer(
+    buffer_text: object,
+    registry: VerbRegistry,
+    *,
+    fuzzy_max_distance: int = 2,
+) -> Optional[str]:
+    """Resolve the help block to surface for an inline ``?``
+    press at the current buffer state. NEVER raises.
+
+    Returns the formatted help text or ``None`` when no help is
+    appropriate (in which case the caller should insert a
+    literal ``?``).
+
+    Decision sequence — every input maps deterministically to
+    exactly one outcome:
+
+    1. Master gate via :func:`is_inline_help_enabled` — when off,
+       returns ``None`` so the keybinding inserts a literal ``?``.
+    2. Non-string / empty / non-slash buffer → ``None`` (operator
+       isn't typing a verb).
+    3. Buffer is exactly ``"/"`` or starts with ``"/ "`` → ``None``
+       (no verb word yet).
+    4. Extract first whitespace-delimited token. Exact registry
+       match (primary OR alias via :meth:`VerbRegistry.find`) →
+       render via :func:`format_verb_help`.
+    5. Fuzzy fallback — only when the operator has typed enough
+       characters to be unambiguous (verb word length ≥ 3) AND
+       :func:`fuzzy_match` returns exactly one confident result
+       within ``fuzzy_max_distance``. Two or more matches → return
+       ``None`` so the operator isn't biased toward an arbitrary
+       choice."""
+    if not is_inline_help_enabled():
+        return None
+    try:
+        text = str(buffer_text or "")
+    except Exception:  # noqa: BLE001
+        return None
+    stripped = text.lstrip()
+    if not stripped.startswith("/"):
+        return None
+    # Extract the first whitespace-delimited token.
+    parts = stripped.split(None, 1)
+    if not parts:
+        return None
+    verb_word = parts[0]
+    if verb_word == "/" or len(verb_word) < 2:
+        return None
+    # Exact primary/alias match wins — no ambiguity. Buggy
+    # registries that raise from find() degrade to None per the
+    # NEVER-raises contract.
+    try:
+        exact = registry.find(verb_word)
+    except Exception:  # noqa: BLE001
+        return None
+    if exact is not None:
+        try:
+            return format_verb_help(exact)
+        except Exception:  # noqa: BLE001
+            return None
+    # Fuzzy fallback — operator may still be typing the verb.
+    # Require enough characters to be confident before surfacing
+    # an unrequested verb's help.
+    if len(verb_word) < 3:
+        return None
+    try:
+        candidates = fuzzy_match(
+            verb_word, registry, max_results=2,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if len(candidates) != 1:
+        # Zero matches → no help. Two+ → ambiguous; surfacing the
+        # top one biases the operator. Either way, decline.
+        return None
+    # Confidence check: top match must be within edit distance.
+    top = candidates[0]
+    try:
+        dist = _levenshtein(
+            verb_word[1:], top.slash_form[1:],
+            cap=max(1, int(fuzzy_max_distance)) + 1,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if dist > fuzzy_max_distance:
+        return None
+    try:
+        return format_verb_help(top)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def format_verb_help(verb: VerbDescriptor) -> str:
     """Render a ``/verb --help`` block. NEVER raises.
 
@@ -847,6 +952,7 @@ __all__ = [
     "CompletionWiring",
     "HISTORY_ENABLED_ENV_VAR",
     "HISTORY_PATH_ENV_VAR",
+    "INLINE_HELP_ENABLED_ENV_VAR",
     "MASTER_FLAG_ENV_VAR",
     "REPL_COMPLETION_SCHEMA_VERSION",
     "VerbCategory",
@@ -860,6 +966,8 @@ __all__ = [
     "fuzzy_match",
     "is_completion_enabled",
     "is_history_enabled",
+    "is_inline_help_enabled",
+    "resolve_help_for_buffer",
     "resolve_history_path",
     "suggest_for_typo",
 ]
