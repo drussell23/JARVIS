@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 import shlex
 from dataclasses import dataclass
-from typing import List
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +97,23 @@ _DEFAULT_FILTER_LIMIT: int = 20
 class ToolPermissionsReplDispatchResult:
     """Result of a ``/tool_permissions`` dispatch. Frozen for safe
     propagation. ``matched=False`` signals the line wasn't a
-    ``/tool_permissions`` invocation (caller routes elsewhere)."""
+    ``/tool_permissions`` invocation (caller routes elsewhere).
+
+    §33.5 frozen-artifact contract: symmetric ``to_dict`` for
+    transport across substrates (SSE bridges, IDE serialization,
+    audit logs).
+    """
 
     ok: bool
     text: str
     matched: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "text": self.text,
+            "matched": self.matched,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +399,92 @@ def _render_stats() -> ToolPermissionsReplDispatchResult:
         f"    schema:      {snap.schema_version}"
     )
     return ToolPermissionsReplDispatchResult(ok=True, text=text)
+
+
+
+# ===========================================================================
+# §33.1 — register_shipped_invariants self-registration
+# ===========================================================================
+#
+# Auto-discovered by the canonical
+# ``shipped_code_invariants`` walker. Mirrors the discipline
+# applied to sibling REPL verbs (decisions_repl, curiosity_repl,
+# karen_voice_command_router, etc.): the load-bearing structural
+# invariants of this module are pinned in source so a future
+# refactor can't silently regress the §33.3 naming-cage
+# auto-discovery contract or the authority-asymmetry / read-only
+# guarantees.
+
+
+def register_shipped_invariants() -> list:
+    """ToolPermissions REPL substrate invariants. Pins:
+
+      * Module-level ``dispatch_tool_permissions_command(line)``
+        callable present — the §33.3 naming-cage hook.
+      * Authority asymmetry: NEVER imports policy / orchestrator /
+        iron_gate / tool_executor / candidate_generator / providers
+        / urgency_router / change_engine.
+      * READ-ONLY: source MUST NOT contain ``archive.record(``
+        or other mutation calls — the REPL is a thin projection
+        layer over the canonical archive ring.
+    """
+    import ast as _ast
+    try:
+        from backend.core.ouroboros.governance.meta.shipped_code_invariants import (  # noqa: E501
+            ShippedCodeInvariant,
+        )
+    except ImportError:
+        return []
+
+    _FORBIDDEN_IMPORT_MODULES = (
+        "backend.core.ouroboros.governance.iron_gate",
+        "backend.core.ouroboros.governance.policy_engine",
+        "backend.core.ouroboros.governance.orchestrator",
+        "backend.core.ouroboros.governance.tool_executor",
+        "backend.core.ouroboros.governance.candidate_generator",
+        "backend.core.ouroboros.governance.providers",
+        "backend.core.ouroboros.governance.urgency_router",
+        "backend.core.ouroboros.governance.change_engine",
+        "backend.core.ouroboros.governance.semantic_guardian",
+    )
+
+    def _validate(
+        tree: "_ast.Module", source: str,  # noqa: ARG001 — pattern signature
+    ) -> tuple:
+        violations: list = []
+        saw_dispatcher = False
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef):
+                if node.name == "dispatch_tool_permissions_command":
+                    saw_dispatcher = True
+            elif isinstance(node, _ast.ImportFrom):
+                if node.module in _FORBIDDEN_IMPORT_MODULES:
+                    violations.append(
+                        f"line {getattr(node, 'lineno', '?')}: "
+                        f"forbidden import {node.module!r} — "
+                        f"REPL surface MUST stay authority-free"
+                    )
+        if not saw_dispatcher:
+            violations.append(
+                "module-level dispatch_tool_permissions_command "
+                "callable missing — §33.3 naming-cage hook broken"
+            )
+        return tuple(violations)
+
+    target = (
+        "backend/core/ouroboros/governance/tool_permissions_repl.py"
+    )
+    return [
+        ShippedCodeInvariant(
+            invariant_name=(
+                "venom_v2_tool_permissions_repl_substrate"
+            ),
+            target_file=target,
+            description=(
+                "ToolPermissions REPL: §33.3 naming-cage "
+                "dispatcher present + authority-asymmetry + "
+                "read-only over canonical archive ring."
+            ),
+            validate=_validate,
+        ),
+    ]
