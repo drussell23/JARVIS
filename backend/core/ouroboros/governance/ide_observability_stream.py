@@ -519,6 +519,22 @@ EXHAUSTED / DISABLED) + budget allowance. Producer hook is
 best-effort — broker exception NEVER raises."""
 
 
+EVENT_TYPE_COMPOSITIONAL_CURIOSITY_EVALUATED = (
+    "compositional_curiosity_evaluated"
+)
+"""§40 Wave 1 #16 (PRD v2.99+, 2026-05-11) — fired by
+``compositional_curiosity.identify_curious_pairs`` whenever the
+evaluation surfaces EMERGING or ACTIONABLE verdict
+(NO_CANDIDATES / DISABLED silent — operators pinged only on
+actionable signal). Payload carries summary metrics
+(``verdict`` + ``pairs_examined`` + ``candidate_count`` +
+``elapsed_s`` + ``schema_version``). Substrate composes
+FlagRegistry inventory + Wave 1 #15 doll snapshot + per-
+substrate import graph via ast.parse → per-Category pair
+novelty score. Last non-experimental §40 arc — closes Wave 1.
+Producer hook is best-effort — broker exception NEVER raises."""
+
+
 EVENT_TYPE_PROACTIVE_PROPOSAL_EMITTED = (
     "proactive_proposal_emitted"
 )
@@ -1124,6 +1140,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_SLEEP_CONSOLIDATION_PASSED,       # §40 Wave 4 #10 (PRD v2.99+, sleep consolidation pass)
     EVENT_TYPE_MIRROR_SELF_CALIBRATED,           # §40 Wave 4 #14 (PRD v2.99+, mirror-self calibration)
     EVENT_TYPE_ANTI_FRAGILITY_EVALUATED,         # §40 Wave 4 #13 (PRD v2.99+, anti-fragility budget)
+    EVENT_TYPE_COMPOSITIONAL_CURIOSITY_EVALUATED, # §40 Wave 1 #16 (PRD v2.99+, compositional curiosity)
 })
 
 
