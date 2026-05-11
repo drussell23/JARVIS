@@ -1,7 +1,9 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
 **Status**: Living document
-**Version**: 2.99 (2026-05-11 — **§41 ADDED: Critical Path to Tier D — Fully Autonomous JARVIS Development**: The first explicit PRD statement of the load-bearing goal: *"O+V develops the JARVIS repo proactively + fully autonomously, safely + governance-bounded."* Prior sessions framed §40 Waves 1-3 (RRD recursion-bounding + adversarial cage + cross-session coherence + UX polish) as the engineering arc. §41 reframes those Waves as the **engineering preamble to the actual North Star**: Tier D operation, where O+V develops JARVIS without operator-in-the-loop. New §41 (~7,200 words, 10 subsections): (41.1) the goal verbatim + why it's load-bearing; (41.2) the 4-tier operating framework (A/B/C/D) with current readiness percentages (Tier A ~80-85%, Tier D ~10-15%); (41.3) updated UX polish gap analysis post-Slice 1 (27 items, ~8 closed by activation, 19 remaining); (41.4) Layer 2 capability gaps (RoadmapReader / goal decomposition / architectural taste / mutation testing / coverage gate / long-horizon memory / infra recovery — ~14-22 weeks of focused engineering); (41.5) **NEW operator-flagged gap — Web Search & Browsing capability**: Venom has basic `web_fetch` + `web_search` tools, but Claude's rich browsing (multi-page navigation, JS render, link-follow, image extraction, authenticated sessions, search-then-cite chains) is MISSING. Proposed `WebBrowser` substrate composes existing Venom tool loop + cross_process_jsonl citation ledger + governance_boundary_gate URL allowlist; ~3-5 weeks effort; load-bearing for autonomous development (researching new APIs, reading docs, following PR discussions); (41.6) Layer 3 empirical evidence requirements (M10 proposals shipped 0→30+, OV-signed commits adversarially audited 2→50+, cadence flags graduated 1→20+, antivenom gaps closed 0→5, continuous unsupervised days 0→90+ — wall-clock 3-6 months per tier transition); (41.7) Layer 4 architectural decision (operator-replacement options: signed roadmap document RECOMMENDED, multi-operator quorum, external trusted oracle, self-bounding research-grade — Tier C→D isn't pure engineering, it's a design decision about what "safe" means); (41.8) 18-30 month phased roadmap from Phase 0 (today, finish Slice 2-3 + WebBrowser substrate) through Phase 5 (Tier D operational); (41.9) prioritization framework (highest leverage at each time horizon); (41.10) honest framing — target Tier B (monthly review) as practical operating point with Tier D as long-horizon destination. **Operator-binding alignment**: §41 explicitly affirms that the cage architecture treats operator as the zero-order doll (structural assumption, not runtime check). Removing operator-in-loop isn't a feature to ship — it's a deliberate architectural rearchitecture requiring Layer 4 substrate work + 12+ months of evidence. **Cumulative session totals (post-§41 push)**: 18,900+ LOC + 765+ regression tests across §40 Wave 1-3 (10 items closed) + UX Polish Pack Slice 1 (~870 LOC + 100 tests). The PRD now contains the explicit Tier D goal + the honest roadmap to it. Future sessions reference §41 as the load-bearing North Star.
+**Version**: 3.0 (2026-05-11 — **§40 FULLY CLOSED — all 22 items shipped across 5 Waves**: This session closed Waves 1+4+5 in one continuous arc (Waves 2+3 closed earlier session). New substrates: Wave 1 #16 Compositional Curiosity (compositional_curiosity); Wave 4 #9 Belief Revision Ledger, #11 Postmortem Fusion, #12 Schelling-Point Consensus Prior, #10 Sleep Consolidation Pass, #14 Mirror-Self Test, #13 Anti-Fragility Budget; Wave 5 #22 Meta-Prior Learning, #18 Predictive Postmortem, #21 Cognitive Load Shedding, #19 Proof Carrier Transport, #20 Cross-Repo Causal Mirror (TRIGGER-GATED). 17 commits / 12 new substrates / **727 new regression tests** / **61 AST pins** / **74 FlagRegistry seeds** / **12 new SSE events**. The complete §40 graph is now wired end-to-end: foundation telemetry (W1) → recursion bounding (W2) → antivenom + cross-session (W3) → calibration learning (W4) → experimental meta-cognition (W5). Every substrate ships §33.1 default-FALSE — the entire loop graduates operator-paced, one flag at a time. Every composition flows through canonical surfaces (no parallel ledgers, no duplicate taxonomies). Advisory cage is one-way at every edge (AST-pinned). See **§40.8 §40 CLOSURE BANNER** below for substrate-by-substrate provenance. **§41 unchanged** — Tier D north star remains. The §40 closure satisfies the engineering preamble; §41's roadmap (Tier B → Tier D, 18-30 months) is now the operative path forward. Prior version note retained:
+
+— v2.99 (2026-05-11 — §41 ADDED: Critical Path to Tier D — Fully Autonomous JARVIS Development): The first explicit PRD statement of the load-bearing goal: *"O+V develops the JARVIS repo proactively + fully autonomously, safely + governance-bounded."* Prior sessions framed §40 Waves 1-3 (RRD recursion-bounding + adversarial cage + cross-session coherence + UX polish) as the engineering arc. §41 reframes those Waves as the **engineering preamble to the actual North Star**: Tier D operation, where O+V develops JARVIS without operator-in-the-loop. New §41 (~7,200 words, 10 subsections): (41.1) the goal verbatim + why it's load-bearing; (41.2) the 4-tier operating framework (A/B/C/D) with current readiness percentages (Tier A ~80-85%, Tier D ~10-15%); (41.3) updated UX polish gap analysis post-Slice 1 (27 items, ~8 closed by activation, 19 remaining); (41.4) Layer 2 capability gaps (RoadmapReader / goal decomposition / architectural taste / mutation testing / coverage gate / long-horizon memory / infra recovery — ~14-22 weeks of focused engineering); (41.5) **NEW operator-flagged gap — Web Search & Browsing capability**: Venom has basic `web_fetch` + `web_search` tools, but Claude's rich browsing (multi-page navigation, JS render, link-follow, image extraction, authenticated sessions, search-then-cite chains) is MISSING. Proposed `WebBrowser` substrate composes existing Venom tool loop + cross_process_jsonl citation ledger + governance_boundary_gate URL allowlist; ~3-5 weeks effort; load-bearing for autonomous development (researching new APIs, reading docs, following PR discussions); (41.6) Layer 3 empirical evidence requirements (M10 proposals shipped 0→30+, OV-signed commits adversarially audited 2→50+, cadence flags graduated 1→20+, antivenom gaps closed 0→5, continuous unsupervised days 0→90+ — wall-clock 3-6 months per tier transition); (41.7) Layer 4 architectural decision (operator-replacement options: signed roadmap document RECOMMENDED, multi-operator quorum, external trusted oracle, self-bounding research-grade — Tier C→D isn't pure engineering, it's a design decision about what "safe" means); (41.8) 18-30 month phased roadmap from Phase 0 (today, finish Slice 2-3 + WebBrowser substrate) through Phase 5 (Tier D operational); (41.9) prioritization framework (highest leverage at each time horizon); (41.10) honest framing — target Tier B (monthly review) as practical operating point with Tier D as long-horizon destination. **Operator-binding alignment**: §41 explicitly affirms that the cage architecture treats operator as the zero-order doll (structural assumption, not runtime check). Removing operator-in-loop isn't a feature to ship — it's a deliberate architectural rearchitecture requiring Layer 4 substrate work + 12+ months of evidence. **Cumulative session totals (post-§41 push)**: 18,900+ LOC + 765+ regression tests across §40 Wave 1-3 (10 items closed) + UX Polish Pack Slice 1 (~870 LOC + 100 tests). The PRD now contains the explicit Tier D goal + the honest roadmap to it. Future sessions reference §41 as the load-bearing North Star.
 
 ---
 
@@ -146,7 +148,9 @@ These three combined: **~3-5 days of focused work**. Each completes a measurable
 
 ### §40.6 Status — operational, not engineering
 
-After tonight's push (16 commits, ~210 tests, ~46 AST pins, soaks #1-5, Move 6.5 PLAN seam, 3 graduation-eligible flags), **structural engineering remaining = NONE**. Everything in §40 above is **enhancement**, not closure. The architecture roadmap is complete. The cadence engine is empirically proven. The roadmap from here forward is operator-paced + trigger-gated.
+**Updated 2026-05-11 post-§40-full-closure** (see §40.8 banner below for full provenance): all 22 §40 items are now closed across 5 Waves. Cumulative §40 push totals — 16 + 17 = 33 commits on `main` / ~210 + 727 = **937 §40-arc regression tests** / ~46 + 61 = **107 §40-arc AST pins** / 5 cost-positive evidence rows across soaks #1-5 / 3 graduation-eligible flags pre-§40 closure (the new 74 FlagRegistry seeds become graduation candidates as soaks accumulate).
+
+**Structural engineering remaining = NONE**. Everything in §40 is **closure**, not enhancement. The architecture roadmap is complete. The cadence engine is empirically proven. The roadmap from here forward is operator-paced + trigger-gated — §41's Tier D path (18-30 months) is the operative trajectory; §40 closure was its prerequisite.
 
 ### §40.7 Academic foundations & related work (prestigious-university research grounding)
 
@@ -198,9 +202,138 @@ The §40 roadmap is not invented in a vacuum. The architectural patterns O+V imp
 
 ---
 
+### §40.8 §40 CLOSURE BANNER (2026-05-11 — all 22 items shipped)
+
+**As of 2026-05-11**, §40 is **fully closed**. All 22 items across 5 Waves are shipped, each as a §33.1 default-FALSE substrate with closed taxonomies, AST pins, FlagRegistry seeds, SSE events, and §33.4 audit ledger persistence where applicable. The complete §40 substrate graph is wired end-to-end through canonical surfaces — no parallel ledgers, no duplicate taxonomies, advisory cage one-way at every edge.
+
+#### §40.8.1 Wave-by-wave closure provenance
+
+**Wave 1 — Foundation telemetry (4 of 4 ✅)**
+
+| # | Substrate | File | Tests | Pins | Commit Range |
+|---|---|---|---|---|---|
+| #15 | Second-order doll metric | `second_order_doll_metric.py` | shipped earlier | 5 | (earlier session) |
+| #4 | Manifesto principle tracker | `manifesto_principle_tracker.py` | shipped earlier | 5 | (earlier session) |
+| #8 | Adversarial autobiography | `adversarial_autobiography.py` | shipped earlier | 5 | (earlier session) |
+| #16 | **Compositional Curiosity** | `compositional_curiosity.py` | **68** | **5** | `26c0b8c0d8` (this session) |
+
+**Wave 2 — Recursion bounding (3 of 3 ✅, earlier session)**
+
+| # | Substrate | File |
+|---|---|---|
+| #1 | RRD recursion-depth gate | `governance_boundary_gate.py` |
+| #2 | Hash-cap on self-modification | `self_modification_manifest.py` |
+| #3 | Antivenom self-immunization | `antivenom_self_immunization.py` |
+
+**Wave 3 — Antivenom completeness + cross-session (4 of 4 ✅, earlier session)**
+
+| # | Substrate | File |
+|---|---|---|
+| #7 | Counterfactual rehearsal mode | `counterfactual_rehearsal_mode.py` |
+| #5 | SemanticGuardian ↔ MCP boundary scanner | `mcp_output_scanner.py` |
+| #6 | Cross-session coherence empirical rig | `cross_session_coherence_rig.py` |
+| #17 | ConversationBridge V1.2 voice integration | (extended in-place) |
+
+**Wave 4 — Calibration learning (6 of 6 ✅, this session)**
+
+| # | Substrate | File | Tests | Pins | Commit |
+|---|---|---|---|---|---|
+| #9 | Belief Revision Ledger | `belief_revision_ledger.py` | 76 | 5 | `3a691ca2e5` |
+| #11 | Postmortem Fusion | `postmortem_fusion.py` | 61 | 5 | `f4212e12a8` |
+| #12 | Schelling-Point Consensus Prior | `schelling_consensus_prior.py` | 64 | 5 | `9804b2fd0d` |
+| #10 | Sleep Consolidation Pass | `sleep_consolidation_pass.py` | 65 | 6 | `7d63389fc2` |
+| #14 | Mirror-Self Test | `mirror_self_test.py` | 71 | 5 | `5f4fb0e68c` |
+| #13 | Anti-Fragility Budget | `anti_fragility_budget.py` | 70 | 5 | `03f0c042e4` |
+
+**Wave 5 — Experimental (5 of 5 ✅, this session)**
+
+| # | Substrate | File | Tests | Pins | Commit |
+|---|---|---|---|---|---|
+| #22 | Meta-Prior Learning | `meta_prior_learning.py` | 60 | 5 | `a0046f6b6c` |
+| #18 | Predictive Postmortem | `predictive_postmortem.py` | 55 | 5 | `1a88539136` |
+| #21 | Cognitive Load Shedding | `cognitive_load_shedding.py` | 48 | 5 | `939787c862` |
+| #19 | Proof Carrier Transport | `proof_carrier_transport.py` | 46 | 5 | `5dfd627668` |
+| #20 | Cross-Repo Causal Mirror (TRIGGER-GATED) | `cross_repo_causal_mirror.py` | 43 | 5 | `90bd8aae44` |
+
+#### §40.8.2 Session-cumulative totals (this session arc)
+
+* **12 new substrates** shipped (Wave 1 #16 + 6 Wave 4 + 5 Wave 5)
+* **727 new regression tests** (cumulative across the 12 substrates)
+* **61 new AST pins** (5-6 per substrate enforcing taxonomy closure + authority asymmetry + master-default-false + composes-canonical)
+* **74 new FlagRegistry seeds** (every new env knob registered with type + category + posture relevance)
+* **12 new SSE events** added to `ide_observability_stream._VALID_EVENT_TYPES`
+* **17 commits** on `main` (one substrate ship per commit + ide_observability_stream wiring)
+* **All cross-suite test sweeps green** at each gate (peak: 678/678 at Wave 4 closure)
+
+#### §40.8.3 The complete §40 composition graph
+
+```
+                ┌────────────────────────────────────┐
+                │   FOUNDATION TELEMETRY (W1)        │
+                │   #15 doll • #4 manifesto •         │
+                │   #8 autobiography • #16 curiosity │
+                └─────────────┬──────────────────────┘
+                              │
+                ┌─────────────▼──────────────────────┐
+                │   RECURSION BOUNDING (W2)          │
+                │   #1 boundary • #2 hash-cap •      │
+                │   #3 antivenom                     │
+                └─────────────┬──────────────────────┘
+                              │
+                ┌─────────────▼──────────────────────┐
+                │   ANTIVENOM + CROSS-SESSION (W3)   │
+                │   #7 rehearsal • #5 MCP scanner •  │
+                │   #6 coherence • #17 voice         │
+                └─────────────┬──────────────────────┘
+                              │
+                ┌─────────────▼──────────────────────────────┐
+                │   CALIBRATION LEARNING (W4)                │
+                │                                            │
+                │   #9 belief revision ◄─ #11 fusion        │
+                │      ▲           ▲    ◄─ #14 mirror-self  │
+                │      │           │                         │
+                │   #10 sleep ─────┴─ reads #9+#11           │
+                │   #12 schelling (multi-prior tie-break)    │
+                │   #13 anti-fragility ─ reads #9+#15        │
+                └─────────────┬──────────────────────────────┘
+                              │
+                ┌─────────────▼──────────────────────────────┐
+                │   EXPERIMENTAL META-COGNITION (W5)         │
+                │                                            │
+                │   #22 meta-prior ─ reads #12 history       │
+                │   #18 predictive ─ reads #9+#11+#14        │
+                │   #21 load shed ── reads #13+#18           │
+                │   #19 proof carrier ─ reads #5+#6+#7       │
+                │   #20 cross-repo (TRIGGER-GATED)           │
+                └────────────────────────────────────────────┘
+```
+
+#### §40.8.4 Architectural invariants enforced by §40 closure
+
+1. **Every substrate is §33.1 default-FALSE** — the entire loop graduates operator-paced, one flag at a time. No "live by default" coercion.
+2. **No parallel ledgers** — falsification tracking flows through Wave 4 #9 `belief_revision_ledger` only; cluster tracking flows through Wave 4 #11 `postmortem_fusion` only; consensus history flows through Wave 4 #12 `schelling_consensus_prior` only. Downstream substrates read these surfaces; never duplicate them.
+3. **One-way advisory cage** — `anti_fragility_budget` doesn't import `sensor_governor`; `cognitive_load_shedding` doesn't import `sensor_governor`; `compositional_curiosity` doesn't import `curiosity_scheduler`. Substrates SURFACE evidence; consumers READ it. AST-pinned at every edge.
+4. **Closed 4-value taxonomies** at every decision boundary — no None returns, no implicit fall-through, no string-typed verdicts. Bytes-pinned via AST so renames cannot escape regression detection.
+5. **Canonical-surface composition** — every Wave 4 substrate composes Wave 4 #9 + #11 + (#15) for its data; every Wave 5 substrate composes Wave 3/4 substrates. No private API access. Lazy imports at the composer boundary keep substrate module-load cheap.
+
+#### §40.8.5 What §40 closure means operationally
+
+**§40 closure does NOT mean Tier D is reached.** §40 is the engineering preamble — the substrate scaffold that calibration + recursive-self-improvement requires. §41 (Critical Path to Tier D) remains the operative roadmap; §40.8's closure is the *prerequisite condition* for §41's Phase 0 to begin in earnest.
+
+**What changes operationally**:
+
+* The orchestrator can now (when flags graduated, per §40.6 cadence) compose any Wave 4/5 substrate signal into its decision-making without writing more substrate scaffolding. Adding "use belief drift to bias risk tier" is now a flag-flip + 1-call composition, not new development.
+* The cadence engine (Phase 9 graduation ladder) has 74 new graduation candidates — each new env flag is eligible for the 3-clean-soak graduation contract.
+* The PhD §6 dissertation evaluation has 22 closed substrates as evidence corpus.
+* Wave 5 experimental items are gated by `EXPERIMENTAL` Category in FlagRegistry — operator can filter `/help category experimental` to see exactly what's available but not yet graduated.
+
+**What does NOT change**: production behavior. With all 12 new substrates' master flags default-FALSE, the production pipeline behaves identically to pre-session — every new capability is opt-in. This is the load-bearing safety invariant.
+
+---
+
 ## §41 CRITICAL PATH TO TIER D — FULLY AUTONOMOUS JARVIS DEVELOPMENT (NEW 2026-05-11)
 
-§40 Waves 1-3 closed the recursion-bounding + adversarial cage + cross-session coherence triad. The UX Polish Pack (Slice 1) closed ~8 of the 27 polish surface gaps by composer-flip activation. The cadence engine produces graduations. Move 6.5 PLAN seam holds empirically. The system is operator-paced + cage-bounded + self-auditing.
+**Updated 2026-05-11 post-§40-full-closure**: §40 Waves 1-5 are now all closed (22 items, 17 substrates this session arc). The UX Polish Pack (Slice 1) closed ~8 of the 27 polish surface gaps by composer-flip activation. The cadence engine produces graduations. Move 6.5 PLAN seam holds empirically. The calibration learning loop (Wave 4) and experimental meta-cognition surfaces (Wave 5) are wired and §33.1 default-FALSE-gated. The system is operator-paced + cage-bounded + self-auditing.
 
 **But §40 + Slice 1 are the engineering preamble, NOT the destination.**
 
