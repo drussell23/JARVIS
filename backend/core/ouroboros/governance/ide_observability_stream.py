@@ -547,6 +547,19 @@ counts + composed_source_count + elapsed_s. Observational only —
 substrate does NOT gate APPLY (advisory cross-session memory)."""
 
 
+EVENT_TYPE_INFRA_RECOVERY_EVALUATED = (
+    "infra_recovery_evaluated"
+)
+"""§41.4 Phase 1 eighth arc (PRD v3.0+, 2026-05-11) — fired by
+``infra_recovery_loop.run_recovery_loop`` after each scan.
+Payload carries verdict + auto_reclaim_enabled + check_count +
+attempt_count + success_count + by_component/health/action
+histograms + elapsed_s. Composes point-source recovery primitives
+(posture_health task-death classifier + worktree_manager
+reap_orphans) into unified periodic scanner with hard-opt-in
+mutation gate per Manifesto §6."""
+
+
 EVENT_TYPE_MUTATION_TESTING_EVALUATED = (
     "mutation_testing_evaluated"
 )
@@ -1284,6 +1297,7 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_MUTATION_TESTING_EVALUATED,       # §41.4 Phase 1 fifth arc (PRD v3.0+, mutation_testing_harness)
     EVENT_TYPE_COVERAGE_GATE_EVALUATED,          # §41.4 Phase 1 sixth arc (PRD v3.0+, coverage_gate)
     EVENT_TYPE_LONG_HORIZON_MEMORY_RECALLED,     # §41.4 Phase 1 seventh arc (PRD v3.0+, long_horizon_memory)
+    EVENT_TYPE_INFRA_RECOVERY_EVALUATED,         # §41.4 Phase 1 eighth arc (PRD v3.0+, infra_recovery_loop)
 })
 
 
