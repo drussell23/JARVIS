@@ -210,6 +210,41 @@ class AutoCommitter:
                 skipped_reason="no_target_files",
             )
 
+        # §40 Wave 2 #6 — RRD §1 hash-cap on self-modification.
+        # When the staged commit touches the canonical governance
+        # directory AND the operator-signed manifest exists AND
+        # the master flag is on AND the current governance/ state
+        # has drifted from the signed baseline → refuse the commit.
+        # The verifier composes the canonical Wave 2 #5 boundary
+        # gate's prefix accessor + a pure-function hash check.
+        # NEVER raises: any verification failure falls through
+        # to the legacy commit path (substrate-unavailable
+        # rollback discipline).
+        try:
+            from backend.core.ouroboros.governance.governance_manifest import (  # noqa: E501
+                is_refusal_verdict,
+                verify_governance_state,
+            )
+            _manifest_verdict = verify_governance_state(
+                target_files=target_files,
+            )
+            if is_refusal_verdict(_manifest_verdict.verdict):
+                logger.warning(
+                    "[AutoCommitter] governance hash-cap "
+                    "refused commit op=%s detail=%s",
+                    op_id, _manifest_verdict.detail[:200],
+                )
+                return CommitResult(
+                    committed=False,
+                    skipped_reason="governance_manifest_drift",
+                )
+        except Exception as _hashcap_exc:  # noqa: BLE001 — defensive
+            logger.debug(
+                "[AutoCommitter] governance hash-cap "
+                "verifier unavailable: %s — proceeding "
+                "without manifest check", _hashcap_exc,
+            )
+
         try:
             # §24.6.2 — Commit-intent token: content-addressed
             # dedup check BEFORE staging. Prevents double-apply
