@@ -232,62 +232,64 @@ def test_buggy_code_fails_multiple_tests_simultaneously(tmp_path):
 # ===========================================================================
 
 
-_NAIVE_STRIP_ONLY_FIX = '''"""Naive fix that adds None-check ONLY at strip_html_tags.
+_NAIVE_LEAF_A_ONLY_FIX = '''"""Naive fix that adds None-check ONLY at clean().
 
-truncate() still crashes on None because len(None) raises TypeError.
-sanitize_thread is also unchanged so it still emits empty strings
-for None comments.
+shorten() still crashes on None because len(None) raises TypeError.
+collect() is also unchanged so it still emits empty strings for
+None entries even when leaf primitives become None-safe.
 """
 from __future__ import annotations
 
 import re
 
 
-def strip_html_tags(text):
-    if text is None:
+_TAG = re.compile(r"<[^>]+>")
+
+
+def clean(raw):
+    if raw is None:
         return ""
-    return re.sub(r"<[^>]+>", "", text)
+    return _TAG.sub("", raw)
 
 
-def truncate(text, max_length):
+def shorten(value, limit):
     # NOT FIXED: crashes on None.
-    if len(text) <= max_length:
-        return text
-    return text[:max_length] + "..."
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
 
 
-def sanitize_comment(comment, max_length=100):
-    stripped = strip_html_tags(comment)
-    return truncate(stripped, max_length)
+def process(item, limit=100):
+    return shorten(clean(item), limit)
 
 
-def sanitize_thread(thread):
-    # NOT FIXED: emits "" for None comments.
-    return [sanitize_comment(c) for c in thread]
+def collect(items):
+    # NOT FIXED: emits "" for None entries (after leaf fix).
+    return [process(i) for i in items]
 '''
 
 
-def test_naive_strip_only_fix_still_fails_truncate_canary(tmp_path):
-    """First multi-site canary: a fix that ONLY None-checks
-    strip_html_tags must still fail because truncate(None) crashes
-    (len(None) raises TypeError) BEFORE sanitize_comment can return.
+def test_naive_clean_only_fix_still_fails_shorten_canary(tmp_path):
+    """First multi-site canary: a fix that ONLY None-checks the
+    first leaf primitive (clean) must still fail because shorten(None)
+    crashes (len(None) raises TypeError) BEFORE process can return.
 
     Without this assertion the fixture would not distinguish
     "one-of-two type errors fixed" from "all type errors fixed.\""""
     test_content = (_FIXTURE_DIR / "test_before.py").read_text(encoding="utf-8")
     result = _run_pytest_against_files(
-        tmp_path, _NAIVE_STRIP_ONLY_FIX, test_content,
+        tmp_path, _NAIVE_LEAF_A_ONLY_FIX, test_content,
     )
     assert result.returncode != 0, (
         "MULTI-SITE TRAP NOT FUNCTIONING: pytest PASSED against the "
-        "strip-only naive fix.  The truncate(None) crash should "
-        "still surface.\n"
+        "clean-only naive fix.  The shorten(None) crash should still "
+        "surface.\n"
         f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
     )
     combined = result.stdout + result.stderr
-    assert "test_truncate_handles_none_input" in combined, (
-        f"Expected test_truncate_handles_none_input to fail under "
-        f"the strip-only fix.\nstdout: {result.stdout!r}\n"
+    assert "test_shorten_input_none" in combined, (
+        f"Expected test_shorten_input_none to fail under the "
+        f"clean-only fix.\nstdout: {result.stdout!r}\n"
         f"stderr: {result.stderr!r}"
     )
 
@@ -297,71 +299,86 @@ def test_naive_strip_only_fix_still_fails_truncate_canary(tmp_path):
 # ===========================================================================
 
 
-_NAIVE_LEAF_ONLY_FIX = '''"""Naive fix that None-checks BOTH leaf primitives (strip_html_tags
-+ truncate) but leaves sanitize_thread unchanged.
+_NAIVE_LEAF_ONLY_FIX = '''"""Naive fix that None-checks BOTH leaf primitives (clean +
+shorten) but leaves collect() unchanged.
 
-Type errors no longer surface, but sanitize_thread emits "" for
-None comments — violating the documented exclusion contract.
-This is the SEMANTIC trap: type-correctness alone is not
-correctness.
+Type errors no longer surface, but collect() emits "" for None
+entries — and the test cases in test_collect_input_a /
+test_collect_input_b / test_collect_input_c demonstrate via
+input/output examples that None entries should be DROPPED from
+the output (not surfaced as empty strings).  This is the
+SEMANTIC trap: type-correctness alone is not correctness.
+
+In v2, the contract surface is HIDDEN from docstrings + function
+names — the fix-finder has to infer the filtering semantics from
+test input/output pairs.
 """
 from __future__ import annotations
 
 import re
 
 
-def strip_html_tags(text):
-    if text is None:
+_TAG = re.compile(r"<[^>]+>")
+
+
+def clean(raw):
+    if raw is None:
         return ""
-    return re.sub(r"<[^>]+>", "", text)
+    return _TAG.sub("", raw)
 
 
-def truncate(text, max_length):
-    if text is None:
+def shorten(value, limit):
+    if value is None:
         return ""
-    if len(text) <= max_length:
-        return text
-    return text[:max_length] + "..."
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
 
 
-def sanitize_comment(comment, max_length=100):
-    stripped = strip_html_tags(comment)
-    return truncate(stripped, max_length)
+def process(item, limit=100):
+    return shorten(clean(item), limit)
 
 
-def sanitize_thread(thread):
-    # NOT FIXED: emits "" for None comments, violating the
-    # exclusion contract documented in the docstring.
-    return [sanitize_comment(c) for c in thread]
+def collect(items):
+    # NOT FIXED: emits "" for None entries.  This is the
+    # semantic-trap miss: leaf-only fix produces empty strings,
+    # but the test examples assert None entries are DROPPED.
+    return [process(i) for i in items]
 '''
 
 
-def test_naive_leaf_only_fix_still_fails_thread_semantic_canary(tmp_path):
+def test_naive_leaf_only_fix_still_fails_collect_semantic_canary(tmp_path):
     """Second multi-site canary: a fix that None-checks BOTH leaf
-    primitives but leaves sanitize_thread unchanged STILL fails
-    because the thread emits empty strings for None comments —
-    violating the documented exclusion contract.
+    primitives but leaves collect() unchanged STILL fails because
+    the collect tests demonstrate (via input/output examples) that
+    None entries get DROPPED from the output, not mapped to empty
+    strings.
 
-    This is the SEMANTIC trap: type-correctness is not correctness.
-    The fixture catches "just suppress the TypeErrors" without
-    reading the docstring's load-bearing contract."""
+    This is the SEMANTIC trap, redesigned for v2: type-correctness
+    is not correctness.  The v2 fixture hides the contract from
+    docstrings + function names — the fix-finder has to read test
+    input/output pairs to infer the filter."""
     test_content = (_FIXTURE_DIR / "test_before.py").read_text(encoding="utf-8")
     result = _run_pytest_against_files(
         tmp_path, _NAIVE_LEAF_ONLY_FIX, test_content,
     )
     assert result.returncode != 0, (
         "SEMANTIC TRAP NOT FUNCTIONING: pytest PASSED against the "
-        "leaf-only naive fix.  The sanitize_thread exclusion-"
-        "contract test should still fail.\n"
+        "leaf-only naive fix.  At least one collect_input test "
+        "should still fail (output contains '' instead of dropping).\n"
         f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
     )
     combined = result.stdout + result.stderr
-    assert (
-        "test_sanitize_thread_excludes_none_entries" in combined
-        or "test_sanitize_thread_preserves_order" in combined
-        or "test_sanitize_thread_all_none_returns_empty" in combined
-    ), (
-        f"Expected at least one sanitize_thread exclusion test to "
-        f"fail under the leaf-only fix.\n"
+    # At least one of the collect_input_* tests OR
+    # test_collect_preserves_order should fail
+    canary_tests = [
+        "test_collect_input_a",
+        "test_collect_input_b",
+        "test_collect_input_c",
+        "test_collect_preserves_order",
+    ]
+    assert any(t in combined for t in canary_tests), (
+        f"Expected at least one collect_input semantic-canary test "
+        f"to fail under the leaf-only fix.\n"
         f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
     )
