@@ -38,9 +38,21 @@ from backend.core.ouroboros.governance.swe_bench_pro.dataset_loader import (
     load_problem,
     swe_bench_pro_enabled,
 )
+from backend.core.ouroboros.governance.swe_bench_pro.per_problem_harness import (
+    DiffCaptureOutcome,
+    HarnessOutcome,
+    PER_PROBLEM_HARNESS_SCHEMA_VERSION,
+    PreparedProblem,
+    capture_produced_patch,
+    cleanup_prepared,
+    prepare_problem,
+    repo_cache_path,
+    worktree_base_path,
+)
 
 
 __all__ = [
+    # Phase A — dataset loader
     "LoadOutcome",
     "ProblemSpec",
     "SWE_BENCH_PRO_PROBLEM_SCHEMA_VERSION",
@@ -49,4 +61,14 @@ __all__ = [
     "list_cached_problems",
     "load_problem",
     "swe_bench_pro_enabled",
+    # Phase B.1 — per-problem harness substrate
+    "DiffCaptureOutcome",
+    "HarnessOutcome",
+    "PER_PROBLEM_HARNESS_SCHEMA_VERSION",
+    "PreparedProblem",
+    "capture_produced_patch",
+    "cleanup_prepared",
+    "prepare_problem",
+    "repo_cache_path",
+    "worktree_base_path",
 ]
