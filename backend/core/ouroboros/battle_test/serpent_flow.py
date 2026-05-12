@@ -5023,6 +5023,15 @@ class SerpentREPL:
                     ):
                         self._handle_tutorial(line)
                         continue
+                    # §41.3 #26 Phase 0 — /ask verb (D1c explicit
+                    # prefix; operator-signed 2026-05-11)
+                    if (
+                        line in ("/ask", "ask")
+                        or line.startswith("/ask ")
+                        or line.startswith("ask ")
+                    ):
+                        await self._handle_ask(line)
+                        continue
 
                     # Runtime configuration commands
                     if line.startswith("/risk") or line.startswith("risk ") or line == "risk":
@@ -6046,6 +6055,117 @@ class SerpentREPL:
             self._flow.console.print(_ln, highlight=False)
         self._flow.console.print()
 
+    async def _handle_ask(self, line: str = "") -> None:
+        """``/ask <question>`` — §41.3 #26 Phase 0 fast-path Q&A.
+
+        Composes :func:`fast_path_qa.ask_question` — NO parallel
+        Claude client, NO parallel conversation state, NO new
+        artifact-ref dispatcher. The Q&A artifact is parked in
+        the canonical sibling ring (:class:`BoundedQAStore`)
+        with a ``q-N`` ref operator can re-expand via the same
+        ``/expand`` verb that handles ``t-N``/``d-N``/``o-N``/
+        ``n-N``/``p-N``.
+
+        Operator-signed 2026-05-11: D1c (explicit prefix) +
+        D2a Claude-direct (Phase 0; D2c hybrid lands in Phase 1)
+        + D3a IMMEDIATE budget (Phase 0; D3b INFORMATIONAL
+        sub-budget lands in Phase 2) + D4 defaults + D5c q-N
+        refs. Runtime traffic gated by §33.1 master flag.
+
+        @arg_spec: <question>
+        @example: /ask What does CONTEXT_EXPANSION do?
+        @example: /ask Where is the topology sentinel master flag?
+        @category: introspection
+        """
+        try:
+            from backend.core.ouroboros.governance.fast_path_qa import (
+                QAVerdict,
+                ask_question,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/ask: substrate import "
+                f"failed: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        # Parse question from line (strip the verb).
+        try:
+            _parts = (line or "").split(None, 1)
+            question = _parts[1].strip() if len(_parts) > 1 else ""
+        except Exception:  # noqa: BLE001
+            question = ""
+        if not question:
+            self._flow.console.print(
+                f"  [{_C['dim']}]/ask: missing question. "
+                f"Usage: `/ask <question>`[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        # Generate a synthetic op_id so ConversationBridge can
+        # correlate the user-turn + assistant-turn pair.
+        try:
+            import uuid as _uuid
+            _ask_op_id = f"ask-{_uuid.uuid4().hex[:8]}"
+        except Exception:  # noqa: BLE001
+            _ask_op_id = "ask"
+        # Render a pending hint while the provider call is in
+        # flight — keeps the operator anchored.
+        self._flow.console.print()
+        self._flow.console.print(
+            f"  [{_C['dim']}]🤔 thinking…[/{_C['dim']}]",
+            highlight=False,
+        )
+        try:
+            report = await ask_question(
+                question, op_id=_ask_op_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/ask: provider error: "
+                f"{exc!r}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        # Map verdict → operator-friendly output. ANSWERED prints
+        # the answer + q-N ref; everything else surfaces the
+        # substrate's diagnostic verbatim.
+        c = self._flow.console
+        if report.verdict is QAVerdict.ANSWERED and report.artifact:
+            c.print()
+            c.print(
+                f"[{_C['neural']}]💡 Answer[/{_C['neural']}] "
+                f"[{_C['dim']}]· "
+                f"ref={report.artifact.ref} · "
+                f"cost=${report.artifact.cost_usd:.5f} · "
+                f"{report.artifact.elapsed_s:.2f}s · "
+                f"{report.artifact.model}[/{_C['dim']}]",
+                highlight=False,
+            )
+            for ln in (report.artifact.answer or "").splitlines():
+                c.print(f"  {ln}", highlight=False)
+            c.print(
+                f"  [{_C['dim']}](re-expand: `/expand "
+                f"{report.artifact.ref}`)[/{_C['dim']}]",
+                highlight=False,
+            )
+            c.print()
+        else:
+            # Verdict in {DISABLED, BUDGET_EXHAUSTED,
+            # PROVIDER_FAILED, OUT_OF_SCOPE}. Print the
+            # substrate's diagnostic verbatim — it already
+            # carries the operator-actionable detail (e.g.
+            # "gate disabled via JARVIS_FAST_PATH_QA_ENABLED=
+            # false" or "daily Q&A budget exhausted").
+            c.print()
+            c.print(
+                f"  [{_C['heal']}]/ask {report.verdict.value}:"
+                f"[/{_C['heal']}] [{_C['dim']}]"
+                f"{report.diagnostic}[/{_C['dim']}]",
+                highlight=False,
+            )
+            c.print()
+
     def _handle_preflight(self) -> None:
         """``/preflight`` — render the preflight checklist on demand.
 
@@ -6100,6 +6220,9 @@ class SerpentREPL:
             re-renders an archived narrative frame.
           * ``p-N`` → :class:`BoundedDecisionArchive` (v2.89 Slice 2):
             re-prints an archived permission decision.
+          * ``q-N`` → :class:`fast_path_qa.BoundedQAStore` (§41.3 #26
+            Phase 0): re-prints an archived Q&A interaction
+            (question + answer + cost + ref).
           * ``<op-id>`` (no prefix) → look up the matching ``o-N`` for
             the most recent op with that id.
 
@@ -6126,6 +6249,9 @@ class SerpentREPL:
             elif ref_or_op.startswith("p-"):
                 # v2.89 Slice 2 — permission decision archive
                 self._expand_permission_decision(ref_or_op)
+            elif ref_or_op.startswith("q-"):
+                # §41.3 #26 Phase 0 — fast-path Q&A ring
+                self._expand_qa(ref_or_op)
             else:
                 # Treat as op_id and find latest matching o-N
                 self._expand_op_block_by_op_id(ref_or_op)
@@ -6134,6 +6260,50 @@ class SerpentREPL:
                 f"  [{_C['death']}]/expand error: {exc}[/{_C['death']}]",
                 highlight=False,
             )
+
+    def _expand_qa(self, ref: str) -> None:
+        """§41.3 #26 Phase 0 D5c — re-print an archived Q&A.
+        NEVER raises into the dispatch."""
+        try:
+            from backend.core.ouroboros.governance.fast_path_qa import (
+                get_default_qa_store,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/expand {ref}: fast_path_qa "
+                f"unavailable: {exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        try:
+            artifact = get_default_qa_store().lookup(ref)
+        except Exception:  # noqa: BLE001
+            artifact = None
+        if artifact is None:
+            self._flow.console.print(
+                f"  [{_C['dim']}]/expand {ref}: not in QA ring "
+                f"(evicted or never recorded)[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        c = self._flow.console
+        c.print()
+        c.print(
+            f"[{_C['neural']}]🤔 Q&A {artifact.ref}"
+            f"[/{_C['neural']}] "
+            f"[{_C['dim']}]· cost=${artifact.cost_usd:.5f} · "
+            f"{artifact.elapsed_s:.2f}s · {artifact.model}[/{_C['dim']}]",
+            highlight=False,
+        )
+        c.print(
+            f"  [{_C['dim']}]Q:[/{_C['dim']}] {artifact.question}",
+            highlight=False,
+        )
+        c.print()
+        c.print(f"  [{_C['dim']}]A:[/{_C['dim']}]", highlight=False)
+        for ln in (artifact.answer or "").splitlines():
+            c.print(f"  {ln}", highlight=False)
+        c.print()
 
     def _print_expand_summary(self) -> None:
         """Print a one-screen overview of recent retrievable refs."""
