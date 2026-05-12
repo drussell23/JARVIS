@@ -92,14 +92,24 @@ _HELP = (
     "N bookmarks (default 20)\n"
     "  /conversation bookmark show <bk-N>  show full turns "
     "for one bookmark\n"
+    "  /conversation resume <session_id>   rehydrate persisted "
+    "turns into live bridge\n"
+    "  /conversation sessions [N]          list persisted "
+    "sessions (default 10, max 50)\n"
+    "  /conversation save                  force-persist "
+    "current bridge snapshot to ledger\n"
     "  /conversation stats                 bridge state + "
     "bookmark ledger size\n"
     "  /conversation help                  this text\n"
     "\n"
     "Bookmark ledger: .jarvis/conversation/bookmarks.jsonl "
     "(operator-tunable via JARVIS_CONVERSATION_BOOKMARKS_PATH)\n"
+    "Session ledger:  .jarvis/conversation/sessions/ "
+    "(operator-tunable via JARVIS_CONVERSATION_LEDGER_DIR)\n"
     "Master flag:     JARVIS_CONVERSATION_BRIDGE_ENABLED (the "
     "bridge's own master)\n"
+    "Ledger flag:     JARVIS_CONVERSATION_LEDGER_ENABLED "
+    "(persistence master)\n"
     "Cross-substrate: each bookmark carries a bk-N ref usable "
     "with /expand <bk-N>\n"
 )
@@ -525,6 +535,26 @@ def dispatch_conversation_command(
         ):
             return _render_bookmark_show(args[2])
         return _render_bookmark(args[1])
+    if head == "resume":
+        if len(args) < 2:
+            return ConversationReplDispatchResult(
+                ok=False,
+                text=(
+                    "  /conversation resume <session_id>: "
+                    "missing session_id argument."
+                ),
+            )
+        return _render_resume(args[1])
+    if head == "sessions":
+        return _render_sessions(
+            _parse_limit(
+                args,
+                default=10,
+                ceiling=50,
+            ),
+        )
+    if head == "save":
+        return _render_save()
     return ConversationReplDispatchResult(
         ok=False,
         text=(
@@ -927,6 +957,19 @@ def _render_stats() -> ConversationReplDispatchResult:
         bookmark_count = len(read_all_bookmarks(limit=100_000))
     except Exception:  # noqa: BLE001
         bookmark_count = 0
+    ledger_flag = False
+    session_count = 0
+    try:
+        from backend.core.ouroboros.governance.conversation_ledger import (  # noqa: E501
+            ledger_enabled as _ledger_on,
+            list_sessions as _ls,
+            ledger_dir as _ld,
+        )
+        ledger_flag = _ledger_on()
+        if ledger_flag:
+            session_count = len(_ls(limit=10_000))
+    except Exception:  # noqa: BLE001
+        pass
     lines = [
         "  /conversation stats:",
         f"    bridge_enabled:   {bridge_enabled}",
@@ -934,9 +977,236 @@ def _render_stats() -> ConversationReplDispatchResult:
         f"    bookmark_count:   {bookmark_count}",
         f"    bookmarks_path:   {bookmarks_jsonl_path()}",
         f"    export_format:    {export_default_format()}",
+        f"    ledger_enabled:   {ledger_flag}",
+        f"    session_count:    {session_count}",
     ]
     return ConversationReplDispatchResult(
         ok=True, text="\n".join(lines),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resume / Sessions / Save renderers (Arc #1)
+# ---------------------------------------------------------------------------
+
+
+def _render_resume(
+    session_id: str,
+) -> ConversationReplDispatchResult:
+    """Rehydrate persisted turns into the live bridge.
+
+    Replay is NOT trust bypass: every turn is re-sanitized through
+    the canonical Tier -1 ``sanitize_for_log`` + ``redact_secrets``
+    before entering the bridge ring buffer.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return ConversationReplDispatchResult(
+            ok=False,
+            text=(
+                "  /conversation resume: empty session_id"
+            ),
+        )
+    try:
+        from backend.core.ouroboros.governance.conversation_ledger import (  # noqa: E501
+            ledger_enabled,
+            read_tail,
+            replay_tail_default,
+            session_exists,
+        )
+    except ImportError:
+        return ConversationReplDispatchResult(
+            ok=False,
+            text=(
+                "  /conversation resume: conversation_ledger "
+                "module not available."
+            ),
+        )
+    if not ledger_enabled():
+        return ConversationReplDispatchResult(
+            ok=False,
+            text=(
+                "  /conversation resume: ledger disabled — set "
+                "JARVIS_CONVERSATION_LEDGER_ENABLED=true"
+            ),
+        )
+    if not session_exists(sid):
+        return ConversationReplDispatchResult(
+            ok=False,
+            text=(
+                f"  /conversation resume: session {sid!r} "
+                f"not found in ledger."
+            ),
+        )
+    tail = read_tail(sid, max_turns=replay_tail_default())
+    if not tail:
+        return ConversationReplDispatchResult(
+            ok=True,
+            text=(
+                f"  /conversation resume: session {sid!r} "
+                f"exists but contains no parseable turns."
+            ),
+        )
+
+    # Re-sanitize + re-redact — replay is NOT trust bypass.
+    from backend.core.secure_logging import sanitize_for_log
+    from backend.core.ouroboros.governance.conversation_bridge import (  # noqa: E501
+        _max_chars_per_turn,
+        get_default_bridge,
+        redact_secrets,
+    )
+    bridge = get_default_bridge()
+    per_turn_cap = _max_chars_per_turn()
+    injected = 0
+    for pt in tail:
+        sanitized = sanitize_for_log(
+            pt.text, max_len=per_turn_cap,
+        )
+        if not sanitized:
+            continue
+        sanitized, _ = redact_secrets(sanitized)
+        bridge.record_turn(
+            role=pt.role,
+            text=sanitized,
+            source=pt.source or "tui_user",
+            op_id=pt.op_id,
+        )
+        injected += 1
+    return ConversationReplDispatchResult(
+        ok=True,
+        text=(
+            f"  /conversation resume: rehydrated {injected} "
+            f"turn(s) from session {sid!r} into live bridge."
+        ),
+    )
+
+
+def _render_sessions(
+    limit: int,
+) -> ConversationReplDispatchResult:
+    """List persisted sessions from the ledger directory."""
+    try:
+        from backend.core.ouroboros.governance.conversation_ledger import (  # noqa: E501
+            ledger_enabled,
+            list_sessions,
+        )
+    except ImportError:
+        return ConversationReplDispatchResult(
+            ok=False,
+            text=(
+                "  /conversation sessions: conversation_ledger "
+                "module not available."
+            ),
+        )
+    if not ledger_enabled():
+        return ConversationReplDispatchResult(
+            ok=False,
+            text=(
+                "  /conversation sessions: ledger disabled — set "
+                "JARVIS_CONVERSATION_LEDGER_ENABLED=true"
+            ),
+        )
+    sessions = list_sessions(limit=limit)
+    if not sessions:
+        return ConversationReplDispatchResult(
+            ok=True,
+            text=(
+                "  /conversation sessions: no persisted "
+                "sessions found."
+            ),
+        )
+    lines = [
+        f"  /conversation sessions (most-recent "
+        f"{len(sessions)}):",
+    ]
+    for s in sessions:
+        try:
+            ts = time.strftime(
+                "%Y-%m-%d %H:%M",
+                time.gmtime(s.last_ts),
+            )
+        except Exception:  # noqa: BLE001
+            ts = "?"
+        size_kb = s.file_size_bytes / 1024
+        lines.append(
+            f"  {s.session_id[:24]:<24}  "
+            f"turns={s.turn_count:<4}  "
+            f"size={size_kb:.1f}KB  @ {ts}"
+        )
+    return ConversationReplDispatchResult(
+        ok=True, text="\n".join(lines),
+    )
+
+
+def _render_save() -> ConversationReplDispatchResult:
+    """Force-persist current bridge snapshot to the ledger."""
+    try:
+        from backend.core.ouroboros.governance.conversation_ledger import (  # noqa: E501
+            append_turn,
+            ledger_enabled,
+        )
+    except ImportError:
+        return ConversationReplDispatchResult(
+            ok=False,
+            text=(
+                "  /conversation save: conversation_ledger "
+                "module not available."
+            ),
+        )
+    if not ledger_enabled():
+        return ConversationReplDispatchResult(
+            ok=False,
+            text=(
+                "  /conversation save: ledger disabled — set "
+                "JARVIS_CONVERSATION_LEDGER_ENABLED=true"
+            ),
+        )
+    turns = _snapshot_bridge_turns(
+        max_turns=_MAX_EXPORT_TURNS,
+    )
+    if not turns:
+        return ConversationReplDispatchResult(
+            ok=True,
+            text=(
+                "  /conversation save: bridge is empty; "
+                "nothing to persist."
+            ),
+        )
+    # Resolve session_id.
+    try:
+        from backend.core.ouroboros.governance.conversation_ledger_observer import (  # noqa: E501
+            _PROCESS_EPOCH_SESSION_ID,
+        )
+        from backend.core.ouroboros.governance.session_manager import (  # noqa: E501
+            get_session_manager,
+        )
+        mgr = get_session_manager()
+        active = mgr.list_active()
+        sid = (
+            active[0].session_id
+            if active
+            else _PROCESS_EPOCH_SESSION_ID
+        )
+    except Exception:  # noqa: BLE001
+        sid = "manual-save"
+    written = 0
+    for t in turns:
+        ok = append_turn(
+            sid,
+            role=str(getattr(t, "role", "")),
+            text=str(getattr(t, "text", "")),
+            source=str(getattr(t, "source", "")),
+            op_id=str(getattr(t, "op_id", "")),
+            ts=float(getattr(t, "ts", 0.0) or 0.0),
+        )
+        if ok:
+            written += 1
+    return ConversationReplDispatchResult(
+        ok=True,
+        text=(
+            f"  /conversation save: persisted {written} "
+            f"turn(s) to session {sid!r}."
+        ),
     )
 
 
@@ -1035,6 +1305,24 @@ def register_shipped_invariants() -> list:
             "the t-N/d-N/o-N/n-N/p-N/q-N artifact-ref family",
         )
 
+    def _validate_resume_resanitizes(
+        tree: "_ast.Module", source: str,  # noqa: ARG001
+    ) -> tuple:
+        """Resume path MUST call sanitize_for_log AND
+        redact_secrets to enforce replay-is-not-trust-bypass."""
+        violations: list = []
+        if "sanitize_for_log" not in source:
+            violations.append(
+                "resume path must call sanitize_for_log "
+                "(replay is not trust bypass)"
+            )
+        if "redact_secrets" not in source:
+            violations.append(
+                "resume path must call redact_secrets "
+                "(replay is not trust bypass)"
+            )
+        return tuple(violations)
+
     return [
         ShippedCodeInvariant(
             invariant_name="conversation_repl_substrate",
@@ -1076,6 +1364,17 @@ def register_shipped_invariants() -> list:
                 "BOOKMARK_REF_PREFIX = 'bk-' bytes-pinned."
             ),
             validate=_validate_ref_prefix_pinned,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
+                "conversation_resume_resanitizes"
+            ),
+            target_file=target,
+            description=(
+                "Resume path MUST call sanitize_for_log + "
+                "redact_secrets — replay is not trust bypass."
+            ),
+            validate=_validate_resume_resanitizes,
         ),
     ]
 
