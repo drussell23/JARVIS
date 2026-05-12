@@ -84,6 +84,13 @@ FAST_PATH_QA_SCHEMA_VERSION: str = "fast_path_qa.1"
 
 _ENV_MASTER = "JARVIS_FAST_PATH_QA_ENABLED"
 _ENV_BUDGET_USD = "JARVIS_FAST_PATH_QA_DAILY_BUDGET_USD"
+# §41.3 #26 Phase 2 D3b — canonical per-route sub-budget knob.
+# Takes precedence over the legacy ``_ENV_BUDGET_USD`` when set
+# (legacy retained for backward compat with Phase 0/1 operator
+# muscle memory; Phase 2+ should prefer the canonical name).
+# Mirrors the operator-signed contract in
+# ``ProviderRoute.INFORMATIONAL``'s docstring (2026-05-11).
+_ENV_INFORMATIONAL_BUDGET_USD = "JARVIS_INFORMATIONAL_BUDGET_USD"
 _ENV_MAX_TOKENS = "JARVIS_FAST_PATH_QA_MAX_TOKENS"
 _ENV_TEMPERATURE = "JARVIS_FAST_PATH_QA_TEMPERATURE"
 _ENV_STORE_CAPACITY = "JARVIS_FAST_PATH_QA_STORE_CAPACITY"
@@ -156,6 +163,21 @@ _DEFAULT_SYSTEM_PROMPT: str = (
 # Module-level constant so AST pins can byte-pin the choice.
 QA_REF_PREFIX: str = "q-"
 
+# §41.3 #26 Phase 2 D3b — canonical route tag.
+#
+# String value MUST equal ``ProviderRoute.INFORMATIONAL.value``
+# (the closed-5→6 taxonomy expansion shipped 2026-05-11 in
+# ``urgency_router.py``). Duplicated here as a module-local
+# constant rather than imported because the authority-asymmetry
+# pin forbids ``fast_path_qa`` from importing ``urgency_router``
+# (read-only Q&A path stays decoupled from routing internals —
+# same precedent as :mod:`intent_envelope`'s
+# ``_VALID_ROUTING_OVERRIDES`` frozenset duplication).
+#
+# Cross-reference parity is enforced by a co-located test:
+# ``test_fast_path_qa_phase2.test_route_informational_matches_canonical``.
+ROUTE_INFORMATIONAL: str = "informational"
+
 _TRUTHY: FrozenSet[str] = frozenset({"1", "true", "yes", "on"})
 
 
@@ -180,6 +202,27 @@ def master_enabled() -> bool:
 
 
 def daily_budget_usd() -> float:
+    """§41.3 #26 Phase 2 D3b — per-route INFORMATIONAL budget.
+
+    Precedence (highest → lowest):
+
+      1. ``JARVIS_INFORMATIONAL_BUDGET_USD`` (canonical, Phase 2+)
+      2. ``JARVIS_FAST_PATH_QA_DAILY_BUDGET_USD`` (legacy, Phase 0/1
+         backward-compat — still honored to avoid breaking operator
+         muscle memory; new deployments should use the canonical
+         name)
+      3. ``_DEFAULT_BUDGET_USD`` ($5/day)
+
+    Clamped [0, 1000]. NEVER raises.
+    """
+    canonical = os.environ.get(
+        _ENV_INFORMATIONAL_BUDGET_USD, "",
+    ).strip()
+    if canonical:
+        try:
+            return max(0.0, min(1000.0, float(canonical)))
+        except (TypeError, ValueError):
+            pass  # fall through to legacy + default
     raw = os.environ.get(_ENV_BUDGET_USD, "").strip()
     if not raw:
         return _DEFAULT_BUDGET_USD
@@ -344,6 +387,16 @@ class QAArtifact:
     # Top retrieval cosine score (when retrieval ran). 0.0 for
     # retrieval_disabled / claude_direct paths.
     top_score: float = 0.0
+    # §41.3 #26 Phase 2 D3b — canonical route tag. Distinct from
+    # ``retrieval_path`` (which is internal-to-substrate
+    # provenance about HOW the answer was synthesized); ``route``
+    # is the cross-substrate ProviderRoute classification of WHAT
+    # KIND of traffic this op was. Q&A is always
+    # ``ROUTE_INFORMATIONAL`` by construction — no other route
+    # may be stamped here. Mirrors the
+    # ``ProviderRoute.INFORMATIONAL`` value (parity enforced by
+    # test_fast_path_qa_phase2).
+    route: str = ROUTE_INFORMATIONAL
     schema_version: str = FAST_PATH_QA_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
@@ -359,6 +412,7 @@ class QAArtifact:
             "inserted_at": float(self.inserted_at),
             "retrieval_path": self.retrieval_path[:64],
             "top_score": float(self.top_score),
+            "route": self.route[:32],
             "schema_version": self.schema_version,
         }
 
@@ -1328,6 +1382,34 @@ def register_shipped_invariants() -> list:
             )
         return tuple(violations)
 
+    def _validate_route_informational_pinned(
+        tree: ast.AST, source: str,  # noqa: ARG001
+    ) -> tuple:
+        """§41.3 #26 Phase 2 D3b bytes-pin: ROUTE_INFORMATIONAL
+        is exactly "informational" — must match
+        :data:`urgency_router.ProviderRoute.INFORMATIONAL.value`.
+
+        Authority-asymmetry forbids importing ``urgency_router``
+        here; the parity contract is enforced structurally by
+        this pin (constant value) + behaviorally by
+        ``test_fast_path_qa_phase2.test_route_informational_matches_canonical``
+        (which DOES import ProviderRoute and asserts equality)."""
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "ROUTE_INFORMATIONAL"
+                and isinstance(node.value, ast.Constant)
+                and node.value.value == "informational"
+            ):
+                return ()
+        return (
+            "ROUTE_INFORMATIONAL must be 'informational' — "
+            "mirrors ProviderRoute.INFORMATIONAL.value "
+            "(closed-5→6 taxonomy expansion, operator-signed "
+            "2026-05-11 per §41.3.1 D3b)",
+        )
+
     def _validate_d2a_no_provider_generate(
         tree: ast.AST, source: str,  # noqa: ARG001
     ) -> tuple:
@@ -1420,6 +1502,21 @@ def register_shipped_invariants() -> list:
         ),
         ShippedCodeInvariant(
             invariant_name=(
+                "fast_path_qa_route_informational_pinned"
+            ),
+            target_file=target,
+            description=(
+                "§41.3 #26 Phase 2 D3b bytes-pin. "
+                "ROUTE_INFORMATIONAL = 'informational' mirrors "
+                "ProviderRoute.INFORMATIONAL.value (closed-5→6 "
+                "expansion, operator-signed 2026-05-11). "
+                "Authority-asymmetry forbids importing "
+                "urgency_router; parity is structural + tested."
+            ),
+            validate=_validate_route_informational_pinned,
+        ),
+        ShippedCodeInvariant(
+            invariant_name=(
                 "fast_path_qa_no_provider_generate"
             ),
             target_file=target,
@@ -1463,13 +1560,30 @@ def register_flags(registry: Any) -> int:
             example=f"{_ENV_MASTER}=true",
         ),
         FlagSpec(
+            name=_ENV_INFORMATIONAL_BUDGET_USD,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_BUDGET_USD,
+            description=(
+                "§41.3 #26 Phase 2 D3b — canonical per-route "
+                "INFORMATIONAL budget cap (USD/day). Takes "
+                "precedence over the legacy "
+                "JARVIS_FAST_PATH_QA_DAILY_BUDGET_USD knob. "
+                "Operator-signed 2026-05-11. Clamped [0, 1000]."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example=f"{_ENV_INFORMATIONAL_BUDGET_USD}=10.0",
+        ),
+        FlagSpec(
             name=_ENV_BUDGET_USD,
             type=FlagType.FLOAT,
             default=_DEFAULT_BUDGET_USD,
             description=(
-                "Daily USD budget cap for Q&A. Phase 0 D3a "
-                "(IMMEDIATE in-process counter). Phase 2 D3b "
-                "will route through urgency_router."
+                "Daily USD budget cap for Q&A (Phase 0/1 "
+                "legacy knob). Phase 2+ should prefer the "
+                "canonical JARVIS_INFORMATIONAL_BUDGET_USD; "
+                "this name is retained for backward-compat "
+                "with existing operator muscle memory."
             ),
             category=Category.SAFETY,
             source_file=src,
@@ -1623,6 +1737,7 @@ __all__ = [
     "RETRIEVAL_PATH_HYBRID",
     "RETRIEVAL_PATH_RETRIEVAL_DISABLED",
     "RETRIEVAL_PATH_RETRIEVAL_ONLY",
+    "ROUTE_INFORMATIONAL",
     "BoundedQAStore",
     "QAArtifact",
     "QAReport",

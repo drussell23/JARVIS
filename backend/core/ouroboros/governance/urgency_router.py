@@ -73,6 +73,18 @@ class ProviderRoute(str, Enum):
     Used for: intent discovery, dream engine, proactive exploration.
     Results cached; applied opportunistically if still relevant."""
 
+    INFORMATIONAL = "informational"
+    """§41.3 #26 Phase 2 D3b — read-only knowledge-lookup route.
+    Used for: fast-path Q&A (operator-typed ``/ask`` queries).
+    Contract: NO code generation, NO file mutations, NO DW
+    cascade (semantic_index grounds Claude; nothing leaves the
+    knowledge surface). Per-route sub-budget via
+    ``JARVIS_INFORMATIONAL_BUDGET_USD``. Operator-signed
+    2026-05-11 per §41.3.1 D3b. Adding this route to the
+    closed-5→6 taxonomy is the structural recognition that Q&A
+    traffic is its own first-class route with isolated cost
+    accounting."""
+
 
 # ---------------------------------------------------------------------------
 # Source → urgency affinity tables (deterministic, no LLM calls)

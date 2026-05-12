@@ -614,7 +614,9 @@ def _load_source_tree():
 
 
 def test_ast_pins_count():
-    assert len(register_shipped_invariants()) == 6
+    # §41.3 #26 Phase 2 (2026-05-11) added a 7th pin:
+    # ``fast_path_qa_route_informational_pinned``.
+    assert len(register_shipped_invariants()) == 7
 
 
 def test_ast_pin_verdict_taxonomy_passes():

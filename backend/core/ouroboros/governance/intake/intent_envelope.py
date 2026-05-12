@@ -79,7 +79,11 @@ _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 # envelopes are upstream of routing; nothing in intake should depend
 # on routing internals).
 _VALID_ROUTING_OVERRIDES = frozenset({
-    "", "immediate", "standard", "complex", "background", "speculative",
+    # Empty string = no override (default).
+    # §41.3 #26 Phase 2 — added "informational" to mirror the
+    # ProviderRoute closed-5→6 taxonomy expansion.
+    "", "immediate", "standard", "complex", "background",
+    "speculative", "informational",
 })
 
 

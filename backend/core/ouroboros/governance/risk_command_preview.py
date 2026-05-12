@@ -200,6 +200,11 @@ _ROUTE_COST_USD = {
     "complex": 0.015,
     "background": 0.002,
     "speculative": 0.001,
+    # §41.3 #26 Phase 2 D3b — INFORMATIONAL route (fast-path
+    # Q&A). Median per-question cost under D2c hybrid: cheaper
+    # than IMMEDIATE because thinking=off + max_tokens=400 +
+    # retrieval-only tier costs $0.
+    "informational": 0.003,
 }
 
 
@@ -214,6 +219,10 @@ _ROUTE_DURATION_S = {
     "complex": 120.0,
     "background": 90.0,
     "speculative": 5.0,
+    # §41.3 #26 Phase 2 D3b — Q&A median wall-clock under
+    # default config (timeout cap 30s; thinking off; retrieval-
+    # only tier returns in ~1s).
+    "informational": 5.0,
 }
 
 

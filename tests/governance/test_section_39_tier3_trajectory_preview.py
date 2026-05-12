@@ -847,13 +847,16 @@ def test_canonical_event_command_preview_registered():
     assert EVENT_TYPE_COMMAND_PREVIEW_RENDERED in _VALID_EVENT_TYPES
 
 
-def test_canonical_provider_route_5_values():
+def test_canonical_provider_route_6_values():
     """Lockstep regression — preview's route values are
-    canonical ProviderRoute string values."""
+    canonical ProviderRoute string values. §41.3 #26 Phase 2
+    expanded the closed-5 taxonomy to closed-6 by adding
+    INFORMATIONAL (read-only Q&A route; D3b operator-signed
+    2026-05-11)."""
     from backend.core.ouroboros.governance.urgency_router import (
         ProviderRoute,
     )
     assert {m.value for m in ProviderRoute} == {
         "immediate", "standard", "complex",
-        "background", "speculative",
+        "background", "speculative", "informational",
     }
