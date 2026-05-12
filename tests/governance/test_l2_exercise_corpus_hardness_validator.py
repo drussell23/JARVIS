@@ -285,10 +285,15 @@ def test_help_works_without_api_key_or_confirm_paid():
 
 def test_report_schema_version_constant():
     """Schema pin: ``REPORT_SCHEMA_VERSION`` MUST be
-    ``hardness_report.v1``.  Any schema change requires a version
-    bump."""
+    ``hardness_report.v2``.  Bumped from v1 in Phase 1.5.D.2
+    Stage 1 to mark the addition of AttemptStatus / retry budget /
+    HARDNESS_SET / gate fields.  v1-aware consumers MUST branch
+    on this field; legacy v1 per-problem fields (passes/fails/
+    attempts_completed/attempts_errored/
+    measured_first_try_fail_rate) are preserved alongside the
+    new structured fields so they keep parsing."""
     mod = _load_script_module()
-    assert mod.REPORT_SCHEMA_VERSION == "hardness_report.v1"
+    assert mod.REPORT_SCHEMA_VERSION == "hardness_report.v2"
 
 
 def test_report_filename_is_underscore_prefixed():
@@ -481,3 +486,495 @@ def test_module_docstring_documents_upper_bound_caveat():
     assert "clean-room" in docstring or "clean room" in docstring, (
         "Module docstring MUST mention the clean-room prompt"
     )
+
+
+# ===========================================================================
+# Phase 1.5.D.2 Stage 1 — AttemptStatus taxonomy + retry + gate pins
+# ===========================================================================
+
+
+def test_attempt_status_taxonomy_is_closed_four_values():
+    """Closed-taxonomy pin: ``AttemptStatus`` MUST have EXACTLY 4
+    values, with the canonical string keys.  Adding a 5th value
+    silently breaks the gate computation + report consumers; AST
+    pin forces explicit version bump on any extension."""
+    mod = _load_script_module()
+    values = {m.value for m in mod.AttemptStatus}
+    assert values == {
+        "passed", "failed", "provider_parse_error", "errored",
+    }, (
+        f"AttemptStatus taxonomy drift; got {sorted(values)}"
+    )
+
+
+def test_attempt_status_taxonomy_ast_bytes_pinned():
+    """AST-walk pin: the enum class body MUST contain exactly 4
+    assignments with the canonical names.  Catches reorders / silent
+    renames at the source level (not just the runtime value set)."""
+    cls = None
+    for node in ast.walk(_SCRIPT_AST):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "AttemptStatus"
+        ):
+            cls = node
+            break
+    assert cls is not None, (
+        "AttemptStatus class MUST exist in source"
+    )
+    names = [
+        a.targets[0].id for a in cls.body
+        if isinstance(a, ast.Assign)
+        and len(a.targets) == 1
+        and isinstance(a.targets[0], ast.Name)
+    ]
+    assert names == ["PASSED", "FAILED", "PROVIDER_PARSE_ERROR", "ERRORED"], (
+        f"AttemptStatus class-body assignments drifted; got {names}"
+    )
+
+
+# ----------------------------------------------------------------------------
+# Env-knob defaults + clamping
+# ----------------------------------------------------------------------------
+
+
+def test_parse_retry_budget_default(monkeypatch):
+    monkeypatch.delenv("JARVIS_VALIDATOR_PARSE_RETRY", raising=False)
+    mod = _load_script_module()
+    assert mod.parse_retry_budget() == mod.DEFAULT_PARSE_RETRY_BUDGET == 3
+
+
+def test_parse_retry_budget_overridable_and_clamped(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("JARVIS_VALIDATOR_PARSE_RETRY", "5")
+    assert mod.parse_retry_budget() == 5
+    monkeypatch.setenv("JARVIS_VALIDATOR_PARSE_RETRY", "999")
+    assert mod.parse_retry_budget() == 10  # clamped to maximum
+    monkeypatch.setenv("JARVIS_VALIDATOR_PARSE_RETRY", "garbage")
+    assert mod.parse_retry_budget() == 3  # default on parse error
+    monkeypatch.setenv("JARVIS_VALIDATOR_PARSE_RETRY", "-2")
+    assert mod.parse_retry_budget() == 0  # clamped to minimum
+
+
+def test_min_completed_per_problem_default(monkeypatch):
+    monkeypatch.delenv("JARVIS_VALIDATOR_MIN_COMPLETED_PER_PROBLEM", raising=False)
+    mod = _load_script_module()
+    assert mod.min_completed_per_problem() == 3
+
+
+def test_acceptance_threshold_default_and_clamping(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.delenv("JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD", raising=False)
+    assert mod.acceptance_threshold() == 0.40
+    monkeypatch.setenv("JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD", "0.6")
+    assert abs(mod.acceptance_threshold() - 0.6) < 1e-9
+    monkeypatch.setenv("JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD", "2.5")
+    assert mod.acceptance_threshold() == 1.0  # clamped
+    monkeypatch.setenv("JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD", "-1")
+    assert mod.acceptance_threshold() == 0.0
+
+
+# ----------------------------------------------------------------------------
+# parse_hardness_set — comma-separated parser, whitespace tolerant
+# ----------------------------------------------------------------------------
+
+
+def test_parse_hardness_set_empty_inputs():
+    """Empty / None / whitespace-only → empty frozenset."""
+    mod = _load_script_module()
+    assert mod.parse_hardness_set(None) == frozenset()
+    assert mod.parse_hardness_set("") == frozenset()
+    assert mod.parse_hardness_set("   ") == frozenset()
+    assert mod.parse_hardness_set(", ,  ") == frozenset()
+
+
+def test_parse_hardness_set_simple_and_whitespace():
+    mod = _load_script_module()
+    assert mod.parse_hardness_set("problem_002,problem_003") == frozenset(
+        {"problem_002", "problem_003"}
+    )
+    # Whitespace around tokens tolerated
+    assert mod.parse_hardness_set(" problem_002 , problem_003 ") == frozenset(
+        {"problem_002", "problem_003"}
+    )
+
+
+def test_parse_hardness_set_duplicates_collapse():
+    mod = _load_script_module()
+    assert mod.parse_hardness_set("p1,p1,p2") == frozenset({"p1", "p2"})
+
+
+def test_hardness_set_from_env_round_trip(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("JARVIS_VALIDATOR_HARDNESS_SET", "problem_002,problem_003")
+    assert mod.hardness_set_from_env() == frozenset(
+        {"problem_002", "problem_003"}
+    )
+    monkeypatch.delenv("JARVIS_VALIDATOR_HARDNESS_SET", raising=False)
+    assert mod.hardness_set_from_env() == frozenset()
+
+
+# ----------------------------------------------------------------------------
+# compute_acceptance_gate — pure-function evaluator
+# ----------------------------------------------------------------------------
+
+
+def _result(pid, completed=3, fails=2, fail_rate=None):
+    """Helper: synthesize a per-problem result dict shaped like
+    validate_one_problem's return."""
+    if fail_rate is None and completed > 0:
+        fail_rate = fails / completed
+    return {
+        "problem_id": pid,
+        "kind": "logic_inversion",
+        "attempts_completed": completed,
+        "fails": fails,
+        "passes": max(0, completed - fails),
+        "measured_first_try_fail_rate": fail_rate,
+    }
+
+
+def test_gate_empty_set_returns_unevaluable():
+    mod = _load_script_module()
+    mean, meets, diag = mod.compute_acceptance_gate(
+        frozenset(), [], threshold=0.40, min_completed=3,
+    )
+    assert mean is None
+    assert meets is False
+    assert diag["reason"] == "empty_set"
+
+
+def test_gate_missing_members_returns_unevaluable():
+    mod = _load_script_module()
+    mean, meets, diag = mod.compute_acceptance_gate(
+        frozenset({"problem_002", "problem_003"}),
+        [_result("problem_002", completed=3, fails=2)],
+        threshold=0.40, min_completed=3,
+    )
+    assert mean is None
+    assert meets is False
+    assert diag["reason"] == "missing_members"
+    assert diag["missing"] == ["problem_003"]
+
+
+def test_gate_insufficient_samples_returns_unevaluable():
+    mod = _load_script_module()
+    mean, meets, diag = mod.compute_acceptance_gate(
+        frozenset({"problem_002"}),
+        [_result("problem_002", completed=2, fails=2)],
+        threshold=0.40, min_completed=3,
+    )
+    assert mean is None
+    assert meets is False
+    assert diag["reason"] == "insufficient_samples"
+    assert diag["under_sampled"] == ["problem_002"]
+
+
+def test_gate_passes_when_mean_meets_threshold():
+    mod = _load_script_module()
+    mean, meets, diag = mod.compute_acceptance_gate(
+        frozenset({"problem_002", "problem_003"}),
+        [
+            _result("problem_002", completed=4, fails=3),  # 0.75
+            _result("problem_003", completed=4, fails=1),  # 0.25
+        ],
+        threshold=0.40, min_completed=3,
+    )
+    # mean = (0.75 + 0.25) / 2 = 0.50, meets 0.40
+    assert mean is not None
+    assert abs(mean - 0.50) < 1e-9
+    assert meets is True
+    assert diag["reason"] == "ok"
+    assert diag["n_problems"] == 2
+
+
+def test_gate_fails_when_mean_below_threshold():
+    mod = _load_script_module()
+    mean, meets, diag = mod.compute_acceptance_gate(
+        frozenset({"problem_002"}),
+        [_result("problem_002", completed=5, fails=1)],  # 0.20
+        threshold=0.40, min_completed=3,
+    )
+    assert mean is not None
+    assert abs(mean - 0.20) < 1e-9
+    assert meets is False
+    assert diag["reason"] == "ok"
+
+
+def test_gate_default_acceptance_threshold_pinned():
+    """Operator-honesty pin: the documented threshold is 0.40 — the
+    constant in the validator MUST match this so the report's
+    ``acceptance_threshold`` field can be cross-checked against the
+    PRD §40.7.10 contract."""
+    mod = _load_script_module()
+    assert mod.DEFAULT_ACCEPTANCE_THRESHOLD == 0.40
+
+
+def test_gate_default_min_completed_pinned():
+    mod = _load_script_module()
+    assert mod.DEFAULT_MIN_COMPLETED_PER_PROBLEM == 3
+
+
+def test_gate_default_parse_retry_pinned():
+    mod = _load_script_module()
+    assert mod.DEFAULT_PARSE_RETRY_BUDGET == 3
+
+
+# ----------------------------------------------------------------------------
+# validate_one_problem — exercise the retry + classification spine
+# without paying for real DW calls
+# ----------------------------------------------------------------------------
+
+
+class _FakeProblem:
+    """Minimal duck-typed stand-in for ExerciseProblem."""
+
+    def __init__(self, problem_id="problem_test", kind_value="off_by_one"):
+        self.problem_id = problem_id
+
+        class _K:
+            value = kind_value
+
+        self.kind = _K()
+        self.target_file_name = "before.py"
+        self.test_file_name = "test_before.py"
+        self.before_content = "def f(): return 0\n"
+        self.test_content = (
+            "from before import f\n"
+            "def test_f(): assert f() == 1\n"
+        )
+
+
+async def _run_validate(
+    monkeypatch, *,
+    call_responses,
+    pytest_results,
+    attempts=3,
+    parse_retry=2,
+    min_completed=2,
+):
+    """Helper: monkeypatch ``call_doubleword_one_shot`` to return
+    a sequence of (text, usage) tuples or to raise; monkeypatch
+    ``run_pytest_against_candidate`` to return a deterministic
+    sequence of bool verdicts.  Then run validate_one_problem and
+    return its result dict."""
+    mod = _load_script_module()
+    call_iter = iter(call_responses)
+    pytest_iter = iter(pytest_results)
+
+    async def fake_call(*a, **kw):
+        nxt = next(call_iter)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+    def fake_pytest(*a, **kw):
+        return next(pytest_iter)
+
+    monkeypatch.setattr(mod, "call_doubleword_one_shot", fake_call)
+    monkeypatch.setattr(mod, "run_pytest_against_candidate", fake_pytest)
+
+    tracker = mod.CostTracker(max_usd=1.0, input_per_m=0.10, output_per_m=0.40)
+    return await mod.validate_one_problem(
+        _FakeProblem(), attempts, {
+            "api_key": "k", "base_url": "https://x", "model": "m",
+            "timeout_s": 10.0,
+        }, tracker,
+        parse_retry_budget_value=parse_retry,
+        min_completed_value=min_completed,
+    )
+
+
+def test_validate_classifies_pass_and_fail(monkeypatch):
+    """Happy path: pytest verdicts route to PASSED / FAILED status."""
+    import asyncio as _aio
+    result = _aio.run(_run_validate(
+        monkeypatch,
+        call_responses=[
+            ("def f(): return 1\n", {"prompt_tokens": 10, "completion_tokens": 5}),
+            ("def f(): return 1\n", {"prompt_tokens": 10, "completion_tokens": 5}),
+            ("def f(): return 0\n", {"prompt_tokens": 10, "completion_tokens": 5}),
+        ],
+        pytest_results=[True, True, False],
+        attempts=3,
+    ))
+    counts = result["attempt_status_counts"]
+    assert counts["passed"] == 2
+    assert counts["failed"] == 1
+    assert counts["provider_parse_error"] == 0
+    assert counts["errored"] == 0
+    assert result["measured_first_try_fail_rate"] == 1 / 3
+    assert result["insufficient_samples"] is False
+
+
+def test_validate_retries_on_provider_parse_error(monkeypatch):
+    """PROVIDER_PARSE_ERROR (KeyError from response parser) MUST be
+    retried up to the budget within one logical attempt.  After
+    successful retry, the attempt records the final status — NOT
+    PROVIDER_PARSE_ERROR."""
+    import asyncio as _aio
+    # First call raises KeyError (parse error), second call succeeds
+    result = _aio.run(_run_validate(
+        monkeypatch,
+        call_responses=[
+            KeyError("first parse fail"),
+            ("def f(): return 1\n", {"prompt_tokens": 10, "completion_tokens": 5}),
+        ],
+        pytest_results=[True],
+        attempts=1,
+        parse_retry=2,
+    ))
+    counts = result["attempt_status_counts"]
+    assert counts["passed"] == 1
+    assert counts["provider_parse_error"] == 0
+    assert result["per_attempt"][0]["retries_used"] == 1
+
+
+def test_validate_retry_budget_exhausted_records_parse_error(monkeypatch):
+    """When retries exhaust without a parseable response, the attempt
+    is classified PROVIDER_PARSE_ERROR + excluded from fail-rate."""
+    import asyncio as _aio
+    result = _aio.run(_run_validate(
+        monkeypatch,
+        call_responses=[
+            KeyError("a"), KeyError("b"), KeyError("c"),
+        ],
+        pytest_results=[],
+        attempts=1,
+        parse_retry=2,  # 2 retries → 3 total attempts (initial + 2)
+    ))
+    counts = result["attempt_status_counts"]
+    assert counts["provider_parse_error"] == 1
+    assert counts["passed"] == 0 and counts["failed"] == 0
+    # Excluded from fail-rate denominator AND numerator
+    assert result["measured_first_try_fail_rate"] is None
+    assert result["per_attempt"][0]["reason"] == "retry_budget_exhausted"
+
+
+def test_validate_other_exception_routes_to_errored(monkeypatch):
+    """Non-KeyError exceptions route to ERRORED — NOT retried."""
+    import asyncio as _aio
+    result = _aio.run(_run_validate(
+        monkeypatch,
+        call_responses=[
+            RuntimeError("network down"),
+        ],
+        pytest_results=[],
+        attempts=1,
+        parse_retry=5,  # retries would exist but errored doesn't use them
+    ))
+    counts = result["attempt_status_counts"]
+    assert counts["errored"] == 1
+    assert counts["provider_parse_error"] == 0
+    assert result["per_attempt"][0]["retries_used"] == 0
+
+
+def test_validate_parse_errors_excluded_from_fail_rate(monkeypatch):
+    """Defense-in-depth: a mix of PROVIDER_PARSE_ERROR + completed
+    attempts MUST produce a fail-rate computed over completed only.
+    This is the bias-fix the user's contract demands."""
+    import asyncio as _aio
+    result = _aio.run(_run_validate(
+        monkeypatch,
+        call_responses=[
+            # Attempt 0: parse error exhaust retries (counts as 1 PROVIDER_PARSE_ERROR)
+            KeyError("x"), KeyError("y"),
+            # Attempt 1: passes pytest (1 PASSED)
+            ("ok", {"prompt_tokens": 10, "completion_tokens": 5}),
+            # Attempt 2: fails pytest (1 FAILED)
+            ("ok", {"prompt_tokens": 10, "completion_tokens": 5}),
+        ],
+        pytest_results=[True, False],
+        attempts=3,
+        parse_retry=1,  # 1 retry → 2 total tries per attempt
+    ))
+    counts = result["attempt_status_counts"]
+    assert counts["passed"] == 1
+    assert counts["failed"] == 1
+    assert counts["provider_parse_error"] == 1
+    # fail_rate = 1 failed / 2 completed = 0.50 (PROVIDER_PARSE_ERROR excluded)
+    assert result["measured_first_try_fail_rate"] == 0.50
+
+
+def test_validate_insufficient_samples_flag_set(monkeypatch):
+    """insufficient_samples MUST be True when completed < min."""
+    import asyncio as _aio
+    result = _aio.run(_run_validate(
+        monkeypatch,
+        call_responses=[
+            ("ok", {"prompt_tokens": 10, "completion_tokens": 5}),
+        ],
+        pytest_results=[True],
+        attempts=1,
+        min_completed=3,
+    ))
+    assert result["insufficient_samples"] is True
+
+
+# ----------------------------------------------------------------------------
+# Report-level structured fields — present in serialized v2 schema
+# ----------------------------------------------------------------------------
+
+
+def test_report_v2_schema_constants_present_in_source():
+    """Source-level pin: the new schema-v2 field names MUST appear
+    in the script's report-construction dict so a reader can find
+    where they come from (operator-debug + grep-discoverability)."""
+    src = _SCRIPT_SRC
+    for field in [
+        "parse_retry_budget",
+        "min_completed_per_problem",
+        "acceptance_threshold",
+        "hardness_set",
+        "hardness_set_mean_fail_rate",
+        "meets_acceptance_gate",
+        "gate_diagnostic",
+    ]:
+        # Match key form: "field":  OR field=  (constants and dict keys)
+        assert (
+            f'"{field}"' in src
+        ), f"Schema-v2 field {field!r} missing from script source"
+
+
+def test_compute_acceptance_gate_is_pure_no_io():
+    """Discipline pin: ``compute_acceptance_gate`` MUST NOT import or
+    call I/O — it's a pure-function evaluator over its inputs.  We
+    inspect the function body's AST for any forbidden patterns."""
+    cls = None
+    for node in ast.walk(_SCRIPT_AST):
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "compute_acceptance_gate"
+        ):
+            cls = node
+            break
+    assert cls is not None, "compute_acceptance_gate MUST exist"
+    # No Calls to: open/print/Path/json/os.environ/subprocess
+    forbidden_calls = {
+        "open", "print", "Path", "input",
+    }
+    for sub in ast.walk(cls):
+        if isinstance(sub, ast.Call):
+            if isinstance(sub.func, ast.Name) and sub.func.id in forbidden_calls:
+                raise AssertionError(
+                    f"compute_acceptance_gate calls forbidden "
+                    f"function {sub.func.id!r}"
+                )
+            if isinstance(sub.func, ast.Attribute):
+                full = []
+                cur = sub.func
+                while isinstance(cur, ast.Attribute):
+                    full.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name):
+                    full.append(cur.id)
+                full = ".".join(reversed(full))
+                for forbidden in (
+                    "os.environ", "subprocess", "json.loads", "json.dumps",
+                    "Path.read_text", "Path.write_text",
+                ):
+                    if forbidden in full:
+                        raise AssertionError(
+                            f"compute_acceptance_gate calls forbidden "
+                            f"{full!r}"
+                        )

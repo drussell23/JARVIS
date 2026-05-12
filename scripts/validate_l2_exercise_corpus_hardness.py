@@ -93,7 +93,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import enum
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -101,7 +103,10 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+
+
+logger = logging.getLogger("Phase1.5.D.HardnessValidator")
 
 
 # Repo-root resolution (matches scripts/candidate_generator_defect4_verdict.py)
@@ -115,7 +120,19 @@ if str(REPO_ROOT) not in sys.path:
 # ===========================================================================
 
 
-REPORT_SCHEMA_VERSION: str = "hardness_report.v1"
+# Schema v2 — bumped from v1 to mark the addition of:
+#   * Per-attempt ``status`` field (AttemptStatus taxonomy)
+#   * Per-attempt ``retries_used`` field (parse-retry budget consumption)
+#   * Per-problem ``attempt_status_counts`` aggregation
+#   * Per-problem ``insufficient_samples`` flag
+#   * Report-level ``hardness_set``, ``hardness_set_mean_fail_rate``,
+#     ``meets_acceptance_gate``, ``acceptance_threshold``,
+#     ``min_completed_per_problem``, ``parse_retry_budget``
+# Legacy v1 fields (passes/fails/attempts_completed/attempts_errored/
+# measured_first_try_fail_rate) are preserved alongside the new
+# structured fields so v1 consumers keep parsing while v2-aware
+# consumers branch on schema_version.
+REPORT_SCHEMA_VERSION: str = "hardness_report.v2"
 REPORT_FILENAME: str = "_hardness_report.json"
 
 # Refusal sentinel argv flag.  Operator MUST pass this to confirm
@@ -136,6 +153,237 @@ PROVIDER_DW: str = "doubleword"
 # Pinned by composition test so accidental drift to a different
 # endpoint is caught.
 DW_CHAT_COMPLETIONS_SUFFIX: str = "/chat/completions"
+
+
+# ---- Stage 1 measurement-integrity knobs ----------------------------------
+#
+# Per the user-defined contract (Phase 1.5.D.2):
+#
+#   * Provider-parse errors are NOT failures.  They surface when the
+#     model's response shape doesn't match either ``content`` or
+#     ``reasoning_content`` (e.g., Qwen3.5 emitting only
+#     ``reasoning_details``).  Counting these as "failed pytest"
+#     would bias the measured fail-rate.  Instead: classify as
+#     ``PROVIDER_PARSE_ERROR``, retry within budget, exclude from
+#     the fail-rate numerator AND denominator.
+#
+#   * The fail-rate over a single problem is unreliable when N is
+#     small.  ``insufficient_samples`` per-problem flag + a global
+#     ``min_completed_per_problem`` knob make this honest.
+#
+#   * The acceptance gate is evaluated over a HARDNESS_SET subset
+#     of the corpus (not necessarily every problem).  Empty default
+#     means the gate is unevaluable until the operator sets the
+#     set explicitly — protects against silent semantic change.
+
+DEFAULT_PARSE_RETRY_BUDGET: int = 3
+PARSE_RETRY_ENV_VAR: str = "JARVIS_VALIDATOR_PARSE_RETRY"
+
+DEFAULT_MIN_COMPLETED_PER_PROBLEM: int = 3
+MIN_COMPLETED_ENV_VAR: str = (
+    "JARVIS_VALIDATOR_MIN_COMPLETED_PER_PROBLEM"
+)
+
+DEFAULT_ACCEPTANCE_THRESHOLD: float = 0.40
+ACCEPTANCE_THRESHOLD_ENV_VAR: str = (
+    "JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD"
+)
+
+# Comma-separated list of problem_ids that compose the HARDNESS_SET
+# (the subset over which the acceptance gate is computed).  Default
+# empty → gate is unevaluable + meets_acceptance_gate=False (forces
+# operator to make the set explicit).
+HARDNESS_SET_ENV_VAR: str = "JARVIS_VALIDATOR_HARDNESS_SET"
+
+
+class AttemptStatus(str, enum.Enum):
+    """Four canonical outcomes for one logical validation attempt.
+
+    Closed taxonomy.  AST-pinned: tests assert the value-set is
+    exactly these four strings.
+
+    PASSED / FAILED — pytest ran AND returned a verdict.  These
+    are the ONLY two statuses that count toward
+    ``measured_first_try_fail_rate``.
+
+    PROVIDER_PARSE_ERROR — the provider call returned a response
+    shape the parser could not extract content from (e.g., Qwen3.5
+    emitting ``reasoning_details``-only).  Retried within budget;
+    if budget exhausts, this attempt is excluded from the fail-rate
+    numerator and denominator.
+
+    ERRORED — any OTHER exception (httpx timeout, network failure,
+    pytest subprocess timeout, fixture I/O error).  Not retried;
+    excluded from the fail-rate numerator and denominator.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+    PROVIDER_PARSE_ERROR = "provider_parse_error"
+    ERRORED = "errored"
+
+
+# ===========================================================================
+# Env readers (garbage-tolerant; NEVER raise; clamped where applicable)
+# ===========================================================================
+
+
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int = 2**31 - 1,
+) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return max(minimum, min(maximum, int(raw)))
+    except (ValueError, TypeError):
+        logger.warning(
+            "[HardnessValidator] invalid %s=%r — using default %d",
+            name, raw, default,
+        )
+        return default
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: float = 1.0,
+) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return max(minimum, min(maximum, float(raw)))
+    except (ValueError, TypeError):
+        logger.warning(
+            "[HardnessValidator] invalid %s=%r — using default %.2f",
+            name, raw, default,
+        )
+        return default
+
+
+def parse_hardness_set(raw: Optional[str]) -> FrozenSet[str]:
+    """Parse a comma-separated HARDNESS_SET env-var value into a
+    deterministic frozenset of problem_ids.
+
+    Tolerates surrounding whitespace + duplicate entries + empty
+    segments.  Returns empty frozenset when the input is None or
+    contains no non-empty tokens.
+
+    NEVER raises.
+    """
+    if raw is None:
+        return frozenset()
+    tokens = [t.strip() for t in raw.split(",")]
+    return frozenset(t for t in tokens if t)
+
+
+def parse_retry_budget() -> int:
+    """Read ``JARVIS_VALIDATOR_PARSE_RETRY`` (default 3, clamped
+    [0, 10]).  NEVER raises."""
+    return _env_int(
+        PARSE_RETRY_ENV_VAR,
+        DEFAULT_PARSE_RETRY_BUDGET,
+        minimum=0, maximum=10,
+    )
+
+
+def min_completed_per_problem() -> int:
+    """Read ``JARVIS_VALIDATOR_MIN_COMPLETED_PER_PROBLEM``
+    (default 3, clamped [1, 100]).  NEVER raises."""
+    return _env_int(
+        MIN_COMPLETED_ENV_VAR,
+        DEFAULT_MIN_COMPLETED_PER_PROBLEM,
+        minimum=1, maximum=100,
+    )
+
+
+def acceptance_threshold() -> float:
+    """Read ``JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD`` (default 0.40,
+    clamped [0.0, 1.0]).  NEVER raises."""
+    return _env_float(
+        ACCEPTANCE_THRESHOLD_ENV_VAR,
+        DEFAULT_ACCEPTANCE_THRESHOLD,
+        minimum=0.0, maximum=1.0,
+    )
+
+
+def hardness_set_from_env() -> FrozenSet[str]:
+    """Read ``JARVIS_VALIDATOR_HARDNESS_SET`` and parse via
+    :func:`parse_hardness_set`.  NEVER raises."""
+    return parse_hardness_set(os.environ.get(HARDNESS_SET_ENV_VAR))
+
+
+# ===========================================================================
+# Acceptance gate computation (pure function; NEVER raises)
+# ===========================================================================
+
+
+def compute_acceptance_gate(
+    hardness_set: FrozenSet[str],
+    results: List[Dict[str, Any]],
+    *,
+    threshold: float,
+    min_completed: int,
+) -> Tuple[Optional[float], bool, Dict[str, Any]]:
+    """Evaluate the Phase 1.5.D acceptance gate.
+
+    Returns
+    -------
+    (mean_fail_rate, meets_gate, diagnostic)
+        ``mean_fail_rate`` is ``None`` whenever the gate is
+        unevaluable (empty set / missing member / insufficient
+        samples on any member).  ``meets_gate`` is ``True`` iff
+        the set is non-empty, every member is fully sampled, AND
+        the mean over the set is ``>= threshold``.
+
+        ``diagnostic`` is a dict carrying the reason the gate is
+        unevaluable (operator-visible in the report) — one of:
+        ``"empty_set"`` / ``"missing_members"`` /
+        ``"insufficient_samples"`` / ``"null_rate"`` / ``"ok"``.
+
+    Pure function over the inputs.  NEVER raises.
+    """
+    if not hardness_set:
+        return None, False, {"reason": "empty_set"}
+    by_id = {r.get("problem_id"): r for r in results}
+    missing = [pid for pid in hardness_set if pid not in by_id]
+    if missing:
+        return None, False, {
+            "reason": "missing_members",
+            "missing": sorted(missing),
+        }
+    insufficient = [
+        pid for pid in hardness_set
+        if int(by_id[pid].get("attempts_completed", 0)) < min_completed
+    ]
+    if insufficient:
+        return None, False, {
+            "reason": "insufficient_samples",
+            "under_sampled": sorted(insufficient),
+            "min_required": min_completed,
+        }
+    rates: List[float] = []
+    for pid in hardness_set:
+        rate = by_id[pid].get("measured_first_try_fail_rate")
+        if rate is None:
+            return None, False, {
+                "reason": "null_rate",
+                "problem_id": pid,
+            }
+        rates.append(float(rate))
+    mean = sum(rates) / len(rates)
+    return (
+        mean,
+        mean >= threshold,
+        {"reason": "ok", "n_problems": len(rates)},
+    )
 
 
 # ===========================================================================
@@ -358,20 +606,168 @@ def run_pytest_against_candidate(
 # ===========================================================================
 
 
+async def _execute_one_attempt(
+    problem: Any,
+    attempt_idx: int,
+    dw_config: Dict[str, Any],
+    cost_tracker: CostTracker,
+    parse_retry_budget_value: int,
+) -> Dict[str, Any]:
+    """Run one logical attempt with up to ``parse_retry_budget_value``
+    retries on PROVIDER_PARSE_ERROR.
+
+    Returns a per-attempt record with a ``status`` field set to one
+    of :class:`AttemptStatus` values + a ``retries_used`` count.
+
+    Each retry consumes the cost budget; the loop short-circuits to
+    ``PROVIDER_PARSE_ERROR`` (with reason ``cost_cap_reached_mid_retry``)
+    if the tracker exceeds mid-retry.
+
+    PROVIDER_PARSE_ERROR is detected by catching ``KeyError`` from
+    :func:`_extract_dw_message_content` specifically.  Other exception
+    types route to ``ERRORED`` (no retry).  ``asyncio.CancelledError``
+    propagates per the §7 fail-closed contract.
+    """
+    retries_used = 0
+    last_parse_diag: Optional[str] = None
+    last_usage: Dict[str, Any] = {}
+    last_cost: float = 0.0
+    prompt = build_clean_room_fix_prompt(
+        problem.target_file_name,
+        problem.before_content,
+        problem.test_file_name,
+        problem.test_content,
+    )
+    while True:
+        if cost_tracker.exceeded():
+            # Out of budget either before first try or mid-retry
+            if retries_used == 0:
+                # Caller will translate "no attempts started + cap
+                # already hit" as a skip — but defensively classify
+                # here as PROVIDER_PARSE_ERROR with cost reason so
+                # the report is still self-describing.
+                return {
+                    "attempt": attempt_idx,
+                    "status": AttemptStatus.PROVIDER_PARSE_ERROR.value,
+                    "retries_used": retries_used,
+                    "reason": "cost_cap_before_start",
+                    "error": last_parse_diag,
+                }
+            return {
+                "attempt": attempt_idx,
+                "status": AttemptStatus.PROVIDER_PARSE_ERROR.value,
+                "retries_used": retries_used,
+                "reason": "cost_cap_reached_mid_retry",
+                "error": last_parse_diag,
+            }
+        try:
+            text, usage = await call_doubleword_one_shot(
+                api_key=dw_config["api_key"],
+                base_url=dw_config["base_url"],
+                model=dw_config["model"],
+                prompt=prompt,
+                timeout_s=dw_config["timeout_s"],
+            )
+            last_usage = usage
+            last_cost = cost_tracker.record(usage)
+        except KeyError as exc:
+            # PROVIDER_PARSE_ERROR — response shape didn't match
+            # content/reasoning_content.  Cost is NOT recorded here
+            # because call_doubleword_one_shot raises before usage
+            # extraction returns; the model still consumed tokens
+            # server-side but we won't know the exact spend.  This
+            # is the same accounting gap the canonical
+            # DoublewordProvider has — composing the same trade-off.
+            retries_used += 1
+            last_parse_diag = f"{type(exc).__name__}: {exc}"
+            if retries_used > parse_retry_budget_value:
+                return {
+                    "attempt": attempt_idx,
+                    "status": AttemptStatus.PROVIDER_PARSE_ERROR.value,
+                    "retries_used": retries_used,
+                    "reason": "retry_budget_exhausted",
+                    "error": last_parse_diag,
+                }
+            logger.info(
+                "[HardnessValidator] parse-retry %d/%d for attempt %d "
+                "(problem=%s): %s",
+                retries_used, parse_retry_budget_value, attempt_idx,
+                problem.problem_id, last_parse_diag,
+            )
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — operator-visible
+            return {
+                "attempt": attempt_idx,
+                "status": AttemptStatus.ERRORED.value,
+                "retries_used": retries_used,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        # Provider call succeeded → run pytest verdict
+        try:
+            candidate = strip_markdown_fences(text)
+            with tempfile.TemporaryDirectory() as raw_tmp:
+                tmpdir = Path(raw_tmp)
+                passed = run_pytest_against_candidate(
+                    tmpdir, candidate, problem.test_content,
+                    problem.target_file_name, problem.test_file_name,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "attempt": attempt_idx,
+                "status": AttemptStatus.ERRORED.value,
+                "retries_used": retries_used,
+                "error": f"pytest_setup: {type(exc).__name__}: {exc}",
+                "usage": last_usage,
+                "cost_usd": round(last_cost, 6),
+            }
+        return {
+            "attempt": attempt_idx,
+            "status": (
+                AttemptStatus.PASSED.value if passed
+                else AttemptStatus.FAILED.value
+            ),
+            "retries_used": retries_used,
+            "passed": passed,  # legacy v1 field, preserved
+            "usage": last_usage,
+            "cost_usd": round(last_cost, 6),
+        }
+
+
 async def validate_one_problem(
     problem: Any,
     attempts: int,
     dw_config: Dict[str, Any],
     cost_tracker: CostTracker,
+    *,
+    parse_retry_budget_value: Optional[int] = None,
+    min_completed_value: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run N attempts against one canonical
     :class:`ExerciseProblem`.  Returns a per-problem result dict for
-    the report.
+    the report (schema v2 with v1 legacy fields preserved).
 
-    Stops early if the cost tracker exceeds the cap."""
-    passes = 0
-    fails = 0
-    errors = 0
+    ``parse_retry_budget_value`` / ``min_completed_value`` default to
+    the env-resolved values (:func:`parse_retry_budget` /
+    :func:`min_completed_per_problem`) so call sites needn't thread
+    them explicitly — but tests can override.
+
+    Stops early if the cost tracker exceeds the cap (a skip entry is
+    appended for the un-attempted indices).
+    """
+    if parse_retry_budget_value is None:
+        parse_retry_budget_value = parse_retry_budget()
+    if min_completed_value is None:
+        min_completed_value = min_completed_per_problem()
+    counts = {
+        AttemptStatus.PASSED.value: 0,
+        AttemptStatus.FAILED.value: 0,
+        AttemptStatus.PROVIDER_PARSE_ERROR.value: 0,
+        AttemptStatus.ERRORED.value: 0,
+    }
     per_attempt: List[Dict[str, Any]] = []
     for attempt_idx in range(attempts):
         if cost_tracker.exceeded():
@@ -380,59 +776,41 @@ async def validate_one_problem(
                 "skipped_reason": "cost_cap_reached",
             })
             break
-        try:
-            prompt = build_clean_room_fix_prompt(
-                problem.target_file_name,
-                problem.before_content,
-                problem.test_file_name,
-                problem.test_content,
-            )
-            text, usage = await call_doubleword_one_shot(
-                api_key=dw_config["api_key"],
-                base_url=dw_config["base_url"],
-                model=dw_config["model"],
-                prompt=prompt,
-                timeout_s=dw_config["timeout_s"],
-            )
-            attempt_cost = cost_tracker.record(usage)
-            candidate = strip_markdown_fences(text)
-            with tempfile.TemporaryDirectory() as raw_tmp:
-                tmpdir = Path(raw_tmp)
-                passed = run_pytest_against_candidate(
-                    tmpdir, candidate, problem.test_content,
-                    problem.target_file_name, problem.test_file_name,
-                )
-            if passed:
-                passes += 1
-            else:
-                fails += 1
-            per_attempt.append({
-                "attempt": attempt_idx,
-                "passed": passed,
-                "usage": usage,
-                "cost_usd": round(attempt_cost, 6),
-            })
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — operator-visible
-            errors += 1
-            per_attempt.append({
-                "attempt": attempt_idx,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-    completed = passes + fails
-    fail_rate: Optional[float] = (
-        (fails / completed) if completed > 0 else None
+        record = await _execute_one_attempt(
+            problem, attempt_idx, dw_config, cost_tracker,
+            parse_retry_budget_value,
+        )
+        per_attempt.append(record)
+        status = record.get("status")
+        if status in counts:
+            counts[status] += 1
+    completed = (
+        counts[AttemptStatus.PASSED.value]
+        + counts[AttemptStatus.FAILED.value]
     )
+    fail_rate: Optional[float] = (
+        (counts[AttemptStatus.FAILED.value] / completed)
+        if completed > 0 else None
+    )
+    # Legacy v1 fields preserved alongside v2 structured fields.
     return {
         "problem_id": problem.problem_id,
         "kind": problem.kind.value,
         "attempts_requested": attempts,
+        # ---- v1 legacy ----
         "attempts_completed": completed,
-        "attempts_errored": errors,
-        "passes": passes,
-        "fails": fails,
+        "attempts_errored": (
+            counts[AttemptStatus.PROVIDER_PARSE_ERROR.value]
+            + counts[AttemptStatus.ERRORED.value]
+        ),
+        "passes": counts[AttemptStatus.PASSED.value],
+        "fails": counts[AttemptStatus.FAILED.value],
         "measured_first_try_fail_rate": fail_rate,
+        # ---- v2 structured ----
+        "attempt_status_counts": dict(counts),
+        "insufficient_samples": completed < min_completed_value,
+        "min_completed_per_problem": min_completed_value,
+        "parse_retry_budget": parse_retry_budget_value,
         "per_attempt": per_attempt,
     }
 
@@ -490,12 +868,27 @@ async def _amain(args: argparse.Namespace) -> int:
         output_per_m=output_per_m,
     )
 
-    print("== L2 corpus hardness validator (Phase 1.5.D) ==")
-    print(f"  corpus:       {corpus}")
-    print(f"  problems:     {[d.name for d in problem_dirs]}")
-    print(f"  attempts/ea:  {args.attempts}")
-    print(f"  max cost:     ${args.max_cost_usd:.2f}")
-    print(f"  model:        {dw_config['model']}")
+    # Stage 1 measurement-integrity knobs (resolved once + threaded
+    # through every per-problem run so the report can record them
+    # verbatim).
+    parse_retry_budget_value = parse_retry_budget()
+    min_completed_value = min_completed_per_problem()
+    acceptance_threshold_value = acceptance_threshold()
+    hardness_set = hardness_set_from_env()
+
+    print("== L2 corpus hardness validator (Phase 1.5.D / schema v2) ==")
+    print(f"  corpus:           {corpus}")
+    print(f"  problems:         {[d.name for d in problem_dirs]}")
+    print(f"  attempts/ea:      {args.attempts}")
+    print(f"  max cost:         ${args.max_cost_usd:.2f}")
+    print(f"  model:            {dw_config['model']}")
+    print(f"  parse_retry:      {parse_retry_budget_value}")
+    print(f"  min_completed:    {min_completed_value}")
+    print(f"  accept_threshold: {acceptance_threshold_value:.2f}")
+    print(
+        f"  hardness_set:     "
+        f"{sorted(hardness_set) if hardness_set else '<empty>'}",
+    )
     print()
 
     results: List[Dict[str, Any]] = []
@@ -509,17 +902,27 @@ async def _amain(args: argparse.Namespace) -> int:
                     f"load_exercise_problem returned None",
                 )
                 continue
-            print(f"-> {problem.problem_id} (kind={problem.kind.value})")
+            in_set = problem.problem_id in hardness_set
+            tag = " [HARDNESS_SET]" if in_set else ""
+            print(
+                f"-> {problem.problem_id} "
+                f"(kind={problem.kind.value}){tag}",
+            )
             result = await validate_one_problem(
                 problem, args.attempts, dw_config, cost_tracker,
+                parse_retry_budget_value=parse_retry_budget_value,
+                min_completed_value=min_completed_value,
             )
             results.append(result)
             rate = result["measured_first_try_fail_rate"]
             rate_s = f"{rate:.0%}" if rate is not None else "n/a"
+            sc = result["attempt_status_counts"]
             print(
-                f"   fails={result['fails']}/"
-                f"{result['attempts_completed']} "
-                f"(rate={rate_s}) errors={result['attempts_errored']}",
+                f"   passed={sc['passed']} failed={sc['failed']} "
+                f"parse_err={sc['provider_parse_error']} "
+                f"errored={sc['errored']} "
+                f"(fail_rate={rate_s}, "
+                f"insufficient={result['insufficient_samples']})",
             )
             if cost_tracker.exceeded():
                 print(
@@ -537,6 +940,16 @@ async def _amain(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # Compose acceptance gate over HARDNESS_SET (pure function;
+    # NEVER raises) — operator-honest reason field surfaces in
+    # the report when the gate is unevaluable.
+    gate_mean, meets_gate, gate_diag = compute_acceptance_gate(
+        hardness_set,
+        results,
+        threshold=acceptance_threshold_value,
+        min_completed=min_completed_value,
+    )
+
     report: Dict[str, Any] = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -545,6 +958,16 @@ async def _amain(args: argparse.Namespace) -> int:
         "attempts_requested": args.attempts,
         "max_cost_usd": args.max_cost_usd,
         "total_cost_usd": round(cost_tracker.total_usd, 6),
+        # ---- v2 measurement-integrity knobs ----
+        "parse_retry_budget": parse_retry_budget_value,
+        "min_completed_per_problem": min_completed_value,
+        "acceptance_threshold": acceptance_threshold_value,
+        "hardness_set": sorted(hardness_set),
+        "hardness_set_mean_fail_rate": (
+            round(gate_mean, 6) if gate_mean is not None else None
+        ),
+        "meets_acceptance_gate": meets_gate,
+        "gate_diagnostic": gate_diag,
         "results": results,
     }
     if runtime_error is not None:
@@ -564,6 +987,18 @@ async def _amain(args: argparse.Namespace) -> int:
     print()
     print(f"Wrote {report_path}")
     print(f"Total cost: ${cost_tracker.total_usd:.4f}")
+    # Operator-visible gate summary (also persisted in the report)
+    if gate_mean is not None:
+        print(
+            f"HARDNESS_SET gate: mean_fail_rate={gate_mean:.2%} "
+            f"vs threshold {acceptance_threshold_value:.0%} → "
+            f"{'PASS' if meets_gate else 'FAIL'}",
+        )
+    else:
+        print(
+            f"HARDNESS_SET gate: unevaluable "
+            f"({gate_diag.get('reason', '?')})",
+        )
     return 0 if runtime_error is None else 3
 
 
