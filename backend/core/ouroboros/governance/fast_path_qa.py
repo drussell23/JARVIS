@@ -115,6 +115,19 @@ _ENV_RETRIEVAL_TOP_K = (
     "JARVIS_FAST_PATH_QA_RETRIEVAL_TOP_K"
 )
 
+# §41.3 #26 Phase 2 D3b — canonical cost_governor composition.
+# Default-TRUE (conditional on master). When on, ask_question
+# threads start()/charge()/finish() through the canonical
+# per-op cost governor for INFORMATIONAL-route attribution.
+# Operator opt-out: set to false to fall back to the Phase 0/1
+# in-process daily counter ONLY (no per-op caps, no cross-
+# substrate cost attribution). The daily aggregate budget gate
+# is independent of this knob — that axis has no canonical
+# home so it stays Q&A-substrate-local.
+_ENV_COMPOSE_COST_GOVERNOR = (
+    "JARVIS_FAST_PATH_QA_COMPOSE_COST_GOVERNOR"
+)
+
 # Canonical model knob name — operators have ANTHROPIC_API_KEY
 # set globally; we don't re-shadow that.
 _ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
@@ -339,6 +352,20 @@ def retrieval_top_k() -> int:
         return max(1, min(50, int(raw)))
     except (TypeError, ValueError):
         return _DEFAULT_RETRIEVAL_TOP_K
+
+
+def compose_cost_governor_enabled() -> bool:
+    """§41.3 #26 Phase 2 D3b — canonical per-op cost-governor
+    composition. Default-TRUE (conditional on master). When on,
+    ask_question registers each Q&A op with the canonical
+    :class:`cost_governor.CostGovernor`, runs the per-op cap
+    pre-check, and charges the realized USD post-call. When
+    off, the substrate falls back to the Phase 0/1 in-process
+    daily counter alone (no per-op caps). NEVER raises."""
+    if not master_enabled():
+        return False
+    raw = os.environ.get(_ENV_COMPOSE_COST_GOVERNOR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +944,99 @@ def _format_snippets_for_operator_answer(
     return "\n".join(lines)
 
 
+def _get_cost_governor_safely() -> Any:
+    """Compose :func:`cost_governor.get_default_cost_governor`.
+    NEVER raises. Returns the singleton governor or None when
+    the canonical governor is unavailable / disabled — caller
+    must defensive-check the result."""
+    try:
+        from backend.core.ouroboros.governance.cost_governor import (  # noqa: E501  # type: ignore[import-not-found]
+            get_default_cost_governor,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return get_default_cost_governor()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cost_governor_start_safely(
+    governor: Any, op_id: str,
+) -> Optional[float]:
+    """Register a Q&A op with the canonical cost governor. Q&A
+    is always:
+      * route = ROUTE_INFORMATIONAL (the canonical INFORMATIONAL
+        route value, matching cost_governor's route_factors
+        entry added 2026-05-11)
+      * complexity = "simple" (small-token Sonnet calls, no
+        tool-loop, no codegen — §41.3.1 non-decision #1)
+      * is_read_only = True (read-only by definition)
+
+    NEVER raises — defensive-degrades to None so the substrate
+    falls back to the daily aggregate counter alone."""
+    if governor is None or not op_id:
+        return None
+    try:
+        return governor.start(
+            op_id, ROUTE_INFORMATIONAL, "simple",
+            is_read_only=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[FastPathQA] cost_governor.start failed: %r", exc,
+        )
+        return None
+
+
+def _cost_governor_remaining_safely(
+    governor: Any, op_id: str,
+) -> Optional[float]:
+    """Read per-op remaining cap. NEVER raises."""
+    if governor is None or not op_id:
+        return None
+    try:
+        rem = governor.remaining(op_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[FastPathQA] cost_governor.remaining failed: %r",
+            exc,
+        )
+        return None
+    try:
+        return float(rem)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cost_governor_charge_safely(
+    governor: Any, op_id: str, cost_usd: float,
+) -> None:
+    """Attribute realized cost. NEVER raises."""
+    if governor is None or not op_id:
+        return
+    try:
+        governor.charge(op_id, float(cost_usd), "claude")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[FastPathQA] cost_governor.charge failed: %r", exc,
+        )
+
+
+def _cost_governor_finish_safely(
+    governor: Any, op_id: str,
+) -> None:
+    """Finalize op (fires finalize_observer chain). NEVER raises."""
+    if governor is None or not op_id:
+        return
+    try:
+        governor.finish(op_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[FastPathQA] cost_governor.finish failed: %r", exc,
+        )
+
+
 def _record_turn_safely(
     role: str, text: str, *, source: str, op_id: str = "",
 ) -> None:
@@ -1015,9 +1135,9 @@ async def ask_question(
     if len(q_text) > 4096:
         q_text = q_text[:4096]
 
-    # Step 3: budget check. Phase 0 D3a — IMMEDIATE budget via
-    # in-process daily counter. Phase 2 will route through
-    # urgency_router INFORMATIONAL sub-budget (D3b approved).
+    # Step 3a: daily aggregate budget check (Q&A-substrate-local —
+    # no canonical "daily per-route aggregate" surface exists,
+    # so this remains a substrate-local rolling counter).
     has_budget, remaining = _check_budget_available(
         now_unix=started,
     )
@@ -1029,10 +1149,51 @@ async def ask_question(
                 f"daily Q&A budget exhausted "
                 f"(remaining=${remaining:.4f}; "
                 f"cap=${daily_budget_usd():.2f} via "
+                f"{_ENV_INFORMATIONAL_BUDGET_USD} or "
                 f"{_ENV_BUDGET_USD})"
             ),
             evaluated_at_unix=started,
         )
+
+    # Step 3b: §41.3 #26 Phase 2 D3b — register Q&A op with the
+    # canonical cost_governor for per-op cap tracking + cross-
+    # substrate cost attribution. Returns None when the
+    # governor is unavailable or composition is disabled — in
+    # which case we fall back to the daily aggregate counter
+    # alone (Phase 0/1 behavior). The governor and op_id are
+    # both required downstream for the pre-call cap check and
+    # the post-call charge.
+    gov = (
+        _get_cost_governor_safely()
+        if (compose_cost_governor_enabled() and op_id)
+        else None
+    )
+    if gov is not None:
+        _cost_governor_start_safely(gov, op_id)
+        per_op_remaining = _cost_governor_remaining_safely(
+            gov, op_id,
+        )
+        # Pre-call cap check. cost_governor.is_exceeded is
+        # post-hoc (cumulative >= cap); for pre-flight we use
+        # remaining >= 0. Re-issued ops with cumulative spend
+        # already past the cap will short-circuit here without
+        # invoking the provider.
+        if (
+            per_op_remaining is not None
+            and per_op_remaining <= 0.0
+        ):
+            _cost_governor_finish_safely(gov, op_id)
+            return QAReport(
+                verdict=QAVerdict.BUDGET_EXHAUSTED,
+                artifact=None,
+                diagnostic=(
+                    f"per-op cost cap exhausted "
+                    f"(cost_governor: route={ROUTE_INFORMATIONAL}, "
+                    f"op={op_id[:12]!r}, remaining="
+                    f"${per_op_remaining:.4f})"
+                ),
+                evaluated_at_unix=started,
+            )
 
     # Step 4: record user turn via ConversationBridge (D4
     # default). Operator-injectable for tests.
@@ -1109,6 +1270,11 @@ async def ask_question(
                 retrieval_path=RETRIEVAL_PATH_RETRIEVAL_ONLY,
                 top_score=top_score,
             )
+            # Finalize cost_governor op (fires finalize_observer
+            # chain). Retrieval-only paths charge $0 — the
+            # governor still gets the op's lifecycle for cross-
+            # substrate observability.
+            _cost_governor_finish_safely(gov, op_id)
             return QAReport(
                 verdict=QAVerdict.ANSWERED,
                 artifact=artifact,
@@ -1151,6 +1317,7 @@ async def ask_question(
             timeout=float(timeout_s()),
         )
     except asyncio.TimeoutError:
+        _cost_governor_finish_safely(gov, op_id)
         return QAReport(
             verdict=QAVerdict.PROVIDER_FAILED,
             artifact=None,
@@ -1158,6 +1325,7 @@ async def ask_question(
             evaluated_at_unix=started,
         )
     except Exception as exc:  # noqa: BLE001
+        _cost_governor_finish_safely(gov, op_id)
         return QAReport(
             verdict=QAVerdict.PROVIDER_FAILED,
             artifact=None,
@@ -1173,6 +1341,7 @@ async def ask_question(
         answer_text = ""
         cost_usd = 0.0
     if not answer_text:
+        _cost_governor_finish_safely(gov, op_id)
         return QAReport(
             verdict=QAVerdict.PROVIDER_FAILED,
             artifact=None,
@@ -1180,9 +1349,12 @@ async def ask_question(
             evaluated_at_unix=started,
         )
 
-    # Step 9: record cost; record assistant turn via
-    # ConversationBridge (D4 default).
+    # Step 9: record cost across BOTH axes:
+    #   * Q&A-substrate daily aggregate (rolling daily counter).
+    #   * Canonical cost_governor per-op cumulative spend (cross-
+    #     substrate observability via finalize_observer chain).
     _record_cost(cost_usd, now_unix=started)
+    _cost_governor_charge_safely(gov, op_id, cost_usd)
     try:
         recorder("assistant", answer_text, "ask_human_a", op_id)
     except Exception as exc:  # noqa: BLE001
@@ -1207,7 +1379,12 @@ async def ask_question(
         top_score=top_score,
     )
 
-    # Step 11: return ANSWERED with path provenance.
+    # Step 11: finalize cost_governor op (fires finalize_observer
+    # chain for cross-substrate observability — e.g.,
+    # CostWarningObserver band-crossing SSE events).
+    _cost_governor_finish_safely(gov, op_id)
+
+    # Step 12: return ANSWERED with path provenance.
     return QAReport(
         verdict=QAVerdict.ANSWERED,
         artifact=artifact,
@@ -1379,6 +1556,22 @@ def register_shipped_invariants() -> list:
                 "must invoke SemanticIndex.top_k_for_text "
                 "(D2c Phase 1 — the canonical retrieval method "
                 "we added to semantic_index for this use)"
+            )
+        # §41.3 #26 Phase 2 D3b — must compose canonical
+        # cost_governor for per-op cost attribution. The
+        # operator binding 2026-05-11 forbids parallel cost
+        # state; cost_governor is the canonical surface.
+        if "cost_governor" not in source:
+            violations.append(
+                "must compose cost_governor "
+                "(Phase 2 D3b — per-op cost attribution + "
+                "cross-substrate observability)"
+            )
+        if "get_default_cost_governor" not in source:
+            violations.append(
+                "must call get_default_cost_governor "
+                "(canonical singleton accessor — no parallel "
+                "governor instance)"
             )
         return tuple(violations)
 
@@ -1718,6 +1911,22 @@ def register_flags(registry: Any) -> int:
             category=Category.CAPACITY,
             source_file=src,
             example=f"{_ENV_RETRIEVAL_TOP_K}=8",
+        ),
+        FlagSpec(
+            name=_ENV_COMPOSE_COST_GOVERNOR,
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "§41.3 #26 Phase 2 D3b — compose canonical "
+                "cost_governor for per-op cost attribution. "
+                "Default-TRUE (conditional on master). When "
+                "off, falls back to in-process daily counter "
+                "alone (no per-op caps, no cross-substrate "
+                "cost observability)."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example=f"{_ENV_COMPOSE_COST_GOVERNOR}=false",
         ),
     ]
     count = 0

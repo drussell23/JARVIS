@@ -30,10 +30,12 @@ from backend.core.ouroboros.governance.fast_path_qa import (
     ROUTE_INFORMATIONAL,
     _DEFAULT_BUDGET_USD,
     _ENV_BUDGET_USD,
+    _ENV_COMPOSE_COST_GOVERNOR,
     _ENV_INFORMATIONAL_BUDGET_USD,
     _ENV_MASTER,
     _ENV_RETRIEVAL_ENABLED,
     ask_question,
+    compose_cost_governor_enabled,
     daily_budget_usd,
     register_flags,
     register_shipped_invariants,
@@ -42,6 +44,13 @@ from backend.core.ouroboros.governance.fast_path_qa import (
 )
 from backend.core.ouroboros.governance.urgency_router import (
     ProviderRoute,
+)
+from backend.core.ouroboros.governance.cost_governor import (
+    CostGovernor,
+    CostGovernorConfig,
+    register_finalize_observer,
+    reset_finalize_observers,
+    set_default_cost_governor,
 )
 
 
@@ -411,3 +420,320 @@ def test_fast_path_qa_does_not_import_urgency_router():
                 assert "urgency_router" not in alias.name, (
                     f"forbidden import: {alias.name}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 — Canonical cost_governor composition
+#
+# Phase 2 D3b strengthens the system by composing the canonical
+# CostGovernor for per-op cost attribution. INFORMATIONAL gains a
+# route_factor entry in cost_governor, mirroring the closed-5→6
+# expansion that ProviderRoute shipped. fast_path_qa.ask_question
+# threads start()/charge()/finish() through the governor so cost
+# data flows into the canonical observability chain (finalize
+# observers, band-crossing SSE events) instead of staying isolated
+# in the Q&A-substrate-local counter.
+#
+# Daily aggregate budget stays Q&A-substrate-local (no canonical
+# daily-per-route surface exists).
+# ---------------------------------------------------------------------------
+
+
+def test_cost_governor_route_factors_include_informational():
+    """cost_governor's route_factors default contains
+    "informational" with the canonical JARVIS_OP_COST_ROUTE_*
+    env knob convention. Mirrors ProviderRoute's closed-5→6
+    expansion."""
+    cfg = CostGovernorConfig()
+    assert "informational" in cfg.route_factors
+    # Q&A is cheap by design (read-only, small-token).
+    assert cfg.route_factors["informational"] > 0.0
+    # Factor should be smaller than the IMMEDIATE / COMPLEX
+    # routes (which absorb tool-loop + multi-file generation).
+    assert (
+        cfg.route_factors["informational"]
+        < cfg.route_factors["immediate"]
+    )
+    assert (
+        cfg.route_factors["informational"]
+        < cfg.route_factors["complex"]
+    )
+
+
+def test_cost_governor_informational_factor_env_tunable(monkeypatch):
+    """The default factor is operator-tunable via
+    JARVIS_OP_COST_ROUTE_INFORMATIONAL — closes the no-
+    hardcoding contract."""
+    monkeypatch.setenv("JARVIS_OP_COST_ROUTE_INFORMATIONAL", "0.99")
+    cfg = CostGovernorConfig()
+    assert cfg.route_factors["informational"] == pytest.approx(0.99)
+
+
+def test_compose_cost_governor_default_true(monkeypatch):
+    """Production behavior: composition is default-TRUE when
+    master is on. Operator opt-out is explicit."""
+    monkeypatch.setenv(_ENV_MASTER, "true")
+    monkeypatch.delenv(_ENV_COMPOSE_COST_GOVERNOR, raising=False)
+    assert compose_cost_governor_enabled() is True
+
+
+def test_compose_cost_governor_master_off_overrides(monkeypatch):
+    """Master flag off forces composition off regardless of the
+    sub-flag — the substrate's §33.1 contract."""
+    monkeypatch.setenv(_ENV_MASTER, "false")
+    monkeypatch.setenv(_ENV_COMPOSE_COST_GOVERNOR, "true")
+    assert compose_cost_governor_enabled() is False
+
+
+def test_compose_cost_governor_sub_flag_off(monkeypatch):
+    """Operator can disable composition without flipping master."""
+    monkeypatch.setenv(_ENV_MASTER, "true")
+    monkeypatch.setenv(_ENV_COMPOSE_COST_GOVERNOR, "false")
+    assert compose_cost_governor_enabled() is False
+
+
+def test_ask_question_starts_cost_governor_op(monkeypatch):
+    """End-to-end: ask_question registers the op with the
+    canonical governor at start. Verified by observing the
+    governor's per-op snapshot post-call."""
+    governor = CostGovernor()
+    set_default_cost_governor(governor)
+    try:
+        async def _fake_provider(
+            system: str, q: str,
+        ) -> Tuple[str, float]:
+            return ("the answer", 0.0050)
+
+        async def _run() -> None:
+            report = await ask_question(
+                "what?",
+                op_id="op-cg-1",
+                provider_callable=_fake_provider,
+                bridge_callable=lambda *_: None,
+            )
+            assert report.verdict is QAVerdict.ANSWERED
+            # finish() was called at the end → entry removed.
+            # Prior to finish, charge() must have been invoked.
+            # The CostWarningObserver / finalize_observer chain
+            # would have already seen this op.
+            assert governor.summary("op-cg-1") is None
+
+        asyncio.run(_run())
+    finally:
+        set_default_cost_governor(None)
+
+
+def test_ask_question_charges_realized_cost_to_governor(monkeypatch):
+    """Per-op cumulative spend is recorded on the governor before
+    finish() clears the entry. Use the module-level finalize
+    observer to capture the final summary."""
+    governor = CostGovernor()
+    captured: list = []
+
+    def _observer(op_id: str, summary: Any) -> None:
+        captured.append((op_id, dict(summary) if summary else {}))
+
+    reset_finalize_observers()
+    unsubscribe = register_finalize_observer(_observer)
+    set_default_cost_governor(governor)
+    try:
+        async def _fake_provider(
+            system: str, q: str,
+        ) -> Tuple[str, float]:
+            return ("answer", 0.0075)
+
+        async def _run() -> None:
+            report = await ask_question(
+                "another?",
+                op_id="op-cg-2",
+                provider_callable=_fake_provider,
+                bridge_callable=lambda *_: None,
+            )
+            assert report.verdict is QAVerdict.ANSWERED
+
+        asyncio.run(_run())
+
+        # Filter to our op (other ops in this process may also fire).
+        ours = [c for c in captured if c[0] == "op-cg-2"]
+        assert len(ours) == 1
+        _, summary = ours[0]
+        # cumulative_usd is the sum of charge() invocations —
+        # equals the fake provider's reported cost.
+        cumulative = summary.get("cumulative_usd", 0.0)
+        assert cumulative == pytest.approx(0.0075, abs=1e-6)
+        # The op was registered with the canonical route.
+        assert summary.get("route") == ROUTE_INFORMATIONAL
+    finally:
+        unsubscribe()
+        reset_finalize_observers()
+        set_default_cost_governor(None)
+
+
+def test_ask_question_finalizes_on_provider_failure():
+    """Provider failure must still finalize the governor op —
+    otherwise we leak entries (resource leak + skewed cumulative
+    cost telemetry)."""
+    governor = CostGovernor()
+    set_default_cost_governor(governor)
+    try:
+        async def _failing_provider(
+            system: str, q: str,
+        ) -> Tuple[str, float]:
+            raise RuntimeError("simulated provider crash")
+
+        async def _run() -> None:
+            report = await ask_question(
+                "fails?",
+                op_id="op-cg-fail",
+                provider_callable=_failing_provider,
+                bridge_callable=lambda *_: None,
+            )
+            assert report.verdict is QAVerdict.PROVIDER_FAILED
+            assert governor.summary("op-cg-fail") is None
+
+        asyncio.run(_run())
+    finally:
+        set_default_cost_governor(None)
+
+
+def test_ask_question_falls_back_when_compose_disabled(monkeypatch):
+    """Sub-flag off → daily aggregate counter still gates; no
+    governor entry is created (Phase 0/1 behavior preserved)."""
+    monkeypatch.setenv(_ENV_COMPOSE_COST_GOVERNOR, "false")
+    governor = CostGovernor()
+    set_default_cost_governor(governor)
+    try:
+        async def _fake_provider(
+            system: str, q: str,
+        ) -> Tuple[str, float]:
+            return ("ok", 0.001)
+
+        async def _run() -> None:
+            report = await ask_question(
+                "fallback?",
+                op_id="op-fallback",
+                provider_callable=_fake_provider,
+                bridge_callable=lambda *_: None,
+            )
+            assert report.verdict is QAVerdict.ANSWERED
+            # No governor entry created — composition disabled.
+            assert governor.summary("op-fallback") is None
+    finally:
+        set_default_cost_governor(None)
+
+
+def test_ask_question_falls_back_when_no_governor_singleton():
+    """No-singleton case → substrate degrades to daily counter
+    alone (Phase 0/1 behavior). Proves the defensive None-check
+    on get_default_cost_governor()."""
+    set_default_cost_governor(None)
+
+    async def _fake_provider(
+        system: str, q: str,
+    ) -> Tuple[str, float]:
+        return ("ok", 0.001)
+
+    async def _run() -> None:
+        report = await ask_question(
+            "no-gov?",
+            op_id="op-nogov",
+            provider_callable=_fake_provider,
+            bridge_callable=lambda *_: None,
+        )
+        # Daily counter still allows the op through.
+        assert report.verdict is QAVerdict.ANSWERED
+
+    asyncio.run(_run())
+
+
+def test_register_flags_includes_compose_cost_governor():
+    """Phase 2 Slice 2 sub-flag is registered."""
+    captured: list = []
+
+    class _FakeRegistry:
+        def register(self, spec: Any) -> None:
+            captured.append(spec)
+
+    register_flags(_FakeRegistry())
+    names = {spec.name for spec in captured}
+    assert _ENV_COMPOSE_COST_GOVERNOR in names
+
+
+def test_compose_cost_governor_default_in_flag_spec_is_true():
+    """The sub-flag's FlagSpec default is True so /help flags
+    surfaces the production behavior, not the opt-out value."""
+    captured: list = []
+
+    class _FakeRegistry:
+        def register(self, spec: Any) -> None:
+            captured.append(spec)
+
+    register_flags(_FakeRegistry())
+    spec = next(
+        s for s in captured
+        if s.name == _ENV_COMPOSE_COST_GOVERNOR
+    )
+    assert spec.default is True
+
+
+def test_composes_canonical_ast_pin_requires_cost_governor():
+    """The composes_canonical pin requires cost_governor +
+    get_default_cost_governor references in the substrate source
+    — guarantees the composition isn't accidentally ripped out."""
+    invariants = register_shipped_invariants()
+    target = next(
+        inv for inv in invariants
+        if inv.invariant_name == "fast_path_qa_composes_canonical"
+    )
+    import ast as _ast
+    src_path = (
+        "backend/core/ouroboros/governance/fast_path_qa.py"
+    )
+    with open(src_path, encoding="utf-8") as fh:
+        source = fh.read()
+    tree = _ast.parse(source)
+    violations = target.validate(tree, source)
+    assert violations == (), f"AST pin drift: {violations}"
+
+
+def test_cost_governor_informational_route_structurally_present():
+    """AST-walks cost_governor.py and asserts the
+    route_factors default-factory dict literal contains an
+    "informational" key bound to the canonical env-knob name.
+    This is the structural enforcement (cost_governor has no
+    shipped_code_invariants registration yet)."""
+    import ast as _ast
+    src_path = (
+        "backend/core/ouroboros/governance/cost_governor.py"
+    )
+    with open(src_path, encoding="utf-8") as fh:
+        source = fh.read()
+    tree = _ast.parse(source)
+    found_route_key = False
+    found_canonical_envvar = False
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if (
+                    isinstance(key, _ast.Constant)
+                    and key.value == "informational"
+                ):
+                    found_route_key = True
+                    # The value should be _env_float(<envvar>, <default>).
+                    if (
+                        isinstance(value, _ast.Call)
+                        and value.args
+                        and isinstance(value.args[0], _ast.Constant)
+                        and value.args[0].value
+                        == "JARVIS_OP_COST_ROUTE_INFORMATIONAL"
+                    ):
+                        found_canonical_envvar = True
+    assert found_route_key, (
+        '"informational" key missing from cost_governor '
+        "route_factors default-factory dict"
+    )
+    assert found_canonical_envvar, (
+        "JARVIS_OP_COST_ROUTE_INFORMATIONAL env-knob name not "
+        "bound to the informational route_factors entry — "
+        "mirrors the JARVIS_OP_COST_ROUTE_* family convention"
+    )

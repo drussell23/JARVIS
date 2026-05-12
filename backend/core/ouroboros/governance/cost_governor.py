@@ -177,6 +177,18 @@ class CostGovernorConfig:
             "complex":     _env_float("JARVIS_OP_COST_ROUTE_COMPLEX", 4.0),
             "background":  _env_float("JARVIS_OP_COST_ROUTE_BACKGROUND", 0.5),
             "speculative": _env_float("JARVIS_OP_COST_ROUTE_SPECULATIVE", 0.25),
+            # §41.3 #26 Phase 2 D3b — read-only knowledge-lookup
+            # route (fast-path Q&A). Cheaper than BACKGROUND
+            # because traffic is read-only by design (§41.3.1
+            # non-decision #1) and typical Q&A traffic is small-
+            # token Sonnet calls. Operator-tunable via
+            # ``JARVIS_OP_COST_ROUTE_INFORMATIONAL``. Closes the
+            # closed-5→6 expansion at cost_governor that
+            # ``ProviderRoute`` shipped in urgency_router on the
+            # same operator signature 2026-05-11.
+            "informational": _env_float(
+                "JARVIS_OP_COST_ROUTE_INFORMATIONAL", 0.3,
+            ),
         }
     )
     complexity_factors: Mapping[str, float] = field(
