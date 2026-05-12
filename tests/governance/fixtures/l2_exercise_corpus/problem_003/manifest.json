@@ -5,10 +5,12 @@
   "test_file_name": "test_before.py",
   "difficulty": "medium",
   "expected_first_try_fail_rate": 0.50,
-  "design_note": "Three-layer content sanitizer pipeline (strip_html_tags -> truncate; sanitize_comment composes them; sanitize_thread iterates a list of comments). The bug surface is two-layer: (a) two leaf primitives crash on None input (TypeError from re.sub(None) and len(None)), (b) the LIST-level sanitize_thread has a SEMANTIC contract that None comments must be EXCLUDED from the output (deleted/missing comment shouldn't surface as an empty row in the moderation feed). A naive fix that only adds None-check at strip_html_tags still crashes inside truncate(None). A naive fix at BOTH primitives makes the type errors go away but produces an empty string for None comments, failing the semantic-contract test that requires None to be excluded from the thread output. The correct coherent fix requires three coordinated changes: (1) strip_html_tags None-safe, (2) truncate None-safe, AND (3) sanitize_thread filters None entries — not just type-error suppression but understanding the cross-function contract.",
+  "design_note": "v2 redesign (Stage 3.5). The original problem_003 v1 measured 0% fail rate against Qwen3.5 because the docstring contract on sanitize_thread plus the load-bearing test name test_sanitize_thread_excludes_none_entries telegraphed the multi-site exclusion semantics directly to the model. v2 hides the contract surface: function names are neutral generics (process / fold / shorten / clean — no thread / sanitize / exclude verbs), docstrings carry NO behavioral contract beyond what the input/output types describe, and the load-bearing semantic decision (None entries are dropped from the collected output, NOT mapped to empty strings) is documented ONLY through test input/output examples. The model has to read test cases like collect([item, None, item]) -> [str, str] and INFER that None gets filtered before reaching process(). Naive leaf-only None-safety still produces [str, '', str] and fails the inference test. Multi-site coordination (leaf + aggregator) remains required; the difference vs v1 is that the LLM cannot pattern-match function names or docstrings to find the trap.",
   "trap_categories": [
     "multi_site_type_error_coordination",
     "cross_function_semantic_contract",
-    "docstring_dependent_correctness"
+    "contract_hidden_from_docstrings",
+    "neutral_function_names",
+    "behavior_inferred_from_test_examples"
   ]
 }

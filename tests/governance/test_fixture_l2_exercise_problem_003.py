@@ -109,8 +109,49 @@ def test_fixture_loads_via_canonical_substrate():
     assert problem is not None
     assert problem.problem_id == "problem_003"
     assert problem.kind == ExerciseProblemKind.MISSING_NULL_CHECK
-    assert "sanitize_thread" in problem.before_content
-    assert "test_sanitize_thread_excludes_none_entries" in problem.test_content
+    # v2 redesign: neutral function names; no "sanitize" / "thread"
+    # / "excludes" verbs that telegraph the trap.
+    assert "def collect(" in problem.before_content
+    assert "def process(" in problem.before_content
+    # Test names are deliberately neutral too — model has to infer
+    # behavior from input/output examples, not test name semantics.
+    assert "test_collect_input_a" in problem.test_content
+
+
+def test_v2_contract_surface_is_hidden():
+    """Stage 3.5 redesign pin: the v1 fixture failed empirically
+    (0% fail rate) because the docstring contract on
+    sanitize_thread + the load-bearing test name
+    test_sanitize_thread_excludes_none_entries gave the model a
+    free path to the multi-site insight.  v2 MUST NOT reintroduce
+    those name-readable contract surfaces."""
+    problem = load_exercise_problem(_FIXTURE_DIR)
+    assert problem is not None
+    forbidden_in_before = [
+        "sanitize",  # v1 used sanitize_thread / sanitize_comment
+        "thread",    # v1 telegraphed "thread of comments"
+        "MUST BE EXCLUDED",  # v1 docstring's load-bearing phrase
+        "MUST be EXCLUDED",
+        "must be excluded",
+        "filter",    # would telegraph the collect-level fix
+    ]
+    for phrase in forbidden_in_before:
+        assert phrase.lower() not in problem.before_content.lower(), (
+            f"v2 before.py reintroduces v1 contract-surface phrase "
+            f"{phrase!r} — model would pattern-match to the trap"
+        )
+    forbidden_in_tests = [
+        "excludes",
+        "filters",
+        "skips",
+        "exclude",
+        "filter",
+    ]
+    for phrase in forbidden_in_tests:
+        assert phrase.lower() not in problem.test_content.lower(), (
+            f"v2 test_before.py reintroduces v1 contract-telegraph "
+            f"phrase {phrase!r} — test name would tip off the model"
+        )
 
 
 def test_corpus_walker_enumerates_problem_003():
