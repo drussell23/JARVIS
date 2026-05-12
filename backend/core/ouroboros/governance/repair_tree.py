@@ -661,7 +661,17 @@ def treefinement_enabled() -> bool:
 # being reorganized into a Protocol-shaped surface, which is its own
 # arc.
 
-_PRODUCTION_FACTORY: Optional[Callable[..., RepairTreeRunner]] = None
+# Production factory type. Phase 5 originally typed this as
+# ``Callable[..., RepairTreeRunner]`` assuming the factory would
+# return a bare runner and the gate would construct generator +
+# validator + posture separately. Phase D refined the contract:
+# the factory returns a zero-arg ``Callable[[], Awaitable[
+# RepairTreeResult]]`` invocation closure that captures all
+# dependencies — operator-readable single-call invariant
+# (one factory call → one tree-result awaitable). Typing relaxed
+# to ``Any`` for forward-compatibility; the production factory in
+# ``repair_tree_production`` defines the precise closure contract.
+_PRODUCTION_FACTORY: Optional[Callable[..., Any]] = None
 _PRODUCTION_FACTORY_LOCK: Any = None  # Lazy threading.Lock
 
 
@@ -676,19 +686,33 @@ def _factory_lock() -> Any:
 
 
 def register_production_tree_runner_factory(
-    factory: Optional[Callable[..., RepairTreeRunner]],
+    factory: Optional[Callable[..., Any]],
 ) -> None:
     """Register (or unregister via ``None``) the production factory
     that ``RepairEngine.run()``'s strategy gate uses to construct a
-    runner when tree mode is requested.
+    tree-runner invocation when tree mode is requested.
 
-    The factory MUST accept ``(*, budget: TreefinementBudget,
-    ctx: Any) -> RepairTreeRunner`` and return a runner with all
-    production dependencies (generator, validator, worktree manager)
-    pre-injected.
+    Factory contract (Phase D refinement)
+    -------------------------------------
+    ``factory(*, budget, ctx, repair_engine, pipeline_deadline,
+    posture=None) -> Callable[[], Awaitable[RepairTreeResult]]``
 
-    Phase 5 ships ``None`` by default — tree mode falls through to
-    legacy LINEAR until Phase 6+ wires the generator/validator/applier.
+    The factory returns a zero-arg async invocation closure that
+    captures the fully-wired runner + generator + validator +
+    posture. ``_invoke_tree_factory`` calls the factory once, then
+    awaits the returned closure once, then adapts the
+    :class:`RepairTreeResult` into a :class:`RepairResult` via
+    :func:`tree_result_to_repair_result`.
+
+    This single-call invariant (one factory call → one tree-result
+    awaitable) keeps the gate path operator-readable + AST-pinnable
+    in Phase E without leaking factory internals into the gate.
+
+    Phase 5 originally typed the factory as ``Callable[...,
+    RepairTreeRunner]`` assuming a bare-runner return; Phase D
+    refined to the closure contract. The substrate-level Optional
+    typing stays at ``Any`` for forward-compatibility — the precise
+    closure shape is defined by ``repair_tree_production``.
 
     NEVER raises — wrapped in defensive try/except by callers.
     """
@@ -698,7 +722,7 @@ def register_production_tree_runner_factory(
 
 
 def get_production_tree_runner_factory() -> Optional[
-    Callable[..., RepairTreeRunner]
+    Callable[..., Any]
 ]:
     """Return the registered production factory, or ``None`` when
     tree mode is not yet wired. Strategy gate consults this on

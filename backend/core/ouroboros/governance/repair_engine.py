@@ -244,6 +244,45 @@ class RepairResult:
     iterations: Tuple[RepairIterationRecord, ...]
 
 
+@dataclass(frozen=True)
+class CandidateGenerationResult:
+    """Output of :meth:`RepairEngine._generate_repair_candidate`.
+
+    Phase A (Treefinement Production Wiring v3.4): single-source
+    primitive extracted from the inline GENERATE block in
+    ``_run_inner``. Composed by BOTH the legacy LINEAR FSM AND the
+    Phase C ``ProductionBranchGenerator`` (which uses the
+    ``hypothesis_seed`` parameter for cross-branch layer-N+1 context).
+
+    NEVER raises into callers — provider exceptions are quarantined
+    into ``stop_reason`` fields. ``asyncio.CancelledError`` is the
+    sole exception that propagates (orchestrator-handled POSTMORTEM
+    contract).
+
+    Field semantics
+    ---------------
+    ``candidate``: ``None`` on any failure; ``dict`` on success.
+    Callers MUST check ``candidate is None`` before consuming
+    ``stop_reason``.
+
+    ``model_id`` / ``provider_name``: ``None`` (sentinel) when the
+    provider response had no such attribute OR when the call failed.
+    Callers should treat ``None`` as "no value supplied; preserve
+    previous value" — this preserves the byte-equivalent semantics
+    of the original ``getattr(gen_result, "model_id", previous)``
+    fallback pattern in ``_run_inner``.
+
+    ``stop_reason``: ``None`` on success; structured failure code
+    on failure. Examples: ``"generate_error:RuntimeError"``,
+    ``"empty_candidates"``.
+    """
+
+    candidate: Optional[Dict[str, Any]]
+    model_id: Optional[str]
+    provider_name: Optional[str]
+    stop_reason: Optional[str]
+
+
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
@@ -429,11 +468,35 @@ class RepairEngine:
                 return None
             factory = get_production_tree_runner_factory()
             if factory is None:
+                # Phase E — attempt lazy boot registration. NEVER
+                # raises; returns False on any failure. The lazy
+                # import is intentional (avoids hard dep on
+                # repair_tree_production for non-tree-mode callers).
+                try:
+                    from backend.core.ouroboros.governance.repair_tree_production import (  # noqa: E501
+                        register_production_factory_at_boot,
+                    )
+                    register_production_factory_at_boot()
+                    factory = get_production_tree_runner_factory()
+                except ImportError:
+                    # repair_tree_production not available → factory
+                    # stays None → fall through to LINEAR.
+                    factory = None
+                except Exception:  # noqa: BLE001 — defensive
+                    _logger.debug(
+                        "[RepairEngine] lazy production registration "
+                        "raised; falling back to LINEAR",
+                        exc_info=True,
+                    )
+                    factory = None
+
+            if factory is None:
                 _logger.info(
                     "[RepairEngine] tree mode requested via "
                     "JARVIS_L2_BRANCHING_STRATEGY=%s but no production "
-                    "runner factory registered (Phase 6+ wiring "
-                    "pending); falling back to LINEAR _run_inner",
+                    "runner factory registered + lazy boot "
+                    "registration failed; falling back to LINEAR "
+                    "_run_inner",
                     budget.branching_strategy.value,
                 )
                 return None
@@ -464,22 +527,78 @@ class RepairEngine:
         ctx: Any,
         pipeline_deadline: datetime,
     ) -> Optional[RepairResult]:
-        """Phase 5 deferred — the production factory call + tree-result
-        adapter. Phase 5 ships a structural placeholder; the factory
-        contract (Protocol) is finalized when Phase 6+ wires the
-        production generator/validator/applier.
+        """Phase D — invoke production factory + adapt tree result.
 
-        Returns ``None`` so the gate falls through to legacy _run_inner
-        until Phase 6+ replaces this stub with the real adapter."""
-        # Phase 5 stub — preserves the call-site signature for AST
-        # pinning while making tree-mode unreachable until Phase 6+.
-        # The factory is captured in the closure so the AST pin sees
-        # an actual call site, not just an import.
-        _ = factory  # silence Pyright; factory consumed Phase 6+
-        _ = budget
-        _ = ctx
-        _ = pipeline_deadline
-        return None
+        Composes the canonical Phase D factory contract:
+
+          1. ``factory(*, budget, ctx, repair_engine, pipeline_deadline,
+             posture=None) -> Callable[[], Awaitable[RepairTreeResult]]``
+          2. ``await invocation()`` → ``RepairTreeResult``
+          3. ``tree_result_to_repair_result(tree_result, op_id=...)
+             -> RepairResult``
+
+        Returns ``None`` when ANY stage fails (factory construction
+        / tree invocation / result adaptation) so the gate falls
+        through to legacy ``_run_inner`` byte-identically.
+        Only ``asyncio.CancelledError`` propagates (orchestrator
+        POSTMORTEM contract).
+        """
+        # Stage 1 — construct invocation closure
+        try:
+            invocation = factory(
+                budget=budget,
+                ctx=ctx,
+                repair_engine=self,
+                pipeline_deadline=pipeline_deadline,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — fail-open per gate contract
+            _logger.warning(
+                "[RepairEngine] production factory raised during "
+                "construction; falling back to LINEAR _run_inner",
+                exc_info=True,
+            )
+            return None
+
+        # Stage 2 — run the tree
+        try:
+            tree_result = await invocation()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "[RepairEngine] production tree invocation raised; "
+                "falling back to LINEAR _run_inner",
+                exc_info=True,
+            )
+            return None
+
+        # Stage 3 — adapt RepairTreeResult → RepairResult
+        try:
+            from backend.core.ouroboros.governance.repair_tree_production import (  # noqa: E501
+                tree_result_to_repair_result,
+            )
+        except ImportError:
+            _logger.warning(
+                "[RepairEngine] repair_tree_production unavailable "
+                "for adapter import; falling back to LINEAR",
+            )
+            return None
+        op_id = getattr(ctx, "op_id", "") or ""
+        try:
+            return tree_result_to_repair_result(
+                tree_result, op_id=op_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "[RepairEngine] tree-result adapter raised; "
+                "falling back to LINEAR _run_inner",
+                exc_info=True,
+            )
+            return None
 
     async def _run_inner(
         self,
@@ -574,22 +693,33 @@ class RepairEngine:
             )
 
             # ----------------------------------------------------------------
-            # GENERATE
+            # GENERATE — composed via _generate_repair_candidate (Phase A
+            # extraction). The primitive is single-source: same call path
+            # used by the production BranchGenerator for tree-search branches
+            # (Phase C) so cross-branch and LINEAR generations stay byte-
+            # equivalent in their provider invocation.
             # ----------------------------------------------------------------
             if repair_context is not None:
-                try:
-                    gen_result = await self._prime.generate(
-                        ctx, pipeline_deadline, repair_context=repair_context
+                gen_outcome = await self._generate_repair_candidate(
+                    ctx, pipeline_deadline,
+                    repair_context=repair_context,
+                    hypothesis_seed=None,  # LINEAR FSM does not seed
+                )
+                if gen_outcome.candidate is None:
+                    return _stopped(
+                        gen_outcome.stop_reason
+                        or "generate_error:unknown",
                     )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    return _stopped(f"generate_error:{type(exc).__name__}")
-                if not gen_result.candidates:
-                    return _stopped("empty_candidates")
-                current_candidate = dict(gen_result.candidates[0])
-                model_id = getattr(gen_result, "model_id", model_id)
-                provider_name = getattr(gen_result, "provider_name", provider_name)
+                current_candidate = gen_outcome.candidate
+                # Preserve byte-equivalent getattr-with-fallback semantic
+                # — None (sentinel) means "provider response lacked the
+                # attribute"; keep previous value. Non-None values
+                # (including empty string) overwrite, matching the
+                # pre-Phase-A getattr behavior exactly.
+                if gen_outcome.model_id is not None:
+                    model_id = gen_outcome.model_id
+                if gen_outcome.provider_name is not None:
+                    provider_name = gen_outcome.provider_name
             else:
                 # First iteration: use candidate from failed L1 generation
                 current_candidate = dict(ctx.generation.candidates[0])
@@ -834,6 +964,104 @@ class RepairEngine:
             )
             self._emit_record(ctx.op_id, rec)
             records.append(rec)
+
+    async def _generate_repair_candidate(
+        self,
+        ctx: Any,
+        pipeline_deadline: datetime,
+        *,
+        repair_context: Any,
+        hypothesis_seed: Optional[str] = None,
+    ) -> CandidateGenerationResult:
+        """Generate a single repair candidate via the prime provider.
+
+        Phase A extraction (Treefinement Production Wiring v3.4) of the
+        inline GENERATE block from :meth:`_run_inner`. Single-source
+        primitive composed by:
+
+          * The legacy LINEAR FSM (``_run_inner``) — passes
+            ``hypothesis_seed=None`` preserving byte-equivalent
+            pre-Phase-A behavior.
+          * The Phase C ``ProductionBranchGenerator`` — passes a
+            ``hypothesis_seed`` carrying the parent branch's
+            ``fix_hypothesis`` so layer-N+1 GENERATE knows which
+            strategy survived. This is the substrate hook for
+            cross-branch context threading; the actual prompt
+            enrichment lives in the generator (which composes
+            ``maybe_inject_sibling_outcomes`` from Phase 3).
+
+        Contract
+        --------
+        * NEVER raises into callers EXCEPT ``asyncio.CancelledError``
+          (which propagates per the orchestrator-handled POSTMORTEM
+          contract — same as ``_run_inner`` discipline).
+        * Provider exceptions quarantine to ``CandidateGenerationResult
+          (candidate=None, stop_reason="generate_error:<TypeName>")``.
+        * Empty-candidates response quarantines to ``stop_reason=
+          "empty_candidates"`` with provider attribution preserved.
+        * Returns sentinel ``model_id=None`` / ``provider_name=None``
+          when the provider response lacks those attributes — callers
+          implement getattr-with-fallback by checking ``is not None``
+          before overwriting (matches the original ``getattr(gen_result,
+          "model_id", model_id)`` semantic).
+
+        Parameters
+        ----------
+        ctx : Any
+            OperationContext from the orchestrator.
+        pipeline_deadline : datetime
+            UTC deadline; passed through to provider.
+        repair_context : Any
+            Required — the caller's prior-failure context. The
+            first-iteration ``ctx.generation.candidates[0]`` reuse
+            path stays inline in ``_run_inner`` and does NOT call
+            this primitive (no provider invocation needed).
+        hypothesis_seed : str, optional
+            Phase C composition hook. Phase A passes ``None``;
+            ``ProductionBranchGenerator`` will pass the parent
+            branch's ``fix_hypothesis``. Reserved for future provider-
+            shape extension — the current ``self._prime.generate``
+            signature accepts only ``ctx`` + ``pipeline_deadline`` +
+            ``repair_context``, so this parameter is captured for
+            telemetry-only at the substrate level until a provider
+            shape change exposes seed threading natively.
+        """
+        # The hypothesis_seed parameter is the Phase C composition hook
+        # — captured here as a deliberate Phase A no-op so the call-site
+        # contract is stable. Phase C will thread it through provider
+        # extensions OR via the prompt-injection layer; either path
+        # composes the same _generate_repair_candidate signature.
+        del hypothesis_seed  # Phase A: explicitly unused; Phase C owns
+
+        try:
+            gen_result = await self._prime.generate(
+                ctx, pipeline_deadline, repair_context=repair_context,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — Protocol contract
+            return CandidateGenerationResult(
+                candidate=None,
+                model_id=None,
+                provider_name=None,
+                stop_reason=f"generate_error:{type(exc).__name__}",
+            )
+        if not gen_result.candidates:
+            return CandidateGenerationResult(
+                candidate=None,
+                model_id=None,
+                provider_name=None,
+                stop_reason="empty_candidates",
+            )
+        # Use sentinel ``None`` when attribute missing so callers can
+        # distinguish "no value supplied" from "explicit empty string".
+        # Matches the byte-equivalent pre-Phase-A getattr behavior.
+        return CandidateGenerationResult(
+            candidate=dict(gen_result.candidates[0]),
+            model_id=getattr(gen_result, "model_id", None),
+            provider_name=getattr(gen_result, "provider_name", None),
+            stop_reason=None,
+        )
 
     def _emit_record(self, op_id: str, record: RepairIterationRecord) -> None:
         """Append a RepairIterationRecord to the ledger (if wired).

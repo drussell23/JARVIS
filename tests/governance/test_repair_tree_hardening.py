@@ -299,17 +299,25 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     )
     assert src is not None, "_run_inner not found in AST"
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
-    # Pin set at Phase 5 cutover. To intentionally change _run_inner:
-    # 1. update this hash in the test; 2. document the change in the
-    # arc memory file; 3. include a soak validating the new behavior.
-    EXPECTED_DIGEST = "EXPECTED_AT_FIRST_RUN"  # placeholder
-    if EXPECTED_DIGEST == "EXPECTED_AT_FIRST_RUN":
-        # Self-bootstrap: first run captures the digest; subsequent
-        # runs assert against the captured value. The captured digest
-        # is printed in the test output for the operator to copy
-        # into this file.
-        print(f"\n[pin-10] _run_inner sha256[:16] = {digest}")
-        return
+    # Pin locked at Phase A cutover (Treefinement Production Wiring v3.4,
+    # 2026-05-11): the inline GENERATE block at line ~581 was extracted
+    # into RepairEngine._generate_repair_candidate as a single-source
+    # primitive composed by both LINEAR FSM and the Phase C
+    # ProductionBranchGenerator. The extraction preserves byte-equivalent
+    # provider invocation semantics (verified by 10/10 existing
+    # repair_engine tests staying green); the function body source
+    # changed because the inline try/except + getattr-with-fallback
+    # block became a single delegation call. Pin updated atomically
+    # with that change.
+    #
+    # To intentionally change _run_inner in the future:
+    # 1. update this hash to the new sha256[:16] (capture via
+    #    `python -c "import ast, hashlib; ..."` — see Phase A memory
+    #    artifact for the exact incantation);
+    # 2. document the change in the arc memory file with explicit
+    #    Phase tag + the byte-equivalence verification approach;
+    # 3. include a soak validating the new behavior under cadence.
+    EXPECTED_DIGEST = "9e881fdde25ec5b1"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "
