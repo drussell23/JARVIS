@@ -565,7 +565,9 @@ def test_min_completed_per_problem_default(monkeypatch):
 def test_acceptance_threshold_default_and_clamping(monkeypatch):
     mod = _load_script_module()
     monkeypatch.delenv("JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD", raising=False)
-    assert mod.acceptance_threshold() == 0.40
+    # Stage 3.5 bumped the default from 0.40 → 0.45 (margin above
+    # the Stage 3 boundary-pass at exactly 0.40).
+    assert mod.acceptance_threshold() == 0.45
     monkeypatch.setenv("JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD", "0.6")
     assert abs(mod.acceptance_threshold() - 0.6) < 1e-9
     monkeypatch.setenv("JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD", "2.5")
@@ -702,12 +704,12 @@ def test_gate_fails_when_mean_below_threshold():
 
 
 def test_gate_default_acceptance_threshold_pinned():
-    """Operator-honesty pin: the documented threshold is 0.40 — the
-    constant in the validator MUST match this so the report's
-    ``acceptance_threshold`` field can be cross-checked against the
-    PRD §40.7.10 contract."""
+    """Operator-honesty pin: bumped to 0.45 in Stage 3.5 after the
+    first paid Stage 3 run landed exactly on the prior 0.40
+    boundary with high per-problem variance.  0.45 gives margin
+    without being so aggressive that legitimate corpora fail."""
     mod = _load_script_module()
-    assert mod.DEFAULT_ACCEPTANCE_THRESHOLD == 0.40
+    assert mod.DEFAULT_ACCEPTANCE_THRESHOLD == 0.45
 
 
 def test_gate_default_min_completed_pinned():
@@ -718,6 +720,108 @@ def test_gate_default_min_completed_pinned():
 def test_gate_default_parse_retry_pinned():
     mod = _load_script_module()
     assert mod.DEFAULT_PARSE_RETRY_BUDGET == 3
+
+
+def test_gate_default_per_problem_floor_pinned():
+    """Stage 3.5 contract pin: per-problem floor default is 0.20
+    (the 'no freeriders' rule).  Each HARDNESS_SET member must
+    individually clear this floor — one fixture at 0% can no
+    longer be carried by another fixture at 80% past the mean."""
+    mod = _load_script_module()
+    assert mod.DEFAULT_PER_PROBLEM_FLOOR == 0.20
+
+
+def test_per_problem_floor_env_override_and_clamping(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("JARVIS_VALIDATOR_PER_PROBLEM_FLOOR", "0.30")
+    assert abs(mod.per_problem_floor() - 0.30) < 1e-9
+    monkeypatch.setenv("JARVIS_VALIDATOR_PER_PROBLEM_FLOOR", "2.5")
+    assert mod.per_problem_floor() == 1.0  # clamped to maximum
+    monkeypatch.setenv("JARVIS_VALIDATOR_PER_PROBLEM_FLOOR", "-1")
+    assert mod.per_problem_floor() == 0.0  # clamped to minimum
+    monkeypatch.setenv("JARVIS_VALIDATOR_PER_PROBLEM_FLOOR", "garbage")
+    assert mod.per_problem_floor() == 0.20  # default on parse error
+
+
+def test_per_problem_floor_default(monkeypatch):
+    monkeypatch.delenv("JARVIS_VALIDATOR_PER_PROBLEM_FLOOR", raising=False)
+    mod = _load_script_module()
+    assert mod.per_problem_floor() == 0.20
+
+
+def test_gate_below_floor_returns_unevaluable():
+    """Stage 3.5 'no freeriders' canary: a HARDNESS_SET where ALL
+    members are sufficiently sampled AND the mean clears the
+    threshold MUST STILL fail the gate if ANY single member is
+    below the per-problem floor.
+
+    This is the empirical failure mode from Stage 3: problem_002
+    at 80% + problem_003 at 0% → mean=0.40 (passes old gate) but
+    003 is a freerider (carries no signal).  Floor=0.20 catches it."""
+    mod = _load_script_module()
+    mean, meets, diag = mod.compute_acceptance_gate(
+        frozenset({"problem_002", "problem_003"}),
+        [
+            _result("problem_002", completed=5, fails=4),  # 0.80
+            _result("problem_003", completed=5, fails=0),  # 0.00
+        ],
+        threshold=0.40, min_completed=3,
+        per_problem_floor_value=0.20,
+    )
+    assert mean is None
+    assert meets is False
+    assert diag["reason"] == "below_floor"
+    assert diag["under_floor"] == ["problem_003"]
+    assert diag["floor"] == 0.20
+    # Per-problem rates surface in diagnostic for operator review
+    assert diag["per_problem_rates"]["problem_003"] == 0.0
+    assert diag["per_problem_rates"]["problem_002"] == 0.80
+
+
+def test_gate_all_above_floor_evaluates_normally():
+    """When every member clears the floor, gate proceeds to mean
+    check as before — floor is additive, not overriding."""
+    mod = _load_script_module()
+    mean, meets, diag = mod.compute_acceptance_gate(
+        frozenset({"problem_002", "problem_003"}),
+        [
+            _result("problem_002", completed=5, fails=3),  # 0.60
+            _result("problem_003", completed=5, fails=2),  # 0.40
+        ],
+        threshold=0.45, min_completed=3,
+        per_problem_floor_value=0.20,
+    )
+    # mean = 0.50, threshold 0.45 → PASS; floor 0.20, all clear
+    assert mean is not None
+    assert abs(mean - 0.50) < 1e-9
+    assert meets is True
+    assert diag["reason"] == "ok"
+
+
+def test_gate_floor_check_runs_after_insufficient_samples():
+    """Diagnostic-order pin: floor check fires AFTER insufficient
+    samples (so an under-sampled fixture doesn't get reported as
+    'below_floor' when the real issue is sample count)."""
+    mod = _load_script_module()
+    mean, meets, diag = mod.compute_acceptance_gate(
+        frozenset({"problem_002"}),
+        [_result("problem_002", completed=2, fails=0)],  # 0.00 + low samples
+        threshold=0.45, min_completed=3,
+        per_problem_floor_value=0.20,
+    )
+    assert mean is None
+    assert meets is False
+    # Diagnostic should be insufficient_samples, NOT below_floor —
+    # under-sampling is the more fundamental problem
+    assert diag["reason"] == "insufficient_samples"
+
+
+def test_report_v2_schema_includes_per_problem_floor_field():
+    """Stage 3.5: ``per_problem_floor`` MUST be a top-level report
+    field so a consumer can reconstruct exactly which floor was
+    applied (especially when env-configured to a non-default value)."""
+    src = _SCRIPT_SRC
+    assert '"per_problem_floor"' in src
 
 
 # ----------------------------------------------------------------------------

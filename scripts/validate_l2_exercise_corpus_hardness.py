@@ -184,9 +184,27 @@ MIN_COMPLETED_ENV_VAR: str = (
     "JARVIS_VALIDATOR_MIN_COMPLETED_PER_PROBLEM"
 )
 
-DEFAULT_ACCEPTANCE_THRESHOLD: float = 0.40
+# Mean fail-rate threshold for HARDNESS_SET acceptance.  Bumped
+# from 0.40 → 0.45 in Phase 1.5.D.2 Stage 3.5 after the first paid
+# run (Stage 3) showed the mean landing exactly on the prior 0.40
+# boundary with high per-problem variance (one fixture at 80%, the
+# other at 0%).  0.45 gives operational margin without being so
+# aggressive that legitimate borderline corpora get rejected.
+DEFAULT_ACCEPTANCE_THRESHOLD: float = 0.45
 ACCEPTANCE_THRESHOLD_ENV_VAR: str = (
     "JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD"
+)
+
+# Per-problem fail-rate FLOOR — the "no freeriders" rule.  Each
+# HARDNESS_SET member must individually clear this floor; a fixture
+# at 0% can no longer be carried by another fixture at 80% to
+# squeak past the mean.  Added in Stage 3.5 after the empirical
+# measurement showed problem_003 (v1) failing to trigger the
+# multi-site trap while problem_002 carried the entire gate.
+# Default 0.20 — every member contributes meaningful signal.
+DEFAULT_PER_PROBLEM_FLOOR: float = 0.20
+PER_PROBLEM_FLOOR_ENV_VAR: str = (
+    "JARVIS_VALIDATOR_PER_PROBLEM_FLOOR"
 )
 
 # Comma-separated list of problem_ids that compose the HARDNESS_SET
@@ -305,11 +323,23 @@ def min_completed_per_problem() -> int:
 
 
 def acceptance_threshold() -> float:
-    """Read ``JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD`` (default 0.40,
+    """Read ``JARVIS_VALIDATOR_ACCEPTANCE_THRESHOLD`` (default 0.45,
     clamped [0.0, 1.0]).  NEVER raises."""
     return _env_float(
         ACCEPTANCE_THRESHOLD_ENV_VAR,
         DEFAULT_ACCEPTANCE_THRESHOLD,
+        minimum=0.0, maximum=1.0,
+    )
+
+
+def per_problem_floor() -> float:
+    """Read ``JARVIS_VALIDATOR_PER_PROBLEM_FLOOR`` (default 0.20,
+    clamped [0.0, 1.0]).  The "no freeriders" rule — every
+    HARDNESS_SET member must clear this floor individually.
+    NEVER raises."""
+    return _env_float(
+        PER_PROBLEM_FLOOR_ENV_VAR,
+        DEFAULT_PER_PROBLEM_FLOOR,
         minimum=0.0, maximum=1.0,
     )
 
@@ -331,6 +361,7 @@ def compute_acceptance_gate(
     *,
     threshold: float,
     min_completed: int,
+    per_problem_floor_value: float = 0.0,
 ) -> Tuple[Optional[float], bool, Dict[str, Any]]:
     """Evaluate the Phase 1.5.D acceptance gate.
 
@@ -339,16 +370,24 @@ def compute_acceptance_gate(
     (mean_fail_rate, meets_gate, diagnostic)
         ``mean_fail_rate`` is ``None`` whenever the gate is
         unevaluable (empty set / missing member / insufficient
-        samples on any member).  ``meets_gate`` is ``True`` iff
-        the set is non-empty, every member is fully sampled, AND
-        the mean over the set is ``>= threshold``.
+        samples on any member / null rate on any member).
+        ``meets_gate`` is ``True`` iff ALL of the following hold:
+          * The set is non-empty.
+          * Every member is in the results AND fully sampled.
+          * Every member has a non-null fail-rate ≥
+            ``per_problem_floor_value`` (the "no freeriders" rule).
+          * The mean fail-rate across the set is ≥ ``threshold``.
 
-        ``diagnostic`` is a dict carrying the reason the gate is
-        unevaluable (operator-visible in the report) — one of:
-        ``"empty_set"`` / ``"missing_members"`` /
-        ``"insufficient_samples"`` / ``"null_rate"`` / ``"ok"``.
+        ``diagnostic`` carries the operator-visible reason —
+        one of: ``empty_set`` / ``missing_members`` /
+        ``insufficient_samples`` / ``null_rate`` / ``below_floor``
+        / ``ok``.
 
     Pure function over the inputs.  NEVER raises.
+
+    The floor parameter defaults to 0.0 for backward compatibility
+    with v2 callers; new code should pass the env-resolved
+    :func:`per_problem_floor` value.
     """
     if not hardness_set:
         return None, False, {"reason": "empty_set"}
@@ -378,6 +417,26 @@ def compute_acceptance_gate(
                 "problem_id": pid,
             }
         rates.append(float(rate))
+    # Per-problem floor — every member must clear individually
+    # ("no freeriders").  Stage 3.5 contract; without this, one
+    # fixture at 80% can carry a fixture at 0% past the mean.
+    under_floor = sorted(
+        pid for pid, rate in zip(sorted(hardness_set), [
+            float(by_id[p]["measured_first_try_fail_rate"])
+            for p in sorted(hardness_set)
+        ])
+        if rate < per_problem_floor_value
+    )
+    if under_floor:
+        return None, False, {
+            "reason": "below_floor",
+            "under_floor": under_floor,
+            "floor": per_problem_floor_value,
+            "per_problem_rates": {
+                pid: float(by_id[pid]["measured_first_try_fail_rate"])
+                for pid in sorted(hardness_set)
+            },
+        }
     mean = sum(rates) / len(rates)
     return (
         mean,
@@ -874,6 +933,7 @@ async def _amain(args: argparse.Namespace) -> int:
     parse_retry_budget_value = parse_retry_budget()
     min_completed_value = min_completed_per_problem()
     acceptance_threshold_value = acceptance_threshold()
+    per_problem_floor_value = per_problem_floor()
     hardness_set = hardness_set_from_env()
 
     print("== L2 corpus hardness validator (Phase 1.5.D / schema v2) ==")
@@ -885,6 +945,7 @@ async def _amain(args: argparse.Namespace) -> int:
     print(f"  parse_retry:      {parse_retry_budget_value}")
     print(f"  min_completed:    {min_completed_value}")
     print(f"  accept_threshold: {acceptance_threshold_value:.2f}")
+    print(f"  per_problem_floor:{per_problem_floor_value:.2f}")
     print(
         f"  hardness_set:     "
         f"{sorted(hardness_set) if hardness_set else '<empty>'}",
@@ -948,6 +1009,7 @@ async def _amain(args: argparse.Namespace) -> int:
         results,
         threshold=acceptance_threshold_value,
         min_completed=min_completed_value,
+        per_problem_floor_value=per_problem_floor_value,
     )
 
     report: Dict[str, Any] = {
@@ -962,6 +1024,7 @@ async def _amain(args: argparse.Namespace) -> int:
         "parse_retry_budget": parse_retry_budget_value,
         "min_completed_per_problem": min_completed_value,
         "acceptance_threshold": acceptance_threshold_value,
+        "per_problem_floor": per_problem_floor_value,
         "hardness_set": sorted(hardness_set),
         "hardness_set_mean_fail_rate": (
             round(gate_mean, 6) if gate_mean is not None else None
