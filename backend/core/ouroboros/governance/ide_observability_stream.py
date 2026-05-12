@@ -1195,6 +1195,18 @@ EVENT_TYPE_PERMISSION_DECISION_RECORDED = (
 # to avoid surfacing operator content over the IDE stream).
 EVENT_TYPE_QA_RECORDED = "qa_recorded"
 
+# Treefinement Phase 4 — branch + layer lifecycle events. Producers
+# (in repair_tree_archive.maybe_archive_tree_result + the runner)
+# fire best-effort; broker exception NEVER raises into the runner
+# path. Stream-side gate (JARVIS_IDE_STREAM_ENABLED) applies via
+# publish_task_event. Substrate-side gate is the in-memory ring
+# master flag (JARVIS_L2_TREE_ARCHIVE_ENABLED) — when off, the
+# producer-bridge short-circuits before publish.
+EVENT_TYPE_REPAIR_BRANCH_PROMOTED = "repair_branch_promoted"
+EVENT_TYPE_REPAIR_BRANCH_PRUNED = "repair_branch_pruned"
+EVENT_TYPE_REPAIR_LAYER_COMPLETED = "repair_layer_completed"
+EVENT_TYPE_REPAIR_TREE_WON = "repair_tree_won"
+
 _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_TASK_CREATED,
     EVENT_TYPE_TASK_STARTED,
@@ -1328,6 +1340,10 @@ _VALID_EVENT_TYPES = frozenset({
     EVENT_TYPE_INFRA_RECOVERY_EVALUATED,         # §41.4 Phase 1 eighth arc (PRD v3.0+, infra_recovery_loop)
     EVENT_TYPE_MULTI_DAY_DEADLOCK_EVALUATED,     # §41.4 Phase 1 ninth (final) arc (PRD v3.0+, multi_day_deadlock_detector)
     EVENT_TYPE_QA_RECORDED,                      # §41.3 #26 Phase 2 Slice 3 (PRD v3.x, fast_path_qa)
+    EVENT_TYPE_REPAIR_BRANCH_PROMOTED,           # Treefinement Phase 4 (repair_tree_archive)
+    EVENT_TYPE_REPAIR_BRANCH_PRUNED,             # Treefinement Phase 4 (repair_tree_archive)
+    EVENT_TYPE_REPAIR_LAYER_COMPLETED,           # Treefinement Phase 4 (repair_tree_archive)
+    EVENT_TYPE_REPAIR_TREE_WON,                  # Treefinement Phase 4 (repair_tree_archive)
 })
 
 

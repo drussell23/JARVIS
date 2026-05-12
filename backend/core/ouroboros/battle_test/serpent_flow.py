@@ -6223,6 +6223,10 @@ class SerpentREPL:
           * ``q-N`` → :class:`fast_path_qa.BoundedQAStore` (§41.3 #26
             Phase 0): re-prints an archived Q&A interaction
             (question + answer + cost + ref).
+          * ``b-N`` → :class:`repair_tree_archive.TreeArchive`
+            (Treefinement Phase 4): re-renders an archived L2
+            tree-search branch (diff + score + outcome + prune
+            reason + worktree id).
           * ``<op-id>`` (no prefix) → look up the matching ``o-N`` for
             the most recent op with that id.
 
@@ -6252,6 +6256,9 @@ class SerpentREPL:
             elif ref_or_op.startswith("q-"):
                 # §41.3 #26 Phase 0 — fast-path Q&A ring
                 self._expand_qa(ref_or_op)
+            elif ref_or_op.startswith("b-"):
+                # Treefinement Phase 4 — L2 tree-search branch archive
+                self._expand_repair_branch(ref_or_op)
             else:
                 # Treat as op_id and find latest matching o-N
                 self._expand_op_block_by_op_id(ref_or_op)
@@ -6586,6 +6593,74 @@ class SerpentREPL:
             self._flow.console.print(
                 f"    [{_C['dim']}]total callbacks consulted: "
                 f"{total}[/{_C['dim']}]",
+                highlight=False,
+            )
+
+    def _expand_repair_branch(self, ref: str) -> None:
+        """Treefinement Phase 4 — re-render an archived L2 tree-search
+        branch from :class:`repair_tree_archive.TreeArchive`. Composes
+        the canonical archive (no parallel state). Master-flag-gated
+        at the producer side; the lookup itself is read-only and
+        returns ``None`` when the archive is empty / master-off / ref
+        evicted."""
+        try:
+            from backend.core.ouroboros.governance.repair_tree_archive import (  # noqa: E501
+                get_default_archive,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_C['death']}]/expand repair branch unavailable: "
+                f"{exc}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        entry = get_default_archive().get_by_ref(ref)
+        if entry is None:
+            self._flow.console.print(
+                f"  [{_C['heal']}]No archived branch for {ref}"
+                f"[/{_C['heal']}]",
+                highlight=False,
+            )
+            return
+        branch = entry.branch
+        outcome = getattr(branch.outcome, "value", str(branch.outcome))
+        prune_reason = getattr(branch, "prune_reason", None)
+        prune_str = (
+            f" / {prune_reason.value}"
+            if prune_reason is not None else ""
+        )
+        self._flow.console.print(
+            f"  [{_C['neural']}]⏺ Repair Branch[/{_C['neural']}] "
+            f"[{_C['dim']}]{ref} · op={entry.op_id} · L{branch.layer_index} · "
+            f"{outcome}{prune_str} · "
+            f"score={branch.validator_score:.2f}"
+            f"[/{_C['dim']}]",
+            highlight=False,
+        )
+        bid_short = str(branch.branch_id)[:16]
+        wt_id = branch.worktree_id or "<no-isolation>"
+        self._flow.console.print(
+            f"    [{_C['dim']}]branch_id={bid_short} · "
+            f"worktree={wt_id} · cost=${branch.cost_usd:.4f} · "
+            f"runs={branch.validation_runs_consumed}"
+            f"[/{_C['dim']}]",
+            highlight=False,
+        )
+        hyp = (branch.fix_hypothesis or "").strip()
+        if hyp:
+            if len(hyp) > 200:
+                hyp = hyp[:197] + "..."
+            self._flow.console.print(
+                f"    [{_C['dim']}]hypothesis: {hyp}[/{_C['dim']}]",
+                highlight=False,
+            )
+        # Diff preview — truncate at ~600 chars (operators wanting more
+        # detail use the IDE /observability/repair-tree/branch/{ref})
+        diff = branch.diff or ""
+        if diff:
+            preview = diff[:600] + ("\n..." if len(diff) > 600 else "")
+            self._flow.console.print(
+                f"    [{_C['dim']}]diff:\n{preview}[/{_C['dim']}]",
                 highlight=False,
             )
 

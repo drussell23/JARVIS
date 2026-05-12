@@ -463,6 +463,25 @@ class IDEObservabilityRouter:
             self._handle_qa_by_ref,
         )
 
+        # Treefinement Phase 4 — repair-tree archive surfaces.
+        # Composes the canonical TreeArchive ring (no parallel state).
+        # Three sub-routes mirror the tool-permissions pattern:
+        # recent / by-op / by-ref. Route-order discipline preserved:
+        # the literal-prefix routes (``/op/{op_id}`` + ``/branch/{ref}``)
+        # MUST register BEFORE any generic catch-all.
+        app.router.add_get(
+            "/observability/repair-tree",
+            self._handle_repair_tree_recent,
+        )
+        app.router.add_get(
+            "/observability/repair-tree/op/{op_id}",
+            self._handle_repair_tree_by_op,
+        )
+        app.router.add_get(
+            "/observability/repair-tree/branch/{ref}",
+            self._handle_repair_tree_by_ref,
+        )
+
     # --- request-path helpers ---------------------------------------------
 
     def _client_key(self, request: "web.Request") -> str:
@@ -3619,6 +3638,186 @@ class IDEObservabilityRouter:
             {
                 "ref": ref,
                 "record": artifact.to_dict(),
+            },
+        )
+
+    # ----------------------------------------------------------------------
+    # Treefinement Phase 4 — repair-tree archive surfaces
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _repair_tree_archive_master_enabled() -> bool:
+        """Authority-free gate — the repair-tree surface inherits the
+        :func:`repair_tree_archive.archive_enabled` master switch.
+        When the switch is off we 403 so port scanners see no signal
+        about what's behind the route. Mirrors the
+        :meth:`_permission_archive_master_enabled` pattern.
+
+        NEVER raises — falls through to False on any import or
+        runtime failure."""
+        try:
+            from backend.core.ouroboros.governance.repair_tree_archive import (  # noqa: E501
+                archive_enabled,
+            )
+        except ImportError:
+            return False
+        try:
+            return bool(archive_enabled())
+        except Exception:  # noqa: BLE001 — defensive
+            return False
+
+    async def _handle_repair_tree_recent(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/repair-tree[?limit=N]`` — bounded
+        read-only projection of the most-recent N archived branches
+        across all ops.
+
+        Composes the canonical :class:`TreeArchive` ring (Phase 4
+        substrate) + the canonical :meth:`ArchivedBranch.to_dict`
+        projection. Read-only — never mutates the archive.
+
+        Returns 403 when ``JARVIS_IDE_OBSERVABILITY_ENABLED=false``.
+        Returns 403 when ``JARVIS_L2_TREE_ARCHIVE_ENABLED=false``.
+        Returns 429 on rate-limit."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._repair_tree_archive_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.repair_tree_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        limit = self._parse_limit(request, default=20, ceiling=200)
+        try:
+            from backend.core.ouroboros.governance.repair_tree_archive import (  # noqa: E501
+                get_default_archive,
+            )
+            archive = get_default_archive()
+            entries = archive.recent(limit=limit)
+            snap = archive.snapshot()
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.repair_tree_unavailable",
+            )
+        return self._json_response(
+            request, 200,
+            {
+                "count": len(entries),
+                "snapshot": snap.to_dict(),
+                "branches": [e.to_dict() for e in entries],
+            },
+        )
+
+    async def _handle_repair_tree_by_op(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/repair-tree/op/{op_id}[?limit=N]`` —
+        filter the archive ring to one op_id (case-sensitive exact
+        match), in record-time order.
+
+        Composes :meth:`TreeArchive.by_op`. Read-only.
+
+        Returns 400 when ``op_id`` is missing/empty. 403/429 same as
+        the parent route."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._repair_tree_archive_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.repair_tree_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        op_id = (request.match_info.get("op_id", "") or "").strip()
+        if not op_id:
+            return self._error_response(
+                request, 400,
+                "ide_observability.repair_tree_missing_op_id",
+            )
+        limit = self._parse_limit(request, default=50, ceiling=200)
+        try:
+            from backend.core.ouroboros.governance.repair_tree_archive import (  # noqa: E501
+                get_default_archive,
+            )
+            entries = get_default_archive().by_op(op_id)
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.repair_tree_unavailable",
+            )
+        truncated = entries[-limit:] if len(entries) > limit else entries
+        return self._json_response(
+            request, 200,
+            {
+                "op_id": op_id,
+                "count": len(truncated),
+                "total_archived": len(entries),
+                "branches": [e.to_dict() for e in truncated],
+            },
+        )
+
+    async def _handle_repair_tree_by_ref(
+        self, request: "web.Request",
+    ) -> Any:
+        """``GET /observability/repair-tree/branch/{ref}`` —
+        canonical single-branch lookup by b-N ref (exact match).
+        Returns the projection of the matching branch, or 404 when
+        the ref doesn't exist (or was evicted by drop-oldest).
+
+        Composes :meth:`TreeArchive.get_by_ref`. Read-only.
+
+        Returns 400 when ``ref`` is missing/empty. 404 when ref
+        doesn't resolve. 403/429 same as the parent route."""
+        if not ide_observability_enabled():
+            return self._error_response(
+                request, 403, "ide_observability.disabled",
+            )
+        if not self._repair_tree_archive_master_enabled():
+            return self._error_response(
+                request, 403,
+                "ide_observability.repair_tree_disabled",
+            )
+        if not self._check_rate_limit(self._client_key(request)):
+            return self._error_response(
+                request, 429, "ide_observability.rate_limited",
+            )
+        ref = (request.match_info.get("ref", "") or "").strip()
+        if not ref:
+            return self._error_response(
+                request, 400,
+                "ide_observability.repair_tree_missing_ref",
+            )
+        try:
+            from backend.core.ouroboros.governance.repair_tree_archive import (  # noqa: E501
+                get_default_archive,
+            )
+            entry = get_default_archive().get_by_ref(ref)
+        except Exception:  # noqa: BLE001 — defensive
+            return self._error_response(
+                request, 503,
+                "ide_observability.repair_tree_unavailable",
+            )
+        if entry is None:
+            return self._error_response(
+                request, 404,
+                "ide_observability.repair_tree_ref_not_found",
+            )
+        return self._json_response(
+            request, 200,
+            {
+                "ref": ref,
+                "branch": entry.to_dict(),
             },
         )
 

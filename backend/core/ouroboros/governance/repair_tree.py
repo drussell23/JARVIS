@@ -193,6 +193,18 @@ SIBLING_SKIP_POSTURES_ENV_VAR: str = (
 )
 
 
+# Phase 4 — SSE event-type constants registered in
+# ``ide_observability_stream._VALID_EVENT_TYPES`` (see Slice 4c
+# extension below). Producers fire best-effort; broker exception
+# NEVER raises into the runner path. The 4-event taxonomy mirrors
+# the layer + branch lifecycle — operators subscribe to whichever
+# subset matches their visualization needs.
+EVENT_TYPE_REPAIR_BRANCH_PROMOTED: str = "repair_branch_promoted"
+EVENT_TYPE_REPAIR_BRANCH_PRUNED: str = "repair_branch_pruned"
+EVENT_TYPE_REPAIR_LAYER_COMPLETED: str = "repair_layer_completed"
+EVENT_TYPE_REPAIR_TREE_WON: str = "repair_tree_won"
+
+
 # Defaults — referenced by both code paths and AST pin tests so drift
 # is structurally detectable. K=3 + M=2 + threshold=0.85 are operator-
 # approved Phase 0 defaults (chat #2026-05-11).
