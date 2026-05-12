@@ -359,12 +359,127 @@ class RepairEngine:
         ``Phase: L2 Repair 2/8`` — stale values after a completed run
         would cause the status line to claim "L2 still running" until
         the next op overwrites them.
+
+        Phase 5 strategy gate
+        ---------------------
+        Before delegating to the legacy LINEAR FSM, this method consults
+        the Treefinement strategy gate
+        (:meth:`_maybe_run_treefinement`). When master flag is FALSE
+        (default) OR strategy is LINEAR OR no production tree-runner
+        factory is registered (Phase 5 default), the gate returns
+        ``None`` and we fall through to ``_run_inner`` byte-identically.
+        Tree mode requires Phase 6+ to register a production factory.
         """
         try:
-            return await self._run_inner(ctx, _best_validation, pipeline_deadline)
+            # Phase 5 strategy gate — Treefinement integration point.
+            # Position MUST be BEFORE _run_inner so the gate can preempt
+            # the legacy FSM. AST-pinned in
+            # tests/governance/test_repair_tree_hardening.py.
+            tree_result = await self._maybe_run_treefinement(
+                ctx, _best_validation, pipeline_deadline,
+            )
+            if tree_result is not None:
+                return tree_result
+            return await self._run_inner(
+                ctx, _best_validation, pipeline_deadline,
+            )
         finally:
             self._current_iteration = 0
             self._max_iterations_live = 0
+
+    async def _maybe_run_treefinement(
+        self,
+        ctx: Any,
+        _best_validation: Any,
+        pipeline_deadline: datetime,
+    ) -> Optional[RepairResult]:
+        """Phase 5 strategy gate.
+
+        Returns a ``RepairResult`` when tree mode handled the op;
+        ``None`` when caller should fall through to the legacy
+        ``_run_inner``. NEVER raises into the caller.
+
+        Gate decision table (all must be true for tree path):
+
+          1. ``treefinement_enabled()`` — master flag (§33.1 default-FALSE)
+          2. ``budget.branching_strategy != LINEAR`` — operator chose
+             ``bfs`` or ``beam_k`` via env
+          3. ``get_production_tree_runner_factory() is not None`` —
+             Phase 6+ registered a production factory
+
+        When ANY of those is false, returns ``None`` (legacy path).
+        Tree path failure ALSO returns ``None`` (degraded fallback) —
+        only ``asyncio.CancelledError`` propagates.
+        """
+        try:
+            from backend.core.ouroboros.governance.repair_tree import (
+                BranchingStrategy,
+                TreefinementBudget,
+                get_production_tree_runner_factory,
+                treefinement_enabled,
+            )
+        except ImportError:
+            return None
+
+        try:
+            if not treefinement_enabled():
+                return None
+            budget = TreefinementBudget.from_env()
+            if budget.branching_strategy == BranchingStrategy.LINEAR:
+                return None
+            factory = get_production_tree_runner_factory()
+            if factory is None:
+                _logger.info(
+                    "[RepairEngine] tree mode requested via "
+                    "JARVIS_L2_BRANCHING_STRATEGY=%s but no production "
+                    "runner factory registered (Phase 6+ wiring "
+                    "pending); falling back to LINEAR _run_inner",
+                    budget.branching_strategy.value,
+                )
+                return None
+            # Phase 6+ runner construction + execution. Phase 5 ships
+            # only the gate skeleton — the conversion logic lives with
+            # the production wiring that registers the factory.
+            return await self._invoke_tree_factory(
+                factory=factory,
+                budget=budget,
+                ctx=ctx,
+                pipeline_deadline=pipeline_deadline,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — gate is fail-open
+            _logger.warning(
+                "[RepairEngine] treefinement gate raised; "
+                "falling back to LINEAR _run_inner",
+                exc_info=True,
+            )
+            return None
+
+    async def _invoke_tree_factory(
+        self,
+        *,
+        factory: Any,
+        budget: Any,
+        ctx: Any,
+        pipeline_deadline: datetime,
+    ) -> Optional[RepairResult]:
+        """Phase 5 deferred — the production factory call + tree-result
+        adapter. Phase 5 ships a structural placeholder; the factory
+        contract (Protocol) is finalized when Phase 6+ wires the
+        production generator/validator/applier.
+
+        Returns ``None`` so the gate falls through to legacy _run_inner
+        until Phase 6+ replaces this stub with the real adapter."""
+        # Phase 5 stub — preserves the call-site signature for AST
+        # pinning while making tree-mode unreachable until Phase 6+.
+        # The factory is captured in the closure so the AST pin sees
+        # an actual call site, not just an import.
+        _ = factory  # silence Pyright; factory consumed Phase 6+
+        _ = budget
+        _ = ctx
+        _ = pipeline_deadline
+        return None
 
     async def _run_inner(
         self,

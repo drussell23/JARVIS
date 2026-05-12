@@ -646,6 +646,69 @@ def treefinement_enabled() -> bool:
 
 
 # ===========================================================================
+# Production tree-runner factory registry (Phase 5 — hardening hook)
+# ===========================================================================
+#
+# The strategy gate at ``RepairEngine.run()`` (Phase 5 wiring) consults
+# this registry to decide whether tree mode is REACHABLE. Phase 5 ships
+# a NULL registry — tree mode is structurally enabled by master flag +
+# branching_strategy env, but BEHAVIORALLY a no-op until a factory is
+# registered (Phase 6+ wires real generator + validator + applier).
+#
+# This separation lets Phase 5 ship the gate, AST pins, and hardening
+# tests WITHOUT requiring the production wiring of generator/validator/
+# applier — those depend on the existing repair_engine generation path
+# being reorganized into a Protocol-shaped surface, which is its own
+# arc.
+
+_PRODUCTION_FACTORY: Optional[Callable[..., RepairTreeRunner]] = None
+_PRODUCTION_FACTORY_LOCK: Any = None  # Lazy threading.Lock
+
+
+def _factory_lock() -> Any:
+    """Lazy-initialize the factory lock so module import order doesn't
+    depend on threading being initialized."""
+    global _PRODUCTION_FACTORY_LOCK
+    if _PRODUCTION_FACTORY_LOCK is None:
+        import threading
+        _PRODUCTION_FACTORY_LOCK = threading.Lock()
+    return _PRODUCTION_FACTORY_LOCK
+
+
+def register_production_tree_runner_factory(
+    factory: Optional[Callable[..., RepairTreeRunner]],
+) -> None:
+    """Register (or unregister via ``None``) the production factory
+    that ``RepairEngine.run()``'s strategy gate uses to construct a
+    runner when tree mode is requested.
+
+    The factory MUST accept ``(*, budget: TreefinementBudget,
+    ctx: Any) -> RepairTreeRunner`` and return a runner with all
+    production dependencies (generator, validator, worktree manager)
+    pre-injected.
+
+    Phase 5 ships ``None`` by default — tree mode falls through to
+    legacy LINEAR until Phase 6+ wires the generator/validator/applier.
+
+    NEVER raises — wrapped in defensive try/except by callers.
+    """
+    global _PRODUCTION_FACTORY
+    with _factory_lock():
+        _PRODUCTION_FACTORY = factory
+
+
+def get_production_tree_runner_factory() -> Optional[
+    Callable[..., RepairTreeRunner]
+]:
+    """Return the registered production factory, or ``None`` when
+    tree mode is not yet wired. Strategy gate consults this on
+    every ``RepairEngine.run()`` invocation — keep cheap (just a
+    lock + read)."""
+    with _factory_lock():
+        return _PRODUCTION_FACTORY
+
+
+# ===========================================================================
 # Injection Protocols — Phase 1 testability seam
 # ===========================================================================
 #
@@ -1026,12 +1089,14 @@ class RepairTreeRunner:
                     won_branch=won,
                     layers=tuple(layers),
                 )
-                return RepairTreeResult(
+                won_result = RepairTreeResult(
                     root_op_id=op_id,
                     layers=tuple(layers),
                     winning_branch_path=winning_path,
                     final_status=None,
                 )
+                self._archive_result(won_result)
+                return won_result
 
             # Hard breaks for terminal verdicts.
             if layer.verdict in (
@@ -1054,16 +1119,37 @@ class RepairTreeRunner:
                     survivors, key=lambda b: b.validator_score
                 )
 
-        return RepairTreeResult(
+        result = RepairTreeResult(
             root_op_id=op_id,
             layers=tuple(layers),
             winning_branch_path=(),
             final_status=None,
         )
+        self._archive_result(result)
+        return result
 
     # ---------------------------------------------------------------------
     # Internal — layer dispatch + per-branch lifecycle
     # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _archive_result(result: RepairTreeResult) -> None:
+        """Phase 5 wire — fire-and-forget archive call.
+
+        Composes the canonical ``maybe_archive_tree_result`` producer-
+        bridge (Phase 4 substrate). Both ring + persistence + SSE are
+        independently master-flag-gated inside the bridge; we don't
+        re-check here. NEVER raises — bridge is fail-open.
+        """
+        try:
+            from backend.core.ouroboros.governance.repair_tree_archive import (  # noqa: E501
+                maybe_archive_tree_result,
+            )
+            maybe_archive_tree_result(result)
+        except Exception:  # noqa: BLE001 — fail-open
+            logger.debug(
+                "[RepairTree] archive bridge raised", exc_info=True,
+            )
 
     async def _dispatch_layer(
         self,
