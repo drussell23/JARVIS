@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
@@ -146,7 +147,6 @@ class MineCycleResult:
 def _bridge_timeout_s() -> float:
     """JARVIS_M10_PRODUCER_BRIDGE_TIMEOUT_S — sync-bridge
     wall-clock ceiling. Clamped [5, 600]. NEVER raises."""
-    import os
     raw = os.environ.get(
         "JARVIS_M10_PRODUCER_BRIDGE_TIMEOUT_S", "",
     ).strip()
@@ -728,10 +728,530 @@ def register_shipped_invariants() -> list:
     ]
 
 
+# ===========================================================================
+# Slice 2 — full-lifecycle composer (mine → synthesize → advance)
+# ===========================================================================
+#
+# Slice 1 stops at DETECTING-phase persistence. Slice 2 extends the
+# bridge to compose ProposalSynthesizer.synthesize() + Proposal-
+# LifecycleOrchestrator.advance() via the 5 adapters in
+# m10.bridge_adapters. Gated by JARVIS_M10_BRIDGE_FULL_LIFECYCLE_ENABLED
+# (default-FALSE — Slice 1 byte-identical behavior preserved when off).
+
+
+def full_lifecycle_enabled() -> bool:
+    """``JARVIS_M10_BRIDGE_FULL_LIFECYCLE_ENABLED`` — Slice 2 gate.
+    Default-FALSE. When on, ``fire_full_lifecycle_cycle`` composes
+    synthesizer + lifecycle for each mined record. NEVER raises."""
+    raw = os.environ.get(
+        "JARVIS_M10_BRIDGE_FULL_LIFECYCLE_ENABLED", "",
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class ProposalLifecyclePersistResult:
+    """Per-proposal outcome of one mine → advance cycle. Frozen."""
+
+    proposal_id: str
+    initial_phase: str = "detecting"
+    synth_verdict: str = ""
+    final_phase: str = ""
+    pr_url: str = ""
+    pr_branch: str = ""
+    failure_reason: str = ""
+    cost_usd: float = 0.0
+    elapsed_s: float = 0.0
+    schema_version: str = field(
+        default=M10_PRODUCER_BRIDGE_SCHEMA_VERSION,
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "proposal_id": self.proposal_id,
+            "initial_phase": self.initial_phase,
+            "synth_verdict": self.synth_verdict,
+            "final_phase": self.final_phase,
+            "pr_url": self.pr_url,
+            "pr_branch": self.pr_branch,
+            "failure_reason": (self.failure_reason or "")[:512],
+            "cost_usd": float(self.cost_usd),
+            "elapsed_s": float(self.elapsed_s),
+        }
+
+
+@dataclass(frozen=True)
+class FullLifecycleCycleResult:
+    """Aggregate result of one fire-full-lifecycle invocation.
+
+    Wraps the :class:`MineCycleResult` from the underlying mining
+    step + adds per-proposal advance outcomes. Frozen."""
+
+    mining_result: Optional[MineCycleResult]
+    """The mining step's result. May be None on early-exit
+    (master flag off / sub-flag off)."""
+
+    advanced_proposals: Tuple[
+        ProposalLifecyclePersistResult, ...
+    ] = field(default_factory=tuple)
+    """Per-proposal advance outcomes — one entry per mined
+    record that the bridge attempted to advance."""
+
+    ok: bool = True
+    outcome: str = "no_op"
+    """``no_op`` when master-flag off / sub-flag off; ``mined``
+    when mining produced no records to advance; ``advanced``
+    when at least one proposal completed an advance attempt
+    (regardless of terminal phase); ``error`` on bridge-level
+    failure."""
+
+    elapsed_s: float = 0.0
+    diagnostic: str = ""
+    schema_version: str = field(
+        default=M10_PRODUCER_BRIDGE_SCHEMA_VERSION,
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "ok": bool(self.ok),
+            "outcome": str(self.outcome),
+            "elapsed_s": float(self.elapsed_s),
+            "diagnostic": str(self.diagnostic)[:512],
+            "mining_result": (
+                self.mining_result.to_dict()
+                if self.mining_result is not None else None
+            ),
+            "advanced_proposals": [
+                p.to_dict() for p in self.advanced_proposals
+            ],
+        }
+
+
+async def _advance_proposal(
+    record: Any,
+    *,
+    synthesizer: Optional[Any] = None,
+    lifecycle: Optional[Any] = None,
+    provider: Optional[Any] = None,
+    layers: Optional[Any] = None,
+    worktree_bridge: Optional[Any] = None,
+    commit_bridge: Optional[Any] = None,
+    pr_bridge: Optional[Any] = None,
+) -> ProposalLifecyclePersistResult:
+    """Synthesize + advance ONE mined record.
+
+    Composes:
+      1. ProposalSynthesizer.synthesize(record, provider)
+      2. ProposalLifecycleOrchestrator.advance(synthesized, ...)
+
+    Updates the proposal_store ledger with the final terminal
+    phase + PR URL. NEVER raises."""
+    started = time.monotonic()
+    proposal_id = str(
+        getattr(record, "proposal_id", "") or "",
+    )
+    # Resolve singletons / adapters lazily.
+    if synthesizer is None:
+        try:
+            from backend.core.ouroboros.governance.m10.proposal_synthesizer import (  # noqa: E501
+                get_default_synthesizer,
+            )
+            synthesizer = get_default_synthesizer()
+        except Exception as err:  # noqa: BLE001
+            return ProposalLifecyclePersistResult(
+                proposal_id=proposal_id,
+                failure_reason=(
+                    f"synthesizer import failed: "
+                    f"{type(err).__name__}"
+                ),
+                elapsed_s=time.monotonic() - started,
+            )
+    if lifecycle is None:
+        try:
+            from backend.core.ouroboros.governance.m10.lifecycle import (  # noqa: E501
+                get_default_lifecycle,
+            )
+            lifecycle = get_default_lifecycle()
+        except Exception as err:  # noqa: BLE001
+            return ProposalLifecyclePersistResult(
+                proposal_id=proposal_id,
+                failure_reason=(
+                    f"lifecycle import failed: "
+                    f"{type(err).__name__}"
+                ),
+                elapsed_s=time.monotonic() - started,
+            )
+    if any(
+        a is None for a in (
+            provider, layers, worktree_bridge,
+            commit_bridge, pr_bridge,
+        )
+    ):
+        try:
+            from backend.core.ouroboros.governance.m10.bridge_adapters import (  # noqa: E501
+                CommitBridgeAdapter,
+                OrangePRBridgeAdapter,
+                SynthesisProviderAdapter,
+                ValidationLayersAdapter,
+                WorktreeBridgeAdapter,
+            )
+        except Exception as err:  # noqa: BLE001
+            return ProposalLifecyclePersistResult(
+                proposal_id=proposal_id,
+                failure_reason=(
+                    f"bridge_adapters import failed: "
+                    f"{type(err).__name__}"
+                ),
+                elapsed_s=time.monotonic() - started,
+            )
+        if provider is None:
+            provider = SynthesisProviderAdapter()
+        if layers is None:
+            layers = ValidationLayersAdapter()
+        if worktree_bridge is None:
+            worktree_bridge = WorktreeBridgeAdapter()
+        if commit_bridge is None:
+            commit_bridge = CommitBridgeAdapter()
+        if pr_bridge is None:
+            pr_bridge = OrangePRBridgeAdapter()
+
+    # Step 1: synthesize.
+    try:
+        synth = await synthesizer.synthesize(
+            record, provider=provider,
+        )
+    except Exception as err:  # noqa: BLE001
+        return ProposalLifecyclePersistResult(
+            proposal_id=proposal_id,
+            failure_reason=(
+                f"synthesize raised: {type(err).__name__}: {err}"
+            )[:256],
+            elapsed_s=time.monotonic() - started,
+        )
+
+    synth_verdict_attr = getattr(synth, "verdict", "")
+    synth_verdict_str = (
+        synth_verdict_attr.value
+        if hasattr(synth_verdict_attr, "value")
+        else str(synth_verdict_attr or "")
+    )
+    synth_cost = float(getattr(synth, "cost_usd", 0.0) or 0.0)
+
+    # Only "synthesized" verdict advances; everything else is
+    # terminal at synthesis.
+    if synth_verdict_str != "synthesized":
+        # Mark FAILED in store (matches lifecycle's contract for
+        # non-synthesized verdicts when advance is skipped).
+        try:
+            from backend.core.ouroboros.governance.m10.proposal_store import (  # noqa: E501
+                append_proposal,
+                StoredProposal,
+            )
+            update_row = StoredProposal(
+                proposal_id=proposal_id,
+                kind=str(
+                    getattr(getattr(record, "kind", ""), "value", "")
+                    or "",
+                ),
+                phase="decided_skip",
+                failure_reason=(
+                    f"synth verdict={synth_verdict_str!r}"
+                )[:256],
+                cost_usd=synth_cost,
+            )
+            append_proposal(update_row)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+        return ProposalLifecyclePersistResult(
+            proposal_id=proposal_id,
+            synth_verdict=synth_verdict_str,
+            final_phase="decided_skip",
+            cost_usd=synth_cost,
+            elapsed_s=time.monotonic() - started,
+        )
+
+    # Step 2: advance through lifecycle.
+    try:
+        lifecycle_result = await lifecycle.advance(
+            synth,
+            layers=layers,
+            worktree_bridge=worktree_bridge,
+            commit_bridge=commit_bridge,
+            pr_bridge=pr_bridge,
+        )
+    except Exception as err:  # noqa: BLE001
+        return ProposalLifecyclePersistResult(
+            proposal_id=proposal_id,
+            synth_verdict=synth_verdict_str,
+            failure_reason=(
+                f"advance raised: {type(err).__name__}: {err}"
+            )[:256],
+            cost_usd=synth_cost,
+            elapsed_s=time.monotonic() - started,
+        )
+
+    final_phase_attr = getattr(lifecycle_result, "final_phase", "")
+    final_phase_str = (
+        final_phase_attr.value
+        if hasattr(final_phase_attr, "value")
+        else str(final_phase_attr or "")
+    )
+    pr_result = getattr(lifecycle_result, "pr_result", None)
+    pr_url = ""
+    pr_branch = ""
+    if pr_result is not None:
+        pr_url = str(getattr(pr_result, "pr_url", "") or "")
+        pr_branch = str(
+            getattr(pr_result, "branch_name", "") or "",
+        )
+
+    # Persist the terminal-phase row.
+    try:
+        from backend.core.ouroboros.governance.m10.proposal_store import (  # noqa: E501
+            append_proposal,
+            StoredProposal,
+        )
+        update_row = StoredProposal(
+            proposal_id=proposal_id,
+            kind=str(
+                getattr(getattr(record, "kind", ""), "value", "")
+                or "",
+            ),
+            phase=final_phase_str or "failed",
+            proposed_module_path=str(
+                getattr(synth, "module_path", "") or "",
+            ),
+            proposed_class_name=str(
+                getattr(synth, "class_name", "") or "",
+            ),
+            proposed_ast_pin_name=str(
+                getattr(synth, "ast_pin_name", "") or "",
+            ),
+            pr_url=pr_url,
+            pr_branch=pr_branch,
+            failure_reason=str(
+                getattr(lifecycle_result, "failure_reason", "")
+                or "",
+            )[:256],
+            cost_usd=synth_cost,
+            consensus_signature=str(
+                getattr(synth, "consensus_signature", "") or "",
+            ),
+        )
+        append_proposal(update_row)
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+
+    return ProposalLifecyclePersistResult(
+        proposal_id=proposal_id,
+        synth_verdict=synth_verdict_str,
+        final_phase=final_phase_str,
+        pr_url=pr_url,
+        pr_branch=pr_branch,
+        failure_reason=str(
+            getattr(lifecycle_result, "failure_reason", "") or "",
+        )[:256],
+        cost_usd=synth_cost,
+        elapsed_s=time.monotonic() - started,
+    )
+
+
+async def fire_full_lifecycle_cycle(
+    *,
+    now_unix: Optional[float] = None,
+    miner: Optional[Any] = None,
+    synthesizer: Optional[Any] = None,
+    lifecycle: Optional[Any] = None,
+    provider: Optional[Any] = None,
+    layers: Optional[Any] = None,
+    worktree_bridge: Optional[Any] = None,
+    commit_bridge: Optional[Any] = None,
+    pr_bridge: Optional[Any] = None,
+) -> FullLifecycleCycleResult:
+    """Slice 2 — mine → synthesize → advance ALL emitted records.
+
+    Composes ``fire_mining_cycle`` (Slice 1) + ``_advance_proposal``
+    for each emitted record. Gated by
+    ``JARVIS_M10_BRIDGE_FULL_LIFECYCLE_ENABLED``. NEVER raises.
+    """
+    started = time.monotonic()
+    if not full_lifecycle_enabled():
+        return FullLifecycleCycleResult(
+            mining_result=None,
+            ok=True,
+            outcome="no_op",
+            diagnostic=(
+                "JARVIS_M10_BRIDGE_FULL_LIFECYCLE_ENABLED=false — "
+                "Slice 2 sub-flag off; use fire_mining_cycle for "
+                "Slice 1 behavior"
+            ),
+            elapsed_s=max(0.0, time.monotonic() - started),
+        )
+
+    mine_res = await fire_mining_cycle(
+        now_unix=now_unix, miner=miner,
+    )
+    # Re-resolve miner singleton to walk its in-flight records.
+    # The mining_result's proposal_ids only carries IDs after
+    # successful append_proposal — we want the ORIGINAL miner-
+    # emitted records (M10ProposalRecord objects) to feed the
+    # synthesizer.
+    if miner is None:
+        try:
+            from backend.core.ouroboros.governance.m10.unhandled_pattern_miner import (  # noqa: E501
+                get_default_miner,
+            )
+            miner = get_default_miner()
+        except Exception:  # noqa: BLE001
+            return FullLifecycleCycleResult(
+                mining_result=mine_res,
+                ok=False,
+                outcome="error",
+                diagnostic="miner re-resolve failed",
+                elapsed_s=max(0.0, time.monotonic() - started),
+            )
+
+    # Re-mine is wasteful; instead the mining result carries
+    # proposal_ids and we re-construct records by reading from
+    # the store. But the store row is a StoredProposal, not the
+    # original M10ProposalRecord with detection_evidence. For
+    # Slice 2 we re-fire the miner to get fresh records — the
+    # miner's idempotency guard (dedup window) protects against
+    # double-emission of the same pattern signature.
+    try:
+        fresh = await miner.mine(now_unix=now_unix)
+        emitted_records = tuple(
+            getattr(fresh, "proposals_emitted", ()) or (),
+        )
+    except Exception as err:  # noqa: BLE001
+        emitted_records = ()
+        logger.debug(
+            "[m10_producer_bridge] re-mine for advance "
+            "raised: %r", err,
+        )
+
+    if not emitted_records:
+        return FullLifecycleCycleResult(
+            mining_result=mine_res,
+            advanced_proposals=(),
+            ok=mine_res.ok,
+            outcome="mined" if mine_res.proposals_emitted_count > 0 else "no_op",
+            diagnostic=(
+                f"mining_outcome={mine_res.outcome!r}, "
+                f"no records to advance"
+            ),
+            elapsed_s=max(0.0, time.monotonic() - started),
+        )
+
+    # Advance each emitted record.
+    advance_results: list = []
+    for record in emitted_records:
+        result = await _advance_proposal(
+            record,
+            synthesizer=synthesizer,
+            lifecycle=lifecycle,
+            provider=provider,
+            layers=layers,
+            worktree_bridge=worktree_bridge,
+            commit_bridge=commit_bridge,
+            pr_bridge=pr_bridge,
+        )
+        advance_results.append(result)
+
+    all_ok = all(
+        r.synth_verdict in ("synthesized", "")
+        and "raised" not in r.failure_reason
+        for r in advance_results
+    )
+
+    return FullLifecycleCycleResult(
+        mining_result=mine_res,
+        advanced_proposals=tuple(advance_results),
+        ok=all_ok,
+        outcome="advanced",
+        diagnostic=(
+            f"advanced {len(advance_results)} proposal(s); "
+            f"phases={tuple(r.final_phase for r in advance_results)}"
+        )[:512],
+        elapsed_s=max(0.0, time.monotonic() - started),
+    )
+
+
+def fire_full_lifecycle_cycle_sync(
+    *,
+    now_unix: Optional[float] = None,
+    timeout_s: Optional[float] = None,
+) -> FullLifecycleCycleResult:
+    """Sync wrapper for REPL. Same loop-detection bridge as
+    :func:`fire_mining_cycle_sync`. NEVER raises."""
+    deadline = (
+        float(timeout_s) if timeout_s is not None
+        else _bridge_timeout_s()
+    )
+    try:
+        try:
+            asyncio.get_running_loop()
+            running = True
+        except RuntimeError:
+            running = False
+    except Exception as err:  # noqa: BLE001
+        return FullLifecycleCycleResult(
+            mining_result=None,
+            ok=False,
+            outcome="error",
+            diagnostic=(
+                f"loop detection raised: {type(err).__name__}"
+            ),
+        )
+
+    coro_factory = lambda: fire_full_lifecycle_cycle(  # noqa: E731
+        now_unix=now_unix,
+    )
+
+    try:
+        if running:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="m10-full-bridge",
+            ) as ex:
+                future = ex.submit(
+                    asyncio.run, coro_factory(),
+                )
+                return future.result(timeout=deadline)
+        return asyncio.run(coro_factory())
+    except concurrent.futures.TimeoutError:
+        return FullLifecycleCycleResult(
+            mining_result=None,
+            ok=False,
+            outcome="error",
+            diagnostic=(
+                f"fire_full_lifecycle_cycle_sync timed out "
+                f"after {deadline:.0f}s"
+            ),
+        )
+    except Exception as err:  # noqa: BLE001
+        return FullLifecycleCycleResult(
+            mining_result=None,
+            ok=False,
+            outcome="error",
+            diagnostic=(
+                f"fire_full_lifecycle_cycle_sync raised: "
+                f"{type(err).__name__}: {err}"
+            )[:256],
+        )
+
+
 __all__ = [
     "M10_PRODUCER_BRIDGE_SCHEMA_VERSION",
+    "FullLifecycleCycleResult",
     "MineCycleResult",
+    "ProposalLifecyclePersistResult",
+    "fire_full_lifecycle_cycle",
+    "fire_full_lifecycle_cycle_sync",
     "fire_mining_cycle",
     "fire_mining_cycle_sync",
+    "full_lifecycle_enabled",
     "register_shipped_invariants",
 ]

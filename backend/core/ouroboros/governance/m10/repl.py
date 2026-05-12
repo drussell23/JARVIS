@@ -352,15 +352,22 @@ def _render_history(limit: int) -> M10ReplDispatchResult:
 
 
 def _render_fire() -> M10ReplDispatchResult:
-    """Slice 1 — operator-initiated mining cycle.
+    """Operator-initiated mining cycle.
 
-    Composes :func:`m10_producer_bridge.fire_mining_cycle_sync`
-    which runs one canonical miner → ledger persistence cycle.
-    NEVER raises — the bridge wraps everything in a structured
-    :class:`MineCycleResult`."""
+    Composes the producer-bridge. When
+    ``JARVIS_M10_BRIDGE_FULL_LIFECYCLE_ENABLED=true`` (Slice 2),
+    routes through ``fire_full_lifecycle_cycle_sync`` which
+    runs mine → synthesize → advance. Otherwise (Slice 1
+    behavior), routes through ``fire_mining_cycle_sync`` which
+    only persists DETECTING records.
+
+    NEVER raises — the bridge wraps everything in structured
+    results."""
     try:
         from backend.core.ouroboros.governance.m10.m10_producer_bridge import (  # noqa: E501
+            fire_full_lifecycle_cycle_sync,
             fire_mining_cycle_sync,
+            full_lifecycle_enabled,
         )
     except Exception as exc:  # noqa: BLE001 — defensive
         return M10ReplDispatchResult(
@@ -370,10 +377,18 @@ def _render_fire() -> M10ReplDispatchResult:
                 f"{type(exc).__name__}"
             ),
         )
-    result = fire_mining_cycle_sync()
-    # Render the structured result for the operator.
+
+    if full_lifecycle_enabled():
+        return _render_full_lifecycle_fire(
+            fire_full_lifecycle_cycle_sync(),
+        )
+    return _render_mining_only_fire(fire_mining_cycle_sync())
+
+
+def _render_mining_only_fire(result: Any) -> M10ReplDispatchResult:
+    """Slice 1 renderer — DETECTING records only."""
     lines = [
-        f"/m10 fire — outcome={result.outcome}",
+        f"/m10 fire — outcome={result.outcome} (Slice 1: mining only)",
         f"  ok:                      {result.ok}",
         f"  proposals_emitted_count: {result.proposals_emitted_count}",
         f"  rows_stored:             {result.rows_stored}",
@@ -392,12 +407,51 @@ def _render_fire() -> M10ReplDispatchResult:
     if not result.ok or result.outcome == "error":
         lines.append("")
         lines.append(
-            "  hint: master flag is "
-            "JARVIS_M10_ARCH_PROPOSER_ENABLED "
-            "(default-FALSE per §30.5.2)"
+            "  hint: master JARVIS_M10_ARCH_PROPOSER_ENABLED "
+            "(default-FALSE); enable Slice 2 with "
+            "JARVIS_M10_BRIDGE_FULL_LIFECYCLE_ENABLED=true"
         )
     return M10ReplDispatchResult(
         ok=result.ok or result.outcome == "disabled",
+        text="\n".join(lines),
+    )
+
+
+def _render_full_lifecycle_fire(
+    result: Any,
+) -> M10ReplDispatchResult:
+    """Slice 2 renderer — synth + lifecycle advance per record."""
+    lines = [
+        f"/m10 fire — outcome={result.outcome} (Slice 2: full lifecycle)",
+        f"  ok:        {result.ok}",
+        f"  elapsed_s: {result.elapsed_s:.3f}",
+    ]
+    mr = result.mining_result
+    if mr is not None:
+        lines.append(
+            f"  mining:    outcome={mr.outcome} "
+            f"emitted={mr.proposals_emitted_count} "
+            f"stored={mr.rows_stored}"
+        )
+    if result.advanced_proposals:
+        lines.append("  advanced:")
+        for adv in result.advanced_proposals[:10]:
+            phase = adv.final_phase or "?"
+            pr_suffix = f" pr={adv.pr_url}" if adv.pr_url else ""
+            lines.append(
+                f"    {adv.proposal_id}  "
+                f"synth={adv.synth_verdict}  "
+                f"final={phase}"
+                f"{pr_suffix}"
+            )
+        if len(result.advanced_proposals) > 10:
+            lines.append(
+                f"    ... ({len(result.advanced_proposals) - 10} more)"
+            )
+    if result.diagnostic:
+        lines.append(f"  diagnostic: {result.diagnostic[:256]}")
+    return M10ReplDispatchResult(
+        ok=bool(result.ok),
         text="\n".join(lines),
     )
 
