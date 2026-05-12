@@ -1,0 +1,12 @@
+{
+  "id": "problem_001",
+  "kind": "off_by_one",
+  "target_file_name": "before.py",
+  "test_file_name": "test_before.py",
+  "difficulty": "medium",
+  "description": "nth_smallest: 1-indexed kth-element selection with off-by-one bug. The implementation accesses sorted_values[n] when it should access sorted_values[n-1]. Multiple test cases (smallest / 2nd / 3rd / largest / out-of-range) force the provider to diagnose the consistent off-by-one across n values rather than patching individual cases.",
+  "expected_first_try_fail_rate": 0.65,
+  "expected_first_try_fail_rate_validated": false,
+  "added_in": "v3.6 Phase 1.5.B (2026-05-12)",
+  "notes": "expected_first_try_fail_rate is the design-time estimate; Phase 1.5.D empirical validator runs the problem against real providers N times to measure the actual rate + updates this manifest if drift is observed. The 'validated' flag starts false and flips true after Phase 1.5.D runs."
+}
