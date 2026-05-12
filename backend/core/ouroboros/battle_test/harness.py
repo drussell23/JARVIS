@@ -1618,65 +1618,6 @@ class BattleTestHarness:
                     exc_info=True,
                 )
 
-            # ── v3.6 Phase 1.5.C — L2 exercise corpus boot hook ────────
-            # Default-FALSE per §33.1 — when JARVIS_L2_EXERCISE_CORPUS_ENABLED
-            # is unset, this short-circuits at the master-flag check
-            # inside maybe_inject_exercise_at_boot without any fixture
-            # I/O / worktree allocation. When operator opts in for a
-            # Phase 9 graduation soak, the hook lifts N problems from
-            # JARVIS_L2_EXERCISE_CORPUS_PATH into isolated worktrees +
-            # emits them as canonical IntentEnvelope(source=
-            # 'cadence_synthetic') ops, so the pipeline runs naturally
-            # and VALIDATE fails → L2 fires → tree mode engages → the
-            # v3.4 production wiring's strategy gate finally has a real
-            # op to exercise.
-            #
-            # Lazy import + outer try/except so the hook never blocks
-            # boot.  Composes existing canonical surfaces only — no
-            # parallel router / no parallel worktree manager.
-            try:
-                from backend.core.ouroboros.governance.l2_exercise_seed import (  # noqa: E501
-                    maybe_inject_exercise_at_boot,
-                )
-                from backend.core.ouroboros.governance.worktree_manager import (  # noqa: E501
-                    WorktreeManager,
-                )
-                # Resolve intake_router via the same attribute walker the
-                # plugin path uses (single canonical resolution pattern).
-                _exercise_router = None
-                for _attr in (
-                    "_intake_router", "intake_router",
-                    "_router", "router",
-                ):
-                    _cand = getattr(
-                        self._governed_loop_service, _attr, None,
-                    )
-                    if _cand is not None:
-                        _exercise_router = _cand
-                        break
-                if _exercise_router is not None:
-                    _exercise_wm = WorktreeManager(
-                        self._config.repo_path,
-                    )
-                    _exercise_verdict = await maybe_inject_exercise_at_boot(
-                        _exercise_router,
-                        worktree_manager=_exercise_wm,
-                        repo_root=str(self._config.repo_path),
-                    )
-                    logger.info(
-                        "[Harness] L2 exercise boot hook: verdict=%s",
-                        _exercise_verdict.value,
-                    )
-                else:
-                    logger.debug(
-                        "[Harness] L2 exercise boot hook: no intake "
-                        "router resolved — skipping",
-                    )
-            except Exception:  # noqa: BLE001 — boot must NEVER fail
-                logger.debug(
-                    "[Harness] L2 exercise boot hook raised — continuing",
-                    exc_info=True,
-                )
 
             # Boot each subsystem independently — failure of one should not
             # prevent others from starting (Manifesto §2: progressive awakening).
@@ -1889,6 +1830,59 @@ class BattleTestHarness:
             logger.info("IntakeLayerService booted")
         except Exception as exc:
             logger.warning("IntakeLayerService failed to boot: %s", exc)
+
+        # ── v3.6 Phase 1.5.C v2 — L2 exercise corpus boot hook ────────
+        # Default-FALSE per §33.1 — when JARVIS_L2_EXERCISE_CORPUS_ENABLED
+        # is unset, this short-circuits at the master-flag check
+        # inside maybe_inject_exercise_at_boot without any fixture
+        # I/O / worktree allocation.  When operator opts in (Phase 9
+        # graduation soak or harness-exercise gap closure), the hook
+        # lifts N problems from JARVIS_L2_EXERCISE_CORPUS_PATH into
+        # isolated worktrees + emits them via the canonical
+        # IntakeLayerService.ingest_envelope path — exactly the
+        # surface Phase 9 cadence synthetic workload uses, so the
+        # pipeline runs naturally and VALIDATE fails → L2 fires →
+        # tree mode engages → repair_tree.jsonl receives a row.
+        #
+        # Positioning: this hook MUST fire AFTER the IntakeLayerService
+        # boot block above so ``self._intake_service`` is non-None.
+        # The v1 (Phase 1.5.C) positioning was BEFORE the subsystem
+        # boot block which made the router walker resolve to None —
+        # caught by the harness-exercise soak (bt-2026-05-12-202511,
+        # 2026-05-12 13:25:16: "no intake router resolved — skipping").
+        # never blocks boot.  Composes the canonical
+        # IntakeLayerService.ingest_envelope surface — no parallel
+        # router / no parallel worktree manager.
+        try:
+            from backend.core.ouroboros.governance.l2_exercise_seed import (  # noqa: E501
+                maybe_inject_exercise_at_boot,
+            )
+            from backend.core.ouroboros.governance.worktree_manager import (  # noqa: E501
+                WorktreeManager,
+            )
+            if self._intake_service is not None:
+                _exercise_wm = WorktreeManager(
+                    self._config.repo_path,
+                )
+                _exercise_verdict = await maybe_inject_exercise_at_boot(
+                    self._intake_service,
+                    worktree_manager=_exercise_wm,
+                    repo_root=str(self._config.repo_path),
+                )
+                logger.info(
+                    "[Harness] L2 exercise boot hook: verdict=%s",
+                    _exercise_verdict.value,
+                )
+            else:
+                logger.debug(
+                    "[Harness] L2 exercise boot hook: "
+                    "_intake_service is None — skipping",
+                )
+        except Exception:  # noqa: BLE001 — boot must NEVER fail
+            logger.debug(
+                "[Harness] L2 exercise boot hook raised — continuing",
+                exc_info=True,
+            )
 
     async def _inject_phase_9_synthetic_workload(self) -> None:
         """Phase 9 cadence synthetic workload injection.

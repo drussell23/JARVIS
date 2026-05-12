@@ -200,66 +200,139 @@ def _find_enclosing_try(target_node: ast.AST):
 
 
 # ===========================================================================
-# Composition pin — same attribute walker as plugin section
+# Composition pin — hook passes the canonical IntakeLayerService directly
+# (Phase 1.5.C v2 — no attribute walker; the previous walker against
+# self._governed_loop_service silently resolved to None because the
+# router lives on self._intake_service, not on the GLS.  Empirical
+# failure caught by harness-exercise soak bt-2026-05-12-202511,
+# 2026-05-12 13:25:16 "no intake router resolved — skipping".)
 # ===========================================================================
 
 
-def test_boot_hook_uses_same_attribute_walker_as_plugins():
-    """Both the plugin section + the L2 exercise hook resolve the
-    intake_router via the SAME 4-attribute walker pattern:
-    ``_intake_router`` → ``intake_router`` → ``_router`` → ``router``.
+def test_boot_hook_passes_intake_service_directly():
+    """The L2 exercise hook MUST pass ``self._intake_service`` (the
+    canonical IntakeLayerService instance) directly to
+    ``maybe_inject_exercise_at_boot`` — composing the same surface
+    Phase 9 cadence synthetic workload uses.
 
-    Drift here = two parallel resolution paths.  Composition
-    discipline pin."""
-    # Count the occurrences of the 4-attribute tuple in source
-    # (both plugins + L2 exercise hook should have it)
-    attr_tuple_pattern = (
-        '"_intake_router", "intake_router",'
+    The Phase 1.5.C v1 attribute walker against
+    ``self._governed_loop_service`` was structurally wrong: the
+    modern router is owned by IntakeLayerService, not GLS.
+    v2 corrects this by passing the service directly."""
+    # The hook block in source must reference self._intake_service
+    # in the maybe_inject_exercise_at_boot call.  AST-walk the call
+    # sites; one of them MUST have self._intake_service as the
+    # first positional arg.
+    found = False
+    for node in ast.walk(_HARNESS_AST):
+        if not isinstance(node, ast.Call):
+            continue
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "maybe_inject_exercise_at_boot"
+        ):
+            if node.args and isinstance(node.args[0], ast.Attribute):
+                attr = node.args[0]
+                if (
+                    isinstance(attr.value, ast.Name)
+                    and attr.value.id == "self"
+                    and attr.attr == "_intake_service"
+                ):
+                    found = True
+                    break
+    assert found, (
+        "maybe_inject_exercise_at_boot MUST be called with "
+        "self._intake_service as the first positional arg "
+        "(canonical IntakeLayerService composition; the previous "
+        "GLS attribute walker silently resolved to None)"
     )
-    count = _HARNESS_SRC.count(attr_tuple_pattern)
-    assert count >= 2, (
-        f"Expected ≥2 occurrences of intake-router attribute walker "
-        f"pattern (plugin section + L2 exercise hook), got {count}"
+
+
+def test_boot_hook_does_not_use_legacy_gls_walker():
+    """Regression pin against the v1 bug.  The L2 exercise hook
+    MUST NOT walk attributes on ``self._governed_loop_service`` to
+    find the router — that path silently resolves to None
+    (router is owned by IntakeLayerService).
+
+    AST inspection: find the maybe_inject_exercise_at_boot call.
+    Walk backwards from that call up to the enclosing function
+    block.  In that block's local code path, there must NOT be
+    any attribute walker over ``self._governed_loop_service``
+    that resolves to the call's first positional arg."""
+    # Locate the call
+    call_node = None
+    for node in ast.walk(_HARNESS_AST):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "maybe_inject_exercise_at_boot"
+        ):
+            call_node = node
+            break
+    assert call_node is not None
+    # The first arg MUST be self._intake_service (not a local
+    # variable that was assigned from a walker)
+    assert call_node.args, "call has no args"
+    arg0 = call_node.args[0]
+    assert isinstance(arg0, ast.Attribute), (
+        f"First arg must be an Attribute node, got {type(arg0).__name__}"
+    )
+    assert arg0.attr == "_intake_service", (
+        f"First arg must be self._intake_service, got "
+        f"self.{arg0.attr}"
     )
 
 
 # ===========================================================================
-# Positioning pin — hook is AFTER plugin section + BEFORE subsystem boot
+# Positioning pin — hook is AFTER the IntakeLayerService boot block
 # ===========================================================================
 
 
-def test_boot_hook_positioned_after_plugin_section():
+def test_boot_hook_positioned_after_intake_layer_service_boots():
     """The L2 exercise hook MUST be positioned in source AFTER the
-    plugin discovery + load section.  Pre-plugin positioning would
-    mean the intake_router isn't fully constructed yet."""
-    plugin_marker = "plugin discovery/load failed"
+    ``IntakeLayerService booted`` log marker.  Pre-IntakeLayer-boot
+    positioning means ``self._intake_service`` is None and the
+    hook silently skips (the v1 bug).
+
+    This positioning pin REPLACES the v1 pins:
+      * test_boot_hook_positioned_after_plugin_section (irrelevant
+        — the relevant boot dependency is IntakeLayerService, not
+        plugins).
+      * test_boot_hook_positioned_before_subsystem_boot_block
+        (load-bearing INVERSION of the v1 pin — v1 said BEFORE
+        subsystem boot, which is exactly why the v1 hook
+        silently failed.  v2 mandates AFTER).
+    """
+    intake_marker = '"IntakeLayerService booted"'
     exercise_marker = "L2 exercise corpus boot hook"
-    plugin_idx = _HARNESS_SRC.find(plugin_marker)
+    intake_idx = _HARNESS_SRC.find(intake_marker)
     exercise_idx = _HARNESS_SRC.find(exercise_marker)
-    assert plugin_idx != -1, "plugin section marker missing"
+    assert intake_idx != -1, (
+        '"IntakeLayerService booted" log marker missing'
+    )
     assert exercise_idx != -1, "L2 exercise hook marker missing"
-    assert plugin_idx < exercise_idx, (
-        f"L2 exercise hook positioned BEFORE plugin section "
-        f"(plugin={plugin_idx} exercise={exercise_idx}); harness boot "
-        f"order requires plugin section to land first"
+    assert intake_idx < exercise_idx, (
+        f"L2 exercise hook positioned BEFORE IntakeLayerService "
+        f"boot (intake={intake_idx} exercise={exercise_idx}); "
+        f"router will be None at hook-fire time — the v1 bug"
     )
 
 
-def test_boot_hook_positioned_before_subsystem_boot_block():
-    """The hook MUST be positioned BEFORE the "Boot each subsystem
-    independently" block — otherwise it would compete for resources
-    with subsystem boot tasks."""
-    exercise_marker = "L2 exercise corpus boot hook"
-    subsystem_marker = "Boot each subsystem independently"
-    exercise_idx = _HARNESS_SRC.find(exercise_marker)
-    subsystem_idx = _HARNESS_SRC.find(subsystem_marker)
-    assert exercise_idx != -1
-    assert subsystem_idx != -1
-    assert exercise_idx < subsystem_idx, (
-        f"L2 exercise hook positioned AFTER subsystem boot block "
-        f"(exercise={exercise_idx} subsystem={subsystem_idx}); "
-        f"boot-order invariant violated"
-    )
+def test_boot_hook_documents_v1_root_cause():
+    """Operator-honesty pin: the hook's comment block MUST surface
+    that the v1 walker positioning was wrong + cite the empirical
+    soak session that caught it.  Without this comment, a future
+    operator could refactor positioning back to the v1 mistake."""
+    expected_phrases = [
+        "Phase 1.5.C v2",
+        "no intake router resolved",  # the v1 failure log message
+        "bt-2026-05-12-202511",  # session that caught the bug
+    ]
+    for phrase in expected_phrases:
+        assert phrase in _HARNESS_SRC, (
+            f"v2 hook comment MUST contain {phrase!r} so future "
+            f"readers don't restore the v1 broken positioning"
+        )
 
 
 # ===========================================================================

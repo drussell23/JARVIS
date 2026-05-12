@@ -604,12 +604,25 @@ async def maybe_inject_exercise_at_boot(
                 problem, worktree, repo_root=repo_root,
             )
             try:
-                ingest_result = await intake_router.ingest(envelope)
+                # Modern canonical injection path: IntakeLayerService
+                # exposes ``ingest_envelope`` for external test-load
+                # injectors (Phase 9 cadence synthetic uses the same
+                # surface; see harness._inject_phase_9_synthetic_workload).
+                # Legacy fallback: UnifiedIntakeRouter exposes ``ingest``
+                # directly — kept for substrate-spine compatibility
+                # where the test stub provides ``.ingest()`` and for
+                # legacy DI deployments that attach the router directly.
+                if hasattr(intake_router, "ingest_envelope"):
+                    ingest_result = await intake_router.ingest_envelope(
+                        envelope,
+                    )
+                else:
+                    ingest_result = await intake_router.ingest(envelope)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — fail-open
                 logger.warning(
-                    "[L2ExerciseSeed] intake_router.ingest failed for "
+                    "[L2ExerciseSeed] ingest failed for "
                     "problem=%r", problem.problem_id, exc_info=True,
                 )
                 continue
