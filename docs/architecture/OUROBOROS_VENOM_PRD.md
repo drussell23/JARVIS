@@ -410,6 +410,53 @@ python3 scripts/validate_l2_exercise_corpus_hardness.py --confirm-paid --attempt
 #           gate_diagnostic.reason="ok", n_problems=1
 ```
 
+##### §40.7.10-soak — Harness-exercise soak (PARTIAL closure 2026-05-12)
+
+**Status**: v2 boot hook + IntakeLayerService composition fix SHIPPED (`df4b70a4a8`); full end-to-end L2 fire under the in-repo battle test harness is **partially closed** with three named follow-up arcs documented below. Phase 2 SWE-Bench-Pro is the structural successor that exercises the same code path under a per-problem cloned-repo architecture (avoiding the in-repo follow-up arcs by construction).
+
+**Goal**: drive a real L2 fire end-to-end through the full 11-phase pipeline (CLASSIFY → ROUTE → CONTEXT_EXPANSION → PLAN → GENERATE → VALIDATE → retry exhaust → L2 → tree mode → `repair_tree.jsonl ≥ 1 row`) using the in-repo corpus + boot hook, complementing §40.7.8's CI deterministic test which proves the wiring fires in a controlled context.
+
+**v1 boot hook bug + v2 fix**:
+
+The Phase 1.5.C v1 boot hook composed the wrong canonical surface — it walked attributes on `self._governed_loop_service` looking for `_intake_router`, but the modern router is owned by `self._intake_service` (an `IntakeLayerService`), not by GLS. v1's walker silently resolved to None and the hook skipped — caught by soak `bt-2026-05-12-202511` (2026-05-12 13:25:16: `[Harness] L2 exercise boot hook: no intake router resolved — skipping`).
+
+v2 fix (`df4b70a4a8`):
+* **Substrate** (`l2_exercise_seed.maybe_inject_exercise_at_boot`): composes the canonical `IntakeLayerService.ingest_envelope` surface — the SAME public delegation method Phase 9 cadence synthetic workload injection uses (`intake_layer_service.py:324` docstring explicitly enumerates "Phase 9 cadence synthetic workload injection — and any future test-load surface"). Legacy `router.ingest` fallback retained for spine compatibility.
+* **Harness** (`battle_test/harness.py`): boot hook moved from BEFORE the subsystem boot block (where `_intake_service` is None) to AFTER the `IntakeLayerService booted` log marker (where `self._intake_service` is fully wired); passes `self._intake_service` directly — no walker.
+* **Spine** (`tests/governance/test_l2_exercise_seed_harness_wire.py`): replaced the v1 positioning + walker pins with v2 invariants (`test_boot_hook_passes_intake_service_directly` + `test_boot_hook_does_not_use_legacy_gls_walker` + `test_boot_hook_positioned_after_intake_layer_service_boots` + `test_boot_hook_documents_v1_root_cause`).
+
+**v2 soak verification** (session `bt-2026-05-12-211536`, 2026-05-12 14:15:39 → 15:27:43):
+
+```
+2026-05-12T14:20:54 [L2ExerciseSeed] injected problem='problem_001' ... ingest=True
+2026-05-12T14:31:49 [L2ExerciseSeed] injected problem='problem_002' ... ingest=True
+2026-05-12T14:38:26 [L2ExerciseSeed] injected problem='problem_003' ... ingest=True
+2026-05-12T14:43:46 [L2ExerciseSeed] injected problem='problem_004' ... ingest=True
+2026-05-12T14:43:46 [Harness] L2 exercise boot hook: verdict=injected
+```
+
+**All 4 corpus problems were injected via the canonical `IntakeLayerService.ingest_envelope` path with `ingest=True`** — proves the v2 wiring is structurally correct. The summary.json reports `attempted=0 / completed=0 / cost=$0.00`, however — no ops actually completed the pipeline.
+
+**Triage — single-sentence root cause** (operator-bounded 60–90min triage; deliverable per the gap-closure direction):
+
+> The L2-exercise envelope **was** dispatched (`op=op-019e1e10-7256` matches problem_002's 14:31:49 ingest; `[PhaseDispatcher] iter=0 dispatching CLASSIFY → CLASSIFYRunner` at 14:31:49); it reached the OperationAdvisor at 14:32:57 which BLOCKED with `risk=1.00, blast=50, coverage=0%, entropy=50%` (Orchestrator log: `Advisor BLOCKED operation: High blast radius: 27 files import these targets; Low test coverage: 0% of targets have tests; BLOCKED: Zero test coverage + extreme blast radius`); termination as `advisor_blocked` short-circuited **before** the orchestrator's `attempted` counter incremented. Load-bearing supporting diagnostic: `[DecisionRuntime] _compute_worker_id: worktree_path is None, using base worker_id` — confirms the advisor never received the envelope's `evidence["worktree_path"]`, despite the envelope having that field set by `build_exercise_intent`.
+
+**Three named follow-up arcs** (NOT gates for Phase 2; backlog after Phase 2 Phase A is moving):
+
+| # | Arc | Evidence | Why structural-not-workaround |
+|---|---|---|---|
+| **A** | Worktree-aware OperationAdvisor (composes `evidence.worktree_path` into blast computation) | 14 `advisor_blocked` events; `_compute_worker_id: worktree_path is None` | A worktree-isolated edit's blast radius on the main tree IS zero; the advisor must consume first-class isolation signals already on the envelope. **Not** a category special-case (rejected per gap-closure direction §3) — must be general policy. |
+| **B** | Parallel worktree creation in `maybe_inject_exercise_at_boot` (`asyncio.gather` over the 4 problems) | Sequential `git worktree add` took 7–11 min each; 4-problem injection consumed 28 min of the 40-min wall budget | Boot hook is fire-once at session start; serial loop multiplies latency unnecessarily. Parallel via `asyncio.gather` cuts injection from sum-of-creates to max-of-creates. |
+| **C** | Router→Dispatcher accounting trace (why `attempted=0` despite 4 successful ingests + at least 1 confirmed dispatch) | `summary.json.stats.attempted=0` while debug.log shows `iter=0 dispatching CLASSIFY` for L2-exercise op_id | Suspected: terminal `advisor_blocked` short-circuits before the orchestrator's outer counter. Worth a small AST-pin on the orchestrator's `attempted` increment site. |
+
+**Why Phase 2 SWE-Bench-Pro structurally avoids these**: SWE-Bench-Pro Phase B (per-problem harness, `clone repo at base_commit + apply test_patch + construct OperationContext`) gives each problem its OWN isolated cloned repo from the start — the advisor sees those edits in isolated full-repo worktrees rather than in the main repo's `.worktrees/` subdir. The advisor's blast computation (which scans the main repo's import graph) is naturally inert against a fresh clone with its own import graph. Worktree creation latency is amortized over per-problem cost (the clone happens once per problem, in parallel via `subagent_scheduler`).
+
+**v2 partial-closure verdict**:
+- ✅ Boot hook fires correctly + injection succeeds end-to-end
+- ✅ 1.5.E singleton-bootstrap acceptance (gate=true) preserved
+- ⚠️ Full end-to-end L2 fire requires the 3 follow-up arcs OR the Phase 2 architecture
+- → **Proceed to §40.7.9 Phase 2 SWE-Bench-Pro Phase A** — the structural answer.
+
 **File-coordinate summary**:
 - `scripts/validate_l2_exercise_corpus_hardness.py` — operator-paced CLI, schema v2 with parse-retry + floor + below_floor diagnostic
 - `tests/governance/test_l2_exercise_corpus_hardness_validator.py` — 55 spine pins (taxonomy + retry + classification + gate semantics + floor + composition)
