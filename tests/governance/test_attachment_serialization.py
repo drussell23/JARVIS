@@ -89,9 +89,14 @@ def _make_ctx(
 # ---------------------------------------------------------------------------
 
 
-def test_allowed_purposes_are_exactly_sensor_classify_and_visual_verify():
+def test_allowed_purposes_are_exactly_sensor_classify_visual_verify_and_generate():
+    """Manifesto §1 expansion — ``"generate"`` joined the
+    allowlist so the Mind can perceive what the Senses captured.
+    The ``JARVIS_GENERATE_ATTACHMENTS_ENABLED`` kill-switch
+    (default TRUE) is the secondary gate; the allowlist
+    membership is the primary."""
     assert _ATTACHMENT_PURPOSES_ALLOWED == frozenset(
-        {"sensor_classify", "visual_verify"}
+        {"sensor_classify", "visual_verify", "generate"}
     )
 
 
@@ -120,7 +125,6 @@ def test_allowed_purpose_materializes_attachments(tmp_path, purpose):
 @pytest.mark.parametrize(
     "bad_purpose",
     [
-        "generate",           # default GENERATE path
         "plan",               # PLAN phase
         "tool_round",         # Venom tool loop
         "validate",           # VALIDATE phase
@@ -132,17 +136,38 @@ def test_allowed_purpose_materializes_attachments(tmp_path, purpose):
     ],
 )
 def test_disallowed_purpose_returns_empty_list(tmp_path, bad_purpose):
+    """Non-allowlisted purposes still silently return empty.
+    (``"generate"`` was promoted to the allowlist per Manifesto
+    §1; remaining non-sanctioned purposes still hit the I7
+    defense-in-depth gate.)"""
     ctx = _make_ctx(tmp_path=tmp_path)
     out = _serialize_attachments(ctx, provider_kind="claude", purpose=bad_purpose)
     assert out == []
 
 
-def test_default_purpose_is_generate_and_returns_empty(tmp_path):
-    """Back-compat: callers that don't pass ``purpose=`` default to
-    ``"generate"`` which is NOT in the allowed set, so attachments
-    stay invisible."""
+def test_default_purpose_is_generate_and_materializes(tmp_path):
+    """Manifesto §1 contract — callers that don't pass
+    ``purpose=`` default to ``"generate"`` which IS in the
+    allowed set, so attachments materialize for the model.
+    ``JARVIS_GENERATE_ATTACHMENTS_ENABLED`` kill-switch is the
+    secondary gate (default TRUE; tested separately)."""
     ctx = _make_ctx(tmp_path=tmp_path)
     out = _serialize_attachments(ctx, provider_kind="claude")
+    assert len(out) == 1
+
+
+def test_generate_purpose_respects_kill_switch(tmp_path, monkeypatch):
+    """The GENERATE-time multi-modal kill-switch
+    ``JARVIS_GENERATE_ATTACHMENTS_ENABLED=false`` restores
+    pre-v5 text-only behavior — attachments strip even though
+    purpose=generate is in the allowlist."""
+    monkeypatch.setenv(
+        "JARVIS_GENERATE_ATTACHMENTS_ENABLED", "false",
+    )
+    ctx = _make_ctx(tmp_path=tmp_path)
+    out = _serialize_attachments(
+        ctx, provider_kind="claude", purpose="generate",
+    )
     assert out == []
 
 

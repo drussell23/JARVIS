@@ -46,12 +46,17 @@ CIRCUIT_BREAKER_PATH = Path(cb.__file__)
 def test_sentinel_branch_inserted_before_static_topology_gate() -> None:
     """The new sentinel branch in ``_resolve_provider_chain`` (or
     wherever the dispatch lives) must fire BEFORE the static yaml
-    gate at line 1404. If a refactor reorders these, the sentinel
-    becomes unreachable for sealed routes."""
+    gate. If a refactor reorders these, the sentinel becomes
+    unreachable for sealed routes.
+
+    Anchor for the static gate is the canonical Phase 10
+    Slice 5a method ``_topology.is_dw_blocked_for_route`` —
+    migrated from the v1 ``dw_allowed_for_route`` (now removed)
+    to the unified deletion-side 3-tuple helper."""
     src = CANDIDATE_GEN_PATH.read_text(encoding="utf-8")
     sentinel_call = src.index("_dispatch_via_sentinel")
     static_gate = src.index(
-        "_topology.dw_allowed_for_route", sentinel_call,
+        "_topology.is_dw_blocked_for_route", sentinel_call,
     )
     assert sentinel_call < static_gate, (
         "sentinel dispatch MUST fire before the static yaml gate "
@@ -476,11 +481,17 @@ def test_master_flag_off_dispatcher_not_invoked_for_sealed_route(
 
 
 def test_static_block_pattern_unchanged_in_source() -> None:
-    """The static topology block at lines 1404-1465 (legacy path)
-    stays intact under Slice 3 — only a NEW branch precedes it.
-    Pinned by string presence."""
+    """The static topology block stays intact under Slice 3 —
+    only a NEW branch precedes it. Pinned by string presence.
+
+    Phase 10 Slice 5a migrated the gate from
+    ``_topology.dw_allowed_for_route`` (True/False) to the
+    unified deletion-side ``_topology.is_dw_blocked_for_route``
+    (3-tuple: is_blocked, reason, block_mode) — pin updated to
+    the canonical name. The block_mode skip_and_queue branch
+    survives the migration unchanged."""
     src = CANDIDATE_GEN_PATH.read_text(encoding="utf-8")
-    assert "_topology.dw_allowed_for_route" in src
+    assert "_topology.is_dw_blocked_for_route" in src
     # Block-mode skip_and_queue branch still present.
     assert 'block_mode == "skip_and_queue"' in src
 
