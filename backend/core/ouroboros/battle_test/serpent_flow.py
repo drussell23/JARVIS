@@ -5938,16 +5938,26 @@ class SerpentREPL:
     # ── Gap #7 Slice 1 — /preflight and /organism (moved boot content) ──
 
     def _handle_tutorial(self, line: str = "") -> None:
-        """``/tutorial`` — category-grouped tour of slash verbs.
+        """``/tutorial`` — category-grouped tour of slash verbs OR
+        env-flag setup walkthrough.
 
         Composes :func:`repl_completion.discover_verbs` (single
         source of truth) + :func:`welcome_state.render_tutorial`
         — NEVER duplicates the registry. Accepts an optional
         category filter as the first argument.
 
-        @arg_spec: [category]
+        Subcommand ``setup`` (§41.3 #16) routes to the env-flag
+        walkthrough composing the canonical
+        :class:`flag_registry.FlagRegistry`. Optional second arg
+        narrows by category (e.g., ``setup safety``) or scope
+        (``setup all`` for the uncapped dump).
+
+        @arg_spec: [category|setup [scope]]
         @example: /tutorial
         @example: /tutorial lifecycle
+        @example: /tutorial setup
+        @example: /tutorial setup safety
+        @example: /tutorial setup all
         @category: introspection
         """
         try:
@@ -5955,6 +5965,7 @@ class SerpentREPL:
                 discover_verbs,
             )
             from backend.core.ouroboros.battle_test.welcome_state import (
+                render_setup_walkthrough,
                 render_tutorial,
             )
         except Exception as exc:  # noqa: BLE001
@@ -5964,14 +5975,60 @@ class SerpentREPL:
                 highlight=False,
             )
             return
-        # Parse optional category filter from the line.
-        _category: Optional[str] = None
+        # Parse: tokens[0] = "/tutorial"; tokens[1:] = args.
+        _tokens: list = []
         try:
-            _parts = (line or "").split(None, 1)
-            if len(_parts) > 1:
-                _category = _parts[1].strip() or None
+            _tokens = [
+                t for t in (line or "").split() if t
+            ]
         except Exception:  # noqa: BLE001
-            _category = None
+            _tokens = []
+        # Strip the verb itself if present at position 0.
+        if _tokens and _tokens[0].lower() in (
+            "/tutorial", "tutorial",
+        ):
+            _tokens = _tokens[1:]
+
+        # §41.3 #16 — setup subcommand routes to flag walkthrough.
+        if _tokens and _tokens[0].lower() == "setup":
+            # Second token (if any) acts as scope OR category
+            # filter — the substrate's category_filter param
+            # accepts category names; scope="all" toggles the
+            # uncapped dump.
+            _sub = (
+                _tokens[1].strip().lower() if len(_tokens) > 1
+                else ""
+            )
+            _scope = "all" if _sub == "all" else "all"
+            # When the second token isn't "all", treat it as a
+            # category filter; the substrate validates against
+            # the Category enum and degrades to "no matches"
+            # if invalid.
+            _category_filter = (
+                _sub if _sub and _sub != "all" else None
+            )
+            try:
+                _text = render_setup_walkthrough(
+                    scope=_scope,
+                    category_filter=_category_filter,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._flow.console.print(
+                    f"  [{_C['death']}]/tutorial setup: render "
+                    f"failed: {exc}[/{_C['death']}]",
+                    highlight=False,
+                )
+                return
+            self._flow.console.print()
+            for _ln in _text.splitlines():
+                self._flow.console.print(_ln, highlight=False)
+            self._flow.console.print()
+            return
+
+        # Legacy verb-tour path (§41.3 #17) unchanged.
+        _category: Optional[str] = None
+        if _tokens:
+            _category = _tokens[0].strip() or None
         try:
             _registry = discover_verbs(self)
             _text = render_tutorial(

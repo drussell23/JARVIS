@@ -416,6 +416,301 @@ def render_tutorial(
     return "\n".join(lines)
 
 
+# ===========================================================================
+# §41.3 #16 — Setup walkthrough (env-flag tour)
+# ===========================================================================
+#
+# Composes the canonical :mod:`flag_registry` (no parallel registry,
+# no hardcoded flag list). Section structure auto-derives from the
+# 8-slot ``Category`` enum — adding a new category in flag_registry
+# automatically produces a new section here. Per-flag display reads
+# from ``FlagSpec`` fields + current env state (via ``os.environ``).
+#
+# Operator binding: the walkthrough is DESCRIPTIVE only — never
+# mutates env state. Operator scrolls through, sees what's
+# configurable, decides which to flip in their shell.
+
+
+# Relevance → glyph table. Keys mirror the closed 3-value
+# :class:`flag_registry.Relevance` taxonomy. Operators can theme
+# by passing a custom mapping; absent keys fall back to defaults.
+_FLAG_RELEVANCE_GLYPHS: Tuple[Tuple[str, str], ...] = (
+    ("critical", "🔥"),
+    ("relevant", "📌"),
+    ("ignored", "·"),
+)
+
+
+# Sentinel marker for flags whose current value matches the
+# default — operator sees at a glance which knobs they've
+# actually customized.
+_FLAG_AT_DEFAULT_MARKER: str = "(default)"
+_FLAG_OVERRIDDEN_MARKER: str = "(overridden)"
+
+
+# Valid scope values for :func:`render_setup_walkthrough`. Closed
+# 3-value taxonomy — drift caught by an AST pin in the registry-
+# composition validator.
+_SETUP_SCOPES: Tuple[str, ...] = ("all", "critical", "relevant")
+
+
+def _relevance_glyph_for(rel_value: object) -> str:
+    """NEVER raises."""
+    try:
+        key = (
+            rel_value.value if hasattr(rel_value, "value")
+            else str(rel_value or "").strip().lower()
+        )
+    except Exception:  # noqa: BLE001
+        return "·"
+    for k, g in _FLAG_RELEVANCE_GLYPHS:
+        if k == key:
+            return g
+    return "·"
+
+
+def _read_env_value(name: object, default: Any) -> Tuple[str, bool]:
+    """Read the current env value for a flag. Returns
+    ``(value_repr, is_overridden)``. NEVER raises."""
+    try:
+        env_name = str(name or "")
+    except Exception:  # noqa: BLE001
+        return ("", False)
+    if not env_name:
+        return ("", False)
+    raw = os.environ.get(env_name, "")
+    if raw == "":
+        # Not set in env → using default
+        try:
+            return (str(default), False)
+        except Exception:  # noqa: BLE001
+            return ("", False)
+    return (raw, True)
+
+
+def render_setup_walkthrough(
+    flag_registry: Any = None,
+    *,
+    scope: str = "all",
+    posture: Optional[str] = None,
+    indent: str = "  ",
+    category_filter: Optional[str] = None,
+    max_per_section: int = 8,
+) -> str:
+    """Render the env-flag setup walkthrough. NEVER raises.
+
+    Composes the canonical
+    :class:`flag_registry.FlagRegistry` — NO parallel registry,
+    NO hardcoded flag list. Section structure auto-derives from
+    the 8-slot ``Category`` enum (adding a new category in
+    flag_registry automatically produces a new section here).
+
+    Parameters
+    ----------
+    flag_registry:
+        Canonical registry. When None, composes
+        ``flag_registry.get_default_registry()`` (which is
+        auto-seeded at import time).
+    scope:
+        One of :data:`_SETUP_SCOPES`:
+          * ``"all"`` — every registered flag (default)
+          * ``"critical"`` — only flags tagged CRITICAL for the
+            posture
+          * ``"relevant"`` — flags tagged CRITICAL or RELEVANT
+    posture:
+        Posture string (e.g., ``"HARDEN"``) used for the
+        ``critical`` / ``relevant`` filter. Ignored when
+        scope=``"all"``.
+    indent:
+        Per-line indent string (default ``"  "``).
+    category_filter:
+        When provided, restrict output to that category's
+        section. Useful for ``/tutorial setup safety`` etc.
+    max_per_section:
+        Cap per-category display to N flags (default 8 — keeps
+        the first-launch tour scannable). Pass 0 to disable the
+        cap and dump everything (used with ``/tutorial setup
+        all`` to see the full registry).
+    """
+    # Compose the canonical registry — NO parallel state. Uses
+    # ``ensure_seeded`` so the discovery walker populates the
+    # registry from all registered modules; the operator sees
+    # the LIVE flag surface, not a frozen snapshot.
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (  # noqa: E501  # type: ignore[import-not-found]
+            Category,
+            Relevance,
+            ensure_seeded,
+        )
+    except Exception:  # noqa: BLE001
+        return "setup: flag_registry unavailable"
+    registry = (
+        flag_registry if flag_registry is not None
+        else ensure_seeded()
+    )
+    if registry is None:
+        return "setup: no registry resolved"
+
+    # Normalize inputs.
+    scope_clean = (
+        str(scope or "all").strip().lower()
+    )
+    if scope_clean not in _SETUP_SCOPES:
+        scope_clean = "all"
+    cat_filter: Optional[str] = None
+    if category_filter is not None:
+        try:
+            cat_filter = (
+                str(category_filter or "").strip().lower()
+            )
+        except Exception:  # noqa: BLE001
+            cat_filter = None
+    posture_clean: Optional[str] = None
+    if posture is not None:
+        try:
+            posture_clean = str(posture).strip().upper()
+        except Exception:  # noqa: BLE001
+            posture_clean = None
+
+    # Filter set: when scope != "all", compose registry's
+    # canonical posture filter. Returns a list of FlagSpec.
+    posture_filtered_names: Optional[set] = None
+    if scope_clean != "all" and posture_clean:
+        try:
+            min_rel = (
+                Relevance.CRITICAL if scope_clean == "critical"
+                else Relevance.RELEVANT
+            )
+            posture_specs = registry.relevant_to_posture(
+                posture_clean, min_relevance=min_rel,
+            )
+            posture_filtered_names = {
+                s.name for s in posture_specs
+            }
+        except Exception:  # noqa: BLE001
+            posture_filtered_names = None
+
+    lines: List[str] = [
+        "⚙  Ouroboros + Venom — Operator Setup",
+    ]
+    if scope_clean == "all":
+        lines.append(
+            f"{indent}scope: all flags (no posture filter)"
+        )
+    else:
+        lines.append(
+            f"{indent}scope: {scope_clean}"
+            + (
+                f" · posture={posture_clean}"
+                if posture_clean else ""
+            )
+        )
+    lines.append("")
+
+    # Walk the Category enum in declaration order — closed 8-value
+    # taxonomy is the canonical section structure. Adding a
+    # category in flag_registry automatically adds a section here.
+    sections_rendered = 0
+    flags_rendered = 0
+    for cat in Category:
+        if cat_filter and cat.value.lower() != cat_filter:
+            continue
+        try:
+            specs_in_cat = registry.list_by_category(cat)
+        except Exception:  # noqa: BLE001
+            continue
+        # Apply posture filter on top of category filter.
+        if posture_filtered_names is not None:
+            specs_in_cat = [
+                s for s in specs_in_cat
+                if s.name in posture_filtered_names
+            ]
+        if not specs_in_cat:
+            continue
+        sections_rendered += 1
+        # Apply per-section cap unless scope=all OR cap=0 OR a
+        # category filter is set (operator explicitly drilling
+        # into one section — they want to see everything in it).
+        cap_active = (
+            max_per_section > 0
+            and scope_clean != "all"
+            and cat_filter is None
+        )
+        total_in_cat = len(specs_in_cat)
+        if cap_active:
+            specs_in_cat = specs_in_cat[:max_per_section]
+        elided = total_in_cat - len(specs_in_cat)
+        lines.append(f"== {cat.value.upper()} ==")
+        for spec in specs_in_cat:
+            flags_rendered += 1
+            value_repr, overridden = _read_env_value(
+                spec.name, spec.default,
+            )
+            # Posture-relevance glyph for the current posture
+            # (when set). Falls back to space (no glyph) when
+            # the flag has no relevance for this posture.
+            rel_glyph = " "
+            if posture_clean:
+                rel = spec.posture_relevance.get(posture_clean)
+                if rel is not None:
+                    rel_glyph = _relevance_glyph_for(rel)
+            override_marker = (
+                _FLAG_OVERRIDDEN_MARKER if overridden
+                else _FLAG_AT_DEFAULT_MARKER
+            )
+            try:
+                type_repr = spec.type.value
+            except Exception:  # noqa: BLE001
+                type_repr = "?"
+            # Truncate value for compact display
+            value_display = value_repr
+            if len(value_display) > 40:
+                value_display = value_display[:37] + "..."
+            header = (
+                f"{indent}{rel_glyph} {spec.name}  "
+                f"[{type_repr}]  "
+                f"value={value_display!r} {override_marker}"
+            )
+            lines.append(header)
+            try:
+                desc = (spec.description or "").strip()
+                if desc:
+                    lines.append(f"{indent}    {desc[:200]}")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                ex = (spec.example or "").strip()
+                if ex:
+                    lines.append(f"{indent}    example: {ex[:200]}")
+            except Exception:  # noqa: BLE001
+                pass
+        if elided > 0:
+            lines.append(
+                f"{indent}  …+{elided} more in {cat.value.upper()} "
+                f"— use `/tutorial setup {cat.value.lower()}` to see all"
+            )
+        lines.append("")
+
+    if sections_rendered == 0:
+        return (
+            "setup: no flags matched the current filter "
+            f"(scope={scope_clean}"
+            + (f", posture={posture_clean}" if posture_clean else "")
+            + (f", category={cat_filter}" if cat_filter else "")
+            + ")"
+        )
+
+    lines.append(
+        f"{indent}({flags_rendered} flag(s) across "
+        f"{sections_rendered} category section(s))"
+    )
+    lines.append(
+        f"{indent}Tip: set any flag in your shell before "
+        f"launching — `export {indent and 'JARVIS_FOO_ENABLED=true'}`"
+    )
+    return "\n".join(lines)
+
+
 # AST pins
 
 
@@ -643,6 +938,7 @@ __all__ = [
     "register_flags",
     "register_shipped_invariants",
     "render_first_launch_banner",
+    "render_setup_walkthrough",
     "render_tutorial",
     "sentinel_path",
 ]
